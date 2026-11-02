@@ -24,7 +24,6 @@ use gpui::{
 use gpui_component::{
     ActiveTheme as _, ColorName, Disableable as _, ElementExt as _, Icon, IconName,
     Selectable as _, Sizable as _, Size, StyledExt as _, Theme, WindowExt as _,
-    accordion::Accordion,
     alert::Alert,
     animation::{EffectTransition as Transition, ease_out_cubic},
     button::{Button, ButtonGroup, ButtonVariant, ButtonVariants as _, Toggle},
@@ -1654,6 +1653,11 @@ pub struct ManagementCenter {
     /// Scroll state for the record detail pages, whose identity header and tabs
     /// stay fixed while only the body moves.
     workspace_detail_scroll: ScrollHandle,
+    /// Scroll state for the Members tab's own body.
+    ///
+    /// The card fills the page, so its member list and Provider palette scroll
+    /// inside it while the form's actions stay pinned below.
+    workspace_route_members_scroll: ScrollHandle,
     /// The revision the Provider settings form was loaded from.
     workspace_edit_revision: Option<i64>,
     /// The revision of the route group the detail page's draft was loaded
@@ -2950,6 +2954,7 @@ impl ManagementCenter {
             ScrollAnchor::for_handle(provider_picker_scroll.clone());
         let workspace_create_scroll = ScrollHandle::new();
         let workspace_detail_scroll = ScrollHandle::new();
+        let workspace_route_members_scroll = ScrollHandle::new();
         Self {
             runtime: None,
             backend: None,
@@ -3258,6 +3263,7 @@ impl ManagementCenter {
             workspace_create_search,
             workspace_create_scroll,
             workspace_detail_scroll,
+            workspace_route_members_scroll,
             workspace_edit_revision: None,
             workspace_route_edit_revision: None,
             route_group_recommendations_height: MANAGEMENT_ROUTE_GROUP_SUGGESTIONS_DEFAULT_HEIGHT,
@@ -30941,6 +30947,18 @@ impl ManagementCenter {
             .into_any_element()
     }
 
+    /// Opens or closes one Provider group in the palette.
+    ///
+    /// The open set is the only state: a render derives the chevron and the
+    /// body from it, so the row never animates through a stale intermediate
+    /// height.
+    fn toggle_route_group_palette_group(&mut self, provider_id: String, cx: &mut Context<Self>) {
+        if !self.route_group_palette_open_groups.remove(&provider_id) {
+            self.route_group_palette_open_groups.insert(provider_id);
+        }
+        cx.notify();
+    }
+
     /// Templates, same-model suggestions, and the Provider/model palette.
     ///
     /// Split from the editor for the same reason as the simulator: each GPUI
@@ -30985,6 +31003,9 @@ impl ManagementCenter {
 
         struct PaletteModel {
             model_id: String,
+            /// The id whose brand mark names the model; an alias points at its
+            /// upstream so the row carries the model's own icon.
+            icon_model: String,
             detail: Option<String>,
             selected: bool,
         }
@@ -31024,6 +31045,7 @@ impl ManagementCenter {
                     .map(str::to_string);
                 models.push(PaletteModel {
                     model_id: entry.id.clone(),
+                    icon_model: entry.id.clone(),
                     detail,
                     selected,
                 });
@@ -31047,6 +31069,7 @@ impl ManagementCenter {
                 });
                 models.push(PaletteModel {
                     model_id: alias_name.to_string(),
+                    icon_model: alias.upstream.clone(),
                     detail: Some(format!("→ {}", alias.upstream)),
                     selected,
                 });
@@ -31174,23 +31197,54 @@ impl ManagementCenter {
         let search = management_search_input_compact(&self.route_group_model_query, cx);
 
         let open_groups = self.route_group_palette_open_groups.clone();
-        let mut group_keys = Vec::new();
-        let mut accordion = Accordion::new("management-model-group-provider-groups")
-            .multiple(true)
-            .bordered(false)
-            .disabled(searching)
-            .w_full()
-            .flex_none();
-        for group in groups {
+        // A flat disclosure list, not a stack of plated cards: each Provider
+        // is separated by a hairline, its mark is drawn without a rounded
+        // tile, and opening or closing swaps the body in place. The kit's
+        // Accordion springs its panel height, which makes every row below it
+        // travel up and down while it settles; the palette is a picker, so the
+        // rows move once and stay put.
+        let mut provider_groups = v_flex().w_full().min_w_0();
+        for (group_index, group) in groups.into_iter().enumerate() {
             let provider_id = group.profile.id.as_str().to_string();
-            group_keys.push(provider_id.clone());
             let open = searching || open_groups.contains(&provider_id);
+            let provider_for_click = provider_id.clone();
+            let provider_for_key = provider_id.clone();
+            let heading_id = format!("management-model-group-provider-{provider_id}");
+            let accessible = format!(
+                "{}, {} {}",
+                group.profile.display_name,
+                group.models.len(),
+                management_locale_text("models", "个模型", "個模型")
+            );
             let heading = h_flex()
+                .id(SharedString::from(heading_id))
+                .role(Role::Button)
+                .aria_label(accessible)
+                .aria_expanded(open)
+                .focusable()
+                .tab_index(0)
                 .w_full()
                 .min_w_0()
                 .items_center()
                 .gap_2()
-                .child(provider_logo_tile(&group.profile, px(20.0), cx))
+                .px_2()
+                .py_2()
+                .rounded(cx.theme().radius)
+                .when(!searching, |row| {
+                    row.cursor_pointer()
+                        .hover(|style| style.bg(cx.theme().muted.opacity(0.45)))
+                        .focus_visible(|style| style.bg(cx.theme().primary.opacity(0.08)))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.toggle_route_group_palette_group(provider_for_click.clone(), cx);
+                        }))
+                        .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+                            if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                                this.toggle_route_group_palette_group(provider_for_key.clone(), cx);
+                                cx.stop_propagation();
+                            }
+                        }))
+                })
+                .child(provider_logo_mark(&group.profile, px(24.0), cx))
                 .child(
                     div()
                         .min_w_0()
@@ -31210,6 +31264,16 @@ impl ManagementCenter {
                             group.models.len(),
                             management_locale_text("models", "个模型", "個模型")
                         )),
+                )
+                .child(
+                    Icon::new(if open {
+                        IconName::ChevronUp
+                    } else {
+                        IconName::ChevronDown
+                    })
+                    .xsmall()
+                    .flex_none()
+                    .text_color(cx.theme().muted_foreground),
                 );
             let provider_for_rows = group.profile.id.clone();
             let rows = group
@@ -31219,6 +31283,7 @@ impl ManagementCenter {
                     Self::render_route_group_palette_row(
                         &provider_for_rows,
                         model.model_id.clone(),
+                        model.icon_model.clone(),
                         model.detail.clone(),
                         model.selected,
                         member_count,
@@ -31227,33 +31292,27 @@ impl ManagementCenter {
                     )
                 })
                 .collect::<Vec<_>>();
-            let body = v_flex().w_full().gap_0p5().children(rows);
-            accordion = accordion.item(move |item| {
-                item.open(open)
-                    .with_size(Size::Small)
-                    .title(heading)
-                    .child(body)
+            let body = open.then(|| {
+                v_flex()
+                    .w_full()
+                    .min_w_0()
+                    .gap_0p5()
+                    .pb_2()
+                    .children(rows)
+                    .into_any_element()
             });
-        }
-        if !searching && !group_keys.is_empty() {
-            let center = cx.weak_entity();
-            let all_keys = group_keys.clone();
-            accordion = accordion.on_toggle_click(move |open_indices, _, cx| {
-                let next = all_keys
-                    .iter()
-                    .enumerate()
-                    .filter(|(index, _)| open_indices.contains(index))
-                    .map(|(_, key)| key.clone())
-                    .collect::<BTreeSet<_>>();
-                center
-                    .update(cx, |this, cx| {
-                        if this.route_group_palette_open_groups != next {
-                            this.route_group_palette_open_groups = next;
-                            cx.notify();
-                        }
+            provider_groups = provider_groups.child(
+                v_flex()
+                    .w_full()
+                    .min_w_0()
+                    .when(group_index > 0, |block| {
+                        block
+                            .border_t_1()
+                            .border_color(cx.theme().border.opacity(0.6))
                     })
-                    .ok();
-            });
+                    .child(heading)
+                    .children(body),
+            );
         }
 
         let empty = if !has_groups {
@@ -31283,7 +31342,7 @@ impl ManagementCenter {
                     .into_any_element()
             }
         } else {
-            accordion.into_any_element()
+            provider_groups.into_any_element()
         };
 
         let at_limit = member_count >= vibex_core::MAX_ROUTE_MEMBERS;
@@ -31320,6 +31379,7 @@ impl ManagementCenter {
     fn render_route_group_palette_row(
         provider_id: &vibex_core::ModelProviderProfileId,
         model_id: String,
+        icon_model: String,
         detail: Option<String>,
         selected: bool,
         member_count: usize,
@@ -31360,7 +31420,9 @@ impl ManagementCenter {
             .px_2()
             .py_1p5()
             .rounded(cx.theme().radius)
-            .when(selected, |row| row.bg(cx.theme().primary.opacity(0.08)))
+            .when(!disabled, |row| {
+                row.focus_visible(|style| style.bg(cx.theme().primary.opacity(0.08)))
+            })
             .when(!selected && !disabled, |row| {
                 row.hover(|style| style.bg(cx.theme().primary.opacity(0.06)))
             })
@@ -31385,19 +31447,7 @@ impl ManagementCenter {
                     cx.stop_propagation();
                 }
             }))
-            .child(
-                Icon::new(if selected {
-                    IconName::Check
-                } else {
-                    IconName::Plus
-                })
-                .xsmall()
-                .text_color(if selected {
-                    cx.theme().primary
-                } else {
-                    cx.theme().muted_foreground
-                }),
-            )
+            .child(Self::palette_model_icon(&icon_model, cx))
             .child(
                 v_flex()
                     .flex_1()
@@ -31427,6 +31477,39 @@ impl ManagementCenter {
                         .child(management_locale_text("Added", "已添加", "已新增")),
                 )
             })
+            .when(!selected, |row| {
+                row.child(
+                    Icon::new(IconName::Plus)
+                        .xsmall()
+                        .flex_none()
+                        .text_color(cx.theme().muted_foreground),
+                )
+            })
+            .into_any_element()
+    }
+
+    /// A model's own mark, or a neutral chip when the catalogue knows no brand
+    /// for it. The row is already grouped under its Provider, so this slot is
+    /// about the model, not a second Provider logo.
+    fn palette_model_icon(icon_model: &str, cx: &App) -> AnyElement {
+        let mark = model_brand_icon(
+            icon_model,
+            px(18.0),
+            Some(cx.theme().foreground.opacity(0.88)),
+        )
+        .unwrap_or_else(|| {
+            Icon::new(IconName::Cpu)
+                .size(px(16.0))
+                .text_color(cx.theme().muted_foreground)
+                .into_any_element()
+        });
+        div()
+            .flex_none()
+            .size(px(18.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(mark)
             .into_any_element()
     }
 
@@ -38910,7 +38993,6 @@ enum RouteGroupDetailTab {
     Overview,
     Members,
     Settings,
-    Traffic,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50900,14 +50982,13 @@ mod gateway_surface_tests {
     }
 
     #[test]
-    fn the_route_group_workbench_has_four_tabs() {
+    fn the_route_group_workbench_has_three_tabs_and_overview_owns_traffic() {
         let source = include_str!("management.rs");
+        let route_group = include_str!("management/provider_workspace/route_group.rs");
         for marker in [
             "management-route-group-detail-tabs",
             "RouteGroupDetailTab::Overview",
             "RouteGroupDetailTab::Members",
-            "RouteGroupDetailTab::Policy",
-            "RouteGroupDetailTab::Traffic",
             "member.order_index",
             "management_route_strategy_label(route.strategy)",
         ] {
@@ -50916,6 +50997,23 @@ mod gateway_surface_tests {
                 "the route workbench must keep {marker}"
             );
         }
+        let tabs = source
+            .split_once("enum RouteGroupDetailTab {")
+            .and_then(|(_, tail)| tail.split_once('}'))
+            .map(|(body, _)| body)
+            .expect("the route-group tab enum should remain inspectable");
+        assert!(
+            !tabs.contains("Traffic"),
+            "traffic is no longer a destination of its own"
+        );
+        assert!(
+            route_group.contains("const ROUTE_TABS: [RouteGroupDetailTab; 3]"),
+            "the route workbench has Overview, Members, and Settings"
+        );
+        assert!(
+            route_group.contains("render_workspace_route_traffic_section("),
+            "Overview draws the group's traffic"
+        );
     }
 
     /// The route map and the requests it is picked from are one tab: a
@@ -52698,12 +52796,36 @@ mod gateway_surface_tests {
             .map(|(body, _)| body)
             .expect("the model palette should remain inspectable");
         assert!(
-            palette.contains("Accordion::new(\"management-model-group-provider-groups\")"),
+            palette.contains("management-model-group-provider-"),
             "the palette must group models under their Provider"
+        );
+        assert!(
+            palette.contains("toggle_route_group_palette_group("),
+            "each Provider heading owns its open state"
+        );
+        assert!(
+            palette.contains("provider_logo_mark("),
+            "a Provider heading carries the mark itself, without a tile"
+        );
+        assert!(
+            !palette.contains("provider_logo_tile("),
+            "the rounded tile around the Provider mark is gone"
+        );
+        assert!(
+            !palette.contains("Accordion::new("),
+            "the palette owns a flat disclosure list instead of the springing Accordion"
         );
         assert!(
             palette.contains("render_route_group_palette_row"),
             "each Provider group must list its models as rows"
+        );
+        assert!(
+            palette.contains("model.icon_model.clone()"),
+            "a model row passes the id its brand mark is drawn from"
+        );
+        assert!(
+            source.contains("fn palette_model_icon("),
+            "model rows carry the model's own icon"
         );
         assert!(
             !palette.contains("palette = palette.child("),
@@ -52868,6 +52990,85 @@ mod gateway_surface_tests {
         assert!(
             cx.debug_bounds("management-model-group-palette").is_some(),
             "the Members tab must draw the grouped model palette"
+        );
+    }
+
+    /// The Members card fills the page, its body scrolls inside the card, and
+    /// the form's actions stay below the card instead of being painted over by
+    /// a long Provider list.
+    #[gpui::test]
+    fn the_route_group_members_page_fills_the_pane_and_scrolls_inside_its_card(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        let (center, cx) = cx.add_window_view(ManagementCenter::new);
+        let providers = (0..20)
+            .map(|index| vibex_core::ModelProviderProfile {
+                display_name: format!("Provider {index:02}"),
+                configured_models: vec![vibex_core::ModelProviderCatalogEntry {
+                    id: format!("model-{index:02}"),
+                    display_name: None,
+                    enabled: true,
+                    metadata: Vec::new(),
+                    capabilities: Default::default(),
+                }],
+                status: vibex_core::ModelProviderProfileStatus::Enabled,
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        let route = vibex_core::ModelRoute {
+            display_name: "Route group".to_string(),
+            kind: vibex_core::RouteKind::ModelGroup,
+            agent_model_id: Some("group".to_string()),
+            members: vec![vibex_core::ModelRouteMember::new(
+                providers[0].id.clone(),
+                "model-00",
+                0,
+            )],
+            status: vibex_core::RouteStatus::Enabled,
+            ..Default::default()
+        };
+        let selected = route.id.to_string();
+        cx.update(|window, cx| {
+            center.update(cx, |center, cx| {
+                center.navigation.active = ManagementSection::Providers;
+                center.providers_sidebar_tab = ProviderSidebarTab::RouteGroups;
+                center.selected_global_route_id = Some(selected);
+                center.providers = providers;
+                center.model_routes = vec![route];
+                center.route_group_detail_tab = RouteGroupDetailTab::Members;
+                cx.notify();
+            });
+            let _ = window.draw(cx);
+        });
+
+        let page = cx
+            .debug_bounds("management-route-members-page")
+            .expect("the Members page fills the detail body");
+        let section = cx
+            .debug_bounds("management-route-members-section")
+            .expect("the Members card is drawn");
+        let scroll = cx
+            .debug_bounds("management-route-members-scroll")
+            .expect("the Members card owns a scroll region");
+        let footer = cx
+            .debug_bounds("management-route-members-footer")
+            .expect("the form actions are pinned below the card");
+        assert!(
+            section.bottom() <= footer.top(),
+            "the card must end above the actions: section={section:?} footer={footer:?}"
+        );
+        assert!(
+            footer.bottom() <= page.bottom(),
+            "the actions must stay inside the page: page={page:?} footer={footer:?}"
+        );
+        assert!(
+            scroll.top() >= section.top() && scroll.bottom() <= section.bottom(),
+            "the card's scroll region must stay inside the card: section={section:?} scroll={scroll:?}"
+        );
+        assert!(
+            scroll.size.height > px(120.0),
+            "the scroll region must take the height the page gives the card, not collapse"
         );
     }
 

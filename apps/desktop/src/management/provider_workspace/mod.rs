@@ -85,6 +85,8 @@ impl ManagementCenter {
         self.route_group_page_open = false;
         self.workspace_detail_scroll
             .set_offset(point(px(0.0), px(0.0)));
+        self.workspace_route_members_scroll
+            .set_offset(point(px(0.0), px(0.0)));
         cx.notify();
     }
 
@@ -98,6 +100,8 @@ impl ManagementCenter {
         self.route_group_page_open = false;
         self.workspace_detail_scroll
             .set_offset(point(px(0.0), px(0.0)));
+        self.workspace_route_members_scroll
+            .set_offset(point(px(0.0), px(0.0)));
         cx.notify();
     }
 
@@ -110,6 +114,8 @@ impl ManagementCenter {
         self.provider_create_page_open = false;
         self.route_group_page_open = false;
         self.workspace_detail_scroll
+            .set_offset(point(px(0.0), px(0.0)));
+        self.workspace_route_members_scroll
             .set_offset(point(px(0.0), px(0.0)));
         cx.notify();
     }
@@ -552,6 +558,45 @@ fn ws_detail_page(
     body: AnyElement,
     scroll: &ScrollHandle,
 ) -> AnyElement {
+    ws_detail_page_with_body(id, header, tabs, body, Some(scroll))
+}
+
+/// The same page for a tab whose body is already a full-height layout.
+///
+/// The Members tab sizes its card to the page and scrolls inside that card, so
+/// wrapping it in the page's scroll would make the card's height indefinite
+/// again and let its content run past the footer.
+fn ws_detail_page_fixed(
+    id: &'static str,
+    header: AnyElement,
+    tabs: AnyElement,
+    body: AnyElement,
+) -> AnyElement {
+    ws_detail_page_with_body(id, header, tabs, body, None)
+}
+
+fn ws_detail_page_with_body(
+    id: &'static str,
+    header: AnyElement,
+    tabs: AnyElement,
+    content: AnyElement,
+    scroll: Option<&ScrollHandle>,
+) -> AnyElement {
+    let body = div()
+        .id(SharedString::from(format!("{id}-body")))
+        .relative()
+        .w_full()
+        .min_h_0()
+        .flex_1();
+    let body = match scroll {
+        Some(scroll) => body
+            .track_scroll(scroll)
+            .overflow_y_scroll()
+            .vertical_scrollbar(scroll)
+            .child(content)
+            .into_any_element(),
+        None => body.child(content).into_any_element(),
+    };
     v_flex()
         .id(id)
         .size_full()
@@ -560,18 +605,7 @@ fn ws_detail_page(
         .gap_4()
         .child(div().w_full().min_w_0().flex_none().child(header))
         .child(div().w_full().min_w_0().flex_none().child(tabs))
-        .child(
-            div()
-                .id(SharedString::from(format!("{id}-body")))
-                .relative()
-                .w_full()
-                .min_h_0()
-                .flex_1()
-                .track_scroll(scroll)
-                .overflow_y_scroll()
-                .vertical_scrollbar(scroll)
-                .child(body),
-        )
+        .child(body)
         .into_any_element()
 }
 
@@ -584,9 +618,48 @@ fn ws_section(
     content: AnyElement,
     cx: &App,
 ) -> AnyElement {
+    ws_section_with_fill(None, title, description, action, content, false, cx)
+}
+
+/// The same card, sized to the remaining page height.
+///
+/// A page that pins its footer uses this: the card takes the space the footer
+/// leaves, and its content owns whatever scrolling is left inside it.
+fn ws_section_fill(
+    debug_id: &'static str,
+    title: &'static str,
+    description: Option<&'static str>,
+    action: Option<AnyElement>,
+    content: AnyElement,
+    cx: &App,
+) -> AnyElement {
+    ws_section_with_fill(
+        Some(debug_id),
+        title,
+        description,
+        action,
+        content,
+        true,
+        cx,
+    )
+}
+
+fn ws_section_with_fill(
+    debug_id: Option<&'static str>,
+    title: &'static str,
+    description: Option<&'static str>,
+    action: Option<AnyElement>,
+    content: AnyElement,
+    fill: bool,
+    cx: &App,
+) -> AnyElement {
     v_flex()
         .w_full()
         .min_w_0()
+        .when(fill, |section| section.flex_1().min_h_0())
+        .when_some(debug_id, |section, id| {
+            section.debug_selector(move || id.to_string())
+        })
         .rounded(cx.theme().radius_lg)
         .border_1()
         .border_color(theme::module_border(cx.theme().is_dark()))
@@ -615,7 +688,15 @@ fn ws_section(
                 )
                 .children(action.map(|action| div().flex_none().child(action))),
         )
-        .child(div().w_full().min_w_0().px_4().pb_3().child(content))
+        .child(
+            div()
+                .w_full()
+                .min_w_0()
+                .px_4()
+                .pb_3()
+                .when(fill, |body| body.flex().flex_col().flex_1().min_h_0())
+                .child(content),
+        )
         .into_any_element()
 }
 

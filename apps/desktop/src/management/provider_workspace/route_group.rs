@@ -3,26 +3,24 @@
 //!
 //! A route group is one model name that tries several Provider models in an
 //! order. Its page reads like a Provider's: an identity header with the
-//! switch that turns it on, then tabs — Overview (who answers and who asks),
-//! Members (the order, edited in place), Settings (how it picks, its limits,
-//! whether pickers list it) and Traffic. The new-group page and the Agent
+//! switch that turns it on, then tabs — Overview (who answers, who asks, and
+//! the traffic they produced), Members (the order, edited in place) and
+//! Settings (how it picks and its limits). The new-group page and the Agent
 //! dialog draw the very same sections, so a setting found in one entry is
 //! found, worded the same, in every other.
 
 use super::*;
 
-const ROUTE_TABS: [RouteGroupDetailTab; 4] = [
+const ROUTE_TABS: [RouteGroupDetailTab; 3] = [
     RouteGroupDetailTab::Overview,
     RouteGroupDetailTab::Members,
     RouteGroupDetailTab::Settings,
-    RouteGroupDetailTab::Traffic,
 ];
 
 fn route_tab_label(tab: RouteGroupDetailTab) -> &'static str {
     match tab {
         RouteGroupDetailTab::Members => management_locale_text("Members", "成员", "成員"),
         RouteGroupDetailTab::Settings => management_locale_text("Settings", "设置", "設定"),
-        RouteGroupDetailTab::Traffic => management_locale_text("Traffic", "流量", "流量"),
         _ => management_locale_text("Overview", "概览", "概覽"),
     }
 }
@@ -71,29 +69,36 @@ impl ManagementCenter {
         let body = match tab {
             RouteGroupDetailTab::Members => self.render_workspace_route_members(cx),
             RouteGroupDetailTab::Settings => self.render_workspace_route_settings(cx),
-            RouteGroupDetailTab::Traffic => self.render_workspace_route_traffic(&row.route, cx),
             _ => self.render_workspace_route_overview(&row, cx),
         };
-        ws_detail_page(
-            "management-route-group-page",
-            self.render_workspace_route_header(&row, cx),
-            ws_tabs(
-                "management-route-group-detail-tabs",
-                ROUTE_TABS.iter().map(|tab| route_tab_label(*tab)).collect(),
-                selected,
-                |this, index, _, cx| {
-                    if let Some(tab) = ROUTE_TABS.get(index) {
-                        this.route_group_detail_tab = *tab;
-                        this.workspace_detail_scroll
-                            .set_offset(point(px(0.0), px(0.0)));
-                        cx.notify();
-                    }
-                },
-                cx,
-            ),
-            body,
-            &self.workspace_detail_scroll,
-        )
+        let header = self.render_workspace_route_header(&row, cx);
+        let tabs = ws_tabs(
+            "management-route-group-detail-tabs",
+            ROUTE_TABS.iter().map(|tab| route_tab_label(*tab)).collect(),
+            selected,
+            |this, index, _, cx| {
+                if let Some(tab) = ROUTE_TABS.get(index) {
+                    this.route_group_detail_tab = *tab;
+                    this.workspace_detail_scroll
+                        .set_offset(point(px(0.0), px(0.0)));
+                    this.workspace_route_members_scroll
+                        .set_offset(point(px(0.0), px(0.0)));
+                    cx.notify();
+                }
+            },
+            cx,
+        );
+        if tab == RouteGroupDetailTab::Members {
+            ws_detail_page_fixed("management-route-group-page", header, tabs, body)
+        } else {
+            ws_detail_page(
+                "management-route-group-page",
+                header,
+                tabs,
+                body,
+                &self.workspace_detail_scroll,
+            )
+        }
     }
 
     /// Loads the group on screen into the shared draft, the way a Provider's
@@ -651,8 +656,11 @@ impl ManagementCenter {
                 ))
             });
 
+        let traffic = self.render_workspace_route_traffic_section(route, cx);
+
         ws_stack(vec![
             tiles,
+            traffic,
             ws_section(
                 management_locale_text("Attempt order", "尝试顺序", "嘗試順序"),
                 Some(management_locale_text(
@@ -720,10 +728,10 @@ impl ManagementCenter {
                     .child((index + 1).to_string()),
             )
             .child(match profile {
-                Some(profile) => provider_logo_tile(profile, px(30.0), cx),
-                None => ws_icon_tile(
+                Some(profile) => provider_logo_mark(profile, px(24.0), cx),
+                None => ws_icon_mark(
                     "icons/vibex/database.svg",
-                    px(30.0),
+                    px(24.0),
                     Some(cx.theme().warning),
                     cx,
                 ),
@@ -775,11 +783,30 @@ impl ManagementCenter {
     // ----- Members & Settings, edited in place ------------------------------
 
     /// The Members tab: the attempt order itself, editable where it is read.
+    ///
+    /// The card fills the page and owns one scroll region for its members and
+    /// palette; the form's actions stay pinned below it. Sizing the card to its
+    /// content instead let a long Provider list run underneath those actions.
     fn render_workspace_route_members(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        ws_stack(vec![
-            self.render_route_group_members_section(cx),
-            self.render_route_group_form_footer(RouteGroupFormScope::Detail, cx),
-        ])
+        let footer = self.render_route_group_form_footer(RouteGroupFormScope::Detail, cx);
+        v_flex()
+            .id("management-route-members-page")
+            .debug_selector(|| "management-route-members-page".to_string())
+            .w_full()
+            .min_w_0()
+            .h_full()
+            .min_h_0()
+            .gap_4()
+            .child(self.render_route_group_members_section(true, cx))
+            .child(
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .flex_none()
+                    .debug_selector(|| "management-route-members-footer".to_string())
+                    .child(footer),
+            )
+            .into_any_element()
     }
 
     /// The Settings tab: everything about the group that is not its members.
@@ -822,7 +849,7 @@ impl ManagementCenter {
     ) -> AnyElement {
         ws_stack(vec![
             self.render_route_group_name_section(cx),
-            self.render_route_group_members_section(cx),
+            self.render_route_group_members_section(false, cx),
             self.render_route_group_strategy_section(cx),
             self.render_route_group_limits_section(cx),
             self.render_route_group_visibility_section(cx),
@@ -854,7 +881,11 @@ impl ManagementCenter {
         )
     }
 
-    fn render_route_group_members_section(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_route_group_members_section(
+        &mut self,
+        fill: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let pending = self.mutation.is_some();
         let members = self.route_group_model_members.clone();
         let mut pipeline = v_flex().w_full().min_w_0();
@@ -877,34 +908,68 @@ impl ManagementCenter {
                 cx,
             ));
         }
-        ws_section(
-            management_locale_text("Members", "成员", "成員"),
-            Some(management_locale_text(
-                "Tried from the top. Move a member to change its place.",
-                "从上往下尝试；移动成员即可调整顺序。",
-                "從上往下嘗試；移動成員即可調整順序。",
-            )),
-            Some(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(format!(
-                        "{}/{} {}",
-                        members.len(),
-                        vibex_core::MAX_ROUTE_MEMBERS,
-                        management_locale_text("members", "个成员", "個成員")
-                    ))
-                    .into_any_element(),
-            ),
-            v_flex()
-                .w_full()
-                .gap_3()
-                .child(pipeline)
-                .child(Separator::horizontal())
-                .child(self.render_model_group_palette(pending, cx))
+        let palette = self.render_model_group_palette(pending, cx);
+        let content = v_flex()
+            .w_full()
+            .min_w_0()
+            .gap_3()
+            .child(pipeline)
+            .child(Separator::horizontal())
+            .child(palette);
+        let title = management_locale_text("Members", "成员", "成員");
+        let description = management_locale_text(
+            "Tried from the top. Move a member to change its place.",
+            "从上往下尝试；移动成员即可调整顺序。",
+            "從上往下嘗試；移動成員即可調整順序。",
+        );
+        let count = Some(
+            div()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(format!(
+                    "{}/{} {}",
+                    members.len(),
+                    vibex_core::MAX_ROUTE_MEMBERS,
+                    management_locale_text("members", "个成员", "個成員")
+                ))
                 .into_any_element(),
-            cx,
-        )
+        );
+        if fill {
+            let body = v_flex()
+                .w_full()
+                .min_w_0()
+                .flex_1()
+                .min_h_0()
+                .child(
+                    div()
+                        .id("management-route-members-scroll")
+                        .debug_selector(|| "management-route-members-scroll".to_string())
+                        .w_full()
+                        .min_h_0()
+                        .flex_1()
+                        .track_scroll(&self.workspace_route_members_scroll)
+                        .overflow_y_scroll()
+                        .vertical_scrollbar(&self.workspace_route_members_scroll)
+                        .child(content),
+                )
+                .into_any_element();
+            ws_section_fill(
+                "management-route-members-section",
+                title,
+                Some(description),
+                count,
+                body,
+                cx,
+            )
+        } else {
+            ws_section(
+                title,
+                Some(description),
+                count,
+                content.into_any_element(),
+                cx,
+            )
+        }
     }
 
     fn render_route_group_strategy_section(&mut self, cx: &mut Context<Self>) -> AnyElement {
@@ -1295,7 +1360,12 @@ impl ManagementCenter {
         )
     }
 
-    fn render_workspace_route_traffic(
+    /// The group's traffic, read on the Overview tab.
+    ///
+    /// It used to have a tab of its own, which made a summary the reader checks
+    /// while deciding on the group a separate destination. The range control
+    /// and the tiles are unchanged; only their home moved.
+    fn render_workspace_route_traffic_section(
         &mut self,
         route: &vibex_core::ModelRoute,
         cx: &mut Context<Self>,
@@ -1311,7 +1381,7 @@ impl ManagementCenter {
                 members.contains(&request.model_provider_profile_id)
                     && request.created_at_ms >= cutoff
             }));
-        ws_stack(vec![ws_section(
+        ws_section(
             management_locale_text("Traffic", "流量", "流量"),
             Some(management_locale_text(
                 "Requests the gateway sent to this group's members. No cost or quota is tracked.",
@@ -1321,7 +1391,7 @@ impl ManagementCenter {
             Some(self.workspace_range_menu("management-route-traffic-range", cx)),
             traffic.tiles(cx),
             cx,
-        )])
+        )
     }
 
     /// One editable member: its place, identity, and the controls that change
@@ -1406,10 +1476,10 @@ impl ManagementCenter {
                     .child((index + 1).to_string()),
             )
             .child(match profile {
-                Some(profile) => provider_logo_tile(profile, px(30.0), cx),
-                None => ws_icon_tile(
+                Some(profile) => provider_logo_mark(profile, px(24.0), cx),
+                None => ws_icon_mark(
                     "icons/vibex/database.svg",
-                    px(30.0),
+                    px(24.0),
                     Some(cx.theme().warning),
                     cx,
                 ),
