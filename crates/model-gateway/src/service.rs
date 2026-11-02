@@ -2219,6 +2219,7 @@ impl ModelGatewayService {
                     .keys
                     .first()
                     .map(|(_, credential)| credential.id.clone()),
+                wire_in: prepared.inbound.wire_protocol_id().to_string(),
                 wire_protocol_id: member.target.wire_protocol_id().to_string(),
                 started_at_ms: vibex_core::unix_timestamp_ms(),
                 first_token_at_ms: None,
@@ -5243,6 +5244,7 @@ mod inflight_tests {
             model_provider_profile_id: ModelProviderProfileId::new(),
             attempt,
             credential_id: Some(RequestId::new()),
+            wire_in: WireProtocol::Responses.wire_protocol_id().to_string(),
             wire_protocol_id: WireProtocol::ChatCompletions.wire_protocol_id().to_string(),
             started_at_ms: vibex_core::unix_timestamp_ms(),
             first_token_at_ms: None,

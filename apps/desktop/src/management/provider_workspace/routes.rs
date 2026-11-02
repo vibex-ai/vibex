@@ -31,6 +31,12 @@ const STAGE_AGENTS: usize = 4;
 const STAGE_LANES: usize = 10;
 /// The height of one request record; the list is virtualised on it.
 const ROUTE_ROW_H: f32 = 36.0;
+/// The request list's fixed lanes, in rems. The head and every row read the
+/// same numbers, so their columns line up at any window width.
+const ROUTE_TIME_W: f32 = 4.5;
+/// Wide enough for latency, tokens, cache share, and speed in one line; the
+/// row truncates only when the window is too narrow for the table itself.
+const ROUTE_METRICS_W: f32 = 21.0;
 /// The id a request without an Agent is drawn under.
 const UNKNOWN_AGENT: &str = "agent";
 
@@ -1245,8 +1251,26 @@ fn wire_short(id: &str) -> &str {
         vibex_core::WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS => "Chat",
         vibex_core::WIRE_PROTOCOL_OPENAI_RESPONSES => "Responses",
         vibex_core::WIRE_PROTOCOL_ANTHROPIC_MESSAGES => "Anthropic",
+        vibex_core::WIRE_PROTOCOL_MISTRAL_CONVERSATIONS => "Mistral",
         vibex_core::WIRE_PROTOCOL_GOOGLE_GENERATIVE_AI => "Gemini",
+        vibex_core::WIRE_PROTOCOL_GOOGLE_VERTEX => "Vertex",
+        vibex_core::WIRE_PROTOCOL_AWS_BEDROCK_CONVERSE => "Bedrock",
         other => other,
+    }
+}
+
+/// Both ends of one request's protocol, as the record list shows them.
+///
+/// A request always names where it entered and where it was sent; when the two
+/// differ the arrow is the conversion. An older in-flight event carries only
+/// the outbound side, and a row with neither (a ledger row written before the
+/// columns existed) keeps a dash rather than an empty tag.
+fn wire_pair(wire_in: &str, wire_out: &str) -> String {
+    match (wire_in.is_empty(), wire_out.is_empty()) {
+        (true, true) => "—".to_string(),
+        (true, false) => wire_short(wire_out).to_string(),
+        (false, true) => wire_short(wire_in).to_string(),
+        (false, false) => format!("{} → {}", wire_short(wire_in), wire_short(wire_out)),
     }
 }
 
@@ -2213,7 +2237,7 @@ impl ManagementCenter {
 
         let rows = live
             .into_iter()
-            .map(RouteListRow::Live)
+            .map(|live| RouteListRow::Live(Box::new(live)))
             .chain(
                 done.into_iter()
                     .map(|done| RouteListRow::Done(Box::new(done))),
@@ -2469,20 +2493,6 @@ impl ManagementCenter {
                             .into_any_element(),
                     );
                 }
-                if done.wire_in != done.wire_out {
-                    tags.push(
-                        div()
-                            .flex_none()
-                            .text_size(px(10.5))
-                            .text_color(cx.theme().muted_foreground)
-                            .child(format!(
-                                "{} → {}",
-                                wire_short(&done.wire_in),
-                                wire_short(&done.wire_out)
-                            ))
-                            .into_any_element(),
-                    );
-                }
                 let who = if done.outcome == vibex_core::GatewayRequestOutcome::Rejected {
                     management_locale_text("gateway", "网关", "閘道").to_string()
                 } else {
@@ -2536,6 +2546,25 @@ impl ManagementCenter {
                 (dot, who, detail, metrics)
             }
         };
+        let protocol = match row {
+            RouteListRow::Live(live) => wire_pair(&live.wire_in, &live.wire_protocol_id),
+            RouteListRow::Done(done) => wire_pair(&done.wire_in, &done.wire_out),
+        };
+        tags.push(
+            div()
+                .flex_none()
+                .max_w(rems(11.0))
+                .truncate()
+                .px_1p5()
+                .rounded(cx.theme().radius)
+                .border_1()
+                .border_color(cx.theme().border)
+                .text_size(px(10.5))
+                .font_family(cx.theme().mono_font_family.clone())
+                .text_color(cx.theme().muted_foreground)
+                .child(protocol)
+                .into_any_element(),
+        );
         let ((dot_color, who_color), pick) = (dot, id.clone());
         let key_pick = id.clone();
         h_flex()
@@ -2572,7 +2601,7 @@ impl ManagementCenter {
             .child(
                 div()
                     .flex_none()
-                    .w(rems(4.5))
+                    .w(rems(ROUTE_TIME_W))
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
                     .font_family(cx.theme().mono_font_family.clone())
@@ -2645,7 +2674,7 @@ impl ManagementCenter {
             .child(
                 div()
                     .flex_none()
-                    .w(rems(13.0))
+                    .w(rems(ROUTE_METRICS_W))
                     .truncate()
                     .text_right()
                     .text_xs()
@@ -2659,7 +2688,9 @@ impl ManagementCenter {
 
 #[derive(Clone)]
 enum RouteListRow {
-    Live(vibex_core::GatewayInflight),
+    /// Boxed: the whole in-flight record would otherwise inflate every row the
+    /// virtual list holds.
+    Live(Box<vibex_core::GatewayInflight>),
     /// Boxed: a ledger row is several times the size of a live entry.
     Done(Box<vibex_core::GatewayRequestSummary>),
 }
@@ -2686,7 +2717,7 @@ fn route_list_header(cx: &App) -> AnyElement {
         .child(
             div()
                 .flex_none()
-                .w(rems(4.5))
+                .w(rems(ROUTE_TIME_W))
                 .child(management_locale_text("Time", "时间", "時間")),
         )
         .child(div().flex_1().min_w_0().child(management_locale_text(
@@ -2702,7 +2733,7 @@ fn route_list_header(cx: &App) -> AnyElement {
         .child(
             div()
                 .flex_none()
-                .w(rems(13.0))
+                .w(rems(ROUTE_METRICS_W))
                 .text_right()
                 .child(management_locale_text(
                     "Time · tokens · cache · speed",
@@ -2779,6 +2810,39 @@ mod tests {
             .strip_prefix("model_provider_")
             .unwrap_or(id.as_str())
             .to_string()
+    }
+
+    /// A record names where the request entered and where it was sent, so a
+    /// conversion reads as one arrow rather than two unrelated labels.
+    #[test]
+    fn a_record_names_both_protocols() {
+        assert_eq!(
+            wire_pair(
+                vibex_core::WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS,
+                vibex_core::WIRE_PROTOCOL_OPENAI_RESPONSES,
+            ),
+            "Chat → Responses"
+        );
+        assert_eq!(
+            wire_pair(
+                vibex_core::WIRE_PROTOCOL_ANTHROPIC_MESSAGES,
+                vibex_core::WIRE_PROTOCOL_ANTHROPIC_MESSAGES,
+            ),
+            "Anthropic → Anthropic"
+        );
+        assert_eq!(
+            wire_pair("", vibex_core::WIRE_PROTOCOL_GOOGLE_VERTEX),
+            "Vertex",
+            "an older in-flight event still names the member's protocol"
+        );
+        assert_eq!(
+            wire_pair(
+                vibex_core::WIRE_PROTOCOL_AWS_BEDROCK_CONVERSE,
+                vibex_core::WIRE_PROTOCOL_OPENAI_RESPONSES,
+            ),
+            "Bedrock → Responses"
+        );
+        assert_eq!(wire_pair("", ""), "—");
     }
 
     fn row(
@@ -2947,6 +3011,7 @@ mod tests {
             model_provider_profile_id: profile_id(provider),
             attempt,
             credential_id: None,
+            wire_in: vibex_core::WIRE_PROTOCOL_OPENAI_RESPONSES.to_string(),
             wire_protocol_id: vibex_core::WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS.to_string(),
             started_at_ms: 0,
             first_token_at_ms: None,

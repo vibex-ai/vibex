@@ -1598,6 +1598,10 @@ pub struct GatewayInflight {
     /// The Key serving this attempt, when one has been chosen.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential_id: Option<RequestId>,
+    /// The protocol the caller spoke, so the list can name a conversion while
+    /// the request is still running. Empty on an event from an older runtime.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub wire_in: String,
     /// The protocol the member is called with.
     pub wire_protocol_id: String,
     pub started_at_ms: i64,
