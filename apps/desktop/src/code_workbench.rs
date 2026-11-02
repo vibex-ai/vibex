@@ -977,6 +977,7 @@ struct CodeRightRailRevision {
     workspace_generation: u64,
     workspace_available: bool,
     git_repository_available: bool,
+    workspace_root_available: bool,
     tree_loading: bool,
     file_mutation_pending: bool,
     status_loading: bool,
@@ -1078,6 +1079,9 @@ struct CodeRightRailProjection {
     /// an explanation instead of the "select a session" prompt, which would be
     /// wrong: a session is selected, the folder simply has no repository.
     git_repository_available: bool,
+    /// Whether the selected workspace still has a folder to read. A removed
+    /// workspace renders one explanation instead of a validation toast.
+    workspace_root_available: bool,
     commit_message: Entity<TextareaState>,
     amend_commit: bool,
     selected_git_path: Option<String>,
@@ -1430,6 +1434,14 @@ pub struct CodeWorkbench {
     /// from then on the Git reads and polling stay off instead of raising a
     /// toast the reader cannot act on.
     git_repository_available: bool,
+    /// Whether the workspace folder itself is still reachable.
+    ///
+    /// A missing root is not a request-validation failure: both the Files and
+    /// Git surfaces have nothing to read, and polling would repeat the same
+    /// error every few seconds. The first read that reports the folder gone
+    /// retires both surfaces behind one explanation until another workspace is
+    /// selected.
+    workspace_root_available: bool,
     pub(crate) editors: EditorBufferRegistry,
     editor_bindings: BTreeMap<String, EditorBinding>,
     next_editor_binding_id: u64,
@@ -1670,6 +1682,7 @@ impl CodeWorkbench {
             files_surface_visible: false,
             git_surface_visible: false,
             git_repository_available: true,
+            workspace_root_available: true,
             editors,
             editor_bindings: BTreeMap::new(),
             next_editor_binding_id: 0,
@@ -2063,6 +2076,7 @@ impl CodeWorkbench {
             workspace_generation: self.workspace_generation,
             workspace_available: self.workspace.is_some(),
             git_repository_available: self.git_repository_available,
+            workspace_root_available: self.workspace_root_available,
             tree_loading: self.tree_loading,
             file_mutation_pending: self.file_mutation_pending,
             status_loading: self.status_loading,
@@ -2124,6 +2138,7 @@ impl CodeWorkbench {
             ),
             workspace_name,
             git_repository_available: self.git_repository_available,
+            workspace_root_available: self.workspace_root_available,
             commit_message: self.commit_message.clone(),
             amend_commit: self.amend_commit,
             selected_git_path: self.selected_git_path.clone(),
@@ -3166,6 +3181,7 @@ impl CodeWorkbench {
         // settles whether it is a repository at all. A folder that is not one
         // keeps its Files panel and simply never arms the Git surface.
         self.git_repository_available = true;
+        self.workspace_root_available = true;
         let restored_expanded_paths = adopted_panel
             .as_ref()
             .map(|panel| {
@@ -3799,7 +3815,8 @@ impl CodeWorkbench {
     }
 
     fn refresh_file_tree(&mut self, cx: &mut Context<Self>) {
-        if self.tree_loading
+        if !self.workspace_root_available
+            || self.tree_loading
             || self.tree_refreshing
             || self.file_mutation_pending
             || !self.tree_tasks.is_empty()
@@ -3871,6 +3888,9 @@ impl CodeWorkbench {
     }
 
     fn load_tree_path(&mut self, path: String, cx: &mut Context<Self>) {
+        if !self.workspace_root_available {
+            return;
+        }
         let (Some(backend), Some(workspace)) = (self.backend.clone(), self.workspace.clone())
         else {
             return;
@@ -3914,7 +3934,11 @@ impl CodeWorkbench {
                     }
                     Ok(Err(error)) => {
                         this.file_tree.fail_load(ticket, &task_path, &error.code);
-                        this.pending_error = Some(format!("{}: {}", error.code, error.message));
+                        if Self::is_missing_workspace_root(&error) {
+                            this.mark_workspace_root_unavailable(cx);
+                        } else {
+                            this.pending_error = Some(format!("{}: {}", error.code, error.message));
+                        }
                     }
                     Err(error) => {
                         this.file_tree
@@ -4048,6 +4072,35 @@ impl CodeWorkbench {
         matches!(error.code.as_str(), "not_git_repository" | "not_working_tree")
     }
 
+    /// Whether a read failed because the workspace folder itself is gone.
+    ///
+    /// This is a workspace state rather than a request error: reopening the
+    /// panel cannot fix it, and every poll would repeat the same failure. The
+    /// panels render one explanation instead.
+    fn is_missing_workspace_root(error: &BackendError) -> bool {
+        matches!(
+            error.code.as_str(),
+            "workspace_root_missing" | "repo_path_missing"
+        )
+    }
+
+    /// Retires the workspace surfaces after the folder disappeared.
+    ///
+    /// Both panels read from the same root, so the first read that sees it
+    /// gone stands the others down. The state is cleared when another
+    /// workspace is selected.
+    fn mark_workspace_root_unavailable(&mut self, cx: &mut Context<Self>) {
+        if !self.workspace_root_available {
+            return;
+        }
+        self.workspace_root_available = false;
+        self.tree_loading = false;
+        self.tree_refreshing = false;
+        self.file_tree.set_git_changes(&[]);
+        self.disable_git_for_workspace(cx);
+        cx.notify();
+    }
+
     pub(crate) fn git_status(&self) -> Option<&GitStatusSummary> {
         self.git.status.as_ref()
     }
@@ -4067,7 +4120,7 @@ impl CodeWorkbench {
     }
 
     fn load_git_status(&mut self, cx: &mut Context<Self>) {
-        if !self.git_repository_available {
+        if !self.workspace_root_available || !self.git_repository_available {
             return;
         }
         let (Some(backend), Some(workspace)) = (self.backend.clone(), self.workspace.clone())
@@ -4100,6 +4153,13 @@ impl CodeWorkbench {
                                 this.load_history(false, cx);
                             }
                         }
+                    }
+                    Ok(Err(error)) if Self::is_missing_workspace_root(&error) => {
+                        // The folder is gone, not the repository state: show
+                        // the workspace explanation instead of a validation
+                        // toast that reads like a missing form field.
+                        this.git.fail_query(&ticket, &error.code);
+                        this.mark_workspace_root_unavailable(cx);
                     }
                     Ok(Err(error)) if Self::is_missing_repository(&error) => {
                         // A plain folder is not a failure: close the Git
@@ -4158,7 +4218,7 @@ impl CodeWorkbench {
     }
 
     fn load_worktree_lifecycle(&mut self, cx: &mut Context<Self>) {
-        if !self.git_repository_available {
+        if !self.workspace_root_available || !self.git_repository_available {
             return;
         }
         if self.lifecycle_loading {
@@ -4194,6 +4254,9 @@ impl CodeWorkbench {
                 let reload = std::mem::take(&mut this.lifecycle_reload_requested);
                 match outcome {
                     Ok(Ok(snapshot)) => this.apply_worktree_lifecycle_snapshot(snapshot),
+                    Ok(Err(error)) if Self::is_missing_workspace_root(&error) => {
+                        this.mark_workspace_root_unavailable(cx);
+                    }
                     Ok(Err(error)) if Self::is_missing_repository(&error) => {
                         this.disable_git_for_workspace(cx);
                     }
@@ -4915,7 +4978,7 @@ impl CodeWorkbench {
     }
 
     pub(crate) fn load_history(&mut self, append: bool, cx: &mut Context<Self>) {
-        if !self.git_repository_available {
+        if !self.workspace_root_available || !self.git_repository_available {
             return;
         }
         let (Some(backend), Some(workspace)) = (self.backend.clone(), self.workspace.clone())
@@ -4975,6 +5038,10 @@ impl CodeWorkbench {
                     Ok(Ok(history)) => {
                         this.git.apply_history(&ticket, history, append);
                     }
+                    Ok(Err(error)) if Self::is_missing_workspace_root(&error) => {
+                        this.git.fail_query(&ticket, &error.code);
+                        this.mark_workspace_root_unavailable(cx);
+                    }
                     Ok(Err(error)) if Self::is_missing_repository(&error) => {
                         this.git.fail_query(&ticket, &error.code);
                         this.disable_git_for_workspace(cx);
@@ -5000,7 +5067,7 @@ impl CodeWorkbench {
     }
 
     fn load_branches(&mut self, cx: &mut Context<Self>) {
-        if !self.git_repository_available {
+        if !self.workspace_root_available || !self.git_repository_available {
             return;
         }
         let (Some(backend), Some(workspace)) = (self.backend.clone(), self.workspace.clone())
@@ -5028,7 +5095,9 @@ impl CodeWorkbench {
                     }
                     Ok(Err(error)) => {
                         this.git.fail_query(&ticket, &error.code);
-                        if Self::is_missing_repository(&error) {
+                        if Self::is_missing_workspace_root(&error) {
+                            this.mark_workspace_root_unavailable(cx);
+                        } else if Self::is_missing_repository(&error) {
                             this.disable_git_for_workspace(cx);
                         }
                     }
@@ -14307,6 +14376,9 @@ impl CodeRightRail {
                 cx,
             );
         }
+        if !self.projection.workspace_root_available {
+            return rail_workspace_folder_missing(cx);
+        }
         let rows = self.projection.files.rows.clone();
         let row_count = rows.len();
         let loading = self.projection.files.loading;
@@ -15767,6 +15839,7 @@ impl CodeRightRail {
         let (
             workspace_available,
             git_repository_available,
+            workspace_root_available,
             mode,
             pending,
             pending_kind,
@@ -15784,6 +15857,7 @@ impl CodeRightRail {
         ) = (
             self.projection.files.workspace_available,
             self.projection.git_repository_available,
+            self.projection.workspace_root_available,
             git.mode,
             git.pending,
             git.pending_kind,
@@ -15809,6 +15883,9 @@ impl CodeRightRail {
                 ),
                 cx,
             );
+        }
+        if !workspace_root_available {
+            return rail_workspace_folder_missing(cx);
         }
         if !git_repository_available {
             // A selected session on a plain folder lands here: there is
@@ -17581,7 +17658,8 @@ impl CodeRightRail {
     }
 
     fn render_file_header_actions(&self, cx: &mut Context<Self>) -> AnyElement {
-        let workspace_available = self.projection.files.workspace_available;
+        let workspace_available =
+            self.projection.files.workspace_available && self.projection.workspace_root_available;
         let tools = available_external_tools();
         let selected_tool_id = self.selected_open_tool_id.as_deref().filter(|selected| {
             matches!(
@@ -18002,6 +18080,28 @@ fn rail_empty_card(
             ),
         )
         .into_any_element()
+}
+
+/// The one explanation both rail panels show once the workspace folder is gone.
+///
+/// The folder can disappear under a live session when it is moved, deleted, or
+/// the Worktree it belongs to is archived. Repeating the backend error in a
+/// toast would only describe the symptom; the state itself is what the reader
+/// has to act on.
+fn rail_workspace_folder_missing(cx: &Context<CodeRightRail>) -> AnyElement {
+    rail_empty_card(
+        locale::text(
+            "Workspace folder not found",
+            "找不到工作区文件夹",
+            "找不到工作區資料夾",
+        ),
+        locale::text(
+            "It may have been moved, deleted, or archived. Reopen the project or restore the Worktree to continue.",
+            "它可能已被移动、删除或归档。请重新打开项目或恢复 Worktree 后继续。",
+            "它可能已被移動、刪除或封存。請重新開啟專案或還原 Worktree 後繼續。",
+        ),
+        cx,
+    )
 }
 
 fn file_tree_guides(depth: usize, cx: &Context<CodeRightRail>) -> Vec<AnyElement> {
@@ -20923,6 +21023,75 @@ mod tests {
                 >= 3,
             "each Git read should fall back through the shared opt-out"
         );
+    }
+
+    #[test]
+    fn a_removed_workspace_folder_is_a_state_instead_of_a_validation_toast() {
+        let source = include_str!("code_workbench.rs");
+
+        // A gone root can arrive as the Files error or the Git error; both
+        // spellings stand the surfaces down through the same classifier.
+        let (_, after_classifier) = source
+            .split_once("fn is_missing_workspace_root(")
+            .expect("the missing-root classifier should remain inspectable");
+        let classifier = after_classifier
+            .split_once("\n    fn ")
+            .map(|(body, _)| body)
+            .expect("the missing-root classifier should end at the next method");
+        assert!(classifier.contains("\"workspace_root_missing\""));
+        assert!(classifier.contains("\"repo_path_missing\""));
+
+        // Every workspace read checks the state before starting.
+        for loader in [
+            "fn load_tree_path(",
+            "fn refresh_file_tree(",
+            "fn load_git_status(",
+            "fn load_branches(",
+            "fn load_worktree_lifecycle(",
+            "pub(crate) fn load_history(",
+        ] {
+            let (_, tail) = source
+                .split_once(loader)
+                .unwrap_or_else(|| panic!("{loader} should remain inspectable"));
+            let head: String = tail.lines().take(6).collect::<Vec<_>>().join("\n");
+            assert!(
+                head.contains("workspace_root_available"),
+                "{loader} should stop on a workspace whose folder is gone"
+            );
+        }
+
+        // The opt-out is still silent: it shows the panel explanation instead
+        // of the raw `repo_path_missing: ...` hint.
+        let (_, after_mark) = source
+            .split_once("fn mark_workspace_root_unavailable(")
+            .expect("the missing-root opt-out should remain inspectable");
+        let body = after_mark
+            .split_once("\n    fn ")
+            .map(|(body, _)| body)
+            .expect("the missing-root opt-out should end at the next method");
+        assert!(!body.contains("pending_error"));
+        assert!(body.contains("workspace_root_available = false"));
+        assert!(body.contains("disable_git_for_workspace(cx)"));
+
+        // Both panels explain the state once instead of repeating the error.
+        for renderer in ["fn render_files(", "fn render_git("] {
+            let (_, tail) = source
+                .split_once(renderer)
+                .unwrap_or_else(|| panic!("{renderer} should remain inspectable"));
+            let body: String = tail.lines().take(80).collect::<Vec<_>>().join("\n");
+            assert!(
+                body.contains("rail_workspace_folder_missing(cx)"),
+                "{renderer} should explain a workspace folder that is gone"
+            );
+        }
+        let (_, after_card) = source
+            .split_once("fn rail_workspace_folder_missing(")
+            .expect("the missing-root card should remain inspectable");
+        let card = after_card
+            .split_once("\nfn ")
+            .map(|(body, _)| body)
+            .expect("the missing-root card should end at the next function");
+        assert!(card.contains("Workspace folder not found"));
     }
 
     #[test]

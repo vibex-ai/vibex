@@ -1671,6 +1671,17 @@ fn error_code_summary(locale: ResolvedLocale, code: &str) -> &'static str {
             "请求的功能不可用",
             "要求的功能無法使用",
         )
+    } else if code == "repo_path_missing" || code == "workspace_root_missing" {
+        // The path the operation needed is gone; nothing about the request was
+        // missing, so this must not fall through to the "required information"
+        // summary that made a deleted folder read like a form validation bug.
+        (
+            "The workspace folder no longer exists",
+            "工作区文件夹已不存在",
+            "工作區資料夾已不存在",
+        )
+    } else if code.ends_with("_path_missing") {
+        ("The path no longer exists", "路径已不存在", "路徑已不存在")
     } else if code.contains("required") || code.contains("missing") {
         (
             "Required information is missing",
@@ -1950,6 +1961,25 @@ mod tests {
                 "not_git_repository: path is not inside a Git work tree",
             ),
             "not_git_repository: 此目录不是 Git 仓库"
+        );
+        // A removed workspace must not read like a missing form field.
+        assert_eq!(
+            localize_error_message_for(
+                ResolvedLocale::ZhCn,
+                "repo_path_missing: Git path does not exist",
+            ),
+            "repo_path_missing: 工作区文件夹已不存在"
+        );
+        assert_eq!(
+            localize_error_message_for(
+                ResolvedLocale::ZhCn,
+                "workspace_root_missing: workspace root does not exist",
+            ),
+            "workspace_root_missing: 工作区文件夹已不存在"
+        );
+        assert_eq!(
+            localize_error_message_for(ResolvedLocale::ZhCn, "file_path_missing: the file is gone",),
+            "file_path_missing: 路径已不存在"
         );
     }
 
