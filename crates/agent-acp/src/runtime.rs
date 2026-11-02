@@ -12645,6 +12645,20 @@ impl AcpRuntimeClient {
                 // not part of the spawn snapshot — so two launches of the same
                 // Profile stay one identity while each child still answers with
                 // its own session.
+                if launch.process_strategy_effective != AcpProcessStrategy::PerSession
+                    && projection.as_ref().is_some_and(|projection| {
+                        !projection.session_env_keys.is_empty()
+                            || !projection.session_header_env.is_empty()
+                    })
+                {
+                    return Err(VibexError::validation(
+                        "agent_projection_dynamic_header_requires_per_session",
+                        "a Provider request header references the session id, which a pooled Agent process cannot carry",
+                    )
+                    .with_recovery_hint(
+                        "Set this Agent's process strategy to per-session, or remove the dynamic header from the Provider.",
+                    ));
+                }
                 for (key, value) in session_scoped_env_overlays(
                     launch.process_strategy_effective,
                     launch.session_id,
@@ -17043,11 +17057,16 @@ fn session_scoped_env_overlays(
     let (Some(session_id), Some(projection)) = (session_id, projection) else {
         return Vec::new();
     };
-    projection
+    let session = session_id.to_string();
+    let mut overlays = projection
         .session_env_keys
         .iter()
-        .map(|key| (key.clone(), session_id.to_string()))
-        .collect()
+        .map(|key| (key.clone(), session.clone()))
+        .collect::<Vec<_>>();
+    for header_env in &projection.session_header_env {
+        overlays.push((header_env.key.clone(), header_env.value_for(&session)));
+    }
+    overlays
 }
 
 #[cfg(test)]
@@ -40512,6 +40531,7 @@ for line in sys.stdin:
             switch_behavior: vibex_core::ProviderSwitchBehavior::RestartAndResume,
             fingerprint: "sha256:dynamic-headers".to_string(),
             session_env_keys: vec!["VIBEX_SESSION_ID".to_string()],
+            session_header_env: Vec::new(),
         };
 
         assert_eq!(
@@ -40536,9 +40556,35 @@ for line in sys.stdin:
             session_scoped_env_overlays(AcpProcessStrategy::PerSession, None, Some(&projection))
                 .is_empty()
         );
+        // An Agent that takes its headers as one environment string gets the
+        // complete list with the same session id substituted.
+        let mut header_projection = projection.clone();
+        header_projection.session_header_env = vec![vibex_core::SessionHeaderEnv {
+            key: "ANTHROPIC_CUSTOM_HEADERS".to_string(),
+            template: format!(
+                "x-opencode-session: {}\nUser-Agent: vibex/1.0",
+                vibex_core::SessionHeaderEnv::placeholder()
+            ),
+        }];
+        assert_eq!(
+            session_scoped_env_overlays(
+                AcpProcessStrategy::PerSession,
+                Some(&session_id),
+                Some(&header_projection),
+            ),
+            vec![
+                ("VIBEX_SESSION_ID".to_string(), session_id.to_string()),
+                (
+                    "ANTHROPIC_CUSTOM_HEADERS".to_string(),
+                    format!("x-opencode-session: {}\nUser-Agent: vibex/1.0", session_id)
+                ),
+            ]
+        );
+
         // A projection that references nothing dynamic contributes nothing.
         let mut static_projection = projection.clone();
         static_projection.session_env_keys.clear();
+        static_projection.session_header_env.clear();
         assert!(
             session_scoped_env_overlays(
                 AcpProcessStrategy::PerSession,

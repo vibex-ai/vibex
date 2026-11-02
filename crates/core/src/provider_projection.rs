@@ -1260,6 +1260,50 @@ pub enum ConfigOverlayStrategy {
     ZcodeJson,
 }
 
+impl ConfigOverlayStrategy {
+    /// Whether this strategy's projected config owns a request-header map.
+    ///
+    /// A `false` here means the Agent has no place to write a header, so the
+    /// Provider editor hides the rows. A `true` means the writer carries at
+    /// least literal headers; not every writer can also spell the dynamic
+    /// `session_id` variable (see [`Self::supports_dynamic_session_header`]).
+    pub const fn supports_request_headers(&self) -> bool {
+        matches!(
+            self,
+            Self::CodexStableHome
+                | Self::DeepseekHarnessSettingsYaml
+                | Self::OpenCodeInlineProvider
+                | Self::KimiToml
+                | Self::GrokToml
+                | Self::QwenCodeJson
+                | Self::ClineProvidersJson
+                | Self::DiracToml
+                | Self::FactoryDroidJson
+                | Self::KiloInlineJson
+                | Self::MistralVibeToml
+                | Self::PiModelsJson
+        )
+    }
+
+    /// Whether this strategy can carry the dynamic `session_id` variable.
+    ///
+    /// The writers that can spell it do so through an environment reference
+    /// the Agent resolves itself. A config format that only accepts a literal
+    /// is left out: writing one session's id into a shared overlay would
+    /// answer every later session with the first session's value.
+    pub const fn supports_dynamic_session_header(&self) -> bool {
+        matches!(
+            self,
+            Self::CodexStableHome
+                | Self::DeepseekHarnessSettingsYaml
+                | Self::OpenCodeInlineProvider
+                | Self::GrokToml
+                | Self::KiloInlineJson
+                | Self::PiModelsJson
+        )
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AgentProviderControl {
@@ -1759,20 +1803,43 @@ impl AgentProviderProjectionCapability {
 
     /// Whether the projection carries user-configured request headers.
     ///
-    /// Only the Agents whose projected config owns a header map read them —
-    /// the DeepSeek Harness route and OpenCode's inline provider. Every other
-    /// Agent's projection has no place to write one, so the Provider editor
-    /// hides the rows instead of storing headers the request never carries.
+    /// A managed config overlay reads them when its writer owns a header map.
+    /// A few environment-only Agents expose a custom-header environment
+    /// variable instead; they are named here because their projection has no
+    /// overlay file to inspect.
     pub fn supports_request_headers(&self) -> bool {
-        let owns_headers = |control: &AgentProviderControl| match control {
-            AgentProviderControl::ManagedConfigOverlay { strategy } => matches!(
-                strategy,
-                ConfigOverlayStrategy::DeepseekHarnessSettingsYaml
-                    | ConfigOverlayStrategy::OpenCodeInlineProvider
-            ),
+        match &self.provider_control {
+            AgentProviderControl::ManagedConfigOverlay { strategy } => {
+                strategy.supports_request_headers()
+            }
+            AgentProviderControl::Environment { .. } => {
+                matches!(
+                    self.agent_id.as_str(),
+                    "claude" | "gemini" | "codebuddy-code"
+                )
+            }
             _ => false,
-        };
-        owns_headers(&self.provider_control)
+        }
+    }
+
+    /// Whether the projection can spell the dynamic `session_id` header value.
+    ///
+    /// The Provider editor offers the variable only where this holds. A
+    /// literal header remains available everywhere
+    /// [`Self::supports_request_headers`] is true.
+    pub fn supports_session_header_variable(&self) -> bool {
+        match &self.provider_control {
+            AgentProviderControl::ManagedConfigOverlay { strategy } => {
+                strategy.supports_dynamic_session_header()
+            }
+            AgentProviderControl::Environment { .. } => {
+                matches!(
+                    self.agent_id.as_str(),
+                    "claude" | "gemini" | "codebuddy-code"
+                )
+            }
+            _ => false,
+        }
     }
 
     pub fn from_resolution(
@@ -1963,6 +2030,42 @@ pub struct ProjectionSecretEnvReference {
     pub secret_reference: ProjectionSecretReference,
 }
 
+/// One environment variable whose value is a request-header list that names
+/// the session serving the Agent process.
+///
+/// A few Agents accept custom request headers only as one environment string
+/// (for example Claude Code's `ANTHROPIC_CUSTOM_HEADERS`). The projection
+/// stores the complete list with a session placeholder here, and the launch
+/// substitutes the session id. It is filled only for a session-scoped process,
+/// exactly like [`AgentProviderProjectionPlan::session_env_keys`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionHeaderEnv {
+    /// The environment key the Agent reads the header list from.
+    pub key: String,
+    /// The full header list, with [`SessionHeaderEnv::placeholder`] standing
+    /// in for the session id.
+    pub template: String,
+}
+
+impl SessionHeaderEnv {
+    /// Render the list for one session.
+    pub fn value_for(&self, session_id: &str) -> String {
+        self.template
+            .replace(SESSION_HEADER_PLACEHOLDER, session_id)
+    }
+
+    /// The marker a projection inserts where the session id belongs.
+    pub const fn placeholder() -> &'static str {
+        SESSION_HEADER_PLACEHOLDER
+    }
+}
+
+/// The marker a [`SessionHeaderEnv`] template uses for the session id.
+///
+/// It is a unit separator so a literal header value can never produce it by
+/// accident, and it never reaches an Agent: the launch replaces it in memory.
+const SESSION_HEADER_PLACEHOLDER: &str = "\u{1f}vibex-session-id\u{1f}";
+
 #[derive(Clone, PartialEq, Eq)]
 pub struct AgentProviderProjectionPlan {
     pub binding_id: AgentModelProviderBindingId,
@@ -1987,6 +2090,11 @@ pub struct AgentProviderProjectionPlan {
     /// fills them from the session that owns the Agent process and only when
     /// that process is session-scoped.
     pub session_env_keys: Vec<String>,
+    /// Environment variables whose value is a request-header list carrying the
+    /// current session identity. Filled at launch, only for a session-scoped
+    /// process. Agents that can read a header value from an environment key
+    /// directly use `session_env_keys` instead.
+    pub session_header_env: Vec<SessionHeaderEnv>,
     /// The local placeholder the Agent sends to the Vibex gateway.
     ///
     /// The hidden gateway Profile authenticates to the upstream with the Key it
@@ -2027,6 +2135,7 @@ impl fmt::Debug for AgentProviderProjectionPlan {
             .field("fingerprint", &self.fingerprint)
             .field("diagnostics", &self.diagnostics)
             .field("session_env_keys", &self.session_env_keys)
+            .field("session_header_env", &self.session_header_env)
             // The value is a local placeholder, never a real Secret, but it is
             // still printed as a flag: a debug dump should not look like a
             // resolved credential.
@@ -2475,6 +2584,55 @@ fn unique_non_empty<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn header_capabilities_follow_the_verified_projections() {
+        for strategy in [
+            ConfigOverlayStrategy::CodexStableHome,
+            ConfigOverlayStrategy::DeepseekHarnessSettingsYaml,
+            ConfigOverlayStrategy::OpenCodeInlineProvider,
+            ConfigOverlayStrategy::KimiToml,
+            ConfigOverlayStrategy::GrokToml,
+            ConfigOverlayStrategy::QwenCodeJson,
+            ConfigOverlayStrategy::ClineProvidersJson,
+            ConfigOverlayStrategy::DiracToml,
+            ConfigOverlayStrategy::FactoryDroidJson,
+            ConfigOverlayStrategy::KiloInlineJson,
+            ConfigOverlayStrategy::MistralVibeToml,
+            ConfigOverlayStrategy::PiModelsJson,
+        ] {
+            assert!(strategy.supports_request_headers(), "{strategy:?}");
+        }
+        for strategy in [
+            ConfigOverlayStrategy::StakpakToml,
+            ConfigOverlayStrategy::VtcodeToml,
+            ConfigOverlayStrategy::GooseJson,
+            ConfigOverlayStrategy::CrowCliYaml,
+            ConfigOverlayStrategy::HermesYaml,
+        ] {
+            assert!(!strategy.supports_request_headers(), "{strategy:?}");
+        }
+        for strategy in [
+            ConfigOverlayStrategy::KimiToml,
+            ConfigOverlayStrategy::QwenCodeJson,
+            ConfigOverlayStrategy::ClineProvidersJson,
+            ConfigOverlayStrategy::DiracToml,
+            ConfigOverlayStrategy::FactoryDroidJson,
+            ConfigOverlayStrategy::MistralVibeToml,
+        ] {
+            assert!(!strategy.supports_dynamic_session_header(), "{strategy:?}");
+        }
+        for strategy in [
+            ConfigOverlayStrategy::CodexStableHome,
+            ConfigOverlayStrategy::DeepseekHarnessSettingsYaml,
+            ConfigOverlayStrategy::OpenCodeInlineProvider,
+            ConfigOverlayStrategy::GrokToml,
+            ConfigOverlayStrategy::KiloInlineJson,
+            ConfigOverlayStrategy::PiModelsJson,
+        ] {
+            assert!(strategy.supports_dynamic_session_header(), "{strategy:?}");
+        }
+    }
 
     fn builtin_identity(agent: &str) -> AgentRuntimeVersionIdentity {
         match agent {

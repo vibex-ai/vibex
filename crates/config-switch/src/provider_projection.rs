@@ -23,13 +23,14 @@ use vibex_core::{
     AgentRuntimeProfileCreateRequest, AgentRuntimeProfileId, AgentRuntimeProfileUpdateRequest,
     ConfigOverlayStrategy, ManagedProjectionOverlay, ModelProviderCredentialReference,
     ModelProviderEndpoint, ModelProviderHeaderReference, ModelProviderHeaderValue,
-    ModelProviderProfile, ModelProviderProfileCreateRequest, ModelProviderProfileId,
-    ModelProviderProfileUpdateRequest, ModelProviderProxyPolicy, ProjectionAuthState,
-    ProjectionDescriptorMatch, ProjectionEvidenceState, ProjectionOverlayPreview,
-    ProjectionSecretEnvReference, ProjectionTargetKind, ProjectionTargetPreview,
-    ProjectionVerificationState, ProviderBindingMetadata, ProviderCredentialSecretMutationRequest,
-    ProviderModelCapabilities, ProviderSecretBackend, ProviderSecretSetupState,
-    ProviderSwitchBehavior, RequestId, VibexError, VibexResult, unix_timestamp_ms,
+    ModelProviderHeaderVariable, ModelProviderProfile, ModelProviderProfileCreateRequest,
+    ModelProviderProfileId, ModelProviderProfileUpdateRequest, ModelProviderProxyPolicy,
+    ProjectionAuthState, ProjectionDescriptorMatch, ProjectionEvidenceState,
+    ProjectionOverlayPreview, ProjectionSecretEnvReference, ProjectionTargetKind,
+    ProjectionTargetPreview, ProjectionVerificationState, ProviderBindingMetadata,
+    ProviderCredentialSecretMutationRequest, ProviderModelCapabilities, ProviderSecretBackend,
+    ProviderSecretSetupState, ProviderSwitchBehavior, RequestId, SessionHeaderEnv, VibexError,
+    VibexResult, unix_timestamp_ms,
 };
 use vibex_db::{
     AgentModelProviderBindingRepository, AgentRuntimeProfileRepository,
@@ -105,6 +106,10 @@ pub struct ResolvedAgentProviderProjection {
     /// headers, in stable order. The launch fills them with the current Vibex
     /// session id when the Agent process is session-scoped.
     pub session_env_keys: Vec<String>,
+    /// Environment variables whose value is a request-header list carrying the
+    /// current session id. The launch substitutes the id when the Agent process
+    /// is session-scoped.
+    pub session_header_env: Vec<SessionHeaderEnv>,
 }
 
 /// Stable, non-secret launch identity for a legacy provider profile binding.
@@ -263,6 +268,7 @@ impl AgentProviderProjectionEngine {
         let mut secret_env = Vec::new();
         let mut overlays = Vec::new();
         let mut session_config = Vec::new();
+        let mut session_header_env = Vec::new();
         let mut targets = Vec::new();
         let mut diagnostics = Vec::new();
 
@@ -299,6 +305,12 @@ impl AgentProviderProjectionEngine {
             selected_model,
             endpoint,
             &mut non_secret_env,
+        );
+        project_environment_headers(
+            descriptor.route.agent_id.as_str(),
+            &model_provider.headers,
+            &mut non_secret_env,
+            &mut session_header_env,
         );
         for overlay in agent_specific_overlays(
             descriptor,
@@ -339,6 +351,10 @@ impl AgentProviderProjectionEngine {
             .filter(|name| !name.is_empty())
             .collect::<Vec<_>>();
         if !header_names.is_empty() {
+            let projected = projection_supports_request_headers(
+                &descriptor.provider_control,
+                descriptor.route.agent_id.as_str(),
+            );
             session_config.push(ProviderBindingMetadata {
                 key: "headerNames".to_string(),
                 value: header_names.join(","),
@@ -347,11 +363,37 @@ impl AgentProviderProjectionEngine {
                 field: "headers".to_string(),
                 target_kind: ProjectionTargetKind::AcpConfigOption,
                 target: "provider request headers".to_string(),
-                value_preview: format!("{} configured", header_names.len()),
+                value_preview: if projected {
+                    format!("{} configured", header_names.len())
+                } else {
+                    "not projected by this Agent".to_string()
+                },
                 secret: model_provider.headers.iter().any(|header| {
                     matches!(header.value, ModelProviderHeaderValue::SecretReference(_))
                 }),
             });
+            if !projected {
+                diagnostics.push(ProviderBindingMetadata {
+                    key: "agent_projection_header_unsupported".to_string(),
+                    value: header_names.join(","),
+                });
+            } else if has_dynamic_headers(&model_provider.headers)
+                && !projection_supports_dynamic_header(
+                    &descriptor.provider_control,
+                    descriptor.route.agent_id.as_str(),
+                )
+            {
+                let dynamic_names = model_provider
+                    .headers
+                    .iter()
+                    .filter(|header| header.value.dynamic_variable().is_some())
+                    .map(|header| header.name.trim())
+                    .collect::<Vec<_>>();
+                diagnostics.push(ProviderBindingMetadata {
+                    key: "agent_projection_header_dynamic_unsupported".to_string(),
+                    value: dynamic_names.join(","),
+                });
+            }
         }
 
         let fingerprint = projection_fingerprint(
@@ -405,6 +447,7 @@ impl AgentProviderProjectionEngine {
             session_env_keys: ModelProviderHeaderReference::dynamic_variable_env_keys(
                 &model_provider.headers,
             ),
+            session_header_env,
             // The gateway ignores whatever credential the Agent sends and
             // authenticates to the upstream itself, so its Profile holds no
             // Secret. Without this the resolver saw a missing credential and
@@ -475,6 +518,7 @@ impl AgentProviderProjectionEngine {
             switch_behavior: plan.switch_behavior,
             fingerprint: plan.fingerprint.clone(),
             session_env_keys: plan.session_env_keys.clone(),
+            session_header_env: plan.session_header_env.clone(),
         })
     }
 }
@@ -2272,6 +2316,155 @@ fn normalize_poolside_base_url(value: &str) -> String {
         .to_string()
 }
 
+/// How an Agent expects several custom headers in one environment value.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HeaderEnvFormat {
+    /// `Name: Value` per line, as Claude Code and CodeBuddy parse it.
+    Newline,
+    /// `Name: Value` separated by a comma, as Gemini CLI parses it.
+    Comma,
+}
+
+impl HeaderEnvFormat {
+    const fn separator(self) -> &'static str {
+        match self {
+            Self::Newline => "\n",
+            Self::Comma => ", ",
+        }
+    }
+}
+
+/// The environment key an environment-only Agent reads custom headers from.
+///
+/// Only Agents whose pinned build was verified to read such a key are listed.
+fn header_env_settings(agent_id: &str) -> Option<(&'static str, HeaderEnvFormat)> {
+    match agent_id {
+        "claude" => Some(("ANTHROPIC_CUSTOM_HEADERS", HeaderEnvFormat::Newline)),
+        "gemini" => Some(("GEMINI_CLI_CUSTOM_HEADERS", HeaderEnvFormat::Comma)),
+        "codebuddy-code" => Some(("CODEBUDDY_CUSTOM_HEADERS", HeaderEnvFormat::Newline)),
+        _ => None,
+    }
+}
+
+/// Whether the descriptor's projection owns a request-header surface.
+fn projection_supports_request_headers(control: &AgentProviderControl, agent_id: &str) -> bool {
+    match control {
+        AgentProviderControl::ManagedConfigOverlay { strategy } => {
+            strategy.supports_request_headers()
+        }
+        AgentProviderControl::Environment { .. } => header_env_settings(agent_id).is_some(),
+        _ => false,
+    }
+}
+
+/// Whether the descriptor's projection can spell the dynamic `session_id`.
+fn projection_supports_dynamic_header(control: &AgentProviderControl, agent_id: &str) -> bool {
+    match control {
+        AgentProviderControl::ManagedConfigOverlay { strategy } => {
+            strategy.supports_dynamic_session_header()
+        }
+        AgentProviderControl::Environment { .. } => header_env_settings(agent_id).is_some(),
+        _ => false,
+    }
+}
+
+fn has_dynamic_headers(headers: &[ModelProviderHeaderReference]) -> bool {
+    headers
+        .iter()
+        .any(|header| header.value.dynamic_variable().is_some())
+}
+
+/// Literal headers in the stable order a config writer should emit them.
+fn literal_headers(headers: &[ModelProviderHeaderReference]) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .filter_map(|header| match &header.value {
+            ModelProviderHeaderValue::NonSecretLiteral(value) => {
+                let name = header.name.trim();
+                (!name.is_empty()).then(|| (name.to_string(), value.clone()))
+            }
+            ModelProviderHeaderValue::SecretReference(_)
+            | ModelProviderHeaderValue::DynamicVariable(_) => None,
+        })
+        .collect()
+}
+
+/// Dynamic headers paired with the variable they carry.
+fn dynamic_headers(
+    headers: &[ModelProviderHeaderReference],
+) -> Vec<(String, ModelProviderHeaderVariable)> {
+    headers
+        .iter()
+        .filter_map(|header| {
+            let variable = header.value.dynamic_variable()?;
+            let name = header.name.trim();
+            (!name.is_empty()).then(|| (name.to_string(), variable))
+        })
+        .collect()
+}
+
+/// Build one `Name: Value` list for an Agent that reads headers from a single
+/// environment value.
+///
+/// `session` is `None` while the projection is planned, because no session
+/// exists yet; a dynamic value is then written as the placeholder the launch
+/// substitutes. Literal-only profiles never need the substitution.
+fn header_env_value(
+    headers: &[ModelProviderHeaderReference],
+    format: HeaderEnvFormat,
+    session: Option<&str>,
+) -> String {
+    let parts = headers
+        .iter()
+        .filter_map(|header| {
+            let name = header.name.trim();
+            if name.is_empty() {
+                return None;
+            }
+            let value = match &header.value {
+                ModelProviderHeaderValue::NonSecretLiteral(value) => value.clone(),
+                ModelProviderHeaderValue::DynamicVariable(_) => session
+                    .map(str::to_string)
+                    .unwrap_or_else(|| SessionHeaderEnv::placeholder().to_string()),
+                ModelProviderHeaderValue::SecretReference(_) => return None,
+            };
+            Some(format!("{name}: {value}"))
+        })
+        .collect::<Vec<_>>();
+    parts.join(format.separator())
+}
+
+/// Project headers onto an environment-only Agent.
+///
+/// A literal-only list travels as ordinary process environment. A list with a
+/// dynamic value becomes a [`SessionHeaderEnv`] template instead, because the
+/// value must be rebuilt for the session that owns the process.
+fn project_environment_headers(
+    agent_id: &str,
+    headers: &[ModelProviderHeaderReference],
+    non_secret_env: &mut BTreeMap<String, String>,
+    session_header_env: &mut Vec<SessionHeaderEnv>,
+) {
+    let Some((key, format)) = header_env_settings(agent_id) else {
+        return;
+    };
+    if headers.is_empty() {
+        return;
+    }
+    let value = header_env_value(headers, format, None);
+    if value.is_empty() {
+        return;
+    }
+    if has_dynamic_headers(headers) {
+        session_header_env.push(SessionHeaderEnv {
+            key: key.to_string(),
+            template: value,
+        });
+    } else {
+        non_secret_env.insert(key.to_string(), value);
+    }
+}
+
 fn build_overlay(
     strategy: &ConfigOverlayStrategy,
     provider: &ModelProviderProfile,
@@ -2330,6 +2523,7 @@ fn build_overlay(
             "settings/providers.json",
             "json",
             cline_overlay(
+                provider,
                 binding,
                 endpoint,
                 model,
@@ -2543,10 +2737,38 @@ fn codex_overlay(
     // Codex app-server derives its default originator from the ACP client name.
     // Keep the ACP identity truthful while identifying the actual HTTP engine to
     // Codex-compatible gateways that route or authorize by request originator.
-    lines.push(format!(
-        "http_headers = {{ originator = {} }}",
-        toml_quote(CODEX_PROVIDER_ORIGINATOR)
-    ));
+    let mut http_headers = vec![(
+        "originator".to_string(),
+        CODEX_PROVIDER_ORIGINATOR.to_string(),
+    )];
+    for (name, value) in literal_headers(&provider.headers) {
+        // The built-in originator is an identity claim, not a user setting;
+        // a case-insensitive duplicate would encode an invalid TOML table.
+        if !name.eq_ignore_ascii_case("originator") {
+            http_headers.push((name, value));
+        }
+    }
+    let http_headers = http_headers
+        .iter()
+        .map(|(name, value)| format!("{} = {}", toml_quote(name), toml_quote(value)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    lines.push(format!("http_headers = {{ {http_headers} }}"));
+    // A dynamic header travels as an env indirection Codex resolves when it
+    // builds the client, so one profile still describes every session. The
+    // launch fills VIBEX_SESSION_ID only for a session-scoped process.
+    let env_http_headers = dynamic_headers(&provider.headers)
+        .into_iter()
+        .map(|(name, variable)| {
+            format!("{} = {}", toml_quote(&name), toml_quote(variable.env_key()))
+        })
+        .collect::<Vec<_>>();
+    if !env_http_headers.is_empty() {
+        lines.push(format!(
+            "env_http_headers = {{ {} }}",
+            env_http_headers.join(", ")
+        ));
+    }
     format!("{}\n", lines.join("\n"))
 }
 
@@ -3606,6 +3828,7 @@ fn civil_date_from_days(days: i64) -> (i64, u32, u32) {
 }
 
 fn cline_overlay(
+    provider: &ModelProviderProfile,
     binding: &AgentModelProviderBinding,
     endpoint: Option<&ModelProviderEndpoint>,
     model: Option<&AgentConfiguredModelBinding>,
@@ -3666,6 +3889,20 @@ fn cline_overlay(
         "baseUrl",
         endpoint.map(|endpoint| endpoint.url.as_str()),
     );
+    // Cline stores per-provider headers as `openAiHeaders` inside the same
+    // settings object the CLI reads. Its values are literal.
+    let headers = literal_headers(&provider.headers);
+    if !headers.is_empty() {
+        settings.insert(
+            "openAiHeaders".to_string(),
+            serde_json::Value::Object(
+                headers
+                    .into_iter()
+                    .map(|(name, value)| (name, serde_json::json!(value)))
+                    .collect(),
+            ),
+        );
+    }
 
     serialized_json(serde_json::json!({
         "version": 1,
@@ -3739,19 +3976,36 @@ fn crow_cli_overlay(
 }
 
 fn dirac_overlay(
-    _provider: &ModelProviderProfile,
+    provider: &ModelProviderProfile,
     endpoint: Option<&ModelProviderEndpoint>,
     model: Option<&AgentConfiguredModelBinding>,
 ) -> VibexResult<String> {
     let endpoint = endpoint.map(|endpoint| endpoint.url.as_str()).unwrap_or("");
     let model_id = projection_model_id(model).unwrap_or("vibex-model");
-    serialized_json(serde_json::json!({
+    let headers = literal_headers(&provider.headers);
+    let mut settings = serde_json::json!({
         "actModeApiProvider": "openai",
         "planModeApiProvider": "openai",
         "openAiBaseUrl": endpoint,
         "actModeOpenAiModelId": model_id,
         "planModeOpenAiModelId": model_id,
-    }))
+    });
+    // Dirac keeps Cline's flat settings state, where request headers live on
+    // `openAiHeaders`. Values are literal.
+    if !headers.is_empty()
+        && let Some(object) = settings.as_object_mut()
+    {
+        object.insert(
+            "openAiHeaders".to_string(),
+            serde_json::Value::Object(
+                headers
+                    .into_iter()
+                    .map(|(name, value)| (name, serde_json::json!(value)))
+                    .collect(),
+            ),
+        );
+    }
+    serialized_json(settings)
 }
 
 fn factory_droid_overlay(
@@ -3778,6 +4032,7 @@ fn factory_droid_overlay(
             model_id,
             endpoint,
             secret_env_key,
+            &provider.headers,
         ));
     } else {
         for model_binding in group {
@@ -3788,6 +4043,7 @@ fn factory_droid_overlay(
                 model_id,
                 endpoint,
                 secret_env_key,
+                &provider.headers,
             ));
         }
     }
@@ -3803,6 +4059,7 @@ fn factory_droid_custom_model(
     model_id: &str,
     endpoint: Option<&ModelProviderEndpoint>,
     secret_env_key: &str,
+    headers: &[ModelProviderHeaderReference],
 ) -> serde_json::Value {
     let custom_id = sanitize_provider_id(&format!("vibex-{vendor}-{model_id}"));
     let mut custom = serde_json::Map::new();
@@ -3821,6 +4078,19 @@ fn factory_droid_custom_model(
         "apiKey".to_string(),
         serde_json::json!(format!("${{{secret_env_key}}}")),
     );
+    // Droid's custom-model record owns `extraHeaders`. Values are literal.
+    let headers = literal_headers(headers);
+    if !headers.is_empty() {
+        custom.insert(
+            "extraHeaders".to_string(),
+            serde_json::Value::Object(
+                headers
+                    .into_iter()
+                    .map(|(name, value)| (name, serde_json::json!(value)))
+                    .collect(),
+            ),
+        );
+    }
     serde_json::Value::Object(custom)
 }
 
@@ -3939,9 +4209,38 @@ fn grok_overlay(
             );
         }
     }
+    let mut models = serde_json::Map::new();
+    models.insert("default".to_string(), serde_json::json!(model_id));
+    // grok's `[models]` table is the per-model default, so one map covers
+    // every Model this Provider projects. A dynamic value rides an env
+    // indirection grok resolves when it builds the client.
+    let literals = literal_headers(&provider.headers);
+    if !literals.is_empty() {
+        models.insert(
+            "extra_headers".to_string(),
+            serde_json::Value::Object(
+                literals
+                    .into_iter()
+                    .map(|(name, value)| (name, serde_json::json!(value)))
+                    .collect(),
+            ),
+        );
+    }
+    let dynamic = dynamic_headers(&provider.headers);
+    if !dynamic.is_empty() {
+        models.insert(
+            "env_http_headers".to_string(),
+            serde_json::Value::Object(
+                dynamic
+                    .into_iter()
+                    .map(|(name, variable)| (name, serde_json::json!(variable.env_key())))
+                    .collect(),
+            ),
+        );
+    }
     serialized_toml(serde_json::json!({
         "model": serde_json::Value::Object(model_table),
-        "models": {"default": model_id},
+        "models": serde_json::Value::Object(models),
         // Vibex owns the install, so the Agent must not swap its own binary out
         // from under a live ACP session. xAI documents `[cli] auto_update`
         // ("check for CLI updates on launch", on when unset) in the same
@@ -4012,6 +4311,24 @@ fn hermes_overlay(
     }))
 }
 
+/// Kilo's inline provider options, with dynamic values spelled as the
+/// environment reference its config loader substitutes.
+fn kilo_headers(
+    headers: &[ModelProviderHeaderReference],
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut values = serde_json::Map::new();
+    for (name, value) in literal_headers(headers) {
+        values.insert(name, serde_json::json!(value));
+    }
+    for (name, variable) in dynamic_headers(headers) {
+        values.insert(
+            name,
+            serde_json::json!(format!("{{env:{}}}", variable.env_key())),
+        );
+    }
+    values
+}
+
 fn kilo_overlay(
     provider: &ModelProviderProfile,
     binding: &AgentModelProviderBinding,
@@ -4036,6 +4353,13 @@ fn kilo_overlay(
         "apiKey".to_string(),
         serde_json::json!(format!("{{env:{secret_env_key}}}")),
     );
+    // Kilo keeps OpenCode's inline-provider shape, including `{env:...}`
+    // substitution in config strings, so a dynamic session value is spelled
+    // the same way OpenCode spells it.
+    let headers = kilo_headers(&provider.headers);
+    if !headers.is_empty() {
+        options.insert("headers".to_string(), serde_json::Value::Object(headers));
+    }
     let mut model_provider = serde_json::Map::new();
     model_provider.insert(
         "npm".to_string(),
@@ -4119,7 +4443,7 @@ fn kimi_model_entry(model_id: &str) -> toml::Value {
 }
 
 fn kimi_overlay(
-    _provider: &ModelProviderProfile,
+    provider: &ModelProviderProfile,
     binding: &AgentModelProviderBinding,
     endpoint: Option<&ModelProviderEndpoint>,
     model: Option<&AgentConfiguredModelBinding>,
@@ -4137,24 +4461,40 @@ fn kimi_overlay(
         toml::Value::String(model_id.to_string()),
     );
     root.insert("default_thinking".to_string(), toml::Value::Boolean(false));
+    let mut provider_table = toml::map::Map::new();
+    provider_table.insert(
+        "type".to_string(),
+        toml::Value::String(provider_type.to_string()),
+    );
+    provider_table.insert(
+        "base_url".to_string(),
+        toml::Value::String(endpoint.to_string()),
+    );
+    provider_table.insert(
+        "api_key".to_string(),
+        toml::Value::String(secret_placeholder),
+    );
+    // Kimi's provider table owns `custom_headers`, but its values are literal:
+    // the loader has no environment interpolation for them. A dynamic row is
+    // therefore reported by the plan instead of being written as its own
+    // expression text.
+    let headers = literal_headers(&provider.headers);
+    if !headers.is_empty() {
+        provider_table.insert(
+            "custom_headers".to_string(),
+            toml::Value::Table(
+                headers
+                    .into_iter()
+                    .map(|(name, value)| (name, toml::Value::String(value)))
+                    .collect(),
+            ),
+        );
+    }
     root.insert(
         "providers".to_string(),
         toml::Value::Table(toml::map::Map::from_iter([(
             "vibex".to_string(),
-            toml::Value::Table(toml::map::Map::from_iter([
-                (
-                    "type".to_string(),
-                    toml::Value::String(provider_type.to_string()),
-                ),
-                (
-                    "base_url".to_string(),
-                    toml::Value::String(endpoint.to_string()),
-                ),
-                (
-                    "api_key".to_string(),
-                    toml::Value::String(secret_placeholder),
-                ),
-            ])),
+            toml::Value::Table(provider_table),
         )])),
     );
     let group = overlay_model_group(binding, model, kimi_provider_type);
@@ -4208,6 +4548,19 @@ fn mistral_vibe_overlay(
         serde_json::json!(mistral_vibe_api_style(model)),
     );
     provider_config.insert("backend".to_string(), serde_json::json!("generic"));
+    // Mistral Vibe's `ProviderConfig` owns `extra_headers`. Values are literal.
+    let headers = literal_headers(&provider.headers);
+    if !headers.is_empty() {
+        provider_config.insert(
+            "extra_headers".to_string(),
+            serde_json::Value::Object(
+                headers
+                    .into_iter()
+                    .map(|(name, value)| (name, serde_json::json!(value)))
+                    .collect(),
+            ),
+        );
+    }
     let group = overlay_model_group(binding, model, |model| mistral_vibe_api_style(Some(model)));
     let mut models = Vec::with_capacity(group.len().max(1));
     if group.is_empty() {
@@ -4635,6 +4988,22 @@ fn pi_model_registry_entry(
     })
 }
 
+/// pi resolves a header value like an API key: `$NAME` reads the environment
+/// and `!command` executes. A dynamic session value therefore needs no
+/// domain-specific spelling beyond the environment reference.
+fn pi_headers(
+    headers: &[ModelProviderHeaderReference],
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut values = serde_json::Map::new();
+    for (name, value) in literal_headers(headers) {
+        values.insert(name, serde_json::json!(value));
+    }
+    for (name, variable) in dynamic_headers(headers) {
+        values.insert(name, serde_json::json!(format!("${}", variable.env_key())));
+    }
+    values
+}
+
 fn pi_overlay(
     provider: &ModelProviderProfile,
     binding: &AgentModelProviderBinding,
@@ -4660,6 +5029,10 @@ fn pi_overlay(
         serde_json::json!(format!("${secret_env_key}")),
     );
     entry.insert("api".to_string(), serde_json::json!(pi_api_kind(model)));
+    let headers = pi_headers(&provider.headers);
+    if !headers.is_empty() {
+        entry.insert("headers".to_string(), serde_json::Value::Object(headers));
+    }
 
     let group = overlay_model_group(binding, model, |model| pi_api_kind(Some(model)));
     let models: Vec<serde_json::Value> = if group.is_empty() {
@@ -4697,6 +5070,7 @@ fn qwen_code_model_entry(
     model_id: &str,
     endpoint: Option<&ModelProviderEndpoint>,
     secret_env_key: &str,
+    headers: &[ModelProviderHeaderReference],
 ) -> serde_json::Value {
     let mut entry = serde_json::Map::new();
     entry.insert("id".to_string(), serde_json::json!(model_id));
@@ -4707,11 +5081,25 @@ fn qwen_code_model_entry(
         endpoint.map(|endpoint| endpoint.url.as_str()),
     );
     entry.insert("envKey".to_string(), serde_json::json!(secret_env_key));
+    // Qwen's provider entry carries headers under `generationConfig`; the
+    // values are literal, with no environment interpolation.
+    let headers = literal_headers(headers);
+    if !headers.is_empty() {
+        entry.insert(
+            "generationConfig".to_string(),
+            serde_json::json!({
+                "customHeaders": headers
+                    .into_iter()
+                    .map(|(name, value)| (name, serde_json::json!(value)))
+                    .collect::<serde_json::Map<_, _>>(),
+            }),
+        );
+    }
     serde_json::Value::Object(entry)
 }
 
 fn qwen_code_overlay(
-    _provider: &ModelProviderProfile,
+    provider: &ModelProviderProfile,
     binding: &AgentModelProviderBinding,
     endpoint: Option<&ModelProviderEndpoint>,
     model: Option<&AgentConfiguredModelBinding>,
@@ -4721,11 +5109,21 @@ fn qwen_code_overlay(
     let group = overlay_model_group(binding, model, |_| "openai-chat-completions");
     let mut model_providers = Vec::with_capacity(group.len().max(1));
     if group.is_empty() {
-        model_providers.push(qwen_code_model_entry(model_id, endpoint, secret_env_key));
+        model_providers.push(qwen_code_model_entry(
+            model_id,
+            endpoint,
+            secret_env_key,
+            &provider.headers,
+        ));
     } else {
         for model_binding in group {
             let model_id = projection_model_id(Some(model_binding)).unwrap_or("vibex-model");
-            model_providers.push(qwen_code_model_entry(model_id, endpoint, secret_env_key));
+            model_providers.push(qwen_code_model_entry(
+                model_id,
+                endpoint,
+                secret_env_key,
+                &provider.headers,
+            ));
         }
     }
     serialized_json(serde_json::json!({
@@ -5874,6 +6272,229 @@ mod tests {
             Some("{env:VIBEX_SESSION_ID}")
         );
         assert_eq!(plan.session_env_keys, vec!["VIBEX_SESSION_ID".to_string()]);
+    }
+
+    fn literal_header(name: &str, value: &str) -> ModelProviderHeaderReference {
+        ModelProviderHeaderReference {
+            name: name.to_string(),
+            value: ModelProviderHeaderValue::NonSecretLiteral(value.to_string()),
+            redacted_hint: "non-secret header".to_string(),
+        }
+    }
+
+    fn dynamic_header(name: &str) -> ModelProviderHeaderReference {
+        ModelProviderHeaderReference {
+            name: name.to_string(),
+            value: ModelProviderHeaderValue::DynamicVariable(
+                ModelProviderHeaderVariable::SessionId,
+            ),
+            redacted_hint: "session variable".to_string(),
+        }
+    }
+
+    #[test]
+    fn environment_header_lists_use_each_agents_separator() {
+        let headers = vec![
+            literal_header("User-Agent", "vibex/1.0"),
+            dynamic_header("x-opencode-session"),
+        ];
+        assert_eq!(
+            header_env_value(&headers, HeaderEnvFormat::Newline, Some("session-1")),
+            "User-Agent: vibex/1.0\nx-opencode-session: session-1"
+        );
+        assert_eq!(
+            header_env_value(&headers, HeaderEnvFormat::Comma, Some("session-1")),
+            "User-Agent: vibex/1.0, x-opencode-session: session-1"
+        );
+    }
+
+    #[test]
+    fn environment_only_agents_get_a_session_header_template() {
+        let mut env = BTreeMap::new();
+        let mut templates = Vec::new();
+        project_environment_headers(
+            "claude",
+            &[
+                literal_header("User-Agent", "vibex/1.0"),
+                dynamic_header("x-opencode-session"),
+            ],
+            &mut env,
+            &mut templates,
+        );
+        assert!(env.is_empty());
+        assert_eq!(templates.len(), 1);
+        assert_eq!(templates[0].key, "ANTHROPIC_CUSTOM_HEADERS");
+        assert_eq!(
+            templates[0].value_for("session-1"),
+            "User-Agent: vibex/1.0\nx-opencode-session: session-1"
+        );
+
+        let mut env = BTreeMap::new();
+        let mut templates = Vec::new();
+        project_environment_headers(
+            "gemini",
+            &[
+                literal_header("User-Agent", "vibex/1.0"),
+                literal_header("X-Trace", "on"),
+            ],
+            &mut env,
+            &mut templates,
+        );
+        assert!(templates.is_empty());
+        assert_eq!(
+            env.get("GEMINI_CLI_CUSTOM_HEADERS").map(String::as_str),
+            Some("User-Agent: vibex/1.0, X-Trace: on")
+        );
+    }
+
+    #[test]
+    fn codex_headers_ride_the_provider_table() {
+        let (mut provider, _, binding, _) = fixture(ConfigOverlayStrategy::CodexStableHome);
+        provider.headers = vec![
+            literal_header("User-Agent", "vibex/1.0"),
+            dynamic_header("x-opencode-session"),
+        ];
+        let overlay = build_overlay(
+            &ConfigOverlayStrategy::CodexStableHome,
+            &provider,
+            &binding,
+            provider.endpoints.first(),
+            binding.configured_models.first(),
+            Some("CODEX_API_KEY"),
+        )
+        .unwrap();
+        let value: toml::Value = toml::from_str(&overlay.content).unwrap();
+        let provider = &value["model_providers"]["fake"];
+        assert_eq!(
+            provider["http_headers"]["User-Agent"].as_str(),
+            Some("vibex/1.0")
+        );
+        assert_eq!(
+            provider["http_headers"]["originator"].as_str(),
+            Some(CODEX_PROVIDER_ORIGINATOR)
+        );
+        assert_eq!(
+            provider["env_http_headers"]["x-opencode-session"].as_str(),
+            Some("VIBEX_SESSION_ID")
+        );
+    }
+
+    #[test]
+    fn grok_headers_ride_the_models_table() {
+        let (mut provider, _, binding, _) = fixture(ConfigOverlayStrategy::GrokToml);
+        provider.headers = vec![
+            literal_header("User-Agent", "vibex/1.0"),
+            dynamic_header("x-opencode-session"),
+        ];
+        let overlay = build_overlay(
+            &ConfigOverlayStrategy::GrokToml,
+            &provider,
+            &binding,
+            provider.endpoints.first(),
+            binding.configured_models.first(),
+            Some("VIBEX_GROK_API_KEY"),
+        )
+        .unwrap();
+        let value: toml::Value = toml::from_str(&overlay.content).unwrap();
+        assert_eq!(
+            value["models"]["extra_headers"]["User-Agent"].as_str(),
+            Some("vibex/1.0")
+        );
+        assert_eq!(
+            value["models"]["env_http_headers"]["x-opencode-session"].as_str(),
+            Some("VIBEX_SESSION_ID")
+        );
+    }
+
+    #[test]
+    fn pi_headers_use_environment_references() {
+        let (mut provider, _, binding, _) = fixture(ConfigOverlayStrategy::PiModelsJson);
+        provider.headers = vec![
+            literal_header("User-Agent", "vibex/1.0"),
+            dynamic_header("x-opencode-session"),
+        ];
+        let overlay = build_overlay(
+            &ConfigOverlayStrategy::PiModelsJson,
+            &provider,
+            &binding,
+            provider.endpoints.first(),
+            binding.configured_models.first(),
+            Some("VIBEX_PI_API_KEY"),
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&overlay.content).unwrap();
+        let headers = &value["providers"]["fake"]["headers"];
+        assert_eq!(headers["User-Agent"].as_str(), Some("vibex/1.0"));
+        assert_eq!(
+            headers["x-opencode-session"].as_str(),
+            Some("$VIBEX_SESSION_ID")
+        );
+    }
+
+    #[test]
+    fn config_file_projections_emit_their_native_header_field() {
+        let cases = [
+            (ConfigOverlayStrategy::ClineProvidersJson, "openAiHeaders"),
+            (ConfigOverlayStrategy::DiracToml, "openAiHeaders"),
+            (ConfigOverlayStrategy::FactoryDroidJson, "extraHeaders"),
+            (ConfigOverlayStrategy::KiloInlineJson, "headers"),
+            (ConfigOverlayStrategy::MistralVibeToml, "extra_headers"),
+            (ConfigOverlayStrategy::QwenCodeJson, "customHeaders"),
+        ];
+        for (strategy, field) in cases {
+            let (mut provider, _, binding, _) = fixture(strategy.clone());
+            provider.headers = vec![literal_header("X-Trace", "on")];
+            let overlay = build_overlay(
+                &strategy,
+                &provider,
+                &binding,
+                provider.endpoints.first(),
+                binding.configured_models.first(),
+                Some("VIBEX_SECRET"),
+            )
+            .unwrap();
+            assert!(
+                overlay.content.contains(field),
+                "{strategy:?} overlay must carry {field}: {}",
+                overlay.content
+            );
+            assert!(
+                overlay.content.contains("X-Trace"),
+                "{strategy:?} overlay must carry the header name: {}",
+                overlay.content
+            );
+        }
+    }
+
+    #[test]
+    fn literal_only_header_maps_are_reported_when_a_dynamic_row_is_dropped() {
+        for agent_id in [
+            "cline",
+            "dirac",
+            "factory-droid",
+            "kimi",
+            "mistral-vibe",
+            "qwen-code",
+        ] {
+            let descriptor = provider_descriptor(agent_id);
+            let (mut provider, runtime, binding) = typed_projection_fixture(&descriptor);
+            provider.headers = vec![dynamic_header("x-opencode-session")];
+            let plan = AgentProviderProjectionEngine::plan(
+                &provider,
+                &runtime,
+                &binding,
+                &descriptor,
+                "dynamic-header-dropped",
+            )
+            .unwrap();
+            assert!(
+                plan.diagnostics.iter().any(|diagnostic| {
+                    diagnostic.key == "agent_projection_header_dynamic_unsupported"
+                        && diagnostic.value == "x-opencode-session"
+                }),
+                "{agent_id} must report the dropped dynamic header"
+            );
+        }
     }
 
     #[test]
@@ -9343,6 +9964,7 @@ mod tests {
         // The selected Model is the one Cline cannot express, so the plan fails
         // rather than falling back to a Model the session would not select.
         let error = cline_overlay(
+            &provider,
             &binding,
             provider.endpoints.first(),
             Some(&anthropic),
@@ -9355,8 +9977,14 @@ mod tests {
         // falls back to the first *enabled* Model, which is this one.
         let mut stored = binding.clone();
         stored.configured_models = vec![anthropic];
-        let error =
-            cline_overlay(&stored, provider.endpoints.first(), None, "CLINE_API_KEY").unwrap_err();
+        let error = cline_overlay(
+            &provider,
+            &stored,
+            provider.endpoints.first(),
+            None,
+            "CLINE_API_KEY",
+        )
+        .unwrap_err();
         assert_eq!(error.code, "agent_projection_cline_provider_unsupported");
     }
 

@@ -26676,6 +26676,7 @@ impl ManagementCenter {
                     .child(Input::new(&value_input).small().w_full())
                     .into_any_element(),
             });
+        let supports_session_variable = self.projection_editor.supports_session_header_variable();
         row = row.child(
             Button::new(SharedString::from(format!(
                 "provider-header-{index}-variable"
@@ -26700,6 +26701,11 @@ impl ManagementCenter {
                         }),
                 );
                 for candidate in vibex_core::ModelProviderHeaderVariable::ALL {
+                    if !supports_session_variable
+                        && candidate == vibex_core::ModelProviderHeaderVariable::SessionId
+                    {
+                        continue;
+                    }
                     let center = center.clone();
                     menu = menu.item(
                         PopupMenuItem::new(provider_header_variable_label(candidate))

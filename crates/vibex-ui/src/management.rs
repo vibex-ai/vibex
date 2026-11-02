@@ -310,6 +310,14 @@ impl AgentProviderBindingEditorState {
             .is_some_and(|capability| capability.supports_request_headers())
     }
 
+    /// Whether the selected Agent can resolve the dynamic `session_id` header
+    /// variable. Literal header rows stay available either way.
+    pub fn supports_session_header_variable(&self) -> bool {
+        self.capability
+            .as_ref()
+            .is_some_and(|capability| capability.supports_session_header_variable())
+    }
+
     pub fn credential_surface(&self) -> ProjectionCredentialSurface {
         use vibex_core::AgentProjectionFormControl as Control;
         if self.shows(Control::ApiKey) {

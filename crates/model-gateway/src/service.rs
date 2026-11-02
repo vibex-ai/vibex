@@ -55,6 +55,8 @@ pub struct GatewayUpstream {
     pub endpoints: Vec<ModelProviderEndpoint>,
     pub models: Vec<String>,
     pub metadata: vibex_core::ModelProviderMetadata,
+    /// The Provider's own request headers, including dynamic values.
+    pub headers: Vec<vibex_core::ModelProviderHeaderReference>,
     pub credentials: Vec<ModelProviderCredentialReference>,
     pub keys: Vec<GatewayKeySummary>,
 }
@@ -648,6 +650,7 @@ impl ModelGatewayService {
                 display_name: profile.display_name.clone(),
                 endpoints: profile.endpoints.clone(),
                 metadata: profile.metadata.clone(),
+                headers: profile.headers.clone(),
                 models: profile
                     .configured_models
                     .iter()
@@ -1296,24 +1299,6 @@ impl ModelGatewayService {
             });
         }
 
-        // Classifier: one small request at the start of the turn, never on a
-        // retry of the turn's own answer. It is skipped unless a rule can use
-        // an intent or the route asked for automatic effort.
-        let route_group =
-            resolved_group_id(&request.model).and_then(|group_id| snapshot.groups.get(group_id));
-        let mut classifier_outcome = ClassifierOutcome::default();
-        let mut forced_effort: Option<String> = None;
-        if let Some(group) = route_group
-            && group.classifier.is_some()
-            && (group.effort.as_deref() == Some("auto")
-                || group.rules.iter().any(|rule| rule.intent.is_some()))
-        {
-            classifier_outcome = self.classify_turn(&snapshot, group, &request).await;
-            if group.effort.as_deref() == Some("auto") {
-                forced_effort = classifier_outcome.effort.clone();
-            }
-        }
-
         let now = vibex_core::unix_timestamp_ms();
         let connection = self.connection()?;
         let agent_id = agent_id_from_headers(headers);
@@ -1326,6 +1311,37 @@ impl ModelGatewayService {
                     .map(|value| (name.as_str().to_string(), value.to_string()))
             })
             .collect::<Vec<_>>();
+        // A Provider may direct the gateway to send a per-conversation HTTP
+        // header. Prefer the explicit session header the ACP layer can send;
+        // otherwise the body-derived conversation key is stable across the
+        // turns of one conversation and is scoped by Agent.
+        let body_conversation = conversation_key(agent_id.as_deref(), &header_pairs, &body_value);
+        let session = header_pairs
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("x-vibex-session"))
+            .map(|(_, value)| value.clone())
+            .filter(|value| !value.trim().is_empty() && value.len() <= 256)
+            .or_else(|| body_conversation.clone());
+
+        // Classifier: one small request at the start of the turn, never on a
+        // retry of the turn's own answer. It is skipped unless a rule can use
+        // an intent or the route asked for automatic effort.
+        let route_group =
+            resolved_group_id(&request.model).and_then(|group_id| snapshot.groups.get(group_id));
+        let mut classifier_outcome = ClassifierOutcome::default();
+        let mut forced_effort: Option<String> = None;
+        if let Some(group) = route_group
+            && group.classifier.is_some()
+            && (group.effort.as_deref() == Some("auto")
+                || group.rules.iter().any(|rule| rule.intent.is_some()))
+        {
+            classifier_outcome = self
+                .classify_turn(&snapshot, group, &request, session.as_deref())
+                .await;
+            if group.effort.as_deref() == Some("auto") {
+                forced_effort = classifier_outcome.effort.clone();
+            }
+        }
         // Pinning is a property of the composition, so the group decides it.
         // There is no gateway-wide default: a model that does not belong to a
         // group is not a gateway model at all.
@@ -1340,7 +1356,7 @@ impl ModelGatewayService {
             .map(|group| group.pin)
             .unwrap_or(GatewayPinScope::Off);
         let conversation = (pin == GatewayPinScope::Conversation)
-            .then(|| conversation_key(agent_id.as_deref(), &header_pairs, &body_value))
+            .then(|| body_conversation.clone())
             .flatten();
         let pinned = conversation
             .as_deref()
@@ -1424,6 +1440,7 @@ impl ModelGatewayService {
                 pinned.as_ref(),
                 now,
                 &tool_names,
+                session.as_deref(),
             ) {
                 Ok(member) => members.push(member),
                 // A member that cannot be called at all is skipped so the next
@@ -1460,6 +1477,7 @@ impl ModelGatewayService {
             members,
             agent_id,
             conversation,
+            session,
             stream: request.stream,
             user_agent: headers
                 .get(reqwest::header::USER_AGENT)
@@ -1640,6 +1658,7 @@ impl ModelGatewayService {
         snapshot: &GatewaySnapshot,
         group: &GatewayRouteGroup,
         request: &CanonicalRequest,
+        session: Option<&str>,
     ) -> ClassifierOutcome {
         let Some(classifier) = group
             .classifier
@@ -1742,11 +1761,14 @@ impl ModelGatewayService {
             }
         };
         let client = self.client_for_key(credential.proxy_url.as_deref(), &upstream.metadata);
-        let http_request = apply_auth(
-            client.post(&url).json(&body),
-            protocol,
-            &secret,
-            upstream.metadata.auth_header_mode.as_deref(),
+        let http_request = apply_provider_headers(
+            apply_auth(
+                client.post(&url).json(&body),
+                protocol,
+                &secret,
+                upstream.metadata.auth_header_mode.as_deref(),
+            ),
+            &resolved_provider_headers(&upstream.headers, session),
         );
         let sent = tokio::time::timeout(std::time::Duration::from_secs(8), async {
             let response = http_request
@@ -1884,6 +1906,7 @@ impl ModelGatewayService {
         pinned: Option<&(ModelProviderProfileId, RequestId)>,
         now: i64,
         tool_names: &ToolNameMap,
+        session: Option<&str>,
     ) -> GatewayResult<PreparedMember> {
         let profile_id = resolved.profile.clone();
         let upstream =
@@ -2080,6 +2103,7 @@ impl ModelGatewayService {
             endpoint,
             metadata: upstream.metadata.clone(),
             extra_body: vibex_core::ModelProviderExtraBody::for_request(&upstream.metadata),
+            headers: resolved_provider_headers(&upstream.headers, session),
             body,
             alternates,
             keys,
@@ -2597,11 +2621,14 @@ impl ModelGatewayService {
                 {
                     request = request.header(reqwest::header::USER_AGENT, user_agent);
                 }
-                let mut wire = apply_auth(
-                    request,
-                    call.target,
-                    &secret,
-                    member.metadata.auth_header_mode.as_deref(),
+                let mut wire = apply_provider_headers(
+                    apply_auth(
+                        request,
+                        call.target,
+                        &secret,
+                        member.metadata.auth_header_mode.as_deref(),
+                    ),
+                    &member.headers,
                 );
                 if let Some(beta) = beta_header(&call.target, &call.body) {
                     wire = wire.header("anthropic-beta", beta);
@@ -3111,6 +3138,8 @@ pub struct PreparedCall {
     pub members: Vec<PreparedMember>,
     pub agent_id: Option<String>,
     pub conversation: Option<String>,
+    /// The per-conversation identity Provider headers resolve against.
+    pub session: Option<String>,
     pub stream: bool,
     pub user_agent: Option<String>,
     /// The group that produced this call. A gateway request always names one:
@@ -3166,6 +3195,8 @@ pub struct PreparedMember {
     /// The body fields the Provider declares, read once here so every Key
     /// attempt and every protocol alternative carries the same ones.
     pub extra_body: vibex_core::ModelProviderExtraBody,
+    /// Resolved request headers for this call, in the order they are applied.
+    pub headers: Vec<(String, String)>,
     pub body: Value,
     /// Ordered attempts: the candidate and the credential record it uses.
     pub keys: Vec<(CandidateKey, ModelProviderCredentialReference)>,
@@ -3667,6 +3698,47 @@ fn resolve_key_secret(
         reference.setup_state,
         &reference.lookup_key,
     )
+}
+
+/// Resolve a Provider's headers for one call.
+///
+/// A dynamic value names the conversation the gateway is serving; a request
+/// with no conversation identity simply omits it rather than sending the
+/// literal variable name.
+fn resolved_provider_headers(
+    headers: &[vibex_core::ModelProviderHeaderReference],
+    session: Option<&str>,
+) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .filter_map(|header| match &header.value {
+            vibex_core::ModelProviderHeaderValue::NonSecretLiteral(value) => {
+                Some((header.name.trim().to_string(), value.clone()))
+            }
+            vibex_core::ModelProviderHeaderValue::DynamicVariable(_) => session
+                .filter(|session| !session.is_empty())
+                .map(|session| (header.name.trim().to_string(), session.to_string())),
+            vibex_core::ModelProviderHeaderValue::SecretReference(_) => None,
+        })
+        .filter(|(name, _)| !name.is_empty())
+        .collect()
+}
+
+fn apply_provider_headers(
+    request: reqwest::RequestBuilder,
+    headers: &[(String, String)],
+) -> reqwest::RequestBuilder {
+    let mut request = request;
+    for (name, value) in headers {
+        let Ok(name) = reqwest::header::HeaderName::from_bytes(name.as_bytes()) else {
+            continue;
+        };
+        let Ok(value) = reqwest::header::HeaderValue::from_str(value) else {
+            continue;
+        };
+        request = request.header(name, value);
+    }
+    request
 }
 
 fn apply_auth(
@@ -4400,6 +4472,7 @@ mod tests {
                 .collect(),
             models: vec!["m".to_string()],
             metadata: vibex_core::ModelProviderMetadata::default(),
+            headers: Vec::new(),
             credentials: Vec::new(),
             keys: Vec::new(),
         }
@@ -4418,9 +4491,41 @@ mod tests {
             }],
             models: vec!["m".to_string()],
             metadata: vibex_core::ModelProviderMetadata::default(),
+            headers: Vec::new(),
             credentials: Vec::new(),
             keys: Vec::new(),
         }
+    }
+
+    #[test]
+    fn provider_headers_resolve_literals_and_the_session() {
+        let headers = vec![
+            vibex_core::ModelProviderHeaderReference {
+                name: "X-Trace".to_string(),
+                value: vibex_core::ModelProviderHeaderValue::NonSecretLiteral("on".to_string()),
+                redacted_hint: "non-secret header".to_string(),
+            },
+            vibex_core::ModelProviderHeaderReference {
+                name: "x-opencode-session".to_string(),
+                value: vibex_core::ModelProviderHeaderValue::DynamicVariable(
+                    vibex_core::ModelProviderHeaderVariable::SessionId,
+                ),
+                redacted_hint: "session variable".to_string(),
+            },
+        ];
+        assert_eq!(
+            resolved_provider_headers(&headers, Some("session-1")),
+            vec![
+                ("X-Trace".to_string(), "on".to_string()),
+                ("x-opencode-session".to_string(), "session-1".to_string()),
+            ]
+        );
+        // A request with no conversation identity omits the dynamic row rather
+        // than sending the variable name.
+        assert_eq!(
+            resolved_provider_headers(&headers, None),
+            vec![("X-Trace".to_string(), "on".to_string())]
+        );
     }
 
     /// Three failures degrade one group, one success recovers it.

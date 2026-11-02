@@ -1540,6 +1540,7 @@ mod tests {
             switch_behavior: ProviderSwitchBehavior::RestartAndResume,
             fingerprint: "sha256:0123456789abcdef".to_string(),
             session_env_keys: Vec::new(),
+            session_header_env: Vec::new(),
         };
         let session = json!({"models": {"availableModels": [{"modelId": "target-model"}]}});
         let fact =
@@ -1565,6 +1566,7 @@ mod tests {
             switch_behavior: ProviderSwitchBehavior::RestartAndResume,
             fingerprint: "sha256:0123456789abcdef".to_string(),
             session_env_keys: Vec::new(),
+            session_header_env: Vec::new(),
         };
         let fact = effective_provider_fact(
             &json!({"endpoint": "https://profile.example"}),
@@ -1690,6 +1692,7 @@ mod tests {
             switch_behavior: ProviderSwitchBehavior::RestartAndResume,
             fingerprint: "sha256:crow".to_string(),
             session_env_keys: Vec::new(),
+            session_header_env: Vec::new(),
         };
         assert_eq!(
             materialized_probe_process_args("crow-cli", &config, Some(&crow_projection)),

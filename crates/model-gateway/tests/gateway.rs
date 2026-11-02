@@ -24,8 +24,10 @@ use vibex_core::{
     AgentCredential, AgentCredentialStatus, GatewayConversationPin, GatewayFailureKind,
     GatewayPolicy, GatewayRequestOutcome, GatewayTokenWindow, ModelProviderAccountState,
     ModelProviderCatalogEntry, ModelProviderCredentialReference, ModelProviderEndpoint,
-    ModelProviderEndpointKind, ModelProviderProfileId, ModelProviderProfileStatus,
-    ModelProviderProxyPolicy, ProjectionSecretReference, ProviderSecretSetupState, RequestId,
+    ModelProviderEndpointKind, ModelProviderHeaderReference, ModelProviderHeaderValue,
+    ModelProviderHeaderVariable, ModelProviderProfileId, ModelProviderProfileStatus,
+    ModelProviderProfileUpdateRequest, ModelProviderProxyPolicy, ProjectionSecretReference,
+    ProviderSecretSetupState, RequestId,
 };
 use vibex_db::{
     GatewayConversationPinRepository, GatewayTokenWindowRepository,
@@ -42,6 +44,8 @@ struct Recorded {
     path: String,
     authorization: Option<String>,
     api_key: Option<String>,
+    trace: Option<String>,
+    session: Option<String>,
     body: Option<Value>,
 }
 
@@ -118,6 +122,14 @@ async fn mock_handler(
             .map(str::to_string);
         recorded.api_key = headers
             .get("x-api-key")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        recorded.trace = headers
+            .get("x-trace")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        recorded.session = headers
+            .get("x-opencode-session")
             .and_then(|value| value.to_str().ok())
             .map(str::to_string);
         recorded.body = serde_json::from_slice(&body).ok();
@@ -4283,6 +4295,77 @@ async fn declared_body_fields_reach_the_upstream_and_never_replace_the_model() {
     // record says; the same holds for the client's own response shape.
     assert_eq!(body["model"], "deepseek-chat");
     assert_eq!(body["stream"], false);
+
+    drop(recorded);
+    gateway_task.abort();
+    upstream_task.abort();
+    service.shutdown().await;
+    cleanup(path);
+}
+
+/// A Provider's own headers reach the upstream, including a dynamic value the
+/// gateway resolves from the conversation.
+#[tokio::test]
+async fn provider_headers_reach_the_upstream() {
+    let path = database_path();
+    let (upstream_url, recorder, upstream_task) = mock_upstream(200, chat_stream(), None).await;
+
+    let config = ProviderConfigService::new(&path);
+    let upstream = seed_upstream(
+        &config,
+        &upstream_url,
+        WireProtocol::ChatCompletions,
+        &["deepseek-chat"],
+        "sk-test",
+    );
+    let mut profile = config
+        .list_model_provider_profiles()
+        .unwrap()
+        .into_iter()
+        .find(|profile| profile.id == upstream)
+        .expect("the seeded Provider exists");
+    profile.headers = vec![
+        ModelProviderHeaderReference {
+            name: "X-Trace".to_string(),
+            value: ModelProviderHeaderValue::NonSecretLiteral("on".to_string()),
+            redacted_hint: "non-secret header".to_string(),
+        },
+        ModelProviderHeaderReference {
+            name: "x-opencode-session".to_string(),
+            value: ModelProviderHeaderValue::DynamicVariable(
+                ModelProviderHeaderVariable::SessionId,
+            ),
+            redacted_hint: "session variable".to_string(),
+        },
+    ];
+    let revision = profile.revision;
+    config
+        .update_model_provider_profile(ModelProviderProfileUpdateRequest {
+            profile,
+            expected_revision: revision,
+        })
+        .unwrap();
+    let group = point_gateway_at(&path, upstream, GatewayPolicy::default());
+    let (service, gateway_url, gateway_task) = gateway(&path).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{gateway_url}/v1/chat/completions"))
+        .header(header::HOST, "127.0.0.1")
+        .header("x-vibex-session", "sess-42")
+        .json(&json!({
+            "model": group_model(&group, "deepseek-chat"),
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = response.text().await.unwrap();
+    assert_eq!(status, 200, "{body}");
+
+    let recorded = recorder.lock().await;
+    assert_eq!(recorded.trace.as_deref(), Some("on"));
+    assert_eq!(recorded.session.as_deref(), Some("sess-42"));
 
     drop(recorded);
     gateway_task.abort();
