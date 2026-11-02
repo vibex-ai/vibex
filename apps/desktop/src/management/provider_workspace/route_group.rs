@@ -901,13 +901,6 @@ impl ManagementCenter {
                 .gap_3()
                 .child(pipeline)
                 .child(Separator::horizontal())
-                .child(
-                    div()
-                        .text_xs()
-                        .font_semibold()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(management_locale_text("Add models", "添加模型", "新增模型")),
-                )
                 .child(self.render_model_group_palette(pending, cx))
                 .into_any_element(),
             cx,
