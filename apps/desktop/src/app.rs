@@ -55225,7 +55225,6 @@ impl VibexWorkbench {
         let rest_background = runtime_menu_rest_background(cx);
         let highlight_background = runtime_menu_highlight_background(cx);
         let selected_background = runtime_menu_selected_background(cx);
-        let selected_shadows = runtime_menu_selected_shadows(cx);
         let hairline = runtime_menu_hairline(cx);
         let searching = !query.trim().is_empty();
         let collapsed = self.runtime_provider_collapsed_groups.clone();
@@ -55271,7 +55270,7 @@ impl VibexWorkbench {
                         .min_w_0()
                         .flex_1()
                         .truncate()
-                        .text_size(type_scale::menu_heading())
+                        .text_size(type_scale::menu_body())
                         .font_semibold()
                         .text_color(cx.theme().foreground.opacity(0.84))
                         .child(heading_label),
@@ -55355,7 +55354,6 @@ impl VibexWorkbench {
                         .gap_2()
                         .rounded(px(6.0))
                         .bg(background)
-                        .when(is_selected, |this| this.shadow(selected_shadows.clone()))
                         .cursor_pointer()
                         .on_hover(hover_listener(cx.entity_id(), row_id.clone()))
                         .on_click(cx.listener(move |this, _, window, cx| {
@@ -55464,7 +55462,7 @@ impl VibexWorkbench {
                         .into_any_element(),
                 );
             }
-            let body = v_flex().w_full().children(rows);
+            let body = v_flex().w_full().pt(px(4.0)).children(rows);
             let rest = rest_background;
             accordion = accordion.item(move |item| {
                 item.open(open)
@@ -55472,7 +55470,7 @@ impl VibexWorkbench {
                     .bg(rest)
                     .border_b_0()
                     .rounded(px(6.0))
-                    .hover(move |style| style.bg(highlight_background))
+                    .hover(move |style| style.bg(highlight_background).rounded(px(6.0)))
                     .title(heading)
                     .child(body)
             });

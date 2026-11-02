@@ -19874,7 +19874,7 @@ impl MobileApp {
                             .overflow_hidden()
                             .text_ellipsis()
                             .whitespace_nowrap()
-                            .text_size(theme::font_caption())
+                            .text_size(theme::font_body())
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(theme::sidebar_foreground(0.84))
                             .child(heading_label),
@@ -19992,12 +19992,18 @@ impl MobileApp {
                         )
                     })
                     .collect::<Vec<_>>();
-                let body = div().flex().flex_col().children(rows);
+                let body = div().flex().flex_col().pt(px(4.0)).children(rows);
                 accordion = accordion.item(move |item| {
                     item.open(open)
                         .with_size(gpui_component::Size::XSmall)
                         .bg(theme::bg_card())
                         .border_b_0()
+                        .rounded(px(theme::RADIUS_CONTROL))
+                        .hover(move |style| {
+                            style
+                                .bg(theme::row_pressed_bg())
+                                .rounded(px(theme::RADIUS_CONTROL))
+                        })
                         .title(heading)
                         .child(body)
                 });
