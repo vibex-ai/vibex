@@ -1177,6 +1177,11 @@ const ERROR_MESSAGES: &[MessageTranslation] = &[
         zh_tw: "供應商設定識別碼無效",
     },
     MessageTranslation {
+        en: "model interface is not supported by the selected Agent projection descriptor",
+        zh_cn: "该 Agent 不支持所选模型的接口协议",
+        zh_tw: "該 Agent 不支援所選模型的介面協定",
+    },
+    MessageTranslation {
         en: "Invalid Agent id",
         zh_cn: "Agent 标识无效",
         zh_tw: "Agent 識別碼無效",

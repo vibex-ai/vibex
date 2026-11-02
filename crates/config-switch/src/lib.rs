@@ -2361,19 +2361,56 @@ impl ProviderConfigService {
         // Provider with different kinds is what made the same Provider selectable
         // from one and invisible from the other.
         let kind = ProviderKind::Acp;
-        let protocol_endpoint = shared
+        // A shared record may publish one address per protocol, and different
+        // Agents speak different ones. Picking the record's first protocol
+        // blindly pinned every binding to it: an OpenCode Go record starts on
+        // Chat, so a Claude binding was written with an interface Claude does
+        // not implement and only failed later, inside the projection, after the
+        // Provider had already been saved. Choose a protocol this Agent
+        // declares instead.
+        let supported_protocols = agent_supported_wire_protocols(agent_id).unwrap_or_default();
+        let protocol_endpoints = shared
             .endpoints
             .iter()
-            .find(|endpoint| endpoint.wire_protocol_id.is_some());
-        let wire_api = protocol_endpoint
+            .filter(|endpoint| endpoint.wire_protocol_id.is_some());
+        let chosen_endpoint = if supported_protocols.is_empty() {
+            // No descriptor: the Agent's interfaces are unknown, so the record's
+            // own order is the only answer available.
+            protocol_endpoints.clone().next()
+        } else {
+            protocol_endpoints.clone().find(|endpoint| {
+                endpoint.wire_protocol_id.as_deref().is_some_and(|protocol| {
+                    supported_protocols
+                        .iter()
+                        .any(|supported| supported == protocol)
+                })
+            })
+        };
+        if chosen_endpoint.is_none()
+            && !supported_protocols.is_empty()
+            && let Some(endpoint) = protocol_endpoints.clone().next()
+        {
+            // The record publishes protocols, but none of them is one this
+            // Agent can speak. Refusing here names the moment the mismatch
+            // happens instead of storing a binding the projection will reject.
+            return Err(unsupported_model_interface(
+                agent_id,
+                endpoint.wire_protocol_id.as_deref().unwrap_or_default(),
+            ));
+        }
+        let wire_api = chosen_endpoint
             .and_then(|endpoint| endpoint.wire_protocol_id.as_deref())
             .and_then(vibex_core::ProviderModelWireApi::from_wire_protocol_id);
-        let base_url = shared
-            .endpoints
-            .iter()
-            .find(|endpoint| endpoint.wire_protocol_id.is_none())
-            .or_else(|| shared.endpoints.first())
-            .map(|endpoint| endpoint.url.clone());
+        let base_url = chosen_endpoint
+            .map(|endpoint| endpoint.url.clone())
+            .or_else(|| {
+                shared
+                    .endpoints
+                    .iter()
+                    .find(|endpoint| endpoint.wire_protocol_id.is_none())
+                    .or_else(|| shared.endpoints.first())
+                    .map(|endpoint| endpoint.url.clone())
+            });
         let mut provider_options = vibex_core::ProviderOptions::empty();
         if let Some(wire_api) = wire_api {
             provider_options
@@ -6079,21 +6116,32 @@ pub fn codex_runtime_config_from_profile(
     })
 }
 
+/// The wire protocols `agent_id` can speak, from its projection descriptors.
+///
+/// An empty answer means no descriptor is registered for the Agent, which
+/// callers read as "unknown, do not narrow": a shared record may be created
+/// before any Agent claims it.
+fn agent_supported_wire_protocols(agent_id: &AgentId) -> VibexResult<Vec<String>> {
+    let registry = vibex_core::AgentProviderProjectionRegistry::builtin()?;
+    Ok(registry
+        .descriptors_for_agent(agent_id)
+        .flat_map(|descriptor| descriptor.model_interfaces.iter())
+        .map(|interface| interface.wire_protocol_id.clone())
+        .collect())
+}
+
 fn validate_agent_model_interfaces(
     agent_id: &AgentId,
     models: &[ProviderConfiguredModel],
     options: Option<&ProviderOptions>,
 ) -> VibexResult<()> {
-    let registry = vibex_core::AgentProviderProjectionRegistry::builtin()?;
-    let supported_protocols = registry
-        .descriptors_for_agent(agent_id)
-        .flat_map(|descriptor| descriptor.model_interfaces.iter())
-        .map(|interface| interface.wire_protocol_id.as_str())
-        .collect::<HashSet<_>>();
+    let supported_protocols = agent_supported_wire_protocols(agent_id)?;
     if !supported_protocols.is_empty() {
         for model in models {
             if let Some(wire_api) = model.wire_api
-                && !supported_protocols.contains(wire_api.wire_protocol_id())
+                && !supported_protocols
+                    .iter()
+                    .any(|protocol| protocol == wire_api.wire_protocol_id())
             {
                 return Err(unsupported_model_interface(
                     agent_id,

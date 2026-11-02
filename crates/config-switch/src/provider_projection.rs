@@ -10038,9 +10038,9 @@ mod shared_provider_launch_tests {
                 endpoints: vec![vibex_core::ModelProviderEndpoint {
                     id: "api".to_string(),
                     kind: vibex_core::ModelProviderEndpointKind::Api,
-                    url: "https://api.example.com/v1".to_string(),
+                    url: "https://api.example.com".to_string(),
                     wire_protocol_id: Some(
-                        vibex_core::WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS.to_string(),
+                        vibex_core::WIRE_PROTOCOL_ANTHROPIC_MESSAGES.to_string(),
                     ),
                 }],
                 proxy_policy: vibex_core::ModelProviderProxyPolicy::InheritSystem,
@@ -10077,8 +10077,138 @@ mod shared_provider_launch_tests {
         // and the address the shared record published.
         assert_eq!(bound.agent_id.as_str(), "claude");
         assert_eq!(bound.display_name, "Shared");
-        assert!(bound.base_url.is_some());
-        assert!(!bound.configured_models.is_empty());
+        assert_eq!(bound.base_url.as_deref(), Some("https://api.example.com"));
+        assert_eq!(
+            bound.configured_models[0].wire_api,
+            Some(vibex_core::ProviderModelWireApi::AnthropicMessages)
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A multi-protocol record binds through the protocol the target Agent
+    /// speaks, not the one the record happens to list first.
+    ///
+    /// This is the OpenCode Go case: its preset publishes Chat, Responses and
+    /// Messages in that order, and a Claude binding used to be written with
+    /// Chat — an interface Claude cannot speak — so the failure surfaced later
+    /// as `agent_model_interface_unsupported` from the projection.
+    #[test]
+    fn a_multi_protocol_shared_provider_binds_on_the_agents_protocol() {
+        let dir = std::env::temp_dir().join(format!(
+            "vibex-shared-protocol-{}",
+            vibex_core::RequestId::new().as_str()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let service = ProviderConfigService::new(dir.join("state.db"));
+        service.open_connection().unwrap();
+
+        let shared = service
+            .create_model_provider_profile(vibex_core::ModelProviderProfileCreateRequest {
+                display_name: "OpenCode Go".to_string(),
+                vendor_hint: None,
+                endpoints: vec![
+                    vibex_core::ModelProviderEndpoint {
+                        id: "api-openai-chat-completions".to_string(),
+                        kind: vibex_core::ModelProviderEndpointKind::Api,
+                        url: "https://opencode.ai/zen/go/v1".to_string(),
+                        wire_protocol_id: Some(
+                            vibex_core::WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS.to_string(),
+                        ),
+                    },
+                    vibex_core::ModelProviderEndpoint {
+                        id: "api-anthropic-messages".to_string(),
+                        kind: vibex_core::ModelProviderEndpointKind::Api,
+                        url: "https://opencode.ai/zen/go".to_string(),
+                        wire_protocol_id: Some(
+                            vibex_core::WIRE_PROTOCOL_ANTHROPIC_MESSAGES.to_string(),
+                        ),
+                    },
+                ],
+                proxy_policy: vibex_core::ModelProviderProxyPolicy::InheritSystem,
+                credentials: Vec::new(),
+                configured_models: vec![vibex_core::ModelProviderCatalogEntry {
+                    id: "claude-sonnet-4-5".to_string(),
+                    display_name: None,
+                    enabled: true,
+                    capabilities: Default::default(),
+                    metadata: vec![vibex_core::ProviderBindingMetadata {
+                        key: "wireApi".to_string(),
+                        value: vibex_core::WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS.to_string(),
+                    }],
+                }],
+                default_model_id: Some("claude-sonnet-4-5".to_string()),
+                headers: vec![vibex_core::ModelProviderHeaderReference {
+                    name: "x-opencode-session".to_string(),
+                    value: vibex_core::ModelProviderHeaderValue::DynamicVariable(
+                        vibex_core::ModelProviderHeaderVariable::SessionId,
+                    ),
+                    redacted_hint: "dynamic".to_string(),
+                }],
+                status: vibex_core::ModelProviderProfileStatus::Enabled,
+            })
+            .unwrap();
+
+        let bound = service
+            .bind_provider_to_agent(vibex_core::AgentModelProviderBindRequest {
+                provider_profile_id: vibex_core::ProviderProfileId::new(),
+                model_provider_profile_id: Some(shared.id.clone()),
+                agent_id: vibex_core::AgentId::parse("claude").unwrap(),
+                make_default: false,
+            })
+            .unwrap();
+
+        assert_eq!(
+            bound.configured_models[0].wire_api,
+            Some(vibex_core::ProviderModelWireApi::AnthropicMessages)
+        );
+        assert_eq!(bound.base_url.as_deref(), Some("https://opencode.ai/zen/go"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A record that publishes only protocols the Agent cannot speak is refused
+    /// at bind time, not stored as a binding the projection will reject.
+    #[test]
+    fn binding_a_record_with_no_supported_protocol_is_refused() {
+        let dir = std::env::temp_dir().join(format!(
+            "vibex-shared-unsupported-{}",
+            vibex_core::RequestId::new().as_str()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let service = ProviderConfigService::new(dir.join("state.db"));
+        service.open_connection().unwrap();
+
+        let shared = service
+            .create_model_provider_profile(vibex_core::ModelProviderProfileCreateRequest {
+                display_name: "Chat only".to_string(),
+                vendor_hint: None,
+                endpoints: vec![vibex_core::ModelProviderEndpoint {
+                    id: "api-openai-chat-completions".to_string(),
+                    kind: vibex_core::ModelProviderEndpointKind::Api,
+                    url: "https://chat.example.invalid/v1".to_string(),
+                    wire_protocol_id: Some(
+                        vibex_core::WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS.to_string(),
+                    ),
+                }],
+                proxy_policy: vibex_core::ModelProviderProxyPolicy::InheritSystem,
+                credentials: Vec::new(),
+                configured_models: Vec::new(),
+                default_model_id: None,
+                headers: Vec::new(),
+                status: vibex_core::ModelProviderProfileStatus::Enabled,
+            })
+            .unwrap();
+
+        let error = service
+            .bind_provider_to_agent(vibex_core::AgentModelProviderBindRequest {
+                provider_profile_id: vibex_core::ProviderProfileId::new(),
+                model_provider_profile_id: Some(shared.id),
+                agent_id: vibex_core::AgentId::parse("claude").unwrap(),
+                make_default: false,
+            })
+            .unwrap_err();
+        assert_eq!(error.code, "agent_model_interface_unsupported");
 
         std::fs::remove_dir_all(&dir).ok();
     }

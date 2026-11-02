@@ -5637,7 +5637,12 @@ ProviderConfigService::{
   URL", which otherwise relabels an Anthropic Provider as Chat Completions on
   reopen. The v2 record a preset creates carries the same declaration on its
   API endpoint (`wireProtocolId`) and on each Model's `wireApi` metadata, so a
-  saved record is never protocol-less.
+  saved record is never protocol-less. When the form is scoped to an Agent, the
+  starting protocol is the preset's first one that Agent's projection declares —
+  an OpenCode Go preset opened for Claude starts on Messages, not the Chat
+  address it lists first. A shared record that publishes several protocols binds
+  through the one the target Agent speaks, and a record with none of them is
+  refused at bind time rather than stored as a binding the projection rejects.
 - **A plan preset states what its vendor's list cannot.** A plan that resells
   models carries its own `models`, an `only` prefix that keeps a metered model
   from being mistaken for a covered one, and a caveat. A fetch that returns none

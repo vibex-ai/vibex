@@ -6425,6 +6425,21 @@ impl ManagementCenter {
             .as_ref()
             .map(|profile| profile.configured_models.clone())
             .unwrap_or_default();
+        // An agent-owned Profile may still pin a protocol this Agent cannot
+        // speak — a Provider created from a multi-protocol preset before the
+        // preset chose for the Agent. The row belongs to this Agent, so there
+        // is no other Agent's choice to preserve: leaving the protocol unset
+        // lets the Agent's own default apply, which is what the save needs.
+        if !self.projection_editor.supported_wire_apis().is_empty() {
+            for model in &mut self.profile_configured_models {
+                if model
+                    .wire_api
+                    .is_some_and(|wire_api| !self.projection_editor.accepts_wire_api(wire_api))
+                {
+                    model.wire_api = None;
+                }
+            }
+        }
         // The catalogue is not persisted with the profile, so a reopened editor
         // starts with only the configured Models as known rows until the user
         // asks the endpoint again.
@@ -9018,14 +9033,33 @@ impl ManagementCenter {
         self.error = None;
         self.notice = None;
         let provider_options = Some(self.profile_provider_options.clone());
+        // Ask the protocols this Agent can speak first. The loop returns on the
+        // first answer, so a Claude Provider must not be labelled Chat just
+        // because its endpoint also answers there: the saved `wireApi` would
+        // name an interface Claude cannot use.
+        let mut candidates = Vec::new();
+        for wire_api in [
+            vibex_core::ProviderModelWireApi::OpenaiChatCompletions,
+            vibex_core::ProviderModelWireApi::OpenaiResponses,
+            vibex_core::ProviderModelWireApi::AnthropicMessages,
+            vibex_core::ProviderModelWireApi::GoogleGenerativeAi,
+        ] {
+            if self.projection_editor.accepts_wire_api(wire_api) {
+                candidates.push(wire_api);
+            }
+        }
+        for wire_api in [
+            vibex_core::ProviderModelWireApi::OpenaiChatCompletions,
+            vibex_core::ProviderModelWireApi::OpenaiResponses,
+            vibex_core::ProviderModelWireApi::AnthropicMessages,
+            vibex_core::ProviderModelWireApi::GoogleGenerativeAi,
+        ] {
+            if !candidates.contains(&wire_api) {
+                candidates.push(wire_api);
+            }
+        }
         let entity = cx.weak_entity();
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            let candidates = [
-                vibex_core::ProviderModelWireApi::OpenaiChatCompletions,
-                vibex_core::ProviderModelWireApi::OpenaiResponses,
-                vibex_core::ProviderModelWireApi::AnthropicMessages,
-                vibex_core::ProviderModelWireApi::GoogleGenerativeAi,
-            ];
             for wire_api in candidates {
                 let probe = vibex_core::ProviderConfiguredModel {
                     id: "__vibex_probe__".to_string(),
@@ -14934,13 +14968,46 @@ impl ManagementCenter {
                 capabilities: Default::default(),
             })
             .collect::<Vec<_>>();
-        let mut endpoints = vec![vibex_core::ModelProviderEndpoint {
-            id: "api".to_string(),
-            kind: vibex_core::ModelProviderEndpointKind::Api,
-            url: base_url,
-            wire_protocol_id: created_wire_api
-                .map(|wire_api| wire_api.wire_protocol_id().to_string()),
-        }];
+        // A preset publishes one address per protocol, and the page only shows
+        // the default one. Writing just that address made the saved record
+        // unable to answer an Agent that speaks another protocol: binding it to
+        // Claude then failed with `agent_model_interface_unsupported`. Keep the
+        // addresses the preset declared, with the edited field winning for the
+        // protocol it belongs to.
+        let mut endpoints = Vec::new();
+        let regional_preset = self
+            .provider_create_preset
+            .as_ref()
+            .map(|preset| preset.with_region(self.provider_create_preset_region.as_deref()));
+        if let Some(preset) = regional_preset.as_ref() {
+            for (protocol, url) in &preset.endpoints {
+                let Some(wire_api) =
+                    vibex_core::ProviderModelWireApi::from_wire_protocol_id(protocol)
+                else {
+                    continue;
+                };
+                let url = if Some(wire_api) == created_wire_api {
+                    base_url.clone()
+                } else {
+                    url.clone()
+                };
+                endpoints.push(vibex_core::ModelProviderEndpoint {
+                    id: format!("api-{}", wire_api.wire_protocol_id().replace('_', "-")),
+                    kind: vibex_core::ModelProviderEndpointKind::Api,
+                    url,
+                    wire_protocol_id: Some(wire_api.wire_protocol_id().to_string()),
+                });
+            }
+        }
+        if endpoints.is_empty() {
+            endpoints.push(vibex_core::ModelProviderEndpoint {
+                id: "api".to_string(),
+                kind: vibex_core::ModelProviderEndpointKind::Api,
+                url: base_url,
+                wire_protocol_id: created_wire_api
+                    .map(|wire_api| wire_api.wire_protocol_id().to_string()),
+            });
+        }
         for (id, kind, url) in [
             (
                 "models",
@@ -26157,6 +26224,30 @@ impl ManagementCenter {
         cx.notify();
     }
 
+    /// The protocol a preset should start on for the Agent this form is for.
+    ///
+    /// The preset's own order is only a fallback. An Agent can speak just the
+    /// interfaces its projection declares, and starting a Claude Provider on
+    /// Chat Completions is what made "Add and verify" fail with
+    /// `agent_model_interface_unsupported` after the whole form was filled in.
+    fn preset_start_wire_api(
+        &self,
+        preset: &vibex_core::ProviderPreset,
+    ) -> Option<vibex_core::ProviderModelWireApi> {
+        [
+            vibex_core::ProviderModelWireApi::OpenaiChatCompletions,
+            vibex_core::ProviderModelWireApi::OpenaiResponses,
+            vibex_core::ProviderModelWireApi::AnthropicMessages,
+            vibex_core::ProviderModelWireApi::GoogleGenerativeAi,
+        ]
+        .into_iter()
+        .find(|wire_api| {
+            preset.endpoint_for(*wire_api).is_some()
+                && self.projection_editor.accepts_wire_api(*wire_api)
+        })
+        .or_else(|| preset.default_wire_api())
+    }
+
     /// Fills the draft from a built-in preset.
     ///
     /// The protocol is written explicitly into `provider_options["wireApi"]`
@@ -26188,7 +26279,9 @@ impl ManagementCenter {
         self.apply_preset_headers(&preset, window, cx);
         // The preset's models are added as declared entries, which is what a
         // manual add produces too: their capabilities stay empty rather than
-        // being guessed from the id.
+        // being guessed from the id. The protocol follows the Agent, not the
+        // preset's own order, so the saved record and the binding agree.
+        let start_wire_api = self.preset_start_wire_api(&preset);
         self.profile_configured_models = preset
             .models
             .iter()
@@ -26196,7 +26289,7 @@ impl ManagementCenter {
                 id: model.clone(),
                 display_name: None,
                 enabled: true,
-                wire_api: preset.default_wire_api(),
+                wire_api: start_wire_api,
                 capabilities: Default::default(),
             })
             .collect();
@@ -26259,7 +26352,8 @@ impl ManagementCenter {
         if let Some(catalog_id) = preset.catalog_id.as_deref() {
             options = with_provider_option(options, "catalogId", Some(catalog_id.to_string()));
         }
-        if let Some(wire_api) = preset.default_wire_api() {
+        let start_wire_api = self.preset_start_wire_api(preset);
+        if let Some(wire_api) = start_wire_api {
             options = with_provider_option(
                 options,
                 "wireApi",
@@ -26278,10 +26372,7 @@ impl ManagementCenter {
                 );
             }
         }
-        if let Some(url) = preset
-            .default_wire_api()
-            .and_then(|wire_api| preset.endpoint_for(wire_api))
-        {
+        if let Some(url) = start_wire_api.and_then(|wire_api| preset.endpoint_for(wire_api)) {
             self.profile_base_url
                 .update(cx, |state, cx| state.set_value(url.to_string(), window, cx));
         }
@@ -41351,7 +41442,7 @@ fn provider_source_section(
                         .text_color(cx.theme().muted_foreground)
                         .child(Icon::default().path(icon).size(px(13.0))),
                 )
-                .child(div().flex_none().text_sm().font_semibold().child(title)),
+                .child(div().flex_none().text_base().font_semibold().child(title)),
         )
         .child(body)
         .into_any_element()
@@ -43922,7 +44013,17 @@ mod tests {
     #[gpui::test]
     fn opencode_presets_start_with_the_session_header(cx: &mut gpui::TestAppContext) {
         cx.update(gpui_component::init);
-        let (center, cx) = cx.add_window_view(ManagementCenter::new);
+        cx.update(hint_layer::init);
+        // Applying a preset announces it through the hint layer, which reads
+        // the window's Base Root; a bare view has none.
+        let mut built = None;
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            let center = cx.new(|cx| ManagementCenter::new(window, cx));
+            let root = gpui_base::Root::new(center.clone(), window, cx);
+            built = Some(center);
+            root
+        });
+        let center = built.expect("the management window builds its center");
         let handle = cx.windows().pop().expect("test window");
 
         for preset_id in [
@@ -43978,6 +44079,62 @@ mod tests {
             let stored: serde_json::Value = serde_json::from_str(&raw).unwrap();
             assert_eq!(stored["x-opencode-session"]["variable"], "session_id");
             assert!(center.provider_create_headers_open);
+        });
+    }
+
+    /// A preset's protocol follows the Agent, so a Claude Provider does not
+    /// start on the Chat address the preset happens to list first.
+    #[gpui::test]
+    fn preset_protocol_follows_the_agents_interfaces(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        cx.update(hint_layer::init);
+        // The preset announces itself through the hint layer, which reads the
+        // window's Base Root; a bare view has none.
+        let mut built = None;
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            let center = cx.new(|cx| ManagementCenter::new(window, cx));
+            let root = gpui_base::Root::new(center.clone(), window, cx);
+            built = Some(center);
+            root
+        });
+        let center = built.expect("the management window builds its center");
+        let handle = cx.windows().pop().expect("test window");
+        center.update(cx, |center, _| {
+            center.selected_agent_id = Some("claude".to_string());
+            let mut capability = projection_capability_with_models();
+            capability.agent_id = AgentId::parse("claude").unwrap();
+            capability.provider_control = vibex_core::AgentProviderControl::Environment {
+                base_url_key: Some("ANTHROPIC_BASE_URL".to_string()),
+            };
+            capability.model_interfaces = vec![vibex_core::AgentModelInterfaceDescriptor {
+                wire_protocol_id: vibex_core::WIRE_PROTOCOL_ANTHROPIC_MESSAGES.to_string(),
+                sdk_adapter_id: None,
+                transport: "https".to_string(),
+                integration_kind: vibex_core::AgentModelInterfaceIntegrationKind::Direct,
+                user_selectable: false,
+                process_scoped: false,
+            }];
+            center.projection_editor.replace_capability(capability);
+        });
+
+        let _ = cx.update_window(handle, |_, window, cx| {
+            center.update(cx, |center, cx| {
+                center.apply_provider_preset(vibex_core::PROVIDER_PRESET_OPENCODE_GO, window, cx);
+            });
+        });
+
+        center.read_with(cx, |center, cx| {
+            assert_eq!(
+                center.profile_base_url.read(cx).value().trim(),
+                "https://opencode.ai/zen/go"
+            );
+            let wire_api = center
+                .profile_provider_options
+                .entries
+                .iter()
+                .find(|entry| entry.key == "wireApi")
+                .map(|entry| entry.value.as_str());
+            assert_eq!(wire_api, Some(vibex_core::WIRE_PROTOCOL_ANTHROPIC_MESSAGES));
         });
     }
 
@@ -47402,14 +47559,22 @@ mod tests {
             save.contains("key: \"wireApi\""),
             "the created Models carry the protocol the page recorded"
         );
-        let api_endpoint = save
-            .split_once("let mut endpoints = vec![vibex_core::ModelProviderEndpoint {")
-            .and_then(|(_, tail)| tail.split_once("}];"))
+        let endpoints = save
+            .split_once("let mut endpoints = Vec::new();")
+            .and_then(|(_, tail)| tail.split_once("if endpoints.is_empty() {"))
             .map(|(body, _)| body)
-            .expect("the page should build one API endpoint");
+            .expect("the page should build the preset's API endpoints");
         assert!(
-            api_endpoint.contains("created_wire_api"),
-            "the saved address must name the preset's protocol"
+            endpoints.contains("preset.endpoints"),
+            "every protocol the preset publishes must reach the record"
+        );
+        assert!(
+            endpoints.contains("created_wire_api"),
+            "the edited address must name the preset's protocol"
+        );
+        assert!(
+            endpoints.contains("wire_protocol_id: Some(wire_api.wire_protocol_id().to_string())"),
+            "the saved address must carry its protocol"
         );
     }
 

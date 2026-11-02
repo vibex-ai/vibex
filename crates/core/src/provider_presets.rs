@@ -165,6 +165,48 @@ impl ProviderPreset {
         .find(|wire_api| self.endpoint_for(*wire_api).is_some())
     }
 
+    /// The protocol a new Provider for `agent_id` should start on.
+    ///
+    /// A preset may publish several addresses, but an Agent can only speak the
+    /// interfaces its projection descriptor declares. Starting on the preset's
+    /// own first protocol made a Claude Provider open on Chat Completions — an
+    /// interface Claude does not implement — and the save then failed with
+    /// `agent_model_interface_unsupported` after the user had already filled in
+    /// the rest of the form. The preset's preference order is kept among the
+    /// protocols the Agent actually supports.
+    ///
+    /// An Agent with no registered descriptor (a shared record, or one whose
+    /// projection is not known here) keeps the preset's own default: nothing
+    /// says it cannot speak it.
+    pub fn wire_api_for_agent(&self, agent_id: &crate::AgentId) -> Option<ProviderModelWireApi> {
+        let supported = crate::AgentProviderProjectionRegistry::builtin()
+            .map(|registry| {
+                registry
+                    .descriptors_for_agent(agent_id)
+                    .flat_map(|descriptor| descriptor.model_interfaces.iter())
+                    .map(|interface| interface.wire_protocol_id.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if supported.is_empty() {
+            return self.default_wire_api();
+        }
+        [
+            ProviderModelWireApi::OpenaiChatCompletions,
+            ProviderModelWireApi::AnthropicMessages,
+            ProviderModelWireApi::OpenaiResponses,
+            ProviderModelWireApi::GoogleGenerativeAi,
+        ]
+        .into_iter()
+        .find(|wire_api| {
+            self.endpoint_for(*wire_api).is_some()
+                && supported
+                    .iter()
+                    .any(|protocol| protocol.as_str() == wire_api.wire_protocol_id())
+        })
+        .or_else(|| self.default_wire_api())
+    }
+
     /// Applies a region's endpoint overrides.
     pub fn with_region(&self, region_id: Option<&str>) -> Self {
         let Some(region_id) = region_id else {
@@ -255,8 +297,10 @@ impl ProviderPreset {
         profile.agent_id = agent_id.clone();
         profile.display_name = self.display_name.clone();
         profile.status = crate::ProviderProfileStatus::Enabled;
-        profile.base_url = self
-            .default_wire_api()
+        // The draft belongs to one Agent, so its protocol has to be one that
+        // Agent can speak; the preset's own default is only the fallback.
+        let wire_api = self.wire_api_for_agent(agent_id);
+        profile.base_url = wire_api
             .and_then(|wire_api| self.endpoint_for(wire_api))
             .map(str::to_string);
         profile.default_model = self.models.first().cloned();
@@ -267,12 +311,12 @@ impl ProviderPreset {
                 id: model.clone(),
                 display_name: None,
                 enabled: true,
-                wire_api: self.default_wire_api(),
+                wire_api,
                 capabilities: crate::ProviderModelCapabilities::default(),
             })
             .collect();
         let mut options = crate::ProviderOptions::empty();
-        if let Some(wire_api) = self.default_wire_api() {
+        if let Some(wire_api) = wire_api {
             options.entries.push(crate::ProviderBindingMetadata {
                 key: "wireApi".to_string(),
                 value: wire_api.wire_protocol_id().to_string(),
@@ -1741,6 +1785,72 @@ mod tests {
         );
         assert_eq!(
             preset.default_wire_api(),
+            Some(ProviderModelWireApi::OpenaiChatCompletions)
+        );
+    }
+
+    /// The protocol a preset starts on follows the Agent it is created for.
+    ///
+    /// OpenCode Go publishes Chat, Responses and Messages, and its own order
+    /// starts on Chat. Claude speaks only Messages, so a draft built from the
+    /// preset for Claude has to start there; otherwise the saved record pins a
+    /// protocol the Agent cannot use and the save fails with
+    /// `agent_model_interface_unsupported`.
+    #[test]
+    fn a_preset_starts_on_a_protocol_the_agent_speaks() {
+        let opencode_go = provider_preset(PROVIDER_PRESET_OPENCODE_GO).unwrap();
+        assert_eq!(
+            opencode_go.default_wire_api(),
+            Some(ProviderModelWireApi::OpenaiChatCompletions)
+        );
+
+        let claude = crate::AgentId::parse("claude").unwrap();
+        assert_eq!(
+            opencode_go.wire_api_for_agent(&claude),
+            Some(ProviderModelWireApi::AnthropicMessages)
+        );
+        let draft = opencode_go.draft_profile(&claude);
+        assert_eq!(
+            draft.base_url.as_deref(),
+            opencode_go.endpoint_for(ProviderModelWireApi::AnthropicMessages)
+        );
+        assert!(draft.provider_options.entries.iter().any(|entry| {
+            entry.key == "wireApi"
+                && entry.value == ProviderModelWireApi::AnthropicMessages.wire_protocol_id()
+        }));
+
+        // A preset that ships its own model list stamps the same protocol on
+        // every row, so the saved record does not disagree with its option.
+        let deepseek = provider_preset(PROVIDER_PRESET_DEEPSEEK).unwrap();
+        let draft = deepseek.draft_profile(&claude);
+        assert!(!draft.configured_models.is_empty());
+        assert!(
+            draft
+                .configured_models
+                .iter()
+                .all(|model| model.wire_api == Some(ProviderModelWireApi::AnthropicMessages))
+        );
+
+        // An Agent that speaks Chat keeps the preset's own default.
+        let harness = crate::AgentId::parse("deepseek-harness").unwrap();
+        assert_eq!(
+            opencode_go.wire_api_for_agent(&harness),
+            Some(ProviderModelWireApi::OpenaiChatCompletions)
+        );
+
+        // A preset whose only address the Agent cannot speak still keeps a
+        // protocol instead of dropping it; the binding check reports it later.
+        let chat_only = preset(
+            "chat-only",
+            "Chat only",
+            &[(
+                crate::WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS,
+                "https://chat.example.invalid",
+            )],
+            &["m"],
+        );
+        assert_eq!(
+            chat_only.wire_api_for_agent(&claude),
             Some(ProviderModelWireApi::OpenaiChatCompletions)
         );
     }
