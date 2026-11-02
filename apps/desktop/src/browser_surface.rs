@@ -2318,8 +2318,9 @@ impl BrowserSurface {
             .px_2()
             .gap_2()
             .items_center()
-            .border_b_1()
-            .border_color(cx.theme().border)
+            // No hairline under the bar: the address bar and the page it opens
+            // are one panel, and a border there cuts the toolbar off from the
+            // page instead of letting them read as one surface.
             .bg(cx.theme().background)
             .child(
                 Button::new("browser-back")

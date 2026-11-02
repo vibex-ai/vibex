@@ -9019,19 +9019,9 @@ impl CodeWorkbench {
                 });
         // The strip paints the plate the folder tabs are read against; a drag
         // over the tab group replaces it with the drop wash so the whole strip
-        // lights up as one target. A browser tab is the live page's own tab,
-        // though: its strip takes the page color as well, so the tab, the
-        // browser toolbar and the page read as one surface instead of a gray
-        // band ending in an edge directly above the toolbar.
-        let browser_tab_active = active.as_deref().is_some_and(|active_id| {
-            tabs.iter().any(|tab| {
-                tab.id == active_id && matches!(&tab.target, PreviewTarget::Browser { .. })
-            })
-        });
+        // lights up as one target.
         let tab_strip_tone = if tab_group_drop_active {
             cx.theme().primary.opacity(0.10)
-        } else if browser_tab_active {
-            cx.theme().background
         } else {
             theme::tab_strip_plate(cx.theme())
         };
