@@ -24809,36 +24809,6 @@ impl ManagementCenter {
                 )
                 .into_any_element();
         }
-        // A new Provider is always shared. When the dialog came from an Agent
-        // card, the same save also enables it for that Agent; saying both keeps
-        // the form from reading as private to the Agent.
-        let shared_scope_note = self.editing_profile_id.is_none().then(|| {
-            let message = if self.provider_editor_bind_agent {
-                management_locale_text(
-                    "This Provider is saved as a shared record and enabled for this Agent. Other Agents can bind it later.",
-                    "该供应商会保存为共享记录，并启用给当前 Agent；其他 Agent 之后也可以绑定它。",
-                    "該供應商會儲存為共用記錄，並啟用給目前 Agent；其他 Agent 之後也可以綁定它。",
-                )
-            } else {
-                management_locale_text(
-                    "This Provider is saved as a shared record. Bind it to Agents from the Providers page.",
-                    "该供应商会保存为共享记录；可在供应商页将它绑定给 Agent。",
-                    "該供應商會儲存為共用記錄；可在供應商頁將它綁定給 Agent。",
-                )
-            };
-            div()
-                .w_full()
-                .min_w_0()
-                .rounded(px(6.0))
-                .border_1()
-                .border_color(cx.theme().info)
-                .px_2()
-                .py_1p5()
-                .text_xs()
-                .text_color(cx.theme().info)
-                .child(message)
-                .into_any_element()
-        });
         let saving = matches!(
             self.mutation,
             Some(ManagementMutation::ProfileCreate) | Some(ManagementMutation::ProfileUpdate(_))
@@ -24922,9 +24892,6 @@ impl ManagementCenter {
         };
 
         let mut body = v_flex().w_full().min_h_0().flex_1();
-        if let Some(note) = shared_scope_note {
-            body = body.child(div().w_full().flex_none().pb_2().child(note));
-        }
         if wide {
             // The band is bounded so an expanded protocol override cannot eat
             // the height the two panes need, and it scrolls on its own if it
