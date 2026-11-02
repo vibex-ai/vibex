@@ -1387,6 +1387,10 @@ const OPENROUTER_PROVIDER_BRANDS: &[(&str, BrandAsset)] = &[
         "lm-studio",
         themed_model_asset("icons/vibex/model-providers/lmstudio.svg"),
     ),
+    (
+        "magpie",
+        themed_model_asset("icons/vibex/model-providers/magpie.svg"),
+    ),
 ];
 
 // Longer prefixes handle model names whose first keyword is shared by providers.
@@ -1988,6 +1992,7 @@ const MODEL_PROVIDER_ASSETS: &[(&str, &[u8])] = &[
     bundled_model_provider_asset!("fireworks.svg"),
     bundled_model_provider_asset!("github.svg"),
     bundled_model_provider_asset!("lmstudio.svg"),
+    bundled_model_provider_asset!("magpie.svg"),
     bundled_model_provider_asset!("ollama.svg"),
     bundled_model_provider_asset!("opencode.svg"),
     bundled_model_provider_asset!("siliconflow.svg"),
@@ -3349,7 +3354,7 @@ mod tests {
         // A count, not a claim about which marks exist: the table grows as a
         // vendor's logo is added, and this test's subject is that every entry
         // is a rasterizable vector rather than a count.
-        assert_eq!(MODEL_PROVIDER_ASSETS.len(), 95);
+        assert_eq!(MODEL_PROVIDER_ASSETS.len(), 96);
         for (path, bytes) in MODEL_PROVIDER_ASSETS {
             let source = std::str::from_utf8(bytes).expect("provider SVG should be UTF-8");
             assert!(source.contains("<svg"), "{path} should be an SVG");
