@@ -39,8 +39,9 @@ use gpui_component::{
     form::{Field, Form},
     h_flex,
     input::{
-        Editor, EditorState, Enter as InputEnter, Input, InputEvent, InputState,
-        MoveLeft as InputMoveLeft, MoveRight as InputMoveRight, Textarea, TextareaState,
+        Editor, EditorState, Enter as InputEnter, Escape as InputEscape, Input, InputEvent,
+        InputState, MoveLeft as InputMoveLeft, MoveRight as InputMoveRight, Textarea,
+        TextareaState,
     },
     menu::{DropdownMenu as _, PopupMenuItem},
     notification::NotificationType,
@@ -25410,6 +25411,18 @@ impl ManagementCenter {
         });
     }
 
+    /// Moves the keyboard from the chooser into the form it just opened.
+    ///
+    /// The search field unmounts with the chooser, so leaving it focused leaves
+    /// the window with a focus handle that is not on the frame: key events,
+    /// Escape included, then go nowhere until a field is clicked.
+    fn focus_profile_form(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let name = self.profile_name.clone();
+        cx.defer_in(window, move |_, window, cx| {
+            name.read(cx).focus_handle(cx).focus(window, cx);
+        });
+    }
+
     /// What Enter means in this dialog: a choice on the picker step, a save on
     /// the Provider form.
     fn confirm_profile_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -26265,6 +26278,7 @@ impl ManagementCenter {
         self.provider_preset_picker = false;
         // The form is one step past the chooser, so it offers the way back.
         self.provider_form_from_picker = true;
+        self.focus_profile_form(window, cx);
         cx.notify();
     }
 
@@ -26283,6 +26297,7 @@ impl ManagementCenter {
         self.provider_preset_query
             .update(cx, |state, cx| state.set_value("", window, cx));
         self.reset_profile_draft_fields(window, cx);
+        self.focus_profile_form(window, cx);
         self.navigation.mark_dirty(ManagementSection::Agents, false);
         cx.notify();
     }
@@ -35899,9 +35914,20 @@ impl Render for ManagementProfileDialog {
             }
             return div().size_full().into_any_element();
         }
-        self.center.update(cx, |center, cx| {
+        let content = self.center.update(cx, |center, cx| {
             center.render_profile_editor_dialog(window, cx)
-        })
+        });
+        // A focused field may claim Escape for itself. Re-dispatch it as the
+        // dialog's Cancel from here — still on the dispatch path — so the key
+        // keeps one meaning whichever control holds the keyboard.
+        div()
+            .size_full()
+            .on_action(cx.listener(|_, _: &InputEscape, window, cx| {
+                cx.stop_propagation();
+                window.dispatch_action(Box::new(gpui_base::actions::Cancel), cx);
+            }))
+            .child(content)
+            .into_any_element()
     }
 }
 
@@ -35925,9 +35951,19 @@ impl Render for ManagementRouteGroupDialog {
             }
             return div().size_full().into_any_element();
         }
-        self.center.update(cx, |center, cx| {
+        let content = self.center.update(cx, |center, cx| {
             center.render_route_group_editor(window, cx)
-        })
+        });
+        // Same as the Provider host: keep Escape meaning "cancel this step"
+        // even when a field handled it first.
+        div()
+            .size_full()
+            .on_action(cx.listener(|_, _: &InputEscape, window, cx| {
+                cx.stop_propagation();
+                window.dispatch_action(Box::new(gpui_base::actions::Cancel), cx);
+            }))
+            .child(content)
+            .into_any_element()
     }
 }
 
@@ -49238,6 +49274,129 @@ mod gateway_surface_tests {
             cx.update(|window, cx| window.has_active_dialog(cx)),
             "the custom form is the same overlay, not a second one"
         );
+    }
+
+    /// Escape on the Provider form is the Back button: it returns to the
+    /// chooser inside the same overlay instead of closing the flow.
+    #[gpui::test]
+    fn escape_returns_to_the_chooser_from_the_provider_form(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let mut built = None;
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            let center = cx.new(|cx| ManagementCenter::new(window, cx));
+            let root = gpui_base::Root::new(center.clone(), window, cx);
+            built = Some(center);
+            root
+        });
+        let center = built.expect("the management window builds its center");
+        cx.update(|window, cx| {
+            center.update(cx, |center, cx| {
+                center.provider_preset_picker = true;
+                center.profile_editor_open = true;
+                center.present_profile_editor_dialog(window, cx);
+            });
+            let _ = window.draw(cx);
+        });
+        cx.update(|window, cx| {
+            center.update(cx, |center, cx| center.choose_custom_provider(window, cx));
+            let _ = window.draw(cx);
+        });
+        center.read_with(cx, |center, _| {
+            assert!(!center.provider_preset_picker);
+            assert!(center.provider_form_from_picker);
+        });
+
+        // The reported case: the keyboard is in a text field, which binds
+        // Escape to its own action and used to shadow the dialog's cancel.
+        cx.update(|window, cx| {
+            center.update(cx, |center, cx| {
+                center
+                    .profile_name
+                    .read(cx)
+                    .focus_handle(cx)
+                    .focus(window, cx);
+            });
+            let _ = window.draw(cx);
+        });
+        assert!(
+            cx.update(|window, cx| {
+                center.read_with(cx, |center, cx| {
+                    center
+                        .profile_name
+                        .read(cx)
+                        .focus_handle(cx)
+                        .is_focused(window)
+                })
+            }),
+            "the test must reproduce a focused text field"
+        );
+
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+
+        center.read_with(cx, |center, _| {
+            assert!(
+                center.provider_preset_picker,
+                "escape must step back to the chooser"
+            );
+            assert!(!center.provider_form_from_picker);
+            assert!(center.profile_editor_open, "the overlay stays open");
+        });
+        assert!(
+            cx.update(|window, cx| window.has_active_dialog(cx)),
+            "the chooser keeps the same overlay"
+        );
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        let list = cx
+            .debug_bounds("provider-picker-list")
+            .expect("the chooser is back on screen, not only in the state");
+        assert!(f32::from(list.size.height) > 120.0);
+    }
+
+    /// The same step-back through the real entry point: the Agent card's
+    /// "Add configuration" opens the chooser, a preset opens the form, and
+    /// Escape returns to the chooser.
+    #[gpui::test]
+    fn escape_returns_from_a_preset_form_opened_by_the_agent_card(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        cx.update(crate::hint_layer::init);
+        let mut built = None;
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            let center = cx.new(|cx| ManagementCenter::new(window, cx));
+            let root = gpui_base::Root::new(center.clone(), window, cx);
+            built = Some(center);
+            root
+        });
+        let center = built.expect("the management window builds its center");
+        cx.update(|window, cx| {
+            center.update(cx, |center, cx| {
+                center.open_profile_creator_from(window, ProviderPickerOrigin::AgentCard, cx);
+            });
+            let _ = window.draw(cx);
+        });
+        cx.update(|window, cx| {
+            center.update(cx, |center, cx| {
+                center.choose_provider_preset("deepseek", window, cx);
+            });
+            let _ = window.draw(cx);
+        });
+        center.read_with(cx, |center, _| {
+            assert!(!center.provider_preset_picker);
+            assert!(center.provider_form_from_picker);
+        });
+
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        center.read_with(cx, |center, _| {
+            assert!(
+                center.provider_preset_picker,
+                "escape must step back to the chooser"
+            );
+            assert!(!center.provider_form_from_picker);
+        });
+        assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
     }
 
     /// Stepping through the flow does not replay a drop-in.
