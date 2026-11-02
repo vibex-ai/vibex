@@ -31389,7 +31389,7 @@ impl ManagementCenter {
                         .flex_1()
                         .truncate()
                         .text_sm()
-                        .font_medium()
+                        .font_semibold()
                         .child(group.profile.display_name.clone()),
                 )
                 .child(
@@ -31432,10 +31432,21 @@ impl ManagementCenter {
                 .collect::<Vec<_>>();
             let body = open.then(|| {
                 v_flex()
+                    .relative()
                     .w_full()
                     .min_w_0()
                     .gap_0p5()
+                    .pt(px(2.0))
                     .pb_2()
+                    .child(
+                        div()
+                            .absolute()
+                            .left(px(20.0))
+                            .top(px(2.0))
+                            .bottom(px(6.0))
+                            .w(px(1.0))
+                            .bg(cx.theme().border.opacity(0.55)),
+                    )
                     .children(rows)
                     .into_any_element()
             });
@@ -31555,7 +31566,8 @@ impl ManagementCenter {
             .min_w_0()
             .items_center()
             .gap_2()
-            .px_2()
+            .pl(px(40.0))
+            .pr_2()
             .py_1p5()
             .rounded(cx.theme().radius)
             .when(!disabled, |row| {
@@ -53044,6 +53056,23 @@ mod gateway_surface_tests {
         assert!(
             source.contains("fn palette_model_icon("),
             "model rows carry the model's own icon"
+        );
+        let row = source
+            .split_once("    fn render_route_group_palette_row(")
+            .and_then(|(_, tail)| tail.split_once("    fn palette_model_icon("))
+            .map(|(body, _)| body)
+            .expect("the palette row should remain inspectable");
+        assert!(
+            row.contains(".pl(px(40.0))"),
+            "model rows indent under the Provider name, not the Provider mark"
+        );
+        assert!(
+            palette.contains(".left(px(20.0))"),
+            "a guide line ties the indented models to their Provider"
+        );
+        assert!(
+            palette.contains(".font_semibold()"),
+            "the Provider heading outweighs the model rows"
         );
         assert!(
             !palette.contains("palette = palette.child("),
