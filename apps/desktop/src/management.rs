@@ -24,6 +24,7 @@ use gpui::{
 use gpui_component::{
     ActiveTheme as _, ColorName, Disableable as _, ElementExt as _, Icon, IconName,
     Selectable as _, Sizable as _, Size, StyledExt as _, Theme, WindowExt as _,
+    accordion::Accordion,
     alert::Alert,
     animation::{EffectTransition as Transition, ease_out_cubic},
     button::{Button, ButtonGroup, ButtonVariant, ButtonVariants as _, Toggle},
@@ -1664,6 +1665,12 @@ pub struct ManagementCenter {
     route_group_recommendations_resize: Option<ManagementRouteGroupSuggestionsResizeState>,
     /// The draft's search term for the model palette.
     route_group_model_query: Entity<InputState>,
+    /// The Provider groups the model palette has open.
+    ///
+    /// The palette lists Providers first and models under them, the same shape
+    /// as the Agent's model picker. This keeps the reader's open groups across
+    /// renders; a search opens every matching group without rewriting it.
+    route_group_palette_open_groups: BTreeSet<String>,
     /// The draft's patience budget, in seconds. Empty disables retries.
     route_group_patience: Entity<InputState>,
     /// Hide the group's model from pickers while keeping it callable by id.
@@ -2404,9 +2411,9 @@ impl ManagementCenter {
         });
         let route_group_model_query = cx.new(|cx| {
             InputState::new(window, cx).placeholder(management_locale_text(
-                "Search models",
-                "搜索模型",
-                "搜尋模型",
+                "Search Providers or models",
+                "搜索供应商或模型",
+                "搜尋供應商或模型",
             ))
         });
         let route_group_patience = cx.new(|cx| {
@@ -2698,6 +2705,11 @@ impl ManagementCenter {
                     return;
                 }
                 cx.notify();
+            }),
+            cx.subscribe(&route_group_model_query, |_, _, event: &InputEvent, cx| {
+                if management_input_changed(event) {
+                    cx.notify();
+                }
             }),
             cx.subscribe(&provider_preset_query, |this, _, event: &InputEvent, cx| {
                 if !management_input_changed(event) {
@@ -3248,6 +3260,7 @@ impl ManagementCenter {
                 MANAGEMENT_ROUTE_GROUP_SUGGESTIONS_DEFAULT_HEIGHT,
             route_group_recommendations_resize: None,
             route_group_model_query,
+            route_group_palette_open_groups: BTreeSet::new(),
             route_group_patience,
             route_group_unlists: false,
             route_group_sink: false,
@@ -29000,15 +29013,12 @@ impl ManagementCenter {
         }
     }
 
-    /// Cycles a member's weight through the small set a picker offers.
-    fn cycle_route_group_model_weight(&mut self, index: usize, cx: &mut Context<Self>) {
-        if let Some(member) = self.route_group_model_members.get_mut(index) {
-            member.weight = match member.weight {
-                1 => 2,
-                2 => 3,
-                3 => 5,
-                _ => 1,
-            };
+    /// Sets a member's weight from the menu that names every supported value.
+    fn set_route_group_model_weight(&mut self, index: usize, weight: u32, cx: &mut Context<Self>) {
+        if let Some(member) = self.route_group_model_members.get_mut(index)
+            && member.weight != weight
+        {
+            member.weight = weight;
             cx.notify();
         }
     }
@@ -30921,55 +30931,18 @@ impl ManagementCenter {
     /// element local adds to the render frame, and one frame large enough to
     /// overflow a test thread's stack would overflow a short UI stack too.
     fn render_model_group_palette(&mut self, pending: bool, cx: &mut Context<Self>) -> AnyElement {
-        let mut rows = v_flex().w_full().gap_1();
-        // Templates and suggestions are drafts, not saves. The copy says so
-        // because a template that silently replaced a user's own order would be
-        // worse than no template at all.
-        let mut templates = h_flex().w_full().flex_wrap().items_center().gap_1();
-        templates = templates.child(
-            div()
-                .text_xs()
-                .text_color(cx.theme().muted_foreground)
-                .child(management_locale_text(
-                    "Start from:",
-                    "从模板开始：",
-                    "從模板開始：",
-                )),
-        );
-        for template in ModelGroupTemplate::ALL {
-            templates =
-                templates.child(
-                    Button::new(SharedString::from(format!(
-                        "management-model-group-template-{:?}",
-                        template
-                    )))
-                    .xsmall()
-                    .outline()
-                    .label(template.label())
-                    .disabled(pending)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.apply_model_group_template(template, cx)
-                    })),
-                );
-        }
-        rows = rows.child(
-            v_flex()
-                .w_full()
-                .gap_1()
-                .child(templates)
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(management_locale_text(
-                            "A template replaces the pipeline as a draft; nothing is saved until you press Save.",
-                            "模板只会替换草稿中的管线，按“保存”前不会写入。",
-                            "模板只會替換草稿中的管線，按「儲存」前不會寫入。",
-                        )),
-                ),
-        );
+        let query = self
+            .route_group_model_query
+            .read(cx)
+            .value()
+            .trim()
+            .to_lowercase();
+        let searching = !query.is_empty();
+        let member_count = self.route_group_model_members.len();
+
         // Same-model suggestions: a model several Providers serve is the
-        // natural model-group candidate, and adding all of them is one click.
+        // natural candidate for a group. The menu adds every Provider that
+        // serves it, in Provider order, exactly as the old pill row did.
         let mut by_model = BTreeMap::<String, Vec<vibex_core::ModelProviderProfileId>>::new();
         for profile in &self.providers {
             if profile.status != vibex_core::ModelProviderProfileStatus::Enabled {
@@ -30989,61 +30962,27 @@ impl ManagementCenter {
         let mut suggestions = by_model
             .into_iter()
             .filter(|(_, providers)| providers.len() >= 2)
-            .take(3)
             .collect::<Vec<_>>();
         suggestions
             .sort_by(|left, right| right.1.len().cmp(&left.1.len()).then(left.0.cmp(&right.0)));
-        if !suggestions.is_empty() {
-            let mut suggestion_row = h_flex().w_full().flex_wrap().items_center().gap_1();
-            suggestion_row = suggestion_row.child(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(management_locale_text("Suggested:", "建议：", "建議：")),
-            );
-            for (model, providers) in suggestions {
-                let label = format!("{} \u{00b7} {}", model, providers.len());
-                let model_id = model.clone();
-                suggestion_row = suggestion_row.child(
-                    Button::new(SharedString::from(format!(
-                        "management-model-group-suggest-{model}"
-                    )))
-                    .xsmall()
-                    .outline()
-                    .label(label)
-                    .disabled(pending)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.add_suggested_model_group(&model_id, cx)
-                    })),
-                );
-            }
-            rows = rows.child(suggestion_row);
+        suggestions.truncate(3);
+
+        struct PaletteModel {
+            model_id: String,
+            detail: Option<String>,
+            selected: bool,
         }
-        rows = rows.child(
-            div()
-                .text_xs()
-                .font_semibold()
-                .text_color(cx.theme().muted_foreground)
-                .child(management_locale_text("Add models", "添加模型", "新增模型")),
-        );
-        rows = rows.child(management_input_field(
-            management_locale_text("Search models", "搜索模型", "搜尋模型"),
-            &self.route_group_model_query,
-            false,
-            cx,
-        ));
-        let query = self
-            .route_group_model_query
-            .read(cx)
-            .value()
-            .trim()
-            .to_lowercase();
-        let mut palette = h_flex().w_full().flex_wrap().items_center().gap_1();
-        let mut shown = 0usize;
+        struct PaletteGroup {
+            profile: vibex_core::ModelProviderProfile,
+            models: Vec<PaletteModel>,
+        }
+
+        let mut groups = Vec::<PaletteGroup>::new();
         for profile in &self.providers {
             if profile.status != vibex_core::ModelProviderProfileStatus::Enabled {
                 continue;
             }
+            let mut models = Vec::new();
             for entry in &profile.configured_models {
                 if !entry.enabled {
                     continue;
@@ -31055,39 +30994,23 @@ impl ManagementCenter {
                     entry.display_name.as_deref().unwrap_or_default()
                 )
                 .to_lowercase();
-                if !query.is_empty() && !haystack.contains(&query) {
+                if searching && !haystack.contains(&query) {
                     continue;
                 }
                 let selected = self.route_group_model_members.iter().any(|member| {
                     member.model_provider_profile_id == profile.id && member.model_id == entry.id
                 });
-                if !selected && shown >= 48 {
-                    continue;
-                }
-                let provider_id = profile.id.clone();
-                let model_id = entry.id.clone();
-                palette = palette.child(
-                    Button::new(SharedString::from(format!(
-                        "management-model-group-add-{}-{}",
-                        provider_id.as_str(),
-                        model_id
-                    )))
-                    .xsmall()
-                    .when(selected, |button| button.primary())
-                    .when(!selected, |button| button.outline())
-                    .label(format!("{} · {}", profile.display_name, model_id))
-                    .disabled(pending)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.toggle_route_group_model_member(
-                            provider_id.clone(),
-                            model_id.clone(),
-                            cx,
-                        )
-                    })),
-                );
-                if !selected {
-                    shown += 1;
-                }
+                let detail = entry
+                    .display_name
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty() && *name != entry.id)
+                    .map(str::to_string);
+                models.push(PaletteModel {
+                    model_id: entry.id.clone(),
+                    detail,
+                    selected,
+                });
             }
             // Local aliases are first-class members too: the gateway maps the
             // alias to its upstream id when it calls the Provider, so the group
@@ -31100,66 +31023,395 @@ impl ManagementCenter {
                 let haystack =
                     format!("{} {} {}", profile.display_name, alias_name, alias.upstream)
                         .to_lowercase();
-                if !query.is_empty() && !haystack.contains(&query) {
+                if searching && !haystack.contains(&query) {
                     continue;
                 }
                 let selected = self.route_group_model_members.iter().any(|member| {
                     member.model_provider_profile_id == profile.id && member.model_id == alias_name
                 });
-                if !selected && shown >= 48 {
-                    continue;
-                }
-                let provider_id = profile.id.clone();
-                let model_id = alias_name.to_string();
-                palette = palette.child(
-                    Button::new(SharedString::from(format!(
-                        "management-model-group-add-alias-{}-{}",
-                        provider_id.as_str(),
-                        model_id
-                    )))
-                    .xsmall()
-                    .when(selected, |button| button.primary())
-                    .when(!selected, |button| button.outline())
-                    .label(format!(
-                        "{} · {} → {}",
-                        profile.display_name, model_id, alias.upstream
-                    ))
-                    .disabled(pending)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.toggle_route_group_model_member(
-                            provider_id.clone(),
-                            model_id.clone(),
-                            cx,
-                        )
-                    })),
-                );
-                if !selected {
-                    shown += 1;
-                }
+                models.push(PaletteModel {
+                    model_id: alias_name.to_string(),
+                    detail: Some(format!("→ {}", alias.upstream)),
+                    selected,
+                });
             }
+            if models.is_empty() {
+                continue;
+            }
+            models.sort_by(|left, right| left.model_id.cmp(&right.model_id));
+            groups.push(PaletteGroup {
+                profile: profile.clone(),
+                models,
+            });
         }
-        if shown == 0 && query.is_empty() {
-            palette = palette.child(div().text_xs().text_color(cx.theme().warning).child(
-                management_locale_text(
-                    "No enabled Provider models are available. Add a model to a Provider first.",
-                    "没有可用的已启用供应模型。请先在供应商中添加模型。",
-                    "沒有可用的已啟用供應模型。請先在供應商中新增模型。",
-                ),
-            ));
-        } else if shown >= 48 {
-            palette = palette.child(
+        groups.sort_by(|left, right| {
+            left.profile
+                .display_name
+                .to_lowercase()
+                .cmp(&right.profile.display_name.to_lowercase())
+                .then(left.profile.id.as_str().cmp(right.profile.id.as_str()))
+        });
+        let has_groups = !groups.is_empty();
+
+        let template_center = cx.weak_entity();
+        let template_menu = Button::new("management-model-group-template")
+            .small()
+            .outline()
+            .icon(Icon::default().path("icons/vibex/list-checks.svg"))
+            .label(management_locale_text("Templates", "模板", "範本"))
+            .tooltip(management_locale_text(
+                "Replace the draft's order with a starting point; nothing is saved until you press Save.",
+                "用模板替换草稿中的顺序；按“保存”前不会写入。",
+                "用範本替換草稿中的順序；按「儲存」前不會寫入。",
+            ))
+            .dropdown_caret(true)
+            .disabled(pending)
+            .dropdown_menu(move |mut menu, _, _| {
+                for template in ModelGroupTemplate::ALL {
+                    let center = template_center.clone();
+                    menu = menu.item(PopupMenuItem::new(template.label()).on_click(
+                        move |_, _, cx| {
+                            center
+                                .update(cx, |this, cx| {
+                                    this.apply_model_group_template(template, cx)
+                                })
+                                .ok();
+                        },
+                    ));
+                }
+                menu
+            });
+        let suggested = (!suggestions.is_empty()).then(|| {
+            let center = cx.weak_entity();
+            let suggestions = suggestions.clone();
+            Button::new("management-model-group-suggestions")
+                .small()
+                .outline()
+                .icon(Icon::default().path("icons/vibex/sparkles.svg"))
+                .label(management_locale_text("Suggested", "建议", "建議"))
+                .tooltip(management_locale_text(
+                    "Add every Provider that serves one model, in Provider order.",
+                    "按供应商顺序加入所有提供同一模型的供应商。",
+                    "依供應商順序加入所有提供同一模型的供應商。",
+                ))
+                .dropdown_caret(true)
+                .disabled(pending)
+                .dropdown_menu(move |mut menu, _, _| {
+                    for (model, providers) in &suggestions {
+                        let center = center.clone();
+                        let model_id = model.clone();
+                        let label = format!(
+                            "{} · {} {}",
+                            model,
+                            providers.len(),
+                            management_locale_text("Providers", "个供应商", "個供應商")
+                        );
+                        menu = menu.item(PopupMenuItem::new(label).on_click(move |_, _, cx| {
+                            center
+                                .update(cx, |this, cx| {
+                                    this.add_suggested_model_group(&model_id, cx)
+                                })
+                                .ok();
+                        }));
+                    }
+                    menu
+                })
+        });
+
+        let add_heading = h_flex()
+            .w_full()
+            .min_w_0()
+            .flex_wrap()
+            .items_center()
+            .gap_2()
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w(rems(12.0))
+                    .gap_0p5()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_semibold()
+                            .child(management_locale_text("Add models", "添加模型", "新增模型")),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(management_locale_text(
+                                "Grouped by Provider. A template replaces this draft; Save writes it.",
+                                "按供应商分组；模板只替换草稿，保存后才写入。",
+                                "依供應商分組；範本只替換草稿，儲存後才寫入。",
+                            )),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .flex_none()
+                    .items_center()
+                    .gap_2()
+                    .child(template_menu)
+                    .children(suggested),
+            );
+
+        let search = management_search_input_compact(&self.route_group_model_query, cx);
+
+        let open_groups = self.route_group_palette_open_groups.clone();
+        let mut group_keys = Vec::new();
+        let mut accordion = Accordion::new("management-model-group-provider-groups")
+            .multiple(true)
+            .bordered(false)
+            .disabled(searching)
+            .w_full()
+            .flex_none();
+        for group in groups {
+            let provider_id = group.profile.id.as_str().to_string();
+            group_keys.push(provider_id.clone());
+            let open = searching || open_groups.contains(&provider_id);
+            let heading = h_flex()
+                .w_full()
+                .min_w_0()
+                .items_center()
+                .gap_2()
+                .child(provider_logo_tile(&group.profile, px(20.0), cx))
+                .child(
+                    div()
+                        .min_w_0()
+                        .flex_1()
+                        .truncate()
+                        .text_sm()
+                        .font_medium()
+                        .child(group.profile.display_name.clone()),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(format!(
+                            "{} {}",
+                            group.models.len(),
+                            management_locale_text("models", "个模型", "個模型")
+                        )),
+                );
+            let provider_for_rows = group.profile.id.clone();
+            let rows = group
+                .models
+                .iter()
+                .map(|model| {
+                    Self::render_route_group_palette_row(
+                        &provider_for_rows,
+                        model.model_id.clone(),
+                        model.detail.clone(),
+                        model.selected,
+                        member_count,
+                        pending,
+                        cx,
+                    )
+                })
+                .collect::<Vec<_>>();
+            let body = v_flex().w_full().gap_0p5().children(rows);
+            accordion = accordion.item(move |item| {
+                item.open(open)
+                    .with_size(Size::Small)
+                    .title(heading)
+                    .child(body)
+            });
+        }
+        if !searching && !group_keys.is_empty() {
+            let center = cx.weak_entity();
+            let all_keys = group_keys.clone();
+            accordion = accordion.on_toggle_click(move |open_indices, _, cx| {
+                let next = all_keys
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, _)| open_indices.contains(index))
+                    .map(|(_, key)| key.clone())
+                    .collect::<BTreeSet<_>>();
+                center
+                    .update(cx, |this, cx| {
+                        if this.route_group_palette_open_groups != next {
+                            this.route_group_palette_open_groups = next;
+                            cx.notify();
+                        }
+                    })
+                    .ok();
+            });
+        }
+
+        let empty = if !has_groups {
+            if searching {
                 div()
-                    .text_xs()
+                    .w_full()
+                    .py_3()
+                    .text_sm()
                     .text_color(cx.theme().muted_foreground)
                     .child(management_locale_text(
-                        "Showing the first matches; type to narrow the list.",
-                        "仅显示前几项；输入可缩小范围。",
-                        "僅顯示前幾項；輸入可縮小範圍。",
-                    )),
-            );
-        }
-        rows = rows.child(palette);
-        rows.into_any_element()
+                        "No Provider or model matches that search.",
+                        "没有匹配的供应商或模型。",
+                        "沒有符合的供應商或模型。",
+                    ))
+                    .into_any_element()
+            } else {
+                div()
+                    .w_full()
+                    .py_3()
+                    .text_xs()
+                    .text_color(cx.theme().warning)
+                    .child(management_locale_text(
+                        "No enabled Provider models are available. Add a model to a Provider first.",
+                        "没有可用的已启用供应模型。请先在供应商中添加模型。",
+                        "沒有可用的已啟用供應模型。請先在供應商中新增模型。",
+                    ))
+                    .into_any_element()
+            }
+        } else {
+            accordion.into_any_element()
+        };
+
+        let at_limit = member_count >= vibex_core::MAX_ROUTE_MEMBERS;
+        v_flex()
+            .debug_selector(|| "management-model-group-palette".to_string())
+            .w_full()
+            .min_w_0()
+            .gap_3()
+            .child(add_heading)
+            .child(search)
+            .child(empty)
+            .when(at_limit, |stack| {
+                stack.child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(format!(
+                            "{} ({}/{})",
+                            management_locale_text(
+                                "This group is full. Remove a member to add another.",
+                                "该组已满，移除一个成员后才能继续添加。",
+                                "該組已滿，移除一個成員後才能繼續新增。"
+                            ),
+                            member_count,
+                            vibex_core::MAX_ROUTE_MEMBERS
+                        )),
+                )
+            })
+            .into_any_element()
+    }
+
+    /// One model in the Provider-grouped palette: a row that adds it, or
+    /// removes it when the draft already holds it.
+    fn render_route_group_palette_row(
+        provider_id: &vibex_core::ModelProviderProfileId,
+        model_id: String,
+        detail: Option<String>,
+        selected: bool,
+        member_count: usize,
+        pending: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let can_toggle = selected || member_count < vibex_core::MAX_ROUTE_MEMBERS;
+        let disabled = pending || !can_toggle;
+        let provider_for_click = provider_id.clone();
+        let provider_for_key = provider_id.clone();
+        let model_for_click = model_id.clone();
+        let model_for_key = model_id.clone();
+        let row_id = format!(
+            "management-model-group-pick-{}-{}",
+            provider_id.as_str(),
+            model_id
+        );
+        let accessible = format!(
+            "{} {}, {}",
+            provider_id.as_str(),
+            model_id,
+            if selected {
+                management_locale_text("added", "已添加", "已新增")
+            } else {
+                management_locale_text("add", "添加", "新增")
+            }
+        );
+        h_flex()
+            .id(SharedString::from(row_id))
+            .role(Role::Button)
+            .aria_label(accessible)
+            .focusable()
+            .tab_index(0)
+            .w_full()
+            .min_w_0()
+            .items_center()
+            .gap_2()
+            .px_2()
+            .py_1p5()
+            .rounded(cx.theme().radius)
+            .when(selected, |row| row.bg(cx.theme().primary.opacity(0.08)))
+            .when(!selected && !disabled, |row| {
+                row.hover(|style| style.bg(cx.theme().primary.opacity(0.06)))
+            })
+            .when(disabled, |row| row.opacity(0.55).cursor_not_allowed())
+            .when(!disabled, |row| row.cursor_pointer())
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if !disabled {
+                    this.toggle_route_group_model_member(
+                        provider_for_click.clone(),
+                        model_for_click.clone(),
+                        cx,
+                    );
+                }
+            }))
+            .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+                if !disabled && (event.keystroke.key == "enter" || event.keystroke.key == "space") {
+                    this.toggle_route_group_model_member(
+                        provider_for_key.clone(),
+                        model_for_key.clone(),
+                        cx,
+                    );
+                    cx.stop_propagation();
+                }
+            }))
+            .child(
+                Icon::new(if selected {
+                    IconName::Check
+                } else {
+                    IconName::Plus
+                })
+                .xsmall()
+                .text_color(if selected {
+                    cx.theme().primary
+                } else {
+                    cx.theme().muted_foreground
+                }),
+            )
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .gap_0p5()
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .font_family(cx.theme().mono_font_family.clone())
+                            .text_sm()
+                            .child(model_id),
+                    )
+                    .children(detail.map(|detail| {
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(detail)
+                    })),
+            )
+            .when(selected, |row| {
+                row.child(
+                    Tag::color(ColorName::Neutral)
+                        .xsmall()
+                        .child(management_locale_text("Added", "已添加", "已新增")),
+                )
+            })
+            .into_any_element()
     }
 
     /// The model-group simulator: inputs and the decision they produce.
@@ -31328,7 +31580,9 @@ impl ManagementCenter {
                     v_flex()
                         .items_center()
                         .gap_0p5()
-                        .child(div().text_xs().child("Images"))
+                        .child(management_field_label(management_locale_text(
+                            "Images", "图片", "圖片",
+                        )))
                         .child(
                             Switch::new("management-model-group-sim-images")
                                 .small()
@@ -31343,38 +31597,49 @@ impl ManagementCenter {
                 .child({
                     let center = cx.weak_entity();
                     let current = self.route_group_sim_effort.clone();
-                    Button::new("management-model-group-sim-effort")
-                        .xsmall()
-                        .ghost()
-                        .label(route_group_effort_label(&current))
-                        .dropdown_menu(move |menu, _, _| {
-                            let mut menu = menu;
-                            for (value, label) in [
-                                (
-                                    "",
-                                    management_locale_text(
-                                        "Any effort",
-                                        "任意推理档位",
-                                        "任意推理檔位",
-                                    ),
-                                ),
-                                ("low", management_locale_text("Low", "低", "低")),
-                                ("medium", management_locale_text("Medium", "中", "中")),
-                                ("high", management_locale_text("High", "高", "高")),
-                            ] {
-                                let center = center.clone();
-                                let value = value.to_string();
-                                menu = menu.item(PopupMenuItem::new(label).on_click(
-                                    move |_, _, cx| {
-                                        let _ = center.update(cx, |this, cx| {
-                                            this.route_group_sim_effort = value.clone();
-                                            cx.notify();
-                                        });
-                                    },
-                                ));
-                            }
-                            menu
-                        })
+                    v_flex()
+                        .items_center()
+                        .gap_0p5()
+                        .child(management_field_label(management_locale_text(
+                            "Effort",
+                            "推理档位",
+                            "推理檔位",
+                        )))
+                        .child(
+                            Button::new("management-model-group-sim-effort")
+                                .xsmall()
+                                .ghost()
+                                .label(route_group_effort_label(&current))
+                                .dropdown_caret(true)
+                                .dropdown_menu(move |menu, _, _| {
+                                    let mut menu = menu;
+                                    for (value, label) in [
+                                        (
+                                            "",
+                                            management_locale_text(
+                                                "Any effort",
+                                                "任意推理档位",
+                                                "任意推理檔位",
+                                            ),
+                                        ),
+                                        ("low", management_locale_text("Low", "低", "低")),
+                                        ("medium", management_locale_text("Medium", "中", "中")),
+                                        ("high", management_locale_text("High", "高", "高")),
+                                    ] {
+                                        let center = center.clone();
+                                        let value = value.to_string();
+                                        menu = menu.item(PopupMenuItem::new(label).on_click(
+                                            move |_, _, cx| {
+                                                let _ = center.update(cx, |this, cx| {
+                                                    this.route_group_sim_effort = value.clone();
+                                                    cx.notify();
+                                                });
+                                            },
+                                        ));
+                                    }
+                                    menu
+                                }),
+                        )
                 })
                 .child({
                     let center = cx.weak_entity();
@@ -31392,46 +31657,59 @@ impl ManagementCenter {
                             management_locale_text("No failure", "不模拟失败", "不模擬失敗")
                                 .to_string()
                         });
-                    Button::new("management-model-group-sim-failure")
-                        .xsmall()
-                        .ghost()
-                        .label(current)
-                        .dropdown_menu(move |menu, _, _| {
-                            let mut menu = menu;
-                            let members = failure_members.clone();
-                            let center_clear = center.clone();
-                            menu = menu.item(
-                                PopupMenuItem::new(management_locale_text(
-                                    "No failure",
-                                    "不模拟失败",
-                                    "不模擬失敗",
-                                ))
-                                .on_click(move |_, _, cx| {
-                                    let _ = center_clear.update(cx, |this, cx| {
-                                        this.route_group_sim_failure = None;
-                                        cx.notify();
-                                    });
+                    v_flex()
+                        .items_center()
+                        .gap_0p5()
+                        .child(management_field_label(management_locale_text(
+                            "Assume failure",
+                            "模拟失败",
+                            "模擬失敗",
+                        )))
+                        .child(
+                            Button::new("management-model-group-sim-failure")
+                                .xsmall()
+                                .ghost()
+                                .label(current)
+                                .dropdown_caret(true)
+                                .dropdown_menu(move |menu, _, _| {
+                                    let mut menu = menu;
+                                    let members = failure_members.clone();
+                                    let center_clear = center.clone();
+                                    menu =
+                                        menu.item(
+                                            PopupMenuItem::new(management_locale_text(
+                                                "No failure",
+                                                "不模拟失败",
+                                                "不模擬失敗",
+                                            ))
+                                            .on_click(move |_, _, cx| {
+                                                let _ = center_clear.update(cx, |this, cx| {
+                                                    this.route_group_sim_failure = None;
+                                                    cx.notify();
+                                                });
+                                            }),
+                                        );
+                                    for member in &members {
+                                        let center = center.clone();
+                                        let member_id = member.id.clone();
+                                        let label = format!(
+                                            "{} · {}",
+                                            member.model_provider_profile_id.as_str(),
+                                            member.model_id
+                                        );
+                                        menu = menu.item(PopupMenuItem::new(label).on_click(
+                                            move |_, _, cx| {
+                                                let _ = center.update(cx, |this, cx| {
+                                                    this.route_group_sim_failure =
+                                                        Some(member_id.clone());
+                                                    cx.notify();
+                                                });
+                                            },
+                                        ));
+                                    }
+                                    menu
                                 }),
-                            );
-                            for member in &members {
-                                let center = center.clone();
-                                let member_id = member.id.clone();
-                                let label = format!(
-                                    "{} · {}",
-                                    member.model_provider_profile_id.as_str(),
-                                    member.model_id
-                                );
-                                menu = menu.item(PopupMenuItem::new(label).on_click(
-                                    move |_, _, cx| {
-                                        let _ = center.update(cx, |this, cx| {
-                                            this.route_group_sim_failure = Some(member_id.clone());
-                                            cx.notify();
-                                        });
-                                    },
-                                ));
-                            }
-                            menu
-                        })
+                        )
                 }),
         );
         let sim_result = if simulation.paused {
@@ -52328,6 +52606,37 @@ mod gateway_surface_tests {
         );
     }
 
+    /// The palette under Members groups models by Provider instead of wrapping
+    /// every Provider-model pair into one button cloud, and its search field
+    /// actually repaints the form it filters.
+    #[test]
+    fn the_route_group_palette_is_grouped_by_provider() {
+        let source = include_str!("management.rs");
+        let palette = source
+            .split_once("    fn render_model_group_palette(")
+            .and_then(|(_, tail)| {
+                tail.split_once("    /// One model in the Provider-grouped palette")
+            })
+            .map(|(body, _)| body)
+            .expect("the model palette should remain inspectable");
+        assert!(
+            palette.contains("Accordion::new(\"management-model-group-provider-groups\")"),
+            "the palette must group models under their Provider"
+        );
+        assert!(
+            palette.contains("render_route_group_palette_row"),
+            "each Provider group must list its models as rows"
+        );
+        assert!(
+            !palette.contains("palette = palette.child("),
+            "the palette must not go back to one wrapped row of add buttons"
+        );
+        assert!(
+            source.contains("cx.subscribe(&route_group_model_query"),
+            "typing in the palette search must repaint the form"
+        );
+    }
+
     /// A route group draft is composed from `(Provider, model)` pairs.
     #[test]
     fn a_route_group_draft_is_composed_from_models() {
@@ -52431,6 +52740,57 @@ mod gateway_surface_tests {
                 );
             });
         });
+    }
+
+    /// The Members tab draws the Provider-grouped palette with real data.
+    ///
+    /// This is the surface the reader reaches from every entry point, and the
+    /// accordion, search field, and model rows are only exercised together when
+    /// a Provider actually contributes a group.
+    #[gpui::test]
+    fn the_route_group_members_tab_draws_the_grouped_palette(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let (center, cx) = cx.add_window_view(ManagementCenter::new);
+        let provider = vibex_core::ModelProviderProfile {
+            display_name: "DeepSeek".to_string(),
+            configured_models: vec![vibex_core::ModelProviderCatalogEntry {
+                id: "deepseek-v4.1-flash".to_string(),
+                display_name: None,
+                enabled: true,
+                metadata: Vec::new(),
+                capabilities: Default::default(),
+            }],
+            ..Default::default()
+        };
+        let route = vibex_core::ModelRoute {
+            display_name: "Route group".to_string(),
+            kind: vibex_core::RouteKind::ModelGroup,
+            agent_model_id: Some("deepseek-flash".to_string()),
+            members: vec![vibex_core::ModelRouteMember::new(
+                provider.id.clone(),
+                "deepseek-v4.1-flash",
+                0,
+            )],
+            status: vibex_core::RouteStatus::Enabled,
+            ..Default::default()
+        };
+        let selected = route.id.to_string();
+        cx.update(|window, cx| {
+            center.update(cx, |center, cx| {
+                center.navigation.active = ManagementSection::Providers;
+                center.providers_sidebar_tab = ProviderSidebarTab::RouteGroups;
+                center.selected_global_route_id = Some(selected);
+                center.providers = vec![provider];
+                center.model_routes = vec![route];
+                center.route_group_detail_tab = RouteGroupDetailTab::Members;
+                cx.notify();
+            });
+            let _ = window.draw(cx);
+        });
+        assert!(
+            cx.debug_bounds("management-model-group-palette").is_some(),
+            "the Members tab must draw the grouped model palette"
+        );
     }
 
     /// The route-group dialog's footer is a sibling of its scroll body, so it

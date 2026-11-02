@@ -889,9 +889,10 @@ impl ManagementCenter {
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
                     .child(format!(
-                        "{}/{}",
+                        "{}/{} {}",
                         members.len(),
-                        vibex_core::MAX_ROUTE_MEMBERS
+                        vibex_core::MAX_ROUTE_MEMBERS,
+                        management_locale_text("members", "个成员", "個成員")
                     ))
                     .into_any_element(),
             ),
@@ -1358,6 +1359,16 @@ impl ManagementCenter {
         .xsmall()
         .ghost()
         .label(route_group_effort_label(&effort))
+        .tooltip(management_locale_text(
+            "Reasoning effort for this member",
+            "该成员的推理档位",
+            "該成員的推理檔位",
+        ))
+        .accessibility_label(management_locale_text(
+            "Reasoning effort for this member",
+            "该成员的推理档位",
+            "該成員的推理檔位",
+        ))
         .dropdown_caret(true)
         .disabled(pending)
         .dropdown_menu(move |mut menu, _, _| {
@@ -1411,88 +1422,133 @@ impl ManagementCenter {
                 ),
             })
             .into_any_element();
-        let trailing =
-            h_flex()
-                .items_center()
-                .gap_1()
-                .child(
-                    Button::new(SharedString::from(format!(
-                        "management-model-group-weight-{index}"
-                    )))
-                    .xsmall()
-                    .ghost()
-                    .label(format!("×{}", member.weight))
-                    .tooltip(management_locale_text(
-                        "Weight: click to change",
-                        "权重：点击切换",
-                        "權重：點擊切換",
-                    ))
-                    .disabled(pending)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.cycle_route_group_model_weight(index, cx)
-                    })),
-                )
-                .child(effort_menu)
-                .child(
-                    Switch::new(SharedString::from(format!(
-                        "management-model-group-enabled-{index}"
-                    )))
-                    .small()
-                    .checked(member.enabled)
-                    .disabled(pending)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.toggle_route_group_model_enabled(index, cx)
-                    })),
-                )
-                .child(
-                    Button::new(SharedString::from(format!(
-                        "management-model-group-up-{index}"
-                    )))
-                    .xsmall()
-                    .ghost()
-                    .icon(IconName::ArrowUp)
-                    .tooltip(management_locale_text("Move up", "上移", "上移"))
-                    .disabled(pending || index == 0)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.move_route_group_model_member(index, true, cx)
-                    })),
-                )
-                .child(
-                    Button::new(SharedString::from(format!(
-                        "management-model-group-down-{index}"
-                    )))
-                    .xsmall()
-                    .ghost()
-                    .icon(IconName::ArrowDown)
-                    .tooltip(management_locale_text("Move down", "下移", "下移"))
-                    .disabled(pending || index + 1 >= count)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.move_route_group_model_member(index, false, cx)
-                    })),
-                )
-                .child(
-                    Button::new(SharedString::from(format!(
-                        "management-model-group-remove-{index}"
-                    )))
-                    .xsmall()
-                    .ghost()
-                    .icon(Icon::default().path("icons/vibex/trash-2.svg"))
-                    .tooltip(management_locale_text(
-                        "Remove member",
-                        "移除成员",
-                        "移除成員",
-                    ))
-                    .accessibility_label(management_locale_text(
-                        "Remove member",
-                        "移除成员",
-                        "移除成員",
-                    ))
-                    .disabled(pending)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.remove_route_group_model_member(index, cx)
-                    })),
-                )
-                .into_any_element();
+        let member_weight = member.weight;
+        let weight_center = cx.weak_entity();
+        let weight_menu = Button::new(SharedString::from(format!(
+            "management-model-group-weight-{index}"
+        )))
+        .xsmall()
+        .ghost()
+        .label(format!("×{}", member.weight))
+        .tooltip(management_locale_text(
+            "Weight for this member",
+            "该成员的权重",
+            "該成員的權重",
+        ))
+        .accessibility_label(management_locale_text(
+            "Weight for this member",
+            "该成员的权重",
+            "該成員的權重",
+        ))
+        .dropdown_caret(true)
+        .disabled(pending)
+        .dropdown_menu(move |mut menu, _, _| {
+            for weight in [1, 2, 3, 5] {
+                let center = weight_center.clone();
+                menu = menu.item(
+                    PopupMenuItem::new(format!("×{weight}"))
+                        .checked(member_weight == weight)
+                        .on_click(move |_, _, cx| {
+                            center
+                                .update(cx, |this, cx| {
+                                    this.set_route_group_model_weight(index, weight, cx)
+                                })
+                                .ok();
+                        }),
+                );
+            }
+            menu
+        });
+        let trailing = h_flex()
+            .items_center()
+            .gap_2()
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap_1()
+                    .child(weight_menu)
+                    .child(effort_menu)
+                    .child(
+                        Switch::new(SharedString::from(format!(
+                            "management-model-group-enabled-{index}"
+                        )))
+                        .small()
+                        .checked(member.enabled)
+                        .tooltip(if member.enabled {
+                            management_locale_text(
+                                "Skip this member when routing",
+                                "路由时跳过该成员",
+                                "路由時跳過該成員",
+                            )
+                        } else {
+                            management_locale_text(
+                                "Use this member when routing",
+                                "路由时使用该成员",
+                                "路由時使用該成員",
+                            )
+                        })
+                        .disabled(pending)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.toggle_route_group_model_enabled(index, cx)
+                        })),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap_0p5()
+                    .child(
+                        Button::new(SharedString::from(format!(
+                            "management-model-group-up-{index}"
+                        )))
+                        .xsmall()
+                        .ghost()
+                        .icon(IconName::ArrowUp)
+                        .tooltip(management_locale_text("Move up", "上移", "上移"))
+                        .accessibility_label(management_locale_text("Move up", "上移", "上移"))
+                        .disabled(pending || index == 0)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.move_route_group_model_member(index, true, cx)
+                        })),
+                    )
+                    .child(
+                        Button::new(SharedString::from(format!(
+                            "management-model-group-down-{index}"
+                        )))
+                        .xsmall()
+                        .ghost()
+                        .icon(IconName::ArrowDown)
+                        .tooltip(management_locale_text("Move down", "下移", "下移"))
+                        .accessibility_label(management_locale_text("Move down", "下移", "下移"))
+                        .disabled(pending || index + 1 >= count)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.move_route_group_model_member(index, false, cx)
+                        })),
+                    ),
+            )
+            .child(
+                Button::new(SharedString::from(format!(
+                    "management-model-group-remove-{index}"
+                )))
+                .xsmall()
+                .ghost()
+                .icon(Icon::default().path("icons/vibex/trash-2.svg"))
+                .tooltip(management_locale_text(
+                    "Remove member",
+                    "移除成员",
+                    "移除成員",
+                ))
+                .accessibility_label(management_locale_text(
+                    "Remove member",
+                    "移除成员",
+                    "移除成員",
+                ))
+                .disabled(pending)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.remove_route_group_model_member(index, cx)
+                })),
+            )
+            .into_any_element();
         ws_row(
             SharedString::from(format!("management-model-group-member-{index}")),
             mark,
