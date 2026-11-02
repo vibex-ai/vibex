@@ -1693,7 +1693,10 @@ fn version_label(agent: &vibex_core::AgentSnapshotEntry, strings: Strings) -> St
 /// middle is routing, not a name. This names the model and, when it differs,
 /// the route group it belongs to.
 pub fn gateway_model_label(model: &vibex_core::GatewayModelSummary) -> String {
-    let model_name = model.model_id.trim();
+    let model_name = vibex_core::route_group_model_ref(&model.model_id)
+        .map(|parsed| parsed.model_id)
+        .unwrap_or(model.model_id.as_str())
+        .trim();
     let group = model.provider_name.trim();
     match (
         model_name.is_empty(),
@@ -5552,7 +5555,7 @@ mod tests {
             models: vec![vibex_core::GatewayModelSummary {
                 model_provider_profile_id: vibex_core::ModelProviderProfileId::new(),
                 provider_name: "Team".to_string(),
-                model_id: "deepseek-chat".to_string(),
+                model_id: format!("group/{route_id}/deepseek-chat"),
                 display_id: format!("group/{route_id}/deepseek-chat"),
                 wire_protocol_id: String::new(),
                 route_id: Some(route_id.to_string()),
