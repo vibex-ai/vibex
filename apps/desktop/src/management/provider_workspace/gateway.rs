@@ -327,7 +327,7 @@ impl ManagementCenter {
             served
                 .entry(group)
                 .or_default()
-                .push(model.display_id.clone());
+                .push(model.model_id.clone());
         }
         let mut served_list = v_flex().w_full().min_w_0();
         for (index, (group, models)) in served.iter().enumerate() {
@@ -785,7 +785,7 @@ impl ManagementCenter {
             .iter()
             .map(|request| request.cached_read_tokens)
             .sum::<u64>();
-        let top = |key: fn(&vibex_core::GatewayRequestSummary) -> String| {
+        let top = |key: &dyn Fn(&vibex_core::GatewayRequestSummary) -> String| {
             let mut counts = BTreeMap::<String, usize>::new();
             for request in &rows {
                 *counts.entry(key(request)).or_default() += 1;
@@ -858,12 +858,17 @@ impl ManagementCenter {
             .gap_6()
             .child(ranking(
                 management_locale_text("Top Providers", "请求最多的供应商", "請求最多的供應商"),
-                top(|request| request.provider_name.clone()),
+                top(&|request| {
+                    self.workspace_provider_label(
+                        &request.model_provider_profile_id,
+                        Some(request.provider_name.as_str()),
+                    )
+                }),
                 cx,
             ))
             .child(ranking(
                 management_locale_text("Top models", "请求最多的模型", "請求最多的模型"),
-                top(|request| request.model_requested.clone()),
+                top(&|request| self.workspace_requested_model_label(&request.model_requested)),
                 cx,
             ));
         ws_section(

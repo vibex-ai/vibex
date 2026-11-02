@@ -24,6 +24,7 @@ use vibex_backend::{BackendError, BackendResult};
 use crate::app::{
     App, ClipboardWanted, Effect, Focus, LiveState, Overlay, Page, PromptField, Toast,
 };
+use crate::config_center::{gateway_provider_label, gateway_requested_model_label};
 use crate::keymap::Chord;
 use crate::reduce::Outcome;
 use crate::terminal::{TerminalGuard, with_terminal_restored};
@@ -2694,6 +2695,7 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
         },
         AppMessage::GatewayRequests(result) => match result {
             Ok(requests) => {
+                let gateway = app.management_data.gateway.as_ref();
                 let mut body = String::new();
                 if requests.is_empty() {
                     body.push_str(app.strings.config_requests_empty());
@@ -2704,12 +2706,16 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
                         "{}  {}  {} -> {}\n",
                         request.request_id.as_str(),
                         request.outcome.id(),
-                        request.model_requested,
+                        gateway_requested_model_label(gateway, &request.model_requested),
                         request.model_served.as_deref().unwrap_or("-"),
                     ));
                     body.push_str(&format!(
                         "  {} · {} → {} · {} tok ({} in / {} out / {} cached) · {} ms\n",
-                        request.provider_name,
+                        gateway_provider_label(
+                            gateway,
+                            request.model_provider_profile_id.as_str(),
+                            &request.provider_name,
+                        ),
                         request.wire_in,
                         request.wire_out,
                         request.total_tokens,
@@ -2731,10 +2737,7 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
                         for attempt in &route.failed_attempts {
                             body.push_str(&format!(
                                 "  tried {}: {}\n",
-                                attempt
-                                    .credential_name
-                                    .as_deref()
-                                    .unwrap_or(attempt.credential_id.as_str()),
+                                attempt.credential_name.as_deref().unwrap_or("Key"),
                                 attempt.failure.id()
                             ));
                         }

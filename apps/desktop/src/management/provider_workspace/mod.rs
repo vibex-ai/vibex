@@ -113,6 +113,56 @@ impl ManagementCenter {
             .unwrap_or_else(|| agent_id.to_string())
     }
 
+    /// A Provider by the name a reader knows.
+    ///
+    /// `recorded` is the name the ledger wrote down. It is used when the
+    /// Provider has since been removed, so a historical row keeps the name it
+    /// answered under. An id repeated as the recorded name is never shown: that
+    /// is the record failing to resolve, not a label.
+    fn workspace_provider_label(
+        &self,
+        id: &vibex_core::ModelProviderProfileId,
+        recorded: Option<&str>,
+    ) -> String {
+        if let Some(profile) = self.providers.iter().find(|profile| &profile.id == id) {
+            let name = profile.display_name.trim();
+            if !name.is_empty() && name != id.as_str() {
+                return name.to_string();
+            }
+        }
+        recorded
+            .map(str::trim)
+            .filter(|name| !name.is_empty() && *name != id.as_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                management_locale_text("a removed Provider", "已删除的供应商", "已刪除的供應商")
+                    .to_string()
+            })
+    }
+
+    /// A model a request named, as a reader knows it.
+    ///
+    /// A route group is addressed as `group/<route id>/<model>`. The id in the
+    /// middle is routing, not a name, so only the model and the group's own
+    /// name are shown; two groups offering the same model still read apart.
+    fn workspace_requested_model_label(&self, requested: &str) -> String {
+        let Some(parsed) = vibex_core::route_group_model_ref(requested) else {
+            return requested.to_string();
+        };
+        let model = parsed.model_id.trim();
+        let group = self
+            .model_routes
+            .iter()
+            .find(|route| route.id.as_str() == parsed.group_id)
+            .map(|route| route.display_name.trim())
+            .filter(|name| !name.is_empty());
+        match group {
+            Some(group) if group != model => format!("{model} · {group}"),
+            Some(group) => group.to_string(),
+            None => model.to_string(),
+        }
+    }
+
     /// The traffic range as a menu button, shared by every traffic view so a
     /// change on one page holds on the others.
     fn workspace_range_menu(&self, id: &'static str, cx: &mut Context<Self>) -> AnyElement {

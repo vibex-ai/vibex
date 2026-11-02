@@ -1181,7 +1181,10 @@ impl ManagementCenter {
             .find(|profile| profile.id == member.model_provider_profile_id);
         let provider_name = profile
             .map(|profile| profile.display_name.clone())
-            .unwrap_or_else(|| member.model_provider_profile_id.as_str().to_string());
+            .unwrap_or_else(|| {
+                management_locale_text("Missing Provider", "供应商已不存在", "供應商已不存在")
+                    .to_string()
+            });
         let effort = member.reasoning_effort.clone().unwrap_or_default();
         let center = cx.weak_entity();
         let effort_menu = Button::new(SharedString::from(format!(

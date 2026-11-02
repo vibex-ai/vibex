@@ -482,14 +482,7 @@ impl ManagementCenter {
     }
 
     fn workspace_provider_name(&self, id: &vibex_core::ModelProviderProfileId) -> String {
-        self.providers
-            .iter()
-            .find(|profile| &profile.id == id)
-            .map(|profile| profile.display_name.clone())
-            .unwrap_or_else(|| {
-                management_locale_text("a removed Provider", "已删除的供应商", "已刪除的供應商")
-                    .to_string()
-            })
+        self.workspace_provider_label(id, None)
     }
 
     fn workspace_credential_owner(
@@ -2309,7 +2302,10 @@ impl ManagementCenter {
                 let who = if done.outcome == vibex_core::GatewayRequestOutcome::Rejected {
                     management_locale_text("gateway", "网关", "閘道").to_string()
                 } else {
-                    done.provider_name.clone()
+                    self.workspace_provider_label(
+                        &done.model_provider_profile_id,
+                        Some(done.provider_name.as_str()),
+                    )
                 };
                 let detail = if answered {
                     let key = gateway_credential_name(done.credential_name.as_deref(), locale);

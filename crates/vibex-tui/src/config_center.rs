@@ -1687,6 +1687,78 @@ fn version_label(agent: &vibex_core::AgentSnapshotEntry, strings: Strings) -> St
     }
 }
 
+/// A gateway model as a reader knows it.
+///
+/// The gateway addresses a model as `group/<route id>/<model>`; the id in the
+/// middle is routing, not a name. This names the model and, when it differs,
+/// the route group it belongs to.
+pub fn gateway_model_label(model: &vibex_core::GatewayModelSummary) -> String {
+    let model_name = model.model_id.trim();
+    let group = model.provider_name.trim();
+    match (
+        model_name.is_empty(),
+        group.is_empty() || group == model_name,
+    ) {
+        (false, true) => model_name.to_string(),
+        (false, false) => format!("{model_name} · {group}"),
+        (true, false) => group.to_string(),
+        (true, true) => "model".to_string(),
+    }
+}
+
+/// The group and model behind an Agent-facing `group/<id>/<model>` request.
+pub fn gateway_requested_model_label(
+    snapshot: Option<&vibex_core::GatewaySnapshot>,
+    requested: &str,
+) -> String {
+    let Some(parsed) = vibex_core::route_group_model_ref(requested) else {
+        return requested.to_string();
+    };
+    let group = snapshot
+        .and_then(|snapshot| {
+            snapshot
+                .models
+                .iter()
+                .find(|model| model.route_id.as_deref() == Some(parsed.group_id))
+        })
+        .map(|model| model.provider_name.trim())
+        .filter(|name| !name.is_empty());
+    match group {
+        Some(group) if group != parsed.model_id => format!("{} · {group}", parsed.model_id),
+        Some(group) => group.to_string(),
+        None => parsed.model_id.to_string(),
+    }
+}
+
+/// A Provider as a reader knows it, for one gateway request.
+///
+/// The recorded name is used when the Provider has since been removed; an id
+/// repeated as the recorded name is never shown.
+pub fn gateway_provider_label(
+    snapshot: Option<&vibex_core::GatewaySnapshot>,
+    profile_id: &str,
+    recorded: &str,
+) -> String {
+    if let Some(name) = snapshot
+        .and_then(|snapshot| {
+            snapshot
+                .upstreams
+                .iter()
+                .find(|upstream| upstream.model_provider_profile_id.as_str() == profile_id)
+        })
+        .map(|upstream| upstream.display_name.trim())
+        .filter(|name| !name.is_empty() && *name != profile_id)
+    {
+        return name.to_string();
+    }
+    let recorded = recorded.trim();
+    if !recorded.is_empty() && recorded != profile_id {
+        recorded.to_string()
+    } else {
+        "Provider".to_string()
+    }
+}
+
 /// The gateway's row, above the direct Providers.
 ///
 /// It is a row rather than a page because it answers the same question the
@@ -1759,7 +1831,7 @@ fn gateway_row(data: &ManagementData, strings: Strings) -> Option<ConfigRow> {
             snapshot
                 .models
                 .iter()
-                .map(|model| model.display_id.clone())
+                .map(gateway_model_label)
                 .collect::<Vec<_>>()
                 .join(", "),
         )
@@ -1826,10 +1898,6 @@ fn gateway_child_rows(data: &ManagementData, strings: Strings) -> Vec<ConfigRow>
                 } else {
                     ConfigTone::Ok
                 },
-            )
-            .detail(
-                strings.config_field_id(),
-                upstream.model_provider_profile_id.as_str(),
             )
             .detail(
                 strings.config_field_models(),
@@ -1947,7 +2015,6 @@ fn provider_rows(data: &ManagementData, strings: Strings) -> Vec<ConfigRow> {
                 },
             )
             .enabled(enabled)
-            .detail(strings.config_field_id(), profile.id.as_str())
             .detail(strings.config_field_agent(), profile.agent_id.as_str())
             .detail(strings.config_field_kind(), profile.kind.to_string())
             .detail(
@@ -5472,6 +5539,63 @@ mod tests {
             center.zone,
             ConfigZone::ALL[ConfigZone::ALL.len() - 2],
             "the walk backwards is not the reverse"
+        );
+    }
+
+    /// A gateway label names the record; the internal ids that address it never
+    /// reach the screen.
+    #[test]
+    fn gateway_labels_use_names_instead_of_ids() {
+        let route_id = "model_route_123";
+        let provider_id = vibex_core::ModelProviderProfileId::new();
+        let snapshot = vibex_core::GatewaySnapshot {
+            models: vec![vibex_core::GatewayModelSummary {
+                model_provider_profile_id: vibex_core::ModelProviderProfileId::new(),
+                provider_name: "Team".to_string(),
+                model_id: "deepseek-chat".to_string(),
+                display_id: format!("group/{route_id}/deepseek-chat"),
+                wire_protocol_id: String::new(),
+                route_id: Some(route_id.to_string()),
+                source_count: 1,
+                model_count: 1,
+            }],
+            upstreams: vec![vibex_core::GatewayUpstreamSummary {
+                model_provider_profile_id: provider_id.clone(),
+                display_name: "DeepSeek".to_string(),
+                model_count: 1,
+                keys: Vec::new(),
+            }],
+            ..vibex_core::GatewaySnapshot::default()
+        };
+
+        assert_eq!(
+            gateway_model_label(&snapshot.models[0]),
+            "deepseek-chat · Team"
+        );
+        assert_eq!(
+            gateway_requested_model_label(
+                Some(&snapshot),
+                &format!("group/{route_id}/deepseek-chat")
+            ),
+            "deepseek-chat · Team"
+        );
+        assert_eq!(
+            gateway_provider_label(Some(&snapshot), provider_id.as_str(), provider_id.as_str()),
+            "DeepSeek"
+        );
+
+        // A record with no resolvable name says what it is, never the id.
+        let removed = vibex_core::ModelProviderProfileId::new();
+        assert_eq!(
+            gateway_provider_label(Some(&snapshot), removed.as_str(), removed.as_str()),
+            "Provider"
+        );
+        assert_eq!(
+            gateway_requested_model_label(
+                Some(&snapshot),
+                "group/model_route_missing/deepseek-chat"
+            ),
+            "deepseek-chat"
         );
     }
 }

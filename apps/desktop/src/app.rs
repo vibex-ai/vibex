@@ -54556,7 +54556,7 @@ impl VibexWorkbench {
             .runtime_catalog
             .as_ref()
             .map(|catalog| runtime_auth_source_label(catalog, &auth_source))
-            .unwrap_or_else(|| auth_source.id().to_string());
+            .unwrap_or_else(|| runtime_auth_source_kind_label(auth_source.kind()));
         let back_agent_id = agent_id.clone();
         let supports_logout = state
             .as_ref()
@@ -77816,17 +77816,35 @@ fn runtime_auth_source_label(
         .iter()
         .find(|summary| &summary.source == auth_source)
         .map(runtime_auth_source_display_label)
-        .unwrap_or_else(|| auth_source.id().to_string())
+        .unwrap_or_else(|| runtime_auth_source_kind_label(auth_source.kind()))
+}
+
+fn runtime_auth_source_kind_label(kind: RuntimeAuthSourceKind) -> String {
+    match kind {
+        RuntimeAuthSourceKind::AgentAccount => {
+            locale::text("Agent account", "Agent 账户", "Agent 帳戶").to_string()
+        }
+        RuntimeAuthSourceKind::ProviderProfile => {
+            locale::text("Provider", "供应商", "供應商").to_string()
+        }
+        RuntimeAuthSourceKind::ModelRoute => {
+            locale::text("Route group", "路由组", "路由組").to_string()
+        }
+    }
 }
 
 fn runtime_auth_source_display_label(source: &RuntimeAuthSourceSummary) -> String {
     match source.kind {
-        RuntimeAuthSourceKind::AgentAccount => {
-            locale::text("Agent account", "Agent 账户", "Agent 帳戶").to_string()
-        }
-        // A route keeps the name its owner gave it, like a Provider.
+        RuntimeAuthSourceKind::AgentAccount => runtime_auth_source_kind_label(source.kind),
+        // A route keeps the name its owner gave it, like a Provider. A record
+        // that could not resolve its name must not fall back to its id.
         RuntimeAuthSourceKind::ProviderProfile | RuntimeAuthSourceKind::ModelRoute => {
-            source.label.clone()
+            let label = source.label.trim();
+            if label.is_empty() || label == source.source.id() {
+                runtime_auth_source_kind_label(source.kind)
+            } else {
+                source.label.clone()
+            }
         }
     }
 }
