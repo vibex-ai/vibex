@@ -21708,11 +21708,18 @@ impl ManagementCenter {
             let id = server.id.as_str().to_string();
             let select_id = id.clone();
             let selected = self.selected_mcp_id.as_deref() == Some(id.as_str());
-            let enabled_count = server
+            let enabled_agents = server
                 .agent_matrix
                 .iter()
                 .filter(|entry| entry.enabled)
-                .count();
+                .map(|entry| entry.agent_id.as_str().to_string())
+                .collect::<BTreeSet<_>>();
+            let agent_logos = provider_workspace::workspace_agent_logos(
+                &format!("management-mcp-row-{id}"),
+                &enabled_agents,
+                |agent| self.agent_label_or_id(agent),
+                cx,
+            );
             let enabled = server.status == vibex_core::McpServerStatus::Enabled;
             let market_icon = mcp_market_icon_url(&server.tags)
                 .and_then(|url| self.mcp_market_icons.get(url).cloned())
@@ -21735,7 +21742,8 @@ impl ManagementCenter {
                         market_transport_label(server.transport_kind),
                         management_mcp_scope_label(server.scope_kind)
                     ),
-                    meta: Some(management_enabled_agent_count(enabled_count)),
+                    agent_count: enabled_agents.len(),
+                    agent_logos,
                 },
                 enabled,
                 selected,
@@ -23153,11 +23161,18 @@ impl ManagementCenter {
             let id = skill.id.as_str().to_string();
             let select_id = id.clone();
             let selected = self.selected_skill_id.as_deref() == Some(id.as_str());
-            let enabled_count = skill
+            let enabled_agents = skill
                 .agent_matrix
                 .iter()
                 .filter(|entry| entry.enabled)
-                .count();
+                .map(|entry| entry.agent_id.as_str().to_string())
+                .collect::<BTreeSet<_>>();
+            let agent_logos = provider_workspace::workspace_agent_logos(
+                &format!("management-skill-row-{id}"),
+                &enabled_agents,
+                |agent| self.agent_label_or_id(agent),
+                cx,
+            );
             let enabled = skill.status == vibex_core::SkillStatus::Enabled;
             let market_icon = skill
                 .source_uri
@@ -23175,7 +23190,8 @@ impl ManagementCenter {
                         management_skill_source_kind_label(skill.source_kind),
                         management_skill_scope_label(skill.scope_kind)
                     ),
-                    meta: Some(management_enabled_agent_count(enabled_count)),
+                    agent_count: enabled_agents.len(),
+                    agent_logos,
                 },
                 enabled,
                 selected,
@@ -33368,7 +33384,8 @@ impl ManagementCenter {
                     // composer would insert rather than repeating the kind and
                     // scope every record already shares.
                     subtitle: management_prompt_preview(&prompt.body),
-                    meta: None,
+                    agent_count: 0,
+                    agent_logos: None,
                 },
                 enabled,
                 selected,
@@ -41550,15 +41567,18 @@ fn management_sidebar_card_style(selected: bool, cx: &App) -> ManagementSidebarC
     }
 }
 
-/// The lines a management sidebar row says about its resource.
+/// The content a management sidebar row draws about its resource.
 struct ManagementResourceRowText {
     /// The resource's own name.
     title: String,
     /// Where it came from, how it connects, or what it contains.
     subtitle: String,
-    /// An optional trailing fact on the same line. MCP servers and Skills
-    /// count the Agents that enabled them; a Prompt has no such number.
-    meta: Option<String>,
+    /// How many Agents enabled the resource. It feeds the accessible label
+    /// while the logos beside the row carry the same answer visually.
+    agent_count: usize,
+    /// The Agents that enabled the resource, as a trailing logo row. A Prompt
+    /// has no per-Agent enablement, so it draws nothing here.
+    agent_logos: Option<AnyElement>,
 }
 
 /// One installed resource in a management sidebar.
@@ -41583,7 +41603,8 @@ fn management_resource_row(
     let ManagementResourceRowText {
         title,
         subtitle,
-        meta,
+        agent_count,
+        agent_logos,
     } = text;
     // "Enabled" is the expected state, so it stays quiet; only a resource that
     // cannot be used says so. The label is localized: the row used to print the
@@ -41598,9 +41619,13 @@ fn management_resource_row(
     } else {
         management_locale_text("Disabled", "已停用", "已停用")
     };
-    let accessible_label = match &meta {
-        Some(meta) => format!("{title}, {status_label}, {subtitle}, {meta}"),
-        None => format!("{title}, {status_label}, {subtitle}"),
+    let accessible_label = if agent_count == 0 {
+        format!("{title}, {status_label}, {subtitle}")
+    } else {
+        format!(
+            "{title}, {status_label}, {subtitle}, {}",
+            management_enabled_agent_count(agent_count)
+        )
     };
     let card_style = management_sidebar_card_style(selected, cx);
 
@@ -41670,12 +41695,10 @@ fn management_resource_row(
                         .truncate()
                         .text_xs()
                         .text_color(cx.theme().muted_foreground)
-                        .child(match meta {
-                            Some(meta) => format!("{subtitle} · {meta}"),
-                            None => subtitle,
-                        }),
+                        .child(subtitle),
                 ),
         )
+        .children(agent_logos)
         .into_any_element()
 }
 
@@ -49327,7 +49350,7 @@ mod tests {
         let source = include_str!("management.rs");
         let style = source
             .split_once("fn management_sidebar_card_style(")
-            .and_then(|(_, tail)| tail.split_once("\n/// The lines a management sidebar row"))
+            .and_then(|(_, tail)| tail.split_once("\n/// The content a management sidebar row"))
             .map(|(body, _)| body)
             .expect("the shared card style should remain inspectable");
         assert!(style.contains(".opacity(if selected { 0.0 } else { 0.65 })"));
@@ -49370,6 +49393,58 @@ mod tests {
         assert!(provider.contains("management_sidebar_card_style(selected, cx)"));
         assert!(provider.contains(".size(px(MANAGEMENT_SIDEBAR_MARK_SLOT_SIZE))"));
         assert!(!provider.contains("cx.theme().primary.opacity(0.45)"));
+    }
+
+    /// MCP and Skill cards name the Agents that enabled them the same way the
+    /// Provider cards do: a trailing row of logos, capped at five with a
+    /// remainder count, instead of a sentence that grows with the audience.
+    #[test]
+    fn resource_cards_show_enabled_agents_as_logos() {
+        let source = include_str!("management.rs");
+        let production = source
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .map(|(production, _)| production)
+            .expect("management tests should remain inspectable");
+        let sidebars = [
+            (
+                "MCP",
+                production
+                    .split_once("    fn render_mcp_sidebar(")
+                    .and_then(|(_, tail)| tail.split_once("\n    /// The MCP market"))
+                    .map(|(body, _)| body)
+                    .expect("MCP sidebar renderer should remain inspectable"),
+            ),
+            (
+                "Skill",
+                production
+                    .split_once("    fn render_skills_sidebar(")
+                    .and_then(|(_, tail)| tail.split_once("\n    fn render_advanced_sidebar("))
+                    .map(|(body, _)| body)
+                    .expect("Skills sidebar renderer should remain inspectable"),
+            ),
+        ];
+        for (name, sidebar) in sidebars {
+            assert!(
+                sidebar.contains("workspace_agent_logos("),
+                "{name} cards must draw the enabled Agents as logos"
+            );
+            assert!(
+                sidebar.contains("agent_logos,"),
+                "{name} cards must hand the logo row to the shared resource card"
+            );
+            assert!(
+                !sidebar.contains("management_enabled_agent_count("),
+                "{name} cards must not print the enabled-Agent count as text"
+            );
+        }
+
+        let resource = production
+            .split_once("fn management_resource_row(")
+            .and_then(|(_, tail)| tail.split_once("\n/// The header of a management sidebar"))
+            .map(|(body, _)| body)
+            .expect("the resource card should remain inspectable");
+        assert!(resource.contains(".children(agent_logos)"));
+        assert!(!resource.contains("meta"));
     }
 
     #[test]

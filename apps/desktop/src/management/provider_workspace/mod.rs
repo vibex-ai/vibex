@@ -21,6 +21,7 @@ mod sidebar;
 pub(in crate::management) use route_group::RouteGroupFormScope;
 pub(crate) use route_stage::RouteStage;
 pub(crate) use routes::GatewayRouteTrail;
+pub(in crate::management) use sidebar::workspace_agent_logos;
 
 impl ManagementCenter {
     /// The detail pane: whichever record the left column selected, or the

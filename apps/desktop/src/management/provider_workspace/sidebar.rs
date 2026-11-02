@@ -883,8 +883,9 @@ fn workspace_nav_row(
 ///
 /// The row keeps the card's right edge stable: it draws at most five marks and
 /// summarises the rest as one count, so a record shared by every Agent never
-/// pushes the name out of its column.
-fn workspace_agent_logos(
+/// pushes the name out of its column. It is shared with the MCP and Skill
+/// sidebars, whose records carry the same per-Agent enablement.
+pub(in crate::management) fn workspace_agent_logos(
     id: &str,
     agents: &BTreeSet<String>,
     labels: impl Fn(&str) -> String,
