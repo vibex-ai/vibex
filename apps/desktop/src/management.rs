@@ -2611,9 +2611,9 @@ impl ManagementCenter {
             cx.subscribe_in(
                 &skill_market_query,
                 window,
-                |this, _, event: &InputEvent, window, cx| {
+                |this, _, event: &InputEvent, _window, cx| {
                     if let InputEvent::PressEnter { .. } = event {
-                        this.search_skill_market(window, cx);
+                        this.search_skill_market(cx);
                         cx.stop_propagation();
                     }
                 },
@@ -5475,12 +5475,17 @@ impl ManagementCenter {
         self.navigation.active
     }
 
+    /// Switch sections, entering MCP and Skill on their discovery surface.
+    ///
+    /// Both markets are the default answer to "what can I add here?", while the
+    /// installed-resource list remains one click away in the sidebar.
     pub fn select_section(
         &mut self,
         section: ManagementSection,
         discard_dirty: bool,
         cx: &mut Context<Self>,
     ) -> bool {
+        let previous = self.navigation.active;
         let section = match section {
             ManagementSection::ModelProviders => ManagementSection::Agents,
             ManagementSection::Providers => ManagementSection::Providers,
@@ -5509,6 +5514,13 @@ impl ManagementCenter {
             self.hide_route_group_page_draft(cx);
             self.provider_create_page_open = false;
             self.route_group_page_open = false;
+        }
+        if section != previous {
+            match section {
+                ManagementSection::Mcp => self.open_mcp_market(cx),
+                ManagementSection::Skills => self.open_skill_market(cx),
+                _ => {}
+            }
         }
         cx.notify();
         true
@@ -8458,8 +8470,13 @@ impl ManagementCenter {
                         this.provider_preset_region = None;
                         this.profile_secret_clear = false;
                         this.projection_editor.set_secret_intent(false, false);
+                        // The dialog is the Agent page's authoring surface, and
+                        // its fields mark that section dirty. A successful save
+                        // therefore retires the same flag; leaving it set made a
+                        // saved Provider still look unsaved when the reader
+                        // switched sections.
                         this.navigation
-                            .mark_dirty(ManagementSection::Providers, false);
+                            .mark_dirty(ManagementSection::Agents, false);
                         // Close the overlay with the state that retires it, not
                         // in a later frame: the host renders an empty body once
                         // this flag is false, and an empty modal left up while
@@ -11595,7 +11612,7 @@ impl ManagementCenter {
     ///
     /// The market is a view of the section rather than an overlay, so it can
     /// keep the sidebar and section chrome the user navigated from.
-    fn open_mcp_market(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+    fn open_mcp_market(&mut self, cx: &mut Context<Self>) {
         if self.mutation.is_some() {
             return;
         }
@@ -11976,7 +11993,7 @@ impl ManagementCenter {
         }));
     }
 
-    fn open_skill_market(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn open_skill_market(&mut self, cx: &mut Context<Self>) {
         if self.mutation.is_some() {
             return;
         }
@@ -11986,10 +12003,10 @@ impl ManagementCenter {
         self.skill_market_install_target = None;
         self.skill_market_document = None;
         self.skill_market_install_agents = self.market_default_agents();
-        self.search_skill_market(window, cx);
+        self.search_skill_market(cx);
     }
 
-    fn search_skill_market(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+    fn search_skill_market(&mut self, cx: &mut Context<Self>) {
         let Some(backend) = self.backend.clone() else {
             return;
         };
@@ -21581,7 +21598,7 @@ impl ManagementCenter {
                 "management-mcp-market",
                 management_locale_text("Browse MCP market", "浏览 MCP 市场", "瀏覽 MCP 市場"),
                 self.mcp_market_open,
-                cx.listener(|this, _, window, cx| this.open_mcp_market(window, cx)),
+                cx.listener(|this, _, _, cx| this.open_mcp_market(cx)),
                 cx,
             ))
             .child(management_search_input(&self.mcp_search, cx))
@@ -22257,7 +22274,7 @@ impl ManagementCenter {
             &query_input,
             loading,
             pending,
-            cx.listener(|this, _, window, cx| this.search_skill_market(window, cx)),
+            cx.listener(|this, _, _, cx| this.search_skill_market(cx)),
             // The ranking is the registry's, so it is part of the request. A
             // ranked search is the registry's own relevance order, which is why
             // the chips are only offered while browsing.
@@ -22266,7 +22283,7 @@ impl ManagementCenter {
                     "management-skill-market-sort",
                     sort,
                     pending || loading,
-                    cx.listener(|this, sort, window, cx| {
+                    cx.listener(|this, sort, _, cx| {
                         if this.skill_market_sort == *sort {
                             return;
                         }
@@ -22275,7 +22292,7 @@ impl ManagementCenter {
                         // returns to the top before the new one arrives.
                         this.skill_market_scroll
                             .set_offset(gpui::point(px(0.0), px(0.0)));
-                        this.search_skill_market(window, cx);
+                        this.search_skill_market(cx);
                     }),
                     cx,
                 )
@@ -23020,7 +23037,7 @@ impl ManagementCenter {
                 "management-skill-market",
                 management_locale_text("Browse Skill market", "浏览 Skill 市场", "瀏覽 Skill 市場"),
                 self.skill_market_open,
-                cx.listener(|this, _, window, cx| this.open_skill_market(window, cx)),
+                cx.listener(|this, _, _, cx| this.open_skill_market(cx)),
                 cx,
             ))
             .child(management_search_input(&self.skill_search, cx))
@@ -44904,7 +44921,7 @@ mod tests {
         );
         let request = renderer(
             "    fn request_mcp_market(",
-            "\n    /// Load the picture of every entry",
+            "\n    /// Load the picture of every market entry",
         );
         assert!(
             request.contains("offset: Some("),
@@ -45095,6 +45112,22 @@ mod tests {
         assert!(renderer.contains("ManagementSection::Skills"));
         assert!(renderer.contains("ManagementSection::PromptsHooks"));
         assert!(!renderer.contains("ManagementSection::Advanced"));
+    }
+
+    #[gpui::test]
+    fn entering_mcp_and_skill_sections_opens_their_markets(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let (center, cx) = cx.add_window_view(ManagementCenter::new);
+
+        center.update(cx, |center, cx| {
+            assert!(center.select_section(ManagementSection::Mcp, false, cx));
+        });
+        assert!(center.read_with(cx, |center, _| center.mcp_market_open));
+
+        center.update(cx, |center, cx| {
+            assert!(center.select_section(ManagementSection::Skills, false, cx));
+        });
+        assert!(center.read_with(cx, |center, _| center.skill_market_open));
     }
 
     /// A mutation response is a complete record, so the list can show it
