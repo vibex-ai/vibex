@@ -8765,7 +8765,11 @@ impl AcpRuntimeSwitchBridge {
 
     /// Resolves the revision the given authentication source currently mints
     /// for new bindings.
-    fn current_auth_source_revision(&self, auth_source: &RuntimeAuthSource) -> VibexResult<i64> {
+    fn current_auth_source_revision(
+        &self,
+        agent_id: &vibex_core::AgentId,
+        auth_source: &RuntimeAuthSource,
+    ) -> VibexResult<i64> {
         match auth_source {
             RuntimeAuthSource::ProviderProfile {
                 provider_profile_id,
@@ -8785,31 +8789,25 @@ impl AcpRuntimeSwitchBridge {
             // revision is that Profile's launch revision. Using the route's own
             // revision would restart every Agent on the route whenever a member
             // order changed, which no launch contract depends on.
+            //
+            // Resolve the Profile exactly as the launch path does. A model group
+            // launches through the gateway Profile, not through its first
+            // member's Provider, so reading the member here compared a durable
+            // route binding against a row it was never committed with. After a
+            // restart that surfaced as a stale revision, or as
+            // `model_route_not_launchable` when the member had no launchable
+            // Profile of its own.
             RuntimeAuthSource::ModelRoute { model_route_id } => {
                 let conn = open_database(&self.db_path)?;
-                let member = vibex_db::ModelRouteRepository::get(&conn, model_route_id)?
-                    .and_then(|route| route.enabled_members().next().cloned())
+                let profile = vibex_db::legacy_profile_for_route(&conn, agent_id, model_route_id)?
                     .ok_or_else(|| {
                         VibexError::validation(
                             "model_route_not_launchable",
-                            "The route has no member to launch through",
+                            "The route has no Profile this Agent can launch through",
                         )
                         .with_diagnostic("modelRouteId", model_route_id.as_str())
                     })?;
-                let legacy_id = vibex_db::ModelProviderProfileRepository::get(
-                    &conn,
-                    &member.model_provider_profile_id,
-                )?
-                .and_then(|shared| shared.legacy_provider_profile_id)
-                .ok_or_else(|| {
-                    VibexError::validation(
-                        "model_route_not_launchable",
-                        "The route's Provider has no Profile this Agent can launch through",
-                    )
-                })?;
-                Ok(vibex_db::ProviderProfileRepository::get(&conn, &legacy_id)?
-                    .map(|profile| profile.launch_revision())
-                    .unwrap_or(0))
+                Ok(profile.launch_revision())
             }
             RuntimeAuthSource::AgentAccount { auth_context_id } => {
                 let conn = open_database(&self.db_path)?;
@@ -8837,7 +8835,7 @@ impl AcpRuntimeSwitchBridge {
         {
             return Ok(());
         }
-        let current = self.current_auth_source_revision(&binding.auth_source)?;
+        let current = self.current_auth_source_revision(&binding.agent_id, &binding.auth_source)?;
         if current == binding.auth_source_revision {
             return Ok(());
         }
@@ -29331,6 +29329,64 @@ for line in sys.stdin:
             "the binding records the route, not the Profile it resolved through"
         );
         assert_eq!(session.state, AgentSessionState::Idle);
+
+        drop(fixture.message_submission);
+        drop(fixture.runtime_selection);
+        drop(fixture.manager);
+        drop(fixture.bridge);
+        drop(fixture.client);
+        fixture.fixture.cleanup();
+    }
+
+    /// A restarted route session compares its binding against the Profile the
+    /// route actually launches through.
+    ///
+    /// A model group launches through the gateway Profile, while its first
+    /// member names a different Provider. Reading that member made the binding
+    /// look stale after every restart, and reported
+    /// `model_route_not_launchable` when the member had no Profile of its own.
+    /// The fixture creates both rows, so this pins the revision to the gateway
+    /// Profile the resolver and the launch path select.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn route_binding_revision_matches_the_profile_the_route_launches_through() {
+        let Some(fixture) = runtime_switch_fixture("route-binding-revision").await else {
+            return;
+        };
+        let agent_id = fixture.selection.agent_id.clone();
+        let route_id = bind_fixture_provider_group(
+            &fixture.fixture,
+            &agent_id,
+            &["mock/model-1", "mock/model-2"],
+        );
+        let mut selection =
+            SessionRuntimeSelection::model_route(agent_id.clone(), route_id.clone());
+        selection.model = RuntimeModelSelection::explicit(format!(
+            "{}{}/Team",
+            vibex_core::ROUTE_GROUP_MODEL_PREFIX,
+            route_id.as_str()
+        ));
+        let resolved = fixture
+            .bridge
+            .resolve(&fixture.session.id, &selection, None)
+            .await
+            .expect("the route must resolve through its gateway Profile");
+
+        let current = fixture
+            .bridge
+            .current_auth_source_revision(&agent_id, &selection.auth_source)
+            .expect("the route revision must resolve");
+        assert_eq!(
+            current, resolved.auth_source_revision,
+            "the restart check must read the same Profile the launch path starts"
+        );
+
+        let mut binding = fixture.source_binding.clone();
+        binding.auth_source = selection.auth_source;
+        binding.auth_source_revision = resolved.auth_source_revision;
+        fixture
+            .bridge
+            .ensure_auth_source_revision_is_current(&binding)
+            .expect("a route binding committed at the launch revision must not look stale");
 
         drop(fixture.message_submission);
         drop(fixture.runtime_selection);
