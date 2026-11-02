@@ -1,5 +1,5 @@
 <h1 align="center">
-  <img src="logo-wordmark-white.svg" alt="Vibex" width="168" />
+  <a href="https://vibex.peatboy.com/"><img src="logo-wordmark-white.svg" alt="Vibex" width="168" valign="middle" /></a>
 </h1>
 
 <p align="center">
@@ -7,7 +7,8 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0--or--later-blue?style=flat" alt="License: AGPL-3.0-or-later" /></a>
   <img src="https://img.shields.io/badge/Rust-1.97.0-black?style=flat&logo=rust&logoColor=white" alt="Rust 1.97.0" />
   <img src="https://img.shields.io/badge/UI-GPUI-2563eb?style=flat" alt="GPUI" />
-  <img src="https://img.shields.io/badge/status-0.1.0--rc.7-f97316?style=flat" alt="Release status: 0.1.0-rc.8" />
+  <img src="https://img.shields.io/badge/platforms-macOS%20%7C%20Windows%20%7C%20Linux%20%7C%20iOS%20%7C%20Android-4493F8?style=flat" alt="Platforms: macOS, Windows, Linux, iOS, and Android" />
+  <img src="https://img.shields.io/badge/status-0.1.0--rc.8-f97316?style=flat" alt="Release status: 0.1.0-rc.8" />
 </p>
 
 <p align="center">
@@ -16,8 +17,8 @@
 </p>
 
 <p align="center">
-  <strong>Your agents. Your workspace. Your control—from prompt to commit, desktop to mobile.</strong><br />
-  A native, local-first AI coding workbench for Agent-powered software development.
+  <strong>Your agents. Your workspace. Your control — from prompt to commit, desktop to terminal to phone.</strong><br />
+  A native, local-first AI coding workbench built on the Agent Client Protocol.
 </p>
 
 <p align="center">
@@ -26,60 +27,178 @@
   <a href="#quick-start">Quick start</a> &nbsp;&bull;&nbsp;
   <a href="#features">Features</a> &nbsp;&bull;&nbsp;
   <a href="#supported-agents">Supported agents</a> &nbsp;&bull;&nbsp;
-  <a href="#architecture">Architecture</a> &nbsp;&bull;&nbsp;
+  <a href="#surfaces">Surfaces</a> &nbsp;&bull;&nbsp;
   <a href="#development">Development</a>
 </p>
+
 <p align="center">
-  <img src="docs/assets/showcase/desktop-en.png" alt="Vibex desktop application interface display" width="960" />
+  <img src="docs/assets/showcase/desktop-en.png" alt="Vibex desktop workbench with Agent sessions, files, Git, and a terminal" width="960" />
 </p>
 
+Vibex brings Agent sessions, source code, Git, terminals, an embedded browser, desktop automation, and provider configuration into one focused workbench. The desktop runtime stays in control of Agent processes, session history, workspace files, Git, PTYs, providers, and permissions. A native mobile client and a terminal client let you monitor and steer those same sessions remotely, while an optional self-hosted Relay carries only encrypted frames.
 
-Vibex brings Agent sessions, source code, Git, terminals, previews, and provider
-configuration into one focused workbench. The desktop runtime stays in control
-of Agent processes, session history, workspace files, Git, PTYs, providers, and
-permissions. A native mobile client lets you monitor and steer those same
-sessions remotely, while an optional self-hosted Relay carries only encrypted
-frames.
-
-No Vibex-hosted workspace is required to run the local desktop. Your repository,
-credentials, and durable session state remain on the machines you choose.
-
-## Why Vibex
-
-| Principle | What it means in practice |
-| --- | --- |
-| **Local-first authority** | The PC owns the runtime and durable state. Mobile is a typed remote client, not a second backend. |
-| **Native by default** | Rust and GPUI power the desktop and mobile clients without a browser shell or a separate WebUI product. |
-| **One Agent contract** | Every online Agent session uses ACP and managed adapters, giving integrations a shared session, capability, permission, and terminal surface. |
-| **Remote without lock-in** | Pair over Direct, Tailnet, or your own Relay. The Relay forwards encrypted frames and never becomes a second database. |
-| **Inspectable workflows** | Plans, tool calls, process details, diffs, approvals, elicitation forms, errors, and reconnect states stay visible and explicit. |
-| **Provider choice** | Configure Agents, model providers, credentials, MCP servers, Skills, Prompts, and Hooks inside Vibex-scoped configuration. |
+No Vibex-hosted workspace is required. Your repository, credentials, and durable session state remain on the machines you choose.
 
 ## Features
 
-Vibex is designed for the complete loop: ask an Agent to change code, inspect
-what it did, run the project, review the diff, and keep the session available
-wherever you are.
+<table>
+<tr>
+<td width="50%" valign="middle">
 
-| Workflow | Included |
-| --- | --- |
-| **Agent sessions** | Stream user and Agent messages as a structured timeline with Markdown, reasoning, plans, tool and process details, attachments, approvals, and typed elicitation forms. Stop, continue, fork, rename, and resume sessions, or import supported local histories. |
-| **Workspace and editor** | Browse workspace-scoped file trees, search by name or content, read and write files with revision checks, and keep encoding, line endings, and large-file limits explicit. |
-| **Git-native review** | Inspect status, history, diffs, and blame; create and switch branches; stage, unstage, revert, commit, fetch, and push; and manage isolated Git worktrees with guarded merge and rebase recovery. |
-| **Terminal and content** | Use native PTYs with ANSI emulation, tabs, resize, scrollback, search, and raw-byte handling. Preview Markdown, images, PDFs, and supported Office documents in the workbench. |
-| **Agent and provider center** | Discover and manage Agent runtimes, select models and reasoning options, authenticate providers, run health and capability probes, and keep provider profiles separate from online route identity. Providers are shared: one set of keys can serve several Agents without being configured per Agent. |
-| **Local model gateway** | Point Agents at a loopback endpoint that routes each call to a shared Provider. It translates between the OpenAI Chat, OpenAI Responses, Anthropic Messages, and Gemini APIs, keeps a conversation on the key that holds its prompt cache, cools down a key that fails instead of retrying it forever, and records a token-only request ledger. Routing state never enters an Agent's process fingerprint, so replacing a key does not restart a session. |
-| **MCP and workflow resources** | Import, validate, and scope MCP servers, Skills, Prompts, and Hooks. Give Agents reusable context without scattering configuration across unrelated home directories. |
-| **Automation** | Schedule one-shot, interval, or daily Agent runs and compose automation graphs with explicit run state, recovery, and audit history. |
-| **Attention and continuity** | Receive desktop notifications for completed, failed, or input-blocked sessions, track unread completions, and recover authoritative timeline state after reconnects or restarts. |
-| **Mobile companion** | Pair an iOS or Android client with the desktop runtime, read the same GUI Agent timeline, approve or decline requests, send follow-ups, inspect files and Git state, and use remote terminal surfaces when available. |
+### Every Agent, one workbench
+
+Run Claude Code, Codex, ZCode, OpenCode, and any ACP-compatible Agent side by side. Vibex installs, updates, authenticates, and scopes each runtime, then keeps every session in the same timeline.
+
+[Docs →](https://vibex.peatboy.com/docs/agents-and-providers)
+
+</td>
+<td width="50%">
+  <!-- Add the Agents demo GIF here, for example docs/assets/features/agents.gif. -->
+</td>
+</tr>
+<tr>
+<td width="50%" valign="middle">
+
+### Agent teams and goals
+
+Delegate work to child Agents and keep the task open across rounds. Follow up in the same session, accept or cancel the result, and watch the ownership tree while goals keep a long-running turn pointed at the outcome.
+
+[Docs →](https://vibex.peatboy.com/docs/sessions)
+
+</td>
+<td width="50%">
+  <!-- Add the Agent teams demo GIF here. -->
+</td>
+</tr>
+<tr>
+<td width="50%" valign="middle">
+
+### Parallel worktrees and Git review
+
+Give every experiment its own isolated Git worktree. Review diffs, stage and commit, merge or rebase, resolve conflicts file by file, and discard the losing branch without touching your main checkout.
+
+[Docs →](https://vibex.peatboy.com/docs/git)
+
+</td>
+<td width="50%">
+  <!-- Add the worktree and Git review demo GIF here. -->
+</td>
+</tr>
+<tr>
+<td width="50%" valign="middle">
+
+### Shared Providers and a local gateway
+
+Configure a model Provider once and share it across Agents. Route groups fail over between Providers or models, translate between OpenAI Chat, OpenAI Responses, Anthropic Messages, and Gemini, and keep a token-only request ledger — all behind one loopback endpoint.
+
+[Docs →](https://vibex.peatboy.com/docs/providers-and-gateway)
+
+</td>
+<td width="50%">
+  <!-- Add the Providers and gateway demo GIF here. -->
+</td>
+</tr>
+<tr>
+<td width="50%" valign="middle">
+
+### Terminal, browser, and computer use
+
+Use a native PTY with tabs, splits, search, and scrollback. Let an Agent drive an isolated embedded browser, or — with your approval — act on the desktop itself while you watch, approve, and stop it from a dedicated panel.
+
+[Docs →](https://vibex.peatboy.com/docs/browser)
+
+</td>
+<td width="50%">
+  <!-- Add the browser and computer-use demo GIF here. -->
+</td>
+</tr>
+<tr>
+<td width="50%" valign="middle">
+
+### Your phone, same session
+
+Pair an iOS or Android client with the desktop runtime. Read the same timeline, answer approvals and questions, send follow-ups, browse files and diffs, and use the terminal — without starting a second backend.
+
+[Docs →](https://vibex.peatboy.com/docs/remote-mobile)
+
+</td>
+<td width="50%">
+  <!-- Add the mobile companion demo GIF here. -->
+</td>
+</tr>
+<tr>
+<td width="50%" valign="middle">
+
+### Vibex TUI
+
+The whole workbench in a terminal: sessions, streaming Markdown, approvals, the queue, settings, and pairing. It ships inside every desktop package, works over SSH and tmux, and can attach to the desktop runtime already running on your machine.
+
+[Docs →](https://vibex.peatboy.com/docs/tui)
+
+</td>
+<td width="50%">
+  <!-- Add the TUI demo GIF here. -->
+</td>
+</tr>
+<tr>
+<td width="50%" valign="middle">
+
+### Remote runtimes, your rules
+
+Run the authoritative runtime on another machine over SSH or inside WSL2, or self-host `vibex-server` behind HTTPS, a Tailnet, or your own Relay. The desktop, phone, and TUI stay clients; the runtime stays the only source of truth.
+
+[Docs →](https://vibex.peatboy.com/docs/ssh-runtime)
+
+</td>
+<td width="50%">
+  <!-- Add the remote runtime demo GIF here. -->
+</td>
+</tr>
+<tr>
+<td width="50%" valign="middle">
+
+### Sessions that keep up
+
+Queue follow-ups, steer a running turn, schedule a send for later, or let auto-continue carry a turn to completion. Search every conversation, import local Agent history, and restore archived sessions with their full timeline.
+
+[Docs →](https://vibex.peatboy.com/docs/sessions)
+
+</td>
+<td width="50%">
+  <!-- Add the session queue and search demo GIF here. -->
+</td>
+</tr>
+<tr>
+<td width="50%" valign="middle">
+
+### Markets, context, and previews
+
+Install MCP servers and Skills from in-app markets, write reusable Prompts, and scope each resource per Agent. Read Markdown, PDFs, Office documents, and images in the workbench, with split panes, full-screen previews, and a workbench background that is yours.
+
+[Docs →](https://vibex.peatboy.com/docs/mcp-and-skills)
+
+</td>
+<td width="50%">
+  <!-- Add the markets and previews demo GIF here. -->
+</td>
+</tr>
+</table>
+
+**Also in the box:**
+
+- **[Global search and command palette](https://vibex.peatboy.com/docs/reference/shortcuts#search-entry-points)** — one search across sessions, settings, and quick actions.
+- **[Usage statistics](https://vibex.peatboy.com/docs/usage)** — tokens and cost by Agent, project, provider, model, and time range.
+- **[Notifications and unread state](https://vibex.peatboy.com/docs/sessions#notifications-and-unread-state)** — know when an Agent finishes, fails, or needs input.
+- **[Session archive](https://vibex.peatboy.com/docs/sessions)** — keep finished work out of the sidebar without losing its timeline.
+- **[Signed auto-updates](https://vibex.peatboy.com/docs/install#upgrade)** — on by default, verified against a signed release manifest.
+- **[Themes and workbench backgrounds](https://vibex.peatboy.com/docs/settings#appearance)** — twenty built-in themes, custom JSON themes, and still or animated backgrounds.
+- **And more shipping every week** — the [changelog](https://github.com/vibex-ai/vibex/releases) is the real feature list.
+
+---
 
 ## Supported Agents
 
-Vibex uses the [Agent Client Protocol](https://agentclientprotocol.com/) (ACP)
-as the only online Agent transport. The runtime is provider-neutral: an Agent's
-identity and capabilities are kept separate from the protocol used to connect it.
-Works with **any ACP-compatible agent** — if it speaks ACP, it runs in Vibex.
+Vibex uses the [Agent Client Protocol](https://agentclientprotocol.com/) (ACP) as the online Agent transport. An Agent's identity and capabilities stay separate from the protocol used to connect it. Works with **any ACP-compatible agent** — if it speaks ACP, it runs in Vibex.
 
 <div align="center">
   <table>
@@ -197,45 +316,57 @@ Works with **any ACP-compatible agent** — if it speaks ACP, it runs in Vibex.
   </table>
 </div>
 
-Built-in presets include **Claude Code**, **Codex**, **ZCode**, and
-**OpenCode**. The ACP catalog also includes integrations such as **Antigravity**,
-**Cline**, **Codebuddy**, **Cursor**, **Gemini CLI**, **GitHub Copilot**,
-**Devin**, **Grok Build**, **Hermes**, **Kimi Code**, **Pi**, **DeepSeek Harness**, and
-more. Availability is checked against the installed runtime, provider
-configuration, and live capability probes.
+Built-in presets include **Claude Code**, **Codex**, **ZCode**, and **OpenCode**. The ACP catalog also includes **Antigravity**, **Cline**, **Codebuddy**, **Cursor**, **Gemini CLI**, **GitHub Copilot**, **Devin**, **Grok Build**, **Hermes**, **Kimi Code**, **Pi**, **DeepSeek Harness**, and more. Availability is checked against the installed runtime, provider configuration, and live capability probes.
 
-You can also register any ACP-compatible executable with its command, arguments,
-environment, and display metadata. Adding an Agent does not require a new UI or
-a second vendor-specific session protocol.
+You can also register any ACP-compatible executable with its command, arguments, environment, and display metadata. Adding an Agent does not require a new UI or a second vendor-specific session protocol.
 
-## Native Surfaces
+---
+
+## Surfaces
 
 | Surface | Role | Entry point |
 | --- | --- | --- |
-| **Desktop** | Full native GPUI workbench and the authoritative `DesktopRuntime` for Agents, workspaces, files, Git, PTYs, providers, permissions, and durable state. | Linux, macOS, and Windows targets; start with `pnpm dev:desktop`. |
-| **Mobile** | Native GPUI iOS and Android companion. It renders the desktop session model as a GUI timeline and sends typed remote mutations. | `apps/mobile`; build with `pnpm build:mobile:android` or `pnpm build:mobile:ios`. |
-| **Self-hosted Relay** | Optional Rust/Axum transport for encrypted WebSocket frames. It stores no workspace, provider, Agent, or application data. | `apps/relay-server` and `deploy/relay`; validate with `pnpm smoke:relay:local`. |
+| **Desktop** | Full native GPUI workbench and the authoritative `DesktopRuntime` for Agents, workspaces, files, Git, PTYs, browser, computer use, providers, permissions, and durable state. | Linux, macOS, and Windows; [download the latest release](https://github.com/vibex-ai/vibex/releases/latest). |
+| **Mobile** | Native GPUI iOS and Android companion. Renders the desktop session model as a GUI timeline and sends typed remote mutations. | Android APK and unsigned iOS device IPA from [Releases](https://github.com/vibex-ai/vibex/releases/latest). |
+| **TUI** | Character-grid client over the same runtime protocol. Ships inside every desktop package and can attach to a running desktop runtime. | `vibex`, `vibex connect`, or `vibex-server tui`. |
+| **Headless runtime** | `vibex-server`: the same authoritative runtime without a window, for a server or always-on machine. | `ghcr.io/vibex-ai/vibex-server` or a release binary. |
+| **Relay** | Optional Rust/Axum transport for encrypted WebSocket frames. It stores no workspace, provider, Agent, or application data. | `apps/relay-server` and `deploy/relay`. |
 
-Mobile never starts a local Agent, owns a workspace filesystem, mutates local
-Git, or becomes a second PTY authority. Its compact native UI preserves the
-desktop Agent timeline semantics, including loading, streaming, approval,
-error, and reconnect states.
+Mobile never starts a local Agent, owns a workspace filesystem, mutates local Git, or becomes a second PTY authority. The TUI is a client too: it renders the runtime's projections and sends typed mutations. Neither client becomes a second backend.
+
+---
 
 ## Quick Start
 
-### Prerequisites
+### Install the desktop app
 
-- Git with submodule support
-- Node.js 22
-- pnpm 11.3.0
-- Rust 1.97.0, pinned by `rust-toolchain.toml`
-- A graphical session and working Vulkan driver for desktop development
+Download the package for your platform from [GitHub Releases](https://github.com/vibex-ai/vibex/releases/latest):
 
-Native mobile builds additionally require the Android SDK/NDK and `cargo-ndk`,
-or macOS with Xcode, XcodeGen, and the Apple Rust targets. See the platform
-sections below for the exact commands.
+- **Linux:** `.deb` or AppImage (x86_64); `.deb` for aarch64.
+- **macOS:** `.dmg` for Apple silicon or Intel.
+- **Windows:** NSIS `.exe` for x86_64 or ARM64.
 
-### Run the desktop workbench
+macOS and Windows packages are currently unsigned, so the first launch needs Gatekeeper or SmartScreen approval. See [Install](https://vibex.peatboy.com/docs/install) for the exact steps.
+
+### First session
+
+1. Open **Config Center → Agents**, add an Agent, and install its managed runtime if Vibex offers one.
+2. Sign in to the Agent's own account, or add a model Provider profile with an API key.
+3. Open a project folder, start a session, and send a task.
+4. Review the plan, tool calls, and diff; approve or deny permission requests as they arrive.
+
+### Try the terminal client
+
+The TUI ships with the desktop package:
+
+```bash
+cd /path/to/your/project
+vibex
+```
+
+It attaches to the runtime for that home, starting one if needed. Run `vibex status` to see which runtime it would use, or `vibex connect vibex://…` to pair with a remote runtime. See [Vibex TUI](https://vibex.peatboy.com/docs/tui).
+
+### Build from source
 
 ```bash
 git clone https://github.com/vibex-ai/vibex.git
@@ -245,184 +376,67 @@ pnpm install --frozen-lockfile
 pnpm dev:desktop
 ```
 
-The desktop app starts with a local runtime. Configure an Agent and provider in
-the Config Center, open a project directory, then create an Agent session from
-the workbench.
+Prerequisites: Git with submodule support, Node.js 22, pnpm 11.3.0, Rust 1.97.0, and a graphical session with a working Vulkan driver.
 
-### Repository checks
-
-```bash
-pnpm check
-pnpm release:build-smoke
-pnpm check:mobile-native
-```
-
-`pnpm check` runs the normal Rust, frontend, license, and deterministic behavior
-gates. `pnpm release:build-smoke` checks the native desktop, mobile, and Relay
-build graph. `pnpm check:mobile-native` validates the mobile crate and checked-in
-native project contract without claiming that an Android or iOS SDK is installed
-on the host.
-
-Tagged releases use the free GitHub-hosted native matrix in
-`.github/workflows/release.yml`: Linux `.deb`/AppImage, macOS `.dmg`, Windows
-NSIS, signed Android APK/AAB, and unsigned iOS simulator/XCFramework artifacts are
-collected by one aggregation job. macOS/Windows signing and mobile store upload
-are optional credentialed follow-up steps; RC and preview Android packages can
-use an ephemeral CI key, while stable Android releases require a configured
-release keystore.
-
-## Development
-
-### Desktop packaging
-
-Targeted desktop checks are useful while iterating:
-
-```bash
-cargo check -p vibex-desktop --locked
-cargo test -p vibex-desktop --locked
-pnpm smoke:first-frame
-```
-
-Linux preview packages use cargo-packager and the reviewed PDFium runtime:
-
-```bash
-cargo install cargo-packager --version 0.11.8 --locked
-pnpm prepare:pdfium
-pnpm package:preview
-```
-
-Use [the release runbook](docs/operations/release.md) before building RC or
-Stable packages. Generated packages and runtime binaries are build outputs and
-are not tracked in the repository.
-
-### Android
-
-Install the Android SDK/NDK, `cargo-ndk`, and the Rust targets for the ABIs you
-will build. Debug defaults to `arm64-v8a` and `x86_64`; release defaults to
-`arm64-v8a`.
-
-```bash
-pnpm build:mobile:android
-pnpm package:mobile:android
-```
-
-Set `VIBEX_MOBILE_ANDROID_TARGETS` to a space-separated ABI list to override the
-debug defaults. The local release APK is unsigned and must be aligned and signed
-with the intended release key before distribution; tagged release APKs are signed
-by the publish workflow.
-
-### iOS
-
-On macOS, install Xcode, XcodeGen, and the `aarch64-apple-ios` plus
-`aarch64-apple-ios-sim` Rust targets:
-
-```bash
-pnpm build:mobile:ios
-```
-
-This builds `VibexFFI.xcframework` and generates the Xcode project. Signing,
-simulator or device selection, and distribution credentials remain local to the
-developer or release pipeline.
-
-### Self-hosted Relay
-
-The Relay is optional. Pull the published image, or build it from source:
-
-```bash
-export VIBEX_RELAY_IMAGE=ghcr.io/vibex-ai/vibex-relay:v0.1.0-rc.8
-docker compose -f deploy/relay/docker-compose.yml pull relay-server
-docker compose -f deploy/relay/docker-compose.yml up -d --no-build relay-server
-curl -fsS http://127.0.0.1:9700/health
-docker compose -f deploy/relay/docker-compose.yml down
-```
-
-The headless runtime publishes `ghcr.io/vibex-ai/vibex-server` the same way; both
-images cover `linux/amd64` and `linux/arm64`. Use
-[the Relay deployment guide](deploy/relay/README.md) for HTTPS through Caddy,
-private Tailnet publication, runtime limits, and the optional operator-owned
-push adapter, and
-[the headless runtime guide](deploy/server/README.md#container-images) for the
-image tag rules. Keep the default loopback binding for local development.
+---
 
 ## Architecture
 
-The desktop runtime is the single authority. Shared contracts and projections
-keep native desktop and mobile behavior aligned without duplicating business
-state.
+The desktop runtime is the single authority. Shared contracts and projections keep the native desktop, mobile, and TUI behavior aligned without duplicating business state.
 
 ```text
-DesktopRuntime
+DesktopRuntime / vibex-server
 |-- ACP Agent sessions and authoritative timelines
 |-- Workspace files, editor, Git, and managed worktrees
-|-- Native PTYs, content previews, providers, and permissions
+|-- Native PTYs, embedded browser, computer use, content previews
+|-- Shared Providers, route groups, and the local model gateway
 `-- Typed RemoteGateway v2
     |-- Direct or Tailnet transport
     `-- Encrypted self-hosted Relay
             -> AutoRemoteTransport
             -> Native mobile GPUI client
+            -> Vibex TUI
 ```
 
 The main ownership boundaries are:
 
-- `crates/core` defines serialized ids, DTOs, errors, capabilities, and remote
-  protocol contracts.
-- `crates/desktop-model` owns framework-neutral session and timeline projections
-  and reducers.
-- `crates/vibex-backend` exposes provider-neutral capability facades shared by
-  native and remote adapters.
-- `crates/vibex-ui` owns semantic tokens, portable component models, workflow
-  controllers, and shell composition.
-- `crates/vibex-remote-client` owns pairing, reconnect, synchronization, and
-  Direct, Tailnet, and Relay route selection.
-- `apps/desktop` owns the native workbench and `DesktopRuntime`; `apps/mobile`
-  only composes the shared remote projections into a compact native surface.
+- `crates/core` defines serialized ids, DTOs, errors, capabilities, and remote protocol contracts.
+- `crates/desktop-model` owns framework-neutral session and timeline projections and reducers.
+- `crates/vibex-backend` exposes provider-neutral capability facades shared by native and remote adapters.
+- `crates/vibex-ui` owns semantic tokens, portable component models, workflow controllers, and shell composition.
+- `crates/vibex-remote-client` owns pairing, reconnect, synchronization, and Direct, Tailnet, and Relay route selection.
+- `apps/desktop` owns the native workbench and `DesktopRuntime`; `apps/mobile` and `apps/tui` compose the shared projections into their own surfaces.
 
-Read the [UI architecture boundary](docs/architecture/ui-boundary.md),
-[platform support matrix](docs/platform/support-matrix.md), and
-[Remote Protocol v2](docs/remote/protocol-v2.md) for the detailed contracts, and
-[SSH Remote Runtime](docs/remote/ssh-runtime.md) to run the runtime on another
-machine over SSH or in WSL2 (beta).
-
-## Tech Stack
-
-| Layer | Technologies |
-| --- | --- |
-| **Application** | Rust 2024, Cargo workspace, Rust 1.97.0 |
-| **Native UI** | GPUI, `gpui-component`, shared Rust UI contracts, generated design tokens |
-| **Agent runtime** | Agent Client Protocol schema 1.6, managed ACP adapters, Tokio |
-| **Workspace runtime** | SQLite via `rusqlite`, filesystem and Git services, `xpty`, `alacritty_terminal` |
-| **Content** | `markdown` (CommonMark/GFM through `gpui-component`), `pulldown-cmark`, HTML5ever, PDFium, ZIP/XML parsers |
-| **Remote transport** | Axum, HTTP/WebSocket v2, Rustls, `tokio-tungstenite`, X25519, HKDF, HMAC, ChaCha20-Poly1305 |
-| **Platforms** | Linux, macOS, and Windows desktop; native Android and iOS through `gpui-pre-mobile` |
-| **Tooling** | Node.js 22, pnpm 11.3.0, deterministic smoke tests and release quality gates |
+Read the [UI architecture boundary](docs/architecture/ui-boundary.md), [platform support matrix](docs/platform/support-matrix.md), [Remote Protocol v2](docs/remote/protocol-v2.md), and [SSH Remote Runtime](docs/remote/ssh-runtime.md) for the detailed contracts.
 
 ## Privacy and Control
 
-- **Local-first storage:** session timelines, workspace metadata, provider
-  profiles, and runtime state are owned by the desktop runtime and stored locally.
-- **Explicit permissions:** Agent tools, terminal actions, device access, and
-  remote mutations are capability-gated and auditable.
-- **Encrypted remote access:** Direct, Tailnet, and Relay routes use typed
-  handshakes and encrypted transport. Relay forwards frames but cannot decrypt
-  business payloads.
-- **Scoped provider configuration:** Vibex does not rewrite real Agent home
-  configuration by default. Export is an explicit user action with preview and
-  rollback boundaries.
-- **Redacted diagnostics:** tokens, private keys, prompts, file contents, and
-  terminal bytes are excluded from logs and diagnostic artifacts.
+- **Local-first storage:** session timelines, workspace metadata, provider profiles, browser profiles, and runtime state are owned by the runtime and stored locally.
+- **Explicit permissions:** Agent tools, terminal actions, browser navigation, computer use, device access, and remote mutations are capability-gated and auditable.
+- **Encrypted remote access:** Direct, Tailnet, and Relay routes use typed handshakes and encrypted transport. Relay forwards frames but cannot decrypt business payloads.
+- **Scoped provider configuration:** Vibex does not rewrite real Agent home configuration by default. Export is an explicit user action with preview and rollback boundaries.
+- **Redacted diagnostics:** tokens, private keys, prompts, file contents, browser cookies, and terminal bytes are excluded from logs and diagnostic artifacts.
+
+## Development
+
+Vibex is a Rust 2024 workspace with a small Node/pnpm toolchain for packaging and release checks.
+
+```bash
+pnpm check                 # Rust fmt/clippy/tests, frontend typecheck, licenses
+pnpm release:build-smoke   # desktop, mobile, and Relay build graph
+pnpm check:mobile-native   # mobile crate and native project contract
+```
+
+Use the smallest relevant gate while iterating. Packaging, mobile, Relay, and release instructions live in the [developer guide](https://vibex.peatboy.com/docs/developer) and [docs/operations/release.md](docs/operations/release.md).
 
 ## Contributing
 
 Issues and pull requests are welcome. Before opening a change:
 
-- Keep `DesktopRuntime` as the only authority and route mobile behavior through
-  typed backend and remote contracts.
-- Run the smallest relevant gate while iterating, then run `pnpm check` for
-  cross-layer changes.
+- Keep `DesktopRuntime` as the only authority and route client behavior through typed backend and remote contracts.
+- Run the smallest relevant gate while iterating, then run `pnpm check` for cross-layer changes.
+- Update the user guide in all three documentation locales when behavior changes.
 
 ## License
 
-Vibex is free software licensed under the
-[GNU Affero General Public License v3.0 or later](LICENSE). Third-party package,
-font, icon, and PDFium notices are recorded in
-[docs/licenses](docs/licenses/README.md).
+Vibex is free software licensed under the [GNU Affero General Public License v3.0 or later](LICENSE). Third-party package, font, icon, and PDFium notices are recorded in [docs/licenses](docs/licenses/README.md).
