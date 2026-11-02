@@ -26561,19 +26561,14 @@ impl ManagementCenter {
                 state.set_placeholder(SharedString::from(hint.to_string()), window, cx)
             });
         }
-        self.notice = Some(format!(
-            "{}: {}",
-            preset.display_name,
-            preset
-                .endpoint_hint
-                .clone()
-                .unwrap_or_else(|| management_locale_text(
-                    "preset applied",
-                    "已应用预设",
-                    "已套用預設",
-                )
-                .to_string())
-        ));
+        // The hint names the preset that filled the form. Its address, key
+        // shape and "no key needed" case are already visible as fields, so
+        // repeating `endpoint_hint` here would only say the same thing twice.
+        self.notice = Some(match locale::current_locale() {
+            ResolvedLocale::En => format!("Using the {} preset", preset.display_name),
+            ResolvedLocale::ZhCn => format!("已使用 {} 预设", preset.display_name),
+            ResolvedLocale::ZhTw => format!("已使用 {} 預設", preset.display_name),
+        });
         self.navigation.mark_dirty(ManagementSection::Agents, true);
         // The preset itself never fetches; the debounce only becomes relevant
         // once a Key completes the pair. Dropping the pending timer keeps one
