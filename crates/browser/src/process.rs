@@ -52,12 +52,49 @@ pub const BROWSER_BASE_FLAGS: &[&str] = &[
     "about:blank",
 ];
 
+/// The user agent a normal, windowed Chrome sends.
+///
+/// `--headless=new` stamps `HeadlessChrome/<major>` into the UA string, and bot
+/// checks key on exactly that marker: Cloudflare's Turnstile served the forum a
+/// challenge page that never completed instead of the page itself. The browser
+/// still runs headless — this changes only the string the page reads — and the
+/// major version stays the installation's own, so the UA and Chromium's client
+/// hints agree.
+///
+/// `None` when discovery could not report a numeric version; launching with no
+/// override keeps the old behaviour rather than inventing a version.
+fn normal_user_agent(version: Option<&str>) -> Option<String> {
+    let major = version?.split('.').next()?;
+    if major.is_empty() || !major.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let platform = if cfg!(target_os = "windows") {
+        "Windows NT 10.0; Win64; x64"
+    } else if cfg!(target_os = "macos") {
+        "Macintosh; Intel Mac OS X 10_15_7"
+    } else if cfg!(target_arch = "aarch64") {
+        "X11; Linux aarch64"
+    } else {
+        "X11; Linux x86_64"
+    };
+    Some(format!(
+        "Mozilla/5.0 ({platform}) AppleWebKit/537.36 (KHTML, like Gecko) \
+         Chrome/{major}.0.0.0 Safari/537.36"
+    ))
+}
+
 /// Configuration for one browser process launch.
 #[derive(Debug, Clone)]
 pub struct BrowserLaunchConfig {
     pub installation: BrowserInstallation,
     pub user_data_dir: PathBuf,
     pub transport: CdpTransportKind,
+    /// The UA the page sees, replacing Chrome's headless marker.
+    ///
+    /// Derived from the installation's version rather than configured: a page
+    /// that reads `HeadlessChrome` treats the panel as a bot, and there is no
+    /// legitimate reason for the embedded browser to announce itself as one.
+    pub user_agent: Option<String>,
     /// Extra flags appended after the base flags.
     pub extra_flags: Vec<String>,
 }
@@ -72,10 +109,12 @@ impl BrowserLaunchConfig {
         user_data_dir: impl Into<PathBuf>,
         transport: CdpTransportKind,
     ) -> Self {
+        let user_agent = normal_user_agent(installation.version.as_deref());
         Self {
             installation,
             user_data_dir: user_data_dir.into(),
             transport,
+            user_agent,
             extra_flags: Vec::new(),
         }
     }
@@ -193,6 +232,12 @@ async fn launch_with_pipe(config: &BrowserLaunchConfig) -> BrowserResult<Browser
         ))
         .arg("--remote-debugging-pipe")
         .args(BROWSER_BASE_FLAGS)
+        .args(
+            config
+                .user_agent
+                .iter()
+                .map(|user_agent| format!("--user-agent={user_agent}")),
+        )
         .args(&config.extra_flags)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -284,6 +329,12 @@ async fn launch_with_port(config: &BrowserLaunchConfig) -> BrowserResult<Browser
         .arg("--remote-debugging-port=0")
         .arg("--remote-allow-origins=http://127.0.0.1")
         .args(BROWSER_BASE_FLAGS)
+        .args(
+            config
+                .user_agent
+                .iter()
+                .map(|user_agent| format!("--user-agent={user_agent}")),
+        )
         .args(&config.extra_flags)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -520,6 +571,44 @@ mod tests {
         assert!(BROWSER_BASE_FLAGS.contains(&"--disable-renderer-backgrounding"));
         assert!(BROWSER_BASE_FLAGS.contains(&"--disable-backgrounding-occluded-windows"));
         assert!(BROWSER_BASE_FLAGS.contains(&"--disable-background-timer-throttling"));
+    }
+
+    #[test]
+    fn the_user_agent_drops_the_headless_marker() {
+        let user_agent = normal_user_agent(Some("156.0.8078.79")).expect("a user agent");
+        assert!(user_agent.contains("Chrome/156.0.0.0"), "{user_agent}");
+        assert!(
+            !user_agent.to_ascii_lowercase().contains("headless"),
+            "{user_agent}"
+        );
+        assert!(user_agent.contains("AppleWebKit/537.36"), "{user_agent}");
+    }
+
+    #[test]
+    fn a_version_that_is_not_numeric_leaves_the_user_agent_alone() {
+        assert_eq!(normal_user_agent(None), None);
+        assert_eq!(normal_user_agent(Some("")), None);
+        assert_eq!(normal_user_agent(Some("dev")), None);
+    }
+
+    #[test]
+    fn the_launch_config_carries_the_derived_user_agent() {
+        let config = BrowserLaunchConfig::new(
+            BrowserInstallation {
+                id: "chrome".to_string(),
+                label: "Google Chrome".to_string(),
+                executable: "/usr/bin/google-chrome".to_string(),
+                version: Some("156.0.8078.79".to_string()),
+            },
+            "/tmp/vibex-browser-test",
+            CdpTransportKind::Pipe,
+        );
+        assert!(
+            config
+                .user_agent
+                .as_deref()
+                .is_some_and(|user_agent| user_agent.contains("Chrome/156.0.0.0"))
+        );
     }
 
     #[test]

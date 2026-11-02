@@ -116,6 +116,56 @@ async fn a_page_opened_tab_is_adopted_and_closed_like_any_other() {
     service.shutdown().await;
 }
 
+/// Cloudflare's Turnstile challenge keys on the `HeadlessChrome` UA marker. The
+/// engine still runs headless, but the string the page reads has to be the
+/// ordinary desktop UA, or every challenge waits for a human who can never pass
+/// it.
+#[tokio::test]
+async fn a_tab_presents_the_desktop_user_agent() {
+    let home = tempfile::tempdir().expect("temp home");
+    let service = BrowserService::new(BrowserServiceConfig::new(home.path()));
+    let Some(session_id) = session_or_skip(&service).await else {
+        return;
+    };
+    let browser_tab = service
+        .create_tab(&session_id, Some("about:blank"), BrowserTabOwner::User)
+        .await
+        .expect("a tab");
+    let outcome = service
+        .call_tool(
+            &vibex_browser::BrowserToolContext {
+                session_id: session_id.clone(),
+                agent_session_id: None,
+                workspace_id: None,
+                authorized_roots: Vec::new(),
+                tier: vibex_core::BrowserToolTier::Fine,
+                approved_origins: Vec::new(),
+            },
+            "browser_evaluate",
+            &serde_json::json!({
+                "tab_id": browser_tab.as_str(),
+                "script": "navigator.userAgent",
+            }),
+        )
+        .await;
+    assert!(
+        !outcome.is_error,
+        "the page did not answer: {}",
+        outcome.text
+    );
+    assert!(
+        !outcome.text.contains("HeadlessChrome"),
+        "the tab kept the headless user agent: {}",
+        outcome.text
+    );
+    assert!(
+        outcome.text.contains("Chrome/"),
+        "not a Chrome user agent: {}",
+        outcome.text
+    );
+    service.shutdown().await;
+}
+
 async fn wait_for_opened_tab(
     events: &mut tokio::sync::broadcast::Receiver<BrowserServiceEvent>,
 ) -> (vibex_core::BrowserSessionId, vibex_core::BrowserTabId) {
