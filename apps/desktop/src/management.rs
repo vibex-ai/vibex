@@ -7185,6 +7185,7 @@ impl ManagementCenter {
         let center = cx.entity();
         let dialog_center = center.clone();
         let confirm_center = center.clone();
+        let cancel_center = center.clone();
         let dialog_content = cx.new(|cx| ManagementProfileDialog::new(center.clone(), cx));
         // Wide enough for the Model picker and its settings side by side, and
         // tall enough that the two panes, not the whole form, are what scrolls.
@@ -7201,6 +7202,7 @@ impl ManagementCenter {
         window.open_dialog(cx, move |dialog, _, _| {
             let dialog_center = dialog_center.clone();
             let confirm_center = confirm_center.clone();
+            let cancel_center = cancel_center.clone();
             dialog
                 .title(title)
                 .w(px(dialog_width))
@@ -7223,12 +7225,32 @@ impl ManagementCenter {
                         .update(cx, |center, cx| center.confirm_profile_dialog(window, cx));
                     false
                 })
+                .on_cancel(move |_, window, cx| {
+                    cancel_center.update(cx, |center, cx| center.escape_profile_dialog(window, cx))
+                })
                 .on_close(move |_, window, cx| {
                     dialog_center.update(cx, |center, cx| {
                         center.reset_profile_editor_state(window, cx);
                     });
                 })
         });
+    }
+
+    /// Answers Escape in the Provider overlay.
+    ///
+    /// The form is one step past the chooser, so Escape there walks back to the
+    /// chooser instead of discarding the whole flow; on the chooser itself —
+    /// and on an edit, which has no step behind it — it closes the overlay. A
+    /// save in flight owns the overlay, so Escape waits for it to settle.
+    fn escape_profile_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.mutation.is_some() {
+            return false;
+        }
+        if self.provider_form_from_picker {
+            self.return_to_provider_picker(window, cx);
+            return false;
+        }
+        true
     }
 
     fn add_profile_model(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -25927,22 +25949,22 @@ impl ManagementCenter {
                 // Keep the mark and the title one centred group. The kit's
                 // `prefix` slot is pinned to the tab's leading edge, which
                 // pushed the icon far away from the label it belongs to.
-                Tab::new()
-                    .flex_1()
-                    .aria_label(tab.label())
-                    .child(
-                        h_flex()
-                            .items_center()
-                            .gap_1p5()
-                            .child(Icon::default().path(tab.icon()))
-                            .child(tab.label()),
-                    )
-                    .suffix(
-                        div()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(count.to_string()),
-                    )
+                Tab::new().flex_1().aria_label(tab.label()).child(
+                    h_flex()
+                        .items_center()
+                        .gap_1p5()
+                        .child(Icon::default().path(tab.icon()))
+                        .child(tab.label())
+                        // The count belongs to the title, not to the tab's
+                        // trailing edge: it reads as part of the same name
+                        // and stays next to it while the group is centred.
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(count.to_string()),
+                        ),
+                )
             }))
             .on_click(cx.listener(|this, index: &usize, window, cx| {
                 if let Some(tab) = ProviderPickerTab::ALL.get(*index) {
@@ -31277,6 +31299,7 @@ impl ManagementCenter {
         let center = cx.entity();
         let dialog_center = center.clone();
         let confirm_center = center.clone();
+        let cancel_center = center.clone();
         let dialog_content = cx.new(|cx| ManagementRouteGroupDialog::new(center.clone(), cx));
         // The two authoring dialogs are steps of one flow, so they share one
         // window: a group editor that opened at a different size would jump as
@@ -31290,6 +31313,7 @@ impl ManagementCenter {
         window.open_dialog(cx, move |dialog, _, _| {
             let dialog_center = dialog_center.clone();
             let confirm_center = confirm_center.clone();
+            let cancel_center = cancel_center.clone();
             dialog
                 .title(title)
                 .w(px(dialog_width))
@@ -31304,10 +31328,31 @@ impl ManagementCenter {
                     confirm_center.update(cx, |center, cx| center.save_route_group(window, cx));
                     false
                 })
+                .on_cancel(move |_, window, cx| {
+                    cancel_center.update(cx, |center, cx| {
+                        center.escape_route_group_dialog(window, cx)
+                    })
+                })
                 .on_close(move |_, _, cx| {
                     dialog_center.update(cx, |center, cx| center.close_route_group_editor(cx));
                 })
         });
+    }
+
+    /// Answers Escape in the route-group overlay.
+    ///
+    /// A group authored from the chooser has a step behind it, so Escape walks
+    /// back there; a group opened from an Agent card has none, so the same key
+    /// closes the overlay. A save in flight owns it, so Escape waits.
+    fn escape_route_group_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.mutation.is_some() {
+            return false;
+        }
+        if self.route_group_form_from_picker {
+            self.return_from_route_group_editor(window, cx);
+            return false;
+        }
+        true
     }
 
     fn render_providers(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
@@ -50529,7 +50574,9 @@ mod gateway_surface_tests {
         assert!(tabs.contains(".gap_1p5()"));
         assert!(tabs.contains(".child(tab.label())"));
         assert!(!tabs.contains(".prefix("));
-        assert!(tabs.contains(".suffix("));
+        // The count is the title's neighbour, not the tab's trailing edge.
+        assert!(tabs.contains("count.to_string()"));
+        assert!(!tabs.contains(".suffix("));
         // A saved selection, not a hover: the tab bar owns the active state.
         assert!(tabs.contains(".selected_index(selected_index)"));
         assert!(tabs.contains("this.provider_picker_tab = *tab;"));
@@ -50601,6 +50648,38 @@ mod gateway_surface_tests {
             .expect("the group form's way back should remain inspectable");
         assert!(leave.contains("self.present_profile_editor_dialog(window, cx);"));
         assert!(leave.contains("ProviderPickerTab::RouteGroups"));
+    }
+
+    /// Escape takes the same step back as the Back button, and only closes when
+    /// there is no step behind the surface.
+    #[test]
+    fn escape_steps_back_before_it_closes_the_overlay() {
+        let source = include_str!("management.rs");
+
+        let provider = source
+            .split_once("    fn escape_profile_dialog(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn add_profile_model("))
+            .map(|(body, _)| body)
+            .expect("the Provider escape answer should remain inspectable");
+        assert!(provider.contains("self.mutation.is_some()"));
+        assert!(provider.contains("self.provider_form_from_picker"));
+        assert!(provider.contains("self.return_to_provider_picker(window, cx);"));
+        assert!(provider.contains("        true\n    }"));
+
+        let group = source
+            .split_once("    fn escape_route_group_dialog(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_providers("))
+            .map(|(body, _)| body)
+            .expect("the group escape answer should remain inspectable");
+        assert!(group.contains("self.mutation.is_some()"));
+        assert!(group.contains("self.route_group_form_from_picker"));
+        assert!(group.contains("self.return_from_route_group_editor(window, cx);"));
+        assert!(group.contains("        true\n    }"));
+
+        // Both dialogs hand Escape to that answer instead of letting the host
+        // close the overlay on the first press.
+        assert!(source.contains("center.escape_profile_dialog(window, cx)"));
+        assert!(source.contains("center.escape_route_group_dialog(window, cx)"));
     }
 
     /// Choosing a source replaces the chooser's own title, which names the
