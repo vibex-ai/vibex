@@ -1139,9 +1139,11 @@ impl ManagementCenter {
             .map(|member| member.model_provider_profile_id.clone())
             .collect::<BTreeSet<_>>();
         let cutoff = vibex_core::unix_timestamp_ms() - self.traffic_range.window_ms();
-        let traffic = WorkspaceTraffic::collect(self.gateway_requests.iter().filter(|request| {
-            members.contains(&request.model_provider_profile_id) && request.created_at_ms >= cutoff
-        }));
+        let traffic =
+            WorkspaceTraffic::collect(self.gateway_traffic_requests.iter().filter(|request| {
+                members.contains(&request.model_provider_profile_id)
+                    && request.created_at_ms >= cutoff
+            }));
         ws_stack(vec![ws_section(
             management_locale_text("Traffic", "流量", "流量"),
             Some(management_locale_text(

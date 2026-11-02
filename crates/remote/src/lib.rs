@@ -630,8 +630,11 @@ pub trait RemoteManagementSnapshotSource: Send + Sync {
         answer: vibex_core::GatewayFailoverAnswer,
     ) -> VibexResult<bool>;
 
-    /// Lists the gateway's metadata-only request ledger.
-    async fn model_gateway_requests(&self) -> VibexResult<Vec<vibex_core::GatewayRequestSummary>>;
+    /// Lists one bounded page of the gateway's metadata-only request ledger.
+    async fn model_gateway_requests(
+        &self,
+        query: vibex_core::GatewayRequestQuery,
+    ) -> VibexResult<Vec<vibex_core::GatewayRequestSummary>>;
 
     /// Clears the gateway's request ledger.
     async fn clear_model_gateway_requests(&self) -> VibexResult<usize>;
@@ -4649,7 +4652,7 @@ async fn dispatch_provider_request(
                     "the model gateway is not available on this service",
                 )
             })?;
-            let requests = source.model_gateway_requests().await?;
+            let requests = source.model_gateway_requests(request.query).await?;
             serde_json::to_value(vibex_core::RemoteModelGatewayRequestListResponse { requests })
                 .map_err(remote_payload_encode_error)
         }

@@ -296,8 +296,11 @@ pub trait ManagementBackend: BackendBound {
         answer: vibex_core::GatewayFailoverAnswer,
     ) -> BackendFuture<'_, bool>;
 
-    /// Lists the metadata-only ledger for the diagnostics view.
-    fn model_gateway_requests(&self) -> BackendFuture<'_, Vec<GatewayRequestSummary>>;
+    /// Lists one bounded page of the metadata-only ledger.
+    fn model_gateway_requests(
+        &self,
+        query: vibex_core::GatewayRequestQuery,
+    ) -> BackendFuture<'_, Vec<GatewayRequestSummary>>;
 
     /// The requests the gateway is serving right now.
     fn model_gateway_inflight(&self) -> BackendFuture<'_, Vec<vibex_core::GatewayInflight>>;

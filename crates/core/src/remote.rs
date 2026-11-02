@@ -2876,6 +2876,8 @@ pub struct RemoteModelGatewayAgentUpdateRequest {
 #[serde(rename_all = "camelCase")]
 pub struct RemoteModelGatewayRequestListRequest {
     pub auth: RemoteAuthProof,
+    #[serde(default)]
+    pub query: crate::GatewayRequestQuery,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -5591,6 +5593,33 @@ mod tests {
         assert_eq!(decoded.operation, RemoteOperationKind::Handshake);
         assert_eq!(decoded.correlation_id, Some(correlation_id));
         assert_eq!(decoded.payload.unwrap()["clientName"], "web");
+    }
+
+    #[test]
+    fn gateway_request_list_query_round_trips_and_defaults_for_old_clients() {
+        let device_id = DeviceId::new();
+        let request = RemoteModelGatewayRequestListRequest {
+            auth: RemoteAuthProof {
+                device_id: device_id.clone(),
+                auth_token: "token".to_string(),
+            },
+            query: crate::GatewayRequestQuery::default()
+                .with_limit(25)
+                .after(crate::GatewayRequestCursor::new(1_000, RequestId::new())),
+        };
+        let encoded = serde_json::to_value(&request).unwrap();
+        assert_eq!(encoded["query"]["limit"], 25);
+        assert_eq!(encoded["query"]["before"]["createdAtMs"], 1_000);
+
+        let old_client: RemoteModelGatewayRequestListRequest =
+            serde_json::from_value(serde_json::json!({
+                "auth": {
+                    "deviceId": device_id,
+                    "authToken": "token"
+                }
+            }))
+            .unwrap();
+        assert_eq!(old_client.query, crate::GatewayRequestQuery::default());
     }
 
     #[test]

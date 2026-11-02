@@ -1873,7 +1873,10 @@ impl vibex_remote::RemoteManagementSnapshotSource for ManagementSnapshotSource {
             .answer_failover(&prompt_id, answer))
     }
 
-    async fn model_gateway_requests(&self) -> VibexResult<Vec<vibex_core::GatewayRequestSummary>> {
+    async fn model_gateway_requests(
+        &self,
+        query: vibex_core::GatewayRequestQuery,
+    ) -> VibexResult<Vec<vibex_core::GatewayRequestSummary>> {
         let management = self.management.get().ok_or_else(|| {
             VibexError::process(
                 "desktop_management_handle_unavailable",
@@ -1882,7 +1885,7 @@ impl vibex_remote::RemoteManagementSnapshotSource for ManagementSnapshotSource {
         })?;
         let logs = management
             .model_gateway()
-            .recent_requests(50)
+            .request_history(&query)
             .map_err(VibexError::from)?;
         let profiles = management
             .providers()

@@ -454,9 +454,10 @@ impl ManagementCenter {
 
         // Traffic.
         let cutoff = vibex_core::unix_timestamp_ms() - self.traffic_range.window_ms();
-        let traffic = WorkspaceTraffic::collect(self.gateway_requests.iter().filter(|request| {
-            request.model_provider_profile_id == profile.id && request.created_at_ms >= cutoff
-        }));
+        let traffic =
+            WorkspaceTraffic::collect(self.gateway_traffic_requests.iter().filter(|request| {
+                request.model_provider_profile_id == profile.id && request.created_at_ms >= cutoff
+            }));
 
         ws_stack(vec![
             tiles,

@@ -3311,13 +3311,16 @@ impl ManagementBackend for NativeBackend {
         })
     }
 
-    fn model_gateway_requests(&self) -> BackendFuture<'_, Vec<GatewayRequestSummary>> {
+    fn model_gateway_requests(
+        &self,
+        query: vibex_core::GatewayRequestQuery,
+    ) -> BackendFuture<'_, Vec<GatewayRequestSummary>> {
         let runtime = self.runtime.clone();
         Box::pin(async move {
             runtime.ensure_accepting_actions()?;
             let service = runtime.model_gateway();
             let logs = service
-                .recent_requests(50)
+                .request_history(&query)
                 .map_err(vibex_core::VibexError::from)?;
             let profiles = runtime
                 .providers()

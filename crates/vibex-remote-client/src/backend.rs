@@ -4133,10 +4133,16 @@ impl ManagementBackend for WebRemoteBackend {
         )
     }
 
-    fn model_gateway_requests(&self) -> BackendFuture<'_, Vec<vibex_core::GatewayRequestSummary>> {
+    fn model_gateway_requests(
+        &self,
+        query: vibex_core::GatewayRequestQuery,
+    ) -> BackendFuture<'_, Vec<vibex_core::GatewayRequestSummary>> {
         self.gateway_rpc(
             vibex_core::RemoteProviderRequest::ListModelGatewayRequests(
-                vibex_core::RemoteModelGatewayRequestListRequest { auth: self.auth() },
+                vibex_core::RemoteModelGatewayRequestListRequest {
+                    auth: self.auth(),
+                    query,
+                },
             ),
             |value| {
                 decode::<vibex_core::RemoteModelGatewayRequestListResponse>(value)

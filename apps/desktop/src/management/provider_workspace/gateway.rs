@@ -1,16 +1,15 @@
 //! The gateway's page.
 //!
 //! The gateway is the local address an Agent reaches when it uses a route
-//! group. Its page answers, in tab order: is it serving (Overview), where each
-//! request went and why (Routing), how well over time (Traffic), with which
-//! accounts (Keys), and under which rules (Settings).
+//! group. Its page answers, in tab order: is it serving and how well over time
+//! (Overview), where each request went and why (Routing), with which accounts
+//! (Keys), and under which rules (Settings).
 
 use super::*;
 
-const GATEWAY_TABS: [GatewayDetailTab; 5] = [
+const GATEWAY_TABS: [GatewayDetailTab; 4] = [
     GatewayDetailTab::Overview,
     GatewayDetailTab::Routing,
-    GatewayDetailTab::Traffic,
     GatewayDetailTab::Keys,
     GatewayDetailTab::Advanced,
 ];
@@ -18,7 +17,6 @@ const GATEWAY_TABS: [GatewayDetailTab; 5] = [
 fn gateway_tab_label(tab: GatewayDetailTab) -> &'static str {
     match tab {
         GatewayDetailTab::Keys => management_locale_text("Keys", "Key", "Key"),
-        GatewayDetailTab::Traffic => management_locale_text("Traffic", "流量", "流量"),
         GatewayDetailTab::Routing => management_locale_text("Routing", "路由", "路由"),
         GatewayDetailTab::Advanced => management_locale_text("Settings", "设置", "設定"),
         GatewayDetailTab::Overview => management_locale_text("Overview", "概览", "概覽"),
@@ -40,7 +38,6 @@ impl ManagementCenter {
         let body = match tab {
             GatewayDetailTab::Keys => self.render_workspace_gateway_keys(window, cx),
             GatewayDetailTab::Routing => self.render_workspace_gateway_routes(cx),
-            GatewayDetailTab::Traffic => self.render_workspace_gateway_traffic(cx),
             GatewayDetailTab::Advanced => self.render_workspace_gateway_settings(window, cx),
             GatewayDetailTab::Overview => self.render_workspace_gateway_overview(cx),
         };
@@ -250,7 +247,7 @@ impl ManagementCenter {
             .len();
         let cutoff = now - self.traffic_range.window_ms();
         let traffic = WorkspaceTraffic::collect(
-            self.gateway_requests
+            self.gateway_traffic_requests
                 .iter()
                 .filter(|request| request.created_at_ms >= cutoff),
         );
@@ -324,10 +321,11 @@ impl ManagementCenter {
                         .map(|route| route.display_name.clone())
                 })
                 .unwrap_or_else(|| model.provider_name.clone());
-            served
-                .entry(group)
-                .or_default()
-                .push(model.model_id.clone());
+            let label = self.workspace_requested_model_label(&model.model_id);
+            let models = served.entry(group).or_default();
+            if !models.contains(&label) {
+                models.push(label);
+            }
         }
         let mut served_list = v_flex().w_full().min_w_0();
         for (index, (group, models)) in served.iter().enumerate() {
@@ -434,6 +432,7 @@ impl ManagementCenter {
                 served_list.into_any_element(),
                 cx,
             ),
+            self.render_workspace_gateway_traffic(cx),
         ])
     }
 
@@ -767,7 +766,7 @@ impl ManagementCenter {
     fn render_workspace_gateway_traffic(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let cutoff = vibex_core::unix_timestamp_ms() - self.traffic_range.window_ms();
         let rows = self
-            .gateway_requests
+            .gateway_traffic_requests
             .iter()
             .filter(|request| request.created_at_ms >= cutoff)
             .collect::<Vec<_>>();

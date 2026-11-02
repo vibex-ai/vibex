@@ -1353,6 +1353,81 @@ pub struct GatewayAgentUpdateRequest {
     pub enabled: bool,
 }
 
+/// A stable position in the gateway request ledger.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct GatewayRequestCursor {
+    pub created_at_ms: i64,
+    pub request_id: RequestId,
+}
+
+impl GatewayRequestCursor {
+    pub fn new(created_at_ms: i64, request_id: RequestId) -> Self {
+        Self {
+            created_at_ms,
+            request_id,
+        }
+    }
+}
+
+/// A bounded page of the gateway's request ledger.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct GatewayRequestQuery {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub until_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before: Option<GatewayRequestCursor>,
+    #[serde(default = "default_gateway_request_limit")]
+    pub limit: usize,
+}
+
+/// The default and UI page size for request history.
+pub const GATEWAY_REQUEST_PAGE_LIMIT: usize = 500;
+/// The largest page an authority will return to one caller.
+pub const GATEWAY_REQUEST_PAGE_MAX: usize = 1_000;
+
+fn default_gateway_request_limit() -> usize {
+    GATEWAY_REQUEST_PAGE_LIMIT
+}
+
+impl Default for GatewayRequestQuery {
+    fn default() -> Self {
+        Self {
+            since_ms: None,
+            until_ms: None,
+            before: None,
+            limit: GATEWAY_REQUEST_PAGE_LIMIT,
+        }
+    }
+}
+
+impl GatewayRequestQuery {
+    /// A page within a half-open `[since, until)` window.
+    pub fn in_window(since_ms: i64, until_ms: i64) -> Self {
+        Self {
+            since_ms: Some(since_ms),
+            until_ms: Some(until_ms),
+            ..Self::default()
+        }
+    }
+
+    /// Continue after the oldest row already loaded.
+    pub fn after(mut self, cursor: GatewayRequestCursor) -> Self {
+        self.before = Some(cursor);
+        self
+    }
+
+    pub fn with_limit(mut self, limit: usize) -> Self {
+        self.limit = limit.clamp(1, GATEWAY_REQUEST_PAGE_MAX);
+        self
+    }
+}
+
 /// One request the gateway served, for the diagnostics list.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

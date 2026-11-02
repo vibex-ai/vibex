@@ -948,7 +948,10 @@ impl ManagementBackend for DisconnectedBackend {
         disconnected_future!()
     }
 
-    fn model_gateway_requests(&self) -> BackendFuture<'_, Vec<vibex_core::GatewayRequestSummary>> {
+    fn model_gateway_requests(
+        &self,
+        _query: vibex_core::GatewayRequestQuery,
+    ) -> BackendFuture<'_, Vec<vibex_core::GatewayRequestSummary>> {
         disconnected_future!()
     }
 

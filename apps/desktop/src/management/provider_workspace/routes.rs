@@ -156,6 +156,111 @@ fn note_trail(trails: &mut Vec<GatewayRouteTrail>, event: &vibex_core::GatewayEv
 }
 
 impl ManagementCenter {
+    /// The ledger query for the range currently shown by the Routing tab.
+    pub(crate) fn current_gateway_request_query(
+        &self,
+        before: Option<vibex_core::GatewayRequestCursor>,
+    ) -> vibex_core::GatewayRequestQuery {
+        let mut query = match self.gateway_request_range {
+            GatewayRequestRange::Live => vibex_core::GatewayRequestQuery::default(),
+            GatewayRequestRange::Day(day) => gateway_local_day_bounds(day)
+                .map(|(start, end)| vibex_core::GatewayRequestQuery::in_window(start, end))
+                .unwrap_or_default(),
+        };
+        if let Some(cursor) = before {
+            query = query.after(cursor);
+        }
+        query
+    }
+
+    /// Replaces or extends the request list with one authority page.
+    pub(crate) fn apply_gateway_request_page(
+        &mut self,
+        mut page: Vec<vibex_core::GatewayRequestSummary>,
+        append: bool,
+    ) {
+        let has_more = page.len() >= vibex_core::GATEWAY_REQUEST_PAGE_LIMIT;
+        if !append {
+            self.gateway_requests.clear();
+        }
+        for request in page.drain(..) {
+            if !self
+                .gateway_requests
+                .iter()
+                .any(|known| known.request_id == request.request_id)
+            {
+                self.gateway_requests.push(request);
+            }
+        }
+        self.gateway_requests.sort_by(|left, right| {
+            right
+                .created_at_ms
+                .cmp(&left.created_at_ms)
+                .then_with(|| left.request_id.as_str().cmp(right.request_id.as_str()))
+        });
+        self.gateway_requests_has_more = has_more;
+    }
+
+    fn load_gateway_request_page(&mut self, append: bool, cx: &mut Context<Self>) {
+        if append && (self.gateway_requests_loading || !self.gateway_requests_has_more) {
+            return;
+        }
+        let Some(backend) = self.backend.clone() else {
+            self.gateway_requests_loading = false;
+            cx.notify();
+            return;
+        };
+        let before = append
+            .then(|| {
+                self.gateway_requests.last().map(|request| {
+                    vibex_core::GatewayRequestCursor::new(
+                        request.created_at_ms,
+                        request.request_id.clone(),
+                    )
+                })
+            })
+            .flatten();
+        if append && before.is_none() {
+            self.gateway_requests_has_more = false;
+            cx.notify();
+            return;
+        }
+        let query = self.current_gateway_request_query(before);
+        self.gateway_requests_generation = self.gateway_requests_generation.saturating_add(1);
+        let generation = self.gateway_requests_generation;
+        self.gateway_requests_loading = true;
+        let this = cx.entity();
+        self.gateway_request_load_task = Some(cx.spawn(async move |_, cx| {
+            let outcome = backend.management().model_gateway_requests(query).await;
+            this.update(cx, |this, cx| {
+                this.gateway_request_load_task = None;
+                if generation != this.gateway_requests_generation {
+                    return;
+                }
+                this.gateway_requests_loading = false;
+                match outcome {
+                    Ok(page) => this.apply_gateway_request_page(page, append),
+                    Err(error) => {
+                        this.error = Some(format!("{}: {}", error.code, error.message));
+                    }
+                }
+                cx.notify();
+            });
+        }));
+        cx.notify();
+    }
+
+    fn set_gateway_request_range(&mut self, range: GatewayRequestRange, cx: &mut Context<Self>) {
+        if self.gateway_request_range == range {
+            return;
+        }
+        self.gateway_request_range = range;
+        self.gateway_requests.clear();
+        self.gateway_requests_has_more = false;
+        self.gateway_route_pinned = None;
+        self.load_gateway_request_page(false, cx);
+    }
+
     /// Keeps the route map's memory of one gateway event.
     pub(crate) fn note_gateway_trail(&mut self, event: &vibex_core::GatewayEvent) {
         note_trail(
@@ -1549,7 +1654,7 @@ impl ManagementCenter {
             .gateway_route_stage
             .get_or_insert_with(|| cx.new(|_| RouteStage::new()))
             .clone();
-        stage.update(cx, |stage, _| stage.set_model(model));
+        stage.update(cx, |stage, cx| stage.set_model(model, cx));
 
         let map = v_flex()
             .w_full()
@@ -1983,6 +2088,51 @@ impl ManagementCenter {
             .trim()
             .to_lowercase();
         let active = self.gateway_request_filter;
+        let today = chrono::Local::now().date_naive();
+        let request_range = self.gateway_request_range;
+        let range_center = cx.weak_entity();
+        let range_menu = Button::new("management-gateway-request-range")
+            .small()
+            .outline()
+            .label(request_range.label(today))
+            .dropdown_caret(true)
+            .dropdown_menu(move |mut menu, _, _| {
+                let live_center = range_center.clone();
+                menu = menu
+                    .item(
+                        PopupMenuItem::new(GatewayRequestRange::Live.label(today))
+                            .checked(request_range == GatewayRequestRange::Live)
+                            .on_click(move |_, _, cx| {
+                                live_center
+                                    .update(cx, |this, cx| {
+                                        this.set_gateway_request_range(
+                                            GatewayRequestRange::Live,
+                                            cx,
+                                        )
+                                    })
+                                    .ok();
+                            }),
+                    )
+                    .separator();
+                for day in gateway_request_days(today) {
+                    let center = range_center.clone();
+                    menu = menu.item(
+                        PopupMenuItem::new(GatewayRequestRange::Day(day).label(today))
+                            .checked(request_range == GatewayRequestRange::Day(day))
+                            .on_click(move |_, _, cx| {
+                                center
+                                    .update(cx, |this, cx| {
+                                        this.set_gateway_request_range(
+                                            GatewayRequestRange::Day(day),
+                                            cx,
+                                        )
+                                    })
+                                    .ok();
+                            }),
+                    );
+                }
+                menu
+            });
         let center = cx.weak_entity();
         let filter = Button::new("management-gateway-request-filter")
             .small()
@@ -2024,6 +2174,7 @@ impl ManagementCenter {
             .gateway_inflight
             .iter()
             .rev()
+            .filter(|_| self.gateway_request_range.is_live())
             .filter(|_| matches!(active, GatewayRequestFilter::All))
             .filter(|request| {
                 matches_query(
@@ -2071,11 +2222,17 @@ impl ManagementCenter {
         let shown = rows.len();
         let content = if rows.is_empty() {
             ws_empty_line(
-                if self.gateway_requests.is_empty() && self.gateway_inflight.is_empty() {
+                if self.gateway_requests_loading {
                     management_locale_text(
-                        "No request yet. Once an Agent goes through the gateway, each request is listed here without its prompt or reply.",
-                        "还没有请求。Agent 经过网关后，每个请求都会列在这里，但不含提示词和回复。",
-                        "還沒有請求。Agent 經過閘道後，每個請求都會列在這裡，但不含提示詞和回覆。",
+                        "Loading request records…",
+                        "正在加载请求记录…",
+                        "正在載入請求記錄…",
+                    )
+                } else if self.gateway_requests.is_empty() && self.gateway_inflight.is_empty() {
+                    management_locale_text(
+                        "No request in this range. Choose Live or another day above.",
+                        "该时间范围内没有请求，请选择实时或其他日期。",
+                        "該時間範圍內沒有請求，請選擇即時或其他日期。",
                     )
                 } else {
                     management_locale_text(
@@ -2113,6 +2270,21 @@ impl ManagementCenter {
                 ))
                 .into_any_element()
         };
+        let load_older =
+            (self.gateway_requests_has_more || self.gateway_requests_loading).then(|| {
+                Button::new("management-gateway-request-load-older")
+                    .small()
+                    .outline()
+                    .label(if self.gateway_requests_loading {
+                        management_locale_text("Loading…", "加载中…", "載入中…")
+                    } else {
+                        management_locale_text("Load older", "加载更早", "載入更早")
+                    })
+                    .disabled(self.gateway_requests_loading)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.load_gateway_request_page(true, cx);
+                    }))
+            });
         let foot = h_flex()
             .w_full()
             .min_w_0()
@@ -2126,23 +2298,34 @@ impl ManagementCenter {
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
                     .child(management_locale_text(
-                        "The gateway keeps 7 days of metadata and lists the latest 50. It never contains the prompt, the reply, a Key, or image content.",
-                        "网关保留最近 7 天的请求元数据，这里列出最新 50 条；不含提示词、回复、Key 和图片内容。",
-                        "閘道保留最近 7 天的請求中繼資料，這裡列出最新 50 筆；不含提示詞、回覆、Key 和圖片內容。",
+                        "The gateway keeps 7 days of metadata. It never contains the prompt, the reply, a Key, or image content.",
+                        "网关保留最近 7 天的请求元数据；不含提示词、回复、Key 和图片内容。",
+                        "閘道保留最近 7 天的請求中繼資料；不含提示詞、回覆、Key 和圖片內容。",
                     )),
             )
-            .when(!self.gateway_requests.is_empty(), |foot| {
-                foot.child(
-                    Button::new("management-gateway-clear-requests")
-                        .small()
-                        .ghost()
-                        .label(management_locale_text("Clear records…", "清除记录…", "清除記錄…"))
-                        .disabled(pending)
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.confirm_clear_gateway_requests(window, cx)
-                        })),
-                )
-            });
+            .child(
+                h_flex()
+                    .flex_none()
+                    .items_center()
+                    .gap_2()
+                    .children(load_older)
+                    .when(!self.gateway_requests.is_empty(), |actions| {
+                        actions.child(
+                            Button::new("management-gateway-clear-requests")
+                                .small()
+                                .ghost()
+                                .label(management_locale_text(
+                                    "Clear records…",
+                                    "清除记录…",
+                                    "清除記錄…",
+                                ))
+                                .disabled(pending)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.confirm_clear_gateway_requests(window, cx)
+                                })),
+                        )
+                    }),
+            );
         let count = said(
             locale::current_locale(),
             format!("{shown} shown"),
@@ -2167,6 +2350,7 @@ impl ManagementCenter {
                             .text_color(cx.theme().muted_foreground)
                             .child(count),
                     )
+                    .child(range_menu)
                     .child(div().w(rems(14.0)).child(management_search_input_compact(
                         &self.gateway_request_search,
                         cx,
@@ -2554,6 +2738,31 @@ fn gateway_duration(ms: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn request_days_cover_today_and_the_previous_six_local_days() {
+        use chrono::TimeZone as _;
+
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 11, 2).unwrap();
+        let days = gateway_request_days(today);
+        assert_eq!(days.len(), 7);
+        assert_eq!(days.first(), Some(&today));
+        assert_eq!(
+            days.last(),
+            Some(&chrono::NaiveDate::from_ymd_opt(2026, 10, 27).unwrap())
+        );
+
+        let (start, end) = gateway_local_day_bounds(today).expect("a local day window");
+        assert!(end > start);
+        assert_eq!(
+            chrono::Local
+                .timestamp_millis_opt(start)
+                .single()
+                .expect("a local timestamp")
+                .date_naive(),
+            today
+        );
+    }
 
     fn profile_id(name: &str) -> vibex_core::ModelProviderProfileId {
         vibex_core::ModelProviderProfileId::parse(format!("model_provider_{name}"))

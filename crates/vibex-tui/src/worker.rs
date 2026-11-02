@@ -2209,7 +2209,11 @@ impl Dispatch {
                 self.send(AppMessage::Gateway(result));
             }
             Effect::LoadGatewayRequests => {
-                let result = self.facade.management().model_gateway_requests().await;
+                let result = self
+                    .facade
+                    .management()
+                    .model_gateway_requests(vibex_core::GatewayRequestQuery::default())
+                    .await;
                 self.send(AppMessage::GatewayRequests(result));
             }
             Effect::SetGatewayEnabled { enabled } => {

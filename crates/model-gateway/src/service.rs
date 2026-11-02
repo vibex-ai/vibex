@@ -2985,6 +2985,15 @@ impl ModelGatewayService {
         ModelGatewayRequestLogRepository::recent(&connection, limit).map_err(GatewayError::from)
     }
 
+    /// Lists one bounded page of ledger rows.
+    pub fn request_history(
+        &self,
+        query: &vibex_core::GatewayRequestQuery,
+    ) -> GatewayResult<Vec<ModelGatewayRequestLog>> {
+        let connection = self.connection()?;
+        ModelGatewayRequestLogRepository::page(&connection, query).map_err(GatewayError::from)
+    }
+
     /// Clears the request ledger.
     pub fn clear_requests(&self) -> GatewayResult<usize> {
         let connection = self.connection()?;

@@ -1293,10 +1293,21 @@ pub struct ManagementCenter {
     providers_sidebar_tab: ProviderSidebarTab,
     /// Which route group the global Providers page has selected.
     selected_global_route_id: Option<String>,
-    /// The gateway's most recent requests, as the authority recorded them.
+    /// The gateway requests in the range selected on the Routing tab.
     gateway_requests: Vec<vibex_core::GatewayRequestSummary>,
+    /// Recent requests kept separately for traffic summaries, which must not
+    /// change when the Routing tab selects a historical day.
+    gateway_traffic_requests: Vec<vibex_core::GatewayRequestSummary>,
     gateway_request_search: Entity<InputState>,
     gateway_request_filter: GatewayRequestFilter,
+    /// Live or one local calendar day from the gateway's seven-day ledger.
+    gateway_request_range: GatewayRequestRange,
+    /// Whether another cursor page exists for the selected range.
+    gateway_requests_has_more: bool,
+    /// Whether the selected range is waiting on its first or next page.
+    gateway_requests_loading: bool,
+    /// Invalidates an older request-list read when the range changes.
+    gateway_requests_generation: u64,
     /// Requests the gateway is serving right now, newest last.
     ///
     /// The ledger draws them ahead of finished rows: a request that is still
@@ -1314,6 +1325,8 @@ pub struct ManagementCenter {
     gateway_route_trails: Vec<provider_workspace::GatewayRouteTrail>,
     /// A pending re-read of the request ledger after a request ended.
     gateway_requests_reload_task: Option<Task<()>>,
+    /// The direct request-list read started by a range change or paging.
+    gateway_request_load_task: Option<Task<()>>,
     /// The failover prompt a session is currently showing, if any.
     ///
     /// At most one at a time: two prompts would mean two held requests against
@@ -3069,6 +3082,7 @@ impl ManagementCenter {
             agent_model_route_bindings: Vec::new(),
             agent_model_source_defaults: Vec::new(),
             gateway_requests: Vec::new(),
+            gateway_traffic_requests: Vec::new(),
             gateway_request_search: cx.new(|cx| {
                 InputState::new(window, cx).placeholder(management_locale_text(
                     "Search requests",
@@ -3077,11 +3091,16 @@ impl ManagementCenter {
                 ))
             }),
             gateway_request_filter: GatewayRequestFilter::All,
+            gateway_request_range: GatewayRequestRange::Live,
+            gateway_requests_has_more: false,
+            gateway_requests_loading: false,
+            gateway_requests_generation: 0,
             gateway_inflight: Vec::new(),
             gateway_route_stage: None,
             gateway_route_pinned: None,
             gateway_route_trails: Vec::new(),
             gateway_requests_reload_task: None,
+            gateway_request_load_task: None,
             gateway_failover_prompt: None,
             gateway_limit_inputs: BTreeMap::new(),
             gateway_limits_error: None,
@@ -5673,6 +5692,13 @@ impl ManagementCenter {
         let generation = self.generation;
         self.loading = true;
         self.error = None;
+        self.gateway_request_load_task = None;
+        self.gateway_requests_generation = self.gateway_requests_generation.saturating_add(1);
+        let gateway_requests_generation = self.gateway_requests_generation;
+        self.gateway_requests_loading = true;
+        let gateway_request_query = self.current_gateway_request_query(None);
+        let gateway_traffic_query = vibex_core::GatewayRequestQuery::default()
+            .with_limit(vibex_core::GATEWAY_REQUEST_PAGE_MAX);
         let default_scope = management_provider_default_scope(self.pairing_workspace_id.clone());
         let entity = cx.weak_entity();
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
@@ -5682,8 +5708,13 @@ impl ManagementCenter {
             // own content.
             tokio::join!(
                 load_snapshot(backend.clone(), default_scope, false),
-                backend.management().model_gateway_requests(),
+                backend
+                    .management()
+                    .model_gateway_requests(gateway_request_query),
                 backend.management().model_gateway_inflight(),
+                backend
+                    .management()
+                    .model_gateway_requests(gateway_traffic_query),
             )
         });
         self.refresh_task = Some(cx.spawn(async move |_, cx| {
@@ -5694,8 +5725,16 @@ impl ManagementCenter {
                 }
                 this.loading = false;
                 match outcome {
-                    Ok((Ok(snapshot), requests, inflight)) => {
-                        this.gateway_requests = requests.unwrap_or_default();
+                    Ok((Ok(snapshot), requests, inflight, traffic)) => {
+                        if gateway_requests_generation == this.gateway_requests_generation {
+                            this.gateway_requests_loading = false;
+                            if let Ok(requests) = requests {
+                                this.apply_gateway_request_page(requests, false);
+                            }
+                        }
+                        if let Ok(traffic) = traffic {
+                            this.gateway_traffic_requests = traffic;
+                        }
                         this.gateway_inflight = inflight.unwrap_or_default();
                         this.apply_snapshot(snapshot, cx);
                         cx.notify();
@@ -5711,7 +5750,10 @@ impl ManagementCenter {
                             this.start_full_refresh(cx);
                         }
                     }
-                    Ok((Err(error), _, _)) => {
+                    Ok((Err(error), _, _, _)) => {
+                        if gateway_requests_generation == this.gateway_requests_generation {
+                            this.gateway_requests_loading = false;
+                        }
                         this.error = Some(format!("{}: {}", error.code, error.message));
                         cx.notify();
                         this.finish_failed_refresh(cx);
@@ -18632,18 +18674,30 @@ impl ManagementCenter {
         let Some(backend) = self.backend.clone() else {
             return;
         };
+        let request_query = self.current_gateway_request_query(None);
+        let traffic_query = vibex_core::GatewayRequestQuery::default()
+            .with_limit(vibex_core::GATEWAY_REQUEST_PAGE_MAX);
+        let generation = self.gateway_requests_generation;
         let this = cx.entity();
         self.gateway_requests_reload_task = Some(cx.spawn(async move |_, cx| {
             cx.background_executor()
                 .timer(Duration::from_millis(250))
                 .await;
-            let requests = backend.management().model_gateway_requests().await;
+            let (requests, traffic) = tokio::join!(
+                backend.management().model_gateway_requests(request_query),
+                backend.management().model_gateway_requests(traffic_query),
+            );
             this.update(cx, |this, cx| {
                 this.gateway_requests_reload_task = None;
-                if let Ok(requests) = requests {
-                    this.gateway_requests = requests;
-                    cx.notify();
+                if let Ok(traffic) = traffic {
+                    this.gateway_traffic_requests = traffic;
                 }
+                if generation == this.gateway_requests_generation
+                    && let Ok(requests) = requests
+                {
+                    this.apply_gateway_request_page(requests, false);
+                }
+                cx.notify();
             });
         }));
     }
@@ -19136,7 +19190,14 @@ impl ManagementCenter {
                 this.mutation = None;
                 match outcome {
                     Ok(cleared) => {
+                        this.gateway_requests_generation =
+                            this.gateway_requests_generation.saturating_add(1);
+                        this.gateway_request_load_task = None;
                         this.gateway_requests.clear();
+                        this.gateway_traffic_requests.clear();
+                        this.gateway_requests_has_more = false;
+                        this.gateway_requests_loading = false;
+                        this.gateway_route_pinned = None;
                         this.notice = Some(format!(
                             "{} ({cleared})",
                             management_locale_text(
@@ -28640,7 +28701,7 @@ impl ManagementCenter {
                     }
                     ModelGroupTemplate::LowLatency => {
                         let latencies = self
-                            .gateway_requests
+                            .gateway_traffic_requests
                             .iter()
                             .filter(|request| {
                                 request.model_provider_profile_id == profile.id
@@ -30763,7 +30824,7 @@ impl ManagementCenter {
             .iter()
             .map(|member| {
                 let latencies = self
-                    .gateway_requests
+                    .gateway_traffic_requests
                     .iter()
                     .filter(|request| {
                         request.model_provider_profile_id == member.model_provider_profile_id
@@ -30775,7 +30836,7 @@ impl ManagementCenter {
                     .filter_map(|request| request.latency_ms)
                     .collect::<Vec<_>>();
                 let used_tokens = self
-                    .gateway_requests
+                    .gateway_traffic_requests
                     .iter()
                     .filter(|request| {
                         request.model_provider_profile_id == member.model_provider_profile_id
@@ -37992,10 +38053,62 @@ impl GatewayRequestFilter {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GatewayRequestRange {
+    Live,
+    Day(chrono::NaiveDate),
+}
+
+impl GatewayRequestRange {
+    fn is_live(self) -> bool {
+        matches!(self, Self::Live)
+    }
+
+    fn label(self, today: chrono::NaiveDate) -> String {
+        match self {
+            Self::Live => management_locale_text("Live", "实时", "即時").to_string(),
+            Self::Day(day) if day == today => format!(
+                "{} · {day}",
+                management_locale_text("Today", "今天", "今天")
+            ),
+            Self::Day(day) => day.to_string(),
+        }
+    }
+}
+
+fn gateway_request_days(today: chrono::NaiveDate) -> Vec<chrono::NaiveDate> {
+    (0..7)
+        .filter_map(|offset| today.checked_sub_days(chrono::Days::new(offset)))
+        .collect()
+}
+
+/// The local half-open `[start, end)` bounds for one calendar day.
+///
+/// A few time zones skip midnight at a daylight-saving transition. In that
+/// case the first valid local minute is the start of the day.
+fn gateway_local_day_bounds(day: chrono::NaiveDate) -> Option<(i64, i64)> {
+    use chrono::TimeZone as _;
+
+    let midnight = day.and_hms_opt(0, 0, 0)?;
+    let start = (0..=180).find_map(|minute| {
+        chrono::Local
+            .from_local_datetime(&(midnight + chrono::Duration::minutes(minute)))
+            .earliest()
+    })?;
+    let next_midnight = day
+        .checked_add_days(chrono::Days::new(1))?
+        .and_hms_opt(0, 0, 0)?;
+    let end = (0..=180).find_map(|minute| {
+        chrono::Local
+            .from_local_datetime(&(next_midnight + chrono::Duration::minutes(minute)))
+            .earliest()
+    })?;
+    (end > start).then(|| (start.timestamp_millis(), end.timestamp_millis()))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GatewayDetailTab {
     Overview,
     Routing,
-    Traffic,
     Keys,
     Advanced,
 }
@@ -48938,6 +49051,8 @@ mod gateway_surface_tests {
             "management-route-traffic-range-",
             "Top error",
             "management-gateway-request-virtual-list",
+            "management-gateway-request-range",
+            "management-gateway-request-load-older",
         ] {
             assert!(
                 source.contains(marker),
@@ -49268,6 +49383,8 @@ mod gateway_surface_tests {
             "management_search_input_compact(",
             "&self.gateway_request_search",
             "v_virtual_list(",
+            "GatewayRequestRange::Day(day)",
+            "load_gateway_request_page(true, cx)",
         ] {
             assert!(
                 source.contains(marker),
@@ -49298,17 +49415,16 @@ mod gateway_surface_tests {
     /// The route map and the requests it is picked from are one tab: a
     /// record that pins nothing it can be seen beside is the old split.
     #[test]
-    fn the_gateway_workbench_has_five_tabs() {
+    fn the_gateway_workbench_has_four_tabs_and_overview_owns_traffic() {
         let source = include_str!("management/provider_workspace/gateway.rs");
         let tabs = source
-            .split_once("const GATEWAY_TABS: [GatewayDetailTab; 5] = [")
+            .split_once("const GATEWAY_TABS: [GatewayDetailTab; 4] = [")
             .and_then(|(_, tail)| tail.split_once("];"))
             .map(|(body, _)| body)
             .expect("the gateway tab list should remain inspectable");
         let order = [
             "GatewayDetailTab::Overview",
             "GatewayDetailTab::Routing",
-            "GatewayDetailTab::Traffic",
             "GatewayDetailTab::Keys",
             "GatewayDetailTab::Advanced",
         ];
@@ -49321,6 +49437,8 @@ mod gateway_surface_tests {
             source
                 .contains("GatewayDetailTab::Routing => self.render_workspace_gateway_routes(cx)")
         );
+        assert!(!source.contains("GatewayDetailTab::Traffic"));
+        assert!(source.contains("self.render_workspace_gateway_traffic(cx)"));
         assert!(source.contains("management-gateway-detail-tabs"));
         assert!(source.contains("this.gateway_detail_tab = *tab"));
     }

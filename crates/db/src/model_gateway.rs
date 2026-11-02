@@ -13,8 +13,9 @@
 use rusqlite::{Connection, OptionalExtension, params};
 
 use vibex_core::{
-    GatewayConversationPin, GatewayFailureKind, GatewayRequestOutcome, GatewayRouteTrace,
-    GatewayTokenWindow, GatewayTokenWindowUsage, ModelGatewayRequestLog, ModelGatewaySettings,
+    GATEWAY_REQUEST_PAGE_MAX, GatewayConversationPin, GatewayFailureKind, GatewayRequestCursor,
+    GatewayRequestOutcome, GatewayRequestQuery, GatewayRouteTrace, GatewayTokenWindow,
+    GatewayTokenWindowUsage, ModelGatewayRequestLog, ModelGatewaySettings,
     ModelProviderAccountState, ModelProviderProfileId, RequestId, VibexError, VibexResult,
     unix_timestamp_ms,
 };
@@ -603,6 +604,30 @@ impl ModelGatewayRequestLogRepository {
 
     /// The newest requests, for the Config Center's request list.
     pub fn recent(conn: &Connection, limit: usize) -> VibexResult<Vec<ModelGatewayRequestLog>> {
+        Self::query(conn, None, None, None, limit)
+    }
+
+    /// One bounded page of ledger rows, newest first.
+    pub fn page(
+        conn: &Connection,
+        query: &GatewayRequestQuery,
+    ) -> VibexResult<Vec<ModelGatewayRequestLog>> {
+        Self::query(
+            conn,
+            query.since_ms,
+            query.until_ms,
+            query.before.as_ref(),
+            query.limit.clamp(1, GATEWAY_REQUEST_PAGE_MAX),
+        )
+    }
+
+    fn query(
+        conn: &Connection,
+        since_ms: Option<i64>,
+        until_ms: Option<i64>,
+        before: Option<&GatewayRequestCursor>,
+        limit: usize,
+    ) -> VibexResult<Vec<ModelGatewayRequestLog>> {
         let mut statement = conn
             .prepare(
                 "
@@ -611,8 +636,15 @@ impl ModelGatewayRequestLogRepository {
                        input_tokens, output_tokens, cached_read_tokens, cached_write_tokens,
                        reasoning_tokens, latency_ms, outcome, route_trace, created_at_ms
                 FROM model_gateway_request_log
+                WHERE (?1 IS NULL OR created_at_ms >= ?1)
+                  AND (?2 IS NULL OR created_at_ms < ?2)
+                  AND (
+                      ?3 IS NULL
+                      OR created_at_ms < ?3
+                      OR (created_at_ms = ?3 AND request_id > ?4)
+                  )
                 ORDER BY created_at_ms DESC, request_id ASC
-                LIMIT ?1
+                LIMIT ?5
                 ",
             )
             .map_err(storage_err(
@@ -620,28 +652,37 @@ impl ModelGatewayRequestLogRepository {
                 "failed to read the gateway request log",
             ))?;
         let rows = statement
-            .query_map(params![i64::try_from(limit).unwrap_or(i64::MAX)], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, Option<String>>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, Option<String>>(5)?,
-                    row.get::<_, String>(6)?,
-                    row.get::<_, String>(7)?,
-                    row.get::<_, Option<i64>>(8)?,
-                    row.get::<_, i64>(9)?,
-                    row.get::<_, i64>(10)?,
-                    row.get::<_, i64>(11)?,
-                    row.get::<_, i64>(12)?,
-                    row.get::<_, i64>(13)?,
-                    row.get::<_, Option<i64>>(14)?,
-                    row.get::<_, String>(15)?,
-                    row.get::<_, Option<String>>(16)?,
-                    row.get::<_, i64>(17)?,
-                ))
-            })
+            .query_map(
+                params![
+                    since_ms,
+                    until_ms,
+                    before.map(|cursor| cursor.created_at_ms),
+                    before.map(|cursor| cursor.request_id.as_str()),
+                    i64::try_from(limit).unwrap_or(i64::MAX),
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, Option<i64>>(8)?,
+                        row.get::<_, i64>(9)?,
+                        row.get::<_, i64>(10)?,
+                        row.get::<_, i64>(11)?,
+                        row.get::<_, i64>(12)?,
+                        row.get::<_, i64>(13)?,
+                        row.get::<_, Option<i64>>(14)?,
+                        row.get::<_, String>(15)?,
+                        row.get::<_, Option<String>>(16)?,
+                        row.get::<_, i64>(17)?,
+                    ))
+                },
+            )
             .map_err(storage_err(
                 "model_gateway_request_log_read_failed",
                 "failed to read the gateway request log",
@@ -1614,6 +1655,88 @@ mod tests {
             ModelGatewayRequestLogRepository::clear(&conn).unwrap(),
             10_000
         );
+        cleanup(path);
+    }
+
+    #[test]
+    fn request_pages_respect_a_half_open_window_and_equal_timestamps() {
+        let (path, conn) = database();
+        let upstream = profile(&conn);
+        let insert = |request_id: &str, created_at_ms: i64| {
+            ModelGatewayRequestLogRepository::insert(
+                &conn,
+                &ModelGatewayRequestLog {
+                    request_id: RequestId::parse(format!("request_page_{request_id}"))
+                        .expect("a valid request id"),
+                    agent_id: Some("codex".to_string()),
+                    model_provider_profile_id: upstream.clone(),
+                    credential_id: None,
+                    model_requested: "deepseek/deepseek-chat".to_string(),
+                    model_served: Some("deepseek-chat".to_string()),
+                    wire_in: vibex_core::WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS.to_string(),
+                    wire_out: vibex_core::WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS.to_string(),
+                    status: Some(200),
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    cached_read_tokens: 0,
+                    cached_write_tokens: 0,
+                    reasoning_tokens: 0,
+                    latency_ms: Some(10),
+                    outcome: GatewayRequestOutcome::Ok,
+                    route: None,
+                    created_at_ms,
+                },
+            )
+            .unwrap();
+        };
+        insert("outside_newer", 110);
+        insert("equal_b", 100);
+        insert("equal_a", 100);
+        insert("middle", 90);
+        insert("oldest", 80);
+        insert("outside_older", 70);
+
+        let first = ModelGatewayRequestLogRepository::page(
+            &conn,
+            &GatewayRequestQuery::in_window(80, 101).with_limit(2),
+        )
+        .unwrap();
+        assert_eq!(
+            first
+                .iter()
+                .map(|row| row.request_id.as_str())
+                .collect::<Vec<_>>(),
+            ["request_page_equal_a", "request_page_equal_b"]
+        );
+
+        let cursor = GatewayRequestCursor::new(first[1].created_at_ms, first[1].request_id.clone());
+        let second = ModelGatewayRequestLogRepository::page(
+            &conn,
+            &GatewayRequestQuery::in_window(80, 101)
+                .after(cursor)
+                .with_limit(2),
+        )
+        .unwrap();
+        assert_eq!(
+            second
+                .iter()
+                .map(|row| row.request_id.as_str())
+                .collect::<Vec<_>>(),
+            ["request_page_middle", "request_page_oldest"]
+        );
+        let cursor =
+            GatewayRequestCursor::new(second[1].created_at_ms, second[1].request_id.clone());
+        assert!(
+            ModelGatewayRequestLogRepository::page(
+                &conn,
+                &GatewayRequestQuery::in_window(80, 101)
+                    .after(cursor)
+                    .with_limit(2),
+            )
+            .unwrap()
+            .is_empty()
+        );
+
         cleanup(path);
     }
 

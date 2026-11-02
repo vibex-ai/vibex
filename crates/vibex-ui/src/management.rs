@@ -2038,6 +2038,7 @@ mod tests {
 
         fn model_gateway_requests(
             &self,
+            _query: vibex_core::GatewayRequestQuery,
         ) -> BackendFuture<'_, Vec<vibex_core::GatewayRequestSummary>> {
             error_future()
         }

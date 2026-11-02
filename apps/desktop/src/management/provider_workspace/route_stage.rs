@@ -198,14 +198,19 @@ impl RouteStage {
 
     /// Takes the latest picture of the gateway.
     ///
-    /// The owner calls this while it renders, and the map renders right after
-    /// in the same frame, so nothing is notified here. A newly pinned request
-    /// starts its replay from the top.
-    pub(crate) fn set_model(&mut self, model: StageModel) {
+    /// A newly pinned request starts its replay from the top. Any model change
+    /// also schedules the map itself to redraw: the owner's repaint does not
+    /// invalidate this child entity, so without the notification a selected
+    /// request would wait for the next unrelated pointer or live update.
+    pub(crate) fn set_model(&mut self, model: StageModel, cx: &mut Context<Self>) {
+        let changed = model != self.model;
         if model.pinned != self.model.pinned {
             self.replay_from_ms = vibex_core::unix_timestamp_ms();
         }
         self.model = model;
+        if changed {
+            cx.notify();
+        }
     }
 
     /// Plays the pinned request again from the top.
@@ -1761,6 +1766,8 @@ impl RouteStage {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use super::*;
 
     fn step(lane: usize, verdict: StepVerdict, at_ms: Option<i64>) -> StageStep {
@@ -2066,7 +2073,7 @@ mod tests {
         cx.update(gpui_component::init);
         let now = vibex_core::unix_timestamp_ms();
         let stage = cx.new(|_| RouteStage::new());
-        stage.update(cx, |stage, _| stage.set_model(busy_model(now)));
+        stage.update(cx, |stage, cx| stage.set_model(busy_model(now), cx));
         let (_, cx) =
             cx.add_window_view(|window, cx| gpui_component::Root::new(stage.clone(), window, cx));
         let draw = |cx: &mut gpui::VisualTestContext| {
@@ -2117,5 +2124,27 @@ mod tests {
         stage.update(cx, |stage, cx| stage.replay(cx));
         draw(cx);
         assert!(cx.debug_bounds("route-stage-hub").is_some());
+    }
+
+    #[gpui::test]
+    fn pinning_a_request_notifies_the_route_stage_immediately(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let now = vibex_core::unix_timestamp_ms();
+        let stage = cx.new(|_| RouteStage::new());
+        let mut model = busy_model(now);
+        model.pinned = None;
+        stage.update(cx, |stage, cx| stage.set_model(model.clone(), cx));
+
+        let notified = Rc::new(Cell::new(false));
+        let observed = notified.clone();
+        let _observer = cx.new(|cx| cx.observe(&stage, move |_, _, _| observed.set(true)));
+        model.pinned = Some("replayed".to_string());
+        stage.update(cx, |stage, cx| stage.set_model(model, cx));
+        cx.run_until_parked();
+
+        assert!(
+            notified.get(),
+            "a newly pinned request must invalidate the route stage without a hover"
+        );
     }
 }
