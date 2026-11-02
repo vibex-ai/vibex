@@ -8470,13 +8470,17 @@ impl ManagementCenter {
                         this.provider_preset_region = None;
                         this.profile_secret_clear = false;
                         this.projection_editor.set_secret_intent(false, false);
+                        // The dialog is gone, so a debounce still holding its
+                        // address and Key must not ask for a catalogue the
+                        // saved record already stores. That answer would also
+                        // mark the Agent page dirty again after the save.
+                        this.cancel_profile_auto_fetch();
                         // The dialog is the Agent page's authoring surface, and
                         // its fields mark that section dirty. A successful save
                         // therefore retires the same flag; leaving it set made a
                         // saved Provider still look unsaved when the reader
                         // switched sections.
-                        this.navigation
-                            .mark_dirty(ManagementSection::Agents, false);
+                        this.navigation.mark_dirty(ManagementSection::Agents, false);
                         // Close the overlay with the state that retires it, not
                         // in a later frame: the host renders an empty body once
                         // this flag is false, and an empty modal left up while
@@ -47741,6 +47745,40 @@ mod tests {
         assert!(!source.contains(&["provider_editor", "shared"].concat()));
         assert!(!source.contains(&["management-provider-source", "scope-"].concat()));
         assert!(!source.contains(&["Only this ", "Agent"].concat()));
+    }
+
+    /// A saved Provider must not leave the Agent page looking unsaved.
+    ///
+    /// Every field of the Agent-card dialog marks the Agents section dirty, and
+    /// the create path used to retire the Providers flag instead — a flag this
+    /// dialog never sets. A successful save therefore kept asking whether to
+    /// discard a draft that no longer existed as soon as the reader switched
+    /// sections. A debounce left over from the draft could re-dirty the section
+    /// the same way, so the save retires that too.
+    #[test]
+    fn a_saved_provider_retires_the_agent_page_draft_flag() {
+        let source = include_str!("management.rs");
+        let shared = source
+            .split_once("    fn save_shared_provider(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn save_profile("))
+            .map(|(body, _)| body)
+            .expect("the shared create path should remain inspectable");
+        let success = shared
+            .split_once("Ok((profile, verification)) => {")
+            .map(|(_, tail)| tail)
+            .expect("the shared create success branch should remain inspectable");
+        assert!(
+            success.contains("mark_dirty(ManagementSection::Agents, false)"),
+            "a saved Provider must retire the Agent page's draft flag"
+        );
+        assert!(
+            !success.contains("mark_dirty(ManagementSection::Providers, false)"),
+            "the dialog never marks Providers dirty, so saving must not clear it"
+        );
+        assert!(
+            success.contains("cancel_profile_auto_fetch()"),
+            "a closed dialog must not keep an automatic fetch armed"
+        );
     }
 
     /// A Provider created from a preset records the protocol the preset names.
