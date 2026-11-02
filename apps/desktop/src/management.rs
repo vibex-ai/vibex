@@ -21430,10 +21430,10 @@ impl ManagementCenter {
             .child(management_search_input(&self.mcp_search, cx))
             .child(
                 div()
+                    .id("management-mcp-list-scroll")
                     .min_h_0()
                     .flex_1()
-                    .overflow_y_scrollbar()
-                    .scroll_gutter()
+                    .overflow_y_scroll()
                     .child(rows),
             )
             .into_any_element()
@@ -22863,10 +22863,10 @@ impl ManagementCenter {
             .child(management_search_input(&self.skill_search, cx))
             .child(
                 div()
+                    .id("management-skill-list-scroll")
                     .min_h_0()
                     .flex_1()
-                    .overflow_y_scrollbar()
-                    .scroll_gutter()
+                    .overflow_y_scroll()
                     .child(rows),
             )
             .into_any_element()
@@ -32694,10 +32694,10 @@ impl ManagementCenter {
             .child(management_search_input(&self.prompt_search, cx))
             .child(
                 div()
+                    .id("management-prompt-list-scroll")
                     .min_h_0()
                     .flex_1()
-                    .overflow_y_scrollbar()
-                    .scroll_gutter()
+                    .overflow_y_scroll()
                     .child(rows),
             )
             .into_any_element()
@@ -48121,6 +48121,70 @@ mod tests {
         assert!(refresh.contains("this.start_fast_snapshot(cx)"));
         assert!(source.contains("load_snapshot(backend, default_scope, false)"));
         assert!(source.contains("load_snapshot(backend, default_scope, true)"));
+    }
+
+    #[test]
+    fn management_sidebars_hide_scrollbars_without_reserving_a_gutter() {
+        let source = include_str!("management.rs");
+        let provider_sidebar = include_str!("management/provider_workspace/sidebar.rs");
+        let resource_sidebars = [
+            (
+                "mcp",
+                source
+                    .split_once("    fn render_mcp_sidebar(")
+                    .and_then(|(_, tail)| tail.split_once("\n    /// The MCP market"))
+                    .map(|(body, _)| body)
+                    .expect("MCP sidebar renderer should remain inspectable"),
+                "management-mcp-list-scroll",
+            ),
+            (
+                "skills",
+                source
+                    .split_once("    fn render_skills_sidebar(")
+                    .and_then(|(_, tail)| tail.split_once("\n    fn render_advanced_sidebar("))
+                    .map(|(body, _)| body)
+                    .expect("Skills sidebar renderer should remain inspectable"),
+                "management-skill-list-scroll",
+            ),
+            (
+                "prompts",
+                source
+                    .split_once("    fn render_prompts_sidebar(")
+                    .and_then(|(_, tail)| tail.split_once("\n    fn render_hooks_card("))
+                    .map(|(body, _)| body)
+                    .expect("Prompts sidebar renderer should remain inspectable"),
+                "management-prompt-list-scroll",
+            ),
+        ];
+
+        for (name, sidebar, id) in resource_sidebars {
+            assert!(
+                sidebar.contains(&format!(".id(\"{id}\")")),
+                "{name} sidebar needs a stable scroll identity"
+            );
+            assert!(
+                sidebar.contains(".overflow_y_scroll()"),
+                "{name} sidebar must keep scrolling"
+            );
+            assert!(
+                !sidebar.contains(".overflow_y_scrollbar()"),
+                "{name} sidebar must hide its scrollbar"
+            );
+            assert!(
+                !sidebar.contains(".scroll_gutter()"),
+                "{name} sidebar must not reserve a scrollbar gutter"
+            );
+        }
+
+        let provider = provider_sidebar
+            .split_once("    pub(in crate::management) fn render_provider_workspace_sidebar(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// The Providers the column lists"))
+            .map(|(body, _)| body)
+            .expect("Provider sidebar renderer should remain inspectable");
+        assert!(provider.contains(".id(\"management-provider-section-list\")"));
+        assert!(provider.contains(".overflow_y_scroll()"));
+        assert!(!provider.contains(".overflow_y_scrollbar()"));
+        assert!(!provider.contains(".scroll_gutter()"));
     }
 
     #[test]

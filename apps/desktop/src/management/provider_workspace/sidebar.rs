@@ -206,8 +206,7 @@ impl ManagementCenter {
                             .w_full()
                             .min_h_0()
                             .flex_1()
-                            .overflow_y_scrollbar()
-                            .scroll_gutter()
+                            .overflow_y_scroll()
                             .child(list),
                     )
                     .child(self.render_catalog_status_row(cx)),
