@@ -240,6 +240,12 @@ const MANAGEMENT_AGENT_INSTALL_REFRESH_INTERVAL: Duration = Duration::from_milli
 /// fetch cannot hang off either one alone: it runs once both are present, and
 /// the pause is what keeps a paste from asking the endpoint per character.
 const PROVIDER_AUTO_FETCH_DEBOUNCE: Duration = Duration::from_millis(700);
+/// How long a market query waits after the last keystroke before it searches.
+///
+/// The field is a live search, but the registry is a network read: the pause
+/// turns a typed word into one request instead of one per character. Enter and
+/// the Search button still ask immediately.
+const MARKET_AUTO_SEARCH_DEBOUNCE: Duration = Duration::from_millis(300);
 const PROVIDER_API_KEY_PLACEHOLDER: &str = "sk-…";
 const PROVIDER_OPTION_WEBSITE_URL: &str = "ccSwitchWebsiteUrl";
 const PROVIDER_OPTION_CC_SWITCH_DB_PATH: &str = "ccSwitchDbPath";
@@ -1843,6 +1849,11 @@ pub struct ManagementCenter {
     /// Bumped for every market request, so a reply that lost the race cannot
     /// overwrite a newer one, and so the indexing poll stops with the view.
     mcp_market_generation: u64,
+    /// The pending pause between a typed MCP query and its automatic search.
+    mcp_market_auto_search_task: Option<Task<()>>,
+    /// Counts every MCP query edit, so a timer overtaken by a newer edit does
+    /// not search for a query the field no longer holds.
+    mcp_market_auto_search_generation: u64,
     /// Entry the install form is configuring; `None` while browsing.
     mcp_market_install_target: Option<vibex_core::McpMarketEntry>,
     mcp_market_install_agents: BTreeSet<String>,
@@ -1865,6 +1876,14 @@ pub struct ManagementCenter {
     skill_market_scroll: ScrollHandle,
     skill_market_loading: bool,
     skill_market_error: Option<String>,
+    /// Bumped for every Skill search, so a reply that lost the race cannot
+    /// replace the results of a newer query or page.
+    skill_market_generation: u64,
+    /// The pending pause between a typed Skill query and its automatic search.
+    skill_market_auto_search_task: Option<Task<()>>,
+    /// Counts every Skill query edit, so a timer overtaken by a newer edit does
+    /// not search for a query the field no longer holds.
+    skill_market_auto_search_generation: u64,
     /// Ranking the browse list asks the registry for.
     skill_market_sort: vibex_core::SkillMarketSort,
     /// The cursor the registry handed back with the last page.
@@ -2608,29 +2627,31 @@ impl ManagementCenter {
         let subscriptions = vec![
             cx.subscribe(&agent_search, |_, _, _: &InputEvent, cx| cx.notify()),
             cx.subscribe(&mcp_search, |_, _, _: &InputEvent, cx| cx.notify()),
-            // Enter runs the market search, so a query does not need a trip to
-            // the button.
+            // Typing runs the market search after a short pause; Enter asks
+            // immediately. Both fields are the same control, so the keystroke
+            // cannot work in one and be missing in the other.
             cx.subscribe_in(
                 &mcp_market_query,
                 window,
-                |this, _, event: &InputEvent, window, cx| {
-                    if let InputEvent::PressEnter { .. } = event {
+                |this, _, event: &InputEvent, window, cx| match event {
+                    InputEvent::Change => this.schedule_mcp_market_auto_search(cx),
+                    InputEvent::PressEnter { .. } => {
                         this.search_mcp_market(window, cx);
                         cx.stop_propagation();
                     }
+                    InputEvent::Focus | InputEvent::Blur => {}
                 },
             ),
-            // The Skill market answers Enter the same way the MCP market does:
-            // both toolbars are the same control, so the keystroke cannot work
-            // in one and be missing in the other.
             cx.subscribe_in(
                 &skill_market_query,
                 window,
-                |this, _, event: &InputEvent, _window, cx| {
-                    if let InputEvent::PressEnter { .. } = event {
+                |this, _, event: &InputEvent, _window, cx| match event {
+                    InputEvent::Change => this.schedule_skill_market_auto_search(cx),
+                    InputEvent::PressEnter { .. } => {
                         this.search_skill_market(cx);
                         cx.stop_propagation();
                     }
+                    InputEvent::Focus | InputEvent::Blur => {}
                 },
             ),
             cx.subscribe(&mcp_name_draft, |_, _, _: &InputEvent, cx| cx.notify()),
@@ -3052,6 +3073,8 @@ impl ManagementCenter {
             mcp_market_loading: false,
             mcp_market_error: None,
             mcp_market_generation: 0,
+            mcp_market_auto_search_task: None,
+            mcp_market_auto_search_generation: 0,
             mcp_market_install_target: None,
             mcp_market_install_agents: BTreeSet::new(),
             mcp_market_install_env: BTreeMap::new(),
@@ -3064,6 +3087,9 @@ impl ManagementCenter {
             skill_market_scroll: ScrollHandle::new(),
             skill_market_loading: false,
             skill_market_error: None,
+            skill_market_generation: 0,
+            skill_market_auto_search_task: None,
+            skill_market_auto_search_generation: 0,
             skill_market_sort: vibex_core::SkillMarketSort::Recommended,
             skill_market_next_cursor: None,
             skill_market_loading_more: false,
@@ -11659,17 +11685,65 @@ impl ManagementCenter {
         self.mcp_market_transport = None;
         self.mcp_market_next_cursor = None;
         self.mcp_market_icon_pending.clear();
+        self.cancel_mcp_market_auto_search();
         self.request_mcp_market(McpMarketRequest::Search, cx);
     }
 
-    /// Ask the registry the current question.
+    /// Ask the registry the current question now.
     ///
     /// A page is addressed by offset because a pager counts pages, and the
     /// runtime walks the registry's cursor until that offset is covered. The
     /// cursor of the answer is kept so the next page starts where this one
     /// ended instead of walking from the first result again.
     fn search_mcp_market(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.cancel_mcp_market_auto_search();
         self.request_mcp_market(McpMarketRequest::Search, cx);
+    }
+
+    /// Drop a pending automatic search.
+    ///
+    /// Every path that asks immediately or abandons the view calls this, so a
+    /// timer left over from an earlier keystroke cannot ask a question the user
+    /// has already answered with Enter, a filter, or a section change.
+    fn cancel_mcp_market_auto_search(&mut self) {
+        self.mcp_market_auto_search_generation =
+            self.mcp_market_auto_search_generation.wrapping_add(1);
+        self.mcp_market_auto_search_task = None;
+    }
+
+    /// Search once the MCP query has been still for a moment.
+    ///
+    /// The field is live, so every edit replaces the previous wait and the
+    /// request reads the text that is actually in the field when it runs. The
+    /// edit also invalidates an answer already in flight, so a slow reply for
+    /// the old query cannot replace the list while the new one is pending.
+    fn schedule_mcp_market_auto_search(&mut self, cx: &mut Context<Self>) {
+        self.cancel_mcp_market_auto_search();
+        if !self.mcp_market_open {
+            return;
+        }
+        self.mcp_market_generation = self.mcp_market_generation.wrapping_add(1);
+        let generation = self.mcp_market_auto_search_generation;
+        let entity = cx.weak_entity();
+        self.mcp_market_auto_search_task = Some(cx.spawn(async move |_, cx| {
+            cx.background_executor()
+                .timer(MARKET_AUTO_SEARCH_DEBOUNCE)
+                .await;
+            let _ = entity.update(cx, |this, cx| {
+                if this.mcp_market_auto_search_generation != generation {
+                    return;
+                }
+                this.mcp_market_auto_search_task = None;
+                if management_primary_section(this.navigation.active) != ManagementSection::Mcp
+                    || !this.mcp_market_open
+                    || this.mcp_market_install_target.is_some()
+                    || this.mutation.is_some()
+                {
+                    return;
+                }
+                this.request_mcp_market(McpMarketRequest::Search, cx);
+            });
+        }));
     }
 
     fn request_mcp_market(&mut self, request: McpMarketRequest, cx: &mut Context<Self>) {
@@ -11882,6 +11956,7 @@ impl ManagementCenter {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.cancel_mcp_market_auto_search();
         self.mcp_market_install_env.clear();
         for requirement in &entry.env {
             let placeholder = requirement
@@ -12035,24 +12110,29 @@ impl ManagementCenter {
         self.search_skill_market(cx);
     }
 
+    /// Ask the Skill market the current question now.
     fn search_skill_market(&mut self, cx: &mut Context<Self>) {
         let Some(backend) = self.backend.clone() else {
             return;
         };
-        let query = self.skill_market_query.read(cx).value().trim().to_string();
+        self.cancel_skill_market_auto_search();
+        let query = skill_market_search_query(&self.skill_market_query.read(cx).value());
         let sort = self.skill_market_sort;
+        self.skill_market_generation = self.skill_market_generation.wrapping_add(1);
+        let generation = self.skill_market_generation;
         self.skill_market_loading = true;
         self.skill_market_error = None;
         // A new search is a new result set, so it starts from the first screen
         // and forgets the page the previous one had reached.
         self.skill_market_page = 1;
         self.skill_market_next_cursor = None;
+        self.skill_market_loading_more = false;
         let entity = cx.weak_entity();
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
             backend
                 .management()
                 .search_skill_market(vibex_core::SkillMarketSearchRequest {
-                    query: (!query.is_empty()).then_some(query),
+                    query,
                     limit: Some(SKILL_MARKET_FETCH_LIMIT),
                     cursor: None,
                     sort: Some(sort),
@@ -12063,6 +12143,11 @@ impl ManagementCenter {
         self.mutation_task = Some(cx.spawn(async move |_, cx| {
             let outcome = runner.await;
             let _ = entity.update(cx, |this, cx| {
+                // A reply from a query the field has already moved past would
+                // otherwise replace the list under the reader.
+                if this.skill_market_generation != generation {
+                    return;
+                }
                 this.skill_market_loading = false;
                 match outcome {
                     Ok(Ok(response)) => {
@@ -12082,6 +12167,52 @@ impl ManagementCenter {
         }));
     }
 
+    /// Drop a pending automatic search.
+    ///
+    /// Every path that asks immediately or abandons the view calls this, so a
+    /// timer left over from an earlier keystroke cannot ask a question the user
+    /// has already answered with Enter, a sort, or a section change.
+    fn cancel_skill_market_auto_search(&mut self) {
+        self.skill_market_auto_search_generation =
+            self.skill_market_auto_search_generation.wrapping_add(1);
+        self.skill_market_auto_search_task = None;
+    }
+
+    /// Search once the Skill query has been still for a moment.
+    ///
+    /// The field is live, so every edit replaces the previous wait and the
+    /// request reads the text that is actually in the field when it runs. The
+    /// edit also invalidates an answer already in flight, so a slow reply for
+    /// the old query cannot replace the list while the new one is pending.
+    fn schedule_skill_market_auto_search(&mut self, cx: &mut Context<Self>) {
+        self.cancel_skill_market_auto_search();
+        if !self.skill_market_open {
+            return;
+        }
+        self.skill_market_generation = self.skill_market_generation.wrapping_add(1);
+        let generation = self.skill_market_auto_search_generation;
+        let entity = cx.weak_entity();
+        self.skill_market_auto_search_task = Some(cx.spawn(async move |_, cx| {
+            cx.background_executor()
+                .timer(MARKET_AUTO_SEARCH_DEBOUNCE)
+                .await;
+            let _ = entity.update(cx, |this, cx| {
+                if this.skill_market_auto_search_generation != generation {
+                    return;
+                }
+                this.skill_market_auto_search_task = None;
+                if management_primary_section(this.navigation.active) != ManagementSection::Skills
+                    || !this.skill_market_open
+                    || this.skill_market_install_target.is_some()
+                    || this.mutation.is_some()
+                {
+                    return;
+                }
+                this.search_skill_market(cx);
+            });
+        }));
+    }
+
     /// Append the registry's next page to the list already on screen.
     ///
     /// Only the browse list pages: a ranked search is answered in one response,
@@ -12096,8 +12227,9 @@ impl ManagementCenter {
         if self.skill_market_loading_more {
             return;
         }
-        let query = self.skill_market_query.read(cx).value().trim().to_string();
+        let query = skill_market_search_query(&self.skill_market_query.read(cx).value());
         let sort = self.skill_market_sort;
+        let generation = self.skill_market_generation;
         self.skill_market_loading_more = true;
         self.skill_market_error = None;
         let entity = cx.weak_entity();
@@ -12105,7 +12237,7 @@ impl ManagementCenter {
             backend
                 .management()
                 .search_skill_market(vibex_core::SkillMarketSearchRequest {
-                    query: (!query.is_empty()).then_some(query),
+                    query,
                     limit: Some(SKILL_MARKET_FETCH_LIMIT),
                     cursor: Some(cursor),
                     sort: Some(sort),
@@ -12116,6 +12248,11 @@ impl ManagementCenter {
         self.mutation_task = Some(cx.spawn(async move |_, cx| {
             let outcome = runner.await;
             let _ = entity.update(cx, |this, cx| {
+                // A new query starts a new result set; this older page must not
+                // be appended to it.
+                if this.skill_market_generation != generation {
+                    return;
+                }
                 this.skill_market_loading_more = false;
                 match outcome {
                     Ok(Ok(response)) => {
@@ -12270,6 +12407,7 @@ impl ManagementCenter {
         entry: vibex_core::SkillMarketEntry,
         cx: &mut Context<Self>,
     ) {
+        self.cancel_skill_market_auto_search();
         let Some(backend) = self.backend.clone() else {
             return;
         };
@@ -40650,6 +40788,16 @@ fn market_page(page: usize, total: usize) -> usize {
     page.clamp(1, market_page_count(total))
 }
 
+/// The query the Skill registry will search, or `None` to browse.
+///
+/// The catalog's search refuses fewer than two characters, so a one-character
+/// prefix is a browse rather than an error: the field is live, and the first
+/// keystroke of a word must not turn the grid red before the second arrives.
+fn skill_market_search_query(value: &str) -> Option<String> {
+    let value = value.trim();
+    (value.chars().count() >= 2).then(|| value.to_string())
+}
+
 /// The slice of a fetched window that one page shows.
 fn market_page_slice<T>(entries: &[T], page: usize) -> &[T] {
     let start = page.saturating_sub(1).saturating_mul(MARKET_PAGE_SIZE);
@@ -41110,12 +41258,15 @@ fn management_market_detail_header(
         .into_any_element()
 }
 
-/// The toolbar above a market grid: a query field, the one command that re-runs
-/// the search, and the filters that narrow the result underneath.
+/// The toolbar above a market grid: a live query field, the command that runs
+/// the current query immediately, and the filters that narrow the result
+/// underneath.
 ///
-/// The filters sit on their own line rather than beside the field: they narrow
-/// the answer the query already produced, so they read as a second, quieter
-/// decision under the search instead of competing with it for the same row.
+/// The field searches on its own once typing pauses, so the button is the
+/// explicit re-run rather than the only way to ask. The filters sit on their
+/// own line: they narrow the answer the query already produced, so they read as
+/// a second, quieter decision under the search instead of competing with it for
+/// the same row.
 fn management_market_toolbar(
     search_id: &'static str,
     query_input: &Entity<InputState>,
@@ -45230,19 +45381,34 @@ mod tests {
         assert_eq!(market_page(2, 0), 1);
     }
 
+    /// The live Skill field sees every prefix of a word. One character is a
+    /// browse, not a search the registry will reject, and whitespace alone is
+    /// still no question at all.
     #[test]
-    fn market_toolbars_answer_enter_with_search() {
+    fn a_short_skill_query_browses_instead_of_erroring() {
+        assert_eq!(skill_market_search_query(""), None);
+        assert_eq!(skill_market_search_query("   "), None);
+        assert_eq!(skill_market_search_query("p"), None);
+        assert_eq!(skill_market_search_query(" p "), None);
+        assert_eq!(skill_market_search_query("pdf"), Some("pdf".to_string()));
+        assert_eq!(skill_market_search_query(" pdf "), Some("pdf".to_string()));
+    }
+
+    #[test]
+    fn market_toolbars_search_while_typing_and_answer_enter() {
         let source = include_str!("management.rs");
-        // Both markets draw the same toolbar, so both query fields have to
-        // answer Enter: a keystroke that works in one registry and is missing
-        // in the other reads as a broken field, not as a different catalog.
-        for (query_field, search_call) in [
+        // Both markets draw the same toolbar, so both query fields have to be
+        // live and answer Enter: behavior that works in one registry and is
+        // missing in the other reads as a broken field, not as another catalog.
+        for (query_field, schedule_call, search_call) in [
             (
                 "                &mcp_market_query,",
+                "this.schedule_mcp_market_auto_search(",
                 "this.search_mcp_market(",
             ),
             (
                 "                &skill_market_query,",
+                "this.schedule_skill_market_auto_search(",
                 "this.search_skill_market(",
             ),
         ] {
@@ -45251,8 +45417,60 @@ mod tests {
                 .and_then(|(_, tail)| tail.split_once("            cx.subscribe(&mcp_name_draft,"))
                 .map(|(body, _)| body)
                 .expect("Market query subscription should remain inspectable");
+            assert!(subscription.contains("InputEvent::Change"));
+            assert!(subscription.contains(schedule_call));
             assert!(subscription.contains("InputEvent::PressEnter"));
             assert!(subscription.contains(search_call));
+        }
+    }
+
+    /// A live market query waits for the typing pause instead of spending one
+    /// registry read per character, and a newer edit cancels the older wait.
+    #[test]
+    fn market_auto_search_waits_for_the_typing_pause() {
+        let source = include_str!("management.rs");
+        let production = source
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .map(|(production, _)| production)
+            .expect("management tests should remain inspectable");
+        assert!(source.contains("const MARKET_AUTO_SEARCH_DEBOUNCE: Duration"));
+        for (scheduler, cancel, request) in [
+            (
+                "fn schedule_mcp_market_auto_search(",
+                "self.cancel_mcp_market_auto_search()",
+                "this.request_mcp_market(McpMarketRequest::Search, cx);",
+            ),
+            (
+                "fn schedule_skill_market_auto_search(",
+                "self.cancel_skill_market_auto_search()",
+                "this.search_skill_market(cx);",
+            ),
+        ] {
+            let body = production
+                .split_once(scheduler)
+                .and_then(|(_, tail)| tail.split_once("\n    fn "))
+                .map(|(body, _)| body)
+                .unwrap_or_else(|| panic!("{scheduler} should remain inspectable"));
+            assert!(
+                body.contains("MARKET_AUTO_SEARCH_DEBOUNCE"),
+                "{scheduler} should debounce registry reads"
+            );
+            assert!(
+                body.contains("cx.background_executor()"),
+                "{scheduler} should wait off the paint path"
+            );
+            assert!(
+                body.contains(cancel),
+                "{scheduler} should cancel the wait it replaces"
+            );
+            assert!(
+                body.contains("auto_search_generation"),
+                "{scheduler} should ignore a timer a newer edit overtook"
+            );
+            assert!(
+                body.contains(request),
+                "{scheduler} should run the market's own search"
+            );
         }
     }
 
