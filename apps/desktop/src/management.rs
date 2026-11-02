@@ -1205,6 +1205,35 @@ enum ManagementRefreshStage {
     Authoritative,
 }
 
+/// The editable state of the Providers page's new-route-group form.
+///
+/// The same fields also back the saved-group editor, so hiding the page and
+/// loading another group would otherwise overwrite the draft. Keeping a
+/// snapshot makes the page's in-memory draft independent of what the shared
+/// editor loads while the page is off screen.
+struct RouteGroupPageDraftMemory {
+    name: String,
+    name_error: Option<String>,
+    model_members: Vec<vibex_core::ModelRouteMember>,
+    model_query: String,
+    patience: String,
+    unlists: bool,
+    sink: bool,
+    sim_agent: String,
+    sim_context: String,
+    sim_images: bool,
+    sim_effort: String,
+    sim_failure: Option<vibex_core::ModelRouteMemberId>,
+    strategy: vibex_core::RouteStrategy,
+    pin: bool,
+    auto_failover: bool,
+    first_token_timeout: String,
+    context_tokens: String,
+    token_limit: String,
+    token_limit_window: vibex_core::GatewayTokenWindow,
+    member_efforts: BTreeMap<String, String>,
+}
+
 pub struct ManagementCenter {
     runtime: Option<Arc<DesktopRuntime>>,
     /// Authority-agnostic handle for the sections whose Remote v2 contract is
@@ -1366,6 +1395,9 @@ pub struct ManagementCenter {
     /// used to own this form is a different question — which model source one
     /// Agent should use — that the global page must not ask.
     provider_create_page_open: bool,
+    /// Whether the page's Provider draft has been initialized and should be
+    /// restored when the reader switches away and comes back.
+    provider_create_draft_active: bool,
     provider_create_name: Entity<InputState>,
     provider_create_base_url: Entity<InputState>,
     provider_create_models: Entity<InputState>,
@@ -1528,6 +1560,10 @@ pub struct ManagementCenter {
     /// drawn in the detail pane and saves a global record without binding any
     /// Agent — the reason the Providers page has a New button at all.
     route_group_page_open: bool,
+    /// Whether the new-route-group page has an in-memory draft to restore.
+    route_group_page_draft_active: bool,
+    /// The page draft saved when another right-pane view replaced it.
+    route_group_page_draft_memory: Option<RouteGroupPageDraftMemory>,
     /// The group draft's name.
     route_group_name: Entity<InputState>,
     /// A rejected group name, shown beside its field.
@@ -1584,10 +1620,11 @@ pub struct ManagementCenter {
     native_import_target: Option<AgentId>,
     /// Whether the new-Provider page is on its preset step.
     workspace_create_choosing: bool,
-    /// The preset category the new-Provider page's gallery is showing.
-    workspace_create_category: Option<ProviderPresetCategory>,
     /// The new-Provider gallery's search field.
     workspace_create_search: Entity<InputState>,
+    /// Scroll state for the Providers workspace, used by the gallery's category
+    /// buttons to reveal a section without filtering the library.
+    workspace_create_scroll: ScrollHandle,
     /// The revision the Provider settings form was loaded from.
     workspace_edit_revision: Option<i64>,
     /// The revision of the route group the detail page's draft was loaded
@@ -2874,6 +2911,7 @@ impl ManagementCenter {
         let provider_picker_scroll = ScrollHandle::new();
         let provider_picker_scroll_anchor =
             ScrollAnchor::for_handle(provider_picker_scroll.clone());
+        let workspace_create_scroll = ScrollHandle::new();
         Self {
             runtime: None,
             backend: None,
@@ -3091,6 +3129,7 @@ impl ManagementCenter {
             shared_provider_edit_base_url_error: None,
             shared_provider_edit_models_error: None,
             provider_create_page_open: false,
+            provider_create_draft_active: false,
             provider_create_name,
             provider_create_base_url,
             provider_create_models,
@@ -3160,6 +3199,8 @@ impl ManagementCenter {
             route_group_editing_id: None,
             route_group_editor_from_agent: false,
             route_group_page_open: false,
+            route_group_page_draft_active: false,
+            route_group_page_draft_memory: None,
             route_group_name,
             route_group_name_error: None,
             route_group_model_members: Vec::new(),
@@ -3170,8 +3211,8 @@ impl ManagementCenter {
             workspace_selected_providers: BTreeSet::new(),
             workspace_selected_routes: BTreeSet::new(),
             workspace_create_choosing: true,
-            workspace_create_category: None,
             workspace_create_search,
+            workspace_create_scroll,
             workspace_edit_revision: None,
             workspace_route_edit_revision: None,
             route_group_recommendations_height: MANAGEMENT_ROUTE_GROUP_SUGGESTIONS_DEFAULT_HEIGHT,
@@ -5435,9 +5476,10 @@ impl ManagementCenter {
             return false;
         }
         self.error = None;
-        // A create view belongs to the Providers page. Leaving the section ends
-        // it, so returning later shows the list rather than a stale draft.
+        // A create view belongs to the Providers page. Leaving the section
+        // hides it, but the page keeps its draft so New can restore it.
         if section != ManagementSection::Providers {
+            self.hide_route_group_page_draft(cx);
             self.provider_create_page_open = false;
             self.route_group_page_open = false;
         }
@@ -14238,42 +14280,56 @@ impl ManagementCenter {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let restore_draft = preset_id.is_none() && self.provider_create_draft_active;
+        self.hide_route_group_page_draft(cx);
         self.provider_create_page_open = true;
-        // A named preset skips the gallery; otherwise the page starts there.
-        self.workspace_create_choosing = preset_id.is_none();
-        self.cancel_provider_create_auto_fetch();
-        self.provider_create_error = None;
-        self.provider_create_name_error = None;
-        self.provider_create_base_url_error = None;
-        self.provider_create_models_error = None;
-        self.provider_create_endpoint_error = None;
-        self.provider_create_headers_open = false;
-        self.provider_create_proxy_disabled = false;
-        self.provider_create_only_through_groups = false;
-        self.provider_create_category = None;
-        self.provider_create_preset = None;
-        self.provider_create_preset_region = None;
-        for input in [
-            &self.provider_create_name,
-            &self.provider_create_base_url,
-            &self.provider_create_models,
-            &self.provider_create_default_model,
-            &self.provider_create_models_url,
-            &self.provider_create_auth_url,
-            &self.provider_create_proxy_url,
-            &self.provider_create_catalog_id,
-        ] {
-            input.update(cx, |state, cx| state.set_value("", window, cx));
-        }
-        self.provider_create_api_key.update(cx, |state, cx| {
-            state.set_masked(true, window, cx);
-            state.set_placeholder(PROVIDER_API_KEY_PLACEHOLDER, window, cx);
-            state.set_value("", window, cx);
-        });
-        self.provider_create_headers
-            .update(cx, |state, cx| state.set_value("", window, cx));
-        if let Some(preset_id) = preset_id {
-            self.apply_provider_create_preset(preset_id, window, cx);
+        self.route_group_page_open = false;
+        if !restore_draft {
+            // A named preset skips the gallery; otherwise the page starts there.
+            self.workspace_create_choosing = preset_id.is_none();
+            self.workspace_create_search
+                .update(cx, |state, cx| state.set_value("", window, cx));
+            self.workspace_create_scroll
+                .set_offset(point(px(0.0), px(0.0)));
+            self.cancel_provider_create_auto_fetch();
+            self.provider_create_error = None;
+            self.provider_create_name_error = None;
+            self.provider_create_base_url_error = None;
+            self.provider_create_models_error = None;
+            self.provider_create_endpoint_error = None;
+            self.provider_create_headers_open = false;
+            self.provider_create_proxy_disabled = false;
+            self.provider_create_only_through_groups = false;
+            self.provider_create_category = None;
+            self.provider_create_preset = None;
+            self.provider_create_preset_region = None;
+            for input in [
+                &self.provider_create_name,
+                &self.provider_create_base_url,
+                &self.provider_create_models,
+                &self.provider_create_default_model,
+                &self.provider_create_models_url,
+                &self.provider_create_auth_url,
+                &self.provider_create_proxy_url,
+                &self.provider_create_catalog_id,
+            ] {
+                input.update(cx, |state, cx| state.set_value("", window, cx));
+            }
+            self.provider_create_api_key.update(cx, |state, cx| {
+                state.set_masked(true, window, cx);
+                state.set_placeholder(PROVIDER_API_KEY_PLACEHOLDER, window, cx);
+                state.set_value("", window, cx);
+            });
+            self.provider_create_headers
+                .update(cx, |state, cx| state.set_value("", window, cx));
+            self.provider_create_draft_active = true;
+            if let Some(preset_id) = preset_id {
+                self.apply_provider_create_preset(preset_id, window, cx);
+            }
+        } else if !self.workspace_create_choosing {
+            // The hidden page may have missed an auto-fetch while it was not
+            // visible; returning to the form arms it again from the same draft.
+            self.schedule_provider_create_auto_fetch(window, cx);
         }
         self.navigation
             .mark_dirty(ManagementSection::Providers, false);
@@ -14282,6 +14338,7 @@ impl ManagementCenter {
 
     fn close_provider_create_page(&mut self, cx: &mut Context<Self>) {
         self.provider_create_page_open = false;
+        self.provider_create_draft_active = false;
         self.cancel_provider_create_auto_fetch();
         self.provider_create_error = None;
         self.provider_create_name_error = None;
@@ -28113,6 +28170,7 @@ impl ManagementCenter {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.hide_route_group_page_draft(cx);
         self.route_group_editor_open = true;
         self.route_group_editing_id = None;
         self.route_group_editor_from_agent = from_agent;
@@ -28151,16 +28209,110 @@ impl ManagementCenter {
         cx.notify();
     }
 
+    /// Keeps the page's route-group draft when another detail view replaces it.
+    fn hide_route_group_page_draft(&mut self, cx: &Context<Self>) {
+        if !self.route_group_page_open {
+            return;
+        }
+        self.remember_route_group_page_draft(cx);
+        self.route_group_page_open = false;
+    }
+
+    fn remember_route_group_page_draft(&mut self, cx: &Context<Self>) {
+        if !self.route_group_page_draft_active {
+            return;
+        }
+        self.route_group_page_draft_memory = Some(RouteGroupPageDraftMemory {
+            name: self.route_group_name.read(cx).value().to_string(),
+            name_error: self.route_group_name_error.clone(),
+            model_members: self.route_group_model_members.clone(),
+            model_query: self.route_group_model_query.read(cx).value().to_string(),
+            patience: self.route_group_patience.read(cx).value().to_string(),
+            unlists: self.route_group_unlists,
+            sink: self.route_group_sink,
+            sim_agent: self.route_group_sim_agent.read(cx).value().to_string(),
+            sim_context: self.route_group_sim_context.read(cx).value().to_string(),
+            sim_images: self.route_group_sim_images,
+            sim_effort: self.route_group_sim_effort.clone(),
+            sim_failure: self.route_group_sim_failure.clone(),
+            strategy: self.route_group_strategy,
+            pin: self.route_group_pin,
+            auto_failover: self.route_group_auto_failover,
+            first_token_timeout: self
+                .route_group_first_token_timeout
+                .read(cx)
+                .value()
+                .to_string(),
+            context_tokens: self.route_group_context_tokens.read(cx).value().to_string(),
+            token_limit: self.route_group_token_limit.read(cx).value().to_string(),
+            token_limit_window: self.route_group_token_limit_window,
+            member_efforts: self.route_group_member_efforts.clone(),
+        });
+    }
+
+    fn restore_route_group_page_draft(
+        &mut self,
+        draft: RouteGroupPageDraftMemory,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.route_group_name
+            .update(cx, |state, cx| state.set_value(draft.name, window, cx));
+        self.route_group_name_error = draft.name_error;
+        self.route_group_model_members = draft.model_members;
+        self.route_group_model_query.update(cx, |state, cx| {
+            state.set_value(draft.model_query, window, cx)
+        });
+        self.route_group_patience
+            .update(cx, |state, cx| state.set_value(draft.patience, window, cx));
+        self.route_group_unlists = draft.unlists;
+        self.route_group_sink = draft.sink;
+        self.route_group_sim_agent
+            .update(cx, |state, cx| state.set_value(draft.sim_agent, window, cx));
+        self.route_group_sim_context.update(cx, |state, cx| {
+            state.set_value(draft.sim_context, window, cx)
+        });
+        self.route_group_sim_images = draft.sim_images;
+        self.route_group_sim_effort = draft.sim_effort;
+        self.route_group_sim_failure = draft.sim_failure;
+        self.route_group_strategy = draft.strategy;
+        self.route_group_pin = draft.pin;
+        self.route_group_auto_failover = draft.auto_failover;
+        self.route_group_first_token_timeout
+            .update(cx, |state, cx| {
+                state.set_value(draft.first_token_timeout, window, cx)
+            });
+        self.route_group_context_tokens.update(cx, |state, cx| {
+            state.set_value(draft.context_tokens, window, cx)
+        });
+        self.route_group_token_limit.update(cx, |state, cx| {
+            state.set_value(draft.token_limit, window, cx)
+        });
+        self.route_group_token_limit_window = draft.token_limit_window;
+        self.route_group_member_efforts = draft.member_efforts;
+        self.request_model_canonical_ids(cx);
+    }
+
     /// Opens the Providers page's own route-group editor.
     ///
     /// It is the same draft the Agent dialog authors, so the two cannot drift,
     /// but it is drawn in the detail pane and saves a global record: no Agent
     /// is bound, which is exactly what the Providers page's New button means.
     fn open_route_group_page_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.provider_create_page_open = false;
         self.route_group_editor_open = false;
         self.route_group_page_open = true;
         self.route_group_editing_id = None;
         self.route_group_editor_from_agent = false;
+        if self.route_group_page_draft_active {
+            if let Some(draft) = self.route_group_page_draft_memory.take() {
+                self.restore_route_group_page_draft(draft, window, cx);
+            }
+            self.navigation
+                .mark_dirty(ManagementSection::Providers, false);
+            cx.notify();
+            return;
+        }
         self.route_group_name_error = None;
         self.route_group_member_efforts.clear();
         self.route_group_model_members.clear();
@@ -28191,6 +28343,8 @@ impl ManagementCenter {
                 cx,
             )
         });
+        self.route_group_page_draft_active = true;
+        self.route_group_page_draft_memory = None;
         self.request_model_canonical_ids(cx);
         self.navigation
             .mark_dirty(ManagementSection::Providers, false);
@@ -28223,6 +28377,7 @@ impl ManagementCenter {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        self.hide_route_group_page_draft(cx);
         let Some(route) = self
             .model_routes
             .iter()
@@ -28315,8 +28470,13 @@ impl ManagementCenter {
     }
 
     fn close_route_group_editor(&mut self, cx: &mut Context<Self>) {
+        let closes_page = self.route_group_page_open;
         self.route_group_editor_open = false;
         self.route_group_page_open = false;
+        if closes_page {
+            self.route_group_page_draft_active = false;
+            self.route_group_page_draft_memory = None;
+        }
         self.route_group_editing_id = None;
         self.route_group_editor_from_agent = false;
         self.route_group_name_error = None;
@@ -28770,6 +28930,7 @@ impl ManagementCenter {
             None
         };
         let expected_revision = existing.as_ref().map(|route| route.revision).unwrap_or(0);
+        let saves_page_draft = self.route_group_page_open;
         self.error = None;
         self.mutation = Some(ManagementMutation::Gateway);
         let this = cx.entity();
@@ -28814,6 +28975,10 @@ impl ManagementCenter {
                     Ok(()) => {
                         this.route_group_editor_open = false;
                         this.route_group_page_open = false;
+                        if saves_page_draft {
+                            this.route_group_page_draft_active = false;
+                            this.route_group_page_draft_memory = None;
+                        }
                         this.route_group_editing_id = None;
                         this.route_group_editor_from_agent = false;
                         // A group created on the Providers page becomes the
@@ -35537,12 +35702,17 @@ impl Render for ManagementCenter {
         // off its content, so it has to sit on the same builder chain as the
         // scroll wrapper — which is the chain a source check reads.
         let main = if self.section_body_owns_its_scroll() {
-            pane.when(viewport_width < 640.0, |main| main.p_3())
+            pane.id("management-provider-workspace-scroll")
+                .when(viewport_width < 640.0, |main| main.p_3())
                 .when(viewport_width >= 640.0, |main| main.p_4())
                 .into_any_element()
         } else {
-            pane.when(viewport_width < 640.0, |main| main.p_3())
+            pane.id("management-provider-workspace-scroll")
+                .when(viewport_width < 640.0, |main| main.p_3())
                 .when(viewport_width >= 640.0, |main| main.p_4())
+                .when(provider_sidebar, |main| {
+                    main.track_scroll(&self.workspace_create_scroll)
+                })
                 .overflow_y_scrollbar()
                 .into_any_element()
         };
@@ -43590,6 +43760,75 @@ mod tests {
             let stored: serde_json::Value = serde_json::from_str(&raw).unwrap();
             assert_eq!(stored["x-opencode-session"]["variable"], "session_id");
             assert!(center.provider_create_headers_open);
+        });
+    }
+
+    /// Switching between the two Provider-page authoring views replaces the
+    /// visible page without discarding either draft.
+    #[gpui::test]
+    fn provider_and_route_group_page_drafts_survive_switching(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let (center, cx) = cx.add_window_view(ManagementCenter::new);
+        let handle = cx.windows().pop().expect("test window");
+
+        let _ = cx.update_window(handle, |_, window, cx| {
+            center.update(cx, |center, cx| {
+                center.open_provider_create_page(None, window, cx);
+            });
+        });
+        let _ = cx.update_window(handle, |_, window, cx| {
+            center.update(cx, |center, cx| {
+                center.workspace_create_choosing = false;
+                center.provider_create_name.update(cx, |state, cx| {
+                    state.set_value("Provider draft", window, cx);
+                });
+            });
+        });
+
+        let _ = cx.update_window(handle, |_, window, cx| {
+            center.update(cx, |center, cx| {
+                center.open_route_group_page_editor(window, cx);
+            });
+        });
+        center.read_with(cx, |center, _| {
+            assert!(!center.provider_create_page_open);
+            assert!(center.route_group_page_open);
+        });
+        let _ = cx.update_window(handle, |_, window, cx| {
+            center.update(cx, |center, cx| {
+                center.route_group_name.update(cx, |state, cx| {
+                    state.set_value("Route group draft", window, cx);
+                });
+            });
+        });
+
+        let _ = cx.update_window(handle, |_, window, cx| {
+            center.update(cx, |center, cx| {
+                center.open_provider_create_page(None, window, cx);
+            });
+        });
+        center.read_with(cx, |center, cx| {
+            assert!(center.provider_create_page_open);
+            assert!(!center.route_group_page_open);
+            assert!(!center.workspace_create_choosing);
+            assert_eq!(
+                center.provider_create_name.read(cx).value(),
+                "Provider draft"
+            );
+        });
+
+        let _ = cx.update_window(handle, |_, window, cx| {
+            center.update(cx, |center, cx| {
+                center.open_route_group_page_editor(window, cx);
+            });
+        });
+        center.read_with(cx, |center, cx| {
+            assert!(!center.provider_create_page_open);
+            assert!(center.route_group_page_open);
+            assert_eq!(
+                center.route_group_name.read(cx).value(),
+                "Route group draft"
+            );
         });
     }
 

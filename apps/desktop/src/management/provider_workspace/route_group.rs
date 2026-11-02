@@ -1103,16 +1103,7 @@ impl ManagementCenter {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let pending = self.mutation.is_some();
         let editing = self.route_group_editing_id.is_some();
-        let back = Button::new("management-route-group-page-back")
-            .small()
-            .ghost()
-            .icon(IconName::ArrowLeft)
-            .label(management_locale_text("Back", "返回", "返回"))
-            .disabled(pending)
-            .on_click(cx.listener(|this, _, _, cx| this.close_route_group_editor(cx)))
-            .into_any_element();
         let mark = ws_icon_tile(
             "icons/vibex/git-branch.svg",
             px(44.0),
@@ -1121,7 +1112,6 @@ impl ManagementCenter {
         );
         ws_authoring_page(
             "management-route-group-page-editor",
-            back,
             Some(mark),
             if editing {
                 management_locale_text("Edit route group", "编辑路由组", "編輯路由組")

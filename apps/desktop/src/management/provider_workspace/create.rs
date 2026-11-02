@@ -25,44 +25,55 @@ impl ManagementCenter {
 
     fn render_workspace_create_gallery(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let query = self.workspace_create_search.read(cx).value().to_string();
-        let active = self.workspace_create_category;
-        let presets = provider_preset_tiles(vibex_core::provider_presets(), &query)
-            .into_iter()
-            .filter(|preset| {
-                active.is_none_or(|category| provider_preset_category(preset) == category)
-            })
-            .collect::<Vec<_>>();
+        let sections = self.provider_picker_preset_sections(&query);
+        let available = sections
+            .iter()
+            .map(|(category, _)| *category)
+            .collect::<BTreeSet<_>>();
+        let anchors = ProviderPresetCategory::ALL.map(|category| {
+            (
+                category,
+                ScrollAnchor::for_handle(self.workspace_create_scroll.clone()),
+            )
+        });
+        let anchor_for = |category| {
+            anchors
+                .iter()
+                .find_map(|(candidate, anchor)| (*candidate == category).then(|| anchor.clone()))
+        };
 
         let mut chips = h_flex().items_center().gap_1();
-        for (index, (category, label)) in
-            std::iter::once((None, management_locale_text("All", "全部", "全部")))
-                .chain(
-                    ProviderPresetCategory::ALL
-                        .into_iter()
-                        .map(|category| (Some(category), category.label())),
-                )
-                .enumerate()
-        {
+        chips = chips.child(
+            Button::new("management-provider-create-kind-all")
+                .small()
+                .ghost()
+                .label(management_locale_text("All", "全部", "全部"))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.workspace_create_scroll
+                        .set_offset(point(px(0.0), px(0.0)));
+                    cx.notify();
+                })),
+        );
+        for category in ProviderPresetCategory::ALL {
+            let anchor = anchor_for(category).expect("every category owns a scroll anchor");
             chips = chips.child(
                 Button::new(SharedString::from(format!(
-                    "management-provider-create-kind-{index}"
+                    "management-provider-create-kind-{}",
+                    category.metadata_value()
                 )))
                 .small()
                 .ghost()
-                .selected(category == active)
-                .label(label)
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.workspace_create_category = category;
-                    cx.notify();
+                .label(category.label())
+                .disabled(!available.contains(&category))
+                .on_click(cx.listener(move |_, _, window, cx| {
+                    anchor.scroll_to(window, cx);
                 })),
             );
         }
 
-        let mut grid = h_flex().w_full().min_w_0().flex_wrap().gap_3();
-        // The blank tile leads: "none of these" is always one click away.
-        grid = grid.child(create_tile(
+        let custom = h_flex().w_full().min_w_0().child(create_tile(
             SharedString::from("management-provider-create-custom"),
-            ws_icon_tile("icons/vibex/wrench.svg", px(36.0), None, cx),
+            ws_icon_tile("icons/vibex/wrench.svg", px(42.0), None, cx),
             management_locale_text("Custom", "自定义", "自訂").to_string(),
             management_locale_text(
                 "Any OpenAI- or Anthropic-compatible address",
@@ -78,52 +89,81 @@ impl ManagementCenter {
             }),
             cx,
         ));
-        for preset in &presets {
-            let preset_id = preset.id.clone();
-            let host = preset
-                .website
-                .as_deref()
-                .map(provider_preset_host)
-                .or_else(|| {
-                    preset
-                        .endpoints
-                        .values()
-                        .next()
-                        .map(|url| provider_preset_host(url))
-                })
-                .unwrap_or_default();
-            let note = if preset.no_key {
-                Some(management_locale_text("No Key", "无需 Key", "無需 Key"))
-            } else if preset.plan_note.is_some() {
-                Some(management_locale_text("Plan", "套餐", "方案"))
-            } else {
-                None
-            };
-            grid = grid.child(create_tile(
-                SharedString::from(format!("management-provider-create-preset-{}", preset.id)),
-                preset_logo_tile(preset, px(36.0), cx),
-                preset.display_name.clone(),
-                host,
-                note,
-                cx.listener(move |this, _, window, cx| {
-                    this.apply_provider_create_preset(&preset_id, window, cx);
-                    this.workspace_create_choosing = false;
-                    cx.notify();
-                }),
-                cx,
-            ));
+
+        let mut catalog = v_flex().w_full().min_w_0().gap_2();
+        for (category, presets) in &sections {
+            let mut grid = h_flex().w_full().min_w_0().flex_wrap().gap_3();
+            for preset in presets {
+                let preset_id = preset.id.clone();
+                let host = preset
+                    .website
+                    .as_deref()
+                    .map(provider_preset_host)
+                    .or_else(|| {
+                        preset
+                            .endpoints
+                            .values()
+                            .next()
+                            .map(|url| provider_preset_host(url))
+                    })
+                    .unwrap_or_default();
+                let note = if preset.no_key {
+                    Some(management_locale_text("No Key", "无需 Key", "無需 Key"))
+                } else if preset.plan_note.is_some() {
+                    Some(management_locale_text("Plan", "套餐", "方案"))
+                } else {
+                    None
+                };
+                grid = grid.child(create_tile(
+                    SharedString::from(format!("management-provider-create-preset-{}", preset.id)),
+                    provider_source_logo(preset, px(42.0), cx),
+                    preset.display_name.clone(),
+                    host,
+                    note,
+                    cx.listener(move |this, _, window, cx| {
+                        this.apply_provider_create_preset(&preset_id, window, cx);
+                        this.workspace_create_choosing = false;
+                        cx.notify();
+                    }),
+                    cx,
+                ));
+            }
+            let anchor = anchor_for(*category);
+            catalog = catalog.child(
+                div()
+                    .id(SharedString::from(format!(
+                        "management-provider-create-section-{}",
+                        category.metadata_value()
+                    )))
+                    .w_full()
+                    .min_w_0()
+                    .anchor_scroll(anchor)
+                    .child(provider_source_section(
+                        SharedString::from(format!(
+                            "management-provider-create-{}",
+                            category.metadata_value()
+                        )),
+                        category.icon(),
+                        category.label(),
+                        grid.into_any_element(),
+                        cx,
+                    )),
+            );
         }
 
-        let back = Button::new("management-provider-create-close")
-            .small()
-            .ghost()
-            .icon(IconName::ArrowLeft)
-            .label(management_locale_text("Back", "返回", "返回"))
-            .on_click(cx.listener(|this, _, _, cx| this.close_provider_create_page(cx)))
-            .into_any_element();
+        let footer = ws_form_footer(
+            None,
+            vec![
+                Button::new("management-provider-create-gallery-cancel")
+                    .ghost()
+                    .label(management_locale_text("Cancel", "取消", "取消"))
+                    .on_click(cx.listener(|this, _, _, cx| this.close_provider_create_page(cx)))
+                    .into_any_element(),
+            ],
+            cx,
+        );
         ws_authoring_page(
             "management-provider-create-page",
-            back,
             None,
             management_locale_text("New Provider", "新建供应商", "新增供應商"),
             management_locale_text(
@@ -149,8 +189,9 @@ impl ManagementCenter {
                         )
                         .child(chips),
                 )
-                .child(grid)
-                .when(presets.is_empty(), |page| {
+                .child(custom)
+                .child(catalog)
+                .when(sections.is_empty(), |page| {
                     page.child(ws_empty_line(
                         management_locale_text(
                             "No preset matches. Start from Custom instead.",
@@ -160,6 +201,7 @@ impl ManagementCenter {
                         cx,
                     ))
                 })
+                .child(footer)
                 .into_any_element(),
             cx,
         )
@@ -560,8 +602,23 @@ impl ManagementCenter {
             )
             .into_any_element();
 
-        let footer = ws_form_footer(
+        let all_presets = Button::new("management-provider-create-all-presets")
+            .ghost()
+            .label(management_locale_text(
+                "All presets",
+                "全部预设",
+                "全部預設",
+            ))
+            .disabled(pending)
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.workspace_create_choosing = true;
+                cx.notify();
+            }))
+            .into_any_element();
+
+        let footer = ws_form_footer_with_leading(
             self.provider_create_error.clone(),
+            Some(all_presets),
             vec![
                 Button::new("management-provider-create-cancel")
                     .ghost()
@@ -584,21 +641,6 @@ impl ManagementCenter {
             cx,
         );
 
-        let back = Button::new("management-provider-create-close")
-            .small()
-            .ghost()
-            .icon(IconName::ArrowLeft)
-            .label(management_locale_text(
-                "All presets",
-                "全部预设",
-                "全部預設",
-            ))
-            .disabled(pending)
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.workspace_create_choosing = true;
-                cx.notify();
-            }))
-            .into_any_element();
         let (mark, title) = match preset.as_ref() {
             Some(preset) => (
                 preset_logo_tile(preset, px(44.0), cx),
@@ -616,7 +658,6 @@ impl ManagementCenter {
         };
         ws_authoring_page(
             "management-provider-create-page",
-            back,
             Some(mark),
             title,
             management_locale_text(

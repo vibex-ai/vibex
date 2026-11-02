@@ -63,6 +63,7 @@ impl ManagementCenter {
 
     /// Selects one Provider in the left column.
     fn select_workspace_provider(&mut self, id: String, cx: &mut Context<Self>) {
+        self.hide_route_group_page_draft(cx);
         self.selected_global_provider_id = Some(id);
         self.selected_global_route_id = None;
         self.providers_sidebar_tab = ProviderSidebarTab::Providers;
@@ -73,6 +74,7 @@ impl ManagementCenter {
 
     /// Selects one route group in the left column.
     fn select_workspace_route_group(&mut self, id: String, cx: &mut Context<Self>) {
+        self.hide_route_group_page_draft(cx);
         self.selected_global_route_id = Some(id);
         self.selected_global_provider_id = None;
         self.providers_sidebar_tab = ProviderSidebarTab::RouteGroups;
@@ -83,6 +85,7 @@ impl ManagementCenter {
 
     /// Selects the gateway in the left column.
     fn select_workspace_gateway(&mut self, cx: &mut Context<Self>) {
+        self.hide_route_group_page_draft(cx);
         self.selected_global_provider_id = Some(GATEWAY_ROW_ID.to_string());
         self.selected_global_route_id = None;
         self.providers_sidebar_tab = ProviderSidebarTab::Providers;
@@ -742,11 +745,9 @@ fn ws_form_footer_with_leading(
         .into_any_element()
 }
 
-/// A page whose subject is a draft: a Back command, the title and its
-/// one-line purpose, then the form.
+/// A page whose subject is a draft: its title, one-line purpose, then the form.
 fn ws_authoring_page(
     id: &'static str,
-    back: AnyElement,
     mark: Option<AnyElement>,
     title: impl Into<SharedString>,
     description: &'static str,
@@ -758,7 +759,6 @@ fn ws_authoring_page(
         .w_full()
         .min_w_0()
         .gap_5()
-        .child(div().child(back))
         .child(
             h_flex()
                 .w_full()
@@ -1192,6 +1192,50 @@ mod tests {
         assert!(CREATE.contains("this.apply_provider_create_preset(&preset_id, window, cx);"));
         assert!(CREATE.contains("this.clear_provider_create_preset(window, cx);"));
         assert!(CREATE.contains("save_provider_create_page(cx)"));
+    }
+
+    /// The draft pages open on their title, not on a separate Back row.
+    #[test]
+    fn authoring_pages_do_not_render_a_top_back_row() {
+        let kit = include_str!("mod.rs");
+        let page = kit
+            .split_once("fn ws_authoring_page(")
+            .and_then(|(_, tail)| tail.split_once("\n/// The Agents that use a model source"))
+            .map(|(body, _)| body)
+            .expect("the shared authoring page should remain inspectable");
+        assert!(!page.contains("back"));
+        assert!(!page.contains("ArrowLeft"));
+        assert!(!CREATE.contains("management-provider-create-close"));
+        assert!(!ROUTE_GROUP.contains("management-route-group-page-back"));
+    }
+
+    /// The preset gallery is a sectioned catalog. Its category controls reveal
+    /// a section and never narrow the library to the selected category.
+    #[test]
+    fn the_create_gallery_scrolls_to_categories_instead_of_filtering() {
+        let gallery = CREATE
+            .split_once("fn render_workspace_create_gallery(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_workspace_create_form("))
+            .map(|(body, _)| body)
+            .expect("the create gallery should remain inspectable");
+
+        assert!(gallery.contains("provider_picker_preset_sections(&query)"));
+        assert!(gallery.contains("provider_source_section("));
+        assert!(gallery.contains("anchor_scroll(anchor)"));
+        assert!(gallery.contains("anchor.scroll_to(window, cx)"));
+        assert!(!gallery.contains("workspace_create_category"));
+        assert!(!gallery.contains(".selected(category == active)"));
+
+        // Presets use the bare brand mark at the larger gallery size; only
+        // Custom keeps the rounded icon plate.
+        assert!(gallery.contains("provider_source_logo(preset, px(42.0), cx)"));
+        assert!(gallery.contains("ws_icon_tile(\"icons/vibex/wrench.svg\", px(42.0), None, cx)"));
+
+        // Custom is its own row before the categorized catalog.
+        let custom = gallery.find("let custom =").unwrap();
+        let catalog = gallery.find("let mut catalog =").unwrap();
+        assert!(custom < catalog);
+        assert!(gallery.contains(".child(custom)\n                .child(catalog)"));
     }
 }
 
