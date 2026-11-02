@@ -39615,10 +39615,9 @@ struct MarketCardEndpoint {
 /// the server I want?" — so its reading order follows that question: identity
 /// first, then what the entry does, then the facts that tell it apart from a
 /// neighbour. Everything that did not answer the question was removed: the
-/// transport glyph is drawn at its own size instead of on a plate, the address
-/// is a line of text instead of a panel inside the panel, and the footer has no
-/// rule of its own because the card's boundary already separates it from the
-/// grid.
+/// fallback transport glyph shares the picture's rounded plate, the address is a
+/// line of text instead of a panel inside the panel, and the footer has no rule
+/// of its own because the card's boundary already separates it from the grid.
 ///
 /// The card is also not a control. It used to blend its background under the
 /// pointer while offering no click, which promised an action that did not
@@ -39632,12 +39631,29 @@ struct MarketCardEndpoint {
 ///
 /// A registry entry can publish its own picture; when it does, that picture is
 /// the card's identity and the transport glyph moves beside the address line.
-/// An entry with none keeps the glyph, so the two kinds of card stay the same
-/// size and the grid does not reflow when one picture arrives.
+/// An entry with none keeps the glyph in the same plate, so both kinds of card
+/// share one footprint and the grid does not reflow when a picture arrives.
 #[derive(Clone, Default)]
 struct MarketCardMark {
     glyph_path: &'static str,
     icon: Option<Arc<gpui::Image>>,
+}
+
+/// The one plate both a publisher picture and a fallback glyph occupy.
+fn management_market_card_mark(content: AnyElement, cx: &App) -> AnyElement {
+    div()
+        .size(px(36.0))
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .overflow_hidden()
+        .rounded(cx.theme().radius)
+        .border_1()
+        .border_color(cx.theme().border.opacity(0.60))
+        .bg(cx.theme().background)
+        .child(content)
+        .into_any_element()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -39674,30 +39690,25 @@ fn management_market_card(
         (meta, quiet) => meta.or(quiet),
     };
 
-    // The lead is the entry's own picture when it has one: a 36px plate, the
-    // same footprint the owned-server rows use, so the market reads as a list
-    // of products rather than a list of protocols.
+    // The lead is the entry's own picture when it has one, otherwise the
+    // transport glyph. Both use the same plate so a missing picture does not
+    // make one card's identity smaller or move the name beside it.
     let lead = match mark.icon.clone() {
-        Some(icon) => div()
-            .size(px(36.0))
-            .flex_none()
-            .overflow_hidden()
-            .rounded(cx.theme().radius)
-            .border_1()
-            .border_color(cx.theme().border.opacity(0.60))
-            .bg(cx.theme().background)
-            .child(
-                gpui::img(icon)
-                    .size_full()
-                    .object_fit(gpui::ObjectFit::Contain),
-            )
-            .into_any_element(),
-        None => Icon::default()
-            .path(mark.glyph_path)
-            .size(px(16.0))
-            .flex_none()
-            .text_color(cx.theme().muted_foreground)
-            .into_any_element(),
+        Some(icon) => management_market_card_mark(
+            gpui::img(icon)
+                .size_full()
+                .object_fit(gpui::ObjectFit::Contain)
+                .into_any_element(),
+            cx,
+        ),
+        None => management_market_card_mark(
+            Icon::default()
+                .path(mark.glyph_path)
+                .size(px(16.0))
+                .text_color(cx.theme().muted_foreground)
+                .into_any_element(),
+            cx,
+        ),
     };
 
     let mut body = v_flex()
@@ -44635,6 +44646,27 @@ mod tests {
             card.contains("mark.glyph_path"),
             "an entry without a picture should keep its glyph"
         );
+        assert!(
+            card.contains("Some(icon) => management_market_card_mark("),
+            "the publisher picture should use the shared card plate"
+        );
+        assert!(
+            card.contains("None => management_market_card_mark("),
+            "the fallback glyph should use the same plate as a publisher picture"
+        );
+        let fallback_plate = source
+            .split_once("fn management_market_card_mark(")
+            .and_then(|(_, tail)| {
+                tail.split_once(
+                    "\n#[allow(clippy::too_many_arguments)]\nfn management_market_card(",
+                )
+            })
+            .map(|(body, _)| body)
+            .expect("the market card mark plate should remain inspectable");
+        assert!(fallback_plate.contains(".size(px(36.0))"));
+        assert!(fallback_plate.contains(".items_center()"));
+        assert!(fallback_plate.contains(".justify_center()"));
+        assert!(fallback_plate.contains(".rounded(cx.theme().radius)"));
         let market = source
             .split_once("    fn render_mcp_market(")
             .and_then(|(_, tail)| tail.split_once("\n    fn render_mcp_market_install_form("))
