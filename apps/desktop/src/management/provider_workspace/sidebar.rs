@@ -339,18 +339,14 @@ impl ManagementCenter {
                     }
                 };
                 menu.item(
-                    PopupMenuItem::new(management_locale_text("Provider…", "供应商…", "供應商…"))
+                    PopupMenuItem::new(management_locale_text("Provider", "供应商", "供應商"))
                         .icon(Icon::default().path("icons/vibex/database.svg"))
                         .on_click(provider),
                 )
                 .item(
-                    PopupMenuItem::new(management_locale_text(
-                        "Route group…",
-                        "路由组…",
-                        "路由組…",
-                    ))
-                    .icon(Icon::default().path("icons/vibex/git-branch.svg"))
-                    .on_click(group),
+                    PopupMenuItem::new(management_locale_text("Route group", "路由组", "路由組"))
+                        .icon(Icon::default().path("icons/vibex/git-branch.svg"))
+                        .on_click(group),
                 )
                 .separator()
                 .item(
@@ -416,7 +412,7 @@ impl ManagementCenter {
             .xsmall()
             .ghost()
             .when(narrowed, |button| button.selected(true))
-            .icon(Icon::default().path("icons/vibex/list-checks.svg"))
+            .icon(Icon::new(gpui_kit_assets::IconName::Funnel))
             .tooltip(management_locale_text(
                 "Filter and sort",
                 "筛选与排序",
