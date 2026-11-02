@@ -389,6 +389,17 @@ impl ManagementCenter {
             toggle,
             cx,
         );
+        let agent_scope = management_agent_scope_actions(
+            "management-provider-agent-scope",
+            self.mutation.is_some(),
+            {
+                let profile_id = profile_id.clone();
+                move |this, enabled, _window, cx| {
+                    this.set_workspace_provider_agents(profile_id.clone(), enabled, cx)
+                }
+            },
+            cx,
+        );
 
         // Route groups this Provider serves.
         let memberships = self
@@ -468,7 +479,7 @@ impl ManagementCenter {
                     "点选 Agent 即可让它使用该供应商的模型。",
                     "點選 Agent 即可讓它使用該供應商的模型。",
                 )),
-                None,
+                Some(agent_scope),
                 agent_list,
                 cx,
             ),
@@ -543,6 +554,185 @@ impl ManagementCenter {
             }
         }
         rows
+    }
+
+    /// Enables or disables this Provider for every Agent at once.
+    ///
+    /// The capsules stay the precise control; this is the same answer for the
+    /// whole list. Enabling copies the shared record into every Agent that can
+    /// use a model source, one binding per Agent because the launch profile is
+    /// per Agent. Disabling keeps a binding when it is that Agent's only model
+    /// source: the same guard a single capsule applies, reported once instead
+    /// of stopping the batch at the first Agent.
+    fn set_workspace_provider_agents(
+        &mut self,
+        profile_id: vibex_core::ModelProviderProfileId,
+        enabled: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if self.mutation.is_some() {
+            return;
+        }
+        let Some(profile) = self
+            .providers
+            .iter()
+            .find(|profile| profile.id == profile_id)
+            .cloned()
+        else {
+            return;
+        };
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        let active_locale = locale::current_locale();
+        let legacy = profile
+            .legacy_provider_profile_id
+            .clone()
+            .unwrap_or_else(vibex_core::ProviderProfileId::new);
+        let mut kept = 0usize;
+        let mut requests = Vec::new();
+        if enabled {
+            let bound = self
+                .provider_bindings
+                .iter()
+                .filter(|binding| {
+                    binding.deleted_at_ms.is_none()
+                        && binding.model_provider_profile_id.as_ref() == Some(&profile_id)
+                })
+                .map(|binding| binding.agent_id.as_str().to_string())
+                .collect::<BTreeSet<_>>();
+            for (agent_id, _) in self.workspace_configurable_agents() {
+                if bound.contains(&agent_id) {
+                    continue;
+                }
+                let Ok(agent) = AgentId::parse(agent_id.clone()) else {
+                    continue;
+                };
+                let make_default = self.resolved_agent_default_source(&agent_id).is_none();
+                requests.push((agent, legacy.clone(), make_default));
+            }
+        } else {
+            for binding in self.provider_bindings.iter().filter(|binding| {
+                binding.deleted_at_ms.is_none()
+                    && binding.model_provider_profile_id.as_ref() == Some(&profile_id)
+            }) {
+                let agent_id = binding.agent_id.clone();
+                if self.agent_model_source_count(agent_id.as_str()) <= 1 {
+                    kept += 1;
+                    continue;
+                }
+                let Some(legacy) = binding.legacy_provider_profile_id.clone() else {
+                    kept += 1;
+                    continue;
+                };
+                requests.push((agent_id, legacy, false));
+            }
+        }
+        if requests.is_empty() {
+            if kept > 0 {
+                self.error = Some(match active_locale {
+                    ResolvedLocale::En => format!(
+                        "This Provider is the only model source for {kept} Agent(s), so it cannot be removed."
+                    ),
+                    ResolvedLocale::ZhCn => {
+                        format!("该供应商是 {kept} 个 Agent 唯一的模型来源，无法移除。")
+                    }
+                    ResolvedLocale::ZhTw => {
+                        format!("該供應商是 {kept} 個 Agent 唯一的模型來源，無法移除。")
+                    }
+                });
+                cx.notify();
+            }
+            return;
+        }
+
+        self.mutation = Some(ManagementMutation::Gateway);
+        self.error = None;
+        let this = cx.entity();
+        self.mutation_task = Some(cx.spawn(async move |_, cx| {
+            let mut applied = 0usize;
+            let mut failure = None;
+            for (agent_id, legacy, make_default) in requests {
+                let outcome = if enabled {
+                    backend
+                        .management()
+                        .bind_agent_model_provider(vibex_backend::MutationRequest::new(
+                            vibex_core::AgentModelProviderBindRequest {
+                                provider_profile_id: legacy,
+                                model_provider_profile_id: Some(profile_id.clone()),
+                                agent_id,
+                                make_default,
+                            },
+                        ))
+                        .await
+                        .map(|_| ())
+                } else {
+                    backend
+                        .management()
+                        .delete_agent_model_provider_profile(vibex_backend::MutationRequest::new(
+                            vibex_core::AgentModelProviderProfileDeleteRequest {
+                                agent_id,
+                                provider_profile_id: legacy,
+                            },
+                        ))
+                        .await
+                };
+                match outcome {
+                    Ok(()) => applied += 1,
+                    Err(error) => {
+                        failure = Some(error);
+                        break;
+                    }
+                }
+            }
+            this.update(cx, |this, cx| {
+                this.mutation = None;
+                this.refresh(cx);
+                if let Some(error) = failure {
+                    this.error = Some(format!("{}: {}", error.code, error.message));
+                } else {
+                    let mut message = match active_locale {
+                        ResolvedLocale::En => {
+                            if enabled {
+                                format!("Enabled for {applied} Agent(s)")
+                            } else {
+                                format!("Disabled for {applied} Agent(s)")
+                            }
+                        }
+                        ResolvedLocale::ZhCn => {
+                            if enabled {
+                                format!("已为 {applied} 个 Agent 启用")
+                            } else {
+                                format!("已为 {applied} 个 Agent 取消")
+                            }
+                        }
+                        ResolvedLocale::ZhTw => {
+                            if enabled {
+                                format!("已為 {applied} 個 Agent 啟用")
+                            } else {
+                                format!("已為 {applied} 個 Agent 取消")
+                            }
+                        }
+                    };
+                    if kept > 0 {
+                        let suffix = match active_locale {
+                            ResolvedLocale::En => {
+                                format!("; {kept} kept because this is their only model source.")
+                            }
+                            ResolvedLocale::ZhCn => {
+                                format!("；{kept} 个 Agent 保留，因为这是它们唯一的模型来源。")
+                            }
+                            ResolvedLocale::ZhTw => {
+                                format!("；{kept} 個 Agent 保留，因為這是它們唯一的模型來源。")
+                            }
+                        };
+                        message.push_str(&suffix);
+                    }
+                    this.notice = Some(message);
+                }
+                cx.notify();
+            });
+        }));
     }
 
     // ----- Keys ------------------------------------------------------------

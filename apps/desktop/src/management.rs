@@ -12575,6 +12575,89 @@ impl ManagementCenter {
         );
     }
 
+    /// Applies one answer to every Agent the MCP server can be enabled for.
+    fn set_mcp_agent_matrix_all(&mut self, id: String, enabled: bool, cx: &mut Context<Self>) {
+        let Some(matrix) = self
+            .snapshot
+            .mcp_servers
+            .iter()
+            .find(|server| server.id.as_str() == id)
+            .map(|server| server.agent_matrix.clone())
+        else {
+            self.error = Some(
+                management_error_text(
+                    "MCP server was not found",
+                    "未找到 MCP 服务",
+                    "找不到 MCP 服務",
+                )
+                .into(),
+            );
+            cx.notify();
+            return;
+        };
+        let agent_ids = self
+            .snapshot
+            .agents
+            .iter()
+            .filter(|agent| agent.added)
+            .map(|agent| agent.id.clone())
+            .collect::<Vec<_>>();
+        if agent_ids.is_empty() {
+            return;
+        }
+        let matrix = updated_mcp_agent_matrix_all(matrix, agent_ids, enabled);
+        let (Ok(mcp_server_id), Some(backend)) = (
+            vibex_core::McpServerId::parse(id.clone()),
+            self.backend.clone(),
+        ) else {
+            return;
+        };
+        let active_locale = locale::current_locale();
+        self.begin_simple_task(
+            ManagementMutation::McpAction(format!("agent-matrix-all:{id}")),
+            cx,
+            async move {
+                backend
+                    .management()
+                    .set_mcp_server_agent_matrix(MutationRequest::new(
+                        vibex_core::McpServerSetAgentMatrixRequest {
+                            mcp_server_id,
+                            agent_matrix: matrix,
+                        },
+                    ))
+                    .await
+                    .map_err(crate::app::remote_error_into_vibex)?;
+                Ok(format!(
+                    "{}: {}",
+                    management_locale_text_for(
+                        active_locale,
+                        "Agent enablement",
+                        "Agent 启用范围",
+                        "Agent 啟用範圍",
+                    ),
+                    management_locale_text_for(
+                        active_locale,
+                        if enabled {
+                            "All enabled"
+                        } else {
+                            "All disabled"
+                        },
+                        if enabled {
+                            "全部启用"
+                        } else {
+                            "全部取消"
+                        },
+                        if enabled {
+                            "全部啟用"
+                        } else {
+                            "全部取消"
+                        },
+                    )
+                ))
+            },
+        );
+    }
+
     fn open_skill_import(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         if self.mutation.is_some() {
             return;
@@ -12842,6 +12925,83 @@ impl ManagementCenter {
                         if enabled { "Enabled" } else { "Disabled" },
                         if enabled { "已启用" } else { "已停用" },
                         if enabled { "已啟用" } else { "已停用" },
+                    )
+                ))
+            },
+        );
+    }
+
+    /// Applies one answer to every Agent the Skill can be enabled for.
+    fn set_skill_agent_matrix_all(&mut self, id: String, enabled: bool, cx: &mut Context<Self>) {
+        let Some(matrix) = self
+            .snapshot
+            .skills
+            .iter()
+            .find(|skill| skill.id.as_str() == id)
+            .map(|skill| skill.agent_matrix.clone())
+        else {
+            self.error = Some(
+                management_error_text("Skill was not found", "未找到 Skill", "找不到 Skill").into(),
+            );
+            cx.notify();
+            return;
+        };
+        let agent_ids = self
+            .snapshot
+            .agents
+            .iter()
+            .filter(|agent| agent.added)
+            .map(|agent| agent.id.clone())
+            .collect::<Vec<_>>();
+        if agent_ids.is_empty() {
+            return;
+        }
+        let matrix = updated_skill_agent_matrix_all(matrix, agent_ids, enabled);
+        let (Ok(skill_id), Some(backend)) =
+            (vibex_core::SkillId::parse(id.clone()), self.backend.clone())
+        else {
+            return;
+        };
+        let active_locale = locale::current_locale();
+        self.begin_simple_task(
+            ManagementMutation::SkillAction(format!("agent-matrix-all:{id}")),
+            cx,
+            async move {
+                backend
+                    .management()
+                    .set_skill_agent_matrix(MutationRequest::new(
+                        vibex_core::SkillSetAgentMatrixRequest {
+                            skill_id,
+                            agent_matrix: matrix,
+                        },
+                    ))
+                    .await
+                    .map_err(crate::app::remote_error_into_vibex)?;
+                Ok(format!(
+                    "{}: {}",
+                    management_locale_text_for(
+                        active_locale,
+                        "Agent enablement",
+                        "Agent 启用范围",
+                        "Agent 啟用範圍",
+                    ),
+                    management_locale_text_for(
+                        active_locale,
+                        if enabled {
+                            "All enabled"
+                        } else {
+                            "All disabled"
+                        },
+                        if enabled {
+                            "全部启用"
+                        } else {
+                            "全部取消"
+                        },
+                        if enabled {
+                            "全部啟用"
+                        } else {
+                            "全部取消"
+                        },
                     )
                 ))
             },
@@ -32414,16 +32574,23 @@ impl ManagementCenter {
                         ))
                     })
                     .when(!matrix_agents.is_empty(), |card| {
+                        let matrix_all_id = id.clone();
                         card.child(
                             v_flex()
                                 .w_full()
                                 .gap_2()
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .font_semibold()
-                                        .child(management_agent_enablement_label()),
-                                )
+                                .child(management_agent_enablement_heading(
+                                    "management-mcp-agent-scope",
+                                    pending,
+                                    move |this, enabled, _window, cx| {
+                                        this.set_mcp_agent_matrix_all(
+                                            matrix_all_id.clone(),
+                                            enabled,
+                                            cx,
+                                        )
+                                    },
+                                    cx,
+                                ))
                                 .child(agent_matrix_rows),
                         )
                     }),
@@ -32659,16 +32826,23 @@ impl ManagementCenter {
                             ))
                         })
                         .when(!matrix_agents.is_empty(), |card| {
+                            let matrix_all_id = id.clone();
                             card.child(
                                 v_flex()
                                     .w_full()
                                     .gap_2()
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .font_semibold()
-                                            .child(management_agent_enablement_label()),
-                                    )
+                                    .child(management_agent_enablement_heading(
+                                        "management-skill-agent-scope",
+                                        pending,
+                                        move |this, enabled, _window, cx| {
+                                            this.set_skill_agent_matrix_all(
+                                                matrix_all_id.clone(),
+                                                enabled,
+                                                cx,
+                                            )
+                                        },
+                                        cx,
+                                    ))
                                     .child(agent_matrix_rows),
                             )
                         }),
@@ -36805,6 +36979,18 @@ fn updated_mcp_agent_matrix(
     matrix
 }
 
+/// Applies one answer to every Agent in an MCP server's audience.
+fn updated_mcp_agent_matrix_all(
+    mut matrix: Vec<vibex_core::McpServerAgentMatrix>,
+    agent_ids: impl IntoIterator<Item = AgentId>,
+    enabled: bool,
+) -> Vec<vibex_core::McpServerAgentMatrix> {
+    for agent_id in agent_ids {
+        matrix = updated_mcp_agent_matrix(matrix, agent_id, enabled);
+    }
+    matrix
+}
+
 fn updated_skill_agent_matrix(
     mut matrix: Vec<vibex_core::SkillAgentMatrix>,
     agent_id: AgentId,
@@ -36821,6 +37007,18 @@ fn updated_skill_agent_matrix(
             source_kind: vibex_core::ResourceAgentMatrixSourceKind::Manual,
             updated_at_ms,
         });
+    }
+    matrix
+}
+
+/// Applies one answer to every Agent in a Skill's audience.
+fn updated_skill_agent_matrix_all(
+    mut matrix: Vec<vibex_core::SkillAgentMatrix>,
+    agent_ids: impl IntoIterator<Item = AgentId>,
+    enabled: bool,
+) -> Vec<vibex_core::SkillAgentMatrix> {
+    for agent_id in agent_ids {
+        matrix = updated_skill_agent_matrix(matrix, agent_id, enabled);
     }
     matrix
 }
@@ -40303,6 +40501,82 @@ fn management_market_section(
         .into_any_element()
 }
 
+/// The two shortcuts that answer a whole Agent audience at once.
+///
+/// The per-Agent capsules remain the precise control; these are the same answer
+/// for a reader who wants the resource on for every Agent, or off for every
+/// one, without clicking each logo. Every surface that lists an Agent audience
+/// draws this pair, so the wording and the position stay one contract instead
+/// of a copy per page.
+fn management_agent_scope_actions(
+    id_prefix: &str,
+    pending: bool,
+    on_set_all: impl Fn(&mut ManagementCenter, bool, &mut Window, &mut Context<ManagementCenter>)
+    + Clone
+    + 'static,
+    cx: &mut Context<ManagementCenter>,
+) -> AnyElement {
+    let enable_all = on_set_all.clone();
+    let disable_all = on_set_all;
+    h_flex()
+        .flex_none()
+        .items_center()
+        .gap_1()
+        .child(
+            Button::new(SharedString::from(format!("{id_prefix}-enable-all")))
+                .xsmall()
+                .ghost()
+                .label(management_locale_text("Enable all", "全部启用", "全部啟用"))
+                .disabled(pending)
+                .on_click(
+                    cx.listener(move |this, _, window, cx| enable_all(this, true, window, cx)),
+                ),
+        )
+        .child(
+            Button::new(SharedString::from(format!("{id_prefix}-disable-all")))
+                .xsmall()
+                .ghost()
+                .label(management_locale_text(
+                    "Disable all",
+                    "全部取消",
+                    "全部取消",
+                ))
+                .disabled(pending)
+                .on_click(
+                    cx.listener(move |this, _, window, cx| disable_all(this, false, window, cx)),
+                ),
+        )
+        .into_any_element()
+}
+
+/// The heading of a resource's Agent audience, with the two all-or-nothing
+/// shortcuts on its trailing edge.
+fn management_agent_enablement_heading(
+    id_prefix: &str,
+    pending: bool,
+    on_set_all: impl Fn(&mut ManagementCenter, bool, &mut Window, &mut Context<ManagementCenter>)
+    + Clone
+    + 'static,
+    cx: &mut Context<ManagementCenter>,
+) -> AnyElement {
+    h_flex()
+        .w_full()
+        .min_w_0()
+        .items_center()
+        .justify_between()
+        .gap_2()
+        .child(
+            div()
+                .text_xs()
+                .font_semibold()
+                .child(management_agent_enablement_label()),
+        )
+        .child(management_agent_scope_actions(
+            id_prefix, pending, on_set_all, cx,
+        ))
+        .into_any_element()
+}
+
 /// The enable-for section both market install forms share.
 ///
 /// The capsules are the ones the resource's own detail panel draws — the
@@ -40356,36 +40630,7 @@ fn management_market_enablement_section(
         ));
     }
 
-    let enable_all = on_set_all.clone();
-    let disable_all = on_set_all;
-    let actions = h_flex()
-        .flex_none()
-        .items_center()
-        .gap_1()
-        .child(
-            Button::new(SharedString::from(format!("{id_prefix}-enable-all")))
-                .xsmall()
-                .ghost()
-                .label(management_locale_text("Enable all", "全部启用", "全部啟用"))
-                .disabled(pending)
-                .on_click(
-                    cx.listener(move |this, _, window, cx| enable_all(this, true, window, cx)),
-                ),
-        )
-        .child(
-            Button::new(SharedString::from(format!("{id_prefix}-disable-all")))
-                .xsmall()
-                .ghost()
-                .label(management_locale_text(
-                    "Disable all",
-                    "全部取消",
-                    "全部取消",
-                ))
-                .disabled(pending)
-                .on_click(
-                    cx.listener(move |this, _, window, cx| disable_all(this, false, window, cx)),
-                ),
-        );
+    let actions = management_agent_scope_actions(id_prefix, pending, on_set_all, cx);
 
     management_market_section(
         management_locale_text("Enable for", "启用范围", "啟用範圍"),
@@ -45680,6 +45925,96 @@ mod tests {
                 && !entry.enabled
                 && entry.source_kind == vibex_core::ResourceAgentMatrixSourceKind::NativeImport
         }));
+    }
+
+    /// The market shortcuts answer for every Agent in one write, not one
+    /// request per capsule, and keep the provenance each entry already had.
+    #[test]
+    fn agent_scope_shortcuts_update_every_matrix_entry() {
+        let codex = AgentId::parse("codex").expect("valid Agent id");
+        let claude = AgentId::parse("claude").expect("valid Agent id");
+        let mcp = updated_mcp_agent_matrix_all(
+            vec![vibex_core::McpServerAgentMatrix {
+                agent_id: claude.clone(),
+                enabled: false,
+                source_kind: vibex_core::ResourceAgentMatrixSourceKind::NativeImport,
+                updated_at_ms: 1,
+            }],
+            vec![codex.clone(), claude.clone()],
+            true,
+        );
+        assert_eq!(mcp.len(), 2);
+        assert!(mcp.iter().all(|entry| entry.enabled));
+        assert!(mcp.iter().any(|entry| {
+            entry.agent_id == claude
+                && entry.source_kind == vibex_core::ResourceAgentMatrixSourceKind::NativeImport
+        }));
+        let mcp = updated_mcp_agent_matrix_all(mcp, vec![codex.clone(), claude.clone()], false);
+        assert!(mcp.iter().all(|entry| !entry.enabled));
+
+        let skill = updated_skill_agent_matrix_all(
+            vec![vibex_core::SkillAgentMatrix {
+                agent_id: claude.clone(),
+                enabled: true,
+                source_kind: vibex_core::ResourceAgentMatrixSourceKind::NativeImport,
+                updated_at_ms: 1,
+            }],
+            vec![codex.clone(), claude.clone()],
+            false,
+        );
+        assert_eq!(skill.len(), 2);
+        assert!(skill.iter().all(|entry| !entry.enabled));
+        assert!(skill.iter().any(|entry| {
+            entry.agent_id == claude
+                && entry.source_kind == vibex_core::ResourceAgentMatrixSourceKind::NativeImport
+        }));
+    }
+
+    /// Every Agent audience offers the same two shortcuts, and each one routes
+    /// through the one write its resource owns rather than writing per capsule.
+    #[test]
+    fn every_agent_audience_offers_enable_all_and_disable_all() {
+        let source = include_str!("management.rs");
+        let actions = source
+            .split_once("fn management_agent_scope_actions(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n/// The heading of a resource's Agent audience")
+            })
+            .map(|(body, _)| body)
+            .expect("the shared Agent scope actions should remain inspectable");
+        for label in [
+            "management_locale_text(\"Enable all\", \"全部启用\", \"全部啟用\")",
+            "\"Disable all\"",
+            "\"全部取消\"",
+        ] {
+            assert!(actions.contains(label), "the shortcuts must keep {label}");
+        }
+        assert!(source.contains("management-mcp-agent-scope"));
+        assert!(source.contains("management-skill-agent-scope"));
+        assert!(source.contains("fn set_mcp_agent_matrix_all("));
+        assert!(source.contains("fn set_skill_agent_matrix_all("));
+        assert!(source.contains("updated_mcp_agent_matrix_all("));
+        assert!(source.contains("updated_skill_agent_matrix_all("));
+        for body in [
+            "fn render_mcp(",
+            "fn render_skills(",
+            "fn management_market_enablement_section(",
+        ] {
+            let section = source
+                .split_once(body)
+                .map(|(_, tail)| tail)
+                .unwrap_or_else(|| panic!("{body} should remain inspectable"));
+            let section = section
+                .split_once("\n    fn ")
+                .or_else(|| section.split_once("\nfn "))
+                .map(|(body, _)| body)
+                .unwrap_or(section);
+            assert!(
+                section.contains("management_agent_scope_actions(")
+                    || section.contains("management_agent_enablement_heading("),
+                "{body} must offer the Agent scope shortcuts"
+            );
+        }
     }
 
     /// Every per-Agent feature in the Config Center asks "which Agents?" with

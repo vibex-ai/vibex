@@ -1205,6 +1205,12 @@ mod tests {
         );
         assert!(PROVIDER.contains("try_unbind_model_source("));
         assert!(ROUTE_GROUP.contains("try_unbind_model_source("));
+        // The same audience offers the two all-or-nothing shortcuts, backed by
+        // one batch method per source kind.
+        assert!(PROVIDER.contains("management_agent_scope_actions("));
+        assert!(PROVIDER.contains("set_workspace_provider_agents("));
+        assert!(ROUTE_GROUP.contains("management_agent_scope_actions("));
+        assert!(ROUTE_GROUP.contains("set_workspace_route_agents("));
     }
 
     /// The Provider settings form is the edit mode: it loads from the record

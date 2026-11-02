@@ -304,6 +304,168 @@ impl ManagementCenter {
         }));
     }
 
+    /// Enables or disables this route group for every Agent at once.
+    ///
+    /// The capsules stay the precise control; this is the same answer for the
+    /// whole list. Disabling keeps a binding when it is that Agent's only model
+    /// source — the guard a single capsule applies — and reports how many were
+    /// kept instead of stopping the batch at the first Agent.
+    fn set_workspace_route_agents(
+        &mut self,
+        route_id: vibex_core::ModelRouteId,
+        enabled: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if self.mutation.is_some() {
+            return;
+        }
+        if !self.model_routes.iter().any(|route| route.id == route_id) {
+            return;
+        }
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        let active_locale = locale::current_locale();
+        let mut kept = 0usize;
+        let mut requests = Vec::new();
+        if enabled {
+            let bound = self
+                .agent_model_route_bindings
+                .iter()
+                .filter(|binding| {
+                    binding.deleted_at_ms.is_none() && binding.model_route_id == route_id
+                })
+                .map(|binding| binding.agent_id.as_str().to_string())
+                .collect::<BTreeSet<_>>();
+            for (agent_id, _) in self.workspace_configurable_agents() {
+                if bound.contains(&agent_id) {
+                    continue;
+                }
+                let Ok(agent) = AgentId::parse(agent_id.clone()) else {
+                    continue;
+                };
+                let make_default = self.resolved_agent_default_source(&agent_id).is_none();
+                requests.push((agent, make_default));
+            }
+        } else {
+            for binding in self.agent_model_route_bindings.iter().filter(|binding| {
+                binding.deleted_at_ms.is_none() && binding.model_route_id == route_id
+            }) {
+                let agent_id = binding.agent_id.clone();
+                if self.agent_model_source_count(agent_id.as_str()) <= 1 {
+                    kept += 1;
+                    continue;
+                }
+                requests.push((agent_id, false));
+            }
+        }
+        if requests.is_empty() {
+            if kept > 0 {
+                self.error = Some(match active_locale {
+                    ResolvedLocale::En => format!(
+                        "This route group is the only model source for {kept} Agent(s), so it cannot be removed."
+                    ),
+                    ResolvedLocale::ZhCn => {
+                        format!("该路由组是 {kept} 个 Agent 唯一的模型来源，无法移除。")
+                    }
+                    ResolvedLocale::ZhTw => {
+                        format!("該路由組是 {kept} 個 Agent 唯一的模型來源，無法移除。")
+                    }
+                });
+                cx.notify();
+            }
+            return;
+        }
+
+        self.mutation = Some(ManagementMutation::Gateway);
+        self.error = None;
+        let this = cx.entity();
+        self.mutation_task = Some(cx.spawn(async move |_, cx| {
+            let mut applied = 0usize;
+            let mut failure = None;
+            for (agent_id, make_default) in requests {
+                let outcome = if enabled {
+                    backend
+                        .management()
+                        .bind_agent_model_route(vibex_backend::MutationRequest::new(
+                            vibex_core::AgentModelRouteBindRequest {
+                                agent_id,
+                                model_route_id: route_id.clone(),
+                                make_default,
+                            },
+                        ))
+                        .await
+                        .map(|_| ())
+                } else {
+                    backend
+                        .management()
+                        .unbind_agent_model_route(vibex_backend::MutationRequest::new(
+                            vibex_core::AgentModelRouteUnbindRequest {
+                                agent_id,
+                                model_route_id: route_id.clone(),
+                            },
+                        ))
+                        .await
+                        .map(|_| ())
+                };
+                match outcome {
+                    Ok(()) => applied += 1,
+                    Err(error) => {
+                        failure = Some(error);
+                        break;
+                    }
+                }
+            }
+            this.update(cx, |this, cx| {
+                this.mutation = None;
+                this.refresh(cx);
+                if let Some(error) = failure {
+                    this.error = Some(format!("{}: {}", error.code, error.message));
+                } else {
+                    let mut message = match active_locale {
+                        ResolvedLocale::En => {
+                            if enabled {
+                                format!("Enabled for {applied} Agent(s)")
+                            } else {
+                                format!("Disabled for {applied} Agent(s)")
+                            }
+                        }
+                        ResolvedLocale::ZhCn => {
+                            if enabled {
+                                format!("已为 {applied} 个 Agent 启用")
+                            } else {
+                                format!("已为 {applied} 个 Agent 取消")
+                            }
+                        }
+                        ResolvedLocale::ZhTw => {
+                            if enabled {
+                                format!("已為 {applied} 個 Agent 啟用")
+                            } else {
+                                format!("已為 {applied} 個 Agent 取消")
+                            }
+                        }
+                    };
+                    if kept > 0 {
+                        let suffix = match active_locale {
+                            ResolvedLocale::En => {
+                                format!("; {kept} kept because this is their only model source.")
+                            }
+                            ResolvedLocale::ZhCn => {
+                                format!("；{kept} 个 Agent 保留，因为这是它们唯一的模型来源。")
+                            }
+                            ResolvedLocale::ZhTw => {
+                                format!("；{kept} 個 Agent 保留，因為這是它們唯一的模型來源。")
+                            }
+                        };
+                        message.push_str(&suffix);
+                    }
+                    this.notice = Some(message);
+                }
+                cx.notify();
+            });
+        }));
+    }
+
     fn render_workspace_route_overview(
         &mut self,
         row: &SharedRouteGroupRow,
@@ -454,6 +616,17 @@ impl ManagementCenter {
             toggle,
             cx,
         );
+        let agent_scope = management_agent_scope_actions(
+            "management-route-group-agent-scope",
+            self.mutation.is_some(),
+            {
+                let route_id = route.id.clone();
+                move |this, enabled, _window, cx| {
+                    this.set_workspace_route_agents(route_id.clone(), enabled, cx)
+                }
+            },
+            cx,
+        );
 
         let model_chips = h_flex()
             .w_full()
@@ -509,7 +682,7 @@ impl ManagementCenter {
                     "点选 Agent 即可让它使用该路由组的模型。",
                     "點選 Agent 即可讓它使用該路由組的模型。",
                 )),
-                None,
+                Some(agent_scope),
                 agent_list,
                 cx,
             ),
