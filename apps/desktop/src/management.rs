@@ -131,6 +131,12 @@ const MANAGEMENT_PROFILE_PANE_MAX_HEIGHT: f32 = 260.0;
 /// The identity and connection band stops growing at this height, so the Model
 /// panes keep the rest of the dialog even when a disclosure opens.
 const MANAGEMENT_PROFILE_FORM_BAND_MAX_HEIGHT: f32 = 320.0;
+/// The title, padding, and action bar of the route-group authoring dialog.
+///
+/// The kit's dialog body is one scroll region, so a 100%-tall column inside it
+/// can resolve against its content. Reserving the chrome keeps the group form's
+/// scrolling section inside the surface and its action bar above the fold.
+const MANAGEMENT_ROUTE_GROUP_DIALOG_CHROME_HEIGHT: f32 = 160.0;
 /// How much foreground the caption and command strips of a pane carry.
 ///
 /// A strip is read as part of the panel it belongs to, so it lifts from the
@@ -30927,13 +30933,20 @@ impl ManagementCenter {
     /// order and words, as the Provider page draws for a new group.
     fn render_model_group_editor(
         &mut self,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         // The dialog matches the Provider form's frame: a scrolling body over a
         // pinned action bar. The form's own footer is therefore left out of the
         // scroll region and drawn here, where a long member list cannot push the
         // commit out of reach.
+        // The dialog content lives in the kit's own scroll body, so a 100%-tall
+        // column still resolves against its content when that content is tall.
+        // Bound the scrolling section against the dialog it is drawn in; the
+        // footer stays inside the surface instead of travelling below the fold.
+        let body_max_height = (management_authoring_dialog_size(window).1
+            - MANAGEMENT_ROUTE_GROUP_DIALOG_CHROME_HEIGHT)
+            .max(180.0);
         let form = self
             .render_route_group_form_sections(provider_workspace::RouteGroupFormScope::Dialog, cx);
         // Returning from a group authored in the chooser restores the step the
@@ -30963,13 +30976,21 @@ impl ManagementCenter {
             .child(
                 div()
                     .id("management-model-group-editor-scroll")
+                    .debug_selector(|| "management-model-group-editor-scroll".to_string())
                     .w_full()
                     .min_h_0()
+                    .max_h(px(body_max_height))
                     .flex_1()
                     .overflow_y_scroll()
                     .child(form),
             )
-            .child(div().w_full().flex_none().child(footer))
+            .child(
+                div()
+                    .debug_selector(|| "management-model-group-editor-footer".to_string())
+                    .w_full()
+                    .flex_none()
+                    .child(footer),
+            )
             .into_any_element()
     }
 
@@ -50857,6 +50878,45 @@ mod gateway_surface_tests {
                 );
             });
         });
+    }
+
+    /// The route-group dialog's footer is a sibling of its scroll body, so it
+    /// stays on screen at the dialog's bottom edge without scrolling.
+    #[gpui::test]
+    fn the_route_group_dialog_keeps_its_footer_on_screen(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let mut built = None;
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            let center = cx.new(|cx| ManagementCenter::new(window, cx));
+            let root = gpui_base::Root::new(center.clone(), window, cx);
+            built = Some(center);
+            root
+        });
+        let center = built.expect("the management window builds its center");
+        cx.update(|window, cx| {
+            center.update(cx, |center, cx| {
+                center.open_route_group_editor(true, window, cx);
+            });
+            let _ = window.draw(cx);
+        });
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        let dialog = cx
+            .debug_bounds("dialog-0")
+            .expect("the route-group dialog is drawn");
+        assert!(
+            cx.debug_bounds("management-model-group-editor-scroll")
+                .is_some(),
+            "the route-group scroll body is drawn"
+        );
+        let footer = cx
+            .debug_bounds("management-model-group-editor-footer")
+            .expect("the route-group footer is drawn");
+        assert!(
+            footer.top() >= dialog.top() && footer.bottom() <= dialog.bottom(),
+            "the footer must sit inside the dialog, not below its scrolling body: dialog={dialog:?} footer={footer:?}"
+        );
     }
 }
 
