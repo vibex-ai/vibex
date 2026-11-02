@@ -2187,11 +2187,8 @@ impl ManagementCenter {
             ))
         });
         let provider_preset_query = cx.new(|cx| {
-            InputState::new(window, cx).placeholder(management_locale_text(
-                "Search vendors",
-                "搜索厂商",
-                "搜尋廠商",
-            ))
+            InputState::new(window, cx)
+                .placeholder(ProviderPickerTab::Providers.search_placeholder())
         });
         let provider_model_add_input = cx.new(|cx| {
             InputState::new(window, cx).placeholder(management_locale_text(
@@ -6228,6 +6225,7 @@ impl ManagementCenter {
     ) {
         self.provider_picker_origin = origin;
         self.provider_picker_tab = ProviderPickerTab::Providers;
+        self.sync_provider_picker_search_placeholder(window, cx);
         // The dialog is opened from an Agent card, so the new shared record is
         // enabled for that Agent after it is written.
         self.provider_editor_bind_agent = true;
@@ -6555,6 +6553,7 @@ impl ManagementCenter {
             .set_offset(point(px(0.0), px(0.0)));
         self.provider_preset_query
             .update(cx, |state, cx| state.set_value("", window, cx));
+        self.sync_provider_picker_search_placeholder(window, cx);
         self.focus_provider_picker_search(window, cx);
         self.navigation.mark_dirty(ManagementSection::Agents, false);
         cx.notify();
@@ -25172,16 +25171,22 @@ impl ManagementCenter {
         // that was on screen could land past the end of the other one.
         self.provider_picker_scroll
             .set_offset(point(px(0.0), px(0.0)));
-        // The provider half owns a search field and the group half does not,
-        // so the tab switch has to leave the keyboard somewhere that still
-        // exists on the other side.
-        self.provider_picker_focus.focus(window, cx);
-        self.provider_preset_query
-            .update(cx, |state, cx| state.set_value("", window, cx));
-        if tab == ProviderPickerTab::Providers {
-            self.focus_provider_picker_search(window, cx);
-        }
+        // Both halves now share the filter, so the switch only retargets it:
+        // the same field keeps the keyboard, and its placeholder names the
+        // records the new half is searching.
+        self.provider_preset_query.update(cx, |state, cx| {
+            state.set_placeholder(tab.search_placeholder(), window, cx);
+            state.set_value("", window, cx);
+        });
+        self.focus_provider_picker_search(window, cx);
         cx.notify();
+    }
+
+    fn sync_provider_picker_search_placeholder(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let tab = self.provider_picker_tab;
+        self.provider_preset_query.update(cx, |state, cx| {
+            state.set_placeholder(tab.search_placeholder(), window, cx);
+        });
     }
 
     fn move_provider_picker_tab(
@@ -25446,23 +25451,11 @@ impl ManagementCenter {
         let column = if two_columns { 2 } else { 1 };
         let mut group_rows = v_flex().w_full().min_w_0().gap_1();
         if !available_groups.is_empty() {
-            group_rows = group_rows.child(
-                div()
-                    .w_full()
-                    .flex_none()
-                    .px_2()
-                    .pt_1()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(management_locale_text(
-                        "Saved groups this Agent can use",
-                        "此 Agent 可使用的已保存路由组",
-                        "此 Agent 可使用的已儲存路由組",
-                    )),
-            );
             let mut line = h_flex().w_full().min_w_0().gap_1();
             let mut filled = 0usize;
-            for row in available_groups {
+            // Borrowed: the group half still asks whether this list was empty
+            // when it decides between the heading and the empty state.
+            for row in &available_groups {
                 let route_id = row.route.id.clone();
                 let use_id = route_id.clone();
                 let summary = management_route_group_member_summary(&row.route, &self.providers);
@@ -25550,12 +25543,11 @@ impl ManagementCenter {
         let providers_tab = tab == ProviderPickerTab::Providers;
 
         // Each half of the chooser is its own list with its own actions: the
-        // Provider tab searches the library and the saved records, the route
-        // group tab lists compositions and the command that makes one. The tabs
-        // exist because the two records are authored differently, so stacking
-        // them made the page read as one long list of unequal things.
-        let search =
-            providers_tab.then(|| management_search_input(&self.provider_preset_query, cx));
+        // Provider tab searches the library and the saved records, and the
+        // route-group tab searches the saved groups. The two records are
+        // authored differently, so stacking them made the page read as one long
+        // list of unequal things; the filter itself is the same gesture on both.
+        let search = management_search_input(&self.provider_preset_query, cx);
         // The body owns the leftover height: the tab bar, the hint and the
         // search above it are fixed, and the list below must be the one region
         // that scrolls. Without `flex_1` here the list resolves against a
@@ -25661,7 +25653,43 @@ impl ManagementCenter {
         } else {
             // The group tab keeps its list and its own New command together, so
             // the tab states what exists and how to add one without the Provider
-            // library underneath answering a different question.
+            // library underneath answering a different question. It names the
+            // block the same way the Provider half does, and a search that
+            // matches nothing says so instead of leaving an empty list.
+            let group_content = if available_groups.is_empty() {
+                div()
+                    .w_full()
+                    .px_3()
+                    .py_2()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(if normalized.is_empty() {
+                        management_locale_text(
+                            "No route group is configured yet. Create one below.",
+                            "还没有配置任何路由组，可在下方创建。",
+                            "還沒有設定任何路由組，可在下方建立。",
+                        )
+                    } else {
+                        management_locale_text(
+                            "No configured route group matches this search.",
+                            "没有已配置的路由组匹配这个搜索。",
+                            "沒有已設定的路由組符合這個搜尋。",
+                        )
+                    })
+                    .into_any_element()
+            } else {
+                provider_source_section(
+                    SharedString::from("management-provider-sources-existing-groups"),
+                    "icons/vibex/git-branch.svg",
+                    management_locale_text(
+                        "Configured route groups",
+                        "已配置的路由组",
+                        "已設定的路由組",
+                    ),
+                    group_rows.into_any_element(),
+                    cx,
+                )
+            };
             body = body.child(
                 div()
                     .id("provider-picker-groups")
@@ -25673,7 +25701,7 @@ impl ManagementCenter {
                     .overflow_y_scrollbar()
                     .scroll_gutter()
                     .pb_1()
-                    .child(group_rows),
+                    .child(group_content),
             );
         }
 
@@ -25761,7 +25789,7 @@ impl ManagementCenter {
             // someone already looking at them.
             // Switching the list and filtering it are two different gestures,
             // so the field sits apart from the switch instead of touching it.
-            .children(search.map(|search| div().w_full().flex_none().pt_3().child(search)))
+            .child(div().w_full().flex_none().pt_3().child(search))
             .child(body)
             // A new source starts from an empty form, which is the one answer
             // neither tab's list can offer. Importing no longer lives in this
@@ -25772,90 +25800,94 @@ impl ManagementCenter {
                 // The manual path is not one more row in the library: it is the
                 // answer for a source the library does not list, so it sits on
                 // its own band under the rule, trailing a chevron that says it
-                // opens a form rather than choosing a row.
-                h_flex()
-                    .id("management-provider-preset-custom")
-                    .w_full()
-                    .min_w_0()
-                    .items_center()
-                    .gap_2()
-                    .px_2()
-                    .py_2()
-                    .rounded(cx.theme().radius)
-                    .when(custom_selected, |this| {
-                        this.bg(cx.theme().primary.opacity(0.10))
-                    })
-                    .when(!pending, |this| {
-                        this.cursor_pointer()
-                            .hover(|style| style.bg(cx.theme().muted.opacity(0.4)))
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                if providers_tab {
-                                    this.choose_custom_provider(window, cx)
-                                } else {
-                                    this.create_route_group_from_picker(window, cx)
-                                }
-                            }))
-                    })
-                    .child(
-                        div()
-                            .flex_none()
-                            .size(px(22.0))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded_full()
-                            .border_1()
-                            .border_color(cx.theme().border)
-                            .child(
-                                Icon::new(IconName::Plus)
-                                    .size(px(12.0))
-                                    .text_color(cx.theme().muted_foreground),
-                            ),
-                    )
-                    .child(
-                        v_flex()
-                            .min_w_0()
-                            .flex_1()
-                            .gap_0p5()
-                            .child(div().text_sm().font_medium().child(if providers_tab {
-                                management_locale_text(
-                                    "Custom provider",
-                                    "自定义供应商",
-                                    "自訂供應商",
-                                )
-                            } else {
-                                management_locale_text(
-                                    "New route group",
-                                    "新建路由组",
-                                    "新增路由組",
-                                )
-                            }))
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(if providers_tab {
-                                        management_locale_text(
-                                            "Any OpenAI- or Anthropic-compatible address",
-                                            "任意兼容 OpenAI 或 Anthropic 的地址",
-                                            "任意相容 OpenAI 或 Anthropic 的位址",
-                                        )
+                // opens a form rather than choosing a row. The wrapper carries
+                // the same clearance under the row that the chooser's gap gives
+                // it above, so the hover plate sits between the two rules.
+                div().w_full().pb_2().child(
+                    h_flex()
+                        .id("management-provider-preset-custom")
+                        .w_full()
+                        .min_w_0()
+                        .items_center()
+                        .gap_2()
+                        .px_2()
+                        .py_2()
+                        .rounded(cx.theme().radius)
+                        .when(custom_selected, |this| {
+                            this.bg(cx.theme().primary.opacity(0.10))
+                        })
+                        .when(!pending, |this| {
+                            this.cursor_pointer()
+                                .hover(|style| style.bg(cx.theme().muted.opacity(0.4)))
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    if providers_tab {
+                                        this.choose_custom_provider(window, cx)
                                     } else {
-                                        management_locale_text(
-                                            "Combine Providers into one model source",
-                                            "把多个供应商组合成一个模型来源",
-                                            "把多個供應商組合成一個模型來源",
-                                        )
-                                    }),
-                            ),
-                    )
-                    .child(
-                        Icon::new(IconName::ChevronRight)
-                            .size(px(14.0))
-                            .text_color(cx.theme().muted_foreground),
-                    ),
+                                        this.create_route_group_from_picker(window, cx)
+                                    }
+                                }))
+                        })
+                        .child(
+                            div()
+                                .flex_none()
+                                .size(px(22.0))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded_full()
+                                .border_1()
+                                .border_color(cx.theme().border)
+                                .child(
+                                    Icon::new(IconName::Plus)
+                                        .size(px(12.0))
+                                        .text_color(cx.theme().muted_foreground),
+                                ),
+                        )
+                        .child(
+                            v_flex()
+                                .min_w_0()
+                                .flex_1()
+                                .gap_0p5()
+                                .child(div().text_sm().font_medium().child(if providers_tab {
+                                    management_locale_text(
+                                        "Custom provider",
+                                        "自定义供应商",
+                                        "自訂供應商",
+                                    )
+                                } else {
+                                    management_locale_text(
+                                        "New route group",
+                                        "新建路由组",
+                                        "新增路由組",
+                                    )
+                                }))
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(if providers_tab {
+                                            management_locale_text(
+                                                "Any OpenAI- or Anthropic-compatible address",
+                                                "任意兼容 OpenAI 或 Anthropic 的地址",
+                                                "任意相容 OpenAI 或 Anthropic 的位址",
+                                            )
+                                        } else {
+                                            management_locale_text(
+                                                "Combine Providers into one model source",
+                                                "把多个供应商组合成一个模型来源",
+                                                "把多個供應商組合成一個模型來源",
+                                            )
+                                        }),
+                                ),
+                        )
+                        .child(
+                            Icon::new(IconName::ChevronRight)
+                                .size(px(14.0))
+                                .text_color(cx.theme().muted_foreground),
+                        ),
+                ),
             )
             .into_any_element()
     }
@@ -25892,11 +25924,19 @@ impl ManagementCenter {
                     ProviderPickerTab::Providers => providers,
                     ProviderPickerTab::RouteGroups => groups,
                 };
+                // Keep the mark and the title one centred group. The kit's
+                // `prefix` slot is pinned to the tab's leading edge, which
+                // pushed the icon far away from the label it belongs to.
                 Tab::new()
                     .flex_1()
                     .aria_label(tab.label())
-                    .prefix(Icon::default().path(tab.icon()))
-                    .label(tab.label())
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_1p5()
+                            .child(Icon::default().path(tab.icon()))
+                            .child(tab.label()),
+                    )
                     .suffix(
                         div()
                             .text_xs()
@@ -25912,12 +25952,11 @@ impl ManagementCenter {
                         .set_offset(point(px(0.0), px(0.0)));
                     // The term was typed against the list that was on screen,
                     // so it does not carry into the other one.
-                    this.provider_preset_query
-                        .update(cx, |state, cx| state.set_value("", window, cx));
-                    this.provider_picker_focus.focus(window, cx);
-                    if *tab == ProviderPickerTab::Providers {
-                        this.focus_provider_picker_search(window, cx);
-                    }
+                    this.provider_preset_query.update(cx, |state, cx| {
+                        state.set_placeholder(tab.search_placeholder(), window, cx);
+                        state.set_value("", window, cx);
+                    });
+                    this.focus_provider_picker_search(window, cx);
                     cx.notify();
                 }
             }))
@@ -26055,6 +26094,7 @@ impl ManagementCenter {
         self.provider_picker_choice = None;
         self.provider_picker_scroll
             .set_offset(point(px(0.0), px(0.0)));
+        self.sync_provider_picker_search_placeholder(window, cx);
         self.profile_editor_open = true;
         self.present_profile_editor_dialog(window, cx);
         let focus = self.provider_picker_focus.clone();
@@ -37885,6 +37925,21 @@ impl ProviderPickerTab {
         match self {
             Self::Providers => "icons/vibex/database.svg",
             Self::RouteGroups => "icons/vibex/git-branch.svg",
+        }
+    }
+
+    /// What the chooser's filter promises on this half.
+    ///
+    /// Both halves now share one search field, so the placeholder names the
+    /// records the field is filtering rather than the library it started on.
+    fn search_placeholder(self) -> &'static str {
+        match self {
+            Self::Providers => {
+                management_locale_text("Search providers", "搜索供应商", "搜尋供應商")
+            }
+            Self::RouteGroups => {
+                management_locale_text("Search route groups", "搜索路由组", "搜尋路由組")
+            }
         }
     }
 }
@@ -50430,9 +50485,18 @@ mod gateway_surface_tests {
             .expect("the picker step should remain inspectable");
         assert!(picker.contains("render_provider_picker_tabs(cx)"));
         assert!(picker.contains("ProviderPickerTab::Providers"));
-        // The search belongs to the Provider half: the group list has no
-        // catalogue to search, only the groups this Agent can reference.
-        assert!(picker.contains("providers_tab.then("));
+        // Both halves are filtered by the same field: the Provider half searches
+        // the library and the saved records, the group half searches the saved
+        // groups, and the placeholder names whichever list is on screen.
+        assert!(
+            picker
+                .contains("let search = management_search_input(&self.provider_preset_query, cx);")
+        );
+        assert!(picker.contains("tab.search_placeholder()"));
+        // The group half is titled the way the Provider half is, so the list
+        // below the search says what it contains.
+        assert!(picker.contains("\"Configured route groups\""));
+        assert!(picker.contains("\"已配置的路由组\""));
         assert_eq!(
             ProviderPickerTab::ALL.map(|tab| tab.label()),
             ["Providers", "Route groups"]
@@ -50455,8 +50519,11 @@ mod gateway_surface_tests {
         // each take an equal share of the width.
         assert!(tabs.contains(".segmented()"));
         assert!(tabs.contains(".flex_1()"));
-        assert!(tabs.contains(".prefix("));
-        assert!(tabs.contains(".label(tab.label())"));
+        // The kit's `prefix` slot pins the mark to the leading edge, away from
+        // the title it belongs to; the tab's own child keeps them one group.
+        assert!(tabs.contains(".gap_1p5()"));
+        assert!(tabs.contains(".child(tab.label())"));
+        assert!(!tabs.contains(".prefix("));
         assert!(tabs.contains(".suffix("));
         // A saved selection, not a hover: the tab bar owns the active state.
         assert!(tabs.contains(".selected_index(selected_index)"));
@@ -50567,7 +50634,7 @@ mod gateway_surface_tests {
         // The chrome above it must not compete for that height.
         assert!(picker.contains("self.render_provider_picker_tabs(cx)"));
         assert!(picker.contains(".flex_none()"));
-        assert!(picker.contains("search.map(|search| div().w_full().flex_none()"));
+        assert!(picker.contains(".child(div().w_full().flex_none().pt_3().child(search))"));
         // Each half's scroll region is the only thing that scrolls.
         assert!(picker.contains(".id(\"provider-picker-list\")"));
         assert!(picker.contains(".id(\"provider-picker-groups\")"));
