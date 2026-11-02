@@ -22,7 +22,30 @@ use serde::{Deserialize, Serialize};
 
 use crate::ids::{ModelProviderProfileId, RequestId};
 use crate::provider_projection::ModelProviderProfile;
-use crate::{VibexError, VibexResult, unix_timestamp_ms};
+use crate::{AgentId, VibexError, VibexResult, unix_timestamp_ms};
+
+/// Prefix of the local placeholder token that identifies one Agent.
+pub const GATEWAY_AGENT_TOKEN_PREFIX: &str = "vibex-";
+
+/// The local placeholder token for one Agent.
+///
+/// The gateway ignores inbound credentials for authentication, but it uses the
+/// token's name to attribute a request when the Agent's User-Agent is generic.
+pub fn gateway_agent_token(agent_id: &str) -> String {
+    format!("{GATEWAY_AGENT_TOKEN_PREFIX}{agent_id}")
+}
+
+/// The Agent named by a local gateway token.
+///
+/// The old shared placeholder is deliberately not an Agent identity. Invalid
+/// token suffixes are ignored rather than stored in the request ledger.
+pub fn gateway_agent_from_token(token: &str) -> Option<&str> {
+    let agent_id = token.trim().strip_prefix(GATEWAY_AGENT_TOKEN_PREFIX)?;
+    if agent_id == "local-gateway" || AgentId::parse(agent_id).is_err() {
+        return None;
+    }
+    Some(agent_id)
+}
 
 /// How the gateway picks one of a Provider's Keys for the next request.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -2247,6 +2270,20 @@ mod tests {
         }
         assert_eq!(GatewayRoutingStrategy::from_id("smart"), None);
         assert_eq!(GatewayRoutingStrategy::from_id("pace"), None);
+    }
+
+    #[test]
+    fn gateway_agent_tokens_round_trip_only_valid_agent_ids() {
+        assert_eq!(gateway_agent_token("codex"), "vibex-codex");
+        assert_eq!(gateway_agent_from_token("vibex-codex"), Some("codex"));
+        assert_eq!(
+            gateway_agent_from_token("  vibex-claude-code  "),
+            Some("claude-code")
+        );
+        assert_eq!(gateway_agent_from_token("vibex-local-gateway"), None);
+        assert_eq!(gateway_agent_from_token("vibex-"), None);
+        assert_eq!(gateway_agent_from_token("vibex-Not_Kebab"), None);
+        assert_eq!(gateway_agent_from_token("sk-vibex-codex"), None);
     }
 
     #[test]

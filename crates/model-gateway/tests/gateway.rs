@@ -745,6 +745,8 @@ async fn passthrough_stream_reaches_the_client_and_the_ledger() {
     let response = reqwest::Client::new()
         .post(format!("{gateway_url}/v1/chat/completions"))
         .header(header::HOST, "127.0.0.1")
+        .header(header::AUTHORIZATION, "Bearer vibex-claude")
+        .header(header::USER_AGENT, "generic-http-client/1.0")
         .json(&json!({
             "model": group_model(&group, "deepseek-chat"),
             "messages": [{"role": "user", "content": "say hi"}],
@@ -777,11 +779,20 @@ async fn passthrough_stream_reaches_the_client_and_the_ledger() {
         group_model(&group, "deepseek-chat"),
         "the ledger records the id the Agent asked for"
     );
+    assert_eq!(
+        logs[0].agent_id.as_deref(),
+        Some("claude"),
+        "the named launch token identifies the Agent despite a generic SDK User-Agent"
+    );
     assert_eq!(logs[0].outcome, GatewayRequestOutcome::Ok);
     assert_eq!(logs[0].input_tokens, 11);
     assert_eq!(logs[0].output_tokens, 3);
     let encoded = serde_json::to_string(&logs).unwrap().to_lowercase();
     assert!(!encoded.contains("sk-test-123"), "the ledger leaked a Key");
+    assert!(
+        !encoded.contains("vibex-claude"),
+        "the ledger stored the raw launch token"
+    );
     assert!(!encoded.contains("say hi"), "the ledger leaked a prompt");
 
     gateway_task.abort();

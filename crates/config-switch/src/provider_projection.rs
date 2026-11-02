@@ -1579,11 +1579,10 @@ fn selected_endpoint<'a>(
 /// Provider is the upstream shape, while "this Agent talks to its own gateway"
 /// is a property of the Agent's binding.
 ///
-/// The value is [`crate::GATEWAY_LOCAL_KEY`], not the human-readable hint. The
-/// Agent validates the credential's shape before it opens a connection, and one
-/// that contains a space is rejected outright — the gateway would never see the
-/// request, and the Agent would report a credential problem the user cannot act
-/// on. See the constant for the wire-format constraint.
+/// The value names the binding's Agent so requests remain attributable even
+/// when the Agent's User-Agent is a generic SDK string. It is a printable-ASCII
+/// token because the Agent validates credential shape before it opens a
+/// connection, and one that contains a space is rejected outright.
 ///
 /// Returns `None` for anything that is not a gateway binding, so an ordinary
 /// Provider with an unset Key still fails loudly.
@@ -1592,7 +1591,7 @@ fn gateway_placeholder_secret(binding: &AgentModelProviderBinding) -> Option<Str
         entry.key.trim() == crate::GATEWAY_PROFILE_ROLE_OPTION_KEY
             && entry.value.trim() == crate::GATEWAY_PROFILE_ROLE
     });
-    is_gateway.then(|| crate::GATEWAY_LOCAL_KEY.to_string())
+    is_gateway.then(|| vibex_core::gateway_agent_token(binding.agent_id.as_str()))
 }
 
 fn selected_credential<'a>(
@@ -7972,10 +7971,11 @@ mod tests {
             "gateway-projection",
         )
         .unwrap();
+        let expected_token = vibex_core::gateway_agent_token(binding.agent_id.as_str());
         assert_eq!(
             plan.local_placeholder_secret.as_deref(),
-            Some(crate::GATEWAY_LOCAL_KEY),
-            "the plan names the placeholder instead of a stored Secret"
+            Some(expected_token.as_str()),
+            "the plan names the Agent instead of resolving a stored Secret"
         );
         assert!(
             plan.secret_env.iter().all(|entry| {
@@ -7994,8 +7994,8 @@ mod tests {
         let injected = resolved
             .secret_env
             .iter()
-            .find(|entry| entry.value.0 == crate::GATEWAY_LOCAL_KEY)
-            .expect("the Agent sends the local placeholder, which the gateway ignores")
+            .find(|entry| entry.value.0 == expected_token)
+            .expect("the Agent sends its named local token")
             .value
             .0
             .clone();
@@ -8013,6 +8013,10 @@ mod tests {
             injected,
             crate::GATEWAY_LOCAL_KEY_HINT,
             "the display hint contains a space, which no Agent accepts as a Key"
+        );
+        assert!(
+            vibex_core::gateway_agent_from_token(&injected).is_some(),
+            "the gateway can attribute the injected token to an Agent"
         );
     }
 

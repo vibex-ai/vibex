@@ -17,7 +17,7 @@ use axum::routing::{get, post};
 use tokio::sync::mpsc;
 
 use crate::error::GatewayError;
-use crate::service::ModelGatewayService;
+use crate::service::{ModelGatewayService, QUERY_AGENT_TOKEN_HEADER};
 use crate::wire::WireProtocol;
 
 /// State the router carries.
@@ -49,25 +49,28 @@ pub fn build_router(service: Arc<ModelGatewayService>) -> Router {
 async fn chat_completions(
     State(state): State<GatewayRouterState>,
     headers: HeaderMap,
+    uri: Uri,
     body: axum::body::Bytes,
 ) -> Response {
-    serve(state, WireProtocol::ChatCompletions, headers, body).await
+    serve(state, WireProtocol::ChatCompletions, headers, uri, body).await
 }
 
 async fn responses(
     State(state): State<GatewayRouterState>,
     headers: HeaderMap,
+    uri: Uri,
     body: axum::body::Bytes,
 ) -> Response {
-    serve(state, WireProtocol::Responses, headers, body).await
+    serve(state, WireProtocol::Responses, headers, uri, body).await
 }
 
 async fn anthropic_messages(
     State(state): State<GatewayRouterState>,
     headers: HeaderMap,
+    uri: Uri,
     body: axum::body::Bytes,
 ) -> Response {
-    serve(state, WireProtocol::AnthropicMessages, headers, body).await
+    serve(state, WireProtocol::AnthropicMessages, headers, uri, body).await
 }
 
 async fn gemini_call(
@@ -101,7 +104,14 @@ async fn gemini_call(
                 .error_response(WireProtocol::GeminiGenerateContent, &error);
         }
     };
-    serve(state, WireProtocol::GeminiGenerateContent, headers, body).await
+    serve(
+        state,
+        WireProtocol::GeminiGenerateContent,
+        headers,
+        uri,
+        body,
+    )
+    .await
 }
 
 /// Decodes the model segment of a Gemini path.
@@ -237,11 +247,13 @@ async fn serve(
     state: GatewayRouterState,
     protocol: WireProtocol,
     headers: HeaderMap,
+    uri: Uri,
     body: axum::body::Bytes,
 ) -> Response {
     if let Err(error) = perimeter(&headers) {
         return state.service.error_response(protocol, &error);
     }
+    let headers = headers_with_query_token(headers, &uri);
     let service = Arc::clone(&state.service);
     let mut prepared = match service.prepare(protocol, &headers, &body).await {
         Ok(prepared) => prepared,
@@ -375,6 +387,23 @@ async fn serve(
     response
 }
 
+/// Promotes a named gateway token from Gemini's `?key=` form into the same
+/// identity path as the credential headers.
+fn headers_with_query_token(mut headers: HeaderMap, uri: &Uri) -> HeaderMap {
+    let Some(query) = uri.query() else {
+        return headers;
+    };
+    let Some((_, token)) = url::form_urlencoded::parse(query.as_bytes())
+        .find(|(name, value)| name == "key" && !value.trim().is_empty())
+    else {
+        return headers;
+    };
+    if let Ok(value) = HeaderValue::from_str(token.trim()) {
+        headers.insert(QUERY_AGENT_TOKEN_HEADER, value);
+    }
+    headers
+}
+
 async fn list_models(State(state): State<GatewayRouterState>, headers: HeaderMap) -> Response {
     if let Err(error) = perimeter(&headers) {
         return state
@@ -472,6 +501,27 @@ mod tests {
                 ("origin", "http://127.0.0.1:3425"),
             ]))
             .is_err()
+        );
+    }
+
+    #[test]
+    fn a_query_key_reaches_agent_identity_without_replacing_headers() {
+        let headers = headers(&[("x-api-key", "vibex-claude")]);
+        let uri: Uri = "http://127.0.0.1:3425/v1beta/models/x?key=vibex-gemini"
+            .parse()
+            .unwrap();
+        let headers = headers_with_query_token(headers, &uri);
+        assert_eq!(
+            headers
+                .get(QUERY_AGENT_TOKEN_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            Some("vibex-gemini")
+        );
+        assert_eq!(
+            headers
+                .get("x-api-key")
+                .and_then(|value| value.to_str().ok()),
+            Some("vibex-claude")
         );
     }
 }

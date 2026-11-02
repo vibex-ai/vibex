@@ -5304,6 +5304,8 @@ GatewayPolicy {
     enabled, token_limit: Option<GatewayTokenLimit>, translate: GatewayTranslatePolicy,
     account_limits, preferred_keys,
 }
+gateway_agent_token(agent_id) -> "vibex-<agent-id>"
+gateway_agent_from_token(token) -> Option<AgentId>
 ModelGatewaySettings { display_name, port, policy, revision, updated_at_ms }
 GatewaySnapshot { settings, runtime, upstreams, models }
 
@@ -5338,6 +5340,13 @@ ProviderConfigService::{
   pins, and token windows never enter `ProcessSpawnConfigSnapshot`,
   `ProviderProfile::launch_revision`, or any other process fingerprint. Replacing
   a Key must not restart an Agent process; a test asserts this.
+- **Agent attribution has a stable precedence.** An explicit
+  `x-vibex-agent`/`x-agent-id` wins, then a named local `vibex-<agent-id>` token
+  from Authorization, `x-api-key`, `x-goog-api-key`, or Gemini's `?key=`, then a
+  recognized User-Agent. The Claude Desktop, Claude Science, Cursor, and
+  Codex-under-Claude-Code client shapes are resolved before generic
+  User-Agent parsing. Only a bounded Agent id reaches the request ledger; an
+  unreadable identity remains absent instead of storing a raw credential.
 - **Passthrough before translation.** When the upstream publishes an endpoint for
   the client's own protocol, the body is forwarded unchanged and only sniffed for
   usage. Translation runs only when the protocols differ, and a protocol the user
@@ -6145,17 +6154,16 @@ shared_route_group_rows(&routes, &bindings) -> Vec<SharedRouteGroupRow>
   on the **binding**, not on the shared Provider record, because "this Agent
   talks to its own gateway" is a property of the binding. An ordinary Provider
   with an unset Key keeps failing loudly.
-- **The placeholder must be a legal credential, not a readable sentence.** The
+- **The placeholder names the Agent and remains a legal credential.** The
   Agent validates the Key's *shape* before it builds a request, so the injected
-  value is `GATEWAY_LOCAL_KEY` (`vibex-local-gateway`), while
+  value is `gateway_agent_token(agent_id)` (`vibex-<agent-id>`), while
   `GATEWAY_LOCAL_KEY_HINT` (`managed by Vibex`) stays display text on the stored
-  credential summary. Sending the hint as the Key meant no request ever reached
-  the gateway: DeepSeek Harness allows printable ASCII only and rejected the
-  space with `INVALID_CREDENTIAL`, which the ACP layer's authentication
-  vocabulary then reported as "Agent authentication is required" — pointing the
-  user at a sign-in page that could not fix it. Any replacement placeholder has
-  to stay inside printable ASCII; the test asserts that rather than the exact
-  string, because nothing interprets the value and only its legality matters.
+  credential summary. The gateway ignores the token for authentication but uses
+  its suffix for request attribution when the User-Agent is a generic SDK
+  string. The legacy `GATEWAY_LOCAL_KEY` (`vibex-local-gateway`) remains legal
+  for existing Profiles but is deliberately not an Agent identity. Every token
+  must stay inside printable ASCII because DeepSeek Harness and other Agents
+  reject a Key containing a space before the request leaves the process.
 
 ### 4. Validation & Error Matrix
 
@@ -6210,11 +6218,12 @@ shared_route_group_rows(&routes, &bindings) -> Vec<SharedRouteGroupRow>
   still refused with `model_route_limit_exceeded`; a bound group is absent from
   the Agent's Profile until the catalogue is republished and present after; an
   ACP Agent's gateway Profile accepts a new catalogue and reports the change;
-  a gateway binding materialises the local placeholder while an ordinary Provider
-  without a Key still reports `agent_projection_secret_missing`.
+  a gateway binding materialises its Agent-named token while an ordinary
+  Provider without a Key still reports `agent_projection_secret_missing`.
 - `vibex-model-gateway` integration: a shared model is routable through the
   group and reaches a serving Provider; a model outside the intersection is
-  refused with `404`.
+  refused with `404`; identity tests cover named tokens, auth-header precedence,
+  User-Agent aliases, special clients, and query-key attribution.
 - `vibex-agent-acp` unit: a group publishes one option per shared model and each
   option's model id is `group/<id>/<model>`.
 - `vibex-desktop` unit: the Providers page has a route-group tab whose Add

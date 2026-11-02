@@ -3684,16 +3684,217 @@ fn member_failure_kind(error: &GatewayError) -> GatewayFailureKind {
     }
 }
 
+const AGENT_USER_AGENT_NAMES: &[(&str, &str)] = &[
+    ("acp-extension-codex", "codex"),
+    ("antigravity", "antigravity"),
+    ("agy", "antigravity"),
+    ("amp", "amp-acp"),
+    ("amp-acp", "amp-acp"),
+    ("auggie", "auggie"),
+    ("claude", "claude"),
+    ("claude-code", "claude"),
+    ("claude-cli", "claude"),
+    ("claude-desktop", "claude-desktop"),
+    ("claude-science", "claude-science"),
+    ("cline", "cline"),
+    ("codebuddy", "codebuddy-code"),
+    ("codebuddy-code", "codebuddy-code"),
+    ("codex", "codex"),
+    ("codex-cli", "codex"),
+    ("codex_cli_rs", "codex"),
+    ("copilot", "copilot"),
+    ("copilot-cli", "copilot"),
+    ("cursor", "cursor"),
+    ("cursor-agent", "cursor"),
+    ("cursor-cli", "cursor"),
+    ("cursor-local", "cursor"),
+    ("deepseek-harness", "deepseek-harness"),
+    ("dsh", "deepseek-harness"),
+    ("factory-cli", "factory-droid"),
+    ("factory-droid", "factory-droid"),
+    ("gemini", "gemini"),
+    ("gemini-cli", "gemini"),
+    ("geminicli", "gemini"),
+    ("github-copilot", "copilot"),
+    ("goose", "goose"),
+    ("grok", "grok"),
+    ("grok-pager", "grok"),
+    ("grok-shell", "grok"),
+    ("hermes", "hermes"),
+    ("hermes-agent", "hermes"),
+    ("kimi", "kimi"),
+    ("kimicli", "kimi"),
+    ("opencode", "opencode"),
+    ("pi", "pi"),
+    ("pi-desktop", "pi"),
+    ("qwen", "qwen-code"),
+    ("qwen-code", "qwen-code"),
+    ("qwencode", "qwen-code"),
+    ("xai-grok-build", "grok"),
+    ("zcode", "zcode"),
+];
+
+const AGENT_USER_AGENT_PREFIXES: &[(&str, &str)] = &[
+    ("claude-code", "claude"),
+    ("claude-cli", "claude"),
+    ("codex-cli", "codex"),
+    ("codex_cli_rs", "codex"),
+    ("codex", "codex"),
+    ("cursor", "cursor"),
+    ("deepseek-harness", "deepseek-harness"),
+    ("gemini-cli", "gemini"),
+    ("geminicli", "gemini"),
+    ("github-copilot", "copilot"),
+    ("grok-pager", "grok"),
+    ("grok-shell", "grok"),
+    ("qwen-code", "qwen-code"),
+    ("qwencode", "qwen-code"),
+    ("xai-grok-build", "grok"),
+];
+
+pub(crate) const QUERY_AGENT_TOKEN_HEADER: &str = "x-vibex-query-token";
+
 fn agent_id_from_headers(headers: &HeaderMap) -> Option<String> {
-    for name in ["x-vibex-agent", "x-agent-id", "user-agent"] {
-        if let Some(value) = headers.get(name).and_then(|value| value.to_str().ok()) {
-            let value = value.trim();
-            if !value.is_empty() && value.len() <= 64 && !value.contains('/') {
-                return Some(value.to_string());
-            }
+    // An explicit identity is the strongest signal. It is still normalized so a
+    // client that names its product instead of its Agent id gets the same label.
+    for name in ["x-vibex-agent", "x-agent-id"] {
+        if let Some(value) = header_text(headers, name)
+            && let Some(agent_id) = normalize_agent_identity(value)
+        {
+            return Some(agent_id);
         }
     }
-    None
+
+    // A named local token survives clients whose User-Agent is only their HTTP
+    // SDK's. Search every accepted credential location so a generic
+    // Authorization value does not hide the named token beside it.
+    for token in gateway_request_tokens(headers) {
+        if let Some(agent_id) = vibex_core::gateway_agent_from_token(token)
+            && let Some(agent_id) = canonical_agent_id(agent_id)
+        {
+            return Some(agent_id);
+        }
+    }
+
+    let user_agent = header_text(headers, "user-agent").unwrap_or_default();
+    if is_claude_desktop(user_agent) {
+        return Some("claude-desktop".to_string());
+    }
+    if header_text(headers, "x-anthropic-surface")
+        .is_some_and(|surface| surface.eq_ignore_ascii_case("operon"))
+    {
+        return Some("claude-science".to_string());
+    }
+    if user_agent
+        .trim_start()
+        .to_ascii_lowercase()
+        .starts_with("cursor")
+    {
+        return Some("cursor".to_string());
+    }
+    if is_codex_for_claude_code(headers) {
+        return Some("codex".to_string());
+    }
+    agent_from_user_agent(user_agent)
+}
+
+fn header_text<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn gateway_request_tokens(headers: &HeaderMap) -> Vec<&str> {
+    let mut tokens = Vec::new();
+
+    if let Some(authorization) = header_text(headers, header::AUTHORIZATION.as_str()) {
+        let mut parts = authorization.split_whitespace();
+        match parts.next() {
+            Some(scheme) if scheme.eq_ignore_ascii_case("bearer") => {
+                if let Some(token) = parts.next() {
+                    push_gateway_token(&mut tokens, token);
+                }
+            }
+            Some(_) => push_gateway_token(&mut tokens, authorization),
+            None => {}
+        }
+    }
+    for name in ["x-api-key", "x-goog-api-key", QUERY_AGENT_TOKEN_HEADER] {
+        if let Some(token) = header_text(headers, name) {
+            push_gateway_token(&mut tokens, token);
+        }
+    }
+    tokens
+}
+
+fn push_gateway_token<'a>(tokens: &mut Vec<&'a str>, value: &'a str) {
+    let value = value.trim();
+    if !value.is_empty() && !tokens.contains(&value) {
+        tokens.push(value);
+    }
+}
+
+fn normalize_agent_identity(value: &str) -> Option<String> {
+    let value = value.trim();
+    let value = vibex_core::gateway_agent_from_token(value).unwrap_or(value);
+    canonical_agent_id(value).or_else(|| agent_from_user_agent(value))
+}
+
+fn canonical_agent_id(value: &str) -> Option<String> {
+    let value = value.trim().to_ascii_lowercase();
+    if let Some(agent_id) = known_agent_id(&value) {
+        return Some(agent_id.to_string());
+    }
+    vibex_core::AgentId::parse(value)
+        .ok()
+        .map(vibex_core::AgentId::into_string)
+}
+
+fn agent_from_user_agent(user_agent: &str) -> Option<String> {
+    let name = user_agent
+        .trim()
+        .split(['/', ' '])
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if name.is_empty() {
+        return None;
+    }
+    canonical_agent_id(&name)
+}
+
+fn known_agent_id(name: &str) -> Option<&'static str> {
+    AGENT_USER_AGENT_NAMES
+        .iter()
+        .find_map(|(candidate, agent_id)| (*candidate == name).then_some(*agent_id))
+        .or_else(|| {
+            AGENT_USER_AGENT_PREFIXES
+                .iter()
+                .find_map(|(prefix, agent_id)| name.starts_with(prefix).then_some(*agent_id))
+        })
+}
+
+fn is_claude_desktop(user_agent: &str) -> bool {
+    let user_agent = user_agent.trim().to_ascii_lowercase();
+    (user_agent.starts_with("mozilla/") && user_agent.contains(" claude/"))
+        || user_agent.starts_with("claude desktop/")
+}
+
+fn is_codex_for_claude_code(headers: &HeaderMap) -> bool {
+    let codex_turn = ["x-codex-window-id", "x-codex-turn-metadata"]
+        .iter()
+        .any(|name| header_text(headers, name).is_some());
+    codex_turn
+        && ["user-agent", "originator"].iter().any(|name| {
+            header_text(headers, name).is_some_and(|value| {
+                value
+                    .to_ascii_lowercase()
+                    .trim_start()
+                    .starts_with("claude code")
+            })
+        })
 }
 
 fn resolve_key_secret(
@@ -4504,6 +4705,129 @@ mod tests {
             credentials: Vec::new(),
             keys: Vec::new(),
         }
+    }
+
+    fn headers(pairs: &[(&'static str, &'static str)]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for (name, value) in pairs {
+            headers.append(
+                *name,
+                axum::http::HeaderValue::from_str(value).expect("test header value"),
+            );
+        }
+        headers
+    }
+
+    #[test]
+    fn request_identity_prefers_explicit_headers_then_named_tokens() {
+        assert_eq!(
+            agent_id_from_headers(&headers(&[
+                ("x-vibex-agent", "codex"),
+                ("authorization", "Bearer vibex-claude"),
+                ("user-agent", "gemini-cli/1.0"),
+            ]))
+            .as_deref(),
+            Some("codex")
+        );
+        assert_eq!(
+            agent_id_from_headers(&headers(&[
+                ("authorization", "Bearer vibex-claude-code"),
+                ("user-agent", "codex_cli_rs/1.0"),
+            ]))
+            .as_deref(),
+            Some("claude")
+        );
+        assert_eq!(
+            agent_id_from_headers(&headers(&[
+                ("authorization", "Bearer vibex-local-gateway"),
+                ("x-api-key", "vibex-gemini"),
+                ("user-agent", "codex_cli_rs/1.0"),
+            ]))
+            .as_deref(),
+            Some("gemini")
+        );
+        assert_eq!(
+            agent_id_from_headers(&headers(&[
+                ("x-goog-api-key", "vibex-deepseek-harness"),
+                ("user-agent", "some-sdk/1.0"),
+            ]))
+            .as_deref(),
+            Some("deepseek-harness")
+        );
+    }
+
+    #[test]
+    fn named_tokens_keep_custom_agent_ids() {
+        assert_eq!(
+            agent_id_from_headers(&headers(&[
+                ("authorization", "Bearer vibex-my-custom-agent"),
+                ("user-agent", "generic-sdk/1.0"),
+            ]))
+            .as_deref(),
+            Some("my-custom-agent")
+        );
+        assert_eq!(
+            agent_id_from_headers(&headers(&[("authorization", "Bearer vibex-Not_Valid")]))
+                .as_deref(),
+            None
+        );
+    }
+
+    #[test]
+    fn user_agents_map_to_the_agent_they_name() {
+        for (user_agent, expected) in [
+            ("claude-cli/2.1.0 (external, cli)", "claude"),
+            ("codex_cli_rs/0.162.1 (Mac OS; arm64)", "codex"),
+            ("geminicli/0.64.0", "gemini"),
+            ("opencode/1.2.3", "opencode"),
+            ("Cursor-CLI/unknown", "cursor"),
+            ("some-agent/1.0", "some-agent"),
+        ] {
+            assert_eq!(
+                agent_id_from_headers(&headers(&[("user-agent", user_agent)])).as_deref(),
+                Some(expected),
+                "{user_agent}"
+            );
+        }
+    }
+
+    #[test]
+    fn special_clients_are_named_before_generic_user_agent_parsing() {
+        assert_eq!(
+            agent_id_from_headers(&headers(&[(
+                "user-agent",
+                "Mozilla/5.0 (Macintosh) Claude/2.7032.0 Chrome/140 Electron/37",
+            )]))
+            .as_deref(),
+            Some("claude-desktop")
+        );
+        assert_eq!(
+            agent_id_from_headers(&headers(&[
+                ("x-anthropic-surface", "Operon"),
+                ("user-agent", "Anthropic/JS 0.71.0"),
+            ]))
+            .as_deref(),
+            Some("claude-science")
+        );
+        assert_eq!(
+            agent_id_from_headers(&headers(&[
+                ("x-codex-window-id", "window-1"),
+                (
+                    "user-agent",
+                    "Claude Code/0.162.1 (Mac OS; arm64) (Claude Code; 1.0.6)",
+                ),
+            ]))
+            .as_deref(),
+            Some("codex")
+        );
+        assert_eq!(
+            agent_id_from_headers(&headers(&[(
+                "user-agent",
+                "Claude Code/0.162.1 (Mac OS; arm64)",
+            )]))
+            .as_deref(),
+            Some("claude")
+        );
     }
 
     #[test]
