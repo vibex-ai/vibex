@@ -1,6 +1,7 @@
 use gpui::{
-    App, BorderStyle, InteractiveElement, Interactivity, IntoElement, ParentElement as _, Pixels,
-    RenderOnce, SharedString, StatefulInteractiveElement, Styled, Window, WindowAppearance, px,
+    AnyElement, App, BorderStyle, Hsla, InteractiveElement, Interactivity, IntoElement,
+    ParentElement as _, Pixels, RenderOnce, SharedString, StatefulInteractiveElement, Styled,
+    Window, WindowAppearance, div, px,
 };
 use gpui_base::Selectable;
 use gpui_component::{
@@ -103,6 +104,26 @@ pub fn is_dark_system_appearance(cx: &App) -> bool {
 pub fn solid_empty_border(mut empty: Empty) -> Empty {
     empty.style().border_style = Some(BorderStyle::Solid);
     empty
+}
+
+/// The 1px cue a folder tab strip paints along its bottom edge while a tab is
+/// dragged over the group.
+///
+/// The cue is an overlay rather than a border on the strip. A border owns a
+/// layout row, and the strip paints its own plate across that row, so the
+/// selected tab stops one pixel short of the pane and a hairline of plate
+/// separates the two — the tab no longer flows into the surface it opens.
+/// Painting the cue over the strip keeps the drop target just as visible
+/// without reserving any space.
+pub fn tab_strip_drop_cue(color: Hsla) -> AnyElement {
+    div()
+        .absolute()
+        .left_0()
+        .right_0()
+        .bottom_0()
+        .h(px(1.0))
+        .bg(color)
+        .into_any_element()
 }
 
 /// Documentation pages a surface inside the product links to.

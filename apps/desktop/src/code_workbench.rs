@@ -95,7 +95,7 @@ use crate::app::{VibexWorkbench, session_search_keyword_highlight, session_searc
 use crate::assets::{BUNDLED_SANS_FAMILY, agent_brand_icon, file_icon, open_tool_brand_icon};
 use crate::browser_surface::{BrowserSurface, BrowserSurfaceEvent, OrphanTextures};
 use crate::directory_picker::{DirectoryPickHandler, DirectoryPickerDialog};
-use crate::gpui_ext::{ScrollGutter as _, solid_empty_border};
+use crate::gpui_ext::{ScrollGutter as _, solid_empty_border, tab_strip_drop_cue};
 use crate::hint_layer::{self, hint_notification};
 use crate::locale;
 use crate::motion::{hover_blend, hover_listener};
@@ -9115,18 +9115,12 @@ impl CodeWorkbench {
                     .flex_none()
                     .min_w_0()
                     .overflow_hidden()
-                    // No hairline under the bar: the selected tab already
-                    // carries the page color, and a line here would cut it
-                    // off from the pane it opens into. The edge is only
-                    // painted while a tab hovers the group, as its drop cue,
-                    // and stays transparent otherwise so lighting it up never
-                    // moves the strip by a pixel.
-                    .border_b_1()
-                    .border_color(if tab_group_drop_active {
-                        cx.theme().primary.opacity(0.60)
-                    } else {
-                        cx.theme().transparent
-                    })
+                    // The strip draws no bottom border. A border owns a layout
+                    // row, and the strip paints its plate across that row, so
+                    // the selected tab stopped one pixel short of the pane and
+                    // a hairline of plate cut it off from the surface it opens
+                    // into. The drag-over cue is painted as an overlay instead,
+                    // so lighting it up still moves nothing.
                     .bg(tab_strip_tone)
                     .on_drag_move(cx.listener(
                         move |this, event: &DragMoveEvent<PreviewTabDrag>, _, cx| {
@@ -9364,7 +9358,12 @@ impl CodeWorkbench {
                                         }),
                                     )
                             }),
-                    ),
+                    )
+                    // The drop cue is painted over the strip's bottom edge, not
+                    // as a border, so it costs the tabs no height.
+                    .when(tab_group_drop_active, |this| {
+                        this.child(tab_strip_drop_cue(cx.theme().primary.opacity(0.60)))
+                    }),
             )
             .child(
                 div()

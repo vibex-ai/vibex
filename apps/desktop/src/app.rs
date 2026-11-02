@@ -228,7 +228,7 @@ use crate::directory_picker::{
 };
 use crate::gpui_ext::{
     DOCS_SELF_HOSTED_SERVER_URL, ScrollGutter as _, button_with_aria_label, docs_help_button,
-    solid_empty_border,
+    solid_empty_border, tab_strip_drop_cue,
 };
 use crate::hint_layer::{self, hint_notification};
 use crate::image_editor::{
@@ -49400,16 +49400,11 @@ impl VibexWorkbench {
             .min_w_0()
             .items_center()
             .overflow_hidden()
-            // The strip and the pane below it are one plate: no hairline, so
-            // the selected tab and the content it opens into keep one color.
-            // A tab hovering the strip still lights the edge as its drop cue,
-            // and the resting edge stays transparent so that costs no layout.
-            .border_b_1()
-            .border_color(if tab_group_drop_active {
-                cx.theme().primary.opacity(0.60)
-            } else {
-                cx.theme().transparent
-            })
+            // The strip draws no bottom border. A border owns a layout row,
+            // and the strip paints its plate across that row, so the selected
+            // tab stopped one pixel short of the pane and a hairline of plate
+            // cut it off from the content it opens into. The drag-over cue is
+            // an overlay instead, so lighting it up still moves nothing.
             .bg(if tab_group_drop_active {
                 cx.theme().primary.opacity(0.10)
             } else {
@@ -49688,18 +49683,24 @@ impl VibexWorkbench {
 
             tab_items.push(tab_element);
         }
-        let tab_strip = tab_strip.child(
-            TabBar::new(format!("session-group-tab-bar-{pane_id}"))
-                .folder()
-                .h_full()
-                .flex_1()
-                .min_w_0()
-                .max_width(px(200.0))
-                .bg(cx.theme().transparent)
-                .track_scroll(&tab_scroll)
-                .when_some(active_index, |bar, index| bar.selected_index(index))
-                .children(tab_items),
-        );
+        let tab_strip = tab_strip
+            .child(
+                TabBar::new(format!("session-group-tab-bar-{pane_id}"))
+                    .folder()
+                    .h_full()
+                    .flex_1()
+                    .min_w_0()
+                    .max_width(px(200.0))
+                    .bg(cx.theme().transparent)
+                    .track_scroll(&tab_scroll)
+                    .when_some(active_index, |bar, index| bar.selected_index(index))
+                    .children(tab_items),
+            )
+            // The drop cue is painted over the strip's bottom edge, not as a
+            // border, so it costs the tabs no height.
+            .when(tab_group_drop_active, |this| {
+                this.child(tab_strip_drop_cue(cx.theme().primary.opacity(0.60)))
+            });
 
         let content = match active_session_id.as_deref() {
             Some(session_id)
