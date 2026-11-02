@@ -367,12 +367,14 @@ pub const PROVIDER_PRESET_GROQ: &str = "groq";
 pub const PROVIDER_PRESET_SILICONFLOW: &str = "siliconflow";
 pub const PROVIDER_PRESET_OLLAMA: &str = "ollama";
 
-/// A local gateway that fronts every upstream Provider behind one address.
+/// A gateway that fronts every upstream Provider behind one address.
 ///
-/// Magpie listens on loopback and speaks the OpenAI, Anthropic and Gemini
-/// wire protocols itself, so one preset covers every Agent. Its model ids are
-/// `provider/model` and depend on the Providers configured inside Magpie,
-/// so the preset ships no list and the catalogue is fetched from the gateway.
+/// Magpie listens on loopback by default and can also be deployed on another
+/// machine, where it requires a gateway key. It speaks the OpenAI, Anthropic
+/// and Gemini wire protocols itself, so one preset covers every Agent. Its
+/// model ids are `provider/model` and depend on the Providers configured
+/// inside Magpie, so the preset ships no list and the catalogue is fetched
+/// from the gateway.
 pub const PROVIDER_PRESET_MAGPIE: &str = "magpie";
 
 /// Third-party plans that resell open coding models.
@@ -951,10 +953,12 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
         },
         ProviderPreset {
             website: Some("https://usemagpie.ai".to_string()),
-            no_key: true,
             no_list: false,
+            key_hint: Some(
+                "magpie on this machine, or a gateway key for a remote Magpie".to_string(),
+            ),
             endpoint_hint: Some(
-                "A local gateway on this machine; model ids are provider/model, fetched from the gateway"
+                "Runs on this machine by default; a remote Magpie needs its address and gateway key. Model ids are provider/model"
                     .to_string(),
             ),
             ..preset(
@@ -1890,18 +1894,20 @@ mod tests {
         assert!(preset.keys_url.is_none());
     }
 
-    /// Magpie is one local address in front of every upstream, so its preset
-    /// has to cover each wire protocol an Agent may speak, and it must not ask
-    /// for a Key: the gateway only listens on loopback.
+    /// Magpie is one address in front of every upstream, so its preset has to
+    /// cover each wire protocol an Agent may speak, and it has to ask for a Key:
+    /// the default is a tokenless local gateway, but a Magpie on another
+    /// machine authenticates with a gateway key.
     ///
     /// Its model ids are `provider/model` and depend on the Providers the user
     /// configured inside Magpie, so the preset carries no list; the catalogue
     /// is fetched from the gateway once the Provider exists.
     #[test]
-    fn magpie_is_a_local_gateway_for_every_wire_protocol() {
+    fn magpie_is_a_gateway_for_every_wire_protocol_and_takes_a_key() {
         let preset = provider_preset(PROVIDER_PRESET_MAGPIE).expect("the preset ships");
-        assert!(preset.no_key);
+        assert!(!preset.no_key);
         assert!(preset.keys_url.is_none());
+        assert!(preset.key_hint.is_some());
         assert!(preset.models.is_empty(), "models come from the gateway");
         assert_eq!(
             preset.endpoint_for(ProviderModelWireApi::OpenaiChatCompletions),
