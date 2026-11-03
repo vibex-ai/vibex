@@ -641,6 +641,19 @@ fn ws_detail_page_with_body(
         .into_any_element()
 }
 
+/// How a section card relates to the height its page has left.
+enum SectionFill {
+    /// The card sizes to its own content, and the page scrolls past it.
+    Content,
+    /// The card takes the height the page leaves, so a scrolling body inside
+    /// it has a definite height to measure against. `floor` is the least
+    /// height it keeps when the cards above have taken the page.
+    Page {
+        debug_id: &'static str,
+        floor: Option<Pixels>,
+    },
+}
+
 /// A section card: a heading band with an optional trailing action, then the
 /// content. Sections stack with one gap; cards never nest.
 fn ws_section(
@@ -650,7 +663,7 @@ fn ws_section(
     content: AnyElement,
     cx: &App,
 ) -> AnyElement {
-    ws_section_with_fill(None, title, description, action, content, false, cx)
+    ws_section_with_fill(SectionFill::Content, title, description, action, content, cx)
 }
 
 /// The same card, sized to the remaining page height.
@@ -666,29 +679,63 @@ fn ws_section_fill(
     cx: &App,
 ) -> AnyElement {
     ws_section_with_fill(
-        Some(debug_id),
+        SectionFill::Page {
+            debug_id,
+            floor: None,
+        },
         title,
         description,
         action,
         content,
-        true,
+        cx,
+    )
+}
+
+/// The same card, stretched into the page but never shorter than `floor`.
+///
+/// A card that stacks a scrolling body between its header and its footer is
+/// crushed to those two bands once the content above it has taken the whole
+/// page. The floor keeps its scroll region real and lets the page scroll to
+/// the rest of the card instead.
+fn ws_section_fill_at_least(
+    debug_id: &'static str,
+    floor: Pixels,
+    title: &'static str,
+    description: Option<&'static str>,
+    action: Option<AnyElement>,
+    content: AnyElement,
+    cx: &App,
+) -> AnyElement {
+    ws_section_with_fill(
+        SectionFill::Page {
+            debug_id,
+            floor: Some(floor),
+        },
+        title,
+        description,
+        action,
+        content,
         cx,
     )
 }
 
 fn ws_section_with_fill(
-    debug_id: Option<&'static str>,
+    fill: SectionFill,
     title: &'static str,
     description: Option<&'static str>,
     action: Option<AnyElement>,
     content: AnyElement,
-    fill: bool,
     cx: &App,
 ) -> AnyElement {
+    let (fill, debug_id, floor) = match fill {
+        SectionFill::Content => (false, None, None),
+        SectionFill::Page { debug_id, floor } => (true, Some(debug_id), floor),
+    };
     v_flex()
         .w_full()
         .min_w_0()
         .when(fill, |section| section.flex_1().min_h_0())
+        .when_some(floor, |section, floor| section.min_h(floor))
         .when_some(debug_id, |section, id| {
             section.debug_selector(move || id.to_string())
         })

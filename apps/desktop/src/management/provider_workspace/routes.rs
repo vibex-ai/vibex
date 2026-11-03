@@ -34,6 +34,12 @@ const STAGE_AGENTS: usize = 4;
 const STAGE_LANES: usize = 10;
 /// The height of one request record, as the records table draws it.
 const ROUTE_ROW_H: f32 = 36.0;
+/// The least room the records card keeps.
+///
+/// A tall map takes the whole page and would otherwise crush the card to its
+/// heading and its footer, leaving the table no row to draw. The floor is
+/// what the page scrolls to when the two no longer fit together.
+const ROUTE_RECORDS_FLOOR: Pixels = px(240.0);
 /// The id a request without an Agent is drawn under.
 pub(super) const UNKNOWN_AGENT: &str = "agent";
 
@@ -2370,8 +2376,9 @@ impl ManagementCenter {
             format!("显示 {shown} 条"),
             format!("顯示 {shown} 筆"),
         );
-        ws_section_fill(
+        ws_section_fill_at_least(
             "management-gateway-requests",
+            ROUTE_RECORDS_FLOOR,
             management_locale_text("Requests", "请求记录", "請求記錄"),
             None,
             Some(

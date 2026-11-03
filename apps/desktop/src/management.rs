@@ -51929,9 +51929,10 @@ mod gateway_surface_tests {
             "the records are drawn as the kit's DataTable"
         );
         // The card sizes itself to the page and the table scrolls inside it,
-        // so the records never stretch the card with every request.
+        // so the records never stretch the card with every request — but it
+        // keeps a floor, or a tall map would crush it to its heading.
         let section = source
-            .split_once("        ws_section_fill(")
+            .split_once("        ws_section_fill_at_least(")
             .map(|(_, tail)| {
                 tail.split_once("\n    /// Everything a record's row")
                     .map(|(body, _)| body)
@@ -54385,11 +54386,17 @@ mod gateway_surface_tests {
         );
     }
 
+    /// A map taller than the page must not crush the records to nothing.
+    ///
+    /// The records card takes the height the page leaves, but a six-member map
+    /// leaves only its heading and its footer, so the table drew a 37px sliver
+    /// and looked like a card with no records in it. The card keeps a floor,
+    /// and the page scrolls to whatever no longer fits.
     #[gpui::test]
-    fn zz_probe_tall(cx: &mut gpui::TestAppContext) {
+    fn the_gateway_routing_records_keep_a_height_under_a_tall_map(cx: &mut gpui::TestAppContext) {
         cx.update(gpui_component::init);
         let (center, cx) = cx.add_window_view(ManagementCenter::new);
-        let providers = (0..6)
+        let providers = (0..10)
             .map(|index| vibex_core::ModelProviderProfile {
                 display_name: format!("Provider {index:02}"),
                 configured_models: vec![vibex_core::ModelProviderCatalogEntry {
