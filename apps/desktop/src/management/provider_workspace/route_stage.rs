@@ -2183,16 +2183,25 @@ mod tests {
         let mut insets = Vec::new();
         for (card_id, lead_id, mark_id) in pairs {
             let card = cx.debug_bounds(card_id).expect("a card");
-            let lead = cx.debug_bounds(lead_id).expect("a card's leading row");
+            let lead = cx.debug_bounds(lead_id).expect("a card's text");
             let mark = cx.debug_bounds(mark_id).expect("a mark");
             insets.push(mark.left() - card.left());
             assert_eq!(mark.size.width, STAGE_ICON);
             assert_eq!(mark.size.height, STAGE_ICON);
-            let above = mark.center().y - lead.top();
-            let below = lead.bottom() - mark.center().y;
+            // The mark centres down the whole card, not down the first line
+            // of its text: the card is the unit the three columns line up on.
+            let above = mark.center().y - card.top();
+            let below = card.bottom() - mark.center().y;
             assert!(
                 (above - below).abs() <= px(1.0),
-                "a mark sits down the middle of its card's leading row"
+                "{card_id}: a mark sits down the middle of its card"
+            );
+            // The text is centred with it, so the row still reads as one
+            // leading line rather than a mark floating clear of its label.
+            assert!(
+                lead.center().y >= mark.center().y - px(12.0)
+                    && lead.center().y <= mark.center().y + px(12.0),
+                "{card_id}: the text stays level with its mark"
             );
         }
         assert!(
