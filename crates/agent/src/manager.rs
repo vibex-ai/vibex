@@ -5457,7 +5457,7 @@ impl AgentManager {
             TimelineSource::Provider,
             TimelinePayload::Error(TimelineErrorPayload {
                 code: err.code.clone(),
-                message: err.message.clone(),
+                message: provider_error_timeline_message(err),
                 recoverable: true,
             }),
             err.correlation_id.as_ref(),
@@ -6259,6 +6259,40 @@ fn describe_runtime_route(route: &vibex_core::AgentRuntimeRouteKey) -> String {
     )
 }
 
+/// The timeline body for a provider failure: the runtime's own sentence, then
+/// the Agent's explanation of it.
+///
+/// The sentence is product copy, so it stays first and keeps the error's
+/// code/sentence pair matchable by the copy catalogue. The explanation is the
+/// only place where what actually happened survives to the reader — the
+/// relayed gateway body, the HTTP status, the account message. Without it a
+/// relayed failure reads as "ACP agent returned a JSON-RPC error" and nothing
+/// else, which is the one thing that never identifies the fault.
+fn provider_error_timeline_message(err: &VibexError) -> String {
+    let mut details: Vec<&str> = Vec::new();
+    for key in ["rpcMessage", "stderrSummary"] {
+        let Some(detail) = err
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.key == key)
+            .map(|diagnostic| diagnostic.value.trim())
+            .filter(|detail| !detail.is_empty())
+        else {
+            continue;
+        };
+        // Some codes already carry the relayed text in their sentence; a
+        // second copy would only make the row longer.
+        if err.message.contains(detail) || details.contains(&detail) {
+            continue;
+        }
+        details.push(detail);
+    }
+    if details.is_empty() {
+        return err.message.clone();
+    }
+    format!("{}\n\n{}", err.message.trim_end(), details.join("\n\n"))
+}
+
 /// Whether one provider event is an update of a row the timeline already holds.
 ///
 /// A provider narrates a thought or an operation as a run of updates, and only
@@ -6998,6 +7032,48 @@ fn filter_and_limit_command_entries(
 
 #[cfg(test)]
 mod tests {
+    /// A relayed failure keeps the Agent's explanation in the row.
+    ///
+    /// The runtime's sentence is what the copy catalogue translates; the
+    /// Agent's relayed text is the only part that says what actually failed.
+    /// Both belong in the row, and a message that already quotes the relayed
+    /// text must not carry it twice.
+    #[test]
+    fn a_provider_error_row_carries_the_relayed_explanation() {
+        let cooling = vibex_core::VibexError::provider(
+            "model_gateway_keys_cooling",
+            "Every Key serving this model is cooling down after a failure; requests resume when one recovers",
+        )
+        .with_diagnostic(
+            "rpcMessage",
+            r#"{"error":{"code":"model_gateway_keys_cooling"}}"#,
+        )
+        .with_diagnostic("stderrSummary", "");
+        assert_eq!(
+            super::provider_error_timeline_message(&cooling),
+            "Every Key serving this model is cooling down after a failure; requests resume when one recovers\n\n{\"error\":{\"code\":\"model_gateway_keys_cooling\"}}"
+        );
+
+        let quoted = vibex_core::VibexError::provider(
+            "opencode_model_api_error",
+            "OpenCode model request failed: invalid api key",
+        )
+        .with_diagnostic("rpcMessage", "invalid api key");
+        assert_eq!(
+            super::provider_error_timeline_message(&quoted),
+            "OpenCode model request failed: invalid api key"
+        );
+
+        let bare = vibex_core::VibexError::provider(
+            "provider_authentication_required",
+            "Agent authentication is required",
+        );
+        assert_eq!(
+            super::provider_error_timeline_message(&bare),
+            "Agent authentication is required"
+        );
+    }
+
     /// Attribution names a route model the way the Provider names it.
     ///
     /// A route model's effective id is the gateway address

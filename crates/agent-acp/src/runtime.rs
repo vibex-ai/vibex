@@ -2028,6 +2028,32 @@ fn provider_access_requires_user_action(message: &str) -> bool {
     .any(|needle| lower.contains(needle))
 }
 
+/// The model gateway's stable error codes, with the sentence to show for each.
+///
+/// When a route resolves through the gateway, the gateway sits between the
+/// Agent and the Provider: the Agent only relays the gateway's HTTP body. Read
+/// on its own, every such body becomes `acp_rpc_error` — a code that names the
+/// transport and says nothing about what failed. Keeping the gateway's own code
+/// preserves the identity the copy catalogue and the recovery hint key off.
+const MODEL_GATEWAY_ERROR_CODES: &[(&str, &str)] = &[
+    (
+        "model_gateway_keys_cooling",
+        "Every Key serving this model is cooling down after a failure; requests resume when one recovers",
+    ),
+    (
+        "model_gateway_upstream_failed",
+        "The model gateway's upstream request failed",
+    ),
+];
+
+/// The gateway failure relayed in a text, with the sentence that names it.
+fn model_gateway_failure(text: &str) -> Option<(&'static str, &'static str)> {
+    MODEL_GATEWAY_ERROR_CODES
+        .iter()
+        .copied()
+        .find(|(code, _)| text.contains(code))
+}
+
 fn rpc_failure_message(error: &Value) -> String {
     let message = error
         .get("message")
@@ -6233,6 +6259,32 @@ impl AcpProcess {
                         .wait_for_stderr_summary_since(stderr_sequence)
                         .await
                         .unwrap_or_default();
+                }
+                // A gateway code is the gateway's own identity for the
+                // failure and outranks every guess made from its wording. It
+                // is checked on the stderr text too: an OpenCode stream failure
+                // only lands there when the response itself was generic.
+                let gateway_failure = model_gateway_failure(&rpc_message)
+                    .map(|failure| (failure, rpc_message.as_str()))
+                    .or_else(|| {
+                        model_gateway_failure(&stderr_summary)
+                            .map(|failure| (failure, stderr_summary.as_str()))
+                    });
+                if let Some(((code, sentence), detail)) = gateway_failure {
+                    // The two failures need different patience: cooling Keys
+                    // recover on their own, while an upstream refusal usually
+                    // needs the Provider's account looked at first.
+                    let hint = if code == "model_gateway_keys_cooling" {
+                        "Wait for a Key to recover, or switch to another model/provider."
+                    } else {
+                        "Check the Provider's account and the upstream message, then retry or switch models."
+                    };
+                    return Err(VibexError::provider(code, sentence)
+                        .with_recovery_hint(hint)
+                        .with_diagnostic("method", method)
+                        .with_diagnostic("rpcCode", failure.code)
+                        .with_diagnostic("rpcMessage", redact_summary(detail))
+                        .with_diagnostic("stderrSummary", redact_summary(&stderr_summary)));
                 }
                 // A credential the Agent refused on shape has to be classified
                 // before the authentication check: its wording ("... the API
@@ -23581,6 +23633,55 @@ mod tests {
         assert!(error.recovery_hint.is_some());
         assert!(error.diagnostics.iter().any(|diagnostic| {
             diagnostic.key == "rpcMessage" && diagnostic.value.contains("余额不足")
+        }));
+    }
+
+    #[tokio::test]
+    async fn json_rpc_gateway_failures_keep_the_gateway_code() {
+        let process = test_process(
+            AcpProcessInstanceId::new(),
+            None,
+            None,
+            None,
+            Arc::new(DisabledAcpTerminalHost),
+            false,
+            false,
+        );
+        let (response, receiver) = oneshot::channel();
+        response
+            .send(Err(AcpRpcFailure {
+                code: "-32603".to_string(),
+                message: r#"{"error":{"message":"Every Key serving `group/a` is cooling down after a failure.","type":"model_gateway_keys_cooling","code":"model_gateway_keys_cooling"}}"#
+                    .to_string(),
+                data_kind: protocol::AcpRpcFailureDataKind::Other,
+            }))
+            .unwrap();
+
+        let result = process
+            .finish_started_request(
+                AcpOperation::SessionPrompt.method(),
+                Duration::from_secs(1),
+                StartedAcpRequest {
+                    id: 1,
+                    prompt_session_id: None,
+                    stderr_sequence: 0,
+                    response: receiver,
+                    registration_release: None,
+                },
+            )
+            .await;
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("a gateway failure must not return an ACP response"),
+        };
+
+        // The gateway's own code is what names the failure; the generic
+        // `acp_rpc_error` would say nothing about what went wrong.
+        assert_eq!(error.code, "model_gateway_keys_cooling");
+        assert!(error.recovery_hint.is_some());
+        assert!(error.diagnostics.iter().any(|diagnostic| {
+            diagnostic.key == "rpcMessage"
+                && diagnostic.value.contains("model_gateway_keys_cooling")
         }));
     }
 

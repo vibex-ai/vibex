@@ -254,6 +254,18 @@ const RUNTIME_ERRORS: &[ErrorCopy] = &[
         zh_cn: "未找到",
         zh_tw: "找不到",
     },
+    ErrorCopy {
+        code: "model_gateway_keys_cooling",
+        en: "Every Key serving this model is cooling down after a failure; requests resume when one recovers",
+        zh_cn: "所有为该模型服务的 Key 都在失败后冷却，待其中一个恢复后即可继续",
+        zh_tw: "所有為該模型服務的 Key 都在失敗後冷卻，待其中一個恢復後即可繼續",
+    },
+    ErrorCopy {
+        code: "model_gateway_upstream_failed",
+        en: "The model gateway's upstream request failed",
+        zh_cn: "模型网关的上游请求失败",
+        zh_tw: "模型網關的上游請求失敗",
+    },
 ];
 
 /// The message a timeline error row should show.
@@ -268,6 +280,18 @@ pub fn timeline_error_message(locale: Locale, code: &str, message: &str) -> Stri
     }
     if let Some(text) = formatted_error(locale, code, message) {
         return text;
+    }
+    // The timeline keeps the runtime's sentence and the Agent's explanation in
+    // one body, separated by a blank line. Translate the sentence and leave the
+    // explanation as it was relayed: it is evidence, not copy.
+    if let Some(copy) = RUNTIME_ERRORS.iter().find(|copy| copy.code == code)
+        && let Some(detail) = message
+            .strip_prefix(copy.en)
+            .and_then(|rest| rest.strip_prefix("\n\n"))
+            .map(str::trim)
+        && !detail.is_empty()
+    {
+        return format!("{}\n\n{detail}", copy.text(locale));
     }
     if let Some(copy) = RUNTIME_ERRORS
         .iter()
@@ -408,6 +432,26 @@ mod tests {
         assert_eq!(
             timeline_error_message(Locale::En, "provider_access_unavailable", message),
             message
+        );
+    }
+
+    #[test]
+    fn gateway_failures_follow_the_reader_and_keep_the_relayed_body() {
+        assert_eq!(
+            timeline_error_message(
+                Locale::ZhCn,
+                "model_gateway_keys_cooling",
+                "Every Key serving this model is cooling down after a failure; requests resume when one recovers",
+            ),
+            "所有为该模型服务的 Key 都在失败后冷却，待其中一个恢复后即可继续"
+        );
+        assert_eq!(
+            timeline_error_message(
+                Locale::ZhTw,
+                "model_gateway_upstream_failed",
+                "The model gateway's upstream request failed\n\n{\"error\":{\"code\":\"model_gateway_upstream_failed\"}}",
+            ),
+            "模型網關的上游請求失敗\n\n{\"error\":{\"code\":\"model_gateway_upstream_failed\"}}"
         );
     }
 
