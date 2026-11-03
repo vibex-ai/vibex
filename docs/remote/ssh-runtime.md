@@ -60,9 +60,9 @@ Steps:
 3. Provisioning walks through *Resolve host → Check environment → Upload →
    Install → Start → Open tunnel → Pair → Connect → Ready*. A failed step shows
    a diagnostics card with the next step (see [Troubleshooting](#troubleshooting)).
-4. When it is Ready, the runtime appears in the Runtime Manager and becomes the
-   active runtime. Switch back to the local runtime from the same menu at any
-   time.
+4. When it is Ready, the runtime appears in the title bar's **Remote
+   instances** switcher and becomes the active runtime. Switch back to the local
+   runtime from the same panel at any time.
 
 The runtime keeps running when SSH disconnects. To reconnect — after a dropped
 tunnel or an app restart — the desktop starts the runtime again if it stopped,

@@ -788,7 +788,7 @@ refused.
 | --- | --- | --- |
 | Pair with a QR code | always | mints a one-time offer and draws it as a QR code, a one-time code and a link |
 | Find a device on this network | the runtime is a desktop shell that can advertise itself, over a reachable Direct route | opens a local-network pairing window and approves what answers it |
-| Pair with a code or link | the runtime is headless | shows the link a second desktop pastes into its add-runtime form |
+| Pair with a code or link | the runtime is headless | shows the link a second client opens to pair |
 
 `Enter` opens the highlighted row in place and `Esc` closes it. A terminal that
 speaks an image protocol (kitty, WezTerm, Ghostty, iTerm2) is handed the code as

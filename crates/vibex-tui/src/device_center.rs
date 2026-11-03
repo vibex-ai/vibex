@@ -79,8 +79,8 @@ pub enum PairMethod {
     /// Advertise the runtime on the local network: the phone finds it and asks,
     /// and the request is approved here.
     LocalNetwork,
-    /// Show the offer as a one-time code and a link: a second desktop pastes
-    /// the link into its add-runtime form.
+    /// Show the offer as a one-time code and a link: a second client opens the
+    /// link to pair.
     CodeOrLink,
 }
 
@@ -314,8 +314,7 @@ impl PairingOffer {
         self.routes.len() > 1
     }
 
-    /// The link a phone opens, and the one a desktop pastes into its
-    /// add-runtime form.
+    /// The link a phone opens, and the one a second desktop opens to pair.
     ///
     /// The runtime answers with a bare `#/pair/…` fragment and leaves the
     /// transport to the client, which is the side that knows which of the

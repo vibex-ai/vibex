@@ -1418,9 +1418,9 @@ strings! {
     },
     devices_link => { "Pairing link", "配对链接", "配對連結" },
     devices_link_hint => {
-        "Paste the link into the desktop's add-runtime form.",
-        "在桌面端「添加运行时」中粘贴这条链接。",
-        "在桌面端「新增執行時」中貼上這條連結。"
+        "Open this link on the device you are pairing.",
+        "在要配对的设备上打开这条链接。",
+        "在要配對的裝置上開啟這條連結。"
     },
     devices_lan_advertising => {
         "Looking for a device on this network",

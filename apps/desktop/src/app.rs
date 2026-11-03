@@ -290,16 +290,6 @@ struct DesktopRemoteClient {
 enum RuntimeManagerStage {
     List,
     Detail,
-    /// Pairing a new runtime, filled in inside the panel rather than a dialog.
-    Add,
-}
-
-/// Which pairing entry the add-runtime form is collecting.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum RuntimeAddTab {
-    #[default]
-    Code,
-    Link,
 }
 
 /// Why a remote runtime is being connected: the first frame of a session, or
@@ -309,18 +299,6 @@ enum RuntimeAddTab {
 enum RuntimeConnectOrigin {
     Boot,
     Switch,
-}
-
-/// How the operator handed over the pairing entry: a typed address plus code,
-/// or the connection link `vibex-server` printed.
-enum RemotePairingEntry {
-    Code {
-        server_url: String,
-        pairing_code: String,
-    },
-    Link {
-        pairing_link: String,
-    },
 }
 
 impl DesktopRemoteClient {
@@ -9397,7 +9375,7 @@ pub struct VibexWorkbench {
     /// A failed write of `remote-runtimes.json`, waiting for
     /// [`Self::present_runtime_registry_error`] to hand it to the hint layer.
     /// Kept apart from [`Self::runtime_note`] because it is a failure rather
-    /// than the progress the add form reports in place.
+    /// than runtime progress.
     runtime_registry_error: Option<String>,
     ui_state: DesktopUiStateV1,
     ui_writer: Option<ThrottledUiStateWriter>,
@@ -9526,12 +9504,11 @@ pub struct VibexWorkbench {
     runtime_manager_stage: RuntimeManagerStage,
     /// The runtime whose detail stage is showing, or whose rename is running.
     runtime_manager_target: Option<String>,
-    /// The panel's three scroll regions. They keep separate offsets because the
-    /// list, one runtime's detail, and the pairing form are different readings,
-    /// and carrying one offset into another lands mid-page.
+    /// The panel's two scroll regions. They keep separate offsets because the
+    /// list and one runtime's detail are different readings, and carrying one
+    /// offset into another lands mid-page.
     runtime_manager_list_scroll: ScrollHandle,
     runtime_manager_detail_scroll: ScrollHandle,
-    runtime_manager_add_scroll: ScrollHandle,
     runtime_rename_input: Entity<InputState>,
     runtime_rename_active: bool,
     runtime_edit_pending: Option<String>,
@@ -9543,11 +9520,6 @@ pub struct VibexWorkbench {
     runtime_edit_error: Option<String>,
     /// The runtime id a switch is connecting to; blocks a second switch.
     runtime_switch_pending: Option<String>,
-    runtime_add_tab: RuntimeAddTab,
-    runtime_add_server_url_input: Entity<InputState>,
-    runtime_add_code_input: Entity<InputState>,
-    runtime_add_link_input: Entity<InputState>,
-    runtime_add_busy: bool,
     /// The runtime a removal is confirming.
     runtime_remove_pending: Option<String>,
     /// The SSH profile whose upgrade is waiting for confirmation.
@@ -10865,23 +10837,6 @@ impl VibexWorkbench {
                 "本機通道連接埠",
             ))
         });
-        let runtime_add_server_url_input = cx.new(|cx| {
-            InputState::new(window, cx).placeholder(locale::text(
-                "https://host:8787",
-                "https://主机:8787",
-                "https://主機:8787",
-            ))
-        });
-        let runtime_add_code_input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder(locale::text("Pairing code", "配对码", "配對碼"))
-                .submit_on_enter(true)
-        });
-        let runtime_add_link_input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder(locale::text("vibex://…", "vibex://…", "vibex://…"))
-                .submit_on_enter(true)
-        });
         // The registry is read once at boot: it names every runtime the manager
         // renders and decides whether the first connection is local or remote.
         let runtime_registry_store = config
@@ -11441,7 +11396,6 @@ impl VibexWorkbench {
             runtime_manager_target: None,
             runtime_manager_list_scroll: ScrollHandle::new(),
             runtime_manager_detail_scroll: ScrollHandle::new(),
-            runtime_manager_add_scroll: ScrollHandle::new(),
             runtime_rename_input,
             runtime_rename_active: false,
             runtime_edit_pending: None,
@@ -11452,11 +11406,6 @@ impl VibexWorkbench {
             runtime_edit_local_port_input,
             runtime_edit_error: None,
             runtime_switch_pending: None,
-            runtime_add_tab: RuntimeAddTab::default(),
-            runtime_add_server_url_input,
-            runtime_add_code_input,
-            runtime_add_link_input,
-            runtime_add_busy: false,
             runtime_remove_pending: None,
             runtime_upgrade_pending: None,
             runtime_uninstall_pending: None,
@@ -14031,132 +13980,6 @@ impl VibexWorkbench {
         ));
     }
 
-    /// Claims a pairing code against a headless runtime, registers it as a
-    /// runtime and switches the workbench to it. The claim happens off the UI
-    /// thread; the credential pins the server identity and reaches the
-    /// registry only after the claim succeeded.
-    fn claim_remote_pairing_code(
-        &mut self,
-        server_url: String,
-        pairing_code: String,
-        cx: &mut Context<Self>,
-    ) {
-        self.begin_remote_pairing(
-            RemotePairingEntry::Code {
-                server_url,
-                pairing_code,
-            },
-            cx,
-        );
-    }
-
-    /// Pairs from the connection link a `vibex-server` operator printed. The
-    /// link also carries the certificate of a runtime that serves its own, so
-    /// this is the only entry point that works without a publicly trusted
-    /// certificate or a system CA.
-    fn claim_remote_pairing_link(&mut self, pairing_link: String, cx: &mut Context<Self>) {
-        self.begin_remote_pairing(RemotePairingEntry::Link { pairing_link }, cx);
-    }
-
-    /// The add-runtime flow: claim, register, then connect. The currently
-    /// installed authority is left alone until the new runtime answers, so a
-    /// mistyped code costs nothing.
-    fn begin_remote_pairing(&mut self, entry: RemotePairingEntry, cx: &mut Context<Self>) {
-        if self.runtime_add_busy || self.runtime_switch_pending.is_some() {
-            return;
-        }
-        if self.runtime_registry_store.is_none() {
-            self.runtime_note = Some(
-                locale::text(
-                    "No writable home for the runtime list",
-                    "无法写入运行时列表",
-                    "無法寫入執行階段清單",
-                )
-                .to_string(),
-            );
-            cx.notify();
-            return;
-        }
-        self.runtime_add_busy = true;
-        self.runtime_note = Some(
-            match entry {
-                RemotePairingEntry::Code { .. } => locale::text(
-                    "Claiming the pairing code…",
-                    "正在领取配对码…",
-                    "正在領取配對碼…",
-                ),
-                RemotePairingEntry::Link { .. } => locale::text(
-                    "Pairing from the connection string…",
-                    "正在使用连接串配对…",
-                    "正在使用連接串配對…",
-                ),
-            }
-            .to_string(),
-        );
-        let allow_insecure_local_dev = cfg!(debug_assertions);
-        let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            match entry {
-                RemotePairingEntry::Code {
-                    server_url,
-                    pairing_code,
-                } => {
-                    crate::remote_client::claim_server_pairing_code(
-                        server_url,
-                        pairing_code,
-                        allow_insecure_local_dev,
-                    )
-                    .await
-                }
-                RemotePairingEntry::Link { pairing_link } => {
-                    crate::remote_client::claim_server_pairing_link(
-                        pairing_link,
-                        allow_insecure_local_dev,
-                    )
-                    .await
-                }
-            }
-        });
-        self.boot_task = Some(cx.spawn(async move |entity: WeakEntity<Self>, cx| {
-            let outcome = runner.await;
-            let _ = entity.update(cx, |this, cx| {
-                this.runtime_add_busy = false;
-                match outcome {
-                    Ok(Ok(credential)) => {
-                        let id = this.register_runtime(credential);
-                        this.persist_runtime_registry(cx);
-                        this.runtime_manager_stage = RuntimeManagerStage::List;
-                        this.switch_to_runtime(id, cx);
-                    }
-                    Ok(Err(error)) => this.finish_runtime_add_failure(error, cx),
-                    Err(_) => this.finish_runtime_add_failure(
-                        BackendError::offline(
-                            "desktop_remote_pairing_task_failed",
-                            "the pairing task stopped unexpectedly",
-                        ),
-                        cx,
-                    ),
-                }
-                cx.notify();
-            });
-        }));
-    }
-
-    /// A failed pairing keeps the form on screen with its inputs intact so the
-    /// operator can correct the address or the code.
-    fn finish_runtime_add_failure(&mut self, error: BackendError, cx: &mut Context<Self>) {
-        self.runtime_note = Some(format!("{} — {}", error.code, error.message));
-        cx.notify();
-    }
-
-    fn clear_runtime_add_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.runtime_add_server_url_input
-            .update(cx, |input, cx| input.set_value("", window, cx));
-        self.runtime_add_code_input
-            .update(cx, |input, cx| input.set_value("", window, cx));
-        self.runtime_add_link_input
-            .update(cx, |input, cx| input.set_value("", window, cx));
-    }
-
     fn toggle_runtime_manager(&mut self, cx: &mut Context<Self>) {
         if self.runtime_manager_open {
             self.close_runtime_manager(cx);
@@ -14224,9 +14047,16 @@ impl VibexWorkbench {
         cx.notify();
     }
 
+    /// The panel's add action: remote instances are paired in Settings, so the
+    /// panel closes and hands the operator to that page rather than keeping a
+    /// second pairing form of its own.
+    fn open_remote_instances_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_runtime_manager(cx);
+        self.open_settings_section(SettingsSection::Connections, window, cx);
+    }
+
     /// Escape walks back one stage at a time: an editor or a confirmation
-    /// closes first, then the pairing form or a detail stage, and only then the
-    /// panel.
+    /// closes first, then a detail stage, and only then the panel.
     fn runtime_manager_dismiss_one_level(&mut self, cx: &mut Context<Self>) {
         if self.runtime_rename_active {
             self.runtime_rename_active = false;
@@ -14521,86 +14351,6 @@ impl VibexWorkbench {
                 });
             },
         ));
-    }
-
-    /// Swaps the panel's body to the pairing form. The form lives in the panel
-    /// rather than in a dialog, so pairing never stacks a second surface over
-    /// the manager that launched it.
-    fn open_runtime_add(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.runtime_manager_stage = RuntimeManagerStage::Add;
-        self.runtime_manager_target = None;
-        self.runtime_add_tab = RuntimeAddTab::default();
-        self.runtime_note = None;
-        self.clear_runtime_add_inputs(window, cx);
-        window.focus(
-            &self.runtime_add_server_url_input.read(cx).focus_handle(cx),
-            cx,
-        );
-        cx.notify();
-    }
-
-    /// Leaves the pairing form for the list. The panel itself stays open: the
-    /// add stage is one level inside it, not a separate surface.
-    fn close_runtime_add(&mut self, cx: &mut Context<Self>) {
-        self.runtime_manager_stage = RuntimeManagerStage::List;
-        self.runtime_add_busy = false;
-        cx.notify();
-    }
-
-    fn submit_runtime_add(&mut self, cx: &mut Context<Self>) {
-        if self.runtime_add_busy {
-            return;
-        }
-        match self.runtime_add_tab {
-            RuntimeAddTab::Code => {
-                let server_url = self
-                    .runtime_add_server_url_input
-                    .read(cx)
-                    .value()
-                    .trim()
-                    .to_string();
-                let pairing_code = self
-                    .runtime_add_code_input
-                    .read(cx)
-                    .value()
-                    .trim()
-                    .to_string();
-                if server_url.is_empty() || pairing_code.is_empty() {
-                    self.runtime_note = Some(
-                        locale::text(
-                            "Enter the server address and the pairing code.",
-                            "请输入服务器地址和配对码。",
-                            "請輸入伺服器位址和配對碼。",
-                        )
-                        .to_string(),
-                    );
-                    cx.notify();
-                    return;
-                }
-                self.claim_remote_pairing_code(server_url, pairing_code, cx);
-            }
-            RuntimeAddTab::Link => {
-                let pairing_link = self
-                    .runtime_add_link_input
-                    .read(cx)
-                    .value()
-                    .trim()
-                    .to_string();
-                if pairing_link.is_empty() {
-                    self.runtime_note = Some(
-                        locale::text(
-                            "Paste the connection string printed by vibex-server.",
-                            "请粘贴 vibex-server 打印的连接串。",
-                            "請貼上 vibex-server 列印的連接串。",
-                        )
-                        .to_string(),
-                    );
-                    cx.notify();
-                    return;
-                }
-                self.claim_remote_pairing_link(pairing_link, cx);
-            }
-        }
     }
 
     /// The removal confirmation is the one destructive decision in the panel,
@@ -16296,12 +16046,6 @@ impl VibexWorkbench {
         }
     }
 
-    /// Registers a freshly paired credential and returns its runtime id.
-    fn register_runtime(&mut self, credential: DesktopRemoteCredential) -> String {
-        self.runtime_registry
-            .upsert(credential, unix_timestamp_ms())
-    }
-
     /// Removes a runtime and its stored grant. Removing the active runtime
     /// returns the workbench to the embedded authority.
     fn remove_ssh_profile_for_runtime(&self, runtime_id: &str) {
@@ -16438,7 +16182,6 @@ impl VibexWorkbench {
         let panel = match self.runtime_manager_stage {
             RuntimeManagerStage::List => self.render_runtime_manager_list(cx),
             RuntimeManagerStage::Detail => self.render_runtime_manager_detail(cx),
-            RuntimeManagerStage::Add => self.render_runtime_manager_add(cx),
         };
         v_flex()
             .id("runtime-manager-content")
@@ -16472,6 +16215,23 @@ impl VibexWorkbench {
             false,
             cx,
         ));
+
+        // The switcher is now the only surface a connect or switch result can
+        // report into: pairing moved to settings, so a failed switch would
+        // otherwise leave its reason nowhere to land.
+        if let Some(note) = self.runtime_note.clone() {
+            rows.push(
+                div()
+                    .w_full()
+                    .px_2()
+                    .pt_2()
+                    .text_xs()
+                    .text_color(cx.theme().danger)
+                    .whitespace_normal()
+                    .child(note)
+                    .into_any_element(),
+            );
+        }
 
         // No empty-state copy when no remote is paired yet: the panel is a
         // popover with one obvious next step, and the add button below already
@@ -16524,9 +16284,9 @@ impl VibexWorkbench {
             .child(
                 // The panel names itself once, at a title's size, and carries
                 // one header action: the help glyph that opens the self-hosted
-                // runtime documentation. The command that adds a runtime is
-                // still the panel's own footer button, where it can say what it
-                // does in words instead of hiding behind a plus.
+                // runtime documentation. Adding an instance is still the
+                // panel's own footer button, where it can say what it does in
+                // words instead of hiding behind a plus.
                 h_flex()
                     .w_full()
                     .flex_none()
@@ -16543,11 +16303,7 @@ impl VibexWorkbench {
                             .truncate()
                             .text_lg()
                             .font_medium()
-                            .child(locale::text(
-                                "Manage runtimes",
-                                "管理运行时",
-                                "管理執行階段",
-                            )),
+                            .child(locale::text("Remote instances", "远程实例", "遠端執行個體")),
                     )
                     .child(docs_help_button(
                         "runtime-manager-docs",
@@ -16569,14 +16325,14 @@ impl VibexWorkbench {
                         // the accessible name.
                         .icon(IconName::Plus)
                         .label(locale::text(
-                            "Add runtime service",
-                            "添加运行时服务",
-                            "新增執行階段服務",
+                            "Add remote instance",
+                            "添加远程实例",
+                            "新增遠端執行個體",
                         ))
                         .disabled(self.runtime_switch_pending.is_some())
-                        .on_click(
-                            cx.listener(|this, _, window, cx| this.open_runtime_add(window, cx)),
-                        ),
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.open_remote_instances_settings(window, cx)
+                        })),
                 ),
             )
             .into_any_element()
@@ -17543,173 +17299,6 @@ impl VibexWorkbench {
                                 cx.notify();
                             })),
                     ),
-            )
-            .into_any_element()
-    }
-
-    /// The add-runtime dialog. It reuses the pairing claim path the manager
-    /// calls, so there is exactly one implementation of pairing.
-    /// The pairing form, as the panel's third stage. It is the same surface the
-    /// list and a runtime's detail share, so pairing fills in where it was
-    /// launched instead of opening a dialog over the manager.
-    fn render_runtime_manager_add(&self, cx: &mut Context<Self>) -> AnyElement {
-        let busy = self.runtime_add_busy;
-        let code_tab = self.runtime_add_tab == RuntimeAddTab::Code;
-        let mut fields = v_flex().w_full().gap_2().child(
-            // Underline tabs: the two entries are the same form's two ways in,
-            // so the bar draws one hairline under the active label instead of
-            // boxing each entry into its own control.
-            TabBar::new("runtime-add-tabs")
-                .small()
-                .underline()
-                .selected_index(if code_tab { 0 } else { 1 })
-                .on_click(cx.listener(|this, index: &usize, _, cx| {
-                    this.runtime_add_tab = if *index == 0 {
-                        RuntimeAddTab::Code
-                    } else {
-                        RuntimeAddTab::Link
-                    };
-                    this.runtime_note = None;
-                    cx.notify();
-                }))
-                .child(Tab::new().label(locale::text("Pairing code", "配对码", "配對碼")))
-                .child(Tab::new().label(locale::text("Connection string", "连接串", "連接串"))),
-        );
-        if code_tab {
-            fields = fields
-                .child(
-                    v_flex()
-                        .gap_1()
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(locale::text("Server address", "服务器地址", "伺服器位址")),
-                        )
-                        .child(
-                            Input::new(&self.runtime_add_server_url_input)
-                                .small()
-                                .h(px(28.0)),
-                        ),
-                )
-                .child(
-                    v_flex()
-                        .gap_1()
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(locale::text(
-                                    "One-time pairing code",
-                                    "一次性配对码",
-                                    "一次性配對碼",
-                                )),
-                        )
-                        .child(Input::new(&self.runtime_add_code_input).small().h(px(28.0))),
-                )
-                .child(runtime_add_hint(
-                    locale::text(
-                        "Run vibex-server on the host; it prints the pairing code at startup.",
-                        "在服务器上运行 vibex-server，它会在启动时打印配对码。",
-                        "在伺服器上執行 vibex-server，它會在啟動時列印配對碼。",
-                    ),
-                    cx,
-                ));
-        } else {
-            fields = fields
-                .child(
-                    v_flex()
-                        .gap_1()
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(locale::text("Connection string", "连接串", "連接串")),
-                        )
-                        .child(Input::new(&self.runtime_add_link_input).small().h(px(28.0))),
-                )
-                .child(runtime_add_hint(
-                    locale::text(
-                        "Paste the whole vibex:// link vibex-server printed. It also carries the certificate of a server that uses its own, so no system CA is needed.",
-                        "粘贴 vibex-server 打印的完整 vibex:// 连接串。自签证书的服务器也通过它携带证书，无需系统 CA。",
-                        "貼上 vibex-server 列印的完整 vibex:// 連接串。自簽憑證的伺服器也透過它攜帶憑證，無需系統 CA。",
-                    ),
-                    cx,
-                ));
-        }
-        if let Some(note) = self.runtime_note.clone() {
-            fields = fields.child(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().danger)
-                    .whitespace_normal()
-                    .child(note),
-            );
-        }
-
-        // Same scroll discipline as the other two stages: plain overflow plus
-        // an explicitly tracked handle, because the panel's height is
-        // content-sized.
-        let fields = v_flex()
-            .id("runtime-manager-add-scroll")
-            .relative()
-            .w_full()
-            .min_h_0()
-            .track_scroll(&self.runtime_manager_add_scroll)
-            .overflow_y_scroll()
-            .px_2()
-            .child(fields)
-            .vertical_scrollbar(&self.runtime_manager_add_scroll);
-
-        v_flex()
-            .w_full()
-            .min_h_0()
-            .child(
-                h_flex()
-                    .w_full()
-                    .flex_none()
-                    .gap_1()
-                    .px_2()
-                    .pt_1()
-                    .pb_2()
-                    .child(
-                        Button::new("runtime-add-back")
-                            .small()
-                            .ghost()
-                            .compact()
-                            .size(px(24.0))
-                            .px_0()
-                            .tooltip(locale::text("Back", "返回", "返回"))
-                            .accessibility_label(locale::text("Back", "返回", "返回"))
-                            .disabled(busy)
-                            .child(Icon::new(IconName::ChevronLeft).size(px(14.0)))
-                            .on_click(cx.listener(|this, _, _, cx| this.close_runtime_add(cx))),
-                    )
-                    .child(
-                        div()
-                            .min_w_0()
-                            .truncate()
-                            .text_lg()
-                            .font_medium()
-                            .child(locale::text(
-                                "Add runtime service",
-                                "添加运行时服务",
-                                "新增執行階段服務",
-                            )),
-                    ),
-            )
-            .child(fields)
-            .child(
-                // No horizontal inset: the submit plate lines up with the
-                // list's add button, which is the same plate in the same panel.
-                div().w_full().flex_none().pt_3().child(
-                    Button::new("runtime-add-submit")
-                        .w_full()
-                        .label(locale::text("Pair", "配对", "配對"))
-                        .disabled(busy)
-                        .loading(busy)
-                        .on_click(cx.listener(|this, _, _, cx| this.submit_runtime_add(cx))),
-                ),
             )
             .into_any_element()
     }
@@ -92530,16 +92119,6 @@ fn runtime_detail_row(label: &'static str, value: String, cx: &App) -> AnyElemen
         .into_any_element()
 }
 
-fn runtime_add_hint(text: &'static str, cx: &App) -> AnyElement {
-    div()
-        .w_full()
-        .text_xs()
-        .text_color(cx.theme().muted_foreground)
-        .whitespace_normal()
-        .child(text)
-        .into_any_element()
-}
-
 /// "3 minutes ago" without a formatting dependency: the panel only needs
 /// enough resolution to separate "just now" from a stale pairing.
 pub(crate) fn relative_time_label(at_ms: i64) -> String {
@@ -114697,11 +114276,6 @@ mod tests {
                 "\n    /// Removal is the one irreversible action here",
                 "runtime_manager_detail_scroll",
             ),
-            (
-                "    fn render_runtime_manager_add(",
-                "\n    /// `locale::text` needs a `'static` string",
-                "runtime_manager_add_scroll",
-            ),
         ] {
             let body = source
                 .split_once(open)
@@ -114716,8 +114290,12 @@ mod tests {
                 body.contains(&format!(".track_scroll(&self.{handle})")),
                 "{open} must drive its own scroll handle"
             );
+            // The bar may be attached to the scrolling node or pinned as its
+            // sibling by the shared builder; both keep a bar on this region.
+            let attached = format!(".vertical_scrollbar(&self.{handle})");
+            let pinned = format!("&self.{handle},\n");
             assert!(
-                body.contains(&format!(".vertical_scrollbar(&self.{handle})")),
+                body.contains(&attached) || body.contains(&pinned),
                 "{open} must keep a scrollbar on the region it scrolls"
             );
         }
@@ -114739,6 +114317,64 @@ mod tests {
             list.contains("DOCS_SELF_HOSTED_SERVER_URL"),
             "the help glyph must open the self-hosted runtime page"
         );
+    }
+
+    /// Remote instances are paired in Settings now. The panel is a switcher: it
+    /// lists what the settings page already paired, and its one add action
+    /// hands the operator to that page instead of keeping a second pairing form
+    /// behind the title bar.
+    #[test]
+    fn the_runtime_manager_switches_paired_instances_and_defers_adding_to_settings() {
+        let source = include_str!("app.rs");
+        let list = source
+            .split_once("    fn render_runtime_manager_list(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_runtime_row("))
+            .map(|(body, _)| body)
+            .unwrap_or_else(|| panic!("the runtime manager list should remain inspectable"));
+        for stale in [
+            "Pairing code",
+            "Connection string",
+            concat!("runtime-add-", "submit"),
+            "Add runtime service",
+        ] {
+            assert!(
+                !list.contains(stale),
+                "the switcher must not carry the retired pairing form ({stale})"
+            );
+        }
+        assert!(
+            list.contains("render_runtime_row"),
+            "the switcher lists the paired instances"
+        );
+        assert!(list.contains("open_remote_instances_settings"));
+
+        let add = source
+            .split_once("Button::new(\"runtime-manager-add\")")
+            .and_then(|(_, tail)| tail.split_once(".on_click("))
+            .map(|(body, _)| body)
+            .expect("the add button should remain inspectable");
+        assert!(
+            add.contains("\"Add remote instance\"") && add.contains("\"添加远程实例\""),
+            "the add action must say it adds a remote instance"
+        );
+
+        let opener = source
+            .split_once("    fn open_remote_instances_settings(")
+            .and_then(|(_, tail)| tail.split_once("\n    }\n"))
+            .map(|(body, _)| body)
+            .expect("the settings hand-off should remain inspectable");
+        assert!(opener.contains("close_runtime_manager(cx)"));
+        assert!(
+            opener.contains("SettingsSection::Connections"),
+            "the add action must open Settings -> Remote instances"
+        );
+        // The retired pieces are spelled in halves so these assertions cannot
+        // match their own literals.
+        assert!(!source.contains(concat!("fn render_runtime_manager", "_add(")));
+        assert!(!source.contains(concat!("RuntimeManagerStage::", "Add")));
+        assert!(!source.contains(concat!("claim_remote_", "pairing_")));
+        assert!(!source.contains(concat!("runtime_add_", "tab")));
+        assert!(!source.contains(concat!("runtime-add-", "submit")));
     }
 
     /// A runtime's state belongs to its row's status lane. The identity line
