@@ -22379,6 +22379,8 @@ impl MobileApp {
         } else {
             row.body.clone()
         };
+        let message =
+            vibex_ui::error_copy::timeline_error_message(locale::current(), &row.title, &message);
         if conversation_conclusion {
             return div()
                 .id(row.id.clone())

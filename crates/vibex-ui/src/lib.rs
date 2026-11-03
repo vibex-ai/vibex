@@ -6,6 +6,7 @@ pub mod component_model;
 #[cfg(feature = "gpui-component")]
 pub mod component_palette;
 pub mod controller;
+pub mod error_copy;
 pub mod files;
 mod generated_tokens;
 pub mod git;

@@ -6369,7 +6369,7 @@ impl App {
             .iter()
             .filter(|row| row_is_rendered(row))
             .map(|row| {
-                let mut block = block_from_row(row);
+                let mut block = block_from_row(row, self.strings.locale);
                 if matches!(
                     row.kind,
                     vibex_desktop_model::TimelineRowKind::ToolCall
@@ -8955,12 +8955,22 @@ fn is_runtime_startup_notice(row: &TimelineRow) -> bool {
 }
 
 /// Project one authoritative `TimelineRow` into a transcript block.
-pub fn block_from_row(row: &TimelineRow) -> Block {
+///
+/// Error rows carry the runtime's English explanation in their body. The
+/// transcript is read by a person, so it is projected in the reader's language
+/// here — before search, copy, and the incremental renderer see it — rather
+/// than translated again at each of those surfaces.
+pub fn block_from_row(row: &TimelineRow, locale: vibex_ui::locale::Locale) -> Block {
+    let body = if row.kind == vibex_desktop_model::TimelineRowKind::Error {
+        vibex_ui::error_copy::timeline_error_message(locale, &row.title, &row.body)
+    } else {
+        row.body.clone()
+    };
     Block {
         id: row.id.clone(),
         kind: row.kind,
         title: row.title.clone(),
-        body: row.body.clone(),
+        body,
         turn_id: row.turn_id.clone(),
         sequence: row.last_sequence,
         // A row the runtime never stamped carries the epoch; the transcript
@@ -11221,7 +11231,7 @@ mod tests {
             .expect("the item projects to a row");
         assert_eq!(row.timestamp_ms, 1_759_237_920_000);
         assert_eq!(
-            block_from_row(&row).timestamp_ms,
+            block_from_row(&row, vibex_ui::locale::Locale::En).timestamp_ms,
             Some(1_759_237_920_000),
             "the block dropped the row's clock"
         );
@@ -11230,6 +11240,30 @@ mod tests {
         // reading the epoch.
         let mut untimed = row;
         untimed.timestamp_ms = 0;
-        assert_eq!(block_from_row(&untimed).timestamp_ms, None);
+        assert_eq!(
+            block_from_row(&untimed, vibex_ui::locale::Locale::En).timestamp_ms,
+            None
+        );
+    }
+
+    #[test]
+    fn a_transcript_error_body_is_projected_in_the_reader_language() {
+        let row = projected_row(vibex_core::TimelinePayload::Error(
+            vibex_core::TimelineErrorPayload {
+                code: "provider_access_unavailable".into(),
+                message:
+                    "The model provider rejected the request because account usage is unavailable"
+                        .into(),
+                recoverable: false,
+            },
+        ));
+        assert_eq!(
+            block_from_row(&row, vibex_ui::locale::Locale::ZhCn).body,
+            "模型供应商拒绝了请求，因为账户用量不可用"
+        );
+        assert_eq!(
+            block_from_row(&row, vibex_ui::locale::Locale::En).body,
+            row.body
+        );
     }
 }

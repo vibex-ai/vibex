@@ -66406,15 +66406,17 @@ impl VibexWorkbench {
             Some(vibex_core::TimelinePayload::Error(error)) => error.recoverable,
             _ => false,
         };
+        let locale = self.resolved_locale();
         let message = if row.body.is_empty() {
             row.title.clone()
         } else {
             row.body.clone()
         };
+        let message =
+            vibex_ui::error_copy::timeline_error_message(locale.shared(), &row.title, &message);
         if conversation_conclusion {
             // Tauri parity: `AgentConclusion` error tone text block with hover timestamp.
             let timestamp = self.timeline_row_timestamp(row);
-            let locale = self.resolved_locale();
             let hover_group: SharedString = format!("timeline-conclusion-{}", row.id).into();
             let tone = if recoverable {
                 cx.theme().warning

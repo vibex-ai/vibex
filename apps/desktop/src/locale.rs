@@ -20,6 +20,15 @@ impl ResolvedLocale {
         }
     }
 
+    /// The platform-neutral locale the shared UI copy resolves through.
+    pub const fn shared(self) -> SharedLocale {
+        match self {
+            Self::En => SharedLocale::En,
+            Self::ZhCn => SharedLocale::ZhCn,
+            Self::ZhTw => SharedLocale::ZhTw,
+        }
+    }
+
     /// Compact code for the resolved-locale cache.
     const fn code(self) -> u8 {
         match self {
@@ -1737,11 +1746,21 @@ pub fn localize_error_message_for(locale: ResolvedLocale, message: &str) -> Stri
     if let Some(translated) = translated_message(locale, message) {
         return translated.into_owned();
     }
+    // The runtime's own failures are translated once in `vibex-ui`, so a
+    // surface that only has the sentence can reuse that copy instead of
+    // growing a second table here.
+    if let Some(translated) = vibex_ui::error_copy::known_message(locale.shared(), message) {
+        return translated.to_string();
+    }
 
     if let Some((code, detail)) = message.split_once(": ")
         && is_stable_error_code(code)
     {
-        let translated_detail = translated_message(locale, detail).map(|value| value.into_owned());
+        let translated_detail = translated_message(locale, detail)
+            .map(|value| value.into_owned())
+            .or_else(|| {
+                vibex_ui::error_copy::known_message(locale.shared(), detail).map(str::to_string)
+            });
         let detail = translated_detail.unwrap_or_else(|| match locale {
             ResolvedLocale::En if !contains_han(detail) => detail.to_string(),
             ResolvedLocale::ZhCn | ResolvedLocale::ZhTw if contains_han(detail) => {
@@ -1985,6 +2004,23 @@ mod tests {
         assert_eq!(
             localize_error_message_for(ResolvedLocale::ZhCn, "file_path_missing: the file is gone",),
             "file_path_missing: 路径已不存在"
+        );
+        // Runtime-authored provider errors are product copy, not provider
+        // prose, so a surface that only carries the sentence still translates
+        // it through the shared catalogue.
+        assert_eq!(
+            localize_error_message_for(
+                ResolvedLocale::ZhCn,
+                "The model provider rejected the request because account usage is unavailable",
+            ),
+            "模型供应商拒绝了请求，因为账户用量不可用"
+        );
+        assert_eq!(
+            localize_error_message_for(
+                ResolvedLocale::ZhTw,
+                "provider_access_unavailable: The model provider rejected the request because account usage is unavailable",
+            ),
+            "provider_access_unavailable: 模型供應商拒絕了請求，因為帳戶用量無法使用"
         );
     }
 
