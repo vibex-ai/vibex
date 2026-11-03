@@ -760,6 +760,16 @@ const VIBEX_ASSETS: &[(&str, &[u8])] = &[
             "/assets/icons/file-video-camera.svg"
         )),
     ),
+    // The Provider section's filter-and-sort button draws this glyph. It lives
+    // outside the gpui-kit default bundle, so naming it there resolved to an
+    // unregistered path and the button drew an empty frame.
+    (
+        "icons/vibex/funnel.svg",
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/icons/funnel.svg"
+        )),
+    ),
 ];
 
 macro_rules! bundled_icon_asset {
@@ -2674,6 +2684,10 @@ mod tests {
             ("app.rs", include_str!("app.rs")),
             ("code_workbench.rs", include_str!("code_workbench.rs")),
             ("management.rs", include_str!("management.rs")),
+            (
+                "management/provider_workspace/sidebar.rs",
+                include_str!("management/provider_workspace/sidebar.rs"),
+            ),
             ("usage.rs", include_str!("usage.rs")),
         ] {
             for (index, _) in source.match_indices("icons/") {

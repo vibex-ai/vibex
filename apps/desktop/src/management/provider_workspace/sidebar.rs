@@ -411,7 +411,7 @@ impl ManagementCenter {
             .xsmall()
             .ghost()
             .when(narrowed, |button| button.selected(true))
-            .icon(Icon::new(gpui_kit_assets::IconName::Funnel))
+            .icon(Icon::default().path("icons/vibex/funnel.svg"))
             .tooltip(management_locale_text(
                 "Filter and sort",
                 "筛选与排序",

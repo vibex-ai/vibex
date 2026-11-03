@@ -123,6 +123,21 @@ so a domain change is one edit, and the glyph stays a child rather than
 passes the external-open boundary and that the glyph is in the asset bundle,
 because an unregistered icon path renders as nothing with no error.
 
+### Icon Assets
+
+`gpui_kit_assets::IconName` names the whole Lucide catalog, but the app registers
+only the crate's default bundle (`default-icons.txt`) plus its own `VIBEX_ASSETS`.
+A variant outside that bundle — `IconName::Funnel`, for example — resolves to a
+path nothing embeds, so the button draws an empty frame with no error and no
+placeholder. Reach for a kit variant only when it is in the default bundle;
+otherwise add the SVG to `apps/desktop/assets/icons`, register it under
+`icons/vibex/` in `apps/desktop/src/assets.rs`, and ask for it with
+`Icon::default().path(...)` like the rest of the workbench does.
+
+A new SVG also changes the reviewed icon tree: update `expectedFileCount`,
+`treeSha256`, and the provenance counts in `docs/licenses/desktop-policy.json`,
+then regenerate with `node scripts/check-licenses.mjs --write`.
+
 ### Window Caption Controls
 
 The workbench draws its own minimize/maximize/close buttons only when it owns the
