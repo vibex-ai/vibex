@@ -89,9 +89,15 @@ impl ManagementCenter {
             cx,
         );
         if tab == RouteGroupDetailTab::Members {
-            ws_detail_page_fixed("management-route-group-page", header, tabs, body, cx)
+            ws_detail_page_fixed("management-route-group-page", header, tabs, body)
         } else {
-            ws_detail_page("management-route-group-page", header, tabs, body, cx)
+            ws_detail_page(
+                "management-route-group-page",
+                header,
+                tabs,
+                body,
+                &self.workspace_detail_scroll,
+            )
         }
     }
 

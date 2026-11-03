@@ -1217,6 +1217,9 @@ impl RouteStage {
                         agent.id
                     )))
                     .debug_selector(|| format!("route-stage-agent:{index}"))
+                    .items_center()
+                    .gap(STAGE_ICON_GAP)
+                    .px_2()
                     .py_1p5()
                     .rounded(cx.theme().radius_lg)
                     .border_1()
@@ -1226,52 +1229,45 @@ impl RouteStage {
                     })
                     .bg(cx.theme().background)
                     .when(agent.idle, |node| node.opacity(0.62))
+                    // Every card on the map leads with its mark at this size
+                    // and on this lane, so the Agent, the gateway and the
+                    // Provider read as one row of peers rather than three
+                    // different drawings. The mark is its own column and the
+                    // card centres it, so it sits down the middle of the card
+                    // instead of the first line of its text.
                     .child(
-                        // The card's leading row, centred on the height the
-                        // Agent's text takes.
-                        h_flex()
+                        div()
+                            .debug_selector(|| format!("route-stage-mark:agent:{index}"))
+                            .child(agent_brand_icon(&agent.id, STAGE_ICON, None)),
+                    )
+                    .child(
+                        // The card's text, centred on the height it takes.
+                        v_flex()
                             .debug_selector(|| format!("route-stage-lead:agent:{index}"))
-                            .w_full()
+                            .flex_1()
                             .min_w_0()
-                            .items_center()
-                            .gap(STAGE_ICON_GAP)
-                            .px_2()
-                            // Every card on the map leads with its mark at
-                            // this size, so the Agent, the gateway and the
-                            // Provider read as one row of peers rather than
-                            // three different drawings.
                             .child(
                                 div()
-                                    .debug_selector(|| format!("route-stage-mark:agent:{index}"))
-                                    .child(agent_brand_icon(&agent.id, STAGE_ICON, None)),
-                            )
-                            .child(
-                                v_flex()
-                                    .flex_1()
                                     .min_w_0()
-                                    .child(
-                                        div()
-                                            .min_w_0()
-                                            .truncate()
-                                            .text_xs()
-                                            .font_semibold()
-                                            .child(agent.label.clone()),
-                                    )
-                                    .when(!agent.detail.is_empty(), |text| {
-                                        text.child(
-                                            div()
-                                                .min_w_0()
-                                                .truncate()
-                                                .text_size(px(10.5))
-                                                .font_family(cx.theme().mono_font_family.clone())
-                                                .text_color(cx.theme().muted_foreground)
-                                                .child(agent.detail.clone()),
-                                        )
-                                    }),
+                                    .truncate()
+                                    .text_xs()
+                                    .font_semibold()
+                                    .child(agent.label.clone()),
                             )
-                            .child(div().flex_none().size(px(8.0)).rounded_full().bg(hue))
-                            .child(measure(geometry, Slot::Agent(index))),
-                    ),
+                            .when(!agent.detail.is_empty(), |text| {
+                                text.child(
+                                    div()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_size(px(10.5))
+                                        .font_family(cx.theme().mono_font_family.clone())
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(agent.detail.clone()),
+                                )
+                            }),
+                    )
+                    .child(div().flex_none().size(px(8.0)).rounded_full().bg(hue))
+                    .child(measure(geometry, Slot::Agent(index))),
             );
         }
         if self.model.agents.is_empty() {
@@ -1304,13 +1300,13 @@ impl RouteStage {
             HubState::Degraded => (cx.theme().warning, cx.theme().warning.opacity(0.7)),
             HubState::Off => (cx.theme().muted_foreground, cx.theme().border),
         };
-        v_flex()
+        h_flex()
             .id("management-route-stage-hub")
             .debug_selector(|| "route-stage-hub".to_string())
             .flex_none()
             .w(rems(9.5))
             .items_center()
-            .gap_1()
+            .gap(STAGE_ICON_GAP)
             .px_2()
             .py_3()
             .rounded(cx.theme().radius_lg)
@@ -1318,25 +1314,25 @@ impl RouteStage {
             .border_color(border)
             .when(hub.state == HubState::Off, |node| node.border_dashed())
             .bg(cx.theme().background)
+            // The mark is its own leading column, so it stays on the lane the
+            // other cards' marks share and centres down the card's height
+            // rather than the first line of its text.
             .child(
-                h_flex()
-                    // The card and its leading row are one element, so the key
-                    // names both.
+                div()
+                    .debug_selector(|| "route-stage-mark:hub".to_string())
+                    .child(ws_icon_mark(
+                        "icons/vibex/server.svg",
+                        STAGE_ICON,
+                        Some(cx.theme().primary),
+                        cx,
+                    )),
+            )
+            .child(
+                v_flex()
                     .debug_selector(|| "route-stage-lead:hub".to_string())
-                    .w_full()
+                    .flex_1()
                     .min_w_0()
-                    .items_center()
-                    .gap(STAGE_ICON_GAP)
-                    .child(
-                        div()
-                            .debug_selector(|| "route-stage-mark:hub".to_string())
-                            .child(ws_icon_mark(
-                                "icons/vibex/server.svg",
-                                STAGE_ICON,
-                                Some(cx.theme().primary),
-                                cx,
-                            )),
-                    )
+                    .gap_1()
                     .child(
                         div()
                             .min_w_0()
@@ -1344,47 +1340,45 @@ impl RouteStage {
                             .text_xs()
                             .font_semibold()
                             .child(hub.title.clone()),
-                    ),
-            )
-            .child(
-                h_flex()
-                    .w_full()
-                    .min_w_0()
-                    .items_center()
-                    .gap_1()
-                    // Aligned under the title, past the mark the card leads with.
-                    .pl(STAGE_ICON + STAGE_ICON_GAP)
-                    .child(
-                        div()
-                            .flex_none()
-                            .size(px(6.0))
-                            .rounded_full()
-                            .bg(state_color),
                     )
                     .child(
-                        div()
+                        h_flex()
+                            .w_full()
                             .min_w_0()
-                            .truncate()
-                            .text_size(px(10.5))
-                            .text_color(cx.theme().muted_foreground)
-                            .child(hub.detail.clone()),
-                    ),
+                            .items_center()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .size(px(6.0))
+                                    .rounded_full()
+                                    .bg(state_color),
+                            )
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(px(10.5))
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(hub.detail.clone()),
+                            ),
+                    )
+                    .when_some(hub.chip.clone(), |node, chip| {
+                        node.child(
+                            div()
+                                .self_start()
+                                .max_w_full()
+                                .truncate()
+                                .px_2()
+                                .rounded_full()
+                                .bg(cx.theme().primary.opacity(0.12))
+                                .text_size(px(10.5))
+                                .font_medium()
+                                .text_color(cx.theme().primary)
+                                .child(chip),
+                        )
+                    }),
             )
-            .when_some(hub.chip.clone(), |node, chip| {
-                node.child(
-                    div()
-                        .max_w_full()
-                        .truncate()
-                        .mt_0p5()
-                        .px_2()
-                        .rounded_full()
-                        .bg(cx.theme().primary.opacity(0.12))
-                        .text_size(px(10.5))
-                        .font_medium()
-                        .text_color(cx.theme().primary)
-                        .child(chip),
-                )
-            })
             .child(measure(geometry, Slot::Hub))
             .into_any_element()
     }
@@ -1626,7 +1620,7 @@ impl RouteStage {
         const SHOWN_KEYS: usize = 4;
         let hidden_keys = keys.len().saturating_sub(SHOWN_KEYS);
 
-        v_flex()
+        h_flex()
             .id(SharedString::from(format!(
                 "management-route-stage-lane-{}",
                 lane.id
@@ -1636,7 +1630,11 @@ impl RouteStage {
             .left(px(shake))
             .w_full()
             .min_w_0()
-            .gap_1()
+            .items_center()
+            .gap(STAGE_ICON_GAP)
+            // The card's own inset, the same as every other card's, so the
+            // marks start on one lane.
+            .px_2()
             .py_2()
             .rounded(cx.theme().radius_lg)
             .border_1()
@@ -1645,125 +1643,130 @@ impl RouteStage {
                 row.border_dashed()
             })
             .bg(cx.theme().background)
+            // The mark and the status dot share one fixed box: the mark starts
+            // where every other card's mark starts, and the dot is a badge on
+            // its corner instead of another column that would push the mark
+            // off the lane. The box is its own column, so the card centres it
+            // down its full height rather than down the first line of text.
             .child(
-                h_flex()
-                    .debug_selector(|| format!("route-stage-lead:lane:{index}"))
-                    .w_full()
-                    .min_w_0()
-                    .items_center()
-                    .gap(STAGE_ICON_GAP)
-                    // The card's leading row carries the same inset as every
-                    // other card's, so the marks start on one lane.
-                    .px_2()
+                div()
+                    .relative()
+                    .flex_none()
+                    .size(STAGE_ICON)
                     .opacity(if faded { 0.55 } else { 1.0 })
-                    // The mark and the status dot share one fixed box: the
-                    // mark starts where every other card's mark starts, and
-                    // the dot is a badge on its corner instead of another
-                    // column that would push the mark off the lane.
                     .child(
                         div()
-                            .relative()
-                            .flex_none()
-                            .size(STAGE_ICON)
-                            .child(
-                                div()
-                                    .debug_selector(|| format!("route-stage-mark:lane:{index}"))
-                                    .child(mark),
-                            )
-                            .child(
-                                div()
-                                    .absolute()
-                                    .right_0()
-                                    .bottom_0()
-                                    .size(px(8.0))
-                                    .rounded_full()
-                                    .border_1()
-                                    .border_color(cx.theme().background)
-                                    .bg(lit.unwrap_or(cx.theme().muted_foreground)),
-                            ),
+                            .debug_selector(|| format!("route-stage-mark:lane:{index}"))
+                            .child(mark),
                     )
                     .child(
                         div()
-                            .min_w(rems(3.0))
-                            .truncate()
-                            .text_xs()
-                            .font_semibold()
-                            .child(lane.title.clone()),
-                    )
-                    .when(!lane.model.is_empty(), |line| {
-                        line.child(
-                            div()
-                                .min_w(rems(2.5))
-                                .max_w(rems(14.0))
-                                .truncate()
-                                .px_1p5()
-                                .rounded(cx.theme().radius)
-                                .bg(cx.theme().muted)
-                                .text_size(px(11.0))
-                                .font_family(cx.theme().mono_font_family.clone())
-                                .text_color(cx.theme().muted_foreground)
-                                .child(lane.model.clone()),
-                        )
-                    })
-                    .child(div().flex_1().min_w_2())
-                    .child(
-                        div()
-                            .min_w(rems(4.0))
-                            .truncate()
-                            .text_xs()
-                            .text_color(status_color)
-                            .child(status),
+                            .absolute()
+                            .right_0()
+                            .bottom_0()
+                            .size(px(8.0))
+                            .rounded_full()
+                            .border_1()
+                            .border_color(cx.theme().background)
+                            .bg(lit.unwrap_or(cx.theme().muted_foreground)),
                     ),
             )
-            .when(!keys.is_empty(), |row| {
-                row.child(
-                    h_flex()
-                        .w_full()
-                        .min_w_0()
-                        .pl(STAGE_ICON + STAGE_ICON_GAP)
-                        .gap_1()
-                        .opacity(if faded { 0.55 } else { 1.0 })
-                        .children(keys.iter().take(SHOWN_KEYS).map(|key| {
-                            let on = Some(&key.id) == busy_key.as_ref();
-                            let refused = Some(&key.id) == refused_key.as_ref() && !on;
-                            let tone = match key.tone {
-                                LaneTone::Ready => cx.theme().success,
-                                LaneTone::Cooling => cx.theme().warning,
-                                LaneTone::Down => cx.theme().danger,
-                                LaneTone::Off => cx.theme().muted_foreground,
-                            };
-                            h_flex()
-                                .min_w_0()
-                                .max_w(rems(8.0))
-                                .gap_1()
-                                .px_1p5()
-                                .rounded(cx.theme().radius)
-                                .border_1()
-                                .border_color(match (on, lit) {
-                                    (true, Some(hue)) => hue,
-                                    _ if refused => cx.theme().danger.opacity(0.6),
-                                    _ => cx.theme().border.opacity(0.8),
-                                })
-                                .text_size(px(10.5))
-                                .text_color(if on {
-                                    cx.theme().foreground
-                                } else {
-                                    cx.theme().muted_foreground
-                                })
-                                .child(div().flex_none().size(px(5.0)).rounded_full().bg(tone))
-                                .child(div().min_w_0().truncate().child(key.label.clone()))
-                        }))
-                        .when(hidden_keys > 0, |chips| {
-                            chips.child(
+            .child(
+                v_flex()
+                    .debug_selector(|| format!("route-stage-lead:lane:{index}"))
+                    .flex_1()
+                    .min_w_0()
+                    .gap_1()
+                    .opacity(if faded { 0.55 } else { 1.0 })
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .min_w_0()
+                            .items_center()
+                            .gap(STAGE_ICON_GAP)
+                            .child(
                                 div()
-                                    .flex_none()
-                                    .text_size(px(10.5))
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(format!("+{hidden_keys}")),
+                                    .min_w(rems(3.0))
+                                    .truncate()
+                                    .text_xs()
+                                    .font_semibold()
+                                    .child(lane.title.clone()),
                             )
-                        }),
-                )
-            })
+                            .when(!lane.model.is_empty(), |line| {
+                                line.child(
+                                    div()
+                                        .min_w(rems(2.5))
+                                        .max_w(rems(14.0))
+                                        .truncate()
+                                        .px_1p5()
+                                        .rounded(cx.theme().radius)
+                                        .bg(cx.theme().muted)
+                                        .text_size(px(11.0))
+                                        .font_family(cx.theme().mono_font_family.clone())
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(lane.model.clone()),
+                                )
+                            })
+                            .child(div().flex_1().min_w_2())
+                            .child(
+                                div()
+                                    .min_w(rems(4.0))
+                                    .truncate()
+                                    .text_xs()
+                                    .text_color(status_color)
+                                    .child(status),
+                            ),
+                    )
+                    .when(!keys.is_empty(), |column| {
+                        column.child(
+                            h_flex()
+                                .w_full()
+                                .min_w_0()
+                                .gap_1()
+                                .children(keys.iter().take(SHOWN_KEYS).map(|key| {
+                                    let on = Some(&key.id) == busy_key.as_ref();
+                                    let refused = Some(&key.id) == refused_key.as_ref() && !on;
+                                    let tone = match key.tone {
+                                        LaneTone::Ready => cx.theme().success,
+                                        LaneTone::Cooling => cx.theme().warning,
+                                        LaneTone::Down => cx.theme().danger,
+                                        LaneTone::Off => cx.theme().muted_foreground,
+                                    };
+                                    h_flex()
+                                        .min_w_0()
+                                        .max_w(rems(8.0))
+                                        .gap_1()
+                                        .px_1p5()
+                                        .rounded(cx.theme().radius)
+                                        .border_1()
+                                        .border_color(match (on, lit) {
+                                            (true, Some(hue)) => hue,
+                                            _ if refused => cx.theme().danger.opacity(0.6),
+                                            _ => cx.theme().border.opacity(0.8),
+                                        })
+                                        .text_size(px(10.5))
+                                        .text_color(if on {
+                                            cx.theme().foreground
+                                        } else {
+                                            cx.theme().muted_foreground
+                                        })
+                                        .child(
+                                            div().flex_none().size(px(5.0)).rounded_full().bg(tone),
+                                        )
+                                        .child(div().min_w_0().truncate().child(key.label.clone()))
+                                }))
+                                .when(hidden_keys > 0, |chips| {
+                                    chips.child(
+                                        div()
+                                            .flex_none()
+                                            .text_size(px(10.5))
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(format!("+{hidden_keys}")),
+                                    )
+                                }),
+                        )
+                    }),
+            )
             .when_some(tag, |row, tag| {
                 row.child(
                     div()

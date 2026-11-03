@@ -54072,6 +54072,171 @@ mod gateway_surface_tests {
         );
     }
 
+    /// A short window must not starve the Members card of height.
+    ///
+    /// The card fills the page and the page's footer is pinned under it. When
+    /// the window is barely taller than the header, the tab bar and the footer,
+    /// a card sized to its content once pushed the scroll region below the
+    /// visible page, so the reader could not reach the rest of the form at all.
+    #[gpui::test]
+    fn the_route_group_members_page_still_scrolls_in_a_short_window(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let (center, cx) = cx.add_window_view(ManagementCenter::new);
+        let providers = (0..20)
+            .map(|index| vibex_core::ModelProviderProfile {
+                display_name: format!("Provider {index:02}"),
+                configured_models: vec![vibex_core::ModelProviderCatalogEntry {
+                    id: format!("model-{index:02}"),
+                    display_name: None,
+                    enabled: true,
+                    metadata: Vec::new(),
+                    capabilities: Default::default(),
+                }],
+                status: vibex_core::ModelProviderProfileStatus::Enabled,
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        let route = vibex_core::ModelRoute {
+            display_name: "Route group".to_string(),
+            kind: vibex_core::RouteKind::ModelGroup,
+            agent_model_id: Some("group".to_string()),
+            members: (0..6)
+                .map(|index| {
+                    vibex_core::ModelRouteMember::new(
+                        providers[index].id.clone(),
+                        format!("model-{index:02}"),
+                        index as i64,
+                    )
+                })
+                .collect(),
+            status: vibex_core::RouteStatus::Enabled,
+            ..Default::default()
+        };
+        let selected = route.id.to_string();
+        cx.update(|window, cx| {
+            center.update(cx, |center, cx| {
+                center.navigation.active = ManagementSection::Providers;
+                center.providers_sidebar_tab = ProviderSidebarTab::RouteGroups;
+                center.selected_global_route_id = Some(selected);
+                center.providers = providers;
+                center.model_routes = vec![route];
+                center.route_group_detail_tab = RouteGroupDetailTab::Members;
+                cx.notify();
+            });
+            let _ = window.draw(cx);
+        });
+        // The reported window, then the shortest window the app allows: both
+        // have to leave the card a scroll region the reader can reach.
+        for height in [1161.0f32, 900.0, 700.0, 620.0] {
+            cx.simulate_resize(gpui::size(px(1125.0), px(height)));
+            for _ in 0..2 {
+                cx.update(|window, cx| {
+                    let _ = window.draw(cx);
+                });
+                cx.run_until_parked();
+            }
+
+            let page = cx
+                .debug_bounds("management-route-members-page")
+                .expect("the Members page fills the detail body");
+            let section = cx
+                .debug_bounds("management-route-members-section")
+                .expect("the Members card is drawn");
+            let scroll = cx
+                .debug_bounds("management-route-members-scroll")
+                .expect("the Members card owns a scroll region");
+            let footer = cx
+                .debug_bounds("management-route-members-footer")
+                .expect("the form actions are pinned below the card");
+            // The page is capped at the body it was given, so the pinned
+            // actions cannot fall past the pane's bottom edge.
+            assert!(
+                page.size.height <= cx.update(|window, _| window.viewport_size()).height,
+                "the page must not outgrow the window at {height}px: page={page:?}"
+            );
+            assert!(
+                footer.bottom() <= page.bottom() + px(1.0),
+                "the actions must stay inside the page at {height}px: page={page:?} footer={footer:?}"
+            );
+            assert!(
+                section.bottom() <= footer.top(),
+                "the card must end above the actions at {height}px: section={section:?} footer={footer:?}"
+            );
+            assert!(
+                scroll.size.height > px(120.0),
+                "the scroll region must keep a usable height at {height}px, got {:?}",
+                scroll.size.height
+            );
+        }
+    }
+
+    /// The Overview tab scrolls its body under the pinned header.
+    ///
+    /// The Members tab scrolls inside its own card, but the other tabs are long
+    /// prose and stacks of cards: they need the page body to move, or a short
+    /// window cuts them off below the fold with no way down.
+    #[gpui::test]
+    fn the_route_group_overview_scrolls_its_body(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let (center, cx) = cx.add_window_view(ManagementCenter::new);
+        let provider = vibex_core::ModelProviderProfile {
+            display_name: "Provider".to_string(),
+            configured_models: (0..8)
+                .map(|index| vibex_core::ModelProviderCatalogEntry {
+                    id: format!("model-{index:02}"),
+                    display_name: None,
+                    enabled: true,
+                    metadata: Vec::new(),
+                    capabilities: Default::default(),
+                })
+                .collect(),
+            status: vibex_core::ModelProviderProfileStatus::Enabled,
+            ..Default::default()
+        };
+        let route = vibex_core::ModelRoute {
+            display_name: "Route group".to_string(),
+            kind: vibex_core::RouteKind::ModelGroup,
+            agent_model_id: Some("group".to_string()),
+            members: (0..8)
+                .map(|index| {
+                    vibex_core::ModelRouteMember::new(
+                        provider.id.clone(),
+                        format!("model-{index:02}"),
+                        index as i64,
+                    )
+                })
+                .collect(),
+            status: vibex_core::RouteStatus::Enabled,
+            ..Default::default()
+        };
+        let selected = route.id.to_string();
+        cx.update(|window, cx| {
+            center.update(cx, |center, cx| {
+                center.navigation.active = ManagementSection::Providers;
+                center.providers_sidebar_tab = ProviderSidebarTab::RouteGroups;
+                center.selected_global_route_id = Some(selected);
+                center.providers = vec![provider];
+                center.model_routes = vec![route];
+                center.route_group_detail_tab = RouteGroupDetailTab::Overview;
+                cx.notify();
+            });
+            let _ = window.draw(cx);
+        });
+        cx.simulate_resize(gpui::size(px(1125.0), px(620.0)));
+        for _ in 0..2 {
+            cx.update(|window, cx| {
+                let _ = window.draw(cx);
+            });
+            cx.run_until_parked();
+        }
+
+        let offset = center.read_with(cx, |center, _| center.workspace_detail_scroll.max_offset());
+        assert!(
+            offset.y > px(0.0),
+            "the overview must scroll its own body, got max offset {offset:?}"
+        );
+    }
+
     /// The route-group dialog's footer is a sibling of its scroll body, so it
     /// stays on screen at the dialog's bottom edge without scrolling.
     #[gpui::test]
@@ -54109,6 +54274,189 @@ mod gateway_surface_tests {
             footer.top() >= dialog.top() && footer.bottom() <= dialog.bottom(),
             "the footer must sit inside the dialog, not below its scrolling body: dialog={dialog:?} footer={footer:?}"
         );
+    }
+
+    /// The Routing tab keeps its records table scrollable in a short window.
+    ///
+    /// The map above the records is fixed height; the records card takes what
+    /// is left and the table scrolls inside it. A page that outgrew the pane
+    /// instead pushed both down and left the table with no height at all.
+    #[gpui::test]
+    fn the_gateway_routing_table_keeps_its_height_in_a_short_window(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let (center, cx) = cx.add_window_view(ManagementCenter::new);
+        cx.update(|_, cx| {
+            center.update(cx, |center, cx| {
+                center.navigation.active = ManagementSection::Providers;
+                center.selected_global_provider_id = Some(GATEWAY_ROW_ID.to_string());
+                center.gateway_detail_tab = GatewayDetailTab::Routing;
+                let rows = (0..30)
+                    .map(|index| {
+                        let mut row = ledger_request(Some("primary"), None);
+                        row.created_at_ms = 1_700_000_000_000 - index * 1_000;
+                        row
+                    })
+                    .collect::<Vec<_>>();
+                center.apply_gateway_request_page(rows, false);
+                cx.notify();
+            });
+        });
+        // The default window, then the shortest one the app allows.
+        for height in [800.0f32, 620.0] {
+            cx.simulate_resize(gpui::size(px(1280.0), px(height)));
+            for _ in 0..2 {
+                cx.update(|window, cx| {
+                    let _ = window.draw(cx);
+                });
+                cx.run_until_parked();
+            }
+
+            let table = cx
+                .debug_bounds("management-gateway-request-table")
+                .expect("the records table is drawn");
+            let section = cx
+                .debug_bounds("management-gateway-requests")
+                .expect("the records card is drawn");
+            assert!(
+                table.size.height >= px(60.0),
+                "the table must keep a usable height at {height}px, got {:?}",
+                table.size.height
+            );
+            assert!(
+                table.top() >= section.top() && table.bottom() <= section.bottom(),
+                "the table must stay inside its card at {height}px: card={section:?} table={table:?}"
+            );
+        }
+        // The records reached the delegate rather than being culled away.
+        center.read_with(cx, |center, cx| {
+            let rows = center
+                .route_requests_table
+                .as_ref()
+                .map(|table| table.read(cx).delegate().rows_count(cx));
+            assert_eq!(rows, Some(30), "every request row is offered to the table");
+        });
+    }
+
+    /// The Routing tab's map keeps its height and the records card takes the
+    /// height left over, so the table always has somewhere to scroll.
+    #[gpui::test]
+    fn the_gateway_routing_map_keeps_its_height_above_the_records(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let (center, cx) = cx.add_window_view(ManagementCenter::new);
+        cx.update(|window, cx| {
+            center.update(cx, |center, cx| {
+                center.navigation.active = ManagementSection::Providers;
+                center.selected_global_provider_id = Some(GATEWAY_ROW_ID.to_string());
+                center.gateway_detail_tab = GatewayDetailTab::Routing;
+                let rows = (0..60)
+                    .map(|index| {
+                        let mut row = ledger_request(Some("primary"), None);
+                        row.created_at_ms = 1_700_000_000_000 - index * 1_000;
+                        row
+                    })
+                    .collect::<Vec<_>>();
+                center.apply_gateway_request_page(rows, false);
+                cx.notify();
+            });
+            let _ = window.draw(cx);
+        });
+        for _ in 0..3 {
+            cx.update(|window, cx| {
+                let _ = window.draw(cx);
+            });
+            cx.run_until_parked();
+        }
+
+        let map = cx
+            .debug_bounds("management-gateway-route-map")
+            .expect("the route map is drawn");
+        let card = cx
+            .debug_bounds("management-gateway-requests")
+            .expect("the records card is drawn");
+        assert!(
+            map.size.height > px(200.0),
+            "the map keeps its own height instead of sharing the card's, got {:?}",
+            map.size.height
+        );
+        assert!(
+            card.top() >= map.bottom(),
+            "the records card follows the map: map={map:?} card={card:?}"
+        );
+        let page = cx
+            .debug_bounds("management-detail-page")
+            .expect("the gateway page is drawn");
+        assert!(
+            card.bottom() <= page.bottom() + px(1.0),
+            "the records card must end inside the page: page={page:?} card={card:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn zz_probe_tall(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let (center, cx) = cx.add_window_view(ManagementCenter::new);
+        let providers = (0..6)
+            .map(|index| vibex_core::ModelProviderProfile {
+                display_name: format!("Provider {index:02}"),
+                configured_models: vec![vibex_core::ModelProviderCatalogEntry {
+                    id: format!("model-{index:02}"),
+                    display_name: None,
+                    enabled: true,
+                    metadata: Vec::new(),
+                    capabilities: Default::default(),
+                }],
+                status: vibex_core::ModelProviderProfileStatus::Enabled,
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        let route = vibex_core::ModelRoute {
+            display_name: "Route group".to_string(),
+            kind: vibex_core::RouteKind::ModelGroup,
+            agent_model_id: Some("group".to_string()),
+            members: (0..6)
+                .map(|index| {
+                    vibex_core::ModelRouteMember::new(
+                        providers[index].id.clone(),
+                        format!("model-{index:02}"),
+                        index as i64,
+                    )
+                })
+                .collect(),
+            status: vibex_core::RouteStatus::Enabled,
+            ..Default::default()
+        };
+        cx.update(|window, cx| {
+            center.update(cx, |center, cx| {
+                center.navigation.active = ManagementSection::Providers;
+                center.selected_global_provider_id = Some(GATEWAY_ROW_ID.to_string());
+                center.gateway_detail_tab = GatewayDetailTab::Routing;
+                center.providers = providers;
+                center.model_routes = vec![route];
+                let rows = (0..200)
+                    .map(|index| {
+                        let mut row = ledger_request(Some("primary"), None);
+                        row.created_at_ms = 1_700_000_000_000 - index * 1_000;
+                        row
+                    })
+                    .collect::<Vec<_>>();
+                center.apply_gateway_request_page(rows, false);
+                cx.notify();
+            });
+            let _ = window.draw(cx);
+        });
+        cx.simulate_resize(gpui::size(px(1093.0), px(781.0)));
+        for _ in 0..3 {
+            cx.update(|window, cx| {
+                let _ = window.draw(cx);
+            });
+            cx.run_until_parked();
+        }
+        let page = cx.debug_bounds("management-detail-page");
+        let map = cx.debug_bounds("management-gateway-route-map");
+        let card = cx.debug_bounds("management-gateway-requests");
+        let table = cx.debug_bounds("management-gateway-request-table");
+        let offset = center.read_with(cx, |center, _| center.workspace_detail_scroll.max_offset());
+        eprintln!("page={page:?}\nmap={map:?}\ncard={card:?}\ntable={table:?}\nscroll_max={offset:?}");
     }
 }
 

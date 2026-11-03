@@ -568,9 +568,9 @@ fn ws_detail_page(
     header: AnyElement,
     tabs: AnyElement,
     body: AnyElement,
-    cx: &App,
+    scroll: &ScrollHandle,
 ) -> AnyElement {
-    ws_detail_page_with_body(id, header, tabs, body, None, cx)
+    ws_detail_page_with_body(id, header, tabs, body, Some(scroll))
 }
 
 /// The same page for a tab whose body is already a full-height layout.
@@ -583,9 +583,8 @@ fn ws_detail_page_fixed(
     header: AnyElement,
     tabs: AnyElement,
     body: AnyElement,
-    cx: &App,
 ) -> AnyElement {
-    ws_detail_page_with_body(id, header, tabs, body, None, cx)
+    ws_detail_page_with_body(id, header, tabs, body, None)
 }
 
 fn ws_detail_page_with_body(
@@ -594,7 +593,6 @@ fn ws_detail_page_with_body(
     tabs: AnyElement,
     content: AnyElement,
     scroll: Option<&ScrollHandle>,
-    _cx: &App,
 ) -> AnyElement {
     let mut body = div()
         .id(SharedString::from(format!("{id}-body")))
@@ -611,19 +609,24 @@ fn ws_detail_page_with_body(
     // A page's cards fill the body whenever it is taller than them. A card
     // that owns a scroll area of its own (a table's rows, say) needs the body
     // to be a definite height for that area to measure against, and the
-    // stretch is what gives it one. The stack scrolls on its own once the
-    // cards together are taller than the body.
-    let body = body
-        .flex()
-        .flex_col()
-        .child(
-            // The page's stack: the same one gap between the cards, and the
-            // stretch that fills the body while the cards are shorter.
-            v_flex().w_full().min_w_0().gap_4().flex_1().child(content),
-        )
-        .into_any_element();
+    // stretch is what gives it one.
+    let stack = v_flex().w_full().min_w_0().gap_4().flex_1().child(content);
+    let stack = if scroll.is_some() {
+        // A scrolling page lets the stack grow past the body; that overflow is
+        // what the body scrolls through.
+        stack
+    } else {
+        // A fixed page is capped at the body's height instead. Without the
+        // floor a page that sizes itself to the body (`h_full`) would resolve
+        // against the stack's content height, pushing the page's pinned footer
+        // and its own scroll region below the visible edge.
+        stack.min_h_0()
+    };
+    // The same stack, which the body scrolls once the cards outgrow it.
+    let body = body.flex().flex_col().child(stack).into_any_element();
     v_flex()
         .id(id)
+        .debug_selector(|| "management-detail-page".to_string())
         .size_full()
         .min_w_0()
         .min_h_0()

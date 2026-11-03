@@ -1732,8 +1732,10 @@ impl ManagementCenter {
         stage.update(cx, |stage, cx| stage.set_model(model, cx));
 
         let map = v_flex()
+            .debug_selector(|| "management-gateway-route-map".to_string())
             .w_full()
             .min_w_0()
+            .flex_none()
             .rounded(cx.theme().radius_lg)
             .border_1()
             .border_color(theme::module_border(cx.theme().is_dark()))
@@ -1741,10 +1743,19 @@ impl ManagementCenter {
             .child(self.render_workspace_route_head(&staged, cx))
             .child(div().w_full().px_3().child(stage))
             .child(self.render_workspace_route_story(&staged, now, cx));
-        ws_stack(vec![
-            map.into_any_element(),
-            self.render_workspace_route_list(now, window, cx),
-        ])
+        // Not `ws_stack`: the records card takes the height the map leaves, so
+        // the stack itself has to stretch and pass that height down rather
+        // than size to its content. The map keeps its height; the table
+        // inside the card then has a definite height to scroll in.
+        v_flex()
+            .w_full()
+            .min_w_0()
+            .flex_1()
+            .min_h_0()
+            .gap_4()
+            .child(map)
+            .child(self.render_workspace_route_list(now, window, cx))
+            .into_any_element()
     }
 
     /// Picks a request on the map, or plays the one already picked again.
