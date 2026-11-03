@@ -227,8 +227,8 @@ use crate::directory_picker::{
     DirectoryBrowseTarget, DirectoryFavoritesHandler, DirectoryPickHandler, DirectoryPickerDialog,
 };
 use crate::gpui_ext::{
-    DOCS_SELF_HOSTED_SERVER_URL, ScrollGutter as _, button_with_aria_label, docs_help_button,
-    solid_empty_border, tab_strip_drop_cue,
+    DOCS_SELF_HOSTED_SERVER_URL, PinnedScrollbar as _, ScrollGutter as _, button_with_aria_label,
+    docs_help_button, solid_empty_border, tab_strip_drop_cue,
 };
 use crate::hint_layer::{self, hint_notification};
 use crate::image_editor::{
@@ -16276,7 +16276,7 @@ impl VibexWorkbench {
             .children(rows)
             // Last child, so the overlay paints over the rows rather than under
             // them, the way `Scrollable` orders its own scroll area.
-            .vertical_scrollbar(&self.runtime_manager_list_scroll);
+            .pinned_scrollbar(&self.runtime_manager_list_scroll, ScrollbarAxis::Vertical);
 
         v_flex()
             .w_full()
@@ -16831,7 +16831,7 @@ impl VibexWorkbench {
                     .track_scroll(&self.runtime_manager_detail_scroll)
                     .overflow_y_scroll()
                     .children(rows)
-                    .vertical_scrollbar(&self.runtime_manager_detail_scroll),
+                    .pinned_scrollbar(&self.runtime_manager_detail_scroll, ScrollbarAxis::Vertical),
             )
             .child(divider_lane(cx))
             .child(actions)
@@ -47553,9 +47553,10 @@ impl VibexWorkbench {
                                     }),
                             ),
                     )
-                    // Keep the scrollbar outside the scrolling node. GPUI applies
-                    // that node's offset to all of its children during prepaint.
-                    .vertical_scrollbar(&self.sidebar_scroll),
+                    // The bar rides on the container, not on the list it
+                    // scrolls: a bar inside the scrolling node moves with the
+                    // rows and leaves the viewport.
+                    .pinned_scrollbar(&self.sidebar_scroll, ScrollbarAxis::Vertical),
             )
             .into_any_element()
     }
@@ -55381,7 +55382,7 @@ impl VibexWorkbench {
                     // never scrolls. Plain overflow keeps `provider_scroll`
                     // as the real scroll driver for keyboard reveal.
                     .overflow_y_scroll()
-                    .vertical_scrollbar(&provider_scroll)
+                    .pinned_scrollbar(&provider_scroll, ScrollbarAxis::Vertical)
                     .when(groups.is_empty(), |this| {
                         this.child(if query.is_empty() {
                             runtime_menu_empty_state(favorites_view, cx)
@@ -58055,7 +58056,7 @@ impl VibexWorkbench {
                             .py_4()
                             .gap_0(),
                         )
-                        .scrollbar(&self.timeline_scroll, ScrollbarAxis::Vertical),
+                        .pinned_scrollbar(&self.timeline_scroll, ScrollbarAxis::Vertical),
                 )
             });
         let runtime_controls = self.render_runtime_controls(live_session_id.as_ref(), cx);
@@ -72478,7 +72479,7 @@ fn render_agent_file_diff_scroll_area(
                         .overflow_scroll()
                         .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
                         .children(rows)
-                        .scrollbar(scroll, ScrollbarAxis::Both),
+                        .pinned_scrollbar(scroll, ScrollbarAxis::Both),
                 ),
             ),
         )
@@ -109792,7 +109793,11 @@ mod tests {
             "the grouped provider/model list must keep `provider_scroll` as the \
              real scroll driver so keyboard reveal can move it"
         );
-        assert!(grouped_models.contains(".vertical_scrollbar(&provider_scroll)"));
+        assert!(
+            grouped_models.contains(".pinned_scrollbar(&provider_scroll, ScrollbarAxis::Vertical)"),
+            "the bar must be pinned outside the scrolling node; attached to it, \
+             GPUI drags the bar up with the rows"
+        );
         assert!(grouped_models.contains("scroll_row_into_view(&reveal_scroll, bounds, window)"));
         assert!(menu_opening.contains("runtime_provider_scroll_to_selection = true;"));
         assert!(menu_opening.contains("runtime_agent_row_reveal_pending = true;"));
@@ -111225,11 +111230,12 @@ mod tests {
         assert!(sidebar.contains("this.locate_selected_session(window, cx)"));
         assert!(sidebar.contains(".id(\"sidebar-session-list-container\")"));
         assert!(sidebar.contains(".track_scroll(&self.sidebar_scroll)"));
-        assert!(sidebar.contains("// Keep the scrollbar outside the scrolling node."));
-        assert!(sidebar.contains(".vertical_scrollbar(&self.sidebar_scroll)"));
+        assert!(
+            sidebar.contains(".pinned_scrollbar(&self.sidebar_scroll, ScrollbarAxis::Vertical)")
+        );
         assert!(
             sidebar.find(".track_scroll(&self.sidebar_scroll)")
-                < sidebar.find(".vertical_scrollbar(&self.sidebar_scroll)")
+                < sidebar.find(".pinned_scrollbar(&self.sidebar_scroll")
         );
 
         let more_menu = source
@@ -114290,12 +114296,11 @@ mod tests {
                 body.contains(&format!(".track_scroll(&self.{handle})")),
                 "{open} must drive its own scroll handle"
             );
-            // The bar may be attached to the scrolling node or pinned as its
-            // sibling by the shared builder; both keep a bar on this region.
-            let attached = format!(".vertical_scrollbar(&self.{handle})");
-            let pinned = format!("&self.{handle},\n");
+            // The bar must be pinned outside the scrolling node: attached to
+            // the scroller it rides up with the rows.
+            let pinned = format!(".pinned_scrollbar(&self.{handle}, ScrollbarAxis::Vertical)");
             assert!(
-                body.contains(&attached) || body.contains(&pinned),
+                body.contains(&pinned),
                 "{open} must keep a scrollbar on the region it scrolls"
             );
         }

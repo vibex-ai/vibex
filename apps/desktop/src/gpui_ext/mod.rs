@@ -1,13 +1,14 @@
 use gpui::{
-    AnyElement, App, BorderStyle, Hsla, InteractiveElement, Interactivity, IntoElement,
-    ParentElement as _, Pixels, RenderOnce, SharedString, StatefulInteractiveElement, Styled,
-    Window, WindowAppearance, div, px,
+    AnyElement, App, BorderStyle, Element, Hsla, InteractiveElement, Interactivity, IntoElement,
+    ParentElement, Pixels, RenderOnce, SharedString, StatefulInteractiveElement, StyleRefinement,
+    Styled, Window, WindowAppearance, div, px,
 };
 use gpui_base::Selectable;
 use gpui_component::{
-    Icon, Sizable as _,
+    Icon, Sizable as _, StyledExt as _,
     button::{Button, ButtonVariants as _},
     empty::Empty,
+    scroll::{ScrollableElement as _, ScrollbarAxis},
 };
 use vibex_desktop_runtime::validate_external_open_url;
 
@@ -90,6 +91,93 @@ pub trait ScrollGutter: Styled + Sized {
 }
 
 impl<T: Styled> ScrollGutter for T {}
+
+/// Pins an overlay scrollbar to its scroll viewport.
+///
+/// `ScrollableElement::scrollbar` adds the bar as one more *child* of the
+/// element it is called on. When that element is the scroll region itself, the
+/// bar ends up inside the node whose content is being moved: GPUI applies the
+/// region's scroll offset to every descendant during prepaint, so the bar
+/// travels with the rows it is supposed to be tracking. The thumb still resizes
+/// correctly, because it reads the handle rather than its own bounds, but the
+/// whole bar slides off the top of the viewport as soon as the reader scrolls.
+///
+/// This helper keeps the scroller as the real scroll area and gives the bar a
+/// stationary home: an outer box that copies the scroller's own layout style
+/// (`flex_1`, `size_full`, `align_self`, …) so the region still occupies the
+/// same slot, and the scroller fills that box. The bar is attached to the outer
+/// box, which never scrolls, so it stays put.
+///
+/// The box is a flex container because the scroller's percentage height then
+/// resolves against a definite parent. That matters for content-sized panels:
+/// a plain block whose only child is `h_full` collapses to zero, which is how
+/// the previous attempts at this fix lost their height.
+pub fn pinned_scrollbar<E>(
+    scroller: E,
+    handle: &(impl gpui_base::ScrollbarHandle + Clone),
+    axis: ScrollbarAxis,
+) -> AnyElement
+where
+    E: InteractiveElement + Styled + ParentElement + Element + 'static,
+{
+    pin_to_viewport(scroller, handle, axis).into_any_element()
+}
+
+/// The wrapper [`pinned_scrollbar`] builds, before type erasure.
+fn pin_to_viewport<E>(
+    mut scroller: E,
+    handle: &(impl gpui_base::ScrollbarHandle + Clone),
+    axis: ScrollbarAxis,
+) -> gpui::Stateful<gpui::Div>
+where
+    E: InteractiveElement + Styled + ParentElement + Element + 'static,
+{
+    let source = scroller.style().clone();
+    let outer_style = StyleRefinement {
+        size: source.size,
+        min_size: source.min_size,
+        max_size: source.max_size,
+        flex_grow: source.flex_grow,
+        flex_shrink: source.flex_shrink,
+        flex_basis: source.flex_basis,
+        align_self: source.align_self,
+        ..Default::default()
+    };
+
+    // The id makes this a `Stateful<Div>`, which is what keeps the chain
+    // usable after the call: `overflow_*_scrollbar()` returns the same shape.
+    div()
+        .id(gpui::ElementId::Name("pinned-scrollbar".into()))
+        .relative()
+        .flex()
+        .min_h_0()
+        .min_w_0()
+        .refine_style(&outer_style)
+        .child(scroller.flex_1().min_h_0().min_w_0())
+        .scrollbar(handle, axis)
+}
+
+/// [`pinned_scrollbar`] as a builder method, so a call site swaps one line.
+///
+/// Replacing `.vertical_scrollbar(&handle)` with `.pinned_scrollbar(&handle,
+/// ScrollbarAxis::Vertical)` keeps the rest of the chain — and its indentation —
+/// untouched, which is what makes the fix readable in review: the diff shows the
+/// bar moving out of the scroller, not a re-indented block.
+///
+/// Like the `overflow_*_scrollbar()` builders, this returns the wrapper rather
+/// than a type-erased element, so a chain can keep adding children after it.
+pub trait PinnedScrollbar: InteractiveElement + Styled + ParentElement + Sized {
+    /// The same bar [`pinned_scrollbar`] draws, pinned to this element's box.
+    fn pinned_scrollbar<H>(self, handle: &H, axis: ScrollbarAxis) -> gpui::Stateful<gpui::Div>
+    where
+        H: gpui_base::ScrollbarHandle + Clone,
+        Self: Element + 'static,
+    {
+        pin_to_viewport(self, handle, axis)
+    }
+}
+
+impl<E> PinnedScrollbar for E where E: InteractiveElement + Styled + ParentElement {}
 
 pub fn is_dark_system_appearance(cx: &App) -> bool {
     matches!(
@@ -287,11 +375,17 @@ mod tests {
     /// next region's padding, which would make this guard pass for the wrong
     /// reason.
     fn scroll_region_chains(source: &str) -> Vec<(usize, String)> {
+        scroll_chains_containing(source, "overflow_y_scrollbar()")
+    }
+
+    /// Every builder chain containing `needle`, with the 1-based line where
+    /// `needle` sits.
+    fn scroll_chains_containing(source: &str, needle: &str) -> Vec<(usize, String)> {
         let lines: Vec<&str> = source.lines().collect();
         let mut chains = Vec::new();
         for (index, line) in lines.iter().enumerate() {
             // A source-inspection assertion names the call without making one.
-            if !line.contains("overflow_y_scrollbar()")
+            if !line.contains(needle)
                 || line.trim_start().starts_with("//")
                 || line.contains("contains(")
             {
@@ -351,5 +445,188 @@ mod tests {
             }
         }
         false
+    }
+
+    /// The overlay bar must never be attached to the node it scrolls.
+    ///
+    /// GPUI applies a scroll region's offset to every descendant during
+    /// prepaint. A `vertical_scrollbar`/`scrollbar` call on that same builder
+    /// chain therefore puts the bar *inside* the moving content: the thumb's
+    /// length stays right, because it reads the handle, but the bar itself
+    /// travels upward with the rows and leaves the viewport. The symptom is a
+    /// scrollbar that sits at the top (or slides out of sight) while the page
+    /// below it scrolls.
+    ///
+    /// This walks every scroll-region source in the desktop crate and fails on
+    /// any chain that both scrolls and carries the bar itself. The pinned form
+    /// is [`pinned_scrollbar`], and the `overflow_*_scrollbar()` builders are
+    /// fine because `Scrollable` makes the bar a sibling of the scrolling area.
+    #[test]
+    fn scrollbars_are_never_inside_the_node_they_scroll() {
+        /// Every file that owns a scroll region.
+        const SOURCES: [(&str, &str); 12] = [
+            ("app.rs", include_str!("../app.rs")),
+            ("code_workbench.rs", include_str!("../code_workbench.rs")),
+            (
+                "directory_picker.rs",
+                include_str!("../directory_picker.rs"),
+            ),
+            (
+                "local_history_import.rs",
+                include_str!("../local_history_import.rs"),
+            ),
+            ("management.rs", include_str!("../management.rs")),
+            (
+                "management/provider_workspace/mod.rs",
+                include_str!("../management/provider_workspace/mod.rs"),
+            ),
+            (
+                "management/provider_workspace/route_group.rs",
+                include_str!("../management/provider_workspace/route_group.rs"),
+            ),
+            ("native_content.rs", include_str!("../native_content.rs")),
+            ("office_surface.rs", include_str!("../office_surface.rs")),
+            ("pdf_surface.rs", include_str!("../pdf_surface.rs")),
+            ("usage.rs", include_str!("../usage.rs")),
+            ("arena/mod.rs", include_str!("../arena/mod.rs")),
+        ];
+
+        let mut offenders = Vec::new();
+        for (name, source) in SOURCES {
+            for needle in [
+                ".vertical_scrollbar(",
+                ".horizontal_scrollbar(",
+                ".scrollbar(",
+            ] {
+                for (line, chain) in scroll_chains_containing(source, needle) {
+                    if chain.contains(".track_scroll(")
+                        || chain.contains(".overflow_y_scroll()")
+                        || chain.contains(".overflow_x_scroll()")
+                        || chain.contains(".overflow_scroll()")
+                    {
+                        offenders.push(format!(
+                            "{name}:{line} in {} attaches a scrollbar and scrolls the same node",
+                            enclosing_fn(source, line)
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "these scroll regions attach the overlay bar to the node it scrolls, \
+             so the bar rides up with the content; wrap them in \
+             `pinned_scrollbar(...)` instead:\n  {}",
+            offenders.join("\n  ")
+        );
+    }
+
+    mod pinned_scrollbar_probe {
+        use gpui::{
+            Context, InteractiveElement as _, IntoElement, ParentElement as _, Render,
+            ScrollHandle, StatefulInteractiveElement as _, Styled as _, TestAppContext, Window,
+            div, prelude::*, px,
+        };
+        use gpui_component::v_flex;
+
+        use super::super::pinned_scrollbar;
+
+        /// A content-sized panel whose body scrolls: the shape that used to let
+        /// the bar ride up with the rows.
+        struct Probe {
+            scroll: ScrollHandle,
+        }
+
+        impl Render for Probe {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let rows = (0..20)
+                    .map(|ix| {
+                        div().h(px(20.0)).flex_none().when(ix == 19, |row| {
+                            row.debug_selector(|| "pinned-last-row".to_string())
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                let body = v_flex()
+                    .id("pinned-probe-scroll")
+                    .w_full()
+                    .min_h_0()
+                    .track_scroll(&self.scroll)
+                    .overflow_y_scroll()
+                    .children(rows);
+                v_flex()
+                    .w(px(240.0))
+                    .max_h(px(160.0))
+                    .min_h_0()
+                    .overflow_hidden()
+                    .p_2()
+                    .child(div().h(px(20.0)).flex_none())
+                    .child(pinned_scrollbar(
+                        body,
+                        &self.scroll,
+                        gpui_component::scroll::ScrollbarAxis::Vertical,
+                    ))
+                    .child(
+                        div()
+                            .debug_selector(|| "pinned-probe-footer".to_string())
+                            .h(px(20.0))
+                            .flex_none(),
+                    )
+            }
+        }
+
+        /// The bar stays over the viewport while the content moves under it.
+        ///
+        /// This is the regression the fix exists for: with the bar attached to
+        /// the scrolling node, its overlay travelled from y=28 to y=-92 during
+        /// the same wheel event that scrolled the rows.
+        #[gpui::test]
+        fn the_pinned_bar_stays_put_while_the_content_scrolls(cx: &mut TestAppContext) {
+            cx.update(gpui_component::init);
+            let (_, cx) = cx.add_window_view(|_, _| Probe {
+                scroll: ScrollHandle::new(),
+            });
+            cx.update(|window, cx| {
+                let _ = window.draw(cx);
+            });
+            cx.run_until_parked();
+
+            let before = cx
+                .debug_bounds("scrollbar-overlay")
+                .expect("the region should own a scrollbar");
+            let row_before = cx
+                .debug_bounds("pinned-last-row")
+                .expect("the last row should be laid out")
+                .origin
+                .y;
+
+            cx.simulate_event(gpui::ScrollWheelEvent {
+                position: gpui::point(px(40.0), px(40.0)),
+                delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.0), px(-120.0))),
+                modifiers: Default::default(),
+                touch_phase: gpui::TouchPhase::Moved,
+            });
+            cx.run_until_parked();
+            cx.update(|window, cx| {
+                let _ = window.draw(cx);
+            });
+
+            let after = cx
+                .debug_bounds("scrollbar-overlay")
+                .expect("the region should still own a scrollbar");
+            let row_after = cx
+                .debug_bounds("pinned-last-row")
+                .expect("the last row should still be laid out")
+                .origin
+                .y;
+
+            assert!(
+                row_after < row_before,
+                "the wheel should move the content: {row_before:?} -> {row_after:?}"
+            );
+            assert_eq!(
+                before.origin, after.origin,
+                "the bar must stay on the viewport while the content scrolls"
+            );
+        }
     }
 }

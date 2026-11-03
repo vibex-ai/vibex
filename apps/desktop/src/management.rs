@@ -46,7 +46,7 @@ use gpui_component::{
     menu::{DropdownMenu as _, PopupMenuItem},
     notification::NotificationType,
     pagination::Pagination,
-    scroll::ScrollableElement as _,
+    scroll::{ScrollableElement as _, ScrollbarAxis},
     separator::Separator,
     switch::Switch,
     tab::{Tab, TabBar},
@@ -89,7 +89,8 @@ use crate::assets::{agent_brand_icon, model_brand_icon};
 
 mod provider_workspace;
 use crate::gpui_ext::{
-    SCROLLBAR_GUTTER, ScrollGutter as _, button_with_aria_label, solid_empty_border,
+    PinnedScrollbar as _, SCROLLBAR_GUTTER, ScrollGutter as _, button_with_aria_label,
+    solid_empty_border,
 };
 use crate::hint_layer::{self, hint_notification};
 use crate::locale::{self, ResolvedLocale};
@@ -21534,7 +21535,7 @@ impl ManagementCenter {
                 .child(grid)
                 // The bar is bound to the same handle the pager resets, so a
                 // page change moves the bar with the content.
-                .vertical_scrollbar(&self.mcp_market_scroll),
+                .pinned_scrollbar(&self.mcp_market_scroll, ScrollbarAxis::Vertical),
         );
 
         if !first_load && page_total > 0 {
@@ -22100,7 +22101,7 @@ impl ManagementCenter {
                 .child(grid)
                 // The bar is bound to the same handle the pager resets, so a
                 // page change moves the bar with the content.
-                .vertical_scrollbar(&self.skill_market_scroll),
+                .pinned_scrollbar(&self.skill_market_scroll, ScrollbarAxis::Vertical),
         );
 
         if !first_load && total > 0 {
@@ -35075,7 +35076,7 @@ impl Render for ManagementCenter {
                 .when(viewport_width >= 640.0, |main| main.p_4())
                 .track_scroll(&self.workspace_create_scroll)
                 .overflow_y_scroll()
-                .vertical_scrollbar(&self.workspace_create_scroll)
+                .pinned_scrollbar(&self.workspace_create_scroll, ScrollbarAxis::Vertical)
                 .into_any_element()
         } else {
             pane.id("management-provider-workspace-scroll")

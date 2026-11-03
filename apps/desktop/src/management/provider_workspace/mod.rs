@@ -614,10 +614,7 @@ fn ws_detail_page_with_body(
         .min_h_0()
         .flex_1();
     if let Some(scroll) = scroll {
-        body = body
-            .track_scroll(scroll)
-            .overflow_y_scroll()
-            .vertical_scrollbar(scroll);
+        body = body.track_scroll(scroll).overflow_y_scroll();
     }
     // A page's cards fill the body whenever it is taller than them. A card
     // that owns a scroll area of its own (a table's rows, say) needs the body
@@ -635,8 +632,17 @@ fn ws_detail_page_with_body(
         // and its own scroll region below the visible edge.
         stack.min_h_0()
     };
-    // The same stack, which the body scrolls once the cards outgrow it.
-    let body = body.flex().flex_col().child(stack).into_any_element();
+    // The same stack, which the body scrolls once the cards outgrow it. The
+    // bar is pinned only after the body owns the stack: attached to the scroll
+    // region itself it would ride up with the cards, and pinning before the
+    // child is added would leave the scroller empty.
+    let body = body.flex().flex_col().child(stack);
+    let body = match scroll {
+        Some(scroll) => body
+            .pinned_scrollbar(scroll, ScrollbarAxis::Vertical)
+            .into_any_element(),
+        None => body.into_any_element(),
+    };
     v_flex()
         .id(id)
         .debug_selector(|| "management-detail-page".to_string())
@@ -1449,7 +1455,7 @@ mod tests {
         );
         assert!(page.contains(".track_scroll("));
         assert!(page.contains(".overflow_y_scroll()"));
-        assert!(page.contains(".vertical_scrollbar("));
+        assert!(page.contains(".pinned_scrollbar("));
 
         let management = include_str!("../../management.rs");
         let main = management

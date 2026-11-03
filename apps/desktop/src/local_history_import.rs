@@ -21,7 +21,7 @@ use gpui_component::{
     input::{Input, InputEvent, InputState},
     notification::NotificationType,
     popover::Popover,
-    scroll::ScrollableElement as _,
+    scroll::ScrollbarAxis,
     v_flex,
 };
 use vibex_core::{
@@ -34,6 +34,7 @@ use vibex_desktop_runtime::DesktopRuntime;
 
 use crate::app::VibexWorkbench;
 use crate::assets::agent_brand_icon;
+use crate::gpui_ext::PinnedScrollbar as _;
 use crate::hint_layer::{self, hint_notification};
 use crate::locale::{self, ResolvedLocale};
 use crate::skeleton;
@@ -1420,7 +1421,7 @@ impl Render for LocalHistoryImportDialog {
                 .min_h_0()
                 .track_scroll(&self.list_scroll)
                 .overflow_y_scroll()
-                .vertical_scrollbar(&self.list_scroll)
+                .pinned_scrollbar(&self.list_scroll, ScrollbarAxis::Vertical)
                 .gap_2()
                 .pb_1()
                 .children(rows)

@@ -24,13 +24,14 @@ use gpui_component::{
     empty::{Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyMediaVariant},
     h_flex,
     input::{Input, InputEvent, InputState},
-    scroll::ScrollableElement as _,
+    scroll::ScrollbarAxis,
     tooltip::Tooltip,
     v_flex,
 };
 use vibex_backend::BackendFacade;
 use vibex_desktop_model::{LocaleMode, PROJECT_DIRECTORY_FAVORITE_LIMIT};
 
+use crate::gpui_ext::PinnedScrollbar as _;
 use crate::locale::{self, ResolvedLocale};
 use crate::spinner::Spinner;
 
@@ -1125,7 +1126,7 @@ impl gpui::Render for DirectoryPickerDialog {
                 .min_h_0()
                 .track_scroll(&self.list_scroll)
                 .overflow_y_scroll()
-                .vertical_scrollbar(&self.list_scroll)
+                .pinned_scrollbar(&self.list_scroll, ScrollbarAxis::Vertical)
                 .gap(px(2.0))
                 .pt(px(2.0))
                 .pb(px(4.0))
@@ -1244,7 +1245,7 @@ impl gpui::Render for DirectoryPickerDialog {
                     .gap(px(2.0))
                     .track_scroll(&self.rail_scroll)
                     .overflow_y_scroll()
-                    .vertical_scrollbar(&self.rail_scroll)
+                    .pinned_scrollbar(&self.rail_scroll, ScrollbarAxis::Vertical)
                     .children(rail_rows),
             );
 

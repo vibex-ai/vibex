@@ -988,8 +988,11 @@ impl ManagementCenter {
                         .flex_1()
                         .track_scroll(&self.workspace_route_members_scroll)
                         .overflow_y_scroll()
-                        .vertical_scrollbar(&self.workspace_route_members_scroll)
-                        .child(content),
+                        .child(content)
+                        .pinned_scrollbar(
+                            &self.workspace_route_members_scroll,
+                            ScrollbarAxis::Vertical,
+                        ),
                 )
                 .into_any_element();
             ws_section_fill(
