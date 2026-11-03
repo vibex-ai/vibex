@@ -921,12 +921,16 @@ fn registry_server_to_entry(record: &RegistryServerRecord) -> Option<McpMarketEn
     })
 }
 
-/// The picture an entry offers, when it offers one the market may load.
+/// The picture an entry leads with, when it names one the market may load.
 ///
 /// The registry's list is a preference order, so the first address that passes
-/// the same public-`https` policy every market fetch passes is the one kept. An
-/// entry with none keeps none: the card falls back to its transport glyph
-/// rather than inventing a logo.
+/// the same public-`https` policy every market fetch passes is the one kept.
+/// Most records publish no picture at all, so the fallback is the mark their
+/// provenance already carries: the GitHub account that owns the repository they
+/// name, or the `io.github.<owner>` namespace they are registered under. That is
+/// the same owner-avatar treatment a Skill gets, derived from what the registry
+/// published rather than invented. An entry that names no account keeps none and
+/// the card falls back to its transport glyph.
 fn registry_icon(server: &RegistryServer) -> Option<String> {
     server
         .icons
@@ -935,6 +939,87 @@ fn registry_icon(server: &RegistryServer) -> Option<String> {
         .map(str::trim)
         .find(|src| market_url_policy(src).is_ok())
         .map(str::to_string)
+        .or_else(|| registry_github_owner(server).map(|owner| github_avatar_url(&owner)))
+}
+
+/// The GitHub account a registry entry belongs to, when it names one.
+///
+/// A repository URL is the direct statement. A record without one still names
+/// its owner in the registry's `io.github.<owner>` namespace, which is how a
+/// server published from GitHub is registered. The account has to be shaped
+/// like a login, because it becomes a path segment of the avatar address.
+fn registry_github_owner(server: &RegistryServer) -> Option<String> {
+    if let Some(owner) = server
+        .repository
+        .as_ref()
+        .and_then(RegistryRepository::url)
+        .and_then(github_repository_owner)
+    {
+        return Some(owner);
+    }
+    let (namespace, _) = server.name.split_once('/')?;
+    let owner = namespace
+        .strip_prefix("io.github.")
+        .or_else(|| namespace.strip_prefix("io.GitHub."))?
+        .trim();
+    is_github_login(owner).then(|| owner.to_string())
+}
+
+/// The owner of a GitHub repository address, however the record spells it.
+///
+/// The registry publishes `https://github.com/<owner>/<repo>`, but older records
+/// carry a `.git` suffix, a `git+https` prefix, or the scp form of an SSH remote.
+/// All of them name the same first path segment.
+fn github_repository_owner(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    // The scp form of an SSH remote, which is not a URL: `git@github.com:owner/repo.git`.
+    let scp = raw
+        .strip_prefix("git@github.com:")
+        .or_else(|| raw.strip_prefix("git@www.github.com:"));
+    let owner = match scp {
+        Some(rest) => rest.split('/').next()?.trim().to_string(),
+        None => {
+            let url = reqwest::Url::parse(raw.strip_prefix("git+").unwrap_or(raw)).ok()?;
+            if !matches!(url.scheme(), "https" | "http" | "ssh") {
+                return None;
+            }
+            let host = url.host_str()?.trim_end_matches('.').to_ascii_lowercase();
+            if host != "github.com" && host != "www.github.com" {
+                return None;
+            }
+            url.path()
+                .trim_matches('/')
+                .split('/')
+                .next()?
+                .trim()
+                .to_string()
+        }
+    };
+    is_github_login(&owner).then_some(owner)
+}
+
+/// Whether a string is shaped like a GitHub login.
+///
+/// The owner becomes a path segment of the avatar address, so a nested path, a
+/// query, or a trailing dot is refused rather than encoded into an address the
+/// market would then fetch.
+fn is_github_login(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 39
+        && !value.starts_with('-')
+        && !value.ends_with('-')
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
+}
+
+/// The avatar a GitHub account publishes, at the size a card shows it.
+///
+/// Both markets lead a card with this when the entry publishes no logo of its
+/// own: the Skill catalog names a repository, and the MCP registry names a
+/// repository or an `io.github.<owner>` namespace.
+fn github_avatar_url(owner: &str) -> String {
+    format!("https://github.com/{owner}.png?size=96")
 }
 
 // ---------------------------------------------------------------------------
@@ -1393,14 +1478,9 @@ impl SkillCatalogRecord {
             summary: None,
             installs: self.installs.unwrap_or(0),
             official: self.is_official.unwrap_or(false),
-            icon_url: skill_owner(source).map(skill_avatar_url),
+            icon_url: skill_owner(source).map(github_avatar_url),
         })
     }
-}
-
-/// The avatar a repository owner publishes, at the size a card shows it.
-fn skill_avatar_url(owner: &str) -> String {
-    format!("https://github.com/{owner}.png?size=96")
 }
 
 /// The catalog's own list of the most installed Skills, read off its home page.
@@ -2850,6 +2930,116 @@ mod tests {
         assert_eq!(registry_icon(&server), None);
     }
 
+    /// Most records publish no logo at all, and the card still leads with the
+    /// publisher's mark: the GitHub account that owns the repository the entry
+    /// names, or the `io.github.<owner>` namespace it is registered under.
+    #[test]
+    fn an_entry_without_a_picture_leads_with_its_owners_avatar() {
+        let mut server = RegistryServer {
+            name: "io.github.dockndevai/mcp-grafana".to_string(),
+            title: None,
+            description: None,
+            homepage: None,
+            website_url: None,
+            repository: None,
+            icons: Vec::new(),
+            packages: vec![registry_package_of("npm", "mcp-grafana", "0.3.3")],
+            remotes: Vec::new(),
+        };
+        // With no repository, the registry's own namespace still names the account.
+        assert_eq!(
+            registry_icon(&server).as_deref(),
+            Some("https://github.com/dockndevai.png?size=96")
+        );
+
+        // A repository is the direct statement, and it wins over the namespace.
+        server.name = "io.example/anything".to_string();
+        server.repository = Some(RegistryRepository::Url(
+            "https://github.com/grafana/mcp-grafana.git".to_string(),
+        ));
+        assert_eq!(
+            registry_icon(&server).as_deref(),
+            Some("https://github.com/grafana.png?size=96")
+        );
+
+        // A picture the publisher did offer is still what the card shows.
+        server.icons.push(RegistryIcon {
+            src: Some("https://cdn.example/icon.png".to_string()),
+        });
+        assert_eq!(
+            registry_icon(&server).as_deref(),
+            Some("https://cdn.example/icon.png")
+        );
+
+        // The entry the grid receives carries the same picture.
+        let mut record = registry_record(
+            "io.github.itzhouq/grafana-mcp",
+            vec![registry_package_of("npm", "grafana-mcp", "0.1.3")],
+        );
+        record.server.as_mut().expect("a record").repository = Some(RegistryRepository::Url(
+            "https://github.com/itzhouq/grafana-mcp".to_string(),
+        ));
+        let entry = registry_server_to_entry(&record).expect("an installable entry");
+        assert_eq!(
+            entry.icon_url.as_deref(),
+            Some("https://github.com/itzhouq.png?size=96")
+        );
+    }
+
+    /// A repository address names its owner however the record spells it, and a
+    /// string that is not an account name is refused rather than turned into an
+    /// address the market would fetch.
+    #[test]
+    fn a_repository_address_names_its_github_owner() {
+        for (raw, owner) in [
+            ("https://github.com/grafana/mcp-grafana", Some("grafana")),
+            (
+                "https://github.com/grafana/mcp-grafana.git",
+                Some("grafana"),
+            ),
+            (
+                "git+https://github.com/grafana/mcp-grafana.git",
+                Some("grafana"),
+            ),
+            (
+                "ssh://git@github.com/grafana/mcp-grafana.git",
+                Some("grafana"),
+            ),
+            ("git@github.com:grafana/mcp-grafana.git", Some("grafana")),
+            (
+                "https://www.github.com/grafana/mcp-grafana",
+                Some("grafana"),
+            ),
+            ("https://gitlab.com/grafana/mcp-grafana", None),
+            ("https://github.com/", None),
+            ("https://github.com/owner%2Fsub/repo", None),
+            ("https://github.com/-bad-/repo", None),
+            ("not a url", None),
+        ] {
+            assert_eq!(
+                github_repository_owner(raw).as_deref(),
+                owner,
+                "owner of {raw}"
+            );
+        }
+    }
+
+    /// A namespace that is not shaped like an account keeps no picture, so the
+    /// card falls back to its transport glyph instead of fetching something else.
+    #[test]
+    fn a_namespace_that_is_not_a_login_keeps_no_picture() {
+        for name in [
+            "io.github./server",
+            "io.github.bad.owner/server",
+            "io.example/server",
+            "io.github.owner",
+        ] {
+            let record = registry_record(name, vec![registry_package_of("npm", "server", "1.0.0")]);
+            let entry = registry_server_to_entry(&record).expect("an installable entry");
+            assert_eq!(entry.icon_url, None, "{name} produced a picture");
+        }
+    }
+
     /// A withdrawn entry is not something the market may offer: installing it
     /// would write a launcher that cannot run.
     #[test]
@@ -3107,6 +3297,41 @@ mod tests {
                 .as_deref()
                 .is_some_and(|mime| mime.starts_with("image/")),
             "the picture's type is {:?}",
+            icon.mime
+        );
+    }
+
+    /// The fallback picture is the account's avatar, fetched through the same
+    /// policy as a published one: GitHub answers with a redirect to its avatar
+    /// host, and the runtime follows it hop by hop.
+    #[test]
+    #[ignore = "hits the live MCP registry and GitHub"]
+    fn live_owner_avatar_loads_for_an_entry_without_a_picture() {
+        let response = search_mcp_registry(&McpMarketSearchRequest {
+            query: Some("grafana".to_string()),
+            limit: Some(20),
+            offset: None,
+            cursor: None,
+            transport: None,
+        })
+        .expect("the live registry answers a search");
+        let entry = response
+            .entries
+            .iter()
+            .find(|entry| {
+                entry
+                    .icon_url
+                    .as_deref()
+                    .is_some_and(|url| url.ends_with(".png?size=96"))
+            })
+            .expect("an entry that names an account but published no picture");
+        let icon = load_market_icon(&entry.id).expect("the owner's avatar loads");
+        assert!(!icon.is_empty(), "the avatar came back empty");
+        assert!(
+            icon.mime
+                .as_deref()
+                .is_some_and(|mime| mime.starts_with("image/")),
+            "the avatar's type is {:?}",
             icon.mime
         );
     }

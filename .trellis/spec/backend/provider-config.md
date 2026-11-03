@@ -1152,13 +1152,18 @@ ProviderConfigService::search_skill_market(SkillMarketSearchRequest)
   secret becomes a `MarketEnvRequirement` with
   `target: MarketEnvTarget::Header`, and the install writes it into
   `McpServerCreateRequest::headers` rather than `env`.
-- **An entry's picture is the publisher's URL, loaded by the authority.**
+- **An entry's picture is its own, or the account it belongs to.**
   `McpMarketEntry::icon_url` is the first `icons[].src` that passes the market's
-  public-`https` policy. `mcp_market_icon` fetches it through the same redirect
-  and size policy (1 MiB cap), decides the media type from the bytes rather than
-  the address, and caches by entry id. A client renders the returned bytes; it
-  never fetches a publisher URL itself, which is what makes the picture work on
-  a paired device.
+  public-`https` policy. Most records publish none, so the fallback is the GitHub
+  account the entry names — the owner of its `repository`, else the
+  `io.github.<owner>` namespace it is registered under — at
+  `https://github.com/<owner>.png?size=96`, the same owner avatar the Skill
+  market leads with. An entry that names no account keeps no picture.
+  `mcp_market_icon` fetches whichever address was chosen through the same
+  redirect and size policy (1 MiB cap), decides the media type from the bytes
+  rather than the address, and caches by entry id. A client renders the returned
+  bytes; it never fetches a publisher URL itself, which is what makes the picture
+  work on a paired device.
 - **The Skill market reads a public catalog, not a registry API.**
   `GET https://www.skills.sh/api/search?q=&limit=` ranks the catalog against a
   query; the browse list is the array the catalog's home page renders
@@ -1197,7 +1202,9 @@ ProviderConfigService::search_skill_market(SkillMarketSearchRequest)
   answered nothing is an outage; a read that answered an empty list is a search
   that found nothing, and the two are reported differently.
 - An entry whose picture fails to load keeps the transport glyph. A market
-  never invents a picture, just as it never invents an entry.
+  never invents a picture, just as it never invents an entry: an owner avatar is
+  derived from the repository or namespace the record published, not chosen for
+  it.
 
 ### 5. Tests
 

@@ -96,9 +96,11 @@ pub struct McpMarketEntry {
     /// RFC3339 timestamp of the registry's last update to this version.
     #[serde(default)]
     pub updated_at: Option<String>,
-    /// Picture the registry published for this entry, when it published one.
+    /// Picture the card leads with, when the entry names one.
     ///
-    /// It is the publisher's own address, not a copy: the market loads it
+    /// It is the picture the registry published, or, when it published none, the
+    /// avatar of the GitHub account the entry belongs to. Either way it is a
+    /// public address the publisher controls, not a copy: the market loads it
     /// through the runtime so a paired client shows the same picture without
     /// reaching the publisher itself.
     #[serde(default)]
