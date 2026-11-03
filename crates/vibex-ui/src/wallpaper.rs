@@ -304,14 +304,16 @@ mod tests {
     /// past the dark ones is what the regression looked like.
     #[test]
     fn a_light_appearance_fades_less_than_a_dark_one() {
-        assert!(
-            WallpaperSurfaces::LIGHT.base < WallpaperSurfaces::DARK.base,
-            "the light page must stay clearer than the dark one"
-        );
-        assert!(
-            WallpaperSurfaces::LIGHT.raised < WallpaperSurfaces::DARK.raised,
-            "the light plates must stay clearer than the dark ones"
-        );
+        const {
+            assert!(
+                WallpaperSurfaces::LIGHT.base < WallpaperSurfaces::DARK.base,
+                "the light page must stay clearer than the dark one"
+            );
+            assert!(
+                WallpaperSurfaces::LIGHT.raised < WallpaperSurfaces::DARK.raised,
+                "the light plates must stay clearer than the dark ones"
+            );
+        }
         // Still frosted rather than transparent: the page keeps enough of the
         // veil for ink to read, and a plate stays a step above the page it sits
         // on so the two never collapse into one surface.
