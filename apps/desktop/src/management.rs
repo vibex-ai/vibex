@@ -50,6 +50,7 @@ use gpui_component::{
     separator::Separator,
     switch::Switch,
     tab::{Tab, TabBar},
+    table::{Column, DataTable, TableDelegate, TableState},
     tag::Tag,
     tooltip::Tooltip,
     v_flex, v_virtual_list,
@@ -157,6 +158,11 @@ const MANAGEMENT_COMPACT_RESIZE_STEP: f32 = 16.0;
 const MANAGEMENT_DETAIL_ACTION_HEIGHT: f32 = 42.0;
 const MANAGEMENT_PROVIDER_ROW_HEIGHT: f32 = 72.0;
 const MANAGEMENT_PROVIDER_ROW_GAP: f32 = 8.0;
+/// One member row in the route-group editor.
+///
+/// Members are stacked with a hairline between them rather than the Provider
+/// card's gap, so this is the row's own height and the drag math's stride.
+const MANAGEMENT_ROUTE_MEMBER_ROW_HEIGHT: f32 = 56.0;
 /// The interface chrome the Prompt editor's body must leave visible.
 ///
 /// The management title bar, the section heading, the pane's inset, the card's
@@ -963,6 +969,107 @@ struct RouteGroupDisplayOrderDragState {
     preview_ids: Vec<String>,
 }
 
+/// What one draft member's grip carries while it is dragged.
+///
+/// A member belongs to a draft rather than to a saved record, so the payload
+/// repeats what the row shows — its Provider mark and model — instead of an id
+/// the preview would have to look up from the card that started the drag.
+#[derive(Clone)]
+struct RouteMemberOrderDrag {
+    member_id: String,
+    provider: Option<vibex_core::ModelProviderProfile>,
+    provider_name: String,
+    model_id: String,
+    enabled: bool,
+}
+
+impl Render for RouteMemberOrderDrag {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        h_flex()
+            .w(px(MANAGEMENT_PROVIDER_DRAG_PREVIEW_WIDTH))
+            .min_w(px(360.0))
+            .min_h(px(MANAGEMENT_PROVIDER_ROW_HEIGHT))
+            .overflow_hidden()
+            .rounded(px(14.0))
+            .border_1()
+            .border_color(cx.theme().drag_border)
+            .bg(cx.theme().popover)
+            .text_color(cx.theme().popover_foreground)
+            .shadow_lg()
+            .opacity(0.92)
+            .child(
+                div()
+                    .w(px(36.0))
+                    .h(px(MANAGEMENT_PROVIDER_ROW_HEIGHT))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        Icon::default()
+                            .path("icons/vibex/grip-vertical.svg")
+                            .size(px(18.0))
+                            .text_color(cx.theme().muted_foreground.opacity(0.72)),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .min_w_0()
+                    .flex_1()
+                    .items_center()
+                    .gap_3()
+                    .pr_3()
+                    .child(match self.provider.as_ref() {
+                        Some(provider) => provider_logo_mark(provider, px(24.0), cx),
+                        None => provider_workspace::ws_icon_mark(
+                            "icons/vibex/database.svg",
+                            px(24.0),
+                            Some(cx.theme().warning),
+                            cx,
+                        ),
+                    })
+                    .child(
+                        v_flex()
+                            .min_w_0()
+                            .flex_1()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_sm()
+                                    .font_semibold()
+                                    .when(!self.enabled, |text| {
+                                        text.text_color(cx.theme().muted_foreground)
+                                    })
+                                    .child(self.provider_name.clone()),
+                            )
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(self.model_id.clone()),
+                            ),
+                    ),
+            )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RouteMemberOrderDropTarget {
+    member_id: String,
+    after: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RouteMemberOrderDragState {
+    member_id: String,
+    original_ids: Vec<String>,
+    preview_ids: Vec<String>,
+}
+
 #[derive(Clone)]
 struct AgentProviderProjectionState {
     agent_id: String,
@@ -987,6 +1094,8 @@ enum ManagementMutation {
         action: String,
     },
     ProviderPreview(String),
+    /// Writing one Agent's Provider display order after a drag.
+    ProviderDisplayOrder(String),
     AgentToggle(String),
     AgentInstall(String),
     AgentRollback(String),
@@ -1137,6 +1246,7 @@ impl ManagementMutation {
             Self::ProviderProbe(id) => format!("provider:probe:{id}"),
             Self::AgentAuth { agent_id, action } => format!("agent:auth:{agent_id}:{action}"),
             Self::ProviderPreview(id) => format!("provider:preview:{id}"),
+            Self::ProviderDisplayOrder(id) => format!("provider:display-order:{id}"),
             Self::AgentToggle(id) => format!("agent:toggle:{id}"),
             Self::AgentInstall(id) => format!("agent:install:{id}"),
             Self::AgentRollback(id) => format!("agent:rollback:{id}"),
@@ -1179,7 +1289,8 @@ impl ManagementMutation {
             | Self::AgentInstall(agent_id)
             | Self::AgentRollback(agent_id)
             | Self::AgentUpdateCheck(agent_id)
-            | Self::AgentUninstall(agent_id) => Some(agent_id),
+            | Self::AgentUninstall(agent_id)
+            | Self::ProviderDisplayOrder(agent_id) => Some(agent_id),
             _ => None,
         }
     }
@@ -1326,6 +1437,9 @@ pub struct ManagementCenter {
     gateway_requests_loading: bool,
     /// Invalidates an older request-list read when the range changes.
     gateway_requests_generation: u64,
+    /// The Routing tab's request records, made once and then handed each
+    /// redraw's rows. `None` until the tab first draws.
+    route_requests_table: Option<Entity<provider_workspace::RouteRequestsTable>>,
     /// Requests the gateway is serving right now, newest last.
     ///
     /// The ledger draws them ahead of finished rows: a request that is still
@@ -1951,6 +2065,12 @@ pub struct ManagementCenter {
     route_group_display_order: BTreeMap<String, i64>,
     route_group_display_order_drag_state: Option<RouteGroupDisplayOrderDragState>,
     route_group_display_order_drop_target: Option<RouteGroupDisplayOrderDropTarget>,
+    /// The member row being dragged inside the open route-group draft.
+    ///
+    /// The draft is not saved while the drag runs, so the order is local: the
+    /// preview list is the only record and Save writes it.
+    route_member_order_drag_state: Option<RouteMemberOrderDragState>,
+    route_member_order_drop_target: Option<RouteMemberOrderDropTarget>,
     selected_mcp_id: Option<String>,
     selected_skill_id: Option<String>,
     selected_scheduled_task_id: Option<String>,
@@ -3103,6 +3223,8 @@ impl ManagementCenter {
             route_group_display_order: BTreeMap::new(),
             route_group_display_order_drag_state: None,
             route_group_display_order_drop_target: None,
+            route_member_order_drag_state: None,
+            route_member_order_drop_target: None,
             selected_agent_id: None,
             agent_tools: vibex_core::AgentToolPreferences::default(),
             computer_tools_ready: false,
@@ -3151,6 +3273,7 @@ impl ManagementCenter {
             gateway_requests_has_more: false,
             gateway_requests_loading: false,
             gateway_requests_generation: 0,
+            route_requests_table: None,
             gateway_inflight: Vec::new(),
             gateway_route_stage: None,
             gateway_route_pinned: None,
@@ -5974,6 +6097,8 @@ impl ManagementCenter {
         self.provider_display_order_drop_target = None;
         self.route_group_display_order_drag_state = None;
         self.route_group_display_order_drop_target = None;
+        self.route_member_order_drag_state = None;
+        self.route_member_order_drop_target = None;
         self.model_provider_agent_ids = snapshot.model_provider_agent_ids;
         self.acp_configs = snapshot.acp_configs;
         self.native_import_preview = snapshot.native_import_preview;
@@ -10711,6 +10836,170 @@ impl ManagementCenter {
         rows
     }
 
+    /// The Provider rows in the order the card draws them.
+    ///
+    /// The stored order is the display order this Agent already set, with any
+    /// row it never placed last. The sort is stable, so unplaced rows keep the
+    /// order the snapshot delivered them in — the same order the card draws.
+    fn ordered_provider_profile_ids(
+        &self,
+        profiles: &[vibex_desktop_model::ProviderProfileProjection],
+    ) -> Vec<String> {
+        let mut rows = profiles.to_vec();
+        rows.sort_by_key(|profile| {
+            (
+                !self
+                    .provider_display_order
+                    .contains_key(profile.id.as_str()),
+                self.provider_display_order
+                    .get(profile.id.as_str())
+                    .copied()
+                    .unwrap_or(i64::MAX),
+            )
+        });
+        rows.into_iter().map(|profile| profile.id).collect()
+    }
+
+    fn start_provider_profile_drag(
+        &mut self,
+        agent_id: &str,
+        profile_id: &str,
+        cursor_offset_y: f32,
+        cx: &mut Context<Self>,
+    ) {
+        let rows = self.provider_rows_for_agent(agent_id);
+        let original_ids = self.ordered_provider_profile_ids(&rows);
+        if !original_ids.iter().any(|id| id == profile_id) {
+            return;
+        }
+        let initial_target = reorder_target_from_cursor_offset(
+            &original_ids,
+            profile_id,
+            cursor_offset_y,
+            MANAGEMENT_PROVIDER_ROW_HEIGHT,
+            MANAGEMENT_PROVIDER_ROW_GAP,
+        );
+        let preview_ids = initial_target
+            .as_ref()
+            .map(|(target_id, after)| {
+                reordered_provider_profile_ids(&original_ids, profile_id, target_id, *after)
+            })
+            .unwrap_or_else(|| original_ids.clone());
+        self.provider_display_order_drag_state = Some(ProviderDisplayOrderDragState {
+            agent_id: agent_id.to_string(),
+            profile_id: profile_id.to_string(),
+            preview_ids,
+            original_ids,
+        });
+        self.provider_display_order_drop_target = initial_target
+            .map(|(profile_id, after)| ProviderDisplayOrderDropTarget { profile_id, after });
+        cx.notify();
+    }
+
+    fn finish_provider_profile_drag(
+        &mut self,
+        agent_id: &str,
+        profile_id: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let valid_drag = self
+            .provider_display_order_drag_state
+            .as_ref()
+            .is_some_and(|state| state.agent_id == agent_id && state.profile_id == profile_id);
+        if !valid_drag {
+            return;
+        }
+        self.provider_display_order_drop_target = None;
+        let state = self
+            .provider_display_order_drag_state
+            .take()
+            .expect("validated provider drag state above");
+        if state.preview_ids == state.original_ids {
+            cx.notify();
+            return;
+        }
+        self.persist_provider_profile_order(&state.agent_id, state.preview_ids, cx);
+    }
+
+    fn persist_provider_profile_order(
+        &mut self,
+        agent_id: &str,
+        ordered_ids: Vec<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Ok(parsed_agent_id) = AgentId::parse(agent_id.to_string()) else {
+            return;
+        };
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        if ordered_ids == self.ordered_provider_profile_ids(&self.provider_rows_for_agent(agent_id))
+        {
+            return;
+        }
+        let active_locale = locale::current_locale();
+        let entries = ordered_ids
+            .iter()
+            .map(
+                |provider_profile_id| vibex_core::AgentModelProviderDisplayOrderSetEntry {
+                    provider_profile_id: vibex_core::ProviderProfileId::parse(
+                        provider_profile_id.clone(),
+                    )
+                    .expect("provider profile ids originate from the loaded snapshot"),
+                },
+            )
+            .collect::<Vec<_>>();
+        self.provider_display_order
+            .extend(ordered_ids.iter().enumerate().map(|(index, profile_id)| {
+                (
+                    profile_id.clone(),
+                    i64::try_from(index).expect("provider order index fits in i64"),
+                )
+            }));
+        cx.notify();
+        self.begin_simple_task(
+            ManagementMutation::ProviderDisplayOrder(agent_id.to_string()),
+            cx,
+            async move {
+                backend
+                    .management()
+                    .set_agent_model_provider_display_order(MutationRequest::new(
+                        vibex_core::AgentModelProviderDisplayOrderSetRequest {
+                            agent_id: parsed_agent_id,
+                            entries,
+                        },
+                    ))
+                    .await
+                    .map_err(crate::app::remote_error_into_vibex)?;
+                Ok(management_locale_text_for(
+                    active_locale,
+                    "Provider order updated",
+                    "模型供应商顺序已更新",
+                    "模型供應商順序已更新",
+                )
+                .to_string())
+            },
+        );
+    }
+
+    /// Every Provider row recorded for one Agent, before the display order is
+    /// applied.
+    ///
+    /// This is the whole set, not only the rows drawn: the display-order write
+    /// replaces the Agent's order and is rejected unless it names every Profile
+    /// the Agent holds. The card may draw fewer when a binding is missing.
+    fn provider_rows_for_agent(
+        &self,
+        agent_id: &str,
+    ) -> Vec<vibex_desktop_model::ProviderProfileProjection> {
+        self.snapshot
+            .profiles
+            .iter()
+            .filter(|profile| profile.agent_id == agent_id)
+            .cloned()
+            .collect()
+    }
+
     fn preview_provider_profile_reorder(
         &mut self,
         drag: &ProviderDisplayOrderDrag,
@@ -10859,6 +11148,114 @@ impl ManagementCenter {
         cx.notify();
     }
 
+    /// The draft member ids in the order the editor draws them.
+    fn route_member_order_ids(&self) -> Vec<String> {
+        self.route_group_model_members
+            .iter()
+            .map(|member| member.id.as_str().to_string())
+            .collect()
+    }
+
+    /// Starts dragging one draft member, taking the click's place on the row
+    /// into account so a fast drag lands where it was pointed at once.
+    fn start_route_member_drag(
+        &mut self,
+        member_id: &str,
+        cursor_offset_y: f32,
+        cx: &mut Context<Self>,
+    ) {
+        let original_ids = self.route_member_order_ids();
+        if !original_ids.iter().any(|id| id == member_id) {
+            return;
+        }
+        let initial_target = reorder_target_from_cursor_offset(
+            &original_ids,
+            member_id,
+            cursor_offset_y,
+            MANAGEMENT_ROUTE_MEMBER_ROW_HEIGHT,
+            0.0,
+        );
+        let preview_ids = initial_target
+            .as_ref()
+            .map(|(target_id, after)| {
+                reordered_provider_profile_ids(&original_ids, member_id, target_id, *after)
+            })
+            .unwrap_or_else(|| original_ids.clone());
+        self.route_member_order_drag_state = Some(RouteMemberOrderDragState {
+            member_id: member_id.to_string(),
+            preview_ids,
+            original_ids,
+        });
+        self.route_member_order_drop_target = initial_target
+            .map(|(member_id, after)| RouteMemberOrderDropTarget { member_id, after });
+        cx.notify();
+    }
+
+    fn preview_route_member_reorder(
+        &mut self,
+        drag: &RouteMemberOrderDrag,
+        target_id: &str,
+        after: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(state) = self
+            .route_member_order_drag_state
+            .as_mut()
+            .filter(|state| state.member_id == drag.member_id)
+        else {
+            return;
+        };
+        let next_target = RouteMemberOrderDropTarget {
+            member_id: target_id.to_string(),
+            after,
+        };
+        let next_ids =
+            reordered_provider_profile_ids(&state.original_ids, &drag.member_id, target_id, after);
+        if self.route_member_order_drop_target.as_ref() == Some(&next_target)
+            && state.preview_ids == next_ids
+        {
+            return;
+        }
+        state.preview_ids = next_ids;
+        self.route_member_order_drop_target = Some(next_target);
+        cx.notify();
+    }
+
+    /// Commits the previewed member order into the draft.
+    ///
+    /// Nothing is written to the authority here: the Members tab edits a draft,
+    /// and its Save owns the write. The order is therefore persisted only once,
+    /// with everything else the reader changed.
+    fn finish_route_member_drag(&mut self, member_id: &str, cx: &mut Context<Self>) {
+        let valid_drag = self
+            .route_member_order_drag_state
+            .as_ref()
+            .is_some_and(|state| state.member_id == member_id);
+        if !valid_drag {
+            return;
+        }
+        self.route_member_order_drop_target = None;
+        let state = self
+            .route_member_order_drag_state
+            .take()
+            .expect("validated route member drag state above");
+        if state.preview_ids == state.original_ids {
+            cx.notify();
+            return;
+        }
+        let mut members = std::mem::take(&mut self.route_group_model_members);
+        members.sort_by_key(|member| {
+            state
+                .preview_ids
+                .iter()
+                .position(|id| id == member.id.as_str())
+                .unwrap_or(usize::MAX)
+        });
+        self.route_group_model_members = members;
+        self.reindex_route_group_model_members();
+        cx.notify();
+    }
+
     /// Seeds the drag order from the workbench's persisted UI state.
     ///
     /// The composer reads the same map, so the first paint of the Agent card
@@ -10947,7 +11344,13 @@ impl ManagementCenter {
                         | ManagementMutation::AgentUninstall(_)
                         | ManagementMutation::AgentDiscovery
                 );
-                let refresh_after_failure = agent_registry_changed;
+                // The order is optimistic: a rejected write leaves the card
+                // showing the dropped order, so read it back.
+                let refresh_after_failure = agent_registry_changed
+                    || matches!(
+                        &completed_mutation,
+                        ManagementMutation::ProviderDisplayOrder(_)
+                    );
                 match outcome {
                     Ok(Ok(success)) => {
                         match &completed_mutation {
@@ -28879,6 +29282,8 @@ impl ManagementCenter {
         self.route_group_editor_open = true;
         self.route_group_editing_id = None;
         self.route_group_editor_from_agent = from_agent;
+        self.route_member_order_drag_state = None;
+        self.route_member_order_drop_target = None;
         self.route_group_name_error = None;
         self.route_group_member_efforts.clear();
         self.route_group_model_members.clear();
@@ -29094,6 +29499,8 @@ impl ManagementCenter {
         self.route_group_editor_open = true;
         self.route_group_editing_id = Some(route.id.clone());
         self.route_group_editor_from_agent = from_agent;
+        self.route_member_order_drag_state = None;
+        self.route_member_order_drop_target = None;
         self.route_group_name_error = None;
         self.route_group_model_members = route.members.clone();
         self.route_group_unlists = route.unlists;
@@ -29185,6 +29592,8 @@ impl ManagementCenter {
         self.route_group_editing_id = None;
         self.route_group_editor_from_agent = false;
         self.route_group_name_error = None;
+        self.route_member_order_drag_state = None;
+        self.route_member_order_drop_target = None;
         self.route_group_model_members.clear();
         self.route_group_member_efforts.clear();
         self.route_group_unlists = false;
@@ -32697,6 +33106,22 @@ impl ManagementCenter {
                         })),
                     management_delete_profile_label(),
                 ));
+            let drag_payload = ProviderDisplayOrderDrag {
+                agent_id: selected_agent_id.clone(),
+                profile_id: id.clone(),
+                kind: profile.kind,
+                label: profile.display_name.clone(),
+                is_default,
+                address: address.clone(),
+                model_count: management_model_count(profile.configured_model_count),
+            };
+            let drag_entity = cx.weak_entity();
+            let drag_agent_id = selected_agent_id.clone();
+            let drag_profile_id = id.clone();
+            let release_agent_id = selected_agent_id.clone();
+            let release_profile_id = id.clone();
+            let release_out_agent_id = selected_agent_id.clone();
+            let release_out_profile_id = id.clone();
             let drag_handle = div()
                 .id(SharedString::from(format!("provider-drag-handle-{id}")))
                 .flex_none()
@@ -32705,15 +33130,12 @@ impl ManagementCenter {
                 .flex()
                 .items_center()
                 .justify_center()
-                // Reordering moved to the routing section, where a member's
-                // position *is* its attempt order. Two surfaces that can both
-                // change the order would fight: the last write would win and the
-                // other would look broken.
+                .cursor_grab()
                 .tooltip(move |window, cx| {
                     Tooltip::new(management_locale_text(
-                        "Order is set in the routing section above",
-                        "顺序已移到上方的路由分区",
-                        "順序已移到上方的路由分區",
+                        "Drag to reorder Providers",
+                        "拖动调整供应商顺序",
+                        "拖動調整供應商順序",
                     ))
                     .build(window, cx)
                 })
@@ -32723,10 +33145,41 @@ impl ManagementCenter {
                         .size(px(18.0))
                         .text_color(cx.theme().muted_foreground.opacity(0.65)),
                 )
-                // No drag handlers: ordering moved to the routing section, where
-                // a member's position is its attempt order. Leaving the handlers
-                // in place would let two surfaces reorder the same list.
-                ;
+                // A release outside any row still ends the drag where the
+                // preview last stood, and a release on the handle does so even
+                // when no row claimed the drop.
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        this.finish_provider_profile_drag(
+                            &release_agent_id,
+                            &release_profile_id,
+                            cx,
+                        );
+                    }),
+                )
+                .on_mouse_up_out(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        this.finish_provider_profile_drag(
+                            &release_out_agent_id,
+                            &release_out_profile_id,
+                            cx,
+                        );
+                    }),
+                )
+                .on_drag(drag_payload, move |drag, cursor_offset, _, cx| {
+                    cx.stop_propagation();
+                    let _ = drag_entity.update(cx, |this, cx| {
+                        this.start_provider_profile_drag(
+                            &drag_agent_id,
+                            &drag_profile_id,
+                            f32::from(cursor_offset.y),
+                            cx,
+                        );
+                    });
+                    cx.new(|_| drag.clone())
+                });
             let active_drop_after = active_drop_target
                 .as_ref()
                 .and_then(|target| (target.profile_id == id).then_some(target.after));
@@ -32832,6 +33285,11 @@ impl ManagementCenter {
                         }
                     },
                 ))
+                .on_drop(
+                    cx.listener(move |this, drag: &ProviderDisplayOrderDrag, _, cx| {
+                        this.finish_provider_profile_drag(&drag.agent_id, &drag.profile_id, cx);
+                    }),
+                )
                 .child(drag_handle)
                 .child(selectable)
                 .child(actions);
@@ -36993,6 +37451,38 @@ fn reordered_provider_profile_ids(
 /// Agents may reference the same group and arrange their lists differently.
 fn route_group_order_key(agent_id: &str, route_id: &str) -> String {
     format!("{agent_id}:{route_id}")
+}
+
+/// The row the pointer has dragged far enough to land on, and on which side.
+///
+/// The kit reports the pointer's offset within the dragged handle, so a quick
+/// drag can cross several rows before the first move event: this resolves the
+/// whole jump instead of waiting for the pointer to enter the next row.
+fn reorder_target_from_cursor_offset(
+    ordered_ids: &[String],
+    moving_id: &str,
+    cursor_offset_y: f32,
+    row_height: f32,
+    row_gap: f32,
+) -> Option<(String, bool)> {
+    let moving_index = ordered_ids.iter().position(|id| id == moving_id)?;
+    let stride = row_height + row_gap;
+    if stride <= 0.0 {
+        return None;
+    }
+    let row_delta = ((cursor_offset_y - row_height / 2.0) / stride).round() as isize;
+    if row_delta == 0 {
+        return None;
+    }
+    let target_index = moving_index
+        .saturating_add_signed(row_delta)
+        .min(ordered_ids.len().saturating_sub(1));
+    (target_index != moving_index).then(|| {
+        (
+            ordered_ids[target_index].clone(),
+            target_index > moving_index,
+        )
+    })
 }
 
 fn provider_reorder_row_offset(
@@ -48988,15 +49478,14 @@ mod tests {
         assert!(!version_row.contains("content = content.child(\n                div()"));
     }
 
-    /// Provider rows no longer reorder by dragging.
+    /// Provider rows reorder by dragging.
     ///
-    /// §7.6 of the routing design moved ordering to the routing section, where a
-    /// member's position is its attempt order. Two surfaces that can both change
-    /// the order fight: the last write wins and the other looks broken. The
-    /// mechanism is still in the source — it is the routing section that needs
-    /// it — so this asserts the Provider card stops offering it.
+    /// The card's order is the order its Providers are tried in, and the grip
+    /// writes it through the display-order contract. A card that only told the
+    /// reader the order lived elsewhere made every reorder a trip to another
+    /// surface.
     #[test]
-    fn provider_rows_no_longer_reorder_by_dragging() {
+    fn provider_rows_reorder_by_dragging() {
         let source = include_str!("management.rs");
         let render = source
             .split_once("    fn render_providers(")
@@ -49004,19 +49493,22 @@ mod tests {
             .map(|(body, _)| body)
             .expect("Provider renderer should remain inspectable");
         assert!(render.contains("provider-drag-handle-"));
+        assert!(render.contains(".cursor_grab()"));
+        assert!(render.contains(".on_drag("));
+        assert!(render.contains(".on_drag_move(cx.listener("));
+        assert!(render.contains(".on_mouse_up_out("));
+        assert!(render.contains("start_provider_profile_drag("));
+        assert!(render.contains("finish_provider_profile_drag("));
         assert!(
-            !render.contains(".cursor_grab()"),
-            "the Provider card must not offer a drag handle any more: ordering lives in the routing section"
+            render.contains("Drag to reorder Providers"),
+            "the handle should say what dragging it does"
         );
-        assert!(
-            !render.contains("finish_provider_profile_drag("),
-            "and must not persist an order of its own"
-        );
-        assert!(
-            render.contains("Order is set in the routing section above"),
-            "it should say where the order moved to, not simply stop working"
-        );
+        assert!(source.contains("set_agent_model_provider_display_order"));
         assert!(render.contains("MANAGEMENT_PROVIDER_ROW_HEIGHT"));
+        assert!(
+            source.contains("impl Render for ProviderDisplayOrderDrag"),
+            "the pointer carries a preview of the row it dragged"
+        );
         assert!(render.contains("Transition::new(Duration::from_millis("));
         assert!(source.contains(".shadow_lg()"));
         assert!(render.contains("preview_provider_profile_reorder("));
@@ -49070,6 +49562,89 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         assert_eq!(reordered_provider_profile_ids(&ids, "b", "b", false), ids);
+    }
+
+    /// A quick drag crosses several rows before the first move event.
+    ///
+    /// The kit only reports the pointer's offset in the grabbed handle, so the
+    /// first update has to resolve the whole jump; waiting for the pointer to
+    /// enter the next row leaves a fast drag stuck on the row it started on.
+    #[test]
+    fn provider_reorder_fast_initial_motion_selects_a_target() {
+        let ids = ["a", "b", "c", "d"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            reorder_target_from_cursor_offset(
+                &ids,
+                "b",
+                MANAGEMENT_PROVIDER_ROW_HEIGHT / 2.0
+                    + 2.0 * (MANAGEMENT_PROVIDER_ROW_HEIGHT + MANAGEMENT_PROVIDER_ROW_GAP),
+                MANAGEMENT_PROVIDER_ROW_HEIGHT,
+                MANAGEMENT_PROVIDER_ROW_GAP,
+            ),
+            Some(("d".to_string(), true))
+        );
+        assert_eq!(
+            reorder_target_from_cursor_offset(
+                &ids,
+                "c",
+                MANAGEMENT_PROVIDER_ROW_HEIGHT / 2.0
+                    - 2.0 * (MANAGEMENT_PROVIDER_ROW_HEIGHT + MANAGEMENT_PROVIDER_ROW_GAP),
+                MANAGEMENT_PROVIDER_ROW_HEIGHT,
+                MANAGEMENT_PROVIDER_ROW_GAP,
+            ),
+            Some(("a".to_string(), false))
+        );
+    }
+
+    /// Member rows reorder by dragging exactly as Provider rows do.
+    ///
+    /// The Members tab is a draft, so the drag only moves the draft: Save owns
+    /// the write, and the row order is re-indexed when the row is released.
+    #[test]
+    fn route_member_rows_reorder_by_dragging() {
+        let source = include_str!("management.rs");
+        let members = include_str!("management/provider_workspace/route_group.rs");
+        let editor = members
+            .split_once("    fn render_workspace_route_member_editor(")
+            .and_then(|(_, tail)| tail.split_once("    fn render_workspace_route_member_view"))
+            .map(|(body, _)| body)
+            .unwrap_or_else(|| {
+                members
+                    .split_once("    fn render_workspace_route_member_editor(")
+                    .map(|(_, tail)| tail)
+                    .expect("the member editor should remain inspectable")
+            });
+        assert!(editor.contains("management-model-group-grip-"));
+        assert!(editor.contains(".cursor_grab()"));
+        assert!(editor.contains(".on_drag("));
+        assert!(editor.contains(".on_drag_move(cx.listener("));
+        assert!(editor.contains(".on_mouse_up_out("));
+        assert!(editor.contains("start_route_member_drag("));
+        assert!(editor.contains("finish_route_member_drag("));
+        assert!(editor.contains("preview_route_member_reorder("));
+        assert!(
+            editor.contains("Drag to reorder members"),
+            "the grip should say what dragging it does"
+        );
+        // The row is painted at its dragged place while the draft still holds
+        // the old order, so its controls address the member by draft position.
+        assert!(editor.contains("draft_index"));
+        assert!(editor.contains("RouteMemberOrderDrag"));
+
+        let finish = source
+            .split_once("    fn finish_route_member_drag(")
+            .and_then(|(_, tail)| tail.split_once("    /// Seeds the drag order"))
+            .map(|(body, _)| body)
+            .expect("the member drag commit should remain inspectable");
+        assert!(finish.contains("preview_ids"));
+        assert!(finish.contains("reindex_route_group_model_members()"));
+        assert!(
+            !finish.contains("set_agent_model_provider_display_order"),
+            "a draft drag must not write behind the Save button"
+        );
     }
 
     #[test]
@@ -51346,7 +51921,7 @@ mod gateway_surface_tests {
             "GatewayRequestFilter::Failed",
             "management_search_input_compact(",
             "&self.gateway_request_search",
-            "v_virtual_list(",
+            "TableState::new(delegate, window, cx)",
             "GatewayRequestRange::Day(day)",
             "load_gateway_request_page(true, cx)",
         ] {
@@ -51355,6 +51930,27 @@ mod gateway_surface_tests {
                 "the request records must keep {marker}"
             );
         }
+        assert!(
+            source.contains("DataTable::new(&table)"),
+            "the records are drawn as the kit's DataTable"
+        );
+        // The card sizes itself to the page and the table scrolls inside it,
+        // so the records never stretch the card with every request.
+        let section = source
+            .split_once("        ws_section_fill(")
+            .map(|(_, tail)| {
+                tail.split_once("\n    /// Everything a record's row")
+                    .map(|(body, _)| body)
+            })
+            .flatten()
+            .expect("the records card should remain inspectable");
+        assert!(section.contains("\"management-gateway-requests\""));
+        assert!(section.contains(".flex_1()"));
+        assert!(section.contains(".min_h_0()"));
+        assert!(
+            !section.contains("清除记录…"),
+            "the clear action says what it does without trailing dots"
+        );
     }
 
     #[test]
@@ -51413,10 +52009,9 @@ mod gateway_surface_tests {
             .map(|tab| tabs.find(tab).unwrap_or_else(|| panic!("missing {tab}")))
             .collect::<Vec<_>>();
         assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
-        assert!(
-            source
-                .contains("GatewayDetailTab::Routing => self.render_workspace_gateway_routes(cx)")
-        );
+        assert!(source.contains(
+            "GatewayDetailTab::Routing => self.render_workspace_gateway_routes(window, cx)"
+        ));
         assert!(!source.contains("GatewayDetailTab::Traffic"));
         assert!(source.contains("self.render_workspace_gateway_traffic(cx)"));
         assert!(source.contains("management-gateway-detail-tabs"));
@@ -52939,19 +53534,24 @@ mod gateway_surface_tests {
     #[test]
     fn a_request_record_pins_the_route_map() {
         let source = include_str!("management/provider_workspace/routes.rs");
-        let row = source
-            .split_once("    fn render_workspace_routes_list_row(")
-            .and_then(|(_, tail)| tail.split_once("\nenum RouteListRow {"))
-            .map(|(body, _)| body)
-            .expect("the request record should remain inspectable");
-        assert!(row.contains("management-gateway-request-row-"));
-        assert!(row.contains(".on_click(cx.listener(move |this, _, _, cx|"));
-        assert!(row.contains("this.pick_gateway_route(pick.clone(), cx)"));
-        assert!(row.contains("event.keystroke.key == \"enter\""));
-        assert!(row.contains("cx.theme().list_active"));
+        let table = include_str!("management/provider_workspace/routes_delegate.rs");
+        for marker in [
+            "management-gateway-request-row-",
+            ".on_click(on_click)",
+            "view.pick_gateway_route(click_id.clone(), cx)",
+            "cx.theme().list_active",
+        ] {
+            assert!(
+                table.contains(marker),
+                "the request record must keep {marker}"
+            );
+        }
+        // Picking again replays the request rather than unpinning it.
+        assert!(source.contains("stage.replay(cx)"));
         // A failed request names why in the record, not only in the message the
         // Agent showed: the code is the one thing a reader can look up.
-        assert!(row.contains("gateway_request_error_code(done)"));
+        assert!(source.contains("gateway_request_error_code(request)"));
+        assert!(table.contains("failure_text(done, &walk)"));
     }
 
     /// A failed row names its code; a successful one has none to name.

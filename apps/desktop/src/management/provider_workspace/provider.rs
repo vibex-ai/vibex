@@ -72,7 +72,7 @@ impl ManagementCenter {
                 cx,
             ),
             body,
-            &self.workspace_detail_scroll,
+            cx,
         )
     }
 

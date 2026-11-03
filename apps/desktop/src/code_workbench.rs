@@ -4053,9 +4053,8 @@ impl CodeWorkbench {
             self.right_rail_mode = RightRailMode::Files;
             if let Some(parent) = self.parent.clone() {
                 cx.defer(move |cx| {
-                    let _ = parent.update(cx, |parent, cx| {
-                        parent.fall_back_right_rail_to_files(cx)
-                    });
+                    let _ =
+                        parent.update(cx, |parent, cx| parent.fall_back_right_rail_to_files(cx));
                 });
             }
         }
@@ -4069,7 +4068,10 @@ impl CodeWorkbench {
     /// callers have to tell that apart from a real error before deciding
     /// whether the reader is owed a notification.
     fn is_missing_repository(error: &BackendError) -> bool {
-        matches!(error.code.as_str(), "not_git_repository" | "not_working_tree")
+        matches!(
+            error.code.as_str(),
+            "not_git_repository" | "not_working_tree"
+        )
     }
 
     /// Whether a read failed because the workspace folder itself is gone.
@@ -21012,9 +21014,13 @@ mod tests {
         }
 
         // The plain-folder failure is classified as a state, not an error.
-        assert!(source.contains(
-            "matches!(error.code.as_str(), \"not_git_repository\" | \"not_working_tree\")"
-        ));
+        // Whitespace may be broken anywhere, so match on a form without it.
+        let squashed = source.split_whitespace().collect::<String>();
+        assert!(
+            squashed.contains(
+                "matches!(error.code.as_str(),\"not_git_repository\"|\"not_working_tree\")"
+            )
+        );
         assert!(
             source
                 .matches("this.disable_git_for_workspace(cx);")

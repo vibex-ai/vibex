@@ -89,15 +89,9 @@ impl ManagementCenter {
             cx,
         );
         if tab == RouteGroupDetailTab::Members {
-            ws_detail_page_fixed("management-route-group-page", header, tabs, body)
+            ws_detail_page_fixed("management-route-group-page", header, tabs, body, cx)
         } else {
-            ws_detail_page(
-                "management-route-group-page",
-                header,
-                tabs,
-                body,
-                &self.workspace_detail_scroll,
-            )
+            ws_detail_page("management-route-group-page", header, tabs, body, cx)
         }
     }
 
@@ -887,14 +881,52 @@ impl ManagementCenter {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let pending = self.mutation.is_some();
-        let members = self.route_group_model_members.clone();
+        let mut members = self.route_group_model_members.clone();
+        let active_drag = self
+            .route_member_order_drag_state
+            .clone()
+            .filter(|_| cx.has_active_drag());
+        if let Some(drag) = active_drag.as_ref() {
+            // The list follows the pointer, not the draft: the draft only moves
+            // once the row is released, so dragging never writes anything.
+            members.sort_by_key(|member| {
+                drag.preview_ids
+                    .iter()
+                    .position(|id| id == member.id.as_str())
+                    .unwrap_or(usize::MAX)
+            });
+        }
+        let active_drop_target = self
+            .route_member_order_drop_target
+            .clone()
+            .filter(|_| cx.has_active_drag());
         let mut pipeline = v_flex().w_full().min_w_0();
         for (index, member) in members.iter().enumerate() {
+            let member_id = member.id.as_str();
+            let drop_after = active_drop_target
+                .as_ref()
+                .and_then(|target| (target.member_id == member_id).then_some(target.after));
+            let reorder_offset = active_drag.as_ref().and_then(|drag| {
+                provider_reorder_row_offset(&drag.original_ids, &drag.preview_ids, member_id)
+            });
+            let reorder_animation_id =
+                active_drag
+                    .as_ref()
+                    .zip(active_drop_target.as_ref())
+                    .map(|(drag, target)| {
+                        format!(
+                            "route-member-reorder-{}-{}-{}-{member_id}",
+                            drag.member_id, target.member_id, target.after
+                        )
+                    });
             pipeline = pipeline.child(self.render_workspace_route_member_editor(
                 index,
                 member,
                 members.len(),
                 pending,
+                drop_after,
+                reorder_offset,
+                reorder_animation_id,
                 cx,
             ));
         }
@@ -918,9 +950,9 @@ impl ManagementCenter {
             .child(palette);
         let title = management_locale_text("Members", "成员", "成員");
         let description = management_locale_text(
-            "Tried from the top. Move a member to change its place.",
-            "从上往下尝试；移动成员即可调整顺序。",
-            "從上往下嘗試；移動成員即可調整順序。",
+            "Tried from the top. Drag a member to change its place.",
+            "从上往下尝试；拖动成员即可调整顺序。",
+            "從上往下嘗試；拖動成員即可調整順序。",
         );
         let count = Some(
             div()
@@ -1394,14 +1426,22 @@ impl ManagementCenter {
         )
     }
 
-    /// One editable member: its place, identity, and the controls that change
-    /// it, in fixed lanes so the rows line up.
+    /// One editable member: its grip, place, identity, and the controls that
+    /// change it, in fixed lanes so the rows line up.
+    ///
+    /// The caller passes the drag it is a part of — where the row would land and
+    /// how far it has travelled — so the row stays a plain function of the
+    /// draft's order plus the live drag.
+    #[allow(clippy::too_many_arguments)]
     fn render_workspace_route_member_editor(
         &self,
         index: usize,
         member: &vibex_core::ModelRouteMember,
         count: usize,
         pending: bool,
+        drop_after: Option<bool>,
+        reorder_offset: Option<isize>,
+        reorder_animation_id: Option<String>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let profile = self
@@ -1414,10 +1454,77 @@ impl ManagementCenter {
                 management_locale_text("Missing Provider", "供应商已不存在", "供應商已不存在")
                     .to_string()
             });
+        let member_id = member.id.as_str().to_string();
+        // The row is drawn at its dragged place while the draft still holds the
+        // old order, so every control addresses the member by id rather than by
+        // the position it happens to be painted at.
+        let draft_index = self
+            .route_group_model_members
+            .iter()
+            .position(|draft| draft.id == member.id)
+            .unwrap_or(index);
+        let drag_payload = RouteMemberOrderDrag {
+            member_id: member_id.clone(),
+            provider: profile.cloned(),
+            provider_name: provider_name.clone(),
+            model_id: member.model_id.clone(),
+            enabled: member.enabled,
+        };
+        let drag_entity = cx.weak_entity();
+        let drag_member_id = member_id.clone();
+        let release_member_id = member_id.clone();
+        let release_out_member_id = member_id.clone();
+        let move_member_id = member_id.clone();
+        let drag_handle = div()
+            .id(SharedString::from(format!(
+                "management-model-group-grip-{member_id}"
+            )))
+            .flex_none()
+            .w(px(24.0))
+            .h(px(MANAGEMENT_ROUTE_MEMBER_ROW_HEIGHT))
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor_grab()
+            .tooltip(move |window, cx| {
+                Tooltip::new(management_locale_text(
+                    "Drag to reorder members",
+                    "拖动调整成员顺序",
+                    "拖動調整成員順序",
+                ))
+                .build(window, cx)
+            })
+            .child(
+                Icon::default()
+                    .path("icons/vibex/grip-vertical.svg")
+                    .size(px(16.0))
+                    .text_color(cx.theme().muted_foreground.opacity(0.65)),
+            )
+            // A drop lands on a row, but a release outside every row still ends
+            // on the preview the pointer left behind.
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    this.finish_route_member_drag(&release_member_id, cx);
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    this.finish_route_member_drag(&release_out_member_id, cx);
+                }),
+            )
+            .on_drag(drag_payload, move |drag, cursor_offset, _, cx| {
+                cx.stop_propagation();
+                let _ = drag_entity.update(cx, |this, cx| {
+                    this.start_route_member_drag(&drag_member_id, f32::from(cursor_offset.y), cx);
+                });
+                cx.new(|_| drag.clone())
+            });
         let effort = member.reasoning_effort.clone().unwrap_or_default();
         let center = cx.weak_entity();
         let effort_menu = Button::new(SharedString::from(format!(
-            "management-model-group-effort-{index}"
+            "management-model-group-effort-{member_id}"
         )))
         .xsmall()
         .ghost()
@@ -1455,7 +1562,11 @@ impl ManagementCenter {
                     move |_, _, cx| {
                         center
                             .update(cx, |this, cx| {
-                                this.set_route_group_model_effort(index, value.to_string(), cx)
+                                this.set_route_group_model_effort(
+                                    draft_index,
+                                    value.to_string(),
+                                    cx,
+                                )
                             })
                             .ok();
                     },
@@ -1488,7 +1599,7 @@ impl ManagementCenter {
         let member_weight = member.weight;
         let weight_center = cx.weak_entity();
         let weight_menu = Button::new(SharedString::from(format!(
-            "management-model-group-weight-{index}"
+            "management-model-group-weight-{member_id}"
         )))
         .xsmall()
         .ghost()
@@ -1514,7 +1625,7 @@ impl ManagementCenter {
                         .on_click(move |_, _, cx| {
                             center
                                 .update(cx, |this, cx| {
-                                    this.set_route_group_model_weight(index, weight, cx)
+                                    this.set_route_group_model_weight(draft_index, weight, cx)
                                 })
                                 .ok();
                         }),
@@ -1533,7 +1644,7 @@ impl ManagementCenter {
                     .child(effort_menu)
                     .child(
                         Switch::new(SharedString::from(format!(
-                            "management-model-group-enabled-{index}"
+                            "management-model-group-enabled-{member_id}"
                         )))
                         .small()
                         .checked(member.enabled)
@@ -1552,7 +1663,7 @@ impl ManagementCenter {
                         })
                         .disabled(pending)
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.toggle_route_group_model_enabled(index, cx)
+                            this.toggle_route_group_model_enabled(draft_index, cx)
                         })),
                     ),
             )
@@ -1562,36 +1673,36 @@ impl ManagementCenter {
                     .gap_0p5()
                     .child(
                         Button::new(SharedString::from(format!(
-                            "management-model-group-up-{index}"
+                            "management-model-group-up-{member_id}"
                         )))
                         .xsmall()
                         .ghost()
                         .icon(IconName::ArrowUp)
                         .tooltip(management_locale_text("Move up", "上移", "上移"))
                         .accessibility_label(management_locale_text("Move up", "上移", "上移"))
-                        .disabled(pending || index == 0)
+                        .disabled(pending || draft_index == 0)
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.move_route_group_model_member(index, true, cx)
+                            this.move_route_group_model_member(draft_index, true, cx)
                         })),
                     )
                     .child(
                         Button::new(SharedString::from(format!(
-                            "management-model-group-down-{index}"
+                            "management-model-group-down-{member_id}"
                         )))
                         .xsmall()
                         .ghost()
                         .icon(IconName::ArrowDown)
                         .tooltip(management_locale_text("Move down", "下移", "下移"))
                         .accessibility_label(management_locale_text("Move down", "下移", "下移"))
-                        .disabled(pending || index + 1 >= count)
+                        .disabled(pending || draft_index + 1 >= count)
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.move_route_group_model_member(index, false, cx)
+                            this.move_route_group_model_member(draft_index, false, cx)
                         })),
                     ),
             )
             .child(
                 Button::new(SharedString::from(format!(
-                    "management-model-group-remove-{index}"
+                    "management-model-group-remove-{member_id}"
                 )))
                 .xsmall()
                 .ghost()
@@ -1608,33 +1719,104 @@ impl ManagementCenter {
                 ))
                 .disabled(pending)
                 .on_click(cx.listener(move |this, _, _, cx| {
-                    this.remove_route_group_model_member(index, cx)
+                    this.remove_route_group_model_member(draft_index, cx)
                 })),
             )
             .into_any_element();
-        ws_row(
-            SharedString::from(format!("management-model-group-member-{index}")),
-            mark,
-            div()
-                .min_w_0()
-                .truncate()
-                .text_sm()
-                .when(!member.enabled, |text| {
-                    text.text_color(cx.theme().muted_foreground)
-                })
-                .child(provider_name)
-                .into_any_element(),
-            Some(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(ws_mono_fact(member.model_id.clone(), cx))
-                    .into_any_element(),
-            ),
-            trailing,
-            index == 0,
-            cx,
-        )
-        .into_any_element()
+        let dragging = self
+            .route_member_order_drag_state
+            .as_ref()
+            .is_some_and(|state| state.member_id == member_id);
+        let row = h_flex()
+            .id(SharedString::from(format!(
+                "management-model-group-member-{member_id}"
+            )))
+            .relative()
+            .w_full()
+            .min_w_0()
+            .items_center()
+            .gap_3()
+            .py_2p5()
+            .when(index > 0, |row| {
+                row.border_t_1()
+                    .border_color(cx.theme().border.opacity(0.6))
+            })
+            .when_some(drop_after, |row, after| {
+                row.child(
+                    div()
+                        .absolute()
+                        .left_0()
+                        .right_0()
+                        .h(px(2.0))
+                        .bg(cx.theme().drag_border)
+                        .map(|line| if after { line.bottom_0() } else { line.top_0() }),
+                )
+            })
+            .when(dragging, |row| row.opacity(0.45))
+            .on_drag_move(cx.listener(
+                move |this, event: &DragMoveEvent<RouteMemberOrderDrag>, _, cx| {
+                    let drag = event.drag(cx).clone();
+                    let position = event.event.position;
+                    let inside_target = position.x >= event.bounds.left() - px(24.0)
+                        && position.x <= event.bounds.right() + px(24.0)
+                        && position.y >= event.bounds.top() - px(2.0)
+                        && position.y <= event.bounds.bottom() + px(2.0);
+                    let next = (inside_target && drag.member_id != move_member_id).then_some(
+                        RouteMemberOrderDropTarget {
+                            member_id: move_member_id.clone(),
+                            after: position.y >= event.bounds.center().y,
+                        },
+                    );
+                    if let Some(next) = next {
+                        this.preview_route_member_reorder(&drag, &next.member_id, next.after, cx);
+                    }
+                },
+            ))
+            .on_drop(
+                cx.listener(move |this, drag: &RouteMemberOrderDrag, _, cx| {
+                    this.finish_route_member_drag(&drag.member_id, cx);
+                }),
+            )
+            .child(drag_handle)
+            .child(mark)
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .gap_0p5()
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_sm()
+                            .when(!member.enabled, |text| {
+                                text.text_color(cx.theme().muted_foreground)
+                            })
+                            .child(provider_name),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(ws_mono_fact(member.model_id.clone(), cx)),
+                    ),
+            )
+            .child(h_flex().flex_none().items_center().gap_2().child(trailing));
+        if let (Some(offset), Some(animation_id)) = (reorder_offset, reorder_animation_id) {
+            Transition::new(Duration::from_millis(
+                MANAGEMENT_PROVIDER_REORDER_ANIMATION_MS,
+            ))
+            .ease(ease_out_cubic)
+            .slide_y(
+                px(offset as f32 * MANAGEMENT_ROUTE_MEMBER_ROW_HEIGHT),
+                px(0.0),
+            )
+            .apply(row, animation_id)
+            .into_any_element()
+        } else {
+            row.into_any_element()
+        }
     }
 }

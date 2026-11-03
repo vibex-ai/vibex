@@ -16,11 +16,18 @@ mod provider;
 mod route_group;
 mod route_stage;
 mod routes;
+mod routes_delegate;
 mod sidebar;
 
 pub(in crate::management) use route_group::RouteGroupFormScope;
 pub(crate) use route_stage::RouteStage;
 pub(crate) use routes::GatewayRouteTrail;
+pub(in crate::management) use routes_delegate::RouteRequestsTableDelegate;
+
+/// The records table's state, so the view can hold it by name.
+pub(in crate::management) type RouteRequestsTable =
+    gpui_component::table::TableState<RouteRequestsTableDelegate>;
+
 pub(in crate::management) use sidebar::workspace_agent_logos;
 
 impl ManagementCenter {
@@ -395,7 +402,12 @@ fn ws_tile_row(tiles: Vec<AnyElement>) -> AnyElement {
 /// the same weight as the filled brand marks it lines up with; the rounded
 /// plate stays reserved for an identity header, where it anchors the page
 /// instead of outlining every row.
-fn ws_icon_mark(path: &'static str, size: Pixels, tone: Option<Hsla>, cx: &App) -> AnyElement {
+pub(in crate::management) fn ws_icon_mark(
+    path: &'static str,
+    size: Pixels,
+    tone: Option<Hsla>,
+    cx: &App,
+) -> AnyElement {
     let tone = tone.unwrap_or(cx.theme().muted_foreground);
     div()
         .flex_none()
@@ -556,9 +568,9 @@ fn ws_detail_page(
     header: AnyElement,
     tabs: AnyElement,
     body: AnyElement,
-    scroll: &ScrollHandle,
+    cx: &App,
 ) -> AnyElement {
-    ws_detail_page_with_body(id, header, tabs, body, Some(scroll))
+    ws_detail_page_with_body(id, header, tabs, body, None, cx)
 }
 
 /// The same page for a tab whose body is already a full-height layout.
@@ -571,8 +583,9 @@ fn ws_detail_page_fixed(
     header: AnyElement,
     tabs: AnyElement,
     body: AnyElement,
+    cx: &App,
 ) -> AnyElement {
-    ws_detail_page_with_body(id, header, tabs, body, None)
+    ws_detail_page_with_body(id, header, tabs, body, None, cx)
 }
 
 fn ws_detail_page_with_body(
@@ -581,22 +594,34 @@ fn ws_detail_page_with_body(
     tabs: AnyElement,
     content: AnyElement,
     scroll: Option<&ScrollHandle>,
+    _cx: &App,
 ) -> AnyElement {
-    let body = div()
+    let mut body = div()
         .id(SharedString::from(format!("{id}-body")))
         .relative()
         .w_full()
         .min_h_0()
         .flex_1();
-    let body = match scroll {
-        Some(scroll) => body
+    if let Some(scroll) = scroll {
+        body = body
             .track_scroll(scroll)
             .overflow_y_scroll()
-            .vertical_scrollbar(scroll)
-            .child(content)
-            .into_any_element(),
-        None => body.child(content).into_any_element(),
-    };
+            .vertical_scrollbar(scroll);
+    }
+    // A page's cards fill the body whenever it is taller than them. A card
+    // that owns a scroll area of its own (a table's rows, say) needs the body
+    // to be a definite height for that area to measure against, and the
+    // stretch is what gives it one. The stack scrolls on its own once the
+    // cards together are taller than the body.
+    let body = body
+        .flex()
+        .flex_col()
+        .child(
+            // The page's stack: the same one gap between the cards, and the
+            // stretch that fills the body while the cards are shorter.
+            v_flex().w_full().min_w_0().gap_4().flex_1().child(content),
+        )
+        .into_any_element();
     v_flex()
         .id(id)
         .size_full()
@@ -1337,9 +1362,14 @@ mod tests {
             .find("flex_none().child(tabs)")
             .expect("the tab bar must not shrink or scroll");
         let body = page
-            .find(".flex_1()")
+            .rfind(".child(body)")
             .expect("the body takes the remaining height");
         assert!(header < tabs && tabs < body);
+        // The cards stretch into the body's height, so a card that scrolls
+        // inside itself (the records table) has a definite height to measure.
+        assert!(
+            page.contains(".flex()\n        .flex_col()") || page.contains(".flex().flex_col()")
+        );
         assert!(page.contains(".track_scroll("));
         assert!(page.contains(".overflow_y_scroll()"));
         assert!(page.contains(".vertical_scrollbar("));

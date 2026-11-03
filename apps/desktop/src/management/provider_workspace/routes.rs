@@ -12,12 +12,15 @@
 //! it. The ledger adds what the announcements do not say — which Key refused
 //! and why — once the request has been written down.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 
+pub(super) use super::route_stage::agent_hue;
 use super::route_stage::{
     FlightClock, HubState, LaneTone, RouteStage, StageAgent, StageFlight, StageHub, StageKey,
-    StageLane, StageModel, StageRow, StageStep, StepVerdict, agent_hue,
+    StageLane, StageModel, StageRow, StageStep, StepVerdict,
 };
+use super::routes_delegate::{RouteRequestsSnapshot, RouteRequestsTableDelegate};
 use super::*;
 
 /// How many requests the map remembers having watched.
@@ -29,16 +32,56 @@ const LINGER_MS: i64 = 12_000;
 /// The live map's room.
 const STAGE_AGENTS: usize = 4;
 const STAGE_LANES: usize = 10;
-/// The height of one request record; the list is virtualised on it.
+/// The height of one request record, as the records table draws it.
 const ROUTE_ROW_H: f32 = 36.0;
-/// The request list's fixed lanes, in rems. The head and every row read the
-/// same numbers, so their columns line up at any window width.
-const ROUTE_TIME_W: f32 = 4.5;
-/// Wide enough for latency, tokens, cache share, and speed in one line; the
-/// row truncates only when the window is too narrow for the table itself.
-const ROUTE_METRICS_W: f32 = 21.0;
 /// The id a request without an Agent is drawn under.
-const UNKNOWN_AGENT: &str = "agent";
+pub(super) const UNKNOWN_AGENT: &str = "agent";
+
+/// One record of the records table: a request still running, or one the
+/// ledger has written down.
+#[derive(Clone)]
+pub(super) enum RouteListRow {
+    /// Boxed: the whole in-flight record would otherwise inflate every row
+    /// the table holds.
+    Live(Box<vibex_core::GatewayInflight>),
+    /// Boxed: a ledger row is several times the size of a live entry.
+    Done(Box<vibex_core::GatewayRequestSummary>),
+}
+
+impl RouteListRow {
+    pub(super) fn id(&self) -> &vibex_core::RequestId {
+        match self {
+            Self::Live(live) => &live.request_id,
+            Self::Done(done) => &done.request_id,
+        }
+    }
+}
+
+/// Why a table of records with no rows has none: nothing happened in the
+/// range, or nothing in it matches the search and the filter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum RouteRequestsEmpty {
+    Range,
+    Filter,
+}
+
+impl RouteRequestsEmpty {
+    /// What the table says instead of its rows.
+    pub(super) fn line(self) -> &'static str {
+        match self {
+            Self::Range => management_locale_text(
+                "No request in this range. Choose Live or another day above.",
+                "该时间范围内没有请求，请选择实时或其他日期。",
+                "該時間範圍內沒有請求，請選擇即時或其他日期。",
+            ),
+            Self::Filter => management_locale_text(
+                "No request matches. Clear the search or the filter.",
+                "没有匹配的请求，请清除搜索或筛选。",
+                "沒有符合的請求，請清除搜尋或篩選。",
+            ),
+        }
+    }
+}
 
 // ----- what this window heard ----------------------------------------------------------
 
@@ -281,7 +324,7 @@ impl ManagementCenter {
 
 /// What became of one step of a walk.
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum WalkVerdict {
+pub(super) enum WalkVerdict {
     Pending,
     Answered,
     /// The Key or member refused, for this reason.
@@ -296,7 +339,7 @@ enum WalkVerdict {
 
 /// One member, or one Key of a member, a request went to.
 #[derive(Clone, Debug, PartialEq)]
-struct WalkStep {
+pub(super) struct WalkStep {
     profile_id: vibex_core::ModelProviderProfileId,
     /// The Key by id, when the record names it.
     key_id: Option<String>,
@@ -307,7 +350,7 @@ struct WalkStep {
     at_ms: Option<i64>,
 }
 
-fn outcome_answered(outcome: vibex_core::GatewayRequestOutcome) -> bool {
+pub(super) fn outcome_answered(outcome: vibex_core::GatewayRequestOutcome) -> bool {
     matches!(
         outcome,
         vibex_core::GatewayRequestOutcome::Ok | vibex_core::GatewayRequestOutcome::Failover
@@ -515,7 +558,7 @@ impl Staged {
 }
 
 /// The model an Agent asked for, without the route group's address around it.
-fn asked_model(requested: &str) -> &str {
+pub(super) fn asked_model(requested: &str) -> &str {
     vibex_core::route_group_model_ref(requested)
         .map(|parsed| parsed.model_id)
         .unwrap_or(requested)
@@ -855,6 +898,10 @@ impl ManagementCenter {
                     .collect()
                 })
                 .unwrap_or_default(),
+            icons: profile
+                .and_then(|profile| profile.metadata.icon.clone())
+                .into_iter()
+                .collect(),
             title: self.workspace_provider_name(profile_id),
             model: model.to_string(),
             keys,
@@ -1106,7 +1153,7 @@ impl ManagementCenter {
 }
 
 /// One sentence written in each language, picked for the reader's.
-fn said(locale: ResolvedLocale, en: String, zh_cn: String, zh_tw: String) -> String {
+pub(super) fn said(locale: ResolvedLocale, en: String, zh_cn: String, zh_tw: String) -> String {
     match locale {
         ResolvedLocale::En => en,
         ResolvedLocale::ZhCn => zh_cn,
@@ -1265,7 +1312,7 @@ fn wire_short(id: &str) -> &str {
 /// differ the arrow is the conversion. An older in-flight event carries only
 /// the outbound side, and a row with neither (a ledger row written before the
 /// columns existed) keeps a dash rather than an empty tag.
-fn wire_pair(wire_in: &str, wire_out: &str) -> String {
+pub(super) fn wire_pair(wire_in: &str, wire_out: &str) -> String {
     match (wire_in.is_empty(), wire_out.is_empty()) {
         (true, true) => "—".to_string(),
         (true, false) => wire_short(wire_out).to_string(),
@@ -1628,20 +1675,20 @@ fn live_story(
 }
 
 /// The share of the prompt read from the vendor's cache, in whole percent.
-fn cache_share(row: &vibex_core::GatewayRequestSummary) -> Option<u64> {
+pub(super) fn cache_share(row: &vibex_core::GatewayRequestSummary) -> Option<u64> {
     let prompt = row.input_tokens.saturating_add(row.cached_read_tokens);
     (row.cached_read_tokens > 0 && prompt > 0)
         .then(|| (row.cached_read_tokens * 100 + prompt / 2) / prompt)
 }
 
 /// Output tokens a second, when the reply was long enough to say.
-fn output_speed(row: &vibex_core::GatewayRequestSummary) -> Option<u64> {
+pub(super) fn output_speed(row: &vibex_core::GatewayRequestSummary) -> Option<u64> {
     let ms = row.latency_ms.filter(|ms| *ms >= 250)?;
     (row.output_tokens >= 16).then(|| row.output_tokens * 1000 / ms as u64)
 }
 
 /// A token count short enough for a list row: 512, 12.3k, 1.2M.
-fn compact_tokens(tokens: u64) -> String {
+pub(super) fn compact_tokens(tokens: u64) -> String {
     match tokens {
         0..1_000 => tokens.to_string(),
         1_000..1_000_000 => format!("{:.1}k", tokens as f64 / 1_000.0),
@@ -1652,7 +1699,11 @@ fn compact_tokens(tokens: u64) -> String {
 // ----- the tab -------------------------------------------------------------------------------
 
 impl ManagementCenter {
-    pub(super) fn render_workspace_gateway_routes(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_workspace_gateway_routes(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let now = vibex_core::unix_timestamp_ms();
         // A pinned request nobody can see any more unpins: the map must not
         // describe a request that is in no list.
@@ -1692,12 +1743,12 @@ impl ManagementCenter {
             .child(self.render_workspace_route_story(&staged, now, cx));
         ws_stack(vec![
             map.into_any_element(),
-            self.render_workspace_route_list(now, cx),
+            self.render_workspace_route_list(now, window, cx),
         ])
     }
 
     /// Picks a request on the map, or plays the one already picked again.
-    fn pick_gateway_route(&mut self, id: vibex_core::RequestId, cx: &mut Context<Self>) {
+    pub(super) fn pick_gateway_route(&mut self, id: vibex_core::RequestId, cx: &mut Context<Self>) {
         if self.gateway_route_pinned.as_ref() == Some(&id) {
             if let Some(stage) = self.gateway_route_stage.clone() {
                 stage.update(cx, |stage, cx| stage.replay(cx));
@@ -2103,7 +2154,12 @@ impl ManagementCenter {
 
     // ----- the records -------------------------------------------------------------------
 
-    fn render_workspace_route_list(&mut self, now: i64, cx: &mut Context<Self>) -> AnyElement {
+    fn render_workspace_route_list(
+        &mut self,
+        now: i64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let pending = self.mutation.is_some();
         let query = self
             .gateway_request_search
@@ -2244,56 +2300,7 @@ impl ManagementCenter {
             )
             .collect::<Vec<_>>();
         let shown = rows.len();
-        let content = if rows.is_empty() {
-            ws_empty_line(
-                if self.gateway_requests_loading {
-                    management_locale_text(
-                        "Loading request records…",
-                        "正在加载请求记录…",
-                        "正在載入請求記錄…",
-                    )
-                } else if self.gateway_requests.is_empty() && self.gateway_inflight.is_empty() {
-                    management_locale_text(
-                        "No request in this range. Choose Live or another day above.",
-                        "该时间范围内没有请求，请选择实时或其他日期。",
-                        "該時間範圍內沒有請求，請選擇即時或其他日期。",
-                    )
-                } else {
-                    management_locale_text(
-                        "No request matches. Clear the search or the filter.",
-                        "没有匹配的请求，请清除搜索或筛选。",
-                        "沒有符合的請求，請清除搜尋或篩選。",
-                    )
-                },
-                cx,
-            )
-        } else {
-            let height = (rows.len() as f32 * ROUTE_ROW_H).clamp(ROUTE_ROW_H * 3.0, 480.0);
-            let sizes = Rc::new(
-                rows.iter()
-                    .map(|_| gpui_size(px(0.0), px(ROUTE_ROW_H)))
-                    .collect::<Vec<GpuiSize<gpui::Pixels>>>(),
-            );
-            let rows = Rc::new(rows);
-            div()
-                .w_full()
-                .h(px(height))
-                .min_h_0()
-                .child(v_virtual_list(
-                    cx.entity(),
-                    "management-gateway-request-virtual-list",
-                    sizes,
-                    move |this, range: Range<usize>, _, cx| {
-                        range
-                            .filter_map(|index| {
-                                let row = rows.get(index)?;
-                                Some(this.render_workspace_routes_list_row(row, now, cx))
-                            })
-                            .collect()
-                    },
-                ))
-                .into_any_element()
-        };
+        let table = self.route_requests_table(rows, now, window, cx);
         let load_older =
             (self.gateway_requests_has_more || self.gateway_requests_loading).then(|| {
                 Button::new("management-gateway-request-load-older")
@@ -2312,6 +2319,7 @@ impl ManagementCenter {
         let foot = h_flex()
             .w_full()
             .min_w_0()
+            .flex_none()
             .items_center()
             .justify_between()
             .gap_3()
@@ -2338,11 +2346,8 @@ impl ManagementCenter {
                             Button::new("management-gateway-clear-requests")
                                 .small()
                                 .ghost()
-                                .label(management_locale_text(
-                                    "Clear records…",
-                                    "清除记录…",
-                                    "清除記錄…",
-                                ))
+                                .icon(Icon::default().path("icons/vibex/trash-2.svg"))
+                                .label(management_locale_text("Clear", "清除记录", "清除記錄"))
                                 .disabled(pending)
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.confirm_clear_gateway_requests(window, cx)
@@ -2356,13 +2361,10 @@ impl ManagementCenter {
             format!("显示 {shown} 条"),
             format!("顯示 {shown} 筆"),
         );
-        ws_section(
+        ws_section_fill(
+            "management-gateway-requests",
             management_locale_text("Requests", "请求记录", "請求記錄"),
-            Some(management_locale_text(
-                "Pick a request to see its route on the map above; pick it again to replay it.",
-                "选中一条请求即可在上方路由图查看它的路由，再次选中会重新回放。",
-                "選取一筆請求即可在上方路由圖查看它的路由，再次選取會重新播放。",
-            )),
+            None,
             Some(
                 h_flex()
                     .items_center()
@@ -2382,370 +2384,307 @@ impl ManagementCenter {
                     .child(filter)
                     .into_any_element(),
             ),
+            // The card takes the height the page has left and hands the
+            // table what the footer does not use: the records scroll inside
+            // the table instead of stretching the card with every request.
             v_flex()
                 .w_full()
-                .child(route_list_header(cx))
-                .child(content)
+                .min_w_0()
+                .flex_1()
+                .min_h_0()
+                .child(table)
                 .child(foot)
                 .into_any_element(),
             cx,
         )
     }
 
-    fn render_workspace_routes_list_row(
-        &self,
-        row: &RouteListRow,
+    /// Everything a record's row shows beside its own fields, gathered once
+    /// for the rows being drawn.
+    fn route_requests_data(&self) -> Rc<dyn RouteRequestsData> {
+        let mut routes = HashMap::new();
+        for route in &self.model_routes {
+            routes.insert(route.id.as_str().to_string(), route.display_name.clone());
+        }
+        let mut providers = HashMap::new();
+        for profile in &self.providers {
+            providers.insert(profile.id.as_str().to_string(), profile.clone());
+        }
+        Rc::new(RouteRequestsFacts {
+            routes,
+            providers,
+            walks: RefCell::new(HashMap::new()),
+            fallbacks: RefCell::new(HashMap::new()),
+        })
+    }
+
+    /// The records as a `DataTable`, kept in step with the filters above it.
+    ///
+    /// The table's delegate owns the rows it paints. It must not read back
+    /// into this view: the `TableState` renders and refreshes from inside the
+    /// view's own update, where reading the leased entity panics with
+    /// "cannot read `ManagementCenter` while it is already being updated".
+    fn route_requests_table(
+        &mut self,
+        rows: Vec<RouteListRow>,
         now: i64,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let locale = locale::current_locale();
-        let id = row.id().clone();
-        let selected = self.gateway_route_pinned.as_ref() == Some(&id);
-        let (at_ms, agent, requested) = match row {
-            RouteListRow::Live(live) => (
-                live.started_at_ms,
-                live.agent_id.clone(),
-                live.requested_model.clone(),
-            ),
-            RouteListRow::Done(done) => (
-                done.created_at_ms,
-                done.agent_id.clone(),
-                done.model_requested.clone(),
-            ),
-        };
-        let agent_key = agent.clone().unwrap_or_else(|| UNKNOWN_AGENT.to_string());
-        let hue = agent_hue(&agent_key, cx);
-        let route = vibex_core::route_group_model_ref(&requested)
-            .and_then(|parsed| self.workspace_route(Some(parsed.group_id)))
-            .map(|route| route.display_name.clone());
-
-        // Who answered, how it ended, and what it cost.
-        let failed = matches!(row, RouteListRow::Done(done) if !outcome_answered(done.outcome));
-        let mut tags = Vec::<AnyElement>::new();
-        let (dot, who, detail, metrics) = match row {
-            RouteListRow::Live(live) => {
-                let waited = (now - live.started_at_ms).max(0);
-                let provider = self.workspace_provider_name(&live.model_provider_profile_id);
-                let state = if live.first_token_at_ms.is_some() {
-                    management_locale_text("streaming", "正在输出", "正在輸出")
-                } else {
-                    management_locale_text("waiting", "等待响应", "等待回應")
-                };
-                if live.attempt > 1 {
-                    tags.push(
-                        Tag::color(ColorName::Blue)
-                            .xsmall()
-                            .child(said(
-                                locale,
-                                format!("member {}", live.attempt),
-                                format!("第 {} 个成员", live.attempt),
-                                format!("第 {} 個成員", live.attempt),
-                            ))
-                            .into_any_element(),
-                    );
-                }
-                let mut metrics = vec![gateway_duration(waited)];
-                if let Some(first) = live.first_token_at_ms {
-                    metrics.push(said(
-                        locale,
-                        format!(
-                            "first token {}",
-                            gateway_duration((first - live.started_at_ms).max(0))
-                        ),
-                        format!(
-                            "首 Token {}",
-                            gateway_duration((first - live.started_at_ms).max(0))
-                        ),
-                        format!(
-                            "首 Token {}",
-                            gateway_duration((first - live.started_at_ms).max(0))
-                        ),
-                    ));
-                }
-                (
-                    (cx.theme().info, cx.theme().foreground),
-                    provider,
-                    state.to_string(),
-                    metrics,
-                )
-            }
-            RouteListRow::Done(done) => {
-                let walk = ledger_walk(done, |id| self.workspace_credential_owner(id));
-                let moves = walk_moves(&walk);
-                let answered = outcome_answered(done.outcome);
-                let dot = if !answered {
-                    (cx.theme().danger, cx.theme().danger)
-                } else if moves > 0 {
-                    (cx.theme().primary, cx.theme().foreground)
-                } else {
-                    (cx.theme().success, cx.theme().foreground)
-                };
-                if answered && moves > 0 {
-                    tags.push(
-                        Tag::color(ColorName::Blue)
-                            .xsmall()
-                            .child(said(
-                                locale,
-                                format!("rerouted ×{moves}"),
-                                format!("转移 ×{moves}"),
-                                format!("轉移 ×{moves}"),
-                            ))
-                            .into_any_element(),
-                    );
-                }
-                let who = if done.outcome == vibex_core::GatewayRequestOutcome::Rejected {
-                    management_locale_text("gateway", "网关", "閘道").to_string()
-                } else {
-                    self.workspace_provider_label(
-                        &done.model_provider_profile_id,
-                        Some(done.provider_name.as_str()),
-                    )
-                };
-                let detail = if answered {
-                    let key = gateway_credential_name(done.credential_name.as_deref(), locale);
-                    match done.model_served.as_deref() {
-                        Some(served) if served != asked_model(&done.model_requested) => {
-                            format!("{key} · {served}")
-                        }
-                        _ => key.to_string(),
-                    }
-                } else {
-                    let failure = walk.iter().rev().find_map(|step| match step.verdict {
-                        WalkVerdict::Failed(kind) | WalkVerdict::Skipped(kind) => {
-                            Some(gateway_failure_text(kind, locale).to_string())
-                        }
-                        _ => None,
-                    });
-                    [
-                        done.status.map(|status| format!("HTTP {status}")),
-                        failure.or_else(|| gateway_request_error_code(done)),
-                    ]
-                    .into_iter()
-                    .flatten()
-                    .collect::<Vec<_>>()
-                    .join(" · ")
-                };
-                let mut metrics = Vec::new();
-                if let Some(latency) = done.latency_ms {
-                    metrics.push(gateway_duration(latency));
-                }
-                if done.total_tokens > 0 {
-                    metrics.push(format!("{} tok", compact_tokens(done.total_tokens)));
-                }
-                if let Some(share) = cache_share(done) {
-                    metrics.push(said(
-                        locale,
-                        format!("{share}% cached"),
-                        format!("缓存 {share}%"),
-                        format!("快取 {share}%"),
-                    ));
-                }
-                if let Some(speed) = output_speed(done) {
-                    metrics.push(format!("{speed} tok/s"));
-                }
-                (dot, who, detail, metrics)
-            }
-        };
-        let protocol = match row {
-            RouteListRow::Live(live) => wire_pair(&live.wire_in, &live.wire_protocol_id),
-            RouteListRow::Done(done) => wire_pair(&done.wire_in, &done.wire_out),
-        };
-        tags.push(
-            div()
-                .flex_none()
-                .max_w(rems(11.0))
-                .truncate()
-                .px_1p5()
-                .rounded(cx.theme().radius)
-                .border_1()
-                .border_color(cx.theme().border)
-                .text_size(px(10.5))
-                .font_family(cx.theme().mono_font_family.clone())
-                .text_color(cx.theme().muted_foreground)
-                .child(protocol)
-                .into_any_element(),
-        );
-        let ((dot_color, who_color), pick) = (dot, id.clone());
-        let key_pick = id.clone();
-        h_flex()
-            .id(SharedString::from(format!(
-                "management-gateway-request-row-{}",
-                id.as_str()
-            )))
-            .w_full()
-            .h(px(ROUTE_ROW_H))
-            .min_w_0()
-            .items_center()
-            .gap_3()
-            .px_2()
-            .rounded(cx.theme().radius)
-            .border_1()
-            .border_color(if selected {
-                cx.theme().list_active_border
+        let snapshot = Rc::new(RouteRequestsSnapshot {
+            rows,
+            pinned: self.gateway_route_pinned.clone(),
+            now,
+            data: self.route_requests_data(),
+            empty: if self.gateway_requests.is_empty() && self.gateway_inflight.is_empty() {
+                RouteRequestsEmpty::Range
             } else {
-                cx.theme().transparent
-            })
-            .when(selected, |row| row.bg(cx.theme().list_active))
-            .when(!selected, |row| {
-                row.hover(|style| style.bg(cx.theme().list_hover))
-            })
-            .on_click(cx.listener(move |this, _, _, cx| this.pick_gateway_route(pick.clone(), cx)))
-            .focusable()
-            .tab_index(0)
-            .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
-                if event.keystroke.key == "enter" || event.keystroke.key == "space" {
-                    this.pick_gateway_route(key_pick.clone(), cx);
-                    cx.stop_propagation();
-                }
-            }))
+                RouteRequestsEmpty::Filter
+            },
+            loading: self.gateway_requests_loading && self.gateway_requests.is_empty(),
+        });
+        let table = match &self.route_requests_table {
+            Some(table) => {
+                let snapshot = snapshot.clone();
+                table.update(cx, |table, cx| {
+                    if table.delegate_mut().set_snapshot(snapshot) {
+                        table.refresh(cx);
+                        cx.notify();
+                    }
+                });
+                table.clone()
+            }
+            None => {
+                let view = cx.weak_entity();
+                let table = cx.new(|cx| {
+                    let delegate = RouteRequestsTableDelegate::new(view, snapshot);
+                    TableState::new(delegate, window, cx)
+                        .col_movable(false)
+                        .col_resizable(false)
+                        .col_selectable(false)
+                        // One click picks the request, and picking it again
+                        // replays it. A table selection on top of that would
+                        // be a second highlight saying a second thing.
+                        .row_selectable(false)
+                        .sortable(false)
+                        .loop_selection(false)
+                });
+                self.route_requests_table = Some(table.clone());
+                table
+            }
+        };
+        div()
+            .id("management-gateway-request-table")
+            .debug_selector(|| "management-gateway-request-table".to_string())
+            .w_full()
+            .min_w_0()
+            .flex_1()
+            .min_h_0()
             .child(
-                div()
-                    .flex_none()
-                    .w(rems(ROUTE_TIME_W))
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .font_family(cx.theme().mono_font_family.clone())
-                    .child(gateway_clock(at_ms)),
-            )
-            .child(
-                h_flex()
-                    .flex_1()
-                    .min_w_0()
-                    .items_center()
-                    .gap_1p5()
-                    .child(div().flex_none().size(px(8.0)).rounded_full().bg(hue))
-                    .child(agent_brand_icon(&agent_key, px(14.0), None))
-                    .child(
-                        div()
-                            .min_w(rems(3.0))
-                            .truncate()
-                            .text_xs()
-                            .font_family(cx.theme().mono_font_family.clone())
-                            .child(asked_model(&requested).to_string()),
-                    )
-                    .when_some(route, |line, route| {
-                        line.child(
-                            div()
-                                .min_w_0()
-                                .max_w(rems(9.0))
-                                .truncate()
-                                .px_1p5()
-                                .rounded(cx.theme().radius)
-                                .border_1()
-                                .border_color(cx.theme().border)
-                                .text_size(px(10.5))
-                                .text_color(cx.theme().muted_foreground)
-                                .child(route),
-                        )
-                    }),
-            )
-            .child(
-                h_flex()
-                    .flex_1()
-                    .min_w_0()
-                    .items_center()
-                    .gap_1p5()
-                    .child(div().flex_none().size(px(6.0)).rounded_full().bg(dot_color))
-                    .child(
-                        div()
-                            .min_w(rems(3.0))
-                            .truncate()
-                            .text_xs()
-                            .font_medium()
-                            .text_color(who_color)
-                            .child(who),
-                    )
-                    .when(!detail.is_empty(), |line| {
-                        line.child(
-                            div()
-                                .min_w_0()
-                                .truncate()
-                                .text_xs()
-                                .text_color(if failed {
-                                    cx.theme().danger
-                                } else {
-                                    cx.theme().muted_foreground
-                                })
-                                .child(detail),
-                        )
-                    })
-                    .children(tags.into_iter().map(|tag| div().flex_none().child(tag))),
-            )
-            .child(
-                div()
-                    .flex_none()
-                    .w(rems(ROUTE_METRICS_W))
-                    .truncate()
-                    .text_right()
-                    .text_xs()
-                    .font_family(cx.theme().mono_font_family.clone())
-                    .text_color(cx.theme().muted_foreground)
-                    .child(metrics.join(" · ")),
+                DataTable::new(&table)
+                    .bordered(false)
+                    .scrollbar_visible(true, true)
+                    .with_size(Size::Size(px(ROUTE_ROW_H))),
             )
             .into_any_element()
     }
 }
 
-#[derive(Clone)]
-enum RouteListRow {
-    /// Boxed: the whole in-flight record would otherwise inflate every row the
-    /// virtual list holds.
-    Live(Box<vibex_core::GatewayInflight>),
-    /// Boxed: a ledger row is several times the size of a live entry.
-    Done(Box<vibex_core::GatewayRequestSummary>),
+// ----- what a record says about the records around it -----------------------------------
+
+/// The facts a record's row shows around its own fields.
+///
+/// A row names the route group it asked under, the Provider that answered,
+/// and the walk and Key that refused it. Looking those up in the Providers
+/// and route groups takes the whole Management Center, which the records'
+/// delegate must not touch while the table paints, so they are gathered once
+/// per table update and handed to the delegate as this value.
+pub(super) trait RouteRequestsData {
+    /// The route group a request named, as a reader knows it.
+    fn route_name(&self, model: &str) -> Option<String>;
+    /// The Provider that answered live.
+    fn provider_name(&self, profile: &vibex_core::ModelProviderProfileId) -> String;
+    /// The Provider that answered, or answered under a name since removed.
+    fn provider_label(
+        &self,
+        profile: &vibex_core::ModelProviderProfileId,
+        recorded: Option<&str>,
+    ) -> String;
+    /// The walk the gateway wrote down for a finished request.
+    fn ledger_walk(&self, request: &vibex_core::GatewayRequestSummary) -> Vec<WalkStep>;
+    /// How many times that walk was sent on past a member.
+    fn walk_moves(&self, walk: &[WalkStep]) -> usize;
+    /// Why a failed request failed, in words: the last verdict that refused
+    /// it, then the code the gateway logged.
+    fn failure_text(
+        &self,
+        request: &vibex_core::GatewayRequestSummary,
+        walk: &[WalkStep],
+    ) -> String;
 }
 
-impl RouteListRow {
-    fn id(&self) -> &vibex_core::RequestId {
-        match self {
-            Self::Live(live) => &live.request_id,
-            Self::Done(done) => &done.request_id,
-        }
+impl RouteRequestsData for ManagementCenter {
+    fn route_name(&self, model: &str) -> Option<String> {
+        vibex_core::route_group_model_ref(model)
+            .and_then(|parsed| self.workspace_route(Some(parsed.group_id)))
+            .map(|route| route.display_name.clone())
+    }
+
+    fn provider_name(&self, profile: &vibex_core::ModelProviderProfileId) -> String {
+        self.workspace_provider_name(profile)
+    }
+
+    fn provider_label(
+        &self,
+        profile: &vibex_core::ModelProviderProfileId,
+        recorded: Option<&str>,
+    ) -> String {
+        self.workspace_provider_label(profile, recorded)
+    }
+
+    fn ledger_walk(&self, request: &vibex_core::GatewayRequestSummary) -> Vec<WalkStep> {
+        ledger_walk(request, |id| self.workspace_credential_owner(id))
+    }
+
+    fn walk_moves(&self, walk: &[WalkStep]) -> usize {
+        walk_moves(walk)
+    }
+
+    fn failure_text(
+        &self,
+        request: &vibex_core::GatewayRequestSummary,
+        walk: &[WalkStep],
+    ) -> String {
+        let locale = locale::current_locale();
+        let failure = walk.iter().rev().find_map(|step| match step.verdict {
+            WalkVerdict::Failed(kind) | WalkVerdict::Skipped(kind) => {
+                Some(gateway_failure_text(kind, locale).to_string())
+            }
+            _ => None,
+        });
+        [
+            request.status.map(|status| format!("HTTP {status}")),
+            failure.or_else(|| gateway_request_error_code(request)),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" · ")
     }
 }
 
-/// The list's column heads, on the same lanes as its rows.
-fn route_list_header(cx: &App) -> AnyElement {
-    h_flex()
-        .w_full()
-        .items_center()
-        .gap_3()
-        .px_2()
-        .pb_1()
-        .text_xs()
-        .text_color(cx.theme().muted_foreground)
-        .child(
-            div()
-                .flex_none()
-                .w(rems(ROUTE_TIME_W))
-                .child(management_locale_text("Time", "时间", "時間")),
-        )
-        .child(div().flex_1().min_w_0().child(management_locale_text(
-            "Agent · model asked",
-            "Agent · 请求模型",
-            "Agent · 請求模型",
-        )))
-        .child(div().flex_1().min_w_0().child(management_locale_text(
-            "Answered by",
-            "响应方",
-            "回應方",
-        )))
-        .child(
-            div()
-                .flex_none()
-                .w(rems(ROUTE_METRICS_W))
-                .text_right()
-                .child(management_locale_text(
-                    "Time · tokens · cache · speed",
-                    "用时 · Token · 缓存 · 速度",
-                    "用時 · Token · 快取 · 速度",
-                )),
-        )
-        .into_any_element()
+/// The Providers, the route groups and the walks one table update reads,
+/// looked up once and then answered from memory.
+///
+/// A record's cells must not read the view they came from while the table
+/// paints, so the deploy copies what they need into this value first.
+struct RouteRequestsFacts {
+    /// Route groups by id.
+    routes: HashMap<String, String>,
+    /// Providers by id.
+    providers: HashMap<String, vibex_core::ModelProviderProfile>,
+    /// Walks by request id, worked out the first time a row asks for one.
+    walks: RefCell<HashMap<String, Vec<WalkStep>>>,
+    /// The words said for a Provider that has since been removed.
+    fallbacks: RefCell<HashMap<String, String>>,
+}
+
+impl RouteRequestsFacts {
+    fn provider(
+        &self,
+        id: &vibex_core::ModelProviderProfileId,
+    ) -> Option<&vibex_core::ModelProviderProfile> {
+        self.providers.get(id.as_str())
+    }
+}
+
+impl RouteRequestsData for RouteRequestsFacts {
+    fn route_name(&self, model: &str) -> Option<String> {
+        let parsed = vibex_core::route_group_model_ref(model)?;
+        self.routes.get(parsed.group_id).cloned()
+    }
+
+    fn provider_name(&self, profile: &vibex_core::ModelProviderProfileId) -> String {
+        self.provider_label(profile, None)
+    }
+
+    fn provider_label(
+        &self,
+        profile: &vibex_core::ModelProviderProfileId,
+        recorded: Option<&str>,
+    ) -> String {
+        if let Some(profile) = self.provider(profile) {
+            let name = profile.display_name.trim();
+            if !name.is_empty() && name != profile.id.as_str() {
+                return name.to_string();
+            }
+        }
+        let named = recorded
+            .map(str::trim)
+            .filter(|name| !name.is_empty() && *name != profile.as_str())
+            .map(str::to_string);
+        named.unwrap_or_else(|| {
+            let mut fallbacks = self.fallbacks.borrow_mut();
+            fallbacks
+                .entry(profile.as_str().to_string())
+                .or_insert_with(|| {
+                    management_locale_text("a removed Provider", "已删除的供应商", "已刪除的供應商")
+                        .to_string()
+                })
+                .clone()
+        })
+    }
+
+    fn ledger_walk(&self, request: &vibex_core::GatewayRequestSummary) -> Vec<WalkStep> {
+        let key = request.request_id.as_str().to_string();
+        if let Some(walk) = self.walks.borrow().get(&key) {
+            return walk.clone();
+        }
+        let owners = |id: &vibex_core::RequestId| {
+            self.providers
+                .values()
+                .find(|provider| {
+                    provider
+                        .credentials
+                        .iter()
+                        .any(|credential| &credential.id == id)
+                })
+                .map(|provider| provider.id.clone())
+        };
+        let walk = ledger_walk(request, owners);
+        self.walks.borrow_mut().insert(key, walk.clone());
+        walk
+    }
+
+    fn walk_moves(&self, walk: &[WalkStep]) -> usize {
+        walk_moves(walk)
+    }
+
+    fn failure_text(
+        &self,
+        request: &vibex_core::GatewayRequestSummary,
+        walk: &[WalkStep],
+    ) -> String {
+        let locale = locale::current_locale();
+        let failure = walk.iter().rev().find_map(|step| match step.verdict {
+            WalkVerdict::Failed(kind) | WalkVerdict::Skipped(kind) => {
+                Some(gateway_failure_text(kind, locale).to_string())
+            }
+            _ => None,
+        });
+        [
+            request.status.map(|status| format!("HTTP {status}")),
+            failure.or_else(|| gateway_request_error_code(request)),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" · ")
+    }
 }
 
 /// A wall-clock time as the list shows it.
-fn gateway_clock(ms: i64) -> String {
+pub(super) fn gateway_clock(ms: i64) -> String {
     use chrono::TimeZone as _;
     chrono::Local
         .timestamp_millis_opt(ms)
@@ -2756,7 +2695,7 @@ fn gateway_clock(ms: i64) -> String {
 
 /// A duration as a reader says it: milliseconds under a second, then seconds,
 /// then minutes.
-fn gateway_duration(ms: i64) -> String {
+pub(super) fn gateway_duration(ms: i64) -> String {
     if ms < 1_000 {
         format!("{ms} ms")
     } else if ms < 60_000 {

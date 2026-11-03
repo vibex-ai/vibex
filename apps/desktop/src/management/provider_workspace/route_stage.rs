@@ -28,7 +28,7 @@ use super::*;
 // ----- the model ---------------------------------------------------------------
 
 /// One Agent on the left edge.
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Debug)]
 pub(crate) struct StageAgent {
     /// The Agent id, which picks its brand mark and its colour.
     pub id: String,
@@ -40,7 +40,7 @@ pub(crate) struct StageAgent {
 }
 
 /// Whether the gateway can serve.
-#[derive(Clone, Copy, PartialEq, Default)]
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
 pub(crate) enum HubState {
     #[default]
     Serving,
@@ -49,7 +49,7 @@ pub(crate) enum HubState {
 }
 
 /// The gateway in the middle.
-#[derive(Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub(crate) struct StageHub {
     pub title: String,
     pub detail: String,
@@ -68,7 +68,7 @@ pub(crate) enum LaneTone {
 }
 
 /// One Key of a member, as a chip under its row.
-#[derive(Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct StageKey {
     pub id: String,
     pub label: String,
@@ -77,12 +77,15 @@ pub(crate) struct StageKey {
 
 /// One route member on the right edge: a Provider and the model it is asked
 /// for there.
-#[derive(Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct StageLane {
     /// The route member, or the Provider when no member names it.
     pub id: String,
     /// What the Provider's logo is looked up by, most specific first.
     pub marks: Vec<String>,
+    /// Line icons the Provider's record carries, for a Provider with no brand
+    /// mark of its own; drawn at the same size as every other card's mark.
+    pub icons: Vec<String>,
     pub title: String,
     pub model: String,
     pub keys: Vec<StageKey>,
@@ -92,7 +95,7 @@ pub(crate) struct StageLane {
 }
 
 /// One row of the members' column.
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Debug)]
 pub(crate) enum StageRow {
     /// A route group's heading, when the map shows more than one.
     Group { title: String, detail: String },
@@ -166,7 +169,7 @@ impl StageFlight {
 }
 
 /// Everything the map draws.
-#[derive(Clone, PartialEq, Default)]
+#[derive(Clone, PartialEq, Default, Debug)]
 pub(crate) struct StageModel {
     pub agents: Vec<StageAgent>,
     pub hub: StageHub,
@@ -183,8 +186,6 @@ pub(crate) struct RouteStage {
     model: StageModel,
     /// When the pinned request's replay began, on the wall clock.
     replay_from_ms: i64,
-    /// A pending redraw for a pulse, while nothing travels.
-    ambient: Option<Task<()>>,
 }
 
 impl RouteStage {
@@ -192,7 +193,6 @@ impl RouteStage {
         Self {
             model: StageModel::default(),
             replay_from_ms: 0,
-            ambient: None,
         }
     }
 
@@ -217,22 +217,6 @@ impl RouteStage {
     pub(crate) fn replay(&mut self, cx: &mut Context<Self>) {
         self.replay_from_ms = vibex_core::unix_timestamp_ms();
         cx.notify();
-    }
-
-    /// Redraws a little later, for a pulse that needs no full frame rate.
-    fn tick_soon(&mut self, cx: &mut Context<Self>) {
-        if self.ambient.is_some() {
-            return;
-        }
-        self.ambient = Some(cx.spawn(async move |this, cx| {
-            cx.background_executor()
-                .timer(Duration::from_millis(AMBIENT_TICK_MS))
-                .await;
-            let _ = this.update(cx, |this, cx| {
-                this.ambient = None;
-                cx.notify();
-            });
-        }));
     }
 }
 
@@ -263,8 +247,18 @@ const PULSE_MS: f64 = 1_600.0;
 const DASH_PERIOD: f32 = 8.0;
 const DASH_ON: f32 = 3.0;
 const FLOW_MS: f64 = 700.0;
-/// A waiting request redraws at this interval instead of every frame.
-const AMBIENT_TICK_MS: u64 = 66;
+
+/// The room every mark on the map occupies, whichever card leads with it.
+///
+/// The Agent's brand, the gateway's server and a Provider's brand are drawn
+/// from three different sources at three different aspect ratios. Giving each
+/// the same square box keeps them the same size and on the same lane, so the
+/// three columns read as one row of peers.
+const STAGE_ICON: Pixels = px(24.0);
+
+/// The gap between a card's mark and the text beside it; the same on every
+/// card, so the columns line up down the map.
+const STAGE_ICON_GAP: Pixels = px(8.0);
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Leg {
@@ -531,8 +525,6 @@ struct StageLooks {
     busy: bool,
     /// A dot travels, a row shakes or a tag shows: frames are needed.
     moving: bool,
-    /// Something pulses or flows: a slower clock is enough.
-    ambient: bool,
 }
 
 fn stage_looks(
@@ -560,7 +552,6 @@ fn stage_looks(
         dots: Vec::new(),
         busy: false,
         moving: false,
-        ambient: false,
     };
     for flight in &model.flights {
         let Some(hue) = hues.get(flight.agent).copied() else {
@@ -645,7 +636,6 @@ fn stage_looks(
                     }
                 };
             }
-            looks.ambient = true;
         }
         if let Some(DotAt::Moving { leg, .. }) = dot {
             looks.moving = true;
@@ -672,9 +662,6 @@ fn stage_looks(
                 at,
             });
         }
-    }
-    if looks.busy && !still {
-        looks.ambient = true;
     }
     looks
 }
@@ -992,7 +979,6 @@ struct Ink {
     border: Hsla,
     background: Hsla,
     danger: Hsla,
-    primary: Hsla,
 }
 
 fn paint_wire(window: &mut Window, line: &Polyline, look: WireLook, ink: Ink, now: f64) {
@@ -1048,12 +1034,9 @@ impl Render for RouteStage {
             .map(|agent| agent_hue(&agent.id, cx))
             .collect::<Vec<_>>();
         let looks = stage_looks(&self.model, &hues, now, self.replay_from_ms as f64, still);
-        if !still {
-            if looks.moving {
-                window.request_animation_frame();
-            } else if looks.ambient {
-                self.tick_soon(cx);
-            }
+        // Only a travelling dot needs the next frame.
+        if !still && looks.moving {
+            window.request_animation_frame();
         }
 
         let geometry: SharedGeometry = Rc::new(RefCell::new(StageGeometry {
@@ -1065,14 +1048,12 @@ impl Render for RouteStage {
             border: cx.theme().border,
             background: cx.theme().background,
             danger: cx.theme().danger,
-            primary: cx.theme().primary,
         };
 
         let wires = {
             let geometry = geometry.clone();
             let agent_looks = looks.agent_wires.clone();
             let lane_looks = looks.lane_wires.clone();
-            let busy = looks.busy && !still;
             canvas(
                 |_, _, _| (),
                 move |_, _, window, _| {
@@ -1086,23 +1067,6 @@ impl Render for RouteStage {
                         if let Some(line) = line {
                             paint_wire(window, line, *look, ink, now);
                         }
-                    }
-                    // A gateway with a request in it breathes.
-                    if busy && let Some(hub) = wires.hub {
-                        let breath = phase(now, PULSE_MS);
-                        let grow = px(3.0 + 7.0 * breath);
-                        let ring = Bounds::new(
-                            point(hub.left() - grow, hub.top() - grow),
-                            gpui::size(hub.size.width + grow * 2.0, hub.size.height + grow * 2.0),
-                        );
-                        window.paint_quad(
-                            gpui::outline(
-                                ring,
-                                ink.primary.opacity(0.32 * (1.0 - breath)),
-                                gpui::BorderStyle::Solid,
-                            )
-                            .corner_radii(px(12.0) + grow),
-                        );
                     }
                 },
             )
@@ -1253,10 +1217,6 @@ impl RouteStage {
                         agent.id
                     )))
                     .debug_selector(|| format!("route-stage-agent:{index}"))
-                    .w_full()
-                    .min_w_0()
-                    .gap_2()
-                    .px_2()
                     .py_1p5()
                     .rounded(cx.theme().radius_lg)
                     .border_1()
@@ -1266,33 +1226,52 @@ impl RouteStage {
                     })
                     .bg(cx.theme().background)
                     .when(agent.idle, |node| node.opacity(0.62))
-                    .child(agent_brand_icon(&agent.id, px(18.0), None))
                     .child(
-                        v_flex()
-                            .flex_1()
+                        // The card's leading row, centred on the height the
+                        // Agent's text takes.
+                        h_flex()
+                            .debug_selector(|| format!("route-stage-lead:agent:{index}"))
+                            .w_full()
                             .min_w_0()
+                            .items_center()
+                            .gap(STAGE_ICON_GAP)
+                            .px_2()
+                            // Every card on the map leads with its mark at
+                            // this size, so the Agent, the gateway and the
+                            // Provider read as one row of peers rather than
+                            // three different drawings.
                             .child(
                                 div()
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_xs()
-                                    .font_semibold()
-                                    .child(agent.label.clone()),
+                                    .debug_selector(|| format!("route-stage-mark:agent:{index}"))
+                                    .child(agent_brand_icon(&agent.id, STAGE_ICON, None)),
                             )
-                            .when(!agent.detail.is_empty(), |text| {
-                                text.child(
-                                    div()
-                                        .min_w_0()
-                                        .truncate()
-                                        .text_size(px(10.5))
-                                        .font_family(cx.theme().mono_font_family.clone())
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child(agent.detail.clone()),
-                                )
-                            }),
-                    )
-                    .child(div().flex_none().size(px(8.0)).rounded_full().bg(hue))
-                    .child(measure(geometry, Slot::Agent(index))),
+                            .child(
+                                v_flex()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .truncate()
+                                            .text_xs()
+                                            .font_semibold()
+                                            .child(agent.label.clone()),
+                                    )
+                                    .when(!agent.detail.is_empty(), |text| {
+                                        text.child(
+                                            div()
+                                                .min_w_0()
+                                                .truncate()
+                                                .text_size(px(10.5))
+                                                .font_family(cx.theme().mono_font_family.clone())
+                                                .text_color(cx.theme().muted_foreground)
+                                                .child(agent.detail.clone()),
+                                        )
+                                    }),
+                            )
+                            .child(div().flex_none().size(px(8.0)).rounded_full().bg(hue))
+                            .child(measure(geometry, Slot::Agent(index))),
+                    ),
             );
         }
         if self.model.agents.is_empty() {
@@ -1341,14 +1320,22 @@ impl RouteStage {
             .bg(cx.theme().background)
             .child(
                 h_flex()
-                    .max_w_full()
+                    // The card and its leading row are one element, so the key
+                    // names both.
+                    .debug_selector(|| "route-stage-lead:hub".to_string())
+                    .w_full()
                     .min_w_0()
-                    .gap_1p5()
+                    .items_center()
+                    .gap(STAGE_ICON_GAP)
                     .child(
-                        Icon::default()
-                            .path("icons/vibex/server.svg")
-                            .size(px(14.0))
-                            .text_color(cx.theme().primary),
+                        div()
+                            .debug_selector(|| "route-stage-mark:hub".to_string())
+                            .child(ws_icon_mark(
+                                "icons/vibex/server.svg",
+                                STAGE_ICON,
+                                Some(cx.theme().primary),
+                                cx,
+                            )),
                     )
                     .child(
                         div()
@@ -1361,9 +1348,12 @@ impl RouteStage {
             )
             .child(
                 h_flex()
-                    .max_w_full()
+                    .w_full()
                     .min_w_0()
+                    .items_center()
                     .gap_1()
+                    // Aligned under the title, past the mark the card leads with.
+                    .pl(STAGE_ICON + STAGE_ICON_GAP)
                     .child(
                         div()
                             .flex_none()
@@ -1579,20 +1569,30 @@ impl RouteStage {
         let resting = look.waiting.is_none() && look.answered.is_none() && look.refused.is_none();
         let faded = lane.tone == LaneTone::Off
             || (resting && matches!(lane.tone, LaneTone::Down | LaneTone::Cooling));
+        // The Provider's own brand leads; a Provider with no brand shows the
+        // icon its record type uses, and only a nameless one falls back to its
+        // initial. Every card on the map draws its mark the same way: a glyph
+        // in a fixed slot, at the Agent's size and on its lane.
         let mark = lane
             .marks
             .iter()
-            .find_map(|candidate| model_brand_icon(candidate, px(15.0), None))
+            .find_map(|candidate| model_brand_icon(candidate, STAGE_ICON, None))
+            .or_else(|| {
+                lane.icons
+                    .iter()
+                    .find(|icon| !icon.is_empty())
+                    .cloned()
+                    .map(|icon| ws_icon_mark(icon.leak(), STAGE_ICON, None, cx))
+            })
             .unwrap_or_else(|| {
-                div()
+                v_flex()
                     .flex_none()
-                    .size(px(15.0))
-                    .flex()
+                    .size(STAGE_ICON)
                     .items_center()
                     .justify_center()
                     .rounded(cx.theme().radius)
                     .bg(cx.theme().muted)
-                    .text_size(px(9.0))
+                    .text_size(px(11.0))
                     .font_semibold()
                     .text_color(cx.theme().muted_foreground)
                     .child(
@@ -1637,7 +1637,6 @@ impl RouteStage {
             .w_full()
             .min_w_0()
             .gap_1()
-            .px_3()
             .py_2()
             .rounded(cx.theme().radius_lg)
             .border_1()
@@ -1648,32 +1647,47 @@ impl RouteStage {
             .bg(cx.theme().background)
             .child(
                 h_flex()
+                    .debug_selector(|| format!("route-stage-lead:lane:{index}"))
                     .w_full()
                     .min_w_0()
-                    .gap_2()
+                    .items_center()
+                    .gap(STAGE_ICON_GAP)
+                    // The card's leading row carries the same inset as every
+                    // other card's, so the marks start on one lane.
+                    .px_2()
                     .opacity(if faded { 0.55 } else { 1.0 })
-                    .child(match lit {
-                        Some(hue) => div()
+                    // The mark and the status dot share one fixed box: the
+                    // mark starts where every other card's mark starts, and
+                    // the dot is a badge on its corner instead of another
+                    // column that would push the mark off the lane.
+                    .child(
+                        div()
+                            .relative()
                             .flex_none()
-                            .size(px(8.0))
-                            .rounded_full()
-                            .bg(hue)
-                            .into_any_element(),
-                        None => div()
-                            .flex_none()
-                            .size(px(8.0))
-                            .rounded_full()
-                            .border_1()
-                            .border_color(cx.theme().muted_foreground)
-                            .into_any_element(),
-                    })
-                    .child(mark)
+                            .size(STAGE_ICON)
+                            .child(
+                                div()
+                                    .debug_selector(|| format!("route-stage-mark:lane:{index}"))
+                                    .child(mark),
+                            )
+                            .child(
+                                div()
+                                    .absolute()
+                                    .right_0()
+                                    .bottom_0()
+                                    .size(px(8.0))
+                                    .rounded_full()
+                                    .border_1()
+                                    .border_color(cx.theme().background)
+                                    .bg(lit.unwrap_or(cx.theme().muted_foreground)),
+                            ),
+                    )
                     .child(
                         div()
                             .min_w(rems(3.0))
                             .truncate()
-                            .text_sm()
-                            .font_medium()
+                            .text_xs()
+                            .font_semibold()
                             .child(lane.title.clone()),
                     )
                     .when(!lane.model.is_empty(), |line| {
@@ -1706,7 +1720,7 @@ impl RouteStage {
                     h_flex()
                         .w_full()
                         .min_w_0()
-                        .pl(rems(2.5))
+                        .pl(STAGE_ICON + STAGE_ICON_GAP)
                         .gap_1()
                         .opacity(if faded { 0.55 } else { 1.0 })
                         .children(keys.iter().take(SHOWN_KEYS).map(|key| {
@@ -1969,6 +1983,7 @@ mod tests {
         StageLane {
             id: id.to_string(),
             marks: vec![id.to_string()],
+            icons: Vec::new(),
             title: id.to_string(),
             model: "gpt-5".to_string(),
             keys: vec![
@@ -2124,6 +2139,63 @@ mod tests {
         stage.update(cx, |stage, cx| stage.replay(cx));
         draw(cx);
         assert!(cx.debug_bounds("route-stage-hub").is_some());
+    }
+
+    /// The Agent, the gateway and the Provider are three peers on the map, so
+    /// their marks start every card on the same lane, at the same size, and
+    /// centred down the card's height.
+    #[gpui::test]
+    fn every_card_leads_with_its_mark_on_one_lane(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let now = vibex_core::unix_timestamp_ms();
+        let stage = cx.new(|_| RouteStage::new());
+        stage.update(cx, |stage, cx| stage.set_model(busy_model(now), cx));
+        let (_, cx) =
+            cx.add_window_view(|window, cx| gpui_component::Root::new(stage.clone(), window, cx));
+        // The members' column is off to the right in a default-sized test
+        // window and its inner rows are culled; widen it so every card paints.
+        cx.update(|window, _| window.resize(gpui::size(px(1600.0), px(900.0))));
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        // Each mark is measured beside the card and the row it leads.
+        let pairs = [
+            (
+                "route-stage-agent:0",
+                "route-stage-lead:agent:0",
+                "route-stage-mark:agent:0",
+            ),
+            (
+                "route-stage-hub",
+                "route-stage-lead:hub",
+                "route-stage-mark:hub",
+            ),
+            (
+                "route-stage-lane:0",
+                "route-stage-lead:lane:0",
+                "route-stage-mark:lane:0",
+            ),
+        ];
+        let mut insets = Vec::new();
+        for (card_id, lead_id, mark_id) in pairs {
+            let card = cx.debug_bounds(card_id).expect("a card");
+            let lead = cx.debug_bounds(lead_id).expect("a card's leading row");
+            let mark = cx.debug_bounds(mark_id).expect("a mark");
+            insets.push(mark.left() - card.left());
+            assert_eq!(mark.size.width, STAGE_ICON);
+            assert_eq!(mark.size.height, STAGE_ICON);
+            let above = mark.center().y - lead.top();
+            let below = lead.bottom() - mark.center().y;
+            assert!(
+                (above - below).abs() <= px(1.0),
+                "a mark sits down the middle of its card's leading row"
+            );
+        }
+        assert!(
+            insets.windows(2).all(|pair| pair[0] == pair[1]),
+            "marks start on one lane: {insets:?}"
+        );
     }
 
     #[gpui::test]

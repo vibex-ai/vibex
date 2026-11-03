@@ -37,7 +37,7 @@ impl ManagementCenter {
             .unwrap_or(0);
         let body = match tab {
             GatewayDetailTab::Keys => self.render_workspace_gateway_keys(window, cx),
-            GatewayDetailTab::Routing => self.render_workspace_gateway_routes(cx),
+            GatewayDetailTab::Routing => self.render_workspace_gateway_routes(window, cx),
             GatewayDetailTab::Advanced => self.render_workspace_gateway_settings(window, cx),
             GatewayDetailTab::Overview => self.render_workspace_gateway_overview(cx),
         };
@@ -62,7 +62,7 @@ impl ManagementCenter {
                 cx,
             ),
             body,
-            &self.workspace_detail_scroll,
+            cx,
         )
     }
 
