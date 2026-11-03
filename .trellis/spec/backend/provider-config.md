@@ -6299,7 +6299,6 @@ ModelRouteMember { weight: u32, context_tokens: Option<u32>, first_token_timeout
 RouteStrategy::{Ordered, RoundRobin, LeastUsed, Smart, LowestLatency, Weighted, Manual}
 RouteTimeWindow { days, start_minute, end_minute, zone }
 RouteRuleContext { agent_id, context_tokens, has_images, requested_effort, compact, intent, workspace_root, local_weekday, local_minute }
-simulate_model_route(route, context, rotation, observations, failed_member) -> RouteSimulation
 GatewayRouteDecisionTrace {
     rule_index, rule_id, reason, classifier, classifier_error,
     intent, effort, strategy, patience_ms, retries,
@@ -6465,8 +6464,6 @@ GatewayRouteDecisionTrace {
   upstream models; it rejects a missing virtual id, a slash, no enabled member,
   a duplicate pair, an out-of-range weight, a manual pick that is absent, a rule
   with no condition, a pause rule with an action, and a cross-midnight window.
-  `simulate_model_route` orders by strategy, reports a matched pause rule, and
-  skips a simulated failure.
 - `vibex-db` unit: a model group round-trips its virtual id, rules, levels,
   patience, sink/unlists, member weight/timeouts, and picked member; clearing
   those fields stores NULL/empty; the partial unique index refuses a second live
@@ -6485,9 +6482,9 @@ GatewayRouteDecisionTrace {
   rotation starts in proportion; manual uses only the picked member; smart and
   lowest-latency prefer health and p50; a paused rule returns
   `model_gateway_route_paused` without an upstream call.
-- `vibex-desktop` unit: a new group opens as a model group; the editor, palette,
-  and simulator expose the virtual id, model/alias palette, pipeline, policy,
-  templates, suggestions, simulated failure, patience, and Unlists/Sink; the save
+- `vibex-desktop` unit: a new group opens as a model group; the editor and
+  palette expose the virtual id, model/alias palette, pipeline, policy,
+  templates, suggestions, patience, and Unlists/Sink; the save
   path writes the model-group fields; the dashboard and live card read real
   gateway state and expose no money metric; AutoInclude adds a discovered model
   without rewriting an authored row; cooldown inputs write the policy map.

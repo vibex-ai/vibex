@@ -816,7 +816,6 @@ impl ManagementCenter {
             self.render_route_group_strategy_section(cx),
             self.render_route_group_limits_section(cx),
             self.render_route_group_visibility_section(cx),
-            self.render_route_group_simulator_section(cx),
             self.render_route_group_form_footer(RouteGroupFormScope::Detail, cx),
         ])
     }
@@ -853,7 +852,6 @@ impl ManagementCenter {
             self.render_route_group_strategy_section(cx),
             self.render_route_group_limits_section(cx),
             self.render_route_group_visibility_section(cx),
-            self.render_route_group_simulator_section(cx),
         ])
     }
 
@@ -1269,22 +1267,6 @@ impl ManagementCenter {
                 ],
                 cx,
             ),
-            cx,
-        )
-    }
-
-    fn render_route_group_simulator_section(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let pending = self.mutation.is_some();
-        let members = self.route_group_model_members.clone();
-        ws_section(
-            management_locale_text("Try it", "试运行", "試執行"),
-            Some(management_locale_text(
-                "See which member would answer a request, without sending one.",
-                "不发送请求，查看哪个成员会响应。",
-                "不傳送請求，查看哪個成員會回應。",
-            )),
-            None,
-            self.render_model_group_simulator(&members, pending, cx),
             cx,
         )
     }

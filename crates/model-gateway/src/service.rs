@@ -3171,7 +3171,7 @@ pub struct PreparedCall {
     /// How long the route is willing to retry after every member failed
     /// before anything reached the client. `None` means no retry.
     pub patience_ms: Option<u64>,
-    /// Why the member order was chosen, for the ledger and the simulator.
+    /// Why the member order was chosen, for the ledger.
     pub route_decision: vibex_core::GatewayRouteDecisionTrace,
     /// Whole-walk retries performed under patience before this attempt.
     pub retries: u32,

@@ -4,9 +4,8 @@
 
 This document describes the third routing wave: model-level route groups,
 ordered rules and classifiers, patience and first-token handling, the route
-builder/simulator, and the Gateway dashboard/live routing card. Durable
-contracts live in `.trellis/spec/backend/provider-config.md`; this is the
-operator-facing overview.
+builder, and the Gateway dashboard/live routing card. Durable contracts live in
+`.trellis/spec/backend/provider-config.md`; this is the operator-facing overview.
 
 The gateway remains one loopback HTTP endpoint. It owns no Provider list: the
 Providers it can call are the members of enabled route groups. Request routing
@@ -94,7 +93,7 @@ body byte before committing. A timeout or empty body is recorded as a skipped
 member and the next member is tried. The last member waits indefinitely because
 there is nowhere to fail over to.
 
-## Builder and Simulator
+## Builder
 
 The Providers page's model-group editor exposes:
 
@@ -106,10 +105,10 @@ The Providers page's model-group editor exposes:
   same-model suggestions, all as drafts until Save. "Same model" compares the
   catalogue's canonical id, so Providers that resell one model under different
   upstream ids still group; a model the catalogue does not know falls back to
-  its own id;
-- a simulator that reads the draft and recent observations and reports the
-  candidate order, cooling markers, matched rule, estimated p50, and the
-  fallback after a chosen member is assumed down. It never sends a request.
+  its own id.
+
+A dry-run preview of the routing decision is not part of the editor: the
+Gateway's live card and ledger show what the router actually did.
 
 `Clone` copies a group as a disabled, unbound record, remapping member ids and
 the rules that name them. It copies no Secret because a route owns none.

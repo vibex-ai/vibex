@@ -1361,11 +1361,6 @@ struct RouteGroupPageDraftMemory {
     patience: String,
     unlists: bool,
     sink: bool,
-    sim_agent: String,
-    sim_context: String,
-    sim_images: bool,
-    sim_effort: String,
-    sim_failure: Option<vibex_core::ModelRouteMemberId>,
     strategy: vibex_core::RouteStrategy,
     pin: bool,
     auto_failover: bool,
@@ -1764,13 +1759,6 @@ pub struct ManagementCenter {
     route_group_unlists: bool,
     /// A hidden composition that exists to be called explicitly.
     route_group_sink: bool,
-    /// Simulator inputs: the Agent id and context size to match rules against.
-    route_group_sim_agent: Entity<InputState>,
-    route_group_sim_context: Entity<InputState>,
-    route_group_sim_images: bool,
-    route_group_sim_effort: String,
-    /// The member whose failure the simulator should assume.
-    route_group_sim_failure: Option<vibex_core::ModelRouteMemberId>,
     /// The draft's strategy.
     route_group_strategy: vibex_core::RouteStrategy,
     /// Whether one conversation stays on one Key within this group.
@@ -2379,20 +2367,6 @@ impl ManagementCenter {
                 "seconds, empty off",
                 "秒，留空关闭",
                 "秒，留空關閉",
-            ))
-        });
-        let route_group_sim_agent = cx.new(|cx| {
-            InputState::new(window, cx).placeholder(management_locale_text(
-                "Agent id, empty any",
-                "Agent ID，留空不限",
-                "Agent ID，留空不限",
-            ))
-        });
-        let route_group_sim_context = cx.new(|cx| {
-            InputState::new(window, cx).placeholder(management_locale_text(
-                "context tokens",
-                "上下文 Token",
-                "上下文 Token",
             ))
         });
         let profile_model_edit_id = cx.new(|cx| {
@@ -3189,11 +3163,6 @@ impl ManagementCenter {
             route_group_patience,
             route_group_unlists: false,
             route_group_sink: false,
-            route_group_sim_agent,
-            route_group_sim_context,
-            route_group_sim_images: false,
-            route_group_sim_effort: String::new(),
-            route_group_sim_failure: None,
             route_group_strategy: vibex_core::RouteStrategy::Ordered,
             route_group_pin: true,
             route_group_auto_failover: true,
@@ -27468,9 +27437,6 @@ impl ManagementCenter {
         self.route_group_model_members.clear();
         self.route_group_unlists = false;
         self.route_group_sink = false;
-        self.route_group_sim_images = false;
-        self.route_group_sim_effort = String::new();
-        self.route_group_sim_failure = None;
         self.route_group_strategy = vibex_core::RouteStrategy::Ordered;
         self.route_group_pin = true;
         self.route_group_auto_failover = true;
@@ -27481,8 +27447,6 @@ impl ManagementCenter {
             &self.route_group_token_limit,
             &self.route_group_model_query,
             &self.route_group_patience,
-            &self.route_group_sim_agent,
-            &self.route_group_sim_context,
         ] {
             input.update(cx, |state, cx| state.set_value("", window, cx));
         }
@@ -27519,11 +27483,6 @@ impl ManagementCenter {
             patience: self.route_group_patience.read(cx).value().to_string(),
             unlists: self.route_group_unlists,
             sink: self.route_group_sink,
-            sim_agent: self.route_group_sim_agent.read(cx).value().to_string(),
-            sim_context: self.route_group_sim_context.read(cx).value().to_string(),
-            sim_images: self.route_group_sim_images,
-            sim_effort: self.route_group_sim_effort.clone(),
-            sim_failure: self.route_group_sim_failure.clone(),
             strategy: self.route_group_strategy,
             pin: self.route_group_pin,
             auto_failover: self.route_group_auto_failover,
@@ -27556,14 +27515,6 @@ impl ManagementCenter {
             .update(cx, |state, cx| state.set_value(draft.patience, window, cx));
         self.route_group_unlists = draft.unlists;
         self.route_group_sink = draft.sink;
-        self.route_group_sim_agent
-            .update(cx, |state, cx| state.set_value(draft.sim_agent, window, cx));
-        self.route_group_sim_context.update(cx, |state, cx| {
-            state.set_value(draft.sim_context, window, cx)
-        });
-        self.route_group_sim_images = draft.sim_images;
-        self.route_group_sim_effort = draft.sim_effort;
-        self.route_group_sim_failure = draft.sim_failure;
         self.route_group_strategy = draft.strategy;
         self.route_group_pin = draft.pin;
         self.route_group_auto_failover = draft.auto_failover;
@@ -27607,9 +27558,6 @@ impl ManagementCenter {
         self.route_group_model_members.clear();
         self.route_group_unlists = false;
         self.route_group_sink = false;
-        self.route_group_sim_images = false;
-        self.route_group_sim_effort = String::new();
-        self.route_group_sim_failure = None;
         self.route_group_strategy = vibex_core::RouteStrategy::Ordered;
         self.route_group_pin = true;
         self.route_group_auto_failover = true;
@@ -27620,8 +27568,6 @@ impl ManagementCenter {
             &self.route_group_token_limit,
             &self.route_group_model_query,
             &self.route_group_patience,
-            &self.route_group_sim_agent,
-            &self.route_group_sim_context,
         ] {
             input.update(cx, |state, cx| state.set_value("", window, cx));
         }
@@ -27696,13 +27642,6 @@ impl ManagementCenter {
         });
         self.route_group_model_query
             .update(cx, |state, cx| state.set_value("", window, cx));
-        self.route_group_sim_agent
-            .update(cx, |state, cx| state.set_value("", window, cx));
-        self.route_group_sim_context
-            .update(cx, |state, cx| state.set_value("", window, cx));
-        self.route_group_sim_images = false;
-        self.route_group_sim_effort = String::new();
-        self.route_group_sim_failure = None;
         self.route_group_strategy = route.strategy;
         self.route_group_pin = route.pin == vibex_core::GatewayPinScope::Conversation;
         self.route_group_auto_failover = route.failover == vibex_core::GatewayFailover::Auto;
@@ -27777,9 +27716,6 @@ impl ManagementCenter {
         self.route_group_member_efforts.clear();
         self.route_group_unlists = false;
         self.route_group_sink = false;
-        self.route_group_sim_images = false;
-        self.route_group_sim_effort = String::new();
-        self.route_group_sim_failure = None;
         cx.notify();
     }
 
@@ -29770,7 +29706,7 @@ impl ManagementCenter {
 
     /// Templates, same-model suggestions, and the Provider/model palette.
     ///
-    /// Split from the editor for the same reason as the simulator: each GPUI
+    /// Split from the editor so the GPUI element frame stays small: each GPUI
     /// element local adds to the render frame, and one frame large enough to
     /// overflow a test thread's stack would overflow a short UI stack too.
     fn render_model_group_palette(&mut self, pending: bool, cx: &mut Context<Self>) -> AnyElement {
@@ -30336,414 +30272,6 @@ impl ManagementCenter {
             .justify_center()
             .child(mark)
             .into_any_element()
-    }
-
-    /// The model-group simulator: inputs and the decision they produce.
-    ///
-    /// Split out of the editor so the GPUI element frame stays small; the
-    /// editor is already the largest form in this file.
-    fn render_model_group_simulator(
-        &mut self,
-        members: &[vibex_core::ModelRouteMember],
-        pending: bool,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let members = members.to_vec();
-        let mut rows = v_flex().w_full().gap_1();
-        // Simulator. It answers "what would the router choose" from the draft,
-        // the request context, and recent observations. It never calls an
-        // upstream, so a bad answer costs nothing and cannot leave a trace.
-        use chrono::{Datelike as _, Timelike as _};
-        let mut sim_route = self
-            .route_group_editing_id
-            .as_ref()
-            .and_then(|id| self.model_routes.iter().find(|route| &route.id == id))
-            .cloned()
-            .unwrap_or_default();
-        sim_route.kind = vibex_core::RouteKind::ModelGroup;
-        sim_route.display_name = self.route_group_name.read(cx).value().trim().to_string();
-        sim_route.sync_agent_model_id();
-        sim_route.members = members.clone();
-        sim_route.strategy = self.route_group_strategy;
-        let sim_agent = self
-            .route_group_sim_agent
-            .read(cx)
-            .value()
-            .trim()
-            .to_string();
-        let sim_context =
-            parse_optional_u64(self.route_group_sim_context.read(cx).value().as_str())
-                .ok()
-                .flatten();
-        let local = chrono::Local::now();
-        let sim_context_data = vibex_core::RouteRuleContext {
-            agent_id: (!sim_agent.is_empty()).then_some(sim_agent),
-            context_tokens: sim_context,
-            has_images: self.route_group_sim_images,
-            requested_effort: (!self.route_group_sim_effort.is_empty())
-                .then(|| self.route_group_sim_effort.clone()),
-            workspace_root: None,
-            local_weekday: Some(local.weekday().number_from_monday() as u8),
-            local_minute: Some((local.hour() * 60 + local.minute()) as u16),
-            ..Default::default()
-        };
-        let observations = members
-            .iter()
-            .map(|member| {
-                let latencies = self
-                    .gateway_traffic_requests
-                    .iter()
-                    .filter(|request| {
-                        request.model_provider_profile_id == member.model_provider_profile_id
-                            && request
-                                .model_served
-                                .as_deref()
-                                .is_none_or(|served| served == member.model_id)
-                    })
-                    .filter_map(|request| request.latency_ms)
-                    .collect::<Vec<_>>();
-                let used_tokens = self
-                    .gateway_traffic_requests
-                    .iter()
-                    .filter(|request| {
-                        request.model_provider_profile_id == member.model_provider_profile_id
-                    })
-                    .map(|request| request.total_tokens)
-                    .sum::<u64>();
-                let cooling = self
-                    .gateway
-                    .upstreams
-                    .iter()
-                    .find(|upstream| {
-                        upstream.model_provider_profile_id == member.model_provider_profile_id
-                    })
-                    .is_some_and(|upstream| {
-                        !upstream.keys.is_empty()
-                            && !upstream.keys.iter().any(|key| key.state.is_ready())
-                    });
-                vibex_core::RouteMemberObservation {
-                    member_id: Some(member.id.clone()),
-                    used_tokens,
-                    p50_ms: management_percentile(latencies.clone(), 0.5)
-                        .and_then(|value| u64::try_from(value).ok()),
-                    p95_ms: management_percentile(latencies, 0.95)
-                        .and_then(|value| u64::try_from(value).ok()),
-                    cooling,
-                    inflight: self
-                        .gateway_inflight
-                        .iter()
-                        .filter(|request| {
-                            request.model_provider_profile_id == member.model_provider_profile_id
-                        })
-                        .count() as u32,
-                }
-            })
-            .collect::<Vec<_>>();
-        let simulation = vibex_core::simulate_model_route(
-            &sim_route,
-            &sim_context_data,
-            0,
-            &observations,
-            self.route_group_sim_failure.as_ref(),
-        );
-        rows = rows.child(
-            div()
-                .w_full()
-                .pt_2()
-                .border_t_1()
-                .border_color(cx.theme().border)
-                .text_xs()
-                .font_semibold()
-                .text_color(cx.theme().muted_foreground)
-                .child(management_locale_text("Simulator", "模拟器", "模擬器")),
-        );
-        rows = rows.child(
-            div()
-                .text_xs()
-                .text_color(cx.theme().muted_foreground)
-                .child(management_locale_text(
-                    "Reads the decision only; it sends no request. Latency is the observed p50, not a promise.",
-                    "只读取决策，不发送请求。延迟为观测到的 p50，不是承诺。",
-                    "只讀取決策，不發送請求。延遲為觀測到的 p50，不是承諾。",
-                )),
-        );
-        rows = rows.child(
-            h_flex()
-                .w_full()
-                .min_w_0()
-                .items_start()
-                .flex_wrap()
-                .gap_2()
-                .child(
-                    div()
-                        .min_w(px(140.0))
-                        .flex_1()
-                        .child(management_input_field(
-                            management_locale_text("Simulated Agent", "模拟 Agent", "模擬 Agent"),
-                            &self.route_group_sim_agent,
-                            false,
-                            cx,
-                        )),
-                )
-                .child(
-                    div()
-                        .min_w(px(140.0))
-                        .flex_1()
-                        .child(management_input_field(
-                            management_locale_text(
-                                "Simulated context tokens",
-                                "模拟上下文 Token",
-                                "模擬上下文 Token",
-                            ),
-                            &self.route_group_sim_context,
-                            false,
-                            cx,
-                        )),
-                )
-                .child(
-                    v_flex()
-                        .items_center()
-                        .gap_0p5()
-                        .child(management_field_label(management_locale_text(
-                            "Images", "图片", "圖片",
-                        )))
-                        .child(
-                            Switch::new("management-model-group-sim-images")
-                                .small()
-                                .checked(self.route_group_sim_images)
-                                .disabled(pending)
-                                .on_click(cx.listener(|this, checked, _, cx| {
-                                    this.route_group_sim_images = *checked;
-                                    cx.notify();
-                                })),
-                        ),
-                )
-                .child({
-                    let center = cx.weak_entity();
-                    let current = self.route_group_sim_effort.clone();
-                    v_flex()
-                        .items_center()
-                        .gap_0p5()
-                        .child(management_field_label(management_locale_text(
-                            "Effort",
-                            "推理档位",
-                            "推理檔位",
-                        )))
-                        .child(
-                            Button::new("management-model-group-sim-effort")
-                                .xsmall()
-                                .ghost()
-                                .label(route_group_effort_label(&current))
-                                .dropdown_caret(true)
-                                .dropdown_menu(move |menu, _, _| {
-                                    let mut menu = menu;
-                                    for (value, label) in [
-                                        (
-                                            "",
-                                            management_locale_text(
-                                                "Any effort",
-                                                "任意推理档位",
-                                                "任意推理檔位",
-                                            ),
-                                        ),
-                                        ("low", management_locale_text("Low", "低", "低")),
-                                        ("medium", management_locale_text("Medium", "中", "中")),
-                                        ("high", management_locale_text("High", "高", "高")),
-                                    ] {
-                                        let center = center.clone();
-                                        let value = value.to_string();
-                                        menu = menu.item(PopupMenuItem::new(label).on_click(
-                                            move |_, _, cx| {
-                                                let _ = center.update(cx, |this, cx| {
-                                                    this.route_group_sim_effort = value.clone();
-                                                    cx.notify();
-                                                });
-                                            },
-                                        ));
-                                    }
-                                    menu
-                                }),
-                        )
-                })
-                .child({
-                    let center = cx.weak_entity();
-                    let failure_members = members.clone();
-                    let current = self
-                        .route_group_sim_failure
-                        .as_ref()
-                        .and_then(|id| {
-                            members
-                                .iter()
-                                .find(|member| &member.id == id)
-                                .map(|member| member.model_id.clone())
-                        })
-                        .unwrap_or_else(|| {
-                            management_locale_text("No failure", "不模拟失败", "不模擬失敗")
-                                .to_string()
-                        });
-                    v_flex()
-                        .items_center()
-                        .gap_0p5()
-                        .child(management_field_label(management_locale_text(
-                            "Assume failure",
-                            "模拟失败",
-                            "模擬失敗",
-                        )))
-                        .child(
-                            Button::new("management-model-group-sim-failure")
-                                .xsmall()
-                                .ghost()
-                                .label(current)
-                                .dropdown_caret(true)
-                                .dropdown_menu(move |menu, _, _| {
-                                    let mut menu = menu;
-                                    let members = failure_members.clone();
-                                    let center_clear = center.clone();
-                                    menu =
-                                        menu.item(
-                                            PopupMenuItem::new(management_locale_text(
-                                                "No failure",
-                                                "不模拟失败",
-                                                "不模擬失敗",
-                                            ))
-                                            .on_click(move |_, _, cx| {
-                                                let _ = center_clear.update(cx, |this, cx| {
-                                                    this.route_group_sim_failure = None;
-                                                    cx.notify();
-                                                });
-                                            }),
-                                        );
-                                    for member in &members {
-                                        let center = center.clone();
-                                        let member_id = member.id.clone();
-                                        let label = format!(
-                                            "{} · {}",
-                                            member.model_provider_profile_id.as_str(),
-                                            member.model_id
-                                        );
-                                        menu = menu.item(PopupMenuItem::new(label).on_click(
-                                            move |_, _, cx| {
-                                                let _ = center.update(cx, |this, cx| {
-                                                    this.route_group_sim_failure =
-                                                        Some(member_id.clone());
-                                                    cx.notify();
-                                                });
-                                            },
-                                        ));
-                                    }
-                                    menu
-                                }),
-                        )
-                }),
-        );
-        let sim_result = if simulation.paused {
-            Some(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().warning)
-                    .child(management_locale_text(
-                        "A pause rule matches this request: routing would stop before any member.",
-                        "有暂停规则命中此请求：路由会在任何成员之前停止。",
-                        "有暫停規則命中此請求：路由會在任何成員之前停止。",
-                    )),
-            )
-        } else if simulation.order.is_empty() {
-            Some(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().warning)
-                    .child(management_locale_text(
-                        "No enabled member would be tried.",
-                        "没有启用的成员可供尝试。",
-                        "沒有啟用的成員可供嘗試。",
-                    )),
-            )
-        } else {
-            let mut result = v_flex().w_full().gap_1();
-            if let Some(index) = simulation.matched_rule_index {
-                result = result.child(div().text_xs().text_color(cx.theme().primary).child(
-                    format!(
-                        "{} #{} {}",
-                        management_locale_text("Rule matched:", "命中规则：", "命中規則："),
-                        index + 1,
-                        simulation.matched_rule_id.clone().unwrap_or_default()
-                    ),
-                ));
-            }
-            for (index, member) in simulation.order.iter().enumerate() {
-                let p50 = observations
-                    .iter()
-                    .find(|observation| observation.member_id.as_ref() == Some(&member.id))
-                    .and_then(|observation| observation.p50_ms);
-                let cooling = simulation.cooling_members.contains(&member.id);
-                result = result.child(
-                    h_flex()
-                        .w_full()
-                        .items_center()
-                        .flex_wrap()
-                        .gap_2()
-                        .text_xs()
-                        .child(div().w(px(18.0)).child(format!("{}", index + 1)))
-                        .child(div().min_w_0().flex_1().truncate().child(format!(
-                            "{} · {}",
-                            member.model_provider_profile_id.as_str(),
-                            member.model_id
-                        )))
-                        .when(cooling, |row| {
-                            row.child(
-                                div()
-                                    .text_color(cx.theme().warning)
-                                    .child(management_locale_text("cooling", "冷却中", "冷卻中")),
-                            )
-                        })
-                        .child(
-                            div()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(match p50 {
-                                    Some(value) => format!("p50 {value} ms"),
-                                    None => {
-                                        management_locale_text("no history", "无历史", "無歷史")
-                                            .to_string()
-                                    }
-                                }),
-                        ),
-                );
-            }
-            if simulation.failed_member_skipped {
-                result = result.child(div().text_xs().text_color(cx.theme().warning).child(
-                    management_locale_text(
-                        "The failed member was skipped; the order above is the fallback.",
-                        "已跳过模拟失败的成员；上方的顺序即回退顺序。",
-                        "已跳過模擬失敗的成員；上方的順序即回退順序。",
-                    ),
-                ));
-            }
-            Some(
-                result.child(
-                    div()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(match simulation.estimated_latency_ms {
-                            Some(value) => format!(
-                                "{} {value} ms",
-                                management_locale_text(
-                                    "Estimated first candidate:",
-                                    "预计首选成员：",
-                                    "預計首選成員："
-                                )
-                            ),
-                            None => management_locale_text(
-                                "No latency history for the first candidate.",
-                                "首选成员没有延迟历史。",
-                                "首選成員沒有延遲歷史。",
-                            )
-                            .to_string(),
-                        }),
-                ),
-            )
-        };
-        rows = rows.child(v_flex().w_full().gap_1().children(sim_result));
-        rows.into_any_element()
     }
 
     /// The model-level route builder: a pipeline of `(Provider, model)` pairs,
@@ -51946,6 +51474,17 @@ mod gateway_surface_tests {
         assert!(
             !editor.contains("route_group_agent_model_id"),
             "the Agent-facing model is the group name, not a second input"
+        );
+        // The editor does not preview the router's decision: the Gateway's live
+        // card and ledger are the only place a decision is reported, so there
+        // is no dry run whose answer could disagree with what actually served.
+        assert!(
+            !source.contains(concat!("render_model_group_", "simulator")),
+            "the route-group form has no dry-run simulator"
+        );
+        assert!(
+            !editor.contains("management-model-group-sim-"),
+            "the simulator's inputs are gone with it"
         );
     }
 
