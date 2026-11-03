@@ -1622,6 +1622,10 @@ pub const MAX_RUNTIME_SWITCH_WAIT_DEADLINE_MS: u64 = 24 * 60 * 60 * 1000;
 /// level safe default is `Reject` for all four categories; product policies
 /// such as `SeamlessSessionSwitch` are built on top of this type, not baked
 /// into it. Serialized into `runtime_switches.active_work_policy_json`.
+///
+/// A wait deadline is how long the switch expects the work to take. Passing it
+/// records a timeout metric but does not fail the switch: the work is still the
+/// reader's, so the switch stays waiting until it ends.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeSwitchActiveWorkPolicy {

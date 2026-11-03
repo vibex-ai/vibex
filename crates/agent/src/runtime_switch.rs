@@ -1275,6 +1275,7 @@ impl RuntimeSwitchCoordinator {
                 .set_prompt_gate(&intent.session_id, true)
                 .await?;
         }
+        let mut timed_out = Vec::new();
         loop {
             self.renew_lease(&intent.switch_id, owner)?;
             self.validate_switch_ownership(&self.required_switch(&intent.switch_id)?)?;
@@ -1285,7 +1286,6 @@ impl RuntimeSwitchCoordinator {
             self.reject_active_work(intent, snapshot)?;
 
             let mut waiting = false;
-            let mut wait_timed_out = false;
             for kind in ACTIVE_WORK_KINDS {
                 if !snapshot.is_active(kind) {
                     continue;
@@ -1293,8 +1293,20 @@ impl RuntimeSwitchCoordinator {
                 match intent.active_work_policy.disposition(kind) {
                     BusyDisposition::Wait { deadline_ms } => {
                         let deadline_ms = i64::try_from(deadline_ms).unwrap_or(i64::MAX);
-                        wait_timed_out |=
-                            unix_timestamp_ms() >= intent.created_at_ms.saturating_add(deadline_ms);
+                        // Passing the deadline does not fail the switch: the
+                        // work is still running, and failing here would turn
+                        // every queued message into a failure and lose the
+                        // reader's input. The switch stays in
+                        // `WaitingForIdle`, which the reader already sees as
+                        // "waiting for current work", and proceeds as soon as
+                        // the turn ends. Only the metric marks the deadline as
+                        // missed, once per kind.
+                        if unix_timestamp_ms() >= intent.created_at_ms.saturating_add(deadline_ms)
+                            && !timed_out.contains(&kind)
+                        {
+                            timed_out.push(kind);
+                            self.record_active_work(kind, RuntimeMetricResult::TimedOut);
+                        }
                         waiting = true;
                     }
                     BusyDisposition::Cancel => {
@@ -1380,22 +1392,6 @@ impl RuntimeSwitchCoordinator {
                 .active_work
                 .set_prompt_gate(&intent.session_id, true)
                 .await?;
-            if wait_timed_out {
-                for kind in ACTIVE_WORK_KINDS {
-                    if snapshot.is_active(kind)
-                        && matches!(
-                            intent.active_work_policy.disposition(kind),
-                            BusyDisposition::Wait { .. }
-                        )
-                    {
-                        self.record_active_work(kind, RuntimeMetricResult::TimedOut);
-                    }
-                }
-                return Err(VibexError::conflict(
-                    "runtime_switch_wait_timeout",
-                    "runtime switch timed out waiting for active work",
-                ));
-            }
             sleep(self.inner.config.idle_poll_interval).await;
         }
     }
@@ -1420,16 +1416,10 @@ impl RuntimeSwitchCoordinator {
                     continue;
                 }
                 match intent.active_work_policy.disposition(kind) {
-                    BusyDisposition::Wait { deadline_ms } => {
-                        let deadline_ms = i64::try_from(deadline_ms).unwrap_or(i64::MAX);
-                        if unix_timestamp_ms() >= intent.created_at_ms.saturating_add(deadline_ms) {
-                            return Err(VibexError::conflict(
-                                "runtime_switch_wait_timeout",
-                                "runtime switch timed out waiting for active work",
-                            ));
-                        }
-                        waiting = true;
-                    }
+                    // A turn that reappeared after `Preparing` is still the
+                    // reader's work; wait it out even past the deadline rather
+                    // than failing the switch.
+                    BusyDisposition::Wait { .. } => waiting = true,
                     BusyDisposition::Cancel => {
                         return Err(VibexError::conflict(
                             "runtime_switch_cancel_unconfirmed",
@@ -3832,23 +3822,41 @@ mod tests {
         }
     }
 
+    /// A missed deadline holds the switch instead of failing it.
+    ///
+    /// The turn is still running when the deadline passes; failing there would
+    /// fail every message queued behind the switch. The switch waits in
+    /// `WaitingForIdle` — what the reader sees as "waiting for current work" —
+    /// and proceeds as soon as the turn ends.
     #[tokio::test]
-    async fn busy_wait_timeout_fails_and_reopens_prompt_gate() {
-        let env = TestEnvironment::new("busy-wait-timeout");
+    async fn busy_wait_past_the_deadline_keeps_waiting() {
+        let env = TestEnvironment::new("busy-wait-past-deadline");
         env.gate.set_active(ActiveWorkKind::ActiveTurn, true);
-        let mut request = env.request("busy-wait-timeout");
-        request.active_work_policy.active_turn = BusyDisposition::Wait { deadline_ms: 80 };
-        let error = env.coordinator.request_switch(request).await.unwrap_err();
-        assert_eq!(error.code, "runtime_switch_wait_timeout");
+        let mut request = env.request("busy-wait-past-deadline");
+        request.active_work_policy.active_turn = BusyDisposition::Wait { deadline_ms: 20 };
+        let coordinator = env.coordinator.clone();
+        let task = tokio::spawn(async move { coordinator.request_switch(request).await });
+        for _ in 0..100 {
+            if env.gate.prompt_gate_events().contains(&true) {
+                break;
+            }
+            sleep(Duration::from_millis(2)).await;
+        }
+        // Past the deadline the switch is still alive and waiting.
+        sleep(Duration::from_millis(60)).await;
         assert_eq!(
-            env.switch_by_key("busy-wait-timeout").status,
-            RuntimeSwitchStatus::Failed
+            env.switch_by_key("busy-wait-past-deadline").status,
+            RuntimeSwitchStatus::WaitingForIdle
         );
+
+        env.gate.set_active(ActiveWorkKind::ActiveTurn, false);
+        let outcome = task.await.unwrap().unwrap();
+        assert_eq!(outcome.status, RuntimeSwitchStatus::Committed);
         assert_eq!(env.gate.prompt_gate_events().last(), Some(&false));
     }
 
     #[tokio::test]
-    async fn busy_wait_uses_the_earliest_active_deadline() {
+    async fn busy_wait_past_the_earliest_active_deadline_keeps_waiting() {
         let env = TestEnvironment::new("busy-wait-earliest-deadline");
         let record = env.seed_reserved_switch("busy-wait-earliest-deadline");
         let policy = RuntimeSwitchActiveWorkPolicy {
@@ -3871,19 +3879,22 @@ mod tests {
         env.gate.set_active(ActiveWorkKind::ActiveTurn, true);
         env.gate.set_active(ActiveWorkKind::BackgroundWork, true);
 
-        let report = tokio::time::timeout(
-            Duration::from_millis(100),
-            env.coordinator.reconcile_on_startup(),
-        )
-        .await
-        .expect("the earliest expired wait deadline must stop the switch")
-        .unwrap();
-        assert!(report.errors.iter().any(|error| {
-            error.switch_id == record.switch_id && error.error_code == "runtime_switch_wait_timeout"
-        }));
+        let coordinator = env.coordinator.clone();
+        let task = tokio::spawn(async move { coordinator.reconcile_on_startup().await });
+        // Both deadlines have passed by now; the reconciled switch still waits.
+        sleep(Duration::from_millis(40)).await;
         assert_eq!(
             env.switch_by_key("busy-wait-earliest-deadline").status,
-            RuntimeSwitchStatus::Failed
+            RuntimeSwitchStatus::WaitingForIdle
+        );
+
+        env.gate.set_active(ActiveWorkKind::ActiveTurn, false);
+        env.gate.set_active(ActiveWorkKind::BackgroundWork, false);
+        let report = task.await.unwrap().unwrap();
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(
+            env.switch_by_key("busy-wait-earliest-deadline").status,
+            RuntimeSwitchStatus::Committed
         );
         assert_eq!(env.gate.prompt_gate_events().last(), Some(&false));
     }

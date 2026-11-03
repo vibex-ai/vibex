@@ -226,7 +226,7 @@ twice or advance to `N + 1` merely because the durable switch is scanned.
 | Illegal/stale status transition | `runtime_switch_transition_invalid` or `runtime_switch_status_conflict`. |
 | Lease unavailable/lost | Return current status or `runtime_switch_lease_lost`; old worker performs no finish. |
 | Reject active work | `runtime_switch_busy_<kind>`; no external operation journal. |
-| Wait expires | `runtime_switch_wait_timeout`, Failed, prompt gate open. |
+| Wait deadline passes | Keep polling in `WaitingForIdle` (prompt gate stays closed); record `TimedOut` once per kind; commit when the work ends. A turn outliving the deadline never fails the switch. |
 | Cancel unsupported/unconfirmed | `runtime_switch_cancel_unsupported` or `_unconfirmed`; source remains current. |
 | Non-retryable AboutToSend without durable evidence | `runtime_switch_ambiguous_external_effect`; never resend create. |
 | Desired selection changes before Commit | Superseded; source current, target Failed/cleaned. |
@@ -445,7 +445,7 @@ agent://runtime-selection-event
 | Runtime-selection event targets another Logical Session | Ignore it for the selected session; do not mutate its runtime state or mark its Timeline lagged. |
 | Desired/session revision is stale | `desired_selection_revision_conflict` / `runtime_switch_revision_conflict`. |
 | Same idempotency key has another target | `runtime_selection_idempotency_payload_conflict`. |
-| Seamless Wait expires | FailedUsingPrevious, source current, prompt gate reopened. |
+| Seamless Wait deadline passes | Stay in `WaitingForCurrentWork` and finish the switch after the work ends; queued messages keep waiting instead of failing. |
 | Prepared config rebuild CAS conflicts | stop reconciliation; never apply using an unpersisted baseline. |
 | Kill/release/wait host call fails | return the host error and keep `active_terminal=true`. |
 
