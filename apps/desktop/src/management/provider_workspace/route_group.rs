@@ -584,26 +584,17 @@ impl ManagementCenter {
                 });
             }
         }
-        let set_default: Rc<dyn Fn(&mut ManagementCenter, String, &mut Context<ManagementCenter>)> =
-            Rc::new({
-                let route_id = route_id.clone();
-                move |this, agent_id, cx| {
-                    this.set_agent_default_model_source(
-                        agent_id,
-                        vibex_core::AgentModelSourceRef::RouteGroup(route_id.clone()),
-                        cx,
-                    )
-                }
-            });
-        let toggle: Rc<
-            dyn Fn(
-                &mut ManagementCenter,
-                String,
-                bool,
-                &mut Window,
-                &mut Context<ManagementCenter>,
-            ),
-        > = Rc::new(move |this, agent_id, bind, window, cx| {
+        let set_default: AgentDefaultSetter = Rc::new({
+            let route_id = route_id.clone();
+            move |this, agent_id, cx| {
+                this.set_agent_default_model_source(
+                    agent_id,
+                    vibex_core::AgentModelSourceRef::RouteGroup(route_id.clone()),
+                    cx,
+                )
+            }
+        });
+        let toggle: AgentSourceBinder = Rc::new(move |this, agent_id, bind, window, cx| {
             if bind {
                 if let Ok(agent) = AgentId::parse(agent_id) {
                     this.bind_route_group(agent, route_id.clone(), cx);

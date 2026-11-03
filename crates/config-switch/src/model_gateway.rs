@@ -855,6 +855,7 @@ mod tests {
                 }],
                 default_model_id: Some("deepseek-chat".to_string()),
                 headers: Vec::new(),
+                metadata: Default::default(),
                 status: vibex_core::ModelProviderProfileStatus::Enabled,
             })
             .unwrap()
@@ -1673,6 +1674,7 @@ mod fingerprint_tests {
                 }],
                 default_model_id: Some("deepseek-chat".to_string()),
                 headers: Vec::new(),
+                metadata: Default::default(),
                 status: vibex_core::ModelProviderProfileStatus::Enabled,
             })
             .unwrap()
@@ -2279,6 +2281,7 @@ mod shared_provider_tests {
                 }],
                 default_model_id: Some("deepseek-chat".to_string()),
                 headers: Vec::new(),
+                metadata: Default::default(),
                 status: vibex_core::ModelProviderProfileStatus::Enabled,
             })
             .unwrap();
@@ -2376,6 +2379,7 @@ mod shared_bind_tests {
                 }],
                 default_model_id: Some("claude-sonnet-4-5".to_string()),
                 headers: Vec::new(),
+                metadata: Default::default(),
                 status: vibex_core::ModelProviderProfileStatus::Enabled,
             })
             .unwrap();

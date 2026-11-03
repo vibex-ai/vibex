@@ -938,7 +938,7 @@ pub fn text_primary() -> Hsla {
 /// toward the palette's own muted role keeps the same relationship the desktop
 /// authored, in both appearances, without a second dimming pass.
 pub fn text_secondary() -> Hsla {
-    mix(tone("foreground"), tone("muted-foreground"), 0.55)
+    mix(tone("foreground"), tone("muted-foreground"), 0.47)
 }
 
 /// Supporting copy: metadata, captions, descriptions.
@@ -950,7 +950,7 @@ pub fn text_secondary() -> Hsla {
 /// the authored pair clears 7:1 on paper. The lift is small enough that muted
 /// still reads clearly quieter than [`text_secondary`] in both appearances.
 pub fn text_muted() -> Hsla {
-    mix(tone("muted-foreground"), tone("foreground"), 0.12)
+    mix(tone("muted-foreground"), tone("foreground"), 0.35)
 }
 
 /// Blend `from` toward `to` across every channel by `amount`.

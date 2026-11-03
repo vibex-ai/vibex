@@ -995,6 +995,7 @@ mod catalog_tests {
                     .collect(),
                 default_model_id: models.first().map(|model| (*model).to_string()),
                 headers: Vec::new(),
+                metadata: Default::default(),
                 status: ModelProviderProfileStatus::Enabled,
             })
             .unwrap()
@@ -1136,6 +1137,7 @@ mod capability_tests {
                 }],
                 default_model_id: Some(model.to_string()),
                 headers: Vec::new(),
+                metadata: Default::default(),
                 status: ModelProviderProfileStatus::Enabled,
             })
             .unwrap()

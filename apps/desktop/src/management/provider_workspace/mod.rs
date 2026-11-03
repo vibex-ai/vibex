@@ -1079,6 +1079,12 @@ struct WorkspaceAgentRow {
     is_default: bool,
 }
 
+/// Sets an Agent's default model source from a capsule's star.
+type AgentDefaultSetter = Rc<dyn Fn(&mut ManagementCenter, String, &mut Context<ManagementCenter>)>;
+/// Binds or unbinds an Agent from a model source.
+type AgentSourceBinder =
+    Rc<dyn Fn(&mut ManagementCenter, String, bool, &mut Window, &mut Context<ManagementCenter>)>;
+
 impl ManagementCenter {
     /// The Agents a Provider or a route group is enabled for.
     ///
@@ -1091,16 +1097,8 @@ impl ManagementCenter {
         &self,
         id_prefix: &'static str,
         rows: Vec<WorkspaceAgentRow>,
-        on_set_default: Rc<dyn Fn(&mut ManagementCenter, String, &mut Context<ManagementCenter>)>,
-        on_toggle: Rc<
-            dyn Fn(
-                &mut ManagementCenter,
-                String,
-                bool,
-                &mut Window,
-                &mut Context<ManagementCenter>,
-            ),
-        >,
+        on_set_default: AgentDefaultSetter,
+        on_toggle: AgentSourceBinder,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let pending = self.mutation.is_some();
@@ -1180,6 +1178,17 @@ impl ManagementCenter {
         }
         capsules.into_any_element()
     }
+}
+
+/// Whether the shared tab bar uses the underline variant.
+#[cfg(test)]
+fn ws_tabs_are_underlined() -> bool {
+    include_str!("mod.rs")
+        .split_once("fn ws_tabs(")
+        .is_some_and(|(_, tail)| {
+            tail.split_once("\n}\n")
+                .is_some_and(|(body, _)| body.contains(".underline()"))
+        })
 }
 
 #[cfg(test)]
@@ -1638,15 +1647,4 @@ mod tests {
         assert!(!placeholder.is_empty());
         assert_ne!(placeholder, route_id);
     }
-}
-
-/// Whether the shared tab bar uses the underline variant.
-#[cfg(test)]
-fn ws_tabs_are_underlined() -> bool {
-    include_str!("mod.rs")
-        .split_once("fn ws_tabs(")
-        .is_some_and(|(_, tail)| {
-            tail.split_once("\n}\n")
-                .is_some_and(|(body, _)| body.contains(".underline()"))
-        })
 }

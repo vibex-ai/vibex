@@ -30196,6 +30196,7 @@ impl ManagementCenter {
 
     /// One model in the Provider-grouped palette: a row that adds it, or
     /// removes it when the draft already holds it.
+    #[allow(clippy::too_many_arguments)]
     fn render_route_group_palette_row(
         provider_id: &vibex_core::ModelProviderProfileId,
         model_id: String,
@@ -40611,6 +40612,7 @@ struct ManagementResourceRowText {
 /// sidebars read as one list instead of three separate designs. Selection is a
 /// tinted surface rather than an outline box, which keeps the eye on one spine
 /// down the rows.
+#[allow(clippy::too_many_arguments)]
 fn management_resource_row(
     id: SharedString,
     glyph_path: &'static str,
@@ -50121,11 +50123,10 @@ mod gateway_surface_tests {
         // keeps a floor, or a tall map would crush it to its heading.
         let section = source
             .split_once("        ws_section_fill_at_least(")
-            .map(|(_, tail)| {
+            .and_then(|(_, tail)| {
                 tail.split_once("\n    /// Everything a record's row")
                     .map(|(body, _)| body)
             })
-            .flatten()
             .expect("the records card should remain inspectable");
         assert!(section.contains("\"management-gateway-requests\""));
         assert!(section.contains(".flex_1()"));

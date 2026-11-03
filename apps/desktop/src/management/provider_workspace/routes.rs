@@ -1735,12 +1735,6 @@ impl ManagementCenter {
             .gateway_route_stage
             .get_or_insert_with(|| cx.new(|_| RouteStage::new()))
             .clone();
-        eprintln!(
-            "rows={} lanes={} agents={}",
-            model.rows.len(),
-            model.lanes.len(),
-            model.agents.len()
-        );
         stage.update(cx, |stage, cx| stage.set_model(model, cx));
 
         let map = v_flex()

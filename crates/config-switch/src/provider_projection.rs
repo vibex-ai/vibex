@@ -10056,6 +10056,7 @@ mod shared_provider_launch_tests {
                 }],
                 default_model_id: Some("shared-model".to_string()),
                 headers: Vec::new(),
+                metadata: Default::default(),
                 status: vibex_core::ModelProviderProfileStatus::Enabled,
             })
             .unwrap();
@@ -10147,6 +10148,7 @@ mod shared_provider_launch_tests {
                     ),
                     redacted_hint: "dynamic".to_string(),
                 }],
+                metadata: Default::default(),
                 status: vibex_core::ModelProviderProfileStatus::Enabled,
             })
             .unwrap();
@@ -10776,6 +10778,7 @@ mod provider_delete_tests {
                 }],
                 default_model_id: Some("shared-model".to_string()),
                 headers: Vec::new(),
+                metadata: Default::default(),
                 status: vibex_core::ModelProviderProfileStatus::Enabled,
             })
             .unwrap();
@@ -10866,6 +10869,7 @@ mod provider_delete_tests {
                 }],
                 default_model_id: Some("shared-model".to_string()),
                 headers: Vec::new(),
+                metadata: Default::default(),
                 status: vibex_core::ModelProviderProfileStatus::Enabled,
             })
             .unwrap();
@@ -11022,6 +11026,7 @@ mod shared_provider_reuse_tests {
                 }],
                 default_model_id: Some("shared-model".to_string()),
                 headers: Vec::new(),
+                metadata: Default::default(),
                 status: vibex_core::ModelProviderProfileStatus::Enabled,
             })
             .unwrap();
@@ -11095,6 +11100,7 @@ mod shared_provider_reuse_tests {
                 }],
                 default_model_id: Some("design-model".to_string()),
                 headers: Vec::new(),
+                metadata: Default::default(),
                 status: vibex_core::ModelProviderProfileStatus::Enabled,
             })
             .unwrap();
@@ -11195,6 +11201,7 @@ mod shared_provider_reuse_tests {
                 }],
                 default_model_id: Some("design-model".to_string()),
                 headers: Vec::new(),
+                metadata: Default::default(),
                 status: vibex_core::ModelProviderProfileStatus::Enabled,
             })
             .unwrap();
@@ -11304,6 +11311,7 @@ mod shared_bind_route_tests {
                 }],
                 default_model_id: Some("shared-model".to_string()),
                 headers: Vec::new(),
+                metadata: Default::default(),
                 status: vibex_core::ModelProviderProfileStatus::Enabled,
             })
             .unwrap();
@@ -11507,6 +11515,7 @@ mod bound_provider_usability_tests {
                 }],
                 default_model_id: Some("design-model".to_string()),
                 headers: Vec::new(),
+                metadata: Default::default(),
                 status: vibex_core::ModelProviderProfileStatus::Enabled,
             })
             .unwrap();
@@ -11600,6 +11609,7 @@ mod bound_provider_usability_tests {
                 }],
                 default_model_id: Some("design-model".to_string()),
                 headers: Vec::new(),
+                metadata: Default::default(),
                 status: vibex_core::ModelProviderProfileStatus::Enabled,
             })
             .unwrap();

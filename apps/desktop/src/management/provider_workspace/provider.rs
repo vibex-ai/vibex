@@ -331,29 +331,19 @@ impl ManagementCenter {
         let agents = self.workspace_provider_agent_rows(row);
         let profile_id = profile.id.clone();
         let legacy = profile.legacy_provider_profile_id.clone();
-        let set_default: Rc<dyn Fn(&mut ManagementCenter, String, &mut Context<ManagementCenter>)> =
-            Rc::new({
-                let profile_id = profile_id.clone();
-                move |this, agent_id, cx| {
-                    if let Some(legacy) = this.workspace_provider_legacy_id(&profile_id, &agent_id)
-                    {
-                        this.set_agent_default_model_source(
-                            agent_id,
-                            vibex_core::AgentModelSourceRef::Provider(legacy),
-                            cx,
-                        );
-                    }
+        let set_default: AgentDefaultSetter = Rc::new({
+            let profile_id = profile_id.clone();
+            move |this, agent_id, cx| {
+                if let Some(legacy) = this.workspace_provider_legacy_id(&profile_id, &agent_id) {
+                    this.set_agent_default_model_source(
+                        agent_id,
+                        vibex_core::AgentModelSourceRef::Provider(legacy),
+                        cx,
+                    );
                 }
-            });
-        let toggle: Rc<
-            dyn Fn(
-                &mut ManagementCenter,
-                String,
-                bool,
-                &mut Window,
-                &mut Context<ManagementCenter>,
-            ),
-        > = Rc::new({
+            }
+        });
+        let toggle: AgentSourceBinder = Rc::new({
             let profile_id = profile_id.clone();
             move |this, agent_id, bind, window, cx| {
                 if bind {
@@ -362,9 +352,7 @@ impl ManagementCenter {
                     };
                     this.bind_provider_to_agent(
                         agent,
-                        legacy
-                            .clone()
-                            .unwrap_or_else(vibex_core::ProviderProfileId::new),
+                        legacy.clone().unwrap_or_default(),
                         Some(profile_id.clone()),
                         cx,
                     );

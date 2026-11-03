@@ -264,6 +264,7 @@ mod tests {
                 }],
                 default_model_id: Some("route-model".to_string()),
                 headers: Vec::new(),
+                metadata: Default::default(),
                 status: ModelProviderProfileStatus::Enabled,
             })
             .unwrap()
