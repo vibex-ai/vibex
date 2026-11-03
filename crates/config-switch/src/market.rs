@@ -73,6 +73,7 @@
 use std::collections::HashMap;
 use std::io::Read;
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
@@ -2103,25 +2104,220 @@ impl ProviderConfigService {
         ))
     }
 
-    /// What one Skill says of itself, read from its manifest.
+    /// What one Skill says of itself, read from its published page.
     ///
-    /// A search result carries no description, and the card has room for one,
-    /// so this reads the folder's `SKILL.md` and answers its summary. It is
-    /// asked for the entries on screen rather than for every result, which is
-    /// what keeps a search to one request.
+    /// The catalog's list and search carry no description, and the card has
+    /// room for one, so this reads the line the catalog itself renders for the
+    /// Skill. It is asked for the entries on screen rather than for every
+    /// result, and the entries are read a few at a time: one page per Skill is
+    /// a small request, but a page of twenty of them in sequence took long
+    /// enough for the reader to conclude the cards had no descriptions at all.
     pub fn skill_market_summaries(
         &self,
         request: SkillMarketSummaryRequest,
     ) -> VibexResult<SkillMarketSummaryResponse> {
-        let mut summaries = Vec::new();
-        for entry in request.entries.iter().take(MAX_ENTRIES_PER_SEARCH) {
-            if let Some(summary) = skill_summary(entry) {
-                summaries.push((entry.id.clone(), summary));
-            }
+        let entries = request
+            .entries
+            .iter()
+            .take(MAX_ENTRIES_PER_SEARCH)
+            .collect::<Vec<_>>();
+        if entries.is_empty() {
+            return Ok(SkillMarketSummaryResponse::default());
         }
+        let Ok(client) = market_http_client() else {
+            return Ok(SkillMarketSummaryResponse::default());
+        };
+        // Results keep the caller's order even though the reads race, so a
+        // later reply cannot shuffle a card under the reader.
+        let found: Vec<Mutex<Option<String>>> = entries.iter().map(|_| Mutex::new(None)).collect();
+        let next = AtomicUsize::new(0);
+        let workers = SKILL_SUMMARY_WORKERS.min(entries.len());
+        std::thread::scope(|scope| {
+            for _ in 0..workers {
+                scope.spawn(|| {
+                    loop {
+                        let index = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(entry) = entries.get(index) else {
+                            return;
+                        };
+                        let summary = skill_summary(&client, entry);
+                        *found[index]
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()) = summary;
+                    }
+                });
+            }
+        });
+        let summaries = entries
+            .iter()
+            .zip(found)
+            .filter_map(|(entry, summary)| {
+                let summary = summary
+                    .into_inner()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())?;
+                Some((entry.id.clone(), summary))
+            })
+            .collect();
         Ok(SkillMarketSummaryResponse { summaries })
     }
 }
+
+/// Readers running at once while the cards' descriptions are read.
+///
+/// One page per Skill is small, but twenty of them in sequence is a wait long
+/// enough to read as an empty field, and the catalog is not ours to hammer. Six
+/// is what magpie settled on against the same catalog.
+const SKILL_SUMMARY_WORKERS: usize = 6;
+
+/// The one-line description a Skill's page gives itself.
+///
+/// The page is the catalog's own rendering of the Skill, so it is the answer
+/// the user would see there, and it is one request rather than a walk of the
+/// repository. A fetch that fails is simply no summary: a card without a
+/// description is better than a market that reports an outage for one.
+fn skill_summary(client: &reqwest::blocking::Client, entry: &SkillMarketEntry) -> Option<String> {
+    if let Some(summary) = fetch_skill_page_summary(client, entry) {
+        return Some(summary);
+    }
+    let manifest = fetch_skill_manifest(client, &entry.source, &entry.slug)?;
+    let (_, description, _) = split_skill_document(&manifest);
+    description
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// Read the description out of one Skill's page on the catalog.
+///
+/// The page renders the description as its own meta description, so this reads
+/// that one tag instead of parsing the document. A Skill the catalog does not
+/// know is answered with a page that describes the catalog rather than the
+/// Skill, so that placeholder — and any page that names a different Skill than
+/// the one asked for — is refused rather than shown as a description.
+fn fetch_skill_page_summary(
+    client: &reqwest::blocking::Client,
+    entry: &SkillMarketEntry,
+) -> Option<String> {
+    let url = format!(
+        "{SKILLS_SH_BASE}/{}/{}",
+        entry.source,
+        url_path_segment(&entry.slug)
+    );
+    let (body, _) = fetch_market_bytes(client, &url, MAX_SKILL_PAGE_BYTES).ok()?;
+    let page = String::from_utf8(body).ok()?;
+    skill_page_description(&page)
+}
+
+/// Percent-encode one path segment of a Skill's slug.
+///
+/// A slug is a name, not a URL: it may carry a space or a character the path
+/// would otherwise read as structure. Everything a plain segment allows is kept
+/// so an ordinary slug still reads as itself, except the two names a URL
+/// resolves as navigation: `.` and `..` have to be written out, or a Skill whose
+/// name happens to be one of them would address its publisher's parent instead
+/// of itself.
+fn url_path_segment(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    // A plain `.` inside a longer name is punctuation, not navigation, so only
+    // the two exact names are rewritten.
+    if value.chars().all(|character| character == '.') {
+        out = value.chars().map(|_| "%2E").collect();
+    }
+    out
+}
+
+/// The description a Skill's page renders for it, or `None` when the page is
+/// not about that Skill.
+fn skill_page_description(page: &str) -> Option<String> {
+    let description = meta_description(page)?;
+    // The catalog renders this sentence for a path it has never published; it
+    // describes no Skill, and putting it on a card would invent one.
+    if description.contains("an installable skill for AI agents") {
+        return None;
+    }
+    let description = description.trim();
+    (!description.is_empty()).then(|| description.to_string())
+}
+
+/// The content of a page's `<meta name="description">`, decoded.
+///
+/// The value is HTML, so the entities a publisher wrote arrive escaped. Only
+/// the handful an English or Chinese description uses are decoded; anything
+/// else is left as written rather than guessed at.
+fn meta_description(page: &str) -> Option<String> {
+    let lowered = page.to_ascii_lowercase();
+    let mut cursor = 0usize;
+    while let Some(offset) = lowered[cursor..].find("<meta") {
+        let start = cursor + offset;
+        let end_offset = lowered[start..].find('>')?;
+        let tag = &page[start..start + end_offset];
+        let lowered_tag = &lowered[start..start + end_offset];
+        if lowered_tag.contains("name=\"description\"")
+            || lowered_tag.contains("name='description'")
+            || lowered_tag.contains("property=\"og:description\"")
+            || lowered_tag.contains("property='og:description'")
+        {
+            let content = attribute_value(tag, "content")?;
+            return Some(decode_html_entities(content.trim()));
+        }
+        cursor = start + end_offset + 1;
+    }
+    None
+}
+
+/// One attribute's value inside a tag, quoted either way.
+fn attribute_value<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
+    let lowered = tag.to_ascii_lowercase();
+    let mut cursor = 0usize;
+    while let Some(offset) = lowered[cursor..].find(name) {
+        let start = cursor + offset;
+        // The name has to be the whole attribute, not the tail of a longer one
+        // such as `data-content`.
+        let preceded_by_boundary = start == 0
+            || tag[..start]
+                .chars()
+                .next_back()
+                .is_some_and(|character| character.is_ascii_whitespace());
+        let after = &tag[start + name.len()..];
+        let after_trimmed = after.trim_start();
+        if preceded_by_boundary && after_trimmed.starts_with('=') {
+            let value = after_trimmed[1..].trim_start();
+            let quote = value.chars().next()?;
+            if quote == '"' || quote == '\'' {
+                let value = &value[1..];
+                return value.split_once(quote).map(|(value, _)| value);
+            }
+            return value.split_whitespace().next();
+        }
+        cursor = start + name.len();
+    }
+    None
+}
+
+/// Decode the entities a description is likely to carry.
+fn decode_html_entities(value: &str) -> String {
+    value
+        .replace("&quot;", "\"")
+        .replace("&#x27;", "'")
+        .replace("&#39;", "'")
+        .replace("&apos;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+}
+
+/// How much of one Skill's page is read for its description.
+///
+/// The tag sits in the document head, so a few hundred kilobytes covers every
+/// page this catalog serves; the ceiling exists so a hostile host cannot answer
+/// a description request with an unbounded body.
+const MAX_SKILL_PAGE_BYTES: u64 = 512 * 1024;
 
 /// Directories a published Skill folder sits under, in the order they are
 /// tried.
@@ -2134,30 +2330,12 @@ impl ProviderConfigService {
 /// for one line of text.
 const SKILL_MANIFEST_PREFIXES: [&str; 4] = ["skills", "", "plugins", ".agents/skills"];
 
-/// The one-line description a Skill's manifest gives itself.
-///
-/// The manifest is the authority on what a Skill is, so this reads it rather
-/// than a page that renders it. A fetch that fails is simply no summary: a card
-/// without a description is better than a market that reports an outage for one.
-fn skill_summary(entry: &SkillMarketEntry) -> Option<String> {
-    let client = market_http_client().ok()?;
-    let manifest = fetch_skill_manifest(&client, &entry.source, &entry.slug).or_else(|| {
-        fetch_skill_bundle(&client, &entry.source, &entry.slug)
-            .ok()?
-            .manifest
-    })?;
-    let (_, description, _) = split_skill_document(&manifest);
-    description
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-}
-
 /// Read one Skill's manifest from the layouts a published repository uses.
 ///
 /// Each attempt is one small request; the first that answers is the manifest.
 /// A repository that keeps its Skills somewhere else still installs, because
-/// the archive path finds the folder by its name — this is the cheap answer,
-/// not the only one.
+/// the archive path finds the folder by its name — this is the answer for a
+/// Skill whose page the catalog has not published, not the first one tried.
 fn fetch_skill_manifest(
     client: &reqwest::blocking::Client,
     source: &str,
@@ -2653,6 +2831,50 @@ mod tests {
         assert!(name.is_none());
         assert!(description.is_none());
         assert_eq!(body, "# Heading\n\nBody\n");
+    }
+
+    /// A card's description comes from the catalog's own page for the Skill, so
+    /// the one tag that page renders for it has to be read out of the document.
+    #[test]
+    fn a_skill_page_describes_the_skill_it_is_about() {
+        let page = r#"<html><head>
+            <meta name="description" content="A relentless interview to sharpen a plan or design."/>
+            <meta property="og:title" content="grill-me"/>
+        </head></html>"#;
+        assert_eq!(
+            skill_page_description(page).as_deref(),
+            Some("A relentless interview to sharpen a plan or design.")
+        );
+
+        // The catalog's own tag order is not guaranteed, and a publisher's tag
+        // may carry entities or quotes.
+        let quoted =
+            r#"<head><meta content="Say &quot;hi&quot; &amp; leave" name='description'></head>"#;
+        assert_eq!(
+            skill_page_description(quoted).as_deref(),
+            Some("Say \"hi\" & leave")
+        );
+
+        // A path the catalog has never published is answered with a page that
+        // describes the catalog. Showing that as a Skill's description would
+        // invent an entry the catalog does not have.
+        let unknown = r#"<meta name="description" content="nope — an installable skill for AI agents, published by x/y."/>"#;
+        assert!(skill_page_description(unknown).is_none());
+        assert!(skill_page_description("<html>no head</html>").is_none());
+    }
+
+    /// A slug is a name, not a URL path: it must not be able to address another
+    /// Skill's page, or escape into a different resource entirely.
+    #[test]
+    fn a_skill_slug_is_one_path_segment() {
+        assert_eq!(url_path_segment("grill-me"), "grill-me");
+        assert_eq!(url_path_segment("a.b_c~d"), "a.b_c~d");
+        assert_eq!(url_path_segment("a/b"), "a%2Fb");
+        assert_eq!(url_path_segment("a b"), "a%20b");
+        assert_eq!(url_path_segment("../../../etc"), "..%2F..%2F..%2Fetc");
+        // The two names a URL resolves as navigation are written out.
+        assert_eq!(url_path_segment("."), "%2E");
+        assert_eq!(url_path_segment(".."), "%2E%2E");
     }
 
     #[test]

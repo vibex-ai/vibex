@@ -12248,18 +12248,20 @@ impl ManagementCenter {
         }
     }
 
-    /// Read what the Skills on screen say of themselves.
+    /// Read what the Skills on the page say of themselves.
     ///
     /// The catalog's list is a name and a counter; the description is the one
-    /// part of a card that has to be read from the Skill itself. It is asked
-    /// for once per entry and kept, and a failure is simply no description: the
-    /// card is still a card without it.
+    /// part of a card that has to be read from the catalog's own page for the
+    /// Skill. It is asked for once per entry and kept, and a failure is simply
+    /// no description: the card is still a card without it. Only the entries on
+    /// the page being looked at are asked for, because a description nobody has
+    /// scrolled to is a request the reader never gets the answer to.
     fn load_skill_market_summaries(&mut self, cx: &mut Context<Self>) {
         let Some(backend) = self.backend.clone() else {
             return;
         };
-        let wanted = self
-            .skill_market_entries
+        let page = market_page(self.skill_market_page, self.skill_market_entries.len());
+        let wanted = market_page_slice(&self.skill_market_entries, page)
             .iter()
             .filter(|entry| {
                 !self.skill_market_summaries.contains_key(&entry.id)
@@ -12270,8 +12272,12 @@ impl ManagementCenter {
         if wanted.is_empty() {
             return;
         }
-        for entry in &wanted {
-            self.skill_market_summary_pending.insert(entry.id.clone());
+        let wanted_ids = wanted
+            .iter()
+            .map(|entry| entry.id.clone())
+            .collect::<Vec<_>>();
+        for id in &wanted_ids {
+            self.skill_market_summary_pending.insert(id.clone());
         }
         let entity = cx.weak_entity();
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
@@ -12284,12 +12290,19 @@ impl ManagementCenter {
         self.mutation_task = Some(cx.spawn(async move |_, cx| {
             let outcome = runner.await;
             let _ = entity.update(cx, |this, cx| {
-                for entry in this.skill_market_entries.clone() {
-                    this.skill_market_summary_pending.remove(&entry.id);
+                for id in &wanted_ids {
+                    this.skill_market_summary_pending.remove(id);
                 }
                 if let Ok(Ok(response)) = outcome {
                     for (id, summary) in response.summaries {
                         this.skill_market_summaries.entry(id).or_insert(summary);
+                    }
+                    // An entry the catalog answered without a description is
+                    // remembered as empty, so paging back to it does not ask
+                    // the same question again. A failed request is not
+                    // remembered, so the next visit can retry it.
+                    for id in wanted_ids {
+                        this.skill_market_summaries.entry(id).or_default();
                     }
                 }
                 cx.notify();
@@ -21448,6 +21461,10 @@ impl ManagementCenter {
                     .icon(IconName::ExternalLink)
                     .label(management_locale_text("Homepage", "主页", "首頁"))
                     .on_click(cx.listener(move |this, _, _, cx| {
+                        // The card is the install gesture; following the
+                        // publisher's page is a different one, so it must not
+                        // also start an install.
+                        cx.stop_propagation();
                         this.open_mcp_market_link(open_link.clone(), cx)
                     }))
                     .into_any_element(),
@@ -21463,7 +21480,7 @@ impl ManagementCenter {
                 name,
                 state,
                 meta,
-                Some(description),
+                Some(MarketCardDescription::Text(description)),
                 Some(market_transport_label(entry.transport).to_string()),
                 quiet_meta,
                 market_entry_env_summary(&entry),
@@ -21484,9 +21501,24 @@ impl ManagementCenter {
                 })
                 .disabled(pending)
                 .on_click(cx.listener(move |this, _, window, cx| {
+                    // The card answers the same question; the press must mean
+                    // one install rather than two.
+                    cx.stop_propagation();
                     this.begin_mcp_market_install(install_entry.clone(), window, cx)
                 }))
                 .into_any_element(),
+                // Anywhere else on the card is the same answer as the button:
+                // pointing at the card promises the install, and pressing it
+                // starts one.
+                {
+                    let install_entry = entry.clone();
+                    cx.listener(move |this, _: &ClickEvent, window, cx| {
+                        if this.mutation.is_some() {
+                            return;
+                        }
+                        this.begin_mcp_market_install(install_entry.clone(), window, cx)
+                    })
+                },
                 cx,
             ));
         }
@@ -21977,10 +22009,29 @@ impl ManagementCenter {
                 .icon(IconName::ExternalLink)
                 .label(management_locale_text("Repository", "代码库", "程式庫"))
                 .on_click(cx.listener(move |this, _, _, cx| {
+                    // The card's press is the install; the repository is a
+                    // different destination and must not also start one.
+                    cx.stop_propagation();
                     this.open_mcp_market_link(repository.clone(), cx)
                 }))
                 .into_any_element(),
             ));
+            // The catalog publishes no description, so the card shows the one
+            // the catalog's page for the Skill gives it. Until that answer
+            // lands the card keeps the shape the text will take, and a Skill
+            // the catalog has no line for says so rather than leaving a blank
+            // where every other card has a sentence.
+            let summary = self.skill_market_summaries.get(&entry.id);
+            let description = match summary {
+                Some(summary) if !summary.trim().is_empty() => {
+                    MarketCardDescription::Text(summary.clone())
+                }
+                Some(_) => MarketCardDescription::Text(
+                    management_locale_text("No description published", "未发布简介", "未發佈簡介")
+                        .to_string(),
+                ),
+                None => MarketCardDescription::Loading,
+            };
             grid = grid.child(management_market_card(
                 entry_id,
                 MarketCardMark {
@@ -21995,12 +22046,7 @@ impl ManagementCenter {
                 // The repository is what tells two Skills of one name apart,
                 // and it is where the card's picture comes from.
                 Some(entry.source.clone()),
-                // A search result carries no description, so the card shows the
-                // one the Skill gives itself once it has been read.
-                self.skill_market_summaries
-                    .get(&entry.id)
-                    .cloned()
-                    .filter(|summary| !summary.trim().is_empty()),
+                Some(description),
                 entry
                     .official
                     .then(|| management_locale_text("Official", "官方", "官方").to_string()),
@@ -22023,9 +22069,22 @@ impl ManagementCenter {
                 })
                 .disabled(pending)
                 .on_click(cx.listener(move |this, _, _, cx| {
+                    // The card answers the same question; the press must mean
+                    // one install rather than two.
+                    cx.stop_propagation();
                     this.begin_skill_market_install(install_entry.clone(), cx)
                 }))
                 .into_any_element(),
+                // Anywhere else on the card is the same answer as the button.
+                {
+                    let install_entry = entry.clone();
+                    cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        if this.mutation.is_some() {
+                            return;
+                        }
+                        this.begin_skill_market_install(install_entry.clone(), cx)
+                    })
+                },
                 cx,
             ));
         }
@@ -22061,6 +22120,10 @@ impl ManagementCenter {
                         // itself has to return to the top of the new page.
                         this.skill_market_scroll
                             .set_offset(gpui::point(px(0.0), px(0.0)));
+                        // The next page's Skills have not been read yet, so
+                        // their descriptions are asked for when they appear
+                        // rather than all of them up front.
+                        this.load_skill_market_summaries(cx);
                         cx.notify();
                     });
                 },
@@ -38680,14 +38743,19 @@ struct MarketCardEndpoint {
 /// line of text instead of a panel inside the panel, and the footer has no rule
 /// of its own because the card's boundary already separates it from the grid.
 ///
-/// The card is also not a control. It used to blend its background under the
-/// pointer while offering no click, which promised an action that did not
-/// exist; the Install button is the card's only affordance and says so.
+/// The card is a control: the whole card chooses its entry, and the Install
+/// button is the same gesture with a name on it. The card used to blend its
+/// background under the pointer while offering no click, which promised an
+/// action that did not exist; now that pointing at the card is what begins an
+/// install, the hover wash is the promise being kept rather than a tease. The
+/// nested Link and Install button stop the click from reaching the card, so one
+/// press means one thing.
 ///
 /// Every card in a row keeps the same height and puts its actions on the same
 /// baseline: the description and metadata take the slack, and the footer is
 /// pinned to the bottom, so a short entry does not leave its Install button
 /// floating halfway up the row.
+///
 /// The mark a market card leads with.
 ///
 /// A registry entry can publish its own picture; when it does, that picture is
@@ -38698,6 +38766,20 @@ struct MarketCardEndpoint {
 struct MarketCardMark {
     glyph_path: &'static str,
     icon: Option<Arc<gpui::Image>>,
+}
+
+/// What a card has to say about the entry, when the answer may still be on its
+/// way.
+///
+/// The Skill catalog publishes no description, so a Skill card asks for one
+/// after it is drawn. A card that renders nothing meanwhile and then grows two
+/// lines of text reflows the whole row under the reader; the placeholder holds
+/// the space the description will take.
+#[derive(Clone)]
+enum MarketCardDescription {
+    /// The description is being read; the card keeps its shape until it lands.
+    Loading,
+    Text(String),
 }
 
 /// The one plate both a publisher picture and a fallback glyph occupy.
@@ -38724,17 +38806,19 @@ fn management_market_card(
     name: String,
     state: Option<MarketEntryState>,
     meta: Option<String>,
-    description: Option<String>,
+    description: Option<MarketCardDescription>,
     chip: Option<String>,
     quiet_meta: Option<String>,
     caution: Option<String>,
     endpoint: Option<MarketCardEndpoint>,
     link: Option<(String, AnyElement)>,
     install: AnyElement,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     cx: &App,
 ) -> AnyElement {
     // Identity owns the strongest type on the card. The grid is a name picker,
     // so the name takes the step above the body text rather than sitting on it.
+    let accessible_name = name.clone();
     let identity = div()
         .min_w_0()
         .flex_1()
@@ -38799,20 +38883,26 @@ fn management_market_card(
                 .text_color(cx.theme().muted_foreground)
                 .child(facts)
         }))
-        // What the server does is what decides the click, so it is read before
-        // the address it happens to run on.
         .children(description.map(|description| {
-            div()
-                .w_full()
-                .text_sm()
-                // `line_clamp` on its own clips the last line at the wrap point,
-                // so a long description ended mid-word with no mark that
-                // anything was missing. The ellipsis is what makes the clamp
-                // read as a summary rather than as a broken string.
-                .line_clamp(2)
-                .text_ellipsis()
-                .text_color(cx.theme().muted_foreground)
-                .child(description)
+            // What the server does is what decides the click, so it is read
+            // before the address it happens to run on.
+            match description {
+                MarketCardDescription::Loading => {
+                    skeleton::skeleton_bar(12.0, 0.92, cx).into_any_element()
+                }
+                MarketCardDescription::Text(description) => div()
+                    .w_full()
+                    .text_sm()
+                    // `line_clamp` on its own clips the last line at the wrap
+                    // point, so a long description ended mid-word with no mark
+                    // that anything was missing. The ellipsis is what makes the
+                    // clamp read as a summary rather than as a broken string.
+                    .line_clamp(2)
+                    .text_ellipsis()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(description)
+                    .into_any_element(),
+            }
         }));
 
     // The transport and the address are one line: the chip classifies the entry
@@ -38876,14 +38966,38 @@ fn management_market_card(
         .child(div().flex_1())
         .child(footer.pt_2());
 
+    let surface = theme::module_surface(cx.theme().is_dark());
+    // The hover tone is the card's own surface warmed by the app's shared wash
+    // rather than a second plate: the card keeps its identity while it answers
+    // the pointer.
+    let hover_surface = surface.blend(theme::hover_wash(cx.theme().is_dark()));
+
     v_flex()
         .id(SharedString::from(format!("management-market-entry-{id}")))
+        .role(Role::Button)
+        .aria_label(accessible_name)
         .min_w(px(MANAGEMENT_MARKET_CARD_MIN_WIDTH))
         .flex_1()
         .min_h(px(MANAGEMENT_MARKET_CARD_MIN_HEIGHT))
         .rounded(cx.theme().radius_lg)
-        .bg(theme::module_surface(cx.theme().is_dark()))
+        .bg(surface)
         .p_3()
+        // Pointing at the card is the promise; the press is the same install the
+        // button names. The wash is the kit's hover tone rather than a color of
+        // its own, so a card hover reads like every other row in the app.
+        .cursor_pointer()
+        .focusable()
+        .tab_index(0)
+        .hover(move |style| style.bg(hover_surface))
+        // The ring is drawn outside the box rather than as a border: a card that
+        // grew a hairline when focused would move everything inside it by a
+        // pixel at the moment the reader arrives.
+        .focus_visible(|style| {
+            style.shadow(vec![
+                gpui::BoxShadow::new(px(0.0), px(0.0), cx.theme().ring).spread_radius(px(2.0)),
+            ])
+        })
+        .on_click(on_click)
         .child(body)
         .into_any_element()
 }
@@ -43906,6 +44020,56 @@ mod tests {
         }
     }
 
+    /// Pressing the card and pressing its button are one gesture, and pressing
+    /// a different control inside the card is not that gesture.
+    #[test]
+    fn both_market_grids_make_the_whole_card_install() {
+        let source = include_str!("management.rs");
+        let renderer = |open: &str, close: &str| {
+            source
+                .split_once(open)
+                .and_then(|(_, tail)| tail.split_once(close))
+                .map(|(body, _)| body)
+                .unwrap_or_else(|| panic!("{open} should remain inspectable"))
+        };
+        for (name, market) in [
+            (
+                "MCP",
+                renderer(
+                    "    fn render_mcp_market(",
+                    "\n    fn render_mcp_market_install_form(",
+                ),
+            ),
+            (
+                "Skill",
+                renderer(
+                    "    fn render_skills_market(",
+                    "\n    /// The preview and confirmation panel for one Skill.",
+                ),
+            ),
+        ] {
+            assert!(
+                market.contains("begin_mcp_market_install(install_entry.clone()")
+                    || market.contains("begin_skill_market_install(install_entry.clone()"),
+                "the {name} card's press should start the install"
+            );
+            // The card's own press and the button's press both carry the entry,
+            // so the card needs a copy of its own rather than borrowing one that
+            // the button already moved.
+            assert!(
+                market.matches("entry.clone()").count() >= 2,
+                "the {name} card and its button each need their own copy of the entry"
+            );
+            // Following the publisher's page or the repository is a different
+            // destination from installing, so it must not fall through to the
+            // card underneath it.
+            assert!(
+                market.contains("cx.stop_propagation();"),
+                "the {name} card's inner controls must keep their press to themselves"
+            );
+        }
+    }
+
     /// The registry publishes a full RFC3339 instant; a card only wants the day.
     #[test]
     fn market_timestamps_reduce_to_a_date() {
@@ -44026,11 +44190,19 @@ mod tests {
             "a clamped description needs an ellipsis, or it reads as a broken string"
         );
 
-        // The card is not a control, so it must not advertise one. It used to
+        // The card is a control, so pointing at it has to answer. It used to
         // blend its background under the pointer while offering no click.
         assert!(
-            !card.contains("on_hover"),
-            "the card has no click, so it must not carry a hover state"
+            card.contains(".hover("),
+            "a clickable card must show the pointer it answers"
+        );
+        assert!(
+            card.contains(".on_click(on_click)"),
+            "the whole card answers the press, not only its button"
+        );
+        assert!(
+            card.contains(".focusable()") && card.contains(".role(Role::Button)"),
+            "a card that can be pressed must be reachable and named by keyboard"
         );
 
         // The footer is separated by spacing. A rule there repeated the card's
