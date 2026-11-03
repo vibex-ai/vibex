@@ -2141,8 +2141,11 @@ const SKILL_MANIFEST_PREFIXES: [&str; 4] = ["skills", "", "plugins", ".agents/sk
 /// without a description is better than a market that reports an outage for one.
 fn skill_summary(entry: &SkillMarketEntry) -> Option<String> {
     let client = market_http_client().ok()?;
-    let manifest = fetch_skill_manifest(&client, &entry.source, &entry.slug)
-        .or_else(|| fetch_skill_bundle(&client, &entry.source, &entry.slug).ok()?.manifest)?;
+    let manifest = fetch_skill_manifest(&client, &entry.source, &entry.slug).or_else(|| {
+        fetch_skill_bundle(&client, &entry.source, &entry.slug)
+            .ok()?
+            .manifest
+    })?;
     let (_, description, _) = split_skill_document(&manifest);
     description
         .map(|value| value.trim().to_string())
@@ -2167,7 +2170,8 @@ fn fetch_skill_manifest(
             format!("{prefix}/{slug}/SKILL.md")
         };
         let url = format!("{RAW_GITHUB_BASE}/{source}/HEAD/{path}");
-        let Ok((body, _)) = fetch_market_bytes(client, &url, MAX_SKILL_MARKET_DOCUMENT_BYTES) else {
+        let Ok((body, _)) = fetch_market_bytes(client, &url, MAX_SKILL_MARKET_DOCUMENT_BYTES)
+        else {
             continue;
         };
         if let Ok(text) = String::from_utf8(body)

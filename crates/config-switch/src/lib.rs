@@ -2377,11 +2377,14 @@ impl ProviderConfigService {
             protocol_endpoints.clone().next()
         } else {
             protocol_endpoints.clone().find(|endpoint| {
-                endpoint.wire_protocol_id.as_deref().is_some_and(|protocol| {
-                    supported_protocols
-                        .iter()
-                        .any(|supported| supported == protocol)
-                })
+                endpoint
+                    .wire_protocol_id
+                    .as_deref()
+                    .is_some_and(|protocol| {
+                        supported_protocols
+                            .iter()
+                            .any(|supported| supported == protocol)
+                    })
             })
         };
         if chosen_endpoint.is_none()

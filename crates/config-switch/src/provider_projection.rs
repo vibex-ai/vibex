@@ -10162,7 +10162,10 @@ mod shared_provider_launch_tests {
             bound.configured_models[0].wire_api,
             Some(vibex_core::ProviderModelWireApi::AnthropicMessages)
         );
-        assert_eq!(bound.base_url.as_deref(), Some("https://opencode.ai/zen/go"));
+        assert_eq!(
+            bound.base_url.as_deref(),
+            Some("https://opencode.ai/zen/go")
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
