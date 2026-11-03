@@ -408,6 +408,7 @@ impl ManagementCenter {
             );
         ws_stack(vec![
             tiles,
+            self.render_workspace_gateway_traffic(cx),
             ws_section(
                 management_locale_text("Address", "地址", "位址"),
                 Some(management_locale_text(
@@ -426,7 +427,6 @@ impl ManagementCenter {
                 served_list.into_any_element(),
                 cx,
             ),
-            self.render_workspace_gateway_traffic(cx),
         ])
     }
 

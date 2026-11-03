@@ -473,6 +473,17 @@ impl ManagementCenter {
         ws_stack(vec![
             tiles,
             ws_section(
+                management_locale_text("Traffic", "流量", "流量"),
+                Some(management_locale_text(
+                    "Requests the gateway sent here. No cost or quota is tracked.",
+                    "经网关发往这里的请求；不统计费用或额度。",
+                    "經閘道發往這裡的請求；不統計費用或額度。",
+                )),
+                Some(self.workspace_range_menu("management-provider-traffic-range", cx)),
+                traffic.tiles(cx),
+                cx,
+            ),
+            ws_section(
                 management_locale_text("Agents", "Agent", "Agent"),
                 Some(management_locale_text(
                     "Click an Agent to let it use this Provider's models.",
@@ -492,17 +503,6 @@ impl ManagementCenter {
                 )),
                 None,
                 groups.into_any_element(),
-                cx,
-            ),
-            ws_section(
-                management_locale_text("Traffic", "流量", "流量"),
-                Some(management_locale_text(
-                    "Requests the gateway sent here. No cost or quota is tracked.",
-                    "经网关发往这里的请求；不统计费用或额度。",
-                    "經閘道發往這裡的請求；不統計費用或額度。",
-                )),
-                Some(self.workspace_range_menu("management-provider-traffic-range", cx)),
-                traffic.tiles(cx),
                 cx,
             ),
         ])
