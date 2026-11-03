@@ -82037,7 +82037,6 @@ struct FoundationSettings {
     /// result is a light hint and rides the workbench's notification layer.
     shortcut_note: Option<String>,
     /// Whether the Connections page is showing its add panel.
-    connections_add_preview: bool,
     /// Profiles loaded when Connections is activated.
     connections_profiles: Vec<SshConnectionProfile>,
     /// The active provisioning snapshot/error mirrored from the workbench.
@@ -82514,7 +82513,6 @@ impl FoundationSettings {
                 browser_import_task: None,
                 browser_clear_task: None,
                 shortcut_note: None,
-                connections_add_preview: false,
                 connections_profiles: Vec::new(),
                 connections_snapshot: None,
                 connections_error: None,
@@ -85903,7 +85901,6 @@ impl FoundationSettings {
         self.connections_host_warnings = discovery.warnings;
         self.connections_selected_host = None;
         self.connections_probe_state = ConnectionsProbeState::Idle;
-        self.connections_add_preview = true;
         cx.notify();
     }
 
@@ -86000,7 +85997,6 @@ impl FoundationSettings {
                         Ok(Ok((alias, profile_id))) => {
                             this.reload_connections_profiles();
                             this.connections_probe_state = ConnectionsProbeState::Added(alias);
-                            this.connections_add_preview = false;
                             this.connections_selected_host = None;
                             let workbench = this.workbench.clone();
                             cx.defer(move |cx| {
@@ -86103,9 +86099,465 @@ impl FoundationSettings {
         });
     }
 
+    /// Opens the add-SSH-connection dialog and starts host discovery.
+    ///
+    /// The list lives in the dialog rather than on the settings page: adding a
+    /// connection is a short, self-contained decision, and the page underneath
+    /// must keep its own list and scroll position while that decision is made.
+    fn open_connections_add_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.connections_selected_host = None;
+        self.connections_probe_state = ConnectionsProbeState::Idle;
+        self.load_connections_discovery(cx);
+        let entity = cx.weak_entity();
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let entity = entity.clone();
+            let entity_for_footer = entity.clone();
+            let (hosts, warnings, selected, probe) = entity
+                .update(cx, |this, _| {
+                    (
+                        this.connections_hosts.clone(),
+                        this.connections_host_warnings.clone(),
+                        this.connections_selected_host.clone(),
+                        this.connections_probe_state.clone(),
+                    )
+                })
+                .unwrap_or_else(|_| {
+                    (Vec::new(), Vec::new(), None, ConnectionsProbeState::Idle)
+                });
+            let probing = matches!(probe, ConnectionsProbeState::Probing(_));
+            let mut body = v_flex().w_full().min_w_0().gap_2();
+            body = body.child(
+                div()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .whitespace_normal()
+                    .child(locale::text(
+                        "Pick a host from ~/.ssh/config. Probing checks it, saves the connection, and starts provisioning.",
+                        "从 ~/.ssh/config 选择主机。探测会先检查该主机、保存连接，然后开始配置。",
+                        "從 ~/.ssh/config 選擇主機。探測會先檢查該主機、儲存連線，然後開始設定。",
+                    )),
+            );
+            if hosts.is_empty() {
+                body = body.child(
+                    div()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(locale::text(
+                            "No concrete hosts were found in your OpenSSH config.",
+                            "OpenSSH 配置中没有找到具体主机。",
+                            "OpenSSH 設定中沒有找到具體主機。",
+                        )),
+                );
+            } else {
+                let mut list = v_flex()
+                    .id("connections-add-host-list")
+                    .w_full()
+                    .max_h(px(300.0))
+                    .overflow_y_scroll()
+                    .gap_px()
+                    .p_1()
+                    .rounded(cx.theme().radius_lg)
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .bg(cx.theme().secondary.opacity(0.35));
+                for (index, host) in hosts.iter().take(200).enumerate() {
+                    let alias = host.alias.clone();
+                    let chosen = selected.as_deref() == Some(alias.as_str());
+                    let row_entity = entity.clone();
+                    let value = alias.clone();
+                    list = list.child(
+                        h_flex()
+                            .id(SharedString::from(format!("connections-host-{index}")))
+                            .w_full()
+                            .min_w_0()
+                            .items_center()
+                            .justify_between()
+                            .gap_2()
+                            .px_2()
+                            .py(px(6.0))
+                            .rounded(cx.theme().radius)
+                            .when(chosen, |this| this.bg(cx.theme().primary.opacity(0.14)))
+                            .hover(|this| this.bg(cx.theme().muted.opacity(0.5)))
+                            .on_click(move |_, _, cx| {
+                                let _ = row_entity.update(cx, |this, cx| {
+                                    this.connections_selected_host = Some(value.clone());
+                                    cx.notify();
+                                });
+                            })
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_sm()
+                                    .child(alias),
+                            )
+                            .when(chosen, |this| {
+                                this.child(Icon::new(IconName::Check).size(px(14.0)))
+                            }),
+                    );
+                }
+                body = body.child(list);
+            }
+            for warning in &warnings {
+                body = body.child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(warning.clone()),
+                );
+            }
+            let failure = match &probe {
+                ConnectionsProbeState::Failed(error) => Some(error.clone()),
+                _ => None,
+            };
+            if let Some(error) = failure {
+                body = body.child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().danger)
+                        .whitespace_normal()
+                        .child(error),
+                );
+            }
+            let probe_label = match &probe {
+                ConnectionsProbeState::Probing(alias) => Some(format!(
+                    "{} {alias}…",
+                    locale::text("Probing", "正在探测", "正在探測")
+                )),
+                _ => None,
+            };
+            if let Some(label) = probe_label {
+                body = body.child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(label),
+                );
+            }
+            dialog
+                .title(locale::text(
+                    "Add SSH connection",
+                    "添加 SSH 连接",
+                    "新增 SSH 連線",
+                ))
+                .w(px(520.0))
+                .child(body)
+                .footer(
+                    DialogFooter::new()
+                        .child(DialogClose::new().child(
+                            Button::new("connections-add-cancel")
+                                .outline()
+                                .label(locale::text("Cancel", "取消", "取消")),
+                        ))
+                        .child(DialogAction::new().child(
+                            Button::new("connections-add-probe")
+                                .primary()
+                                .label(locale::text(
+                                    "Probe and add",
+                                    "探测并添加",
+                                    "探測並新增",
+                                ))
+                                .disabled(selected.is_none() || probing)
+                                .loading(probing),
+                        )),
+                )
+                .on_ok(move |_, _, cx| {
+                    let _ = entity_for_footer.update(cx, |this, cx| {
+                        if let Some(alias) = this.connections_selected_host.clone() {
+                            this.probe_connections_host(alias, cx);
+                        }
+                    });
+                    // The probe reports into the page's provisioning section,
+                    // which is the object that actually changes, so the dialog
+                    // closes instead of parking on a spinner.
+                    true
+                })
+        });
+    }
+
+    /// Opens the no-ssh-yet bootstrap dialog and resets its previous answer.
+    fn open_connections_bootstrap_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.bootstrap_command = None;
+        self.bootstrap_error = None;
+        self.bootstrap_open = true;
+        let entity = cx.weak_entity();
+        // The input entity is captured, not reached through `self`: the dialog
+        // builder must outlive this method.
+        let user_input = self.bootstrap_user_input.clone();
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let entity = entity.clone();
+            let user_input = user_input.clone();
+            let (command, error) = entity
+                .update(cx, |this, _| {
+                    (this.bootstrap_command.clone(), this.bootstrap_error.clone())
+                })
+                .unwrap_or((None, None));
+            let mut body = v_flex().w_full().min_w_0().gap_2();
+            body = body.child(
+                div()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .whitespace_normal()
+                    .child(locale::text(
+                        "Run this in the provider console or serial console. It installs sshd, authorizes the displayed desktop key, and expires after 15 minutes.",
+                        "在云控制台或串口控制台执行。它会安装 sshd、注入显示的桌面公钥，并在 15 分钟后过期。",
+                        "在雲端主控台或序列埠主控台執行。它會安裝 sshd、注入顯示的桌面公鑰，並在 15 分鐘後過期。",
+                    )),
+            );
+            body = body.child(
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(locale::text("Linux account", "Linux 账户", "Linux 帳戶")),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(Input::new(&user_input).small().h(px(28.0))),
+                    )
+                    .child(
+                        Button::new("connections-bootstrap-generate")
+                            .small()
+                            .outline()
+                            .label(locale::text(
+                                "Generate command",
+                                "生成命令",
+                                "產生命令",
+                            ))
+                            .on_click({
+                                let entity = entity.clone();
+                                move |_, _, cx| {
+                                    let _ = entity.update(cx, |this, cx| {
+                                        this.generate_bootstrap_command(cx)
+                                    });
+                                }
+                            }),
+                    ),
+            );
+            if let Some(error) = error {
+                body = body.child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().danger)
+                        .whitespace_normal()
+                        .child(error),
+                );
+            }
+            if let Some(command) = command {
+                body = body.child(
+                    div()
+                        .id("connections-bootstrap-command")
+                        .w_full()
+                        .max_h(px(220.0))
+                        .overflow_y_scroll()
+                        .rounded(cx.theme().radius)
+                        .bg(cx.theme().muted)
+                        .p_2()
+                        .child(
+                            div()
+                                .w_full()
+                                .text_xs()
+                                .font_family("monospace")
+                                .whitespace_normal()
+                                .child(command.command.clone()),
+                        ),
+                );
+            }
+            dialog
+                .title(locale::text(
+                    "Bootstrap without SSH",
+                    "无 SSH 初始化",
+                    "無 SSH 初始化",
+                ))
+                .w(px(560.0))
+                .child(body)
+                .footer(
+                    DialogFooter::new()
+                        .child(DialogClose::new().child(
+                            Button::new("connections-bootstrap-close")
+                                .outline()
+                                .label(locale::text("Done", "完成", "完成")),
+                        ))
+                        .child({
+                            let entity = entity.clone();
+                            Button::new("connections-bootstrap-recheck")
+                                .outline()
+                                .label(locale::text(
+                                    "Recheck SSH",
+                                    "重新检测 SSH",
+                                    "重新偵測 SSH",
+                                ))
+                                .on_click(move |_, window, cx| {
+                                    // The SSH form is the next step, so hand
+                                    // over in this same frame: closing first
+                                    // would leave the reader with nothing open.
+                                    let _ = entity.update(cx, |this, cx| {
+                                        this.load_connections_discovery(cx);
+                                        this.open_connections_add_dialog(window, cx);
+                                        window.close_dialog(cx);
+                                    });
+                                })
+                        })
+                        .child({
+                            let entity = entity.clone();
+                            Button::new("connections-bootstrap-copy")
+                                .primary()
+                                .label(locale::text("Copy command", "复制命令", "複製命令"))
+                                .on_click(move |_, _, cx| {
+                                    let command = entity
+                                        .update(cx, |this, _| {
+                                            this.bootstrap_command
+                                                .as_ref()
+                                                .map(|command| command.command.clone())
+                                        })
+                                        .ok()
+                                        .flatten();
+                                    if let Some(command) = command {
+                                        cx.write_to_clipboard(ClipboardItem::new_string(command));
+                                    }
+                                })
+                        }),
+                )
+        });
+    }
+
+    /// Opens the WSL distro dialog. The distro list is read once, when the
+    /// dialog opens, because `wsl.exe` is a process call rather than a value.
+    fn open_connections_wsl_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.load_wsl_distros(cx);
+        let entity = cx.weak_entity();
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let entity = entity.clone();
+            let entity_for_footer = entity.clone();
+            let (distros, selected, error) = entity
+                .update(cx, |this, _| {
+                    (
+                        this.connections_wsl_distros.clone(),
+                        this.connections_wsl_selected.clone(),
+                        this.connections_wsl_error.clone(),
+                    )
+                })
+                .unwrap_or_default();
+            let mut body = v_flex().w_full().min_w_0().gap_2();
+            body = body.child(
+                div()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .whitespace_normal()
+                    .child(locale::text(
+                        "WSL2 runs Linux locally; no sshd or SSH key is required.",
+                        "WSL2 在本机运行 Linux，不需要 sshd 或 SSH 密钥。",
+                        "WSL2 在本機執行 Linux，不需要 sshd 或 SSH 金鑰。",
+                    )),
+            );
+            if let Some(error) = error {
+                body = body.child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().danger)
+                        .whitespace_normal()
+                        .child(error),
+                );
+            }
+            if distros.is_empty() {
+                body = body.child(
+                    div()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(locale::text(
+                            "No WSL distros found. Install WSL2 and at least one distro first.",
+                            "未找到 WSL 发行版。请先安装 WSL2 和一个发行版。",
+                            "找不到 WSL 發行版。請先安裝 WSL2 和一個發行版。",
+                        )),
+                );
+            } else {
+                let mut list = v_flex()
+                    .id("connections-wsl-distro-list")
+                    .w_full()
+                    .max_h(px(280.0))
+                    .overflow_y_scroll()
+                    .gap_px()
+                    .p_1()
+                    .rounded(cx.theme().radius_lg)
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .bg(cx.theme().secondary.opacity(0.35));
+                for distro in &distros {
+                    let chosen = selected.as_deref() == Some(distro.as_str());
+                    let row_entity = entity.clone();
+                    let value = distro.clone();
+                    list = list.child(
+                        h_flex()
+                            .id(SharedString::from(format!("connections-wsl-{distro}")))
+                            .w_full()
+                            .min_w_0()
+                            .items_center()
+                            .justify_between()
+                            .gap_2()
+                            .px_2()
+                            .py(px(6.0))
+                            .rounded(cx.theme().radius)
+                            .when(chosen, |this| this.bg(cx.theme().primary.opacity(0.14)))
+                            .hover(|this| this.bg(cx.theme().muted.opacity(0.5)))
+                            .on_click(move |_, _, cx| {
+                                let _ = row_entity.update(cx, |this, cx| {
+                                    this.connections_wsl_selected = Some(value.clone());
+                                    cx.notify();
+                                });
+                            })
+                            .child(div().min_w_0().truncate().text_sm().child(distro.clone()))
+                            .when(chosen, |this| {
+                                this.child(Icon::new(IconName::Check).size(px(14.0)))
+                            }),
+                    );
+                }
+                body = body.child(list);
+            }
+            dialog
+                .title(locale::text(
+                    "Add WSL runtime",
+                    "添加 WSL 运行时",
+                    "新增 WSL 執行階段",
+                ))
+                .w(px(480.0))
+                .child(body)
+                .footer(
+                    DialogFooter::new()
+                        .child(
+                            DialogClose::new().child(
+                                Button::new("connections-wsl-cancel")
+                                    .outline()
+                                    .label(locale::text("Cancel", "取消", "取消")),
+                            ),
+                        )
+                        .child(
+                            DialogAction::new().child(
+                                Button::new("connections-wsl-connect")
+                                    .primary()
+                                    .label(locale::text("Connect WSL", "连接 WSL", "連線 WSL"))
+                                    .disabled(selected.is_none()),
+                            ),
+                        ),
+                )
+                .on_ok(move |_, _, cx| {
+                    let _ = entity_for_footer.update(cx, |this, cx| this.connect_wsl_distro(cx));
+                    true
+                })
+        });
+    }
+
     fn render_connections_page(&self, stacked: bool, cx: &mut Context<Self>) -> AnyElement {
-        let is_dark = cx.theme().is_dark();
-        let muted = theme::semantic_color("muted-foreground", is_dark);
+        // The three add flows are dialogs over the page, not sections inside
+        // it. A page that grew a section whenever a button was pressed pushed
+        // its own list down the viewport and read as a different page; a
+        // dialog keeps the list where the reader left it and dismisses back to
+        // the same scroll position.
         let add_button = Button::new("connections-add")
             .small()
             .outline()
@@ -86115,19 +86567,16 @@ impl FoundationSettings {
                 "添加 SSH 连接",
                 "新增 SSH 連線",
             ))
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.load_connections_discovery(cx);
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.open_connections_add_dialog(window, cx);
             }));
 
         let bootstrap_button = Button::new("connections-bootstrap")
             .small()
             .outline()
             .label(locale::text("Bootstrap SSH", "初始化 SSH", "初始化 SSH"))
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.bootstrap_open = true;
-                this.bootstrap_command = None;
-                this.bootstrap_error = None;
-                cx.notify();
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.open_connections_bootstrap_dialog(window, cx);
             }));
         let wsl_button = Button::new("connections-add-wsl")
             .small()
@@ -86138,329 +86587,10 @@ impl FoundationSettings {
                 "添加 WSL 运行时",
                 "新增 WSL 執行階段",
             ))
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.load_wsl_distros(cx);
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.open_connections_wsl_dialog(window, cx);
             }));
         let mut groups = Vec::new();
-        if self.connections_add_preview {
-            let close = Button::new("connections-add-close")
-                .small()
-                .ghost()
-                .label(locale::text("Close", "关闭", "關閉"))
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.connections_add_preview = false;
-                    cx.notify();
-                }));
-            let mut children = vec![div()
-                .text_xs()
-                .text_color(muted)
-                .child(locale::text(
-                    "Choose a host from ~/.ssh/config. Probe and add records it before provisioning.",
-                    "从 ~/.ssh/config 选择主机。探测并添加后会先保存连接资料。",
-                    "從 ~/.ssh/config 選擇主機。探測並新增後會先儲存連線資料。",
-                ))
-                .into_any_element()];
-            if self.connections_hosts.is_empty() {
-                children.push(
-                    div()
-                        .text_xs()
-                        .text_color(muted)
-                        .child(locale::text(
-                            "No concrete hosts were found in your OpenSSH config.",
-                            "OpenSSH 配置中没有找到具体主机。",
-                            "OpenSSH 設定中沒有找到具體主機。",
-                        ))
-                        .into_any_element(),
-                );
-            } else {
-                children.push(
-                    v_flex()
-                        .w_full()
-                        .gap_1()
-                        .children(self.connections_hosts.iter().take(50).enumerate().map(
-                            |(index, host)| {
-                                let alias = host.alias.clone();
-                                let selected = self.connections_selected_host.as_deref()
-                                    == Some(alias.as_str());
-                                Button::new(SharedString::from(format!("connections-host-{index}")))
-                                    .small()
-                                    .when(selected, |button| button.primary())
-                                    .when(!selected, |button| button.outline())
-                                    .label(alias.clone())
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.connections_selected_host = Some(alias.clone());
-                                        cx.notify();
-                                    }))
-                                    .into_any_element()
-                            },
-                        ))
-                        .into_any_element(),
-                );
-            }
-            for warning in &self.connections_host_warnings {
-                children.push(
-                    div()
-                        .text_xs()
-                        .text_color(muted)
-                        .child(warning.clone())
-                        .into_any_element(),
-                );
-            }
-            let probe_label = match &self.connections_probe_state {
-                ConnectionsProbeState::Idle => None,
-                ConnectionsProbeState::Probing(alias) => Some(format!(
-                    "{} {alias}…",
-                    locale::text("Probing", "正在探测", "正在探測")
-                )),
-                ConnectionsProbeState::Added(alias) => Some(format!(
-                    "{} {alias}",
-                    locale::text("Added", "已添加", "已新增")
-                )),
-                ConnectionsProbeState::Failed(error) => Some(error.clone()),
-            };
-            if let Some(label) = probe_label {
-                children.push(
-                    div()
-                        .text_xs()
-                        .text_color(muted)
-                        .child(label)
-                        .into_any_element(),
-                );
-            }
-            let probing = matches!(
-                self.connections_probe_state,
-                ConnectionsProbeState::Probing(_)
-            );
-            let add = Button::new("connections-add-probe")
-                .small()
-                .outline()
-                .icon(IconName::Plus)
-                .label(locale::text("Probe and add", "探测并添加", "探測並新增"))
-                .disabled(self.connections_selected_host.is_none() || probing)
-                .on_click(cx.listener(|this, _, _, cx| {
-                    if let Some(alias) = this.connections_selected_host.clone() {
-                        this.probe_connections_host(alias, cx);
-                    }
-                }));
-            children.push(
-                h_flex()
-                    .w_full()
-                    .justify_between()
-                    .items_center()
-                    .gap_4()
-                    .child(close)
-                    .child(add)
-                    .into_any_element(),
-            );
-            groups.push(SettingsGroup::new(
-                locale::text("Add SSH connection", "添加 SSH 连接", "新增 SSH 連線"),
-                children,
-            ));
-        }
-        if self.bootstrap_open {
-            let close = Button::new("connections-bootstrap-close")
-                .small()
-                .ghost()
-                .label(locale::text("Close", "关闭", "關閉"))
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.bootstrap_open = false;
-                    this.bootstrap_command = None;
-                    this.bootstrap_error = None;
-                    cx.notify();
-                }));
-            let copy = Button::new("connections-bootstrap-copy")
-                .small()
-                .outline()
-                .label(locale::text("Copy command", "复制命令", "複製命令"))
-                .on_click(cx.listener(|this, _, _, cx| {
-                    if let Some(command) = this.bootstrap_command.as_ref() {
-                        cx.write_to_clipboard(ClipboardItem::new_string(command.command.clone()));
-                    }
-                }));
-            let recheck = Button::new("connections-bootstrap-recheck")
-                .small()
-                .outline()
-                .label(locale::text("Recheck SSH", "重新检测 SSH", "重新偵測 SSH"))
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.bootstrap_open = false;
-                    this.bootstrap_command = None;
-                    this.bootstrap_error = None;
-                    this.load_connections_discovery(cx);
-                }));
-            let generate = Button::new("connections-bootstrap-generate")
-                .small()
-                .primary()
-                .label(locale::text("Generate command", "生成命令", "產生命令"))
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.generate_bootstrap_command(cx);
-                }));
-            let mut children = vec![div()
-                .text_xs()
-                .text_color(muted)
-                .child(locale::text(
-                    "Run this in the provider console or serial console. It installs sshd, authorizes the displayed desktop key, and expires after 15 minutes.",
-                    "在云控制台或串口控制台执行。它会安装 sshd、注入显示的桌面公钥，并在 15 分钟后过期。",
-                    "在雲端主控台或序列埠主控台執行。它會安裝 sshd、注入顯示的桌面公鑰，並在 15 分鐘後過期。",
-                ))
-                .into_any_element()];
-            children.push(
-                h_flex()
-                    .w_full()
-                    .items_center()
-                    .gap_2()
-                    .child(div().text_xs().text_color(muted).child(locale::text(
-                        "Linux account",
-                        "Linux 账户",
-                        "Linux 帳戶",
-                    )))
-                    .child(
-                        div()
-                            .flex_1()
-                            .child(Input::new(&self.bootstrap_user_input).small().h(px(28.0))),
-                    )
-                    .child(generate)
-                    .into_any_element(),
-            );
-            if let Some(error) = &self.bootstrap_error {
-                children.push(
-                    div()
-                        .text_xs()
-                        .text_color(cx.theme().danger)
-                        .child(error.clone())
-                        .into_any_element(),
-                );
-            }
-            if let Some(command) = &self.bootstrap_command {
-                children.push(
-                    div()
-                        .w_full()
-                        .rounded_md()
-                        .bg(cx.theme().muted)
-                        .p_2()
-                        .child(
-                            div()
-                                .w_full()
-                                .text_xs()
-                                .font_family("monospace")
-                                .whitespace_normal()
-                                .child(command.command.clone()),
-                        )
-                        .into_any_element(),
-                );
-                children.push(
-                    h_flex()
-                        .w_full()
-                        .justify_between()
-                        .items_center()
-                        .gap_2()
-                        .child(close)
-                        .child(recheck)
-                        .child(copy)
-                        .into_any_element(),
-                );
-            } else {
-                children.push(
-                    h_flex()
-                        .w_full()
-                        .justify_end()
-                        .child(close)
-                        .into_any_element(),
-                );
-            }
-            groups.push(SettingsGroup::new(
-                locale::text("Bootstrap without SSH", "无 SSH 初始化", "無 SSH 初始化"),
-                children,
-            ));
-        }
-
-        if self.connections_wsl_open {
-            let close = Button::new("connections-wsl-close")
-                .small()
-                .ghost()
-                .label(locale::text("Close", "关闭", "關閉"))
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.connections_wsl_open = false;
-                    cx.notify();
-                }));
-            let connect = Button::new("connections-wsl-connect")
-                .small()
-                .outline()
-                .label(locale::text("Connect WSL", "连接 WSL", "連線 WSL"))
-                .disabled(self.connections_wsl_selected.is_none())
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.connect_wsl_distro(cx);
-                }));
-            let mut children = vec![
-                div()
-                    .text_xs()
-                    .text_color(muted)
-                    .child(locale::text(
-                        "WSL2 runs Linux locally; no sshd or SSH key is required.",
-                        "WSL2 在本机运行 Linux，不需要 sshd 或 SSH 密钥。",
-                        "WSL2 在本機執行 Linux，不需要 sshd 或 SSH 金鑰。",
-                    ))
-                    .into_any_element(),
-            ];
-            if let Some(error) = &self.connections_wsl_error {
-                children.push(
-                    div()
-                        .text_xs()
-                        .text_color(cx.theme().danger)
-                        .child(error.clone())
-                        .into_any_element(),
-                );
-            }
-            if self.connections_wsl_distros.is_empty() {
-                children.push(
-                    div()
-                        .text_xs()
-                        .text_color(muted)
-                        .child(locale::text(
-                            "No WSL distros found. Install WSL2 and at least one distro first.",
-                            "未找到 WSL 发行版。请先安装 WSL2 和一个发行版。",
-                            "找不到 WSL 發行版。請先安裝 WSL2 和一個發行版。",
-                        ))
-                        .into_any_element(),
-                );
-            } else {
-                children.push(
-                    v_flex()
-                        .w_full()
-                        .gap_1()
-                        .children(self.connections_wsl_distros.iter().map(|distro| {
-                            let selected =
-                                self.connections_wsl_selected.as_deref() == Some(distro.as_str());
-                            let value = distro.clone();
-                            Button::new(SharedString::from(format!("connections-wsl-{distro}")))
-                                .small()
-                                .when(selected, |button| button.primary())
-                                .when(!selected, |button| button.outline())
-                                .label(distro.clone())
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.connections_wsl_selected = Some(value.clone());
-                                    cx.notify();
-                                }))
-                                .into_any_element()
-                        }))
-                        .into_any_element(),
-                );
-            }
-            children.push(
-                h_flex()
-                    .w_full()
-                    .justify_between()
-                    .items_center()
-                    .gap_2()
-                    .child(close)
-                    .child(connect)
-                    .into_any_element(),
-            );
-            groups.push(SettingsGroup::new(
-                locale::text("WSL", "WSL", "WSL"),
-                children,
-            ));
-        }
-
         if self.connections_snapshot.is_some() || self.connections_error.is_some() {
             groups.push(SettingsGroup::new(
                 locale::text("Provisioning", "配置进度", "設定進度"),
@@ -86489,6 +86619,35 @@ impl FoundationSettings {
             .child(wsl_button)
             .child(add_button)
             .into_any_element();
+        // A failure that outlives its dialog lands here rather than in the
+        // dialog's body: the dialog closes on submit, so this list is the only
+        // surface still on screen when the probe or the WSL connect fails.
+        let mut notices: Vec<AnyElement> = Vec::new();
+        if let ConnectionsProbeState::Failed(error) = &self.connections_probe_state {
+            notices.push(
+                div()
+                    .w_full()
+                    .text_xs()
+                    .text_color(cx.theme().danger)
+                    .whitespace_normal()
+                    .child(error.clone())
+                    .into_any_element(),
+            );
+        }
+        if let Some(error) = &self.connections_wsl_error {
+            notices.push(
+                div()
+                    .w_full()
+                    .text_xs()
+                    .text_color(cx.theme().danger)
+                    .whitespace_normal()
+                    .child(error.clone())
+                    .into_any_element(),
+            );
+        }
+        if !notices.is_empty() {
+            groups.push(SettingsGroup::unlabeled(notices));
+        }
         groups.push(SettingsGroup::with_leading(
             locale::text("SSH connections", "SSH 连接", "SSH 連線"),
             leading,
@@ -111489,6 +111648,118 @@ mod tests {
         assert!(!page.contains(".bg(background)"));
     }
 
+    /// The add flows are dialogs over the page, not sections inside it.
+    ///
+    /// Each of them used to mount as a new settings group above the list, so
+    /// pressing a button grew the page and pushed everything the reader was
+    /// looking at down the viewport. The page now only owns the list, and every
+    /// add action opens a focused dialog that dismisses back to the same
+    /// scroll position.
+    #[test]
+    fn connection_add_flows_open_over_the_page_instead_of_growing_it() {
+        let source = include_str!("app.rs");
+        let page = source
+            .split_once("    fn render_connections_page(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_connections_empty_state("))
+            .map(|(body, _)| body)
+            .expect("the Connections page should remain inspectable");
+        for opener in [
+            "open_connections_add_dialog",
+            "open_connections_bootstrap_dialog",
+            "open_connections_wsl_dialog",
+        ] {
+            assert!(page.contains(opener), "the page must route {opener}");
+        }
+        // None of the retired inline sections survives on the page.
+        for retired in [
+            "connections-add-close",
+            "connections-bootstrap-close",
+            "connections-wsl-close",
+            "connections-add-probe",
+        ] {
+            assert!(
+                !page.contains(retired),
+                "{retired} still renders inside the page"
+            );
+        }
+
+        // Each opener is a dialog builder, and each keeps its own selection
+        // state so a scroll or a repaint never loses the reader's choice.
+        for (opener, dialog_test) in [
+            (
+                "    fn open_connections_add_dialog(",
+                "connections-add-probe",
+            ),
+            (
+                "    fn open_connections_bootstrap_dialog(",
+                "connections-bootstrap-command",
+            ),
+            (
+                "    fn open_connections_wsl_dialog(",
+                "connections-wsl-connect",
+            ),
+        ] {
+            let body = source
+                .split_once(opener)
+                .and_then(|(_, tail)| tail.split_once("\n    /// "))
+                .map(|(body, _)| body)
+                .unwrap_or_else(|| panic!("{opener} should remain inspectable"));
+            assert!(
+                body.contains("window.open_dialog(cx"),
+                "{opener} must open a dialog instead of a page section"
+            );
+            assert!(
+                body.contains(".w(px(") && body.contains(".footer("),
+                "{opener} must size itself and keep its commit in a footer"
+            );
+            assert!(
+                dialog_test.contains("connections") && body.contains(dialog_test),
+                "{opener} must own {dialog_test}"
+            );
+        }
+    }
+
+    /// A probe or WSL failure outlives its dialog.
+    ///
+    /// Both submit and close their dialog, so the failure text cannot live in
+    /// the dialog body: the page carries it in a notice above the list, which is
+    /// the surface still on screen when the work reports back.
+    #[test]
+    fn connection_failures_land_on_the_page_when_their_dialog_closes() {
+        let source = include_str!("app.rs");
+        let page = source
+            .split_once("    fn render_connections_page(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_connections_empty_state("))
+            .map(|(body, _)| body)
+            .expect("the Connections page should remain inspectable");
+        assert!(
+            page.contains("ConnectionsProbeState::Failed(error)"),
+            "a failed probe must report above the list"
+        );
+        assert!(
+            page.contains("connections_wsl_error"),
+            "a failed WSL connect must report above the list"
+        );
+        assert!(
+            page.contains("SettingsGroup::unlabeled(notices)"),
+            "the notices need a group of their own, not a row inside the list"
+        );
+
+        // Both dialogs close on submit, so parking the failure in their bodies
+        // would show it for one frame and then drop it.
+        for opener in [
+            "    fn open_connections_add_dialog(",
+            "    fn open_connections_wsl_dialog(",
+        ] {
+            let body = source
+                .split_once(opener)
+                .and_then(|(_, tail)| tail.split_once("\n    /// "))
+                .map(|(body, _)| body)
+                .unwrap_or_else(|| panic!("{opener} should remain inspectable"));
+            assert!(body.contains(".on_ok("), "{opener} must submit from Enter");
+        }
+    }
+
     /// The browser page is where a new tab's page and the address bar's engine
     /// are chosen, and both have to reach the workbench rather than only the
     /// settings snapshot.
@@ -111749,7 +112020,15 @@ mod tests {
         assert!(page.contains("render_connections_empty_state"));
         assert!(page.contains("SettingsGroup::with_leading"));
         assert!(page.contains("Button::new(\"connections-add\")"));
-        assert!(page.contains("connections_add_preview"));
+        // The add flows are dialogs, so the page itself never grows a section
+        // when one of them opens. A page that did is what pushed the list down
+        // the viewport.
+        // The retired inline section flag is gone from the whole file, so a
+        // later change cannot reintroduce the layout shift by reviving it.
+        assert!(!source.contains(concat!("connections_add_", "preview")));
+        assert!(page.contains("open_connections_add_dialog"));
+        assert!(page.contains("open_connections_bootstrap_dialog"));
+        assert!(page.contains("open_connections_wsl_dialog"));
 
         let row = source
             .split_once("    fn connection_row(")
