@@ -6288,19 +6288,23 @@ impl ManagementCenter {
         }));
     }
 
-    /// Opens the chooser from a known surface.
+    /// Opens the chooser from a known surface, on the half that surface asked
+    /// for.
     ///
     /// The add buttons on the Agent card and on the global Providers page open
     /// the same chooser but disagree about what a save binds, so the origin is
-    /// recorded here rather than guessed at save time.
+    /// recorded here rather than guessed at save time. The tab is a parameter
+    /// because an empty list's placeholder knows which record it is inviting,
+    /// while the heading's Add button has no list to speak for it.
     fn open_profile_creator_from(
         &mut self,
         window: &mut Window,
         origin: ProviderPickerOrigin,
+        tab: ProviderPickerTab,
         cx: &mut Context<Self>,
     ) {
         self.provider_picker_origin = origin;
-        self.provider_picker_tab = ProviderPickerTab::Providers;
+        self.provider_picker_tab = tab;
         self.sync_provider_picker_search_placeholder(window, cx);
         // The dialog is opened from an Agent card, so the new shared record is
         // enabled for that Agent after it is written.
@@ -31061,7 +31065,12 @@ impl ManagementCenter {
                     cx,
                 )
                 .on_click(cx.listener(|this, _, window, cx| {
-                    this.open_route_group_editor(true, window, cx);
+                    this.open_profile_creator_from(
+                        window,
+                        ProviderPickerOrigin::AgentCard,
+                        ProviderPickerTab::RouteGroups,
+                        cx,
+                    );
                 })),
             );
         }
@@ -32807,7 +32816,12 @@ impl ManagementCenter {
                     .icon(IconName::Plus)
                     .disabled(pending)
                     .on_click(cx.listener(|this, _, window, cx| {
-                        this.open_profile_creator_from(window, ProviderPickerOrigin::AgentCard, cx);
+                        this.open_profile_creator_from(
+                            window,
+                            ProviderPickerOrigin::AgentCard,
+                            ProviderPickerTab::Providers,
+                            cx,
+                        );
                     })),
                 copy.add_configuration,
             ))
@@ -32828,7 +32842,12 @@ impl ManagementCenter {
                 cx,
             )
             .on_click(cx.listener(|this, _, window, cx| {
-                this.open_profile_creator_from(window, ProviderPickerOrigin::AgentCard, cx);
+                this.open_profile_creator_from(
+                    window,
+                    ProviderPickerOrigin::AgentCard,
+                    ProviderPickerTab::Providers,
+                    cx,
+                );
             }))
             .into_any_element()
         } else {
@@ -48631,6 +48650,16 @@ mod tests {
         assert!(render.contains("management_empty_source_card("));
         assert!(render.contains("Add model provider"));
         assert!(render.contains("this.open_profile_creator_from("));
+        // The placeholder invites the record it stands in for, so its chooser
+        // opens on the Providers half rather than whatever tab was last used.
+        let empty_provider_card = render
+            .split_once("let providers = if profiles.is_empty()")
+            .and_then(|(_, tail)| tail.split_once("} else {"))
+            .map(|(body, _)| body)
+            .expect("the empty Provider card should remain inspectable");
+        assert!(empty_provider_card.contains("provider-empty-card"));
+        assert!(empty_provider_card.contains("ProviderPickerTab::Providers"));
+        assert!(empty_provider_card.contains("this.open_profile_creator_from("));
         // The two headings show their own counts.
         assert!(render.contains("management_section_heading("));
         assert!(render.contains("profiles.len()"));
@@ -50378,7 +50407,12 @@ mod gateway_surface_tests {
         let center = built.expect("the management window builds its center");
         cx.update(|window, cx| {
             center.update(cx, |center, cx| {
-                center.open_profile_creator_from(window, ProviderPickerOrigin::AgentCard, cx);
+                center.open_profile_creator_from(
+                    window,
+                    ProviderPickerOrigin::AgentCard,
+                    ProviderPickerTab::Providers,
+                    cx,
+                );
             });
             let _ = window.draw(cx);
         });
@@ -52653,6 +52687,13 @@ mod gateway_surface_tests {
         // An empty list is a same-size card with an icon and a caption.
         assert!(card.contains("management-route-group-empty"));
         assert!(card.contains("management_empty_source_card("));
+        // The placeholder opens the chooser on the Route groups half, so the
+        // reader lands on the records it is inviting instead of a blank form.
+        assert!(card.contains("ProviderPickerTab::RouteGroups"));
+        assert!(
+            !card.contains("this.open_route_group_editor(true, window, cx);"),
+            "the empty card must not skip the chooser"
+        );
         assert!(card.contains("management_section_heading("));
         assert!(card.contains("group_count"));
 
