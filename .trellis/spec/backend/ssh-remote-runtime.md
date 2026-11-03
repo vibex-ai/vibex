@@ -6,69 +6,66 @@ Code lives in `apps/desktop/src/ssh_connection/`; the workbench wiring is in
 `apps/desktop/src/app.rs`. User-facing behaviour is documented in
 `docs/remote/ssh-runtime.md`.
 
-## Scenario: Release flag and entry points
+## Scenario: Remote instance entry points
 
 ### 1. Scope / Trigger
 
-- Any change that adds an SSH/WSL entry point (settings, search, palette,
-  Runtime Manager), restores an SSH/WSL runtime, or switches to one.
+- Any change that adds or renames an SSH/WSL entry point (settings, search,
+  palette, Runtime Manager), restores an SSH/WSL runtime, or switches to one.
 
 ### 2. Signatures
 
 ```rust
-// apps/desktop/src/ssh_connection/feature.rs
-pub const FEATURE_ENV: &str = "VIBEX_SSH_REMOTE_RUNTIME";
-pub fn enabled(setting: bool) -> bool;          // env override, else setting
-pub fn env_override() -> Option<bool>;          // 1/true/on/yes, 0/false/off/no
-
-// crates/desktop-model/src/ui_state.rs
-DeveloperUiState { ssh_remote_runtime: bool }   // serde "sshRemoteRuntime", default false
-
 // apps/desktop/src/app.rs
-VibexWorkbench::ssh_remote_runtime_enabled(&self) -> bool
-VibexWorkbench::runtime_is_ssh_or_wsl(&self, runtime_id: &str) -> bool
-FoundationSettings::settings_section_visible(&self, SettingsSection, &App) -> bool
-FoundationSettings::visible_settings_search_candidates(&self, query, strings, &App)
+VibexWorkbench::boot_remote_runtime(&self) -> Option<RegisteredRuntime>
+settings_search_candidates_for_query(query, strings) -> Vec<SettingsSearchCandidate>
+settings_section_for_query(query: &str) -> Option<SettingsSection>
+settings_section_label(SettingsSection::Connections) -> &'static str // "Remote instances" / "远程实例"
 ```
 
 ### 3. Contracts
 
-- Default off. The environment value wins over the stored setting in both
-  directions; unrecognised values are ignored.
-- Off hides entry points only. It never deletes `ssh-connections.json`,
-  `wsl-connections.json`, registry entries, credentials, or the remote runtime.
-- Gates while off:
-  - settings navigation, search candidates, command palette, and the
-    `settings_section_for_query` keyword fallback skip `SettingsSection::Connections`;
-  - `boot_remote_runtime` returns `None` for an SSH/WSL active runtime (the
-    embedded runtime boots; the registry keeps the remote active);
-  - `switch_to_runtime` refuses an SSH/WSL runtime with a warning hint before
-    any `begin_ssh_restore` / `begin_wsl_restore`.
-- Paired Docker/HTTPS/Relay runtimes are never gated.
+- SSH and WSL remote runtimes are always on; there is no stored preference, no
+  `feature.rs` module, and no `VIBEX_SSH_REMOTE_RUNTIME` environment gate.
+  `Settings → Remote instances` (`SettingsSection::Connections`) is listed in
+  settings navigation, search candidates, the keyword fallback, and the command
+  palette unconditionally.
+- The sidebar label is `Remote instances` / `远程实例` / `遠端執行個體`; the page
+  title uses the same string. The section id stays `Connections` so existing
+  widget ids, test hooks, and state files keep working.
+- An SSH/WSL active runtime boots and switches like any other remote runtime;
+  `switch_to_runtime` goes straight to `begin_ssh_restore` /
+  `begin_wsl_restore` with no refusal hint.
+- Saved profiles, credentials, registry entries, and the remote runtime are
+  ordinary user data and are never deleted by a build change.
 
 ### 4. Validation & Error Matrix
 
 | Condition | Behaviour |
 | --- | --- |
-| flag off, active runtime is SSH/WSL at boot | local boot, no provisioning |
-| flag off, user switches to SSH/WSL runtime | hint, no state change |
-| flag off, query `ssh` / `主机` | no Connections result; Developer "SSH remote runtime" row is found |
-| env set | Developer switch shows the effective value and is disabled |
+| active runtime is SSH/WSL at boot | remote boot, provisioning as before |
+| user switches to an SSH/WSL runtime | connect/restore immediately |
+| query `ssh` / `远程` / `实例` | Remote instances results from the shared candidate list |
+| older state file with `sshRemoteRuntime` | loads cleanly; the retired key is ignored |
 
 ### 5. Good / Base / Bad
 
-- Good: a new SSH entry point checks `ssh_remote_runtime_enabled()` (workbench)
-  or `settings_section_visible` (settings) before acting.
-- Base: render paths read the flag through `self.developer(cx)`.
-- Bad: reading workbench state from `activate_settings_section` — see §7.
+- Good: a new SSH entry point lists `SettingsSection::Connections` like every
+  other section and reads no flag.
+- Base: render paths read `self.developer(cx)` only for real Developer
+  preferences.
+- Bad: re-introducing a release flag around the section — see §7.
 
 ### 6. Tests Required
 
-- `ssh_connection::feature::tests` — override parsing both directions.
-- `ui_state::developer_preferences_default_off_and_round_trip` — legacy state
-  loads off; `sshRemoteRuntime` round-trips.
-- `app::tests::ssh_remote_runtime_flag_gates_every_entry_point` — each gate
-  above is present, and the switch gate precedes `begin_ssh_restore`.
+- `ui_state::developer_preferences_default_off_and_round_trip` — a state file
+  carrying the retired `sshRemoteRuntime` key still loads, and the key is not
+  written back.
+- `app::tests::remote_instances_are_reachable_from_every_settings_entry_point` —
+  navigation, search, palette, boot, and switch carry no flag gate; the
+  Developer page has no switch.
+- `app::tests::connections_section_is_discoverable_and_uses_the_profile_store` —
+  the label reads `Remote instances` and the profile store wiring is intact.
 - `app::tests::settings_sections_activate_while_the_workbench_is_leased` — must
   keep passing.
 
@@ -77,18 +74,21 @@ FoundationSettings::visible_settings_search_candidates(&self, query, strings, &A
 #### Wrong
 
 ```rust
-fn activate_settings_section(&mut self, section: SettingsSection, cx: &mut Context<Self>) {
-    if !self.settings_section_visible(section, cx) { return; } // reads the workbench
-    self.active_section = section;
+fn settings_section_visible(&self, section: SettingsSection, cx: &App) -> bool {
+    section != SettingsSection::Connections || feature::enabled(...) // hidden again
+}
 ```
 
-`open_settings` activates a section *inside* `workbench.update`, so reading the
-workbench there panics ("already being updated").
+A release flag around the section hides it from navigation, search, and the
+palette at once, and a stale Developer switch in the UI then lies about it.
 
 #### Correct
 
-Filter the inputs that can name a hidden section (navigation list, search
-candidates, keyword fallback) and leave activation free of workbench reads.
+Leave `SettingsSection::Connections` in the navigation list and in
+`settings_search_candidates_for_query`, and keep activation free of workbench
+reads: `open_settings` activates a section *inside* `workbench.update`, so
+reading the workbench from `activate_settings_section` panics ("already being
+updated").
 
 ## Scenario: Trust chain and remote command construction
 

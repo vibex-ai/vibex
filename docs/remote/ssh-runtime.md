@@ -13,7 +13,7 @@ without sshd, an out-of-band console to bootstrap it once.
 The same flow covers a WSL2 distro on the local Windows machine, which needs no
 sshd at all.
 
-> **Beta.** The feature is off by default. See [Feature flag](#feature-flag).
+> **Beta.** The feature is always available; see [Enabling it](#enabling-it).
 
 ## Contents
 
@@ -26,7 +26,7 @@ sshd at all.
 - [Security boundary](#security-boundary)
 - [Troubleshooting](#troubleshooting)
 - [Operations reference](#operations-reference)
-- [Feature flag](#feature-flag)
+- [Enabling it](#enabling-it)
 - [Support matrix](#support-matrix)
 
 ## Quick start (Linux over SSH)
@@ -52,8 +52,8 @@ Prerequisites on the host:
 
 Steps:
 
-1. Settings → Connections → **Add SSH connection**. Vibex lists the hosts it
-   finds in your SSH config.
+1. Settings → Remote instances → **Add SSH connection**. Vibex lists the hosts
+   it finds in your SSH config.
 2. Pick the host and choose **Probe and add**. The probe checks OS,
    architecture, glibc, free space, tools, and whether the runtime port is
    free, then saves the connection and starts provisioning.
@@ -107,7 +107,7 @@ A WSL2 distro on the same Windows machine is treated as a local Linux
 environment, not a remote Windows host. No sshd and no SSH keys are involved.
 
 1. Install WSL2 and at least one distro (`wsl --install`).
-2. Settings → Connections → **Add WSL runtime**, pick the distro, and choose
+2. Settings → Remote instances → **Add WSL runtime**, pick the distro, and choose
    **Connect WSL**.
 
 Vibex runs the Linux x86_64 artifact inside the distro through `wsl.exe`,
@@ -132,7 +132,7 @@ A fresh VM may have no SSH server. If you can reach a root shell another way —
 the cloud provider's web console, a serial console, or cloud-init — Vibex can
 generate a one-time command that sets SSH up.
 
-1. Settings → Connections → **Bootstrap SSH**.
+1. Settings → Remote instances → **Bootstrap SSH**.
 2. Enter the **existing** Linux account Vibex will connect as (for example
    `ubuntu`, `debian`, `ec2-user`) and choose **Generate command**. The desktop
    public key is read from `~/.ssh/id_ed25519.pub` (or `id_rsa.pub` /
@@ -317,23 +317,17 @@ On the desktop, connection profiles live in the Vibex home as
 `ssh-connections.json` and `wsl-connections.json`; the runtime credential sits
 in the remote runtime registry next to them.
 
-## Feature flag
+## Enabling it
 
-SSH and WSL runtimes ship behind a flag that is **off by default**.
+SSH and WSL runtimes are part of every build. Their settings live under
+**Settings → Remote instances** in the workspace group, next to the other
+runtime surfaces; nothing has to be switched on first.
 
-- Turn it on in **Settings → Developer → SSH remote runtime**.
-- `VIBEX_SSH_REMOTE_RUNTIME=1` turns it on for one launch and
-  `VIBEX_SSH_REMOTE_RUNTIME=0` turns it off; the environment variable wins over
-  the setting, and the Developer switch locks while it is set. Use `0` as a
-  kill switch that needs no release.
-
-While the flag is off, the Connections section is hidden from settings,
-search, and the command palette; an SSH or WSL runtime that was active boots
-the local runtime instead; and switching to one from the Runtime Manager is
-refused with a hint. Nothing is deleted — connection profiles, credentials,
-the Runtime Manager entry, and the remote runtime are kept, and turning the
-flag back on restores them. Docker/HTTPS servers, Remote v2 Direct/Relay, and
-phone pairing are not affected by the flag.
+Earlier releases hid that section behind a Developer setting and the
+`VIBEX_SSH_REMOTE_RUNTIME` environment variable. Both are gone: an SSH or WSL
+runtime that is active in the registry boots and switches like any other remote
+runtime. Docker/HTTPS servers, Remote v2 Direct/Relay, and phone pairing are
+unchanged.
 
 ## Support matrix
 

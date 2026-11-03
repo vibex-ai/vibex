@@ -13,7 +13,6 @@ pub mod diagnostics;
 pub mod effects;
 pub mod environment;
 pub mod error;
-pub mod feature;
 pub mod host_key;
 pub mod install;
 pub mod launch;

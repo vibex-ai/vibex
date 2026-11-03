@@ -12374,29 +12374,7 @@ impl VibexWorkbench {
             return None;
         }
         let runtime = self.runtime_registry.active_remote().cloned()?;
-        // With the SSH remote runtime flag off, an SSH or WSL active runtime
-        // boots the embedded authority instead. The registry keeps it active
-        // so turning the flag back on restores it.
-        if !self.ssh_remote_runtime_enabled() && self.runtime_is_ssh_or_wsl(&runtime.id) {
-            return None;
-        }
         Some(runtime)
-    }
-
-    /// The SSH/WSL remote runtime release flag, with its environment override.
-    fn ssh_remote_runtime_enabled(&self) -> bool {
-        crate::ssh_connection::feature::enabled(self.ui_state.developer.ssh_remote_runtime)
-    }
-
-    fn runtime_is_ssh_or_wsl(&self, runtime_id: &str) -> bool {
-        self.wsl_profile_for_runtime(runtime_id).is_some()
-            || self.ssh_profile_for_runtime(runtime_id).is_some()
-    }
-
-    fn set_ssh_remote_runtime_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
-        self.ui_state.developer.ssh_remote_runtime = enabled;
-        self.queue_ui_state();
-        cx.notify();
     }
 
     fn boot_local_runtime(&mut self, cx: &mut Context<Self>) {
@@ -16269,23 +16247,6 @@ impl VibexWorkbench {
         let Some(runtime) = self.runtime_registry.remote(&id).cloned() else {
             return;
         };
-        if !self.ssh_remote_runtime_enabled() && self.runtime_is_ssh_or_wsl(&id) {
-            let message = locale::text(
-                "SSH remote runtimes are turned off. Turn them on in Settings → Developer.",
-                "SSH 远程运行时已关闭，请在 设置 → 开发者 中开启。",
-                "SSH 遠端執行階段已關閉，請在 設定 → 開發者 中開啟。",
-            );
-            if let Some(handle) = self.window_handle {
-                let _ = handle.update(cx, |_, window, cx| {
-                    hint_layer::push(
-                        window,
-                        hint_notification(NotificationType::Warning, message),
-                        cx,
-                    );
-                });
-            }
-            return;
-        }
         if let Some(profile) = self.ssh_profile_for_runtime(&id) {
             self.begin_ssh_restore(runtime, profile, RuntimeConnectOrigin::Switch, cx);
         } else {
@@ -71348,12 +71309,8 @@ impl VibexWorkbench {
         // Settings entries are only meaningful once something has been asked
         // for; there is no "recent settings" to fall back to.
         if !query_empty {
-            let connections_visible = self.ssh_remote_runtime_enabled();
             let settings = settings_search_candidates_for_query(query, strings)
                 .into_iter()
-                .filter(|candidate| {
-                    connections_visible || candidate.section != SettingsSection::Connections
-                })
                 .map(CommandPaletteEntry::Setting)
                 .collect::<Vec<_>>();
             if !settings.is_empty() {
@@ -80484,11 +80441,15 @@ fn settings_section_for_query(query: &str) -> Option<SettingsSection> {
         "connections",
         "ssh",
         "remote",
+        "instance",
+        "instances",
         "host",
         "连接",
         "連線",
         "远程",
         "遠端",
+        "实例",
+        "執行個體",
         "主机",
         "主機",
     ]) {
@@ -81182,7 +81143,7 @@ fn settings_search_candidates(strings: &'static Strings) -> Vec<SettingsSearchCa
         ),
         settings_search_candidate(
             SettingsSection::Connections,
-            locale::text("SSH connections", "SSH 连接", "SSH 連線"),
+            locale::text("Remote instances", "远程实例", "遠端執行個體"),
             locale::text(
                 "Connect Vibex to a runtime on another machine over SSH.",
                 "通过 SSH 把 Vibex 连接到另一台机器上的运行时。",
@@ -81192,12 +81153,15 @@ fn settings_search_candidates(strings: &'static Strings) -> Vec<SettingsSearchCa
                 "ssh",
                 "connection",
                 "remote",
+                "instance",
                 "host",
                 "server",
                 "连接",
                 "連線",
                 "远程",
                 "遠端",
+                "实例",
+                "執行個體",
                 "主机",
                 "主機",
             ],
@@ -81358,25 +81322,6 @@ fn settings_search_candidates(strings: &'static Strings) -> Vec<SettingsSearchCa
                 "帧率",
                 "幀率",
                 "性能",
-            ],
-        ),
-        settings_search_candidate(
-            SettingsSection::Developer,
-            locale::text("SSH remote runtime", "SSH 远程运行时", "SSH 遠端執行階段"),
-            locale::text(
-                "Beta. Turn on SSH and WSL remote runtimes and the Connections settings.",
-                "测试版。开启 SSH 与 WSL 远程运行时以及连接设置。",
-                "測試版。開啟 SSH 與 WSL 遠端執行階段以及連線設定。",
-            ),
-            &[
-                "ssh",
-                "wsl",
-                "remote runtime",
-                "beta",
-                "远程",
-                "遠端",
-                "测试版",
-                "測試版",
             ],
         ),
         settings_search_candidate(
@@ -81583,7 +81528,9 @@ fn settings_section_label(section: SettingsSection) -> &'static str {
         SettingsSection::General => locale::text("General", "常规", "一般"),
         SettingsSection::Appearance => locale::text("Appearance", "外观", "外觀"),
         SettingsSection::Workbench => locale::text("Workbench", "工作台", "工作台"),
-        SettingsSection::Connections => locale::text("Connections", "连接", "連線"),
+        SettingsSection::Connections => {
+            locale::text("Remote instances", "远程实例", "遠端執行個體")
+        }
         SettingsSection::Session => locale::text("Session", "会话", "會話"),
         SettingsSection::Archived => locale::text("Archived sessions", "已归档会话", "已封存會話"),
         SettingsSection::Terminal => locale::text("Terminal", "终端", "終端機"),
@@ -83003,24 +82950,6 @@ impl FoundationSettings {
         })
     }
 
-    /// Connections is the SSH/WSL remote runtime surface, so it only exists
-    /// while that release flag is on.
-    fn settings_section_visible(&self, section: SettingsSection, cx: &App) -> bool {
-        section != SettingsSection::Connections
-            || crate::ssh_connection::feature::enabled(self.developer(cx).ssh_remote_runtime)
-    }
-
-    fn visible_settings_search_candidates(
-        &self,
-        query: &str,
-        strings: &'static Strings,
-        cx: &App,
-    ) -> Vec<SettingsSearchCandidate> {
-        let mut candidates = settings_search_candidates_for_query(query, strings);
-        candidates.retain(|candidate| self.settings_section_visible(candidate.section, cx));
-        candidates
-    }
-
     fn activate_settings_section(&mut self, section: SettingsSection, cx: &mut Context<Self>) {
         self.active_section = section;
         self.settings_render_context
@@ -83835,20 +83764,17 @@ impl FoundationSettings {
         cx: &mut Context<Self>,
     ) {
         let query = self.search.read(cx).value().trim().to_lowercase();
-        let candidates = self.visible_settings_search_candidates(&query, strings, cx);
+        let candidates = settings_search_candidates_for_query(&query, strings);
         let Some(candidate) = candidates
             .get(index.min(candidates.len().saturating_sub(1)))
             .copied()
         else {
             self.search_selected_index = 0;
             self.search_scroll.scroll_to_item(0);
-            // The keyword fallback can name a section the candidate list
-            // filtered out (Connections behind its flag), so it is checked
-            // here rather than in activation, which also runs while the
-            // workbench is leased and cannot read its state.
-            if let Some(section) = settings_section_for_query(&query)
-                .filter(|section| self.settings_section_visible(*section, cx))
-            {
+            // The keyword fallback can name a section outside the candidate
+            // list, so it is resolved here rather than in activation, which
+            // also runs while the workbench is leased.
+            if let Some(section) = settings_section_for_query(&query) {
                 self.activate_settings_section(section, cx);
             } else {
                 self.settings_render_context
@@ -83897,8 +83823,7 @@ impl FoundationSettings {
             .borrow_mut()
             .replace(candidate.title.to_string());
         let query = self.search.read(cx).value().to_string();
-        let candidates =
-            self.visible_settings_search_candidates(&query, locale::current_strings(), cx);
+        let candidates = settings_search_candidates_for_query(&query, locale::current_strings());
         self.search_scroll
             .scroll_to_item(settings_search_result_scroll_index(&candidates, index));
         self.search.update(cx, |input, cx| input.focus(window, cx));
@@ -83912,8 +83837,7 @@ impl FoundationSettings {
         cx: &mut Context<Self>,
     ) {
         let query = self.search.read(cx).value().to_string();
-        let candidates =
-            self.visible_settings_search_candidates(&query, locale::current_strings(), cx);
+        let candidates = settings_search_candidates_for_query(&query, locale::current_strings());
         if candidates.is_empty() {
             return;
         }
@@ -83947,7 +83871,7 @@ impl FoundationSettings {
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let query = self.search.read(cx).value().trim().to_string();
-        let candidates = self.visible_settings_search_candidates(&query, strings, cx);
+        let candidates = settings_search_candidates_for_query(&query, strings);
         if candidates.is_empty() {
             return None;
         }
@@ -84699,13 +84623,6 @@ impl FoundationSettings {
         cx.notify();
     }
 
-    fn set_ssh_remote_runtime(&mut self, enabled: bool, cx: &mut Context<Self>) {
-        let _ = self.workbench.update(cx, |this, cx| {
-            this.set_ssh_remote_runtime_enabled(enabled, cx)
-        });
-        cx.notify();
-    }
-
     fn set_queue_send_mode(&mut self, mode: ComposerQueueSendMode, cx: &mut Context<Self>) {
         let _ = self.workbench.update(cx, |this, cx| {
             this.ui_state.composer.queue_send_mode = mode;
@@ -85105,15 +85022,11 @@ impl FoundationSettings {
                 ],
             ),
         ];
-        let connections_visible = self.settings_section_visible(SettingsSection::Connections, cx);
         let groups = sections
             .into_iter()
             .map(|(label, entries)| {
                 let buttons = entries
                     .iter()
-                    .filter(|(section, _)| {
-                        connections_visible || *section != SettingsSection::Connections
-                    })
                     .map(|(section, icon)| {
                         let section = *section;
                         let label = settings_section_label(section);
@@ -86993,7 +86906,7 @@ impl FoundationSettings {
         ));
 
         settings_page(
-            locale::text("Connections", "连接", "連線"),
+            locale::text("Remote instances", "远程实例", "遠端執行個體"),
             locale::text(
                 "Connect Vibex to a runtime on another machine over SSH.",
                 "通过 SSH 把 Vibex 连接到另一台机器上的运行时。",
@@ -90298,61 +90211,24 @@ impl FoundationSettings {
             .on_click(cx.listener(|this, enabled, window, cx| {
                 this.set_show_fps_monitor(*enabled, window, cx)
             }));
-        // The environment override wins over the stored value, so the switch
-        // shows what is in effect and locks while the override is set.
-        let ssh_override = crate::ssh_connection::feature::env_override();
-        let ssh_remote_runtime_switch = Switch::new("developer-ssh-remote-runtime")
-            .small()
-            .checked(ssh_override.unwrap_or(developer.ssh_remote_runtime))
-            .disabled(ssh_override.is_some())
-            .tooltip(locale::text(
-                "SSH remote runtime",
-                "SSH 远程运行时",
-                "SSH 遠端執行階段",
-            ))
-            .on_click(
-                cx.listener(|this, enabled, _, cx| this.set_ssh_remote_runtime(*enabled, cx)),
-            );
-        let ssh_remote_runtime_description = if ssh_override.is_some() {
-            locale::text(
-                "Set by the VIBEX_SSH_REMOTE_RUNTIME environment variable for this launch.",
-                "本次启动由环境变量 VIBEX_SSH_REMOTE_RUNTIME 决定。",
-                "本次啟動由環境變數 VIBEX_SSH_REMOTE_RUNTIME 決定。",
-            )
-        } else {
-            locale::text(
-                "Beta. Shows Settings → Connections for SSH and WSL runtimes and lets the workbench restore them. Turning it off only hides the entry points; saved connections and remote runtimes are kept.",
-                "测试版。显示 设置 → 连接，用于 SSH 与 WSL 运行时，并允许工作台恢复它们。关闭只会隐藏入口，已保存的连接与远端运行时都会保留。",
-                "測試版。顯示 設定 → 連線，用於 SSH 與 WSL 執行階段，並允許工作台復原它們。關閉只會隱藏入口，已儲存的連線與遠端執行階段都會保留。",
-            )
-        };
         settings_page(
             locale::text("Developer", "开发者", "開發者"),
             locale::text(
-                "Instrumentation for profiling the workbench, and features still in beta.",
-                "用于诊断和分析工作台自身的性能，以及仍处于测试阶段的功能。",
-                "用於診斷與分析工作台自身的效能，以及仍處於測試階段的功能。",
+                "Instrumentation for profiling the workbench.",
+                "用于诊断和分析工作台自身的性能。",
+                "用於診斷與分析工作台自身的效能。",
             ),
-            vec![SettingsGroup::unlabeled(vec![
-                setting_row(
-                    locale::text("FPS monitor", "帧率监视器", "幀率監視器"),
-                    locale::text(
-                        "Overlay realtime frame rate, frame time and resource usage on the workbench. The HUD opens in the middle of the window and can be dragged from there; while it is on, one sample a second is recorded to the diagnostics folder.",
-                        "在工作台上叠加实时帧率、帧耗时与资源占用，开启时显示在窗口正中，可拖动调整位置；开启期间每秒记录一次采样到诊断数据。",
-                        "在工作台上疊加即時幀率、幀耗時與資源佔用，開啟時顯示在視窗正中，可拖動調整位置；開啟期間每秒記錄一次取樣到診斷資料。",
-                    ),
-                    fps_monitor_switch,
-                    stacked,
-                    cx,
+            vec![SettingsGroup::unlabeled(vec![setting_row(
+                locale::text("FPS monitor", "帧率监视器", "幀率監視器"),
+                locale::text(
+                    "Overlay realtime frame rate, frame time and resource usage on the workbench. The HUD opens in the middle of the window and can be dragged from there; while it is on, one sample a second is recorded to the diagnostics folder.",
+                    "在工作台上叠加实时帧率、帧耗时与资源占用，开启时显示在窗口正中，可拖动调整位置；开启期间每秒记录一次采样到诊断数据。",
+                    "在工作台上疊加即時幀率、幀耗時與資源佔用，開啟時顯示在視窗正中，可拖動調整位置；開啟期間每秒記錄一次取樣到診斷資料。",
                 ),
-                setting_row(
-                    locale::text("SSH remote runtime", "SSH 远程运行时", "SSH 遠端執行階段"),
-                    ssh_remote_runtime_description,
-                    ssh_remote_runtime_switch,
-                    stacked,
-                    cx,
-                ),
-            ])],
+                fps_monitor_switch,
+                stacked,
+                cx,
+            )])],
             cx,
         )
     }
@@ -112147,7 +112023,7 @@ mod tests {
         );
         assert_eq!(
             settings_section_label(SettingsSection::Connections),
-            locale::text("Connections", "连接", "連線")
+            locale::text("Remote instances", "远程实例", "遠端執行個體")
         );
         let english = locale::strings(locale::ResolvedLocale::En);
         assert!(
@@ -112186,7 +112062,7 @@ mod tests {
     }
 
     #[test]
-    fn ssh_remote_runtime_flag_gates_every_entry_point() {
+    fn remote_instances_are_reachable_from_every_settings_entry_point() {
         let source = include_str!("app.rs");
         let section = |start: &str, end: &str| {
             source
@@ -112195,18 +112071,11 @@ mod tests {
                 .map(|(body, _)| body.to_string())
                 .unwrap_or_else(|| panic!("{start} should remain inspectable"))
         };
-        // Settings: navigation, search, and the keyword fallback all consult
-        // the flag, so Connections cannot be reached by any route while it is
-        // off.
-        let preview = section(
-            "    fn preview_settings_search_selection(",
-            "\n    fn select_settings_search_candidate(",
-        );
-        assert!(preview.contains(".filter(|section| self.settings_section_visible(*section, cx))"));
+        // The remote instances surface is no longer behind a release flag: the
+        // navigation, search, and command palette all list it unconditionally.
         let navigation = section("    fn render_navigation(", "\n    }\n");
-        assert!(
-            navigation.contains("connections_visible || *section != SettingsSection::Connections")
-        );
+        assert!(navigation.contains("(SettingsSection::Connections, IconName::Network)"));
+        assert!(!navigation.contains("connections_visible"));
         for function in [
             "    fn preview_settings_search_selection(",
             "    fn select_settings_search_candidate(",
@@ -112214,36 +112083,39 @@ mod tests {
             "    fn render_search_results(",
         ] {
             assert!(
-                section(function, "\n    }\n").contains("self.visible_settings_search_candidates("),
-                "{function} should only list visible sections"
+                section(function, "\n    }\n")
+                    .contains("settings_search_candidates_for_query(&query,"),
+                "{function} should still resolve its candidates through the shared list"
             );
         }
         let palette = section("    fn command_palette_sections(", "\n    }\n");
-        assert!(palette.contains("self.ssh_remote_runtime_enabled()"));
-        // Runtime authority: boot and manual switches never start SSH/WSL
-        // provisioning while the flag is off.
+        assert!(palette.contains("settings_search_candidates_for_query(query, strings)"));
+        assert!(!palette.contains("SettingsSection::Connections"));
+        // Runtime authority: an SSH or WSL runtime boots and switches like any
+        // other remote runtime.
         let boot = section("    fn boot_remote_runtime(", "\n    }\n");
-        assert!(boot.contains(
-            "!self.ssh_remote_runtime_enabled() && self.runtime_is_ssh_or_wsl(&runtime.id)"
-        ));
+        assert!(!boot.contains("ssh_remote_runtime_enabled"));
         let switch = section(
             "    fn switch_to_runtime(",
             "\n    /// Records which runtime",
         );
-        let gate = switch
-            .find("!self.ssh_remote_runtime_enabled() && self.runtime_is_ssh_or_wsl(&id)")
-            .expect("switching should check the flag");
-        let restore = switch
-            .find("self.begin_ssh_restore(")
-            .expect("switching should still restore SSH runtimes");
-        assert!(gate < restore, "the flag check must run before SSH restore");
+        assert!(!switch.contains("ssh_remote_runtime_enabled"));
+        assert!(
+            switch.contains("self.begin_ssh_restore("),
+            "switching should still restore SSH runtimes"
+        );
+        // The Developer page no longer carries the flag's switch.
         let developer = section(
             "    fn render_developer_page(",
             "\nimpl Render for FoundationSettings",
         );
-        assert!(developer.contains("feature::env_override()"));
-        assert!(developer.contains(".disabled(ssh_override.is_some())"));
-        assert!(developer.contains("set_ssh_remote_runtime"));
+        assert!(!developer.contains("feature::env_override()"));
+        assert!(!developer.contains("set_ssh_remote_runtime"));
+        // Nothing in the app still reaches for the retired release flag; the
+        // literal pieces are split so this assertion cannot match itself.
+        assert!(!source.contains(concat!("ssh_connection::", "feature")));
+        assert!(!source.contains(concat!("VIBEX_SSH_REMOTE", "_RUNTIME")));
+        assert!(!source.contains(concat!("developer.ssh_remote", "_runtime")));
     }
 
     #[test]
