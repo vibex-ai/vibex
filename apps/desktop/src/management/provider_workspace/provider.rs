@@ -432,7 +432,7 @@ impl ManagementCenter {
             let select_id = route.id.as_str().to_string();
             groups = groups.child(ws_row(
                 SharedString::from(format!("management-provider-route-{}", route.id.as_str())),
-                ws_icon_tile("icons/vibex/git-branch.svg", px(30.0), None, cx),
+                ws_icon_tile("icons/vibex/directions.svg", px(30.0), None, cx),
                 div()
                     .min_w_0()
                     .truncate()
@@ -1358,273 +1358,70 @@ impl ManagementCenter {
             || self.workspace_edit_revision != Some(profile.revision)
         {
             self.open_shared_provider_editor(&profile, window, cx);
-            self.workspace_edit_revision = Some(profile.revision);
         }
         let pending = self.mutation.is_some();
-        let category = self.shared_provider_edit_category.clone();
-
-        let identity = v_flex()
-            .w_full()
-            .gap_4()
-            .child(ws_field(
-                management_locale_text("Name", "名称", "名稱"),
-                None,
-                ws_input(
-                    &self.shared_provider_edit_name,
-                    false,
-                    self.shared_provider_edit_name_error.as_deref(),
-                    cx,
-                ),
-                cx,
-            ))
-            .child(ws_field(
-                management_locale_text("Kind", "类型", "類型"),
-                None,
-                ws_choice_cards(
-                    "management-shared-provider-category",
-                    vec![
-                        (
-                            "vendor",
-                            SharedString::from(management_locale_text("Official", "官方", "官方")),
-                            Some(SharedString::from(management_locale_text(
-                                "The model vendor's own API",
-                                "模型厂商自己的 API",
-                                "模型廠商自己的 API",
-                            ))),
-                        ),
-                        (
-                            "relay",
-                            SharedString::from(management_locale_text("Relay", "中转", "中轉")),
-                            Some(SharedString::from(management_locale_text(
-                                "A service that resells other vendors' models",
-                                "转售其他厂商模型的服务",
-                                "轉售其他廠商模型的服務",
-                            ))),
-                        ),
-                        (
-                            "local",
-                            SharedString::from(management_locale_text("Local", "本机", "本機")),
-                            Some(SharedString::from(management_locale_text(
-                                "A server on this machine or network",
-                                "运行在本机或局域网的服务",
-                                "執行在本機或區域網路的服務",
-                            ))),
-                        ),
-                    ],
-                    category.as_deref(),
-                    pending,
-                    |this, value, cx| {
-                        this.shared_provider_edit_category = Some(value.to_string());
-                        cx.notify();
-                    },
-                    cx,
-                ),
-                cx,
-            ));
-
-        let connection = v_flex()
-            .w_full()
-            .gap_4()
-            .child(ws_field(
-                management_locale_text("API address", "API 地址", "API 位址"),
-                Some(management_locale_text(
-                    "The base URL requests are sent to.",
-                    "请求发往的基础地址。",
-                    "請求發往的基礎位址。",
-                )),
-                ws_input(
-                    &self.shared_provider_edit_base_url,
-                    false,
-                    self.shared_provider_edit_base_url_error.as_deref(),
-                    cx,
-                ),
-                cx,
-            ))
-            .child(ws_field_pair(
-                ws_field(
-                    management_locale_text("Model list address", "模型列表地址", "模型清單位址"),
-                    Some(management_locale_text(
-                        "Leave empty to use the API address.",
-                        "留空则使用 API 地址。",
-                        "留空則使用 API 位址。",
-                    )),
-                    ws_input(&self.shared_provider_edit_models_url, false, None, cx),
-                    cx,
-                ),
-                ws_field(
-                    management_locale_text("Sign-in address", "认证地址", "認證位址"),
-                    None,
-                    ws_input(&self.shared_provider_edit_auth_url, false, None, cx),
-                    cx,
-                ),
-            ))
-            .child(ws_field_pair(
-                ws_field(
-                    management_locale_text("Proxy", "代理", "代理"),
-                    Some(if self.shared_provider_edit_proxy_disabled {
-                        management_locale_text(
-                            "Direct connection: the system proxy is ignored.",
-                            "直连：忽略系统代理。",
-                            "直連：忽略系統代理。",
-                        )
-                    } else {
-                        management_locale_text(
-                            "Empty follows the system proxy.",
-                            "留空则跟随系统代理。",
-                            "留空則跟隨系統代理。",
-                        )
-                    }),
-                    h_flex()
-                        .w_full()
-                        .items_center()
-                        .gap_3()
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .when(self.shared_provider_edit_proxy_disabled, |field| {
-                                    field.opacity(0.5)
-                                })
-                                .child(ws_input(
-                                    &self.shared_provider_edit_proxy_url,
-                                    false,
-                                    None,
-                                    cx,
-                                )),
-                        )
-                        .child(
-                            Switch::new("management-shared-provider-proxy-disabled")
-                                .small()
-                                .label(management_locale_text("Direct", "直连", "直連"))
-                                .checked(self.shared_provider_edit_proxy_disabled)
-                                .disabled(pending)
-                                .on_click(cx.listener(|this, checked, _, cx| {
-                                    this.shared_provider_edit_proxy_disabled = *checked;
-                                    cx.notify();
-                                })),
-                        )
-                        .into_any_element(),
-                    cx,
-                ),
-                ws_field(
-                    management_locale_text("Proxy service", "代理服务地址", "代理服務位址"),
-                    Some(management_locale_text(
-                        "A relay endpoint that forwards for this Provider.",
-                        "为该供应商转发请求的服务地址。",
-                        "為該供應商轉發請求的服務位址。",
-                    )),
-                    ws_input(
-                        &self.shared_provider_edit_proxy_endpoint_url,
-                        false,
-                        None,
-                        cx,
-                    ),
-                    cx,
-                ),
-            ));
-
-        let request = v_flex()
-            .w_full()
-            .gap_4()
-            .child(ws_field(
-                management_locale_text("Request headers", "请求头", "請求標頭"),
-                Some(management_locale_text(
-                    "A JSON object of header names and values. Use {\"variable\": \"session_id\"} for the session header. Secret headers are kept but not shown.",
-                    "JSON 对象，键为请求头名称。会话请求头写作 {\"variable\": \"session_id\"}。Secret 请求头会保留但不显示。",
-                    "JSON 物件，鍵為請求標頭名稱。工作階段請求標頭寫作 {\"variable\": \"session_id\"}。Secret 請求標頭會保留但不顯示。",
-                )),
-                Textarea::new(&self.shared_provider_edit_headers)
+        // The form brings its own Basics/Connection/Request/Advanced sections;
+        // only the footer is this page's, because saving a saved record is a
+        // different promise from creating one.
+        let form = self.render_provider_form(cx);
+        let footer = ws_form_footer(
+            self.provider_form.error.clone(),
+            vec![
+                Button::new("management-shared-provider-edit-cancel")
                     .small()
-                    .w_full()
-                    .h(px(96.0))
+                    .ghost()
+                    .label(management_locale_text(
+                        "Discard changes",
+                        "放弃修改",
+                        "放棄修改",
+                    ))
+                    .disabled(pending)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.reload_provider_form(window, cx);
+                    }))
                     .into_any_element(),
-                cx,
-            ))
-            .child(ws_field_pair(
-                ws_field(
-                    management_locale_text("models.dev id", "models.dev ID", "models.dev ID"),
-                    Some(management_locale_text(
-                        "Only powers suggestions; never changes a request.",
-                        "仅用于提供建议，不会改变请求。",
-                        "僅用於提供建議，不會改變請求。",
-                    )),
-                    ws_input(&self.shared_provider_edit_catalog_id, false, None, cx),
-                    cx,
-                ),
-                ws_field(
-                    management_locale_text("Icon", "图标", "圖示"),
-                    Some(management_locale_text(
-                        "A bundled icon key, such as openai.",
-                        "内置图标的 key，例如 openai。",
-                        "內建圖示的 key，例如 openai。",
-                    )),
-                    ws_input(&self.shared_provider_edit_icon, false, None, cx),
-                    cx,
-                ),
-            ));
-
-        let profile_id = profile.id.clone();
-        let form = ws_section(
-            management_locale_text("Connection", "连接", "連線"),
-            Some(management_locale_text(
-                "Applies to every Agent that uses this Provider once saved.",
-                "保存后对所有使用该供应商的 Agent 生效。",
-                "儲存後對所有使用該供應商的 Agent 生效。",
-            )),
-            None,
-            v_flex()
-                .w_full()
-                .gap_5()
-                .child(identity)
-                .child(Separator::horizontal())
-                .child(connection)
-                .child(Separator::horizontal())
-                .child(request)
-                .child(ws_form_footer(
-                    self.shared_provider_edit_error.clone(),
-                    vec![
-                        Button::new("management-shared-provider-edit-cancel")
-                            .small()
-                            .ghost()
-                            .label(management_locale_text(
-                                "Discard changes",
-                                "放弃修改",
-                                "放棄修改",
-                            ))
-                            .disabled(pending)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.workspace_edit_revision = None;
-                                cx.notify();
-                            }))
-                            .into_any_element(),
-                        Button::new("management-shared-provider-edit-save")
-                            .small()
-                            .primary()
-                            .label(management_locale_text("Save", "保存", "儲存"))
-                            .loading(matches!(
-                                self.mutation,
-                                Some(ManagementMutation::ProfileUpdate(_))
-                            ))
-                            .disabled(pending)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.save_shared_provider_editor(profile_id.clone(), cx)
-                            }))
-                            .into_any_element(),
-                    ],
-                    cx,
-                ))
-                .into_any_element(),
+                Button::new("management-shared-provider-edit-save")
+                    .small()
+                    .primary()
+                    .label(management_locale_text("Save", "保存", "儲存"))
+                    .loading(matches!(
+                        self.mutation,
+                        Some(ManagementMutation::ProfileUpdate(_))
+                    ))
+                    .disabled(pending)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.save_provider_form(cx);
+                    }))
+                    .into_any_element(),
+            ],
             cx,
         );
 
         ws_stack(vec![
             form,
+            footer,
             self.render_workspace_provider_behaviour(&profile, cx),
             self.render_workspace_provider_extra_body(&profile, cx),
             self.render_shared_provider_endpoint_probes(&profile, cx),
             self.render_shared_provider_advanced_editor(&profile, window, cx),
             self.render_workspace_provider_danger(row, cx),
         ])
+    }
+
+    /// Re-reads the record into the form, dropping unsaved edits.
+    fn reload_provider_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self.shared_provider_edit_target.clone() else {
+            return;
+        };
+        let Some(profile) = self
+            .providers
+            .iter()
+            .find(|profile| profile.id == id)
+            .cloned()
+        else {
+            return;
+        };
+        self.open_shared_provider_editor(&profile, window, cx);
     }
 
     /// Settings that take effect the moment they change.

@@ -8,8 +8,6 @@
 
 use super::*;
 
-const CREATE_ADVANCED_DISCLOSURE_ID: &str = "management-provider-create-advanced";
-
 impl ManagementCenter {
     pub(super) fn render_workspace_provider_create(
         &mut self,
@@ -217,8 +215,6 @@ impl ManagementCenter {
     fn render_workspace_create_form(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let pending = self.mutation.is_some();
         let preset = self.provider_create_preset.clone();
-
-        // Region, when the preset serves more than one.
         let region = preset
             .as_ref()
             .filter(|preset| !preset.regions.is_empty())
@@ -274,348 +270,54 @@ impl ManagementCenter {
                     cx,
                 )
             });
-        let key_hint = preset
-            .as_ref()
-            .and_then(|preset| preset.key_hint.clone())
-            .map(SharedString::from);
-        let keys_url = preset.as_ref().and_then(|preset| preset.keys_url.clone());
-        let no_key = preset.as_ref().is_some_and(|preset| preset.no_key);
 
-        let basics = ws_section(
-            management_locale_text("Basics", "基本信息", "基本資訊"),
-            None,
-            None,
-            v_flex()
-                .w_full()
-                .gap_4()
-                .child(match region {
-                    Some(region) => ws_field_pair(
-                        ws_field(
-                            management_locale_text("Name", "名称", "名稱"),
-                            None,
-                            ws_input(
-                                &self.provider_create_name,
-                                false,
-                                self.provider_create_name_error.as_deref(),
-                                cx,
+        // The preset row names what filled the form; the fields themselves are
+        // the shared body, so only the create-only chrome lives here.
+        let start_row = h_flex()
+            .w_full()
+            .min_w_0()
+            .items_center()
+            .justify_between()
+            .gap_2()
+            .child(
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(match preset.as_ref() {
+                        Some(preset) => format!(
+                            "{} · {}",
+                            management_locale_text(
+                                "Start from a preset",
+                                "从预设开始",
+                                "從預設開始"
                             ),
-                            cx,
+                            preset.display_name
                         ),
-                        region,
-                    ),
-                    None => ws_field(
-                        management_locale_text("Name", "名称", "名稱"),
-                        Some(management_locale_text(
-                            "How the Provider is listed everywhere.",
-                            "供应商在各处显示的名称。",
-                            "供應商在各處顯示的名稱。",
-                        )),
-                        ws_input(
-                            &self.provider_create_name,
-                            false,
-                            self.provider_create_name_error.as_deref(),
-                            cx,
-                        ),
-                        cx,
-                    ),
-                })
-                .child(ws_field(
-                    management_locale_text("API address", "API 地址", "API 位址"),
-                    Some(management_locale_text(
-                        "The base URL requests are sent to.",
-                        "请求发往的基础地址。",
-                        "請求發往的基礎位址。",
-                    )),
-                    ws_input(
-                        &self.provider_create_base_url,
-                        false,
-                        self.provider_create_base_url_error.as_deref(),
-                        cx,
-                    ),
-                    cx,
-                ))
-                .when(!no_key, |form| {
-                    form.child(
-                        v_flex()
-                            .w_full()
-                            .gap_1p5()
-                            .child(
-                                h_flex()
-                                    .w_full()
-                                    .items_center()
-                                    .justify_between()
-                                    .child(div().text_sm().font_medium().child("API Key"))
-                                    .children(keys_url.map(|url| {
-                                        gpui_component::link::Link::new("management-provider-create-keys-url")
-                                            .href(url)
-                                            .child(div().text_xs().child(management_locale_text(
-                                                "Get a Key",
-                                                "获取 Key",
-                                                "取得 Key",
-                                            )))
-                                    })),
-                            )
-                            .child(ws_input(&self.provider_create_api_key, true, None, cx))
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(key_hint.unwrap_or_else(|| {
-                                        SharedString::from(management_locale_text(
-                                            "Stored once and shared by every Agent that uses this Provider. You can add more later.",
-                                            "只保存一次，所有使用该供应商的 Agent 共用；之后还可以添加更多。",
-                                            "只儲存一次，所有使用該供應商的 Agent 共用；之後還可以新增更多。",
-                                        ))
-                                    })),
-                            ),
-                    )
-                })
-                .into_any_element(),
-            cx,
-        );
-
-        let models = ws_section(
-            management_locale_text("Models", "模型", "模型"),
-            Some(management_locale_text(
-                "You can change these at any time on the Provider's Models tab.",
-                "之后随时可以在供应商的“模型”标签页中修改。",
-                "之後隨時可以在供應商的「模型」分頁中修改。",
-            )),
-            None,
-            v_flex()
-                .w_full()
-                .gap_4()
-                .child(ws_field(
-                    management_locale_text("Models to turn on", "启用的模型", "啟用的模型"),
-                    Some(if no_key {
-                        management_locale_text(
-                            "Model ids separated by commas. Fetch fills it from the address above; each model's settings live on the Models tab after saving.",
-                            "用逗号分隔的模型 ID。“拉取模型”会按上方地址自动填入；保存后可在“模型”标签页逐个设置。",
-                            "用逗號分隔的模型 ID。「擷取模型」會依上方位址自動填入；儲存後可在「模型」分頁逐一設定。",
+                        None => management_locale_text(
+                            "No preset: every field is manual",
+                            "未使用预设：全部手动填写",
+                            "未使用預設：全部手動填寫",
                         )
-                    } else {
-                        management_locale_text(
-                            "Model ids separated by commas. Fetch fills it from the address and Key above; each model's settings live on the Models tab after saving.",
-                            "用逗号分隔的模型 ID。“拉取模型”会按上方地址与 Key 自动填入；保存后可在“模型”标签页逐个设置。",
-                            "用逗號分隔的模型 ID。「擷取模型」會依上方位址與 Key 自動填入；儲存後可在「模型」分頁逐一設定。",
-                        )
+                        .to_string(),
                     }),
-                    h_flex()
-                        .w_full()
-                        .items_start()
-                        .gap_2()
-                        .child(div().flex_1().min_w_0().child(ws_input(
-                            &self.provider_create_models,
-                            false,
-                            self.provider_create_models_error.as_deref(),
-                            cx,
-                        )))
-                        .child(
-                            Button::new("management-provider-create-fetch-models")
-                                .outline()
-                                .icon(Icon::default().path("icons/vibex/rotate-ccw.svg"))
-                                .label(management_fetch_models_label())
-                                .loading(matches!(
-                                    &self.mutation,
-                                    Some(ManagementMutation::ProviderProbe(action))
-                                        if action == "create-page-models"
-                                ))
-                                .disabled(pending)
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.fetch_provider_create_models(window, cx)
-                                })),
-                        )
-                        .into_any_element(),
-                    cx,
-                ))
-                .child(ws_field(
-                    management_locale_text("Default model", "默认模型", "預設模型"),
-                    None,
-                    ws_input(&self.provider_create_default_model, false, None, cx),
-                    cx,
-                ))
-                .into_any_element(),
-            cx,
-        );
-
-        let open = self.provider_create_headers_open;
-        let advanced_body = v_flex()
-            .w_full()
-            .gap_4()
-            .pt_2()
-            .child(ws_field(
-                management_locale_text("Kind", "类型", "類型"),
-                None,
-                ws_choice_cards(
-                    "management-provider-create-category",
-                    vec![
-                        ("vendor", SharedString::from(management_locale_text("Official", "官方", "官方")), None),
-                        ("relay", SharedString::from(management_locale_text("Relay", "中转", "中轉")), None),
-                        ("local", SharedString::from(management_locale_text("Local", "本机", "本機")), None),
-                    ],
-                    self.provider_create_category.as_deref(),
-                    pending,
-                    |this, value, cx| {
-                        this.provider_create_category = Some(value.to_string());
-                        cx.notify();
-                    },
-                    cx,
-                ),
-                cx,
-            ))
-            .child(ws_field_pair(
-                ws_field(
-                    management_locale_text("Model list address", "模型列表地址", "模型清單位址"),
-                    None,
-                    ws_input(&self.provider_create_models_url, false, None, cx),
-                    cx,
-                ),
-                ws_field(
-                    management_locale_text("Sign-in address", "认证地址", "認證位址"),
-                    None,
-                    ws_input(&self.provider_create_auth_url, false, None, cx),
-                    cx,
-                ),
-            ))
-            .child(ws_field(
-                management_locale_text("Proxy", "代理", "代理"),
-                Some(management_locale_text(
-                    "Empty follows the system proxy.",
-                    "留空则跟随系统代理。",
-                    "留空則跟隨系統代理。",
-                )),
-                h_flex()
-                    .w_full()
-                    .items_center()
-                    .gap_3()
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .when(self.provider_create_proxy_disabled, |field| field.opacity(0.5))
-                            .child(ws_input(&self.provider_create_proxy_url, false, None, cx)),
-                    )
-                    .child(
-                        Switch::new("management-provider-create-proxy-disabled")
-                            .small()
-                            .label(management_locale_text("Direct", "直连", "直連"))
-                            .checked(self.provider_create_proxy_disabled)
-                            .disabled(pending)
-                            .on_click(cx.listener(|this, checked, _, cx| {
-                                this.provider_create_proxy_disabled = *checked;
-                                cx.notify();
-                            })),
-                    )
-                    .into_any_element(),
-                cx,
-            ))
-            .child(ws_field(
-                management_locale_text("Request headers", "请求头", "請求標頭"),
-                Some(management_locale_text(
-                    "A JSON object of header names and values. Use {\"variable\": \"session_id\"} for the session header.",
-                    "JSON 对象，键为请求头名称；会话请求头写作 {\"variable\": \"session_id\"}。",
-                    "JSON 物件，鍵為請求標頭名稱；工作階段請求標頭寫作 {\"variable\": \"session_id\"}。",
-                )),
-                v_flex()
-                    .w_full()
-                    .gap_1()
-                    .child(
-                        Textarea::new(&self.provider_create_headers)
-                            .small()
-                            .w_full()
-                            .h(px(92.0)),
-                    )
-                    .children(self.provider_create_endpoint_error.clone().map(|message| {
-                        div().text_xs().text_color(cx.theme().danger).child(message)
-                    }))
-                    .into_any_element(),
-                cx,
-            ))
-            .child(ws_field(
-                management_locale_text("models.dev id", "models.dev ID", "models.dev ID"),
-                Some(management_locale_text(
-                    "Only powers suggestions; never changes a request.",
-                    "仅用于提供建议，不会改变请求。",
-                    "僅用於提供建議，不會改變請求。",
-                )),
-                ws_input(&self.provider_create_catalog_id, false, None, cx),
-                cx,
-            ))
-            .child(management_setting_row(
-                management_locale_text("Route groups only", "仅通过路由组使用", "僅透過路由組使用"),
-                management_locale_text(
-                    "Keep these models out of Agent pickers; route groups still reach them.",
-                    "不在 Agent 的模型选择器中显示，路由组仍可调用。",
-                    "不在 Agent 的模型選擇器中顯示，路由組仍可呼叫。",
-                ),
-                Switch::new("management-provider-create-only-groups")
-                    .small()
-                    .checked(self.provider_create_only_through_groups)
+            )
+            .child(
+                Button::new("management-provider-create-preset-change")
+                    .xsmall()
+                    .ghost()
+                    .label(management_locale_text(
+                        "Change preset",
+                        "更换预设",
+                        "更換預設",
+                    ))
                     .disabled(pending)
-                    .on_click(cx.listener(|this, checked, _, cx| {
-                        this.provider_create_only_through_groups = *checked;
-                        cx.notify();
-                    }))
-                    .into_any_element(),
-                cx,
-            ));
-        let advanced = v_flex()
-            .w_full()
-            .rounded(cx.theme().radius_lg)
-            .border_1()
-            .border_color(cx.theme().border)
-            .px_4()
-            .py_2()
-            .child(
-                h_flex()
-                    .id(CREATE_ADVANCED_DISCLOSURE_ID)
-                    .w_full()
-                    .items_center()
-                    .gap_2()
-                    .py_1()
-                    .cursor_pointer()
                     .on_click(cx.listener(|this, _, _, cx| {
-                        this.provider_create_headers_open = !this.provider_create_headers_open;
+                        this.workspace_create_choosing = true;
                         cx.notify();
-                    }))
-                    .child(
-                        Icon::new(if open {
-                            IconName::ChevronDown
-                        } else {
-                            IconName::ChevronRight
-                        })
-                        .size_4()
-                        .text_color(cx.theme().muted_foreground),
-                    )
-                    .child(
-                        v_flex()
-                            .flex_1()
-                            .min_w_0()
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .font_semibold()
-                                    .child(management_locale_text("Advanced", "高级", "進階")),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(management_locale_text(
-                                        "Kind, extra addresses, proxy, headers",
-                                        "类型、其他地址、代理、请求头",
-                                        "類型、其他位址、代理、請求標頭",
-                                    )),
-                            ),
-                    ),
-            )
-            .child(
-                Collapsible::new()
-                    .open(open)
-                    .motion_id(CREATE_ADVANCED_DISCLOSURE_ID)
-                    .content(advanced_body),
-            )
-            .into_any_element();
+                    })),
+            );
 
         let all_presets = Button::new("management-provider-create-all-presets")
             .ghost()
@@ -633,7 +335,7 @@ impl ManagementCenter {
             .into_any_element();
 
         let footer = ws_form_footer_with_leading(
-            self.provider_create_error.clone(),
+            self.provider_form.error.clone(),
             Some(all_presets),
             vec![
                 Button::new("management-provider-create-cancel")
@@ -651,7 +353,7 @@ impl ManagementCenter {
                     ))
                     .loading(pending)
                     .disabled(pending)
-                    .on_click(cx.listener(|this, _, _, cx| this.save_provider_create_page(cx)))
+                    .on_click(cx.listener(|this, _, _, cx| this.save_provider_form(cx)))
                     .into_any_element(),
             ],
             cx,
@@ -672,6 +374,15 @@ impl ManagementCenter {
                     .to_string(),
             ),
         };
+        let mut body = self.render_provider_form(cx);
+        body = v_flex()
+            .w_full()
+            .min_w_0()
+            .gap_4()
+            .child(start_row)
+            .children(region)
+            .child(body)
+            .into_any_element();
         ws_authoring_page(
             "management-provider-create-page",
             Some(mark),
@@ -681,7 +392,7 @@ impl ManagementCenter {
                 "共享记录：创建后任何 Agent 都可以使用。",
                 "共用記錄：建立後任何 Agent 都可以使用。",
             ),
-            ws_stack(vec![basics, models, advanced, footer]),
+            ws_stack(vec![body, footer]),
             cx,
         )
     }

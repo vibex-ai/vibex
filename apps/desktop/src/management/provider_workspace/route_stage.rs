@@ -1427,7 +1427,7 @@ impl RouteStage {
                     .text_color(cx.theme().muted_foreground)
                     .child(
                         Icon::default()
-                            .path("icons/vibex/git-branch.svg")
+                            .path("icons/vibex/directions.svg")
                             .size(px(12.0))
                             .text_color(cx.theme().muted_foreground),
                     )
@@ -2162,7 +2162,9 @@ mod tests {
             let _ = window.draw(cx);
         });
 
-        // Each mark is measured beside the card and the row it leads.
+        // Each mark is measured against the card it leads and against the
+        // text beside it, so neither the lane nor the vertical centre can
+        // drift back to a line of text.
         let pairs = [
             (
                 "route-stage-agent:0",

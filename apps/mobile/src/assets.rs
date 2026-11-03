@@ -40,6 +40,7 @@ const ICONS: &[&str] = &[
     "icons/pause.svg",
     "icons/copy.svg",
     "icons/git-branch.svg",
+    "icons/directions.svg",
     "icons/wifi-outlined.svg",
     "icons/clipboard-paste.svg",
     "icons/arrow-to-top.svg",
@@ -545,6 +546,11 @@ impl AssetSource for MobileAssets {
             )),
             "icons/git-branch.svg" => {
                 Some(include_bytes!("../../desktop/assets/icons/git-branch.svg"))
+            }
+            // The route-group mark, shared with the desktop: a group composes
+            // Providers rather than forking a worktree, so it is drawn apart.
+            "icons/directions.svg" => {
+                Some(include_bytes!("../../desktop/assets/icons/directions.svg"))
             }
             "icons/clipboard-paste.svg" => Some(include_bytes!(
                 "../../desktop/assets/icons/clipboard-paste.svg"

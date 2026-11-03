@@ -457,6 +457,8 @@ impl AgentUsageRepository {
                                    NULLIF(ac.account_hint_redacted, ''),
                                    COALESCE(NULLIF(a.label_override, ''), f.agent_id)
                                )
+                           WHEN 'model_route' THEN
+                               COALESCE(NULLIF(mr.display_name, ''), 'Route group')
                            ELSE f.auth_source_id
                        END,
                        COALESCE(NULLIF(s.title, ''), f.session_id)
@@ -468,6 +470,9 @@ impl AgentUsageRepository {
                 LEFT JOIN agent_auth_contexts ac
                     ON ac.auth_context_id = f.auth_source_id
                    AND f.auth_source_kind = 'agent_account'
+                LEFT JOIN model_routes mr
+                    ON mr.model_route_id = f.auth_source_id
+                   AND f.auth_source_kind = 'model_route'
                 LEFT JOIN agent_sessions s ON s.session_id = f.session_id
                 WHERE f.dispatched_at_ms >= ?1 AND f.dispatched_at_ms < ?2
                 ORDER BY f.dispatched_at_ms ASC, f.usage_execution_id ASC

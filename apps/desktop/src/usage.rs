@@ -26,7 +26,7 @@ use vibex_core::{
     AgentUsageDimension, AgentUsageDimensionRow, AgentUsageFilterOption, AgentUsageMetricCoverage,
     AgentUsageMetricValue, AgentUsageRange, AgentUsageSortDirection, AgentUsageSortMetric,
     AgentUsageStatistics, AgentUsageStatisticsRequest, AgentUsageTrendMetric, ProjectId,
-    ProviderProfileId, VibexSessionId,
+    VibexSessionId,
 };
 
 use crate::{
@@ -86,7 +86,7 @@ const USAGE_RANGE_SEGMENT_HEIGHT: f32 = 20.0;
 enum UsageFilterKind {
     Agent,
     Project,
-    ProviderProfile,
+    ModelSource,
     Model,
     Session,
 }
@@ -328,7 +328,7 @@ impl UsageView {
         match kind {
             UsageFilterKind::Agent => self.request.agent_ids.clear(),
             UsageFilterKind::Project => self.request.project_ids.clear(),
-            UsageFilterKind::ProviderProfile => self.request.provider_profile_ids.clear(),
+            UsageFilterKind::ModelSource => self.request.auth_source_ids.clear(),
             UsageFilterKind::Model => self.request.model_ids.clear(),
             UsageFilterKind::Session => self.request.session_ids.clear(),
         }
@@ -347,11 +347,7 @@ impl UsageView {
                     toggle_typed(&mut self.request.project_ids, id);
                 }
             }
-            UsageFilterKind::ProviderProfile => {
-                if let Ok(id) = ProviderProfileId::parse(id) {
-                    toggle_typed(&mut self.request.provider_profile_ids, id);
-                }
-            }
+            UsageFilterKind::ModelSource => toggle_typed(&mut self.request.auth_source_ids, id),
             UsageFilterKind::Model => toggle_typed(&mut self.request.model_ids, id),
             UsageFilterKind::Session => {
                 if let Ok(id) = VibexSessionId::parse(id) {
@@ -401,19 +397,13 @@ impl UsageView {
                             cx,
                         ),
                     )
-                    .child(
-                        self.render_filter_button(
-                            UsageFilterKind::ProviderProfile,
-                            locale::text("Model provider", "模型供应商", "模型供應商"),
-                            options.provider_profiles,
-                            self.request
-                                .provider_profile_ids
-                                .iter()
-                                .map(|id| id.as_str().to_string())
-                                .collect(),
-                            cx,
-                        ),
-                    )
+                    .child(self.render_filter_button(
+                        UsageFilterKind::ModelSource,
+                        locale::text("Model source", "模型来源", "模型來源"),
+                        options.auth_sources,
+                        self.request.auth_source_ids.clone(),
+                        cx,
+                    ))
                     .child(self.render_filter_button(
                         UsageFilterKind::Model,
                         locale::text("Model", "模型", "模型"),
@@ -1387,7 +1377,7 @@ fn usage_filter_icon(kind: UsageFilterKind) -> Icon {
     match kind {
         UsageFilterKind::Agent => Icon::new(IconName::Bot),
         UsageFilterKind::Project => Icon::new(IconName::Folder),
-        UsageFilterKind::ProviderProfile => Icon::default().path("icons/vibex/database.svg"),
+        UsageFilterKind::ModelSource => Icon::default().path("icons/vibex/database.svg"),
         UsageFilterKind::Model => Icon::default().path("icons/vibex/sparkles.svg"),
         UsageFilterKind::Session => Icon::default().path("icons/vibex/message-square.svg"),
     }
@@ -2108,9 +2098,9 @@ fn dimension_label(dimension: AgentUsageDimension) -> &'static str {
         AgentUsageDimension::Time => locale::text("Time", "时间", "時間"),
         AgentUsageDimension::Agent => locale::text("Agent", "Agent", "Agent"),
         AgentUsageDimension::Project => locale::text("Project", "项目", "專案"),
-        AgentUsageDimension::ModelProvider => {
-            locale::text("Model provider", "模型供应商", "模型供應商")
-        }
+        // Provider Profiles and route groups both run turns, so the dimension
+        // is the source rather than the vendor alone.
+        AgentUsageDimension::ModelProvider => locale::text("Model source", "模型来源", "模型來源"),
         AgentUsageDimension::Model => locale::text("Model", "模型", "模型"),
     }
 }

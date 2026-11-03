@@ -609,6 +609,16 @@ pub fn masked_secret_hint(secret: &str) -> String {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelProviderMetadata {
+    /// A free-form note the user keeps about the record.
+    ///
+    /// The legacy launch row stores the same text in `account_alias`, where it
+    /// reads as an account label; a shared Provider is not an account, so the
+    /// field is named for what it is here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    /// The vendor's own site, shown beside the record and copied from a preset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub website_url: Option<String>,
     /// The matching models.dev provider id, when the editor knows it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub catalog_id: Option<String>,
@@ -2158,6 +2168,15 @@ pub struct ModelProviderProfileCreateRequest {
     pub configured_models: Vec<ModelProviderCatalogEntry>,
     pub default_model_id: Option<String>,
     pub headers: Vec<ModelProviderHeaderReference>,
+    /// Advisory metadata the record keeps from the first frame.
+    ///
+    /// It is on the create request because the alternative — creating the
+    /// record and patching metadata in a second update — leaves a Provider
+    /// that is briefly missing its kind, catalogue id or visibility, and makes
+    /// every create-site responsible for remembering which fields have no
+    /// create path.
+    #[serde(default)]
+    pub metadata: ModelProviderMetadata,
     pub status: ModelProviderProfileStatus,
 }
 

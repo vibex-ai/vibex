@@ -11387,6 +11387,7 @@ mod tests {
                         configured_models: Vec::new(),
                         default_model_id: None,
                         headers: Vec::new(),
+                        metadata: Default::default(),
                         status: vibex_core::ModelProviderProfileStatus::Enabled,
                     },
                 },

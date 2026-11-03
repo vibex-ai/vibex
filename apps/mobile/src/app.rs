@@ -19765,6 +19765,7 @@ impl MobileApp {
         let collapsed = self.runtime_collapsed_groups.clone();
         let workbench = cx.weak_entity();
         let mut group_keys = Vec::new();
+        let mut route_keys = BTreeSet::new();
         let mut accordion = Accordion::new("mobile-runtime-provider-accordion")
             .multiple(true)
             .bordered(false)
@@ -19851,7 +19852,14 @@ impl MobileApp {
                 };
                 let group_key = format!("{}:{source_id}", agent_id.as_str());
                 group_keys.push(group_key.clone());
-                let open = searching || !collapsed.contains(&group_key);
+                // A route group's name *is* the model an Agent asks for, so it
+                // has nothing to unfold into: the item is disabled and its
+                // title is the row itself.
+                let direct = source.kind == RuntimeAuthSourceKind::ModelRoute;
+                if direct {
+                    route_keys.insert(group_key.clone());
+                }
+                let open = !direct && (searching || !collapsed.contains(&group_key));
                 let model_ids = options
                     .iter()
                     .filter_map(|option| option.selection.model_id())
@@ -19887,6 +19895,9 @@ impl MobileApp {
                             .child(status),
                     );
 
+                // The route row's own selection, taken before the loop consumes
+                // the list.
+                let route_choice = direct.then(|| models.first().cloned()).flatten();
                 let rows = models
                     .into_iter()
                     .map(|option| {
@@ -19993,8 +20004,44 @@ impl MobileApp {
                     })
                     .collect::<Vec<_>>();
                 let body = div().flex().flex_col().pt(px(4.0)).children(rows);
+                // The route heading is its own control: a click picks the
+                // group's single model instead of folding a list.
+                let title = if direct {
+                    let option = route_choice;
+                    match option {
+                        Some(option) => {
+                            let selection = option.selection.clone();
+                            heading
+                                .id(format!("runtime-route:{group_key}"))
+                                .cursor_pointer()
+                                .active(|style| style.bg(theme::row_pressed_bg()))
+                                .on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _, _, cx| {
+                                        if !busy {
+                                            this.choose_runtime_selection(selection.clone(), cx);
+                                            this.close_sheet(SheetKey::RuntimeOptions, cx);
+                                        }
+                                    }),
+                                )
+                                .when(runtime_option_matches(&option, draft), |row| {
+                                    row.child(
+                                        svg()
+                                            .path("icons/check.svg")
+                                            .size(px(theme::ICON_SM))
+                                            .text_color(theme::text_primary()),
+                                    )
+                                })
+                                .into_any_element()
+                        }
+                        None => heading.into_any_element(),
+                    }
+                } else {
+                    heading.into_any_element()
+                };
                 accordion = accordion.item(move |item| {
                     item.open(open)
+                        .disabled(direct)
                         .with_size(gpui_component::Size::XSmall)
                         .bg(theme::bg_card())
                         .border_b_0()
@@ -20004,7 +20051,7 @@ impl MobileApp {
                                 .bg(theme::row_pressed_bg())
                                 .rounded(px(theme::RADIUS_CONTROL))
                         })
-                        .title(heading)
+                        .title(title)
                         .child(body)
                 });
             }
@@ -20013,11 +20060,14 @@ impl MobileApp {
         if !group_keys.is_empty() && !searching {
             let collapsed_workbench = workbench;
             let all_keys = group_keys.clone();
+            let route_keys = route_keys.clone();
             accordion = accordion.on_toggle_click(move |open_indices, _, cx| {
                 let next = all_keys
                     .iter()
                     .enumerate()
-                    .filter(|(index, _)| !open_indices.contains(index))
+                    .filter(|(index, key)| {
+                        !open_indices.contains(index) && !route_keys.contains(*key)
+                    })
                     .map(|(_, key)| key.clone())
                     .collect::<BTreeSet<_>>();
                 let _ = collapsed_workbench.update(cx, |this, cx| {
@@ -33581,7 +33631,7 @@ fn runtime_provider_icon(
             runtime_agent_icon(&source.agent_id, &source.label, size, tint)
         }
         RuntimeAuthSourceKind::ModelRoute => svg()
-            .path("icons/git-branch.svg")
+            .path("icons/directions.svg")
             .size(size)
             .flex_shrink_0()
             .text_color(theme::accent_green())

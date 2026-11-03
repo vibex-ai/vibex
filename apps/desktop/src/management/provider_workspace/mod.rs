@@ -11,7 +11,9 @@ use super::*;
 
 mod batch;
 mod create;
+mod form;
 mod gateway;
+mod model_editor;
 mod provider;
 mod route_group;
 mod route_stage;
@@ -19,6 +21,13 @@ mod routes;
 mod routes_delegate;
 mod sidebar;
 
+pub(in crate::management) use form::{ProviderDraft, ProviderEditorScope};
+pub(in crate::management) use model_editor::{
+    ModelEditDraft, ModelEditorConfig, WireChoice, all_wire_choices,
+};
+// Only tests reach it; the editor itself reads the live fields.
+#[cfg(test)]
+pub(in crate::management) use model_editor::capability_matches_suggestion;
 pub(in crate::management) use route_group::RouteGroupFormScope;
 pub(crate) use route_stage::RouteStage;
 pub(crate) use routes::GatewayRouteTrail;
@@ -663,7 +672,14 @@ fn ws_section(
     content: AnyElement,
     cx: &App,
 ) -> AnyElement {
-    ws_section_with_fill(SectionFill::Content, title, description, action, content, cx)
+    ws_section_with_fill(
+        SectionFill::Content,
+        title,
+        description,
+        action,
+        content,
+        cx,
+    )
 }
 
 /// The same card, sized to the remaining page height.
@@ -1476,9 +1492,13 @@ mod tests {
     /// on screen and reloads when that record's revision changes.
     #[test]
     fn provider_settings_reload_from_the_record_revision() {
+        let form = include_str!("form.rs");
+        let form = &form;
         assert!(PROVIDER.contains("self.workspace_edit_revision != Some(profile.revision)"));
         assert!(PROVIDER.contains("self.open_shared_provider_editor(&profile, window, cx)"));
-        assert!(PROVIDER.contains("save_shared_provider_editor(profile_id.clone(), cx)"));
+        assert!(PROVIDER.contains("this.save_provider_form(cx)"));
+        assert!(form.contains("ProviderEditorScope::Shared"));
+        assert!(form.contains("self.provider_form.scope.clone()"));
     }
 
     /// A saved group edits on its own tabs, like a Provider does, instead of
@@ -1512,7 +1532,7 @@ mod tests {
         assert!(CREATE.contains("if self.workspace_create_choosing"));
         assert!(CREATE.contains("this.apply_provider_create_preset(&preset_id, window, cx);"));
         assert!(CREATE.contains("this.clear_provider_create_preset(window, cx);"));
-        assert!(CREATE.contains("save_provider_create_page(cx)"));
+        assert!(CREATE.contains("this.save_provider_form(cx)"));
     }
 
     /// The draft pages open on their title, not on a separate Back row.

@@ -758,7 +758,7 @@ impl ProviderConfigService {
             configured_models: request.configured_models,
             default_model_id: request.default_model_id,
             headers: request.headers,
-            metadata: Default::default(),
+            metadata: request.metadata,
             status: request.status,
             revision: 1,
             created_at_ms: now,
@@ -9466,6 +9466,7 @@ mod tests {
                 default_model_id: None,
                 headers: Vec::new(),
                 status: ModelProviderProfileStatus::Enabled,
+                metadata: Default::default(),
             })
             .unwrap();
 
@@ -9627,6 +9628,7 @@ mod tests {
                 default_model_id: None,
                 headers: Vec::new(),
                 status: ModelProviderProfileStatus::Enabled,
+                metadata: Default::default(),
             })
             .unwrap();
 
@@ -10200,6 +10202,7 @@ mod shared_provider_launch_tests {
                 default_model_id: None,
                 headers: Vec::new(),
                 status: vibex_core::ModelProviderProfileStatus::Enabled,
+                metadata: Default::default(),
             })
             .unwrap();
 
@@ -10253,6 +10256,7 @@ mod provider_delete_scope_tests {
                 default_model_id: None,
                 headers: Vec::new(),
                 status: vibex_core::ModelProviderProfileStatus::Enabled,
+                metadata: Default::default(),
             })
             .unwrap();
 
@@ -10957,6 +10961,7 @@ mod provider_delete_tests {
                 default_model_id: None,
                 headers: Vec::new(),
                 status: vibex_core::ModelProviderProfileStatus::Enabled,
+                metadata: Default::default(),
             })
             .unwrap();
         assert!(created.legacy_provider_profile_id.is_none());
@@ -11363,6 +11368,7 @@ mod shared_bind_route_tests {
                     default_model_id: None,
                     headers: Vec::new(),
                     status: vibex_core::ModelProviderProfileStatus::Enabled,
+                    metadata: Default::default(),
                 })
                 .unwrap();
             let bound = service

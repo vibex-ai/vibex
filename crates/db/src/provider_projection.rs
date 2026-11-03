@@ -12,15 +12,15 @@ use vibex_core::{
     AgentRuntimeResourcePolicy, AgentRuntimeRouteKey, AgentRuntimeVersionIdentity,
     AgentVersionSource, ModelProviderCatalogEntry, ModelProviderCredentialReference,
     ModelProviderEndpoint, ModelProviderEndpointKind, ModelProviderHeaderReference,
-    ModelProviderHeaderValue, ModelProviderHeaderVariable, ModelProviderProfile,
-    ModelProviderProfileId, ModelProviderProfileStatus, ModelProviderProxyPolicy,
-    ProjectionDescriptorMatch, ProjectionEvidenceState, ProjectionSecretReference,
-    ProjectionVerificationState, ProviderBindingMetadata, ProviderConfiguredModel,
-    ProviderModelWireApi, ProviderProfile, ProviderProfileId, ProviderProfileStatus,
-    ProviderSecretKind, ProviderSecretSetupState, TransportKind, VibexError, VibexResult,
-    WIRE_PROTOCOL_ANTHROPIC_MESSAGES, WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS,
-    WIRE_PROTOCOL_OPENAI_RESPONSES, acp_agent_catalog_entries, builtin_agent_definitions,
-    unix_timestamp_ms,
+    ModelProviderHeaderValue, ModelProviderHeaderVariable, ModelProviderMetadata,
+    ModelProviderProfile, ModelProviderProfileId, ModelProviderProfileStatus,
+    ModelProviderProxyPolicy, ProjectionDescriptorMatch, ProjectionEvidenceState,
+    ProjectionSecretReference, ProjectionVerificationState, ProviderBindingMetadata,
+    ProviderConfiguredModel, ProviderModelWireApi, ProviderOptions, ProviderProfile,
+    ProviderProfileId, ProviderProfileStatus, ProviderSecretKind, ProviderSecretSetupState,
+    TransportKind, VibexError, VibexResult, WIRE_PROTOCOL_ANTHROPIC_MESSAGES,
+    WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS, WIRE_PROTOCOL_OPENAI_RESPONSES,
+    acp_agent_catalog_entries, builtin_agent_definitions, unix_timestamp_ms,
 };
 
 use super::{
@@ -829,6 +829,14 @@ impl ProviderProjectionCompatibilityRepository {
             configured_models: candidate.configured_models,
             default_model_id: candidate.default_model_id,
             headers: candidate.headers,
+            // The note and the website are the fields an Agent-page edit can
+            // change; without them here the merge would silently keep the old
+            // values while reporting success.
+            metadata: ModelProviderMetadata {
+                note: candidate.metadata.note,
+                website_url: candidate.metadata.website_url,
+                ..existing.metadata.clone()
+            },
             status: candidate.status,
             ..existing.clone()
         };
@@ -1046,6 +1054,11 @@ impl ProviderProjectionCompatibilityRepository {
         legacy.default_model = provider.default_model_id.clone();
         legacy.configured_models = legacy_configured_models_from_model_provider(provider, &before);
         legacy.secrets = legacy_secrets_from_model_provider(provider, &before, legacy_id);
+        // The note and the website live on different fields in each shape; the
+        // shared record owns them now, so this direction writes them back where
+        // the launch row and the import markers keep reading them.
+        legacy.account_alias = provider.metadata.note.clone();
+        legacy.provider_options = legacy_options_with_website(provider, &before);
 
         // `updated_at_ms` is part of the comparison the launch contract hashes, so a
         // projection that changes nothing must not move it: every binding reading
@@ -1131,6 +1144,33 @@ fn primary_endpoints_from_legacy(legacy: &ProviderProfile) -> Vec<ModelProviderE
         url: base_url.to_string(),
         wire_protocol_id: pin,
     }]
+}
+
+/// Writes the shared record's website back into the legacy option map.
+///
+/// `provider_options` also carries the ACP config and the protocol pin, so the
+/// map is reused and only this one key moves; clearing it removes the entry.
+fn legacy_options_with_website(
+    provider: &ModelProviderProfile,
+    previous: &ProviderProfile,
+) -> ProviderOptions {
+    let mut options = previous.provider_options.clone();
+    options
+        .entries
+        .retain(|entry| entry.key.trim() != LEGACY_WEBSITE_URL_OPTION_KEY);
+    if let Some(website) = provider
+        .metadata
+        .website_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|website| !website.is_empty())
+    {
+        options.entries.push(ProviderBindingMetadata {
+            key: LEGACY_WEBSITE_URL_OPTION_KEY.to_string(),
+            value: website.to_string(),
+        });
+    }
+    options
 }
 
 fn primary_legacy_base_url(provider: &ModelProviderProfile) -> Option<String> {
@@ -1629,8 +1669,10 @@ fn map_legacy_projection_records(
         id: model_provider_id.clone(),
         legacy_provider_profile_id: Some(legacy.id.clone()),
         display_name: legacy.display_name.clone(),
+        // The hint names the vendor, so it comes from the vendor marker — not
+        // from the account alias, which is the user's own note and used to
+        // arrive here as a fake brand.
         vendor_hint: provider_option(legacy, "codexModelProviderId")
-            .or_else(|| legacy.account_alias.clone())
             .or_else(|| Some(legacy.kind.to_string())),
         endpoints: legacy_model_provider_endpoints(legacy),
         proxy_policy: ModelProviderProxyPolicy::InheritSystem,
@@ -1638,7 +1680,11 @@ fn map_legacy_projection_records(
         credentials,
         configured_models: legacy_model_catalog(legacy),
         default_model_id: legacy.default_model.clone(),
-        metadata: Default::default(),
+        metadata: ModelProviderMetadata {
+            note: legacy.account_alias.clone(),
+            website_url: provider_option(legacy, LEGACY_WEBSITE_URL_OPTION_KEY),
+            ..Default::default()
+        },
         status: if legacy.status == ProviderProfileStatus::Enabled {
             ModelProviderProfileStatus::Enabled
         } else {
@@ -2090,6 +2136,8 @@ fn same_model_provider_content(left: &ModelProviderProfile, right: &ModelProvide
         && left.configured_models == right.configured_models
         && left.default_model_id == right.default_model_id
         && left.headers == right.headers
+        && left.metadata.note == right.metadata.note
+        && left.metadata.website_url == right.metadata.website_url
         && left.status == right.status
         && left.deleted_at_ms == right.deleted_at_ms
 }
@@ -2334,6 +2382,11 @@ fn legacy_agent_model_id(profile: &ProviderProfile, provider_model_id: &str) -> 
 const LEGACY_HEADER_OVERRIDE_OPTION_KEY: &str = "headerOverrideJson";
 /// The Provider option that pins the protocol a new Model inherits.
 const LEGACY_WIRE_API_OPTION_KEY: &str = "wireApi";
+/// The Provider option the website link has always lived in.
+///
+/// It is a cc-switch import key, so it stays in the option map for older
+/// readers; the shared record mirrors it in `metadata.website_url`.
+const LEGACY_WEBSITE_URL_OPTION_KEY: &str = "ccSwitchWebsiteUrl";
 
 fn legacy_headers(profile: &ProviderProfile) -> Vec<ModelProviderHeaderReference> {
     let Some(raw) = provider_option(profile, LEGACY_HEADER_OVERRIDE_OPTION_KEY) else {

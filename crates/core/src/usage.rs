@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AgentId, MessageSubmissionId, ProjectId, ProviderProfileId, RuntimeAuthSource,
-    RuntimeBindingId, UsageExecutionId, VibexSessionId, WorkspaceId,
+    AgentId, MessageSubmissionId, ProjectId, RuntimeAuthSource, RuntimeBindingId, UsageExecutionId,
+    VibexSessionId, WorkspaceId,
 };
 
 pub const MAX_AGENT_USAGE_TOKEN_VALUE: u64 = i64::MAX as u64;
@@ -460,7 +460,14 @@ pub struct AgentUsageStatisticsRequest {
     pub range: AgentUsageRange,
     pub agent_ids: Vec<AgentId>,
     pub project_ids: Vec<ProjectId>,
-    pub provider_profile_ids: Vec<ProviderProfileId>,
+    /// The authentication source a turn ran through, as an id.
+    ///
+    /// A source is a Provider Profile, an Agent account, or a route group, so
+    /// the ids are strings rather than Provider Profile ids. The wire name
+    /// stays `providerProfileIds` for clients written before route groups could
+    /// run a turn; `authSourceIds` is accepted as the newer spelling.
+    #[serde(rename = "providerProfileIds", alias = "authSourceIds")]
+    pub auth_source_ids: Vec<String>,
     pub model_ids: Vec<String>,
     pub session_ids: Vec<VibexSessionId>,
     pub dimension: AgentUsageDimension,
@@ -627,7 +634,13 @@ pub struct AgentUsageFilterOption {
 pub struct AgentUsageFilterOptions {
     pub agents: Vec<AgentUsageFilterOption>,
     pub projects: Vec<AgentUsageFilterOption>,
-    pub provider_profiles: Vec<AgentUsageFilterOption>,
+    /// Provider Profiles and route groups, by id, each under its own name.
+    ///
+    /// Both kinds run turns, so both filter the same way. The wire name stays
+    /// `providerProfiles` for clients written before route groups could;
+    /// `authSources` is accepted as the newer spelling.
+    #[serde(rename = "providerProfiles", alias = "authSources")]
+    pub auth_sources: Vec<AgentUsageFilterOption>,
     pub models: Vec<AgentUsageFilterOption>,
     pub sessions: Vec<AgentUsageFilterOption>,
 }

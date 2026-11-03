@@ -54922,7 +54922,11 @@ impl VibexWorkbench {
         let collapsed = &self.runtime_provider_collapsed_groups;
         let groups = groups
             .into_iter()
-            .filter(|group| searching || !collapsed.contains(&runtime_provider_group_key(group)))
+            .filter(|group| {
+                searching
+                    || group.source.kind == RuntimeAuthSourceKind::ModelRoute
+                    || !collapsed.contains(&runtime_provider_group_key(group))
+            })
             .collect::<Vec<_>>();
         let choices = runtime_provider_group_choices(&groups);
         if choices.is_empty() {
@@ -55283,6 +55287,12 @@ impl VibexWorkbench {
             .h_auto()
             .flex_none();
 
+        // Route groups are one row each: their name *is* the model an Agent
+        // asks for, so there is no second model to choose once the group is
+        // picked. They are drawn inside the same accordion only to keep the
+        // frequency order the whole list shares; the item is disabled and the
+        // title itself is the selectable row, so nothing folds.
+        let mut route_keys = BTreeSet::new();
         for group in &groups {
             let heading_key = format!(
                 "{menu_prefix}-runtime-provider-heading:{}:{}",
@@ -55291,7 +55301,11 @@ impl VibexWorkbench {
             );
             let group_key = runtime_provider_group_key(group);
             group_keys.push(group_key.clone());
-            let open = searching || !collapsed.contains(&group_key);
+            let direct = group.source.kind == RuntimeAuthSourceKind::ModelRoute;
+            if direct {
+                route_keys.insert(group_key.clone());
+            }
+            let open = !direct && (searching || !collapsed.contains(&group_key));
             let auth_agent_id = group.agent_id.clone();
             let auth_source = group.source.source.clone();
             let heading_label = if favorites_view {
@@ -55303,6 +55317,146 @@ impl VibexWorkbench {
             } else {
                 group.source_label.clone()
             };
+            if direct {
+                let choice = group.choices.first().cloned();
+                let is_selected = choice.as_ref().is_some_and(|choice| {
+                    selected.is_some_and(|selected| {
+                        choice.selection.agent_id == selected.agent_id
+                            && choice.selection.auth_source == selected.auth_source
+                            && choice.selection.model == selected.model
+                    })
+                });
+                let keyboard_selected = choice.as_ref().is_some_and(|choice| {
+                    keyboard_selection.as_ref().is_some_and(|selection| {
+                        runtime_selection_identity_matches(&choice.selection, selection)
+                    })
+                });
+                let highlighted =
+                    keyboard_selected || (is_selected && keyboard_selection.is_none());
+                let background = if is_selected {
+                    selected_background
+                } else if highlighted {
+                    highlight_background
+                } else {
+                    rest_background
+                };
+                let row_id = format!("{menu_prefix}-runtime-route:{group_key}");
+                let heading_body = || {
+                    div()
+                        .w_full()
+                        .h(px(COMPOSER_RUNTIME_GROUP_HEADING_HEIGHT))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(runtime_provider_group_icon(group, &profiles, cx))
+                        .child(
+                            div()
+                                .min_w_0()
+                                .flex_1()
+                                .truncate()
+                                .text_size(type_scale::menu_body())
+                                .font_semibold()
+                                .text_color(cx.theme().foreground.opacity(0.84))
+                                .child(heading_label),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .text_size(type_scale::menu_subline())
+                                .text_color(cx.theme().muted_foreground)
+                                .child(group.status.clone()),
+                        )
+                };
+                let title = match choice {
+                    None => heading_body().into_any_element(),
+                    Some(choice) => {
+                        let click_selection = choice.selection.clone();
+                        let reveal_selection = choice.selection.clone();
+                        let reveal_workbench = workbench.clone();
+                        let reveal_scroll = provider_scroll.clone();
+                        let favorite_agent_id = choice.selection.agent_id.clone();
+                        let favorite_auth_source = choice.selection.auth_source.clone();
+                        let favorite_model_key =
+                            runtime_model_selection_key(&choice.selection.model);
+                        let is_favorite = is_runtime_model_favorite(
+                            &favorites,
+                            &favorite_agent_id,
+                            &favorite_auth_source,
+                            &favorite_model_key,
+                        );
+                        heading_body()
+                            .id(SharedString::from(row_id.clone()))
+                            .cursor_pointer()
+                            .on_hover(hover_listener(cx.entity_id(), row_id.clone()))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                if new_session {
+                                    this.choose_new_session_runtime(
+                                        click_selection.clone(),
+                                        window,
+                                        cx,
+                                    );
+                                } else {
+                                    this.choose_runtime_selection(
+                                        click_selection.clone(),
+                                        window,
+                                        cx,
+                                    );
+                                }
+                            }))
+                            .when(is_selected, |this| {
+                                this.child(Icon::new(IconName::Check).size(px(14.0)))
+                            })
+                            .child(runtime_menu_star_toggle(
+                                row_id.clone(),
+                                is_favorite,
+                                cx.listener(move |this, _, _, cx| {
+                                    this.toggle_runtime_model_favorite(
+                                        &favorite_agent_id,
+                                        &favorite_auth_source,
+                                        &favorite_model_key,
+                                        cx,
+                                    )
+                                }),
+                                cx.entity_id(),
+                                cx,
+                            ))
+                            .on_prepaint(move |bounds, window, cx| {
+                                let should_reveal = reveal_workbench
+                                    .update(cx, |this, _| {
+                                        this.runtime_provider_reveal_selection
+                                            .take_if(|selection| {
+                                                runtime_selection_identity_matches(
+                                                    selection,
+                                                    &reveal_selection,
+                                                )
+                                            })
+                                            .is_some()
+                                            || std::mem::take(
+                                                &mut this.runtime_provider_scroll_to_selection,
+                                            )
+                                    })
+                                    .unwrap_or(false);
+                                if should_reveal {
+                                    scroll_row_into_view(&reveal_scroll, bounds, window);
+                                }
+                            })
+                            .into_any_element()
+                    }
+                };
+                let hover = highlight_background;
+                accordion = accordion.item(move |item| {
+                    item.disabled(true)
+                        .open(false)
+                        .with_size(gpui_component::Size::XSmall)
+                        .bg(background)
+                        .border_b_0()
+                        .rounded(px(6.0))
+                        .hover(move |style| style.bg(hover).rounded(px(6.0)))
+                        .title(title)
+                });
+                continue;
+            }
             let heading = div()
                 .w_full()
                 .h(px(COMPOSER_RUNTIME_GROUP_HEADING_HEIGHT))
@@ -55525,11 +55679,14 @@ impl VibexWorkbench {
         if !group_keys.is_empty() && !searching {
             let collapsed_workbench = workbench.clone();
             let all_keys = group_keys.clone();
+            let route_keys = route_keys.clone();
             accordion = accordion.on_toggle_click(move |open_indices, _, cx| {
                 let next = all_keys
                     .iter()
                     .enumerate()
-                    .filter(|(index, _)| !open_indices.contains(index))
+                    .filter(|(index, key)| {
+                        !open_indices.contains(index) && !route_keys.contains(*key)
+                    })
                     .map(|(_, key)| key.clone())
                     .collect::<BTreeSet<_>>();
                 let _ = collapsed_workbench.update(cx, |this, cx| {
@@ -78257,7 +78414,7 @@ fn runtime_provider_group_icon(
             agent_brand_icon(group.agent_id.as_str(), size, None)
         }
         RuntimeAuthSourceKind::ModelRoute => new_session_selector_icon(
-            "icons/vibex/git-branch.svg",
+            "icons/vibex/directions.svg",
             theme::semantic_color("chart-1", cx.theme().is_dark()),
         ),
         RuntimeAuthSourceKind::ProviderProfile => {
@@ -120022,8 +120179,44 @@ mod route_picker_tests {
         assert!(grouped.contains(".bordered(false)"));
         assert!(grouped.contains(".on_toggle_click(move |open_indices"));
         assert!(grouped.contains("runtime_provider_collapsed_groups"));
-        assert!(grouped.contains("let open = searching || !collapsed.contains(&group_key);"));
+        assert!(
+            grouped
+                .contains("let open = !direct && (searching || !collapsed.contains(&group_key));")
+        );
         assert!(grouped.contains("runtime_provider_group_key(group)"));
+    }
+
+    /// A route group is one row, not a folder over one model.
+    ///
+    /// Its name is the model an Agent asks for, so unfolding it to show a
+    /// single identical label is noise. The heading is drawn as the row and the
+    /// accordion item is inert; a click on it picks the group.
+    #[test]
+    fn route_groups_are_directly_selectable_rows() {
+        let source = include_str!("app.rs");
+        let grouped = source
+            .split_once("    fn render_provider_model_groups(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_new_session_runtime_cascade("))
+            .map(|(body, _)| body)
+            .expect("grouped provider/model renderer should remain inspectable");
+        assert!(
+            grouped
+                .contains("let direct = group.source.kind == RuntimeAuthSourceKind::ModelRoute;")
+        );
+        assert!(grouped.contains("if direct {"));
+        assert!(grouped.contains(".disabled(true)"));
+        assert!(grouped.contains(".open(false)"));
+        assert!(grouped.contains("choose_new_session_runtime("));
+        assert!(grouped.contains("choose_runtime_selection("));
+        // The fold bookkeeping must not remember a closed row it never folds.
+        assert!(grouped.contains("!route_keys.contains(*key)"));
+        // Keyboard stepping still reaches a row that never opens.
+        let nav = source
+            .split_once("    fn handle_runtime_provider_model_nav(")
+            .and_then(|(_, tail)| tail.split_once("    fn choose_new_session_runtime("))
+            .map(|(body, _)| body)
+            .expect("runtime provider navigation should remain inspectable");
+        assert!(nav.contains("RuntimeAuthSourceKind::ModelRoute"));
     }
 
     /// A star belongs to one Agent + source + model triple, and Provider

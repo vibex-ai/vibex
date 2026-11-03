@@ -1833,6 +1833,7 @@ mod credential_tests {
                 default_model_id: None,
                 headers: Vec::new(),
                 status: vibex_core::ModelProviderProfileStatus::Enabled,
+                metadata: Default::default(),
             })
             .unwrap()
             .id
@@ -2317,6 +2318,7 @@ mod shared_provider_tests {
                 default_model_id: None,
                 headers: Vec::new(),
                 status: vibex_core::ModelProviderProfileStatus::Enabled,
+                metadata: Default::default(),
             })
             .unwrap();
         // Creating it needed no Agent and was accepted.

@@ -330,7 +330,7 @@ impl ManagementCenter {
             served_list = served_list.child(
                 ws_row(
                     SharedString::from(format!("management-gateway-served-{index}")),
-                    ws_icon_tile("icons/vibex/git-branch.svg", px(30.0), None, cx),
+                    ws_icon_tile("icons/vibex/directions.svg", px(30.0), None, cx),
                     div()
                         .min_w_0()
                         .truncate()

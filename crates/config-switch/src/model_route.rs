@@ -487,6 +487,7 @@ mod tests {
                 default_model_id: models.first().map(|model| (*model).to_string()),
                 headers: Vec::new(),
                 status: ModelProviderProfileStatus::Enabled,
+                metadata: Default::default(),
             })
             .unwrap()
             .id
@@ -1315,6 +1316,7 @@ mod model_group_tests {
                 default_model_id: models.first().map(|model| (*model).to_string()),
                 headers: Vec::new(),
                 status: ModelProviderProfileStatus::Enabled,
+                metadata: Default::default(),
             })
             .unwrap()
             .id

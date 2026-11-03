@@ -541,8 +541,9 @@ fn build_annual_projection(
                 .into_iter()
                 .map(|(model_id, model_facts)| {
                     Ok(AgentUsageDailyModelUsage {
-                        label: model_id
-                            .clone()
+                        label: model_facts
+                            .first()
+                            .map(|projection| model_label(projection))
                             .unwrap_or_else(|| "Agent default".to_string()),
                         model_id,
                         requests: model_facts.len() as u64,
@@ -611,11 +612,11 @@ fn matches_filters(
     let fact = &projection.fact;
     (request.agent_ids.is_empty() || request.agent_ids.contains(&fact.agent_id))
         && (request.project_ids.is_empty() || request.project_ids.contains(&fact.project_id))
-        && (request.provider_profile_ids.is_empty()
-            || fact
-                .auth_source
-                .provider_profile_id()
-                .is_some_and(|profile_id| request.provider_profile_ids.contains(profile_id)))
+        && (request.auth_source_ids.is_empty()
+            || request
+                .auth_source_ids
+                .iter()
+                .any(|source_id| source_id == fact.auth_source.id()))
         && (request.model_ids.is_empty()
             || fact
                 .model_id
@@ -624,10 +625,34 @@ fn matches_filters(
         && (request.session_ids.is_empty() || request.session_ids.contains(&fact.session_id))
 }
 
+/// How a Model row and its chart series are keyed.
+///
+/// A turn that disclosed no model is not a model id, so it takes a fixed key
+/// of its own rather than an empty string another reading could collide with.
+fn model_series_id(model_id: Option<&str>) -> String {
+    model_id
+        .map(str::to_string)
+        .unwrap_or_else(|| "model-resolution:agent-default".to_string())
+}
+
+/// The Model of one fact, as a reader knows it.
+///
+/// A route model is addressed as `group/<route id>/<model>`; the id in the
+/// middle is routing, not a name. The model part is the one the Provider's
+/// catalogue names, and that is the name the reader picked from.
+fn model_label(projection: &AgentUsageFactProjection) -> String {
+    let Some(model_id) = projection.fact.model_id.as_deref() else {
+        return "Agent default".to_string();
+    };
+    vibex_core::route_group_model_ref(model_id)
+        .map(|parsed| parsed.model_id.to_string())
+        .unwrap_or_else(|| model_id.to_string())
+}
+
 fn build_filter_options(facts: &[AgentUsageFactProjection]) -> AgentUsageFilterOptions {
     let mut agents = BTreeMap::new();
     let mut projects = BTreeMap::new();
-    let mut provider_profiles = BTreeMap::new();
+    let mut auth_sources = BTreeMap::new();
     let mut models = BTreeMap::new();
     let mut sessions = BTreeMap::new();
     for projection in facts {
@@ -640,12 +665,12 @@ fn build_filter_options(facts: &[AgentUsageFactProjection]) -> AgentUsageFilterO
             fact.project_id.as_str().to_string(),
             projection.project_label.clone(),
         );
-        provider_profiles.insert(
+        auth_sources.insert(
             fact.auth_source.id().to_string(),
             projection.auth_source_label.clone(),
         );
         if let Some(model_id) = fact.model_id.as_ref() {
-            models.insert(model_id.clone(), model_id.clone());
+            models.insert(model_id.clone(), model_label(projection));
         }
         sessions.insert(
             fact.session_id.as_str().to_string(),
@@ -655,7 +680,7 @@ fn build_filter_options(facts: &[AgentUsageFactProjection]) -> AgentUsageFilterO
     AgentUsageFilterOptions {
         agents: filter_options(agents),
         projects: filter_options(projects),
-        provider_profiles: filter_options(provider_profiles),
+        auth_sources: filter_options(auth_sources),
         models: filter_options(models),
         sessions: filter_options(sessions),
     }
@@ -700,15 +725,13 @@ fn build_dimension_rows(
                 fact.auth_source.id().to_string(),
                 projection.auth_source_label.clone(),
             ),
-            AgentUsageDimension::Model => fact.model_id.as_ref().map_or_else(
-                || {
-                    (
-                        "model-resolution:agent-default".to_string(),
-                        "Agent default".to_string(),
-                    )
-                },
-                |model_id| (model_id.clone(), model_id.clone()),
-            ),
+            AgentUsageDimension::Model => {
+                let model_id = projection.fact.model_id.clone();
+                (
+                    model_series_id(model_id.as_deref()),
+                    model_label(projection),
+                )
+            }
         };
         groups.entry((id, label)).or_default().push(*projection);
     }
@@ -1481,6 +1504,143 @@ mod tests {
         assert_eq!(day.models[0].total_tokens.value, Some(100));
     }
 
+    /// A route group's usage is filed under its name, never its id.
+    ///
+    /// The auth source of a route turn is `model_route_<hex>`, which READMEs
+    /// nothing about; the group's name is what the reader authored, and its
+    /// model arrives as the gateway address `group/<id>/<model>`. The Model
+    /// dimension and filter must show the model alone, exactly like the picker
+    /// the turn was chosen in.
+    #[test]
+    fn a_route_groups_usage_reads_by_its_name_and_bare_model() {
+        let (_directory, service, session) = seeded_service();
+        let route_id = vibex_core::ModelRouteId::new();
+        let connection = open_database(service.database_path()).unwrap();
+        let provider = vibex_core::ModelProviderProfile {
+            display_name: "DeepSeek".to_string(),
+            status: vibex_core::ModelProviderProfileStatus::Enabled,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            ..vibex_core::ModelProviderProfile::default()
+        };
+        vibex_db::ModelProviderProfileRepository::insert(&connection, &provider).unwrap();
+        let route = vibex_core::ModelRoute {
+            id: route_id.clone(),
+            display_name: "Fast".to_string(),
+            agent_model_id: Some("fast-model".to_string()),
+            kind: vibex_core::RouteKind::ModelGroup,
+            members: vec![vibex_core::ModelRouteMember::new(
+                provider.id.clone(),
+                "upstream-model",
+                0,
+            )],
+            ..vibex_core::ModelRoute::default()
+        };
+        vibex_db::ModelRouteRepository::insert(&connection, &route).unwrap();
+
+        let migration_applied_at_ms = connection
+            .query_row(
+                "SELECT applied_at_ms FROM schema_migrations WHERE version = 31",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        let stream = AgentUsageStreamAttribution {
+            session_id: session.id.clone(),
+            binding_id: RuntimeBindingId::new(),
+            activation_generation: 1,
+            agent_id: session.agent_id.clone(),
+            auth_source: RuntimeAuthSource::model_route(route_id.clone()),
+            auth_source_revision: 1,
+            model_id: Some(format!("group/{}/fast-model", route_id.as_str())),
+        };
+        connection
+            .execute(
+                "
+                INSERT INTO session_runtime_bindings (
+                    binding_id, session_id, agent_id, transport_kind, adapter_id, adapter_version,
+                    adapter_compatibility_identity, provider_profile_id, profile_revision,
+                    auth_source_kind, auth_source_id, auth_source_revision, native_state_home_id,
+                    process_spawn_fingerprint, session_runtime_config_state_json, binding_state,
+                    activation_generation, created_at_ms, updated_at_ms,
+                    usage_zero_baseline_state
+                ) VALUES (
+                    ?1, ?2, ?3, 'acp', 'usage-test-adapter', '1.0.0',
+                    'usage-test-compatibility', NULL, NULL, 'model_route', ?4, 1,
+                    'usage-test-home',
+                    'usage-test-fingerprint', '{}', 'current', 1, ?5, ?5, 'available'
+                )
+                ",
+                rusqlite::params![
+                    stream.binding_id.as_str(),
+                    stream.session_id.as_str(),
+                    stream.agent_id.as_str(),
+                    route_id.as_str(),
+                    migration_applied_at_ms.saturating_add(1),
+                ],
+            )
+            .unwrap();
+
+        let execution = execution(&service, &session, &stream, 9);
+        service
+            .apply_telemetry_event(dispatched_event(execution.clone()))
+            .unwrap();
+        service
+            .apply_telemetry_event(AgentUsageTelemetryEvent::Observation(observation(
+                execution, 1, 60, 40, 20, 100,
+            )))
+            .unwrap();
+
+        let statistics = service
+            .query_statistics_at(
+                AgentUsageStatisticsRequest {
+                    dimension: AgentUsageDimension::Model,
+                    ..fixed_request(AgentUsageRange::Today)
+                },
+                dispatched_at(12),
+            )
+            .unwrap();
+        assert_eq!(statistics.filter_options.auth_sources.len(), 1);
+        assert_eq!(statistics.filter_options.auth_sources[0].label, "Fast");
+        assert_eq!(statistics.filter_options.models[0].label, "fast-model");
+        assert_eq!(statistics.dimension_rows[0].label, "fast-model");
+        assert_eq!(
+            statistics.dimension_rows[0].id,
+            format!("group/{}/fast-model", route_id.as_str()),
+        );
+        let day = statistics
+            .annual
+            .as_ref()
+            .unwrap()
+            .days
+            .iter()
+            .find(|day| day.label == "2026-07-31")
+            .unwrap();
+        assert_eq!(day.models[0].label, "fast-model");
+
+        // The source filter matches the route id the fact carries.
+        let filtered = service
+            .query_statistics_at(
+                AgentUsageStatisticsRequest {
+                    auth_source_ids: vec![route_id.as_str().to_string()],
+                    ..fixed_request(AgentUsageRange::Today)
+                },
+                dispatched_at(12),
+            )
+            .unwrap();
+        assert_eq!(filtered.totals.requests, 1);
+        let unrelated = service
+            .query_statistics_at(
+                AgentUsageStatisticsRequest {
+                    auth_source_ids: vec![ProviderProfileId::new().as_str().to_string()],
+                    ..fixed_request(AgentUsageRange::Today)
+                },
+                dispatched_at(12),
+            )
+            .unwrap();
+        assert_eq!(unrelated.totals.requests, 0);
+    }
+
     #[test]
     fn zero_baseline_is_claimed_only_after_execution_dispatch() {
         let (_directory, service, session) = seeded_service();
@@ -1791,7 +1951,7 @@ mod tests {
                 AgentUsageStatisticsRequest {
                     agent_ids: vec![first_stream.agent_id.clone()],
                     project_ids: vec![first_session.project_id.clone()],
-                    provider_profile_ids: vec![first_profile],
+                    auth_source_ids: vec![first_profile.as_str().to_string()],
                     model_ids: vec![first_stream.model_id.clone().unwrap()],
                     session_ids: vec![first_session.id.clone()],
                     ..fixed_request(AgentUsageRange::Today)
@@ -1814,7 +1974,7 @@ mod tests {
         );
         assert_eq!(filtered.filter_options.agents.len(), 2);
         assert_eq!(filtered.filter_options.projects.len(), 2);
-        assert_eq!(filtered.filter_options.provider_profiles.len(), 2);
+        assert_eq!(filtered.filter_options.auth_sources.len(), 2);
         assert_eq!(filtered.filter_options.models.len(), 2);
         assert_eq!(filtered.filter_options.sessions.len(), 2);
 

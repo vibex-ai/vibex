@@ -1,7 +1,7 @@
 //! One route group's page, the page that authors one, and the form both
 //! share with the Agent dialog.
 //!
-//! A route group is one model name that tries several Provider models in an
+//! A route group is one name that tries several Provider models in an
 //! order. Its page reads like a Provider's: an identity header with the
 //! switch that turns it on, then tabs — Overview (who answers, who asks, and
 //! the traffic they produced), Members (the order, edited in place) and
@@ -245,7 +245,7 @@ impl ManagementCenter {
             .into_any_element();
         ws_page_header(
             ws_icon_tile(
-                "icons/vibex/git-branch.svg",
+                "icons/vibex/directions.svg",
                 px(48.0),
                 Some(cx.theme().primary),
                 cx,
@@ -479,6 +479,11 @@ impl ManagementCenter {
         let route = &row.route;
         let models = management_route_group_models(route, &self.providers);
         let providers = management_route_group_provider_names(route, &self.providers);
+        // The name is the model an Agent asks for, so the tile shows it under
+        // "Name" rather than counting "Models" that are always one.
+        let name = route
+            .agent_model()
+            .unwrap_or_else(|| management_locale_text("No name", "没有名称", "沒有名稱"));
         let tiles = ws_tile_row(vec![
             management_stat_tile(
                 management_locale_text("Members", "成员", "成員"),
@@ -498,12 +503,12 @@ impl ManagementCenter {
                 cx,
             ),
             management_stat_tile(
-                management_locale_text("Models", "模型", "模型"),
-                models.len().to_string(),
+                management_locale_text("Name", "名称", "名稱"),
+                name.to_string(),
                 management_locale_text(
-                    "Names Agents can ask for",
-                    "Agent 可请求的模型名",
-                    "Agent 可請求的模型名",
+                    "What Agents ask for",
+                    "Agent 请求的模型",
+                    "Agent 請求的模型",
                 )
                 .to_string(),
                 models.is_empty().then(|| cx.theme().warning),
@@ -652,9 +657,9 @@ impl ManagementCenter {
             .when(models.is_empty(), |chips| {
                 chips.child(ws_empty_line(
                     management_locale_text(
-                        "This group names no model Agents can ask for.",
-                        "这个路由组没有 Agent 可请求的模型名。",
-                        "這個路由組沒有 Agent 可請求的模型名。",
+                        "This group has no name yet.",
+                        "这个路由组还没有名称。",
+                        "這個路由組還沒有名稱。",
                     ),
                     cx,
                 ))
@@ -677,11 +682,11 @@ impl ManagementCenter {
                 cx,
             ),
             ws_section(
-                management_locale_text("Model names", "对外模型名", "對外模型名"),
+                management_locale_text("Name", "名称", "名稱"),
                 Some(management_locale_text(
                     "What an Agent asks for to reach this group.",
-                    "Agent 通过这些模型名调用该路由组。",
-                    "Agent 透過這些模型名呼叫該路由組。",
+                    "Agent 用这个名称请求该路由组。",
+                    "Agent 用這個名稱請求該路由組。",
                 )),
                 None,
                 model_chips.into_any_element(),
@@ -862,16 +867,19 @@ impl ManagementCenter {
     }
 
     fn render_route_group_name_section(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        // The name is the model an Agent asks for, so the field is just the
+        // name: there is no second "model name" beside it for the reader to
+        // reconcile. The hint says what the name doubles as.
         ws_section(
             management_locale_text("Name", "名称", "名稱"),
             None,
             None,
             ws_field(
-                management_locale_text("Model name", "模型名", "模型名"),
+                management_locale_text("Name", "名称", "名稱"),
                 Some(management_locale_text(
                     "Agents ask for this name as if it were a model. Members may use different upstream models.",
-                    "Agent 会把它当作模型名来请求；组内成员可以使用不同的上游模型。",
-                    "Agent 會把它當作模型名來請求；組內成員可以使用不同的上游模型。",
+                    "Agent 会把这个名称当作模型来请求；组内成员可以使用不同的上游模型。",
+                    "Agent 會把這個名稱當作模型來請求；組內成員可以使用不同的上游模型。",
                 )),
                 ws_input(
                     &self.route_group_name,
@@ -1379,7 +1387,7 @@ impl ManagementCenter {
     ) -> AnyElement {
         let editing = self.route_group_editing_id.is_some();
         let mark = ws_icon_tile(
-            "icons/vibex/git-branch.svg",
+            "icons/vibex/directions.svg",
             px(44.0),
             Some(cx.theme().primary),
             cx,
@@ -1394,8 +1402,8 @@ impl ManagementCenter {
             },
             management_locale_text(
                 "Combine models from several Providers under one name, with an order to fall back through.",
-                "把多个供应商的模型合成一个模型名，并按顺序依次回退。",
-                "把多個供應商的模型合成一個模型名，並依順序依次回退。",
+                "把多个供应商的模型合成一个名称，并按顺序依次回退。",
+                "把多個供應商的模型合成一個名稱，並依順序依次回退。",
             ),
             self.render_route_group_form(RouteGroupFormScope::Page, cx),
             cx,

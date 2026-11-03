@@ -2436,6 +2436,16 @@ impl ProviderConfigService {
                     value: endpoint.url.clone(),
                 });
         }
+        // The shared record owns the note and the website; the launch row has
+        // the two shapes the launch path and the import markers still read.
+        if let Some(website) = shared.metadata.website_url.as_deref() {
+            provider_options
+                .entries
+                .push(vibex_core::ProviderBindingMetadata {
+                    key: "ccSwitchWebsiteUrl".to_string(),
+                    value: website.to_string(),
+                });
+        }
         // The ACP runtime config this Agent launches with, exactly as the Agent
         // page's own create path inherits it. Without it the row has no ACP
         // configuration at all, and launching fails at `acp_config_missing` — the
@@ -2498,7 +2508,7 @@ impl ProviderConfigService {
                 vibex_core::ModelProviderProfileStatus::Enabled => ProviderProfileStatus::Enabled,
                 vibex_core::ModelProviderProfileStatus::Disabled => ProviderProfileStatus::Disabled,
             },
-            account_alias: None,
+            account_alias: shared.metadata.note.clone(),
             base_url,
             default_model: shared.default_model_id.clone(),
             small_model: None,
@@ -14408,6 +14418,7 @@ mod shared_provider_probe_tests {
                 default_model_id: None,
                 headers: Vec::new(),
                 status: vibex_core::ModelProviderProfileStatus::Enabled,
+                metadata: Default::default(),
             })
             .unwrap();
         service
@@ -14465,6 +14476,7 @@ mod shared_provider_probe_tests {
                 default_model_id: None,
                 headers: Vec::new(),
                 status: vibex_core::ModelProviderProfileStatus::Enabled,
+                metadata: Default::default(),
             })
             .unwrap();
 

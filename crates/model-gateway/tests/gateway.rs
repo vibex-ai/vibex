@@ -450,6 +450,7 @@ fn seed_upstream(
             .collect(),
         default_model_id: models.first().map(|model| (*model).to_string()),
         headers: Vec::new(),
+        metadata: Default::default(),
         status: ModelProviderProfileStatus::Enabled,
     };
     service.create_model_provider_profile(profile).unwrap().id
@@ -567,6 +568,7 @@ fn seed_untyped_upstream(
             .collect(),
         default_model_id: models.first().map(|model| (*model).to_string()),
         headers: Vec::new(),
+        metadata: Default::default(),
         status: ModelProviderProfileStatus::Enabled,
     };
     service.create_model_provider_profile(profile).unwrap().id

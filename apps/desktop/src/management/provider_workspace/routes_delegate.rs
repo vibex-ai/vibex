@@ -218,6 +218,7 @@ impl TableDelegate for RouteRequestsTableDelegate {
             RouteColumn::Answered => {
                 let id = row.id().clone();
                 let click_id = id.clone();
+                let debug_id = id.clone();
                 let failed = parts.failed;
                 // The record is the way into its route: a click picks it and
                 // pins the map above, a second click replays it.
@@ -233,6 +234,9 @@ impl TableDelegate for RouteRequestsTableDelegate {
                         "management-gateway-request-row-{}",
                         id.as_str()
                     )))
+                    .debug_selector(move || {
+                        format!("management-gateway-request-row-{}", debug_id.as_str())
+                    })
                     .w_full()
                     .min_w_0()
                     .items_center()

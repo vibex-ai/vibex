@@ -400,6 +400,16 @@ const VIBEX_ASSETS: &[(&str, &[u8])] = &[
         )),
     ),
     (
+        // The route-group mark: a two-tone `keyline-icons:directions-sharp`
+        // arrow crossing a track, distinct from the worktree's branch glyph the
+        // group used to borrow.
+        "icons/vibex/directions.svg",
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/icons/directions.svg"
+        )),
+    ),
+    (
         "icons/vibex/puzzle.svg",
         include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),

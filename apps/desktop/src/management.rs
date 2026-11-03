@@ -26,7 +26,7 @@ use gpui_component::{
     Selectable as _, Sizable as _, Size, StyledExt as _, Theme, WindowExt as _,
     alert::Alert,
     animation::{EffectTransition as Transition, ease_out_cubic},
-    button::{Button, ButtonGroup, ButtonVariant, ButtonVariants as _, Toggle},
+    button::{Button, ButtonVariant, ButtonVariants as _, Toggle},
     checkbox::Checkbox,
     clipboard::Clipboard,
     collapsible::Collapsible,
@@ -424,13 +424,6 @@ pub(crate) enum ManagementEvent {
 }
 
 /// Which control inside the open Model editor produced a message.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProfileModelEditField {
-    Id,
-    Reasoning,
-    Limits,
-}
-
 /// One request-header row in the Provider editor.
 ///
 /// `variable` selects a value the runtime fills from the session; while it is
@@ -478,9 +471,29 @@ impl McpMarketRequest {
 struct ProfileModelEditorContext {
     agent_owns_catalog: bool,
     catalog_choices: Vec<(String, Option<vibex_core::ProviderModelWireApi>)>,
-    wire_api_choices: Vec<vibex_core::ProviderModelWireApi>,
-    shows_wire_api: bool,
+    /// The integration that would carry a protocol, when the projection has one.
+    integration_kinds: Vec<(
+        vibex_core::ProviderModelWireApi,
+        Option<vibex_core::AgentModelInterfaceIntegrationKind>,
+    )>,
     pending: bool,
+}
+
+impl ProfileModelEditorContext {
+    /// The protocols the shared editor may offer this Agent, with what the
+    /// projection says about each one.
+    fn wire_choices(&self) -> Vec<provider_workspace::WireChoice> {
+        self.integration_kinds
+            .iter()
+            .map(|(wire_api, integration)| provider_workspace::WireChoice {
+                api: *wire_api,
+                support: integration.map(|integration| {
+                    SharedString::from(provider_interface_integration_label(integration))
+                }),
+                supported: integration.is_some(),
+            })
+            .collect()
+    }
 }
 
 /// One row of the Model picker.
@@ -1513,26 +1526,14 @@ pub struct ManagementCenter {
     /// Which Provider the add-key field belongs to.
     gateway_key_add_target: Option<String>,
     gateway_key_add_error: Option<String>,
-    /// The shared Provider whose core fields are open in the inline editor.
+    /// The shared Provider whose Settings tab is open, if any.
     shared_provider_edit_target: Option<vibex_core::ModelProviderProfileId>,
-    shared_provider_edit_name: Entity<InputState>,
-    shared_provider_edit_base_url: Entity<InputState>,
-    shared_provider_edit_models: Entity<InputState>,
-    shared_provider_edit_default_model: Entity<InputState>,
-    shared_provider_edit_models_url: Entity<InputState>,
-    shared_provider_edit_auth_url: Entity<InputState>,
-    shared_provider_edit_proxy_endpoint_url: Entity<InputState>,
-    shared_provider_edit_headers: Entity<TextareaState>,
-    shared_provider_edit_catalog_id: Entity<InputState>,
-    shared_provider_edit_icon: Entity<InputState>,
-    shared_provider_edit_category: Option<String>,
-    shared_provider_edit_proxy_url: Entity<InputState>,
-    shared_provider_edit_proxy_disabled: bool,
-    shared_provider_edit_only_through_groups: bool,
-    shared_provider_edit_error: Option<String>,
-    shared_provider_edit_name_error: Option<String>,
-    shared_provider_edit_base_url_error: Option<String>,
-    shared_provider_edit_models_error: Option<String>,
+    /// The one Provider form's draft, and the record it writes.
+    ///
+    /// Both the new-Provider page and a saved record's Settings tab draw
+    /// [`Self::render_provider_form`] over this; the scope decides which record
+    /// the same body saves.
+    provider_form: provider_workspace::ProviderDraft,
     /// Whether the Providers page is showing its own "new Provider" view.
     ///
     /// It replaces the detail pane rather than opening an overlay: the record
@@ -1543,29 +1544,10 @@ pub struct ManagementCenter {
     /// Whether the page's Provider draft has been initialized and should be
     /// restored when the reader switches away and comes back.
     provider_create_draft_active: bool,
-    provider_create_name: Entity<InputState>,
-    provider_create_base_url: Entity<InputState>,
-    provider_create_models: Entity<InputState>,
-    provider_create_default_model: Entity<InputState>,
-    provider_create_models_url: Entity<InputState>,
-    provider_create_auth_url: Entity<InputState>,
-    provider_create_api_key: Entity<InputState>,
-    provider_create_headers: Entity<TextareaState>,
-    provider_create_headers_open: bool,
-    provider_create_proxy_url: Entity<InputState>,
-    provider_create_proxy_disabled: bool,
-    provider_create_only_through_groups: bool,
-    provider_create_category: Option<String>,
-    provider_create_catalog_id: Entity<InputState>,
     /// The preset the page draft started from, so its region override and
     /// catalogue id survive until the record is created.
     provider_create_preset: Option<vibex_core::ProviderPreset>,
     provider_create_preset_region: Option<String>,
-    provider_create_error: Option<String>,
-    provider_create_name_error: Option<String>,
-    provider_create_base_url_error: Option<String>,
-    provider_create_models_error: Option<String>,
-    provider_create_endpoint_error: Option<String>,
     /// The page draft's own debounce and generations, kept apart from the
     /// dialog's so a create page and an edit dialog never cancel each other.
     provider_create_auto_fetch_generation: u64,
@@ -1639,33 +1621,11 @@ pub struct ManagementCenter {
     provider_models_filter: ProviderModelsFilter,
     traffic_range: TrafficRange,
     provider_model_edit_id: Option<String>,
-    provider_model_edit_context: Option<Entity<InputState>>,
-    provider_model_edit_output: Option<Entity<InputState>>,
-    /// The open model's display name and declared thinking levels, the same
-    /// two fields the Agent dialog's model settings hold.
-    provider_model_edit_name: Option<Entity<InputState>>,
-    provider_model_edit_efforts: Option<Entity<InputState>>,
-    /// The open model's API protocol; `None` inherits the Provider's.
-    provider_model_edit_wire_api: Option<vibex_core::ProviderModelWireApi>,
-    /// The open model's capabilities as the inline editor holds them.
-    ///
-    /// The chips used to write straight to the saved record, which made the
-    /// editor's two halves behave differently: a token limit waited for "Save
-    /// model" while a capability was persisted on the click. They are kept
-    /// here so one Save writes the whole model, and so a catalogue lookup can
-    /// fill them without touching a saved Provider.
-    provider_model_edit_image_input: Option<bool>,
-    provider_model_edit_pdf_input: Option<bool>,
-    provider_model_edit_temperature: Option<bool>,
-    provider_model_edit_reasoning: Option<bool>,
-    /// The catalogue's suggestion for the model the inline editor has open.
-    provider_model_capability_suggestion: Option<vibex_core::GatewayCapabilitySuggestion>,
-    /// How many suggestion fields the lookup filled in by itself, so the
-    /// editor can say so instead of leaving the numbers unexplained.
-    provider_model_capability_auto_filled: usize,
-    /// The in-flight catalogue lookup behind the inline editor.
+    /// The in-flight catalogue lookup for the model the inline editor has open.
     provider_model_capability_task: Option<Task<()>>,
-    provider_model_edit_error: Option<String>,
+    /// The one model editor's draft, shared by the Agent dialog and the Models
+    /// tab, so both edit the same fields with the same rules.
+    model_editor: provider_workspace::ModelEditDraft,
     /// The Models tab's "add a model by id" field.
     provider_model_add_input: Entity<InputState>,
     provider_endpoint_probes: Option<Vec<vibex_core::ModelProviderEndpointProbe>>,
@@ -2126,7 +2086,6 @@ pub struct ManagementCenter {
     profile_model_edit_reasoning_disabled: bool,
     /// The open Model editor's problem, tagged with the field it belongs to so
     /// the message lands next to the control that produced it.
-    profile_model_edit_error: Option<(ProfileModelEditField, String)>,
     /// Per-protocol endpoint overrides stay behind a disclosure: most Providers
     /// only ever configure the default address.
     profile_protocol_advanced_open: bool,
@@ -2383,154 +2342,7 @@ impl ManagementCenter {
                 "依名稱或位址搜尋預設",
             ))
         });
-        let shared_provider_edit_name = cx.new(|cx| {
-            InputState::new(window, cx).placeholder(management_locale_text(
-                "Provider name",
-                "供应商名称",
-                "供應商名稱",
-            ))
-        });
-        let shared_provider_edit_base_url = cx.new(|cx| {
-            InputState::new(window, cx).placeholder(management_locale_text(
-                "https://api.example.com/v1",
-                "https://api.example.com/v1",
-                "https://api.example.com/v1",
-            ))
-        });
-        let shared_provider_edit_models = cx.new(|cx| {
-            InputState::new(window, cx).placeholder(management_locale_text(
-                "model-a, model-b",
-                "模型 A, 模型 B",
-                "模型 A, 模型 B",
-            ))
-        });
-        let shared_provider_edit_default_model = cx.new(|cx| {
-            InputState::new(window, cx).placeholder(management_locale_text(
-                "default model",
-                "默认模型",
-                "預設模型",
-            ))
-        });
-        let shared_provider_edit_models_url = cx.new(|cx| {
-            InputState::new(window, cx).placeholder(management_locale_text(
-                "models endpoint",
-                "模型列表地址",
-                "模型清單位址",
-            ))
-        });
-        let shared_provider_edit_auth_url = cx.new(|cx| {
-            InputState::new(window, cx).placeholder(management_locale_text(
-                "auth endpoint",
-                "认证地址",
-                "認證位址",
-            ))
-        });
-        let shared_provider_edit_proxy_endpoint_url = cx.new(|cx| {
-            InputState::new(window, cx).placeholder(management_locale_text(
-                "proxy endpoint",
-                "代理服务地址",
-                "代理服務位址",
-            ))
-        });
-        let shared_provider_edit_headers = cx.new(|cx| {
-            TextareaState::new(window, cx).placeholder(management_locale_text(
-                "{\n  \"X-Header\": \"value\"\n}",
-                "{\n  \"X-Header\": \"值\"\n}",
-                "{\n  \"X-Header\": \"值\"\n}",
-            ))
-        });
-        let shared_provider_edit_catalog_id = cx.new(|cx| {
-            InputState::new(window, cx).placeholder(management_locale_text(
-                "models.dev id",
-                "models.dev ID",
-                "models.dev ID",
-            ))
-        });
-        let shared_provider_edit_icon = cx.new(|cx| {
-            InputState::new(window, cx).placeholder(management_locale_text(
-                "icon key",
-                "图标 key",
-                "圖示 key",
-            ))
-        });
-        let shared_provider_edit_proxy_url = cx.new(|cx| {
-            InputState::new(window, cx).placeholder(management_locale_text(
-                "http://127.0.0.1:7890",
-                "http://127.0.0.1:7890",
-                "http://127.0.0.1:7890",
-            ))
-        });
-        // The Providers page creates its own record, so it owns its own draft
-        // rather than borrowing the Agent editor's. Sharing the inputs would
-        // make a page draft and a dialog draft overwrite each other.
-        let provider_create_name = cx.new(|cx| {
-            InputState::new(window, cx).placeholder(management_locale_text(
-                "Provider name",
-                "供应商名称",
-                "供應商名稱",
-            ))
-        });
-        let provider_create_base_url = cx.new(|cx| {
-            InputState::new(window, cx).placeholder(management_locale_text(
-                "https://api.example.com/v1",
-                "https://api.example.com/v1",
-                "https://api.example.com/v1",
-            ))
-        });
-        let provider_create_models = cx.new(|cx| {
-            InputState::new(window, cx).placeholder(management_locale_text(
-                "model-a, model-b",
-                "模型 A, 模型 B",
-                "模型 A, 模型 B",
-            ))
-        });
-        let provider_create_default_model = cx.new(|cx| {
-            InputState::new(window, cx).placeholder(management_locale_text(
-                "default model",
-                "默认模型",
-                "預設模型",
-            ))
-        });
-        let provider_create_models_url = cx.new(|cx| {
-            InputState::new(window, cx).placeholder(management_locale_text(
-                "models endpoint",
-                "模型列表地址",
-                "模型清單位址",
-            ))
-        });
-        let provider_create_catalog_id = cx.new(|cx| {
-            InputState::new(window, cx).placeholder(management_locale_text(
-                "models.dev id",
-                "models.dev ID",
-                "models.dev ID",
-            ))
-        });
-        let provider_create_auth_url = cx.new(|cx| {
-            InputState::new(window, cx).placeholder(management_locale_text(
-                "auth endpoint",
-                "认证地址",
-                "認證位址",
-            ))
-        });
-        let provider_create_api_key = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder(PROVIDER_API_KEY_PLACEHOLDER)
-                .masked(true)
-        });
-        let provider_create_headers = cx.new(|cx| {
-            TextareaState::new(window, cx).placeholder(management_locale_text(
-                "{\n  \"X-Header\": \"value\"\n}",
-                "{\n  \"X-Header\": \"值\"\n}",
-                "{\n  \"X-Header\": \"值\"\n}",
-            ))
-        });
-        let provider_create_proxy_url = cx.new(|cx| {
-            InputState::new(window, cx).placeholder(management_locale_text(
-                "http://127.0.0.1:7890",
-                "http://127.0.0.1:7890",
-                "http://127.0.0.1:7890",
-            ))
-        });
+        let provider_form = provider_workspace::ProviderDraft::new(window, cx);
         let route_group_name = cx.new(|cx| {
             InputState::new(window, cx).placeholder(management_locale_text(
                 "Route group name",
@@ -2954,13 +2766,13 @@ impl ManagementCenter {
             // the two fields a fetch reads. The debounce lives on the schedule,
             // so a paste that fills one field and then the other asks once.
             cx.subscribe_in(
-                &provider_create_base_url,
+                &provider_form.base_url,
                 window,
                 |this, _, event: &InputEvent, window, cx| {
                     if !management_input_changed(event) {
                         return;
                     }
-                    this.provider_create_base_url_error = None;
+                    this.provider_form.base_url_error = None;
                     this.navigation
                         .mark_dirty(ManagementSection::Providers, false);
                     this.schedule_provider_create_auto_fetch(window, cx);
@@ -2968,7 +2780,7 @@ impl ManagementCenter {
                 },
             ),
             cx.subscribe_in(
-                &provider_create_api_key,
+                &provider_form.api_key,
                 window,
                 |this, _, event: &InputEvent, window, cx| {
                     if !management_input_changed(event) {
@@ -3308,47 +3120,11 @@ impl ManagementCenter {
             gateway_key_add_target: None,
             gateway_key_add_error: None,
             shared_provider_edit_target: None,
-            shared_provider_edit_name,
-            shared_provider_edit_base_url,
-            shared_provider_edit_models,
-            shared_provider_edit_default_model,
-            shared_provider_edit_models_url,
-            shared_provider_edit_auth_url,
-            shared_provider_edit_proxy_endpoint_url,
-            shared_provider_edit_headers,
-            shared_provider_edit_catalog_id,
-            shared_provider_edit_icon,
-            shared_provider_edit_category: None,
-            shared_provider_edit_proxy_url,
-            shared_provider_edit_proxy_disabled: false,
-            shared_provider_edit_only_through_groups: false,
-            shared_provider_edit_error: None,
-            shared_provider_edit_name_error: None,
-            shared_provider_edit_base_url_error: None,
-            shared_provider_edit_models_error: None,
+            provider_form,
             provider_create_page_open: false,
             provider_create_draft_active: false,
-            provider_create_name,
-            provider_create_base_url,
-            provider_create_models,
-            provider_create_default_model,
-            provider_create_models_url,
-            provider_create_auth_url,
-            provider_create_api_key,
-            provider_create_headers,
-            provider_create_headers_open: false,
-            provider_create_proxy_url,
-            provider_create_proxy_disabled: false,
-            provider_create_only_through_groups: false,
-            provider_create_category: None,
-            provider_create_catalog_id,
             provider_create_preset: None,
             provider_create_preset_region: None,
-            provider_create_error: None,
-            provider_create_name_error: None,
-            provider_create_base_url_error: None,
-            provider_create_models_error: None,
-            provider_create_endpoint_error: None,
             provider_create_auto_fetch_generation: 0,
             provider_create_auto_fetch_task: None,
             provider_preset_draft: None,
@@ -3369,19 +3145,8 @@ impl ManagementCenter {
             provider_models_filter: ProviderModelsFilter::All,
             traffic_range: TrafficRange::Day,
             provider_model_edit_id: None,
-            provider_model_edit_context: None,
-            provider_model_edit_output: None,
-            provider_model_edit_name: None,
-            provider_model_edit_efforts: None,
-            provider_model_edit_wire_api: None,
-            provider_model_edit_image_input: None,
-            provider_model_edit_pdf_input: None,
-            provider_model_edit_temperature: None,
-            provider_model_edit_reasoning: None,
-            provider_model_capability_suggestion: None,
-            provider_model_capability_auto_filled: 0,
             provider_model_capability_task: None,
-            provider_model_edit_error: None,
+            model_editor: provider_workspace::ModelEditDraft::new(window, cx),
             provider_model_add_input,
             provider_endpoint_probes: None,
             provider_endpoint_probes_profile: None,
@@ -3467,7 +3232,6 @@ impl ManagementCenter {
             profile_model_selection: None,
             profile_model_edit_wire_api: None,
             profile_model_edit_reasoning_disabled: false,
-            profile_model_edit_error: None,
             profile_protocol_advanced_open: false,
             profile_headers: Vec::new(),
             profile_headers_open: false,
@@ -6553,7 +6317,6 @@ impl ManagementCenter {
         self.profile_model_selection = None;
         self.profile_model_edit_wire_api = None;
         self.profile_model_edit_reasoning_disabled = false;
-        self.profile_model_edit_error = None;
         self.profile_protocol_advanced_open = false;
         self.profile_provider_options = vibex_core::ProviderOptions::empty();
         self.clear_profile_headers(window, cx);
@@ -6653,7 +6416,6 @@ impl ManagementCenter {
         self.profile_model_selection = None;
         self.profile_model_edit_wire_api = None;
         self.profile_model_edit_reasoning_disabled = false;
-        self.profile_model_edit_error = None;
         self.profile_provider_options = full_profile
             .map(|profile| profile.provider_options)
             .unwrap_or_else(vibex_core::ProviderOptions::empty);
@@ -6836,7 +6598,6 @@ impl ManagementCenter {
         self.profile_model_edit_wire_api = None;
         self.model_capability_suggestion = None;
         self.model_capability_task = None;
-        self.profile_model_edit_error = None;
         self.profile_protocol_advanced_open = false;
         self.profile_provider_options = vibex_core::ProviderOptions::empty();
         self.profile_protocol_base_urls.clear();
@@ -7707,14 +7468,6 @@ impl ManagementCenter {
         rows
     }
 
-    fn toggle_profile_model(&mut self, index: usize, enabled: bool, cx: &mut Context<Self>) {
-        if let Some(model) = self.profile_configured_models.get_mut(index) {
-            model.enabled = enabled;
-            self.navigation.mark_dirty(ManagementSection::Agents, true);
-            cx.notify();
-        }
-    }
-
     /// Removes a Model from the draft entirely, wherever its declaration lives.
     ///
     /// Unchecking a row only releases a Model and keeps its declaration for a
@@ -7767,7 +7520,7 @@ impl ManagementCenter {
                 self.profile_headers_open = !self.profile_headers_open;
             }
             PROVIDER_CREATE_HEADERS_DISCLOSURE_ID => {
-                self.provider_create_headers_open = !self.provider_create_headers_open;
+                self.provider_form.headers_open = !self.provider_form.headers_open;
             }
             _ => return,
         }
@@ -7812,12 +7565,7 @@ impl ManagementCenter {
         let Some(backend) = self.backend.clone() else {
             return;
         };
-        let model_id = self
-            .profile_model_edit_id
-            .read(cx)
-            .value()
-            .trim()
-            .to_string();
+        let model_id = self.model_editor.id.read(cx).value().trim().to_string();
         if model_id.is_empty() {
             self.model_capability_suggestion = None;
             return;
@@ -7912,13 +7660,15 @@ impl ManagementCenter {
         // The field on screen is the answer the user is looking at, so a limit
         // only counts as undeclared while its box is empty as well.
         let context_box_empty = self
-            .profile_model_edit_context_tokens
+            .model_editor
+            .context_tokens
             .read(cx)
             .value()
             .trim()
             .is_empty();
         let output_box_empty = self
-            .profile_model_edit_output_tokens
+            .model_editor
+            .output_tokens
             .read(cx)
             .value()
             .trim()
@@ -7955,18 +7705,16 @@ impl ManagementCenter {
         if let Some(value) = context_tokens
             && context_box_empty
         {
-            self.profile_model_edit_context_tokens
-                .update(cx, |state, cx| {
-                    state.set_value(value.to_string(), window, cx)
-                });
+            self.model_editor.context_tokens.update(cx, |state, cx| {
+                state.set_value(value.to_string(), window, cx)
+            });
         }
         if let Some(value) = output_tokens
             && output_box_empty
         {
-            self.profile_model_edit_output_tokens
-                .update(cx, |state, cx| {
-                    state.set_value(value.to_string(), window, cx)
-                });
+            self.model_editor.output_tokens.update(cx, |state, cx| {
+                state.set_value(value.to_string(), window, cx)
+            });
         }
         self.navigation.mark_dirty(ManagementSection::Agents, true);
         cx.notify();
@@ -8037,11 +7785,11 @@ impl ManagementCenter {
         }));
     }
 
-    /// Points the settings pane's fields at the Model the pane is showing.
+    /// Points the settings pane at the Model the pane is showing.
     ///
     /// A row can become the selection before the draft holds it — the pane
     /// offers to add it — and a checkbox can put it in the draft afterwards.
-    /// Loading and emptying therefore travel together, so the fields always
+    /// Loading and clearing therefore travel together, so the fields always
     /// describe the Model named by the pane's header.
     fn sync_profile_model_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match self.selected_profile_model_index() {
@@ -8052,20 +7800,8 @@ impl ManagementCenter {
 
     /// Empties the settings pane, for a selection the draft no longer holds.
     fn clear_profile_model_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.model_capability_suggestion = None;
+        self.model_editor.clear(window, cx);
         self.model_capability_task = None;
-        self.profile_model_edit_wire_api = None;
-        self.profile_model_edit_reasoning_disabled = false;
-        self.profile_model_edit_error = None;
-        for input in [
-            &self.profile_model_edit_id,
-            &self.profile_model_edit_name,
-            &self.profile_model_edit_efforts,
-            &self.profile_model_edit_context_tokens,
-            &self.profile_model_edit_output_tokens,
-        ] {
-            input.update(cx, |state, cx| state.set_value("", window, cx));
-        }
     }
 
     /// Loads one configured Model into the settings pane's fields.
@@ -8079,42 +7815,9 @@ impl ManagementCenter {
             return;
         };
         let was_dirty = self.navigation.is_dirty(ManagementSection::Agents);
-        self.profile_model_edit_wire_api = model.wire_api;
-        let model_id = model.id.clone();
-        self.profile_model_edit_id
-            .update(cx, |state, cx| state.set_value(model_id, window, cx));
-        self.profile_model_edit_name.update(cx, |state, cx| {
-            state.set_value(model.display_name.unwrap_or_default(), window, cx)
-        });
-        // Two answers share the reasoning control: an opt-out and "not
-        // declared". The levels are the wire spellings the user declared, and
-        // the field is the only copy they have.
-        self.profile_model_edit_reasoning_disabled = model.capabilities.reasoning == Some(false);
-        let efforts = model
-            .capabilities
-            .reasoning_efforts
-            .as_ref()
-            .map(ToString::to_string)
-            .unwrap_or_default();
-        self.profile_model_edit_efforts
-            .update(cx, |state, cx| state.set_value(efforts, window, cx));
-        // A declared limit is shown as the number the user will write back; an
-        // undeclared one stays an empty field, which is what "not declared"
-        // looks like everywhere else in this editor.
-        let context_tokens = model
-            .capabilities
-            .context_tokens
-            .map_or_else(String::new, |tokens| tokens.to_string());
-        let output_tokens = model
-            .capabilities
-            .output_tokens
-            .map_or_else(String::new, |tokens| tokens.to_string());
-        self.profile_model_edit_context_tokens
-            .update(cx, |state, cx| state.set_value(context_tokens, window, cx));
-        self.profile_model_edit_output_tokens
-            .update(cx, |state, cx| state.set_value(output_tokens, window, cx));
+        self.load_model_editor(&model, window, cx);
+        self.model_editor.target_id = Some(model.id.clone());
         self.profile_model_selection = Some(model.id);
-        self.profile_model_edit_error = None;
         self.navigation
             .mark_dirty(ManagementSection::Agents, was_dirty);
         // Every path that shows a Model's settings asks the catalogue, not only
@@ -8131,224 +7834,7 @@ impl ManagementCenter {
     /// half-typed level list or token count keeps the Model's previous value
     /// and reports the problem under the field it came from.
     fn apply_profile_model_edit(&mut self, cx: &mut Context<Self>) {
-        let Some(index) = self.selected_profile_model_index() else {
-            return;
-        };
-        if self.profile_configured_models.get(index).is_none() {
-            return;
-        }
-        let model_id = self
-            .profile_model_edit_id
-            .read(cx)
-            .value()
-            .trim()
-            .to_string();
-        let display_name = self
-            .profile_model_edit_name
-            .read(cx)
-            .value()
-            .trim()
-            .to_string();
-        let efforts_text = self
-            .profile_model_edit_efforts
-            .read(cx)
-            .value()
-            .trim()
-            .to_string();
-        let context_tokens_text = self
-            .profile_model_edit_context_tokens
-            .read(cx)
-            .value()
-            .trim()
-            .to_string();
-        let output_tokens_text = self
-            .profile_model_edit_output_tokens
-            .read(cx)
-            .value()
-            .trim()
-            .to_string();
-        let reasoning_disabled = self.profile_model_edit_reasoning_disabled;
-
-        let mut error = None;
-        if model_id.is_empty() {
-            error = Some((
-                ProfileModelEditField::Id,
-                management_error_text(
-                    "Model id is required",
-                    "模型 ID 不能为空",
-                    "模型 ID 不能為空",
-                )
-                .to_string(),
-            ));
-        }
-        // `None` keeps the declared levels, `Some(None)` clears them, and
-        // `Some(Some(..))` replaces them. Both the opt-out and an emptied field
-        // are the "clear" answer.
-        let mut declared_efforts = None;
-        if reasoning_disabled || efforts_text.is_empty() {
-            declared_efforts = Some(None);
-        } else {
-            match vibex_core::ProviderModelReasoningEfforts::parse(&efforts_text) {
-                Ok(parsed) => declared_efforts = Some(parsed),
-                Err(reason) => {
-                    if error.is_none() {
-                        error = Some((
-                            ProfileModelEditField::Reasoning,
-                            declared_reasoning_efforts_error(&reason),
-                        ));
-                    }
-                }
-            }
-        }
-        let declared_limits = match declared_token_limits(&context_tokens_text, &output_tokens_text)
-        {
-            Ok(limits) => Some(limits),
-            Err(reason) => {
-                if error.is_none() {
-                    error = Some((
-                        ProfileModelEditField::Limits,
-                        declared_token_limit_error(&reason),
-                    ));
-                }
-                None
-            }
-        };
-
-        let Some(model) = self.profile_configured_models.get_mut(index) else {
-            return;
-        };
-        let renamed = if model_id.is_empty() {
-            None
-        } else {
-            model.id = model_id.clone();
-            Some(model_id)
-        };
-        model.display_name = (!display_name.is_empty()).then_some(display_name);
-        model.wire_api = self.profile_model_edit_wire_api;
-        if reasoning_disabled {
-            model.capabilities.reasoning = Some(false);
-            model.capabilities.reasoning_efforts = None;
-        } else if let Some(declared) = declared_efforts {
-            // Declaring levels is declaring the capability; an emptied field
-            // returns the Model to the Agent's default, which also clears an
-            // opt-out this editor wrote.
-            model.capabilities.reasoning = match (declared.is_some(), model.capabilities.reasoning)
-            {
-                (true, _) => Some(true),
-                (false, Some(false)) => None,
-                (false, declared) => declared,
-            };
-            model.capabilities.reasoning_efforts = declared;
-        }
-        if let Some((context, output)) = declared_limits {
-            // Both limits are always written from the field: an emptied field is
-            // the "not declared" answer, so it clears a previous declaration
-            // instead of preserving it.
-            model.capabilities.context_tokens = context;
-            model.capabilities.output_tokens = output;
-        }
-        // The selection names the Model by id, so a rename has to carry it or
-        // the pane would lose the Model it is editing.
-        if let Some(renamed) = renamed {
-            self.profile_model_selection = Some(renamed);
-        }
-        self.profile_model_edit_error = error;
-        self.projection_editor.mark_draft_changed();
-        self.navigation.mark_dirty(ManagementSection::Agents, true);
-        cx.notify();
-    }
-
-    /// Keeps the per-Protocol interface selection consistent with the projection.
-    fn set_profile_model_wire_api(
-        &mut self,
-        index: usize,
-        wire_api: Option<vibex_core::ProviderModelWireApi>,
-        cx: &mut Context<Self>,
-    ) {
-        if wire_api.is_some_and(|wire_api| !self.projection_editor.accepts_wire_api(wire_api)) {
-            self.error = Some(
-                "agent_model_interface_unsupported: model interface is not supported by the selected Agent projection descriptor"
-                    .to_string(),
-            );
-            cx.notify();
-            return;
-        }
-        if self.selected_profile_model_index() == Some(index) {
-            self.profile_model_edit_wire_api = wire_api;
-            self.apply_profile_model_edit(cx);
-        }
-    }
-
-    /// Selects one answer of the Model's reasoning control.
-    ///
-    /// `disabled` is the Model's opt-out; the levels themselves are the set the
-    /// chips toggle, and both answers leave the field as the declaration the
-    /// Agent reads.
-    fn set_profile_model_reasoning_draft(
-        &mut self,
-        index: usize,
-        disabled: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.selected_profile_model_index() != Some(index) {
-            return;
-        }
-        self.profile_model_edit_reasoning_disabled = disabled;
-        self.profile_model_edit_efforts
-            .update(cx, |state, cx| state.set_value("", window, cx));
-        self.apply_profile_model_edit(cx);
-    }
-
-    /// Adds or removes one level of the Model's declared thinking levels.
-    ///
-    /// The chips and the field are two views of one declaration: a chip toggles
-    /// the level it names, the field keeps every wire spelling, and an entry the
-    /// vocabulary does not name stays exactly where the user wrote it.
-    fn toggle_profile_model_reasoning_level(
-        &mut self,
-        index: usize,
-        level: vibex_core::ProviderReasoningEffortLevel,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.selected_profile_model_index() != Some(index) {
-            return;
-        }
-        let declaration =
-            toggled_reasoning_levels(&self.profile_model_edit_efforts.read(cx).value(), level);
-        // A declaration is the more specific answer, so choosing levels leaves
-        // the non-reasoning opt-out behind.
-        self.profile_model_edit_reasoning_disabled = false;
-        self.profile_model_edit_efforts
-            .update(cx, |state, cx| state.set_value(declaration, window, cx));
-        self.apply_profile_model_edit(cx);
-    }
-
-    /// Selects a Model from the Agent-owned catalogue.
-    ///
-    /// The catalogue entry also carries the wire protocol it was advertised
-    /// under, so picking a Model picks the protocol the projection writes
-    /// instead of leaving the previous selection in place.
-    fn set_profile_model_id_from_catalog(
-        &mut self,
-        index: usize,
-        model_id: String,
-        wire_api: Option<vibex_core::ProviderModelWireApi>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.selected_profile_model_index() != Some(index) {
-            return;
-        }
-        self.profile_model_edit_id
-            .update(cx, |state, cx| state.set_value(model_id, window, cx));
-        if let Some(wire_api) = wire_api
-            && self.projection_editor.accepts_wire_api(wire_api)
-        {
-            self.profile_model_edit_wire_api = Some(wire_api);
-        }
-        self.apply_profile_model_edit(cx);
+        self.apply_model_editor(cx);
     }
 
     fn duplicate_provider_profile(&mut self, profile_id: String, cx: &mut Context<Self>) {
@@ -8516,6 +8002,15 @@ impl ManagementCenter {
             configured_models: models,
             default_model_id,
             headers: Vec::new(),
+            // The Agent dialog collects the same note and website as the page,
+            // so a Provider authored here is not born missing them.
+            metadata: vibex_core::ModelProviderMetadata {
+                note: (!self.profile_note.read(cx).value().trim().is_empty())
+                    .then(|| self.profile_note.read(cx).value().trim().to_string()),
+                website_url: (!self.profile_website_url.read(cx).value().trim().is_empty())
+                    .then(|| self.profile_website_url.read(cx).value().trim().to_string()),
+                ..Default::default()
+            },
             status: vibex_core::ModelProviderProfileStatus::Enabled,
         };
         let active_locale = locale::current_locale();
@@ -15231,6 +14726,7 @@ impl ManagementCenter {
         self.hide_route_group_page_draft(cx);
         self.provider_create_page_open = true;
         self.route_group_page_open = false;
+        self.shared_provider_edit_target = None;
         if !restore_draft {
             // A named preset skips the gallery; otherwise the page starts there.
             self.workspace_create_choosing = preset_id.is_none();
@@ -15239,36 +14735,11 @@ impl ManagementCenter {
             self.workspace_create_scroll
                 .set_offset(point(px(0.0), px(0.0)));
             self.cancel_provider_create_auto_fetch();
-            self.provider_create_error = None;
-            self.provider_create_name_error = None;
-            self.provider_create_base_url_error = None;
-            self.provider_create_models_error = None;
-            self.provider_create_endpoint_error = None;
-            self.provider_create_headers_open = false;
-            self.provider_create_proxy_disabled = false;
-            self.provider_create_only_through_groups = false;
-            self.provider_create_category = None;
+            self.provider_form.reset(window, cx);
+            self.provider_form
+                .rebuild_protocol_fields(&BTreeMap::new(), window, cx);
             self.provider_create_preset = None;
             self.provider_create_preset_region = None;
-            for input in [
-                &self.provider_create_name,
-                &self.provider_create_base_url,
-                &self.provider_create_models,
-                &self.provider_create_default_model,
-                &self.provider_create_models_url,
-                &self.provider_create_auth_url,
-                &self.provider_create_proxy_url,
-                &self.provider_create_catalog_id,
-            ] {
-                input.update(cx, |state, cx| state.set_value("", window, cx));
-            }
-            self.provider_create_api_key.update(cx, |state, cx| {
-                state.set_masked(true, window, cx);
-                state.set_placeholder(PROVIDER_API_KEY_PLACEHOLDER, window, cx);
-                state.set_value("", window, cx);
-            });
-            self.provider_create_headers
-                .update(cx, |state, cx| state.set_value("", window, cx));
             self.provider_create_draft_active = true;
             if let Some(preset_id) = preset_id {
                 self.apply_provider_create_preset(preset_id, window, cx);
@@ -15287,11 +14758,11 @@ impl ManagementCenter {
         self.provider_create_page_open = false;
         self.provider_create_draft_active = false;
         self.cancel_provider_create_auto_fetch();
-        self.provider_create_error = None;
-        self.provider_create_name_error = None;
-        self.provider_create_base_url_error = None;
-        self.provider_create_models_error = None;
-        self.provider_create_endpoint_error = None;
+        self.provider_form.error = None;
+        self.provider_form.name_error = None;
+        self.provider_form.base_url_error = None;
+        self.provider_form.models_error = None;
+        self.provider_form.endpoint_error = None;
         cx.notify();
     }
 
@@ -15314,31 +14785,38 @@ impl ManagementCenter {
         self.provider_create_preset = Some(preset.clone());
         self.provider_create_preset_region = None;
         // A failure from the previous preset's address is not about this one.
-        self.provider_create_models_error = None;
+        self.provider_form.models_error = None;
         let catalog_id = preset.catalog_id.clone().unwrap_or_default();
-        self.provider_create_catalog_id
+        self.provider_form
+            .catalog_id
             .update(cx, |state, cx| state.set_value(catalog_id, window, cx));
-        self.provider_create_category = Some(
+        self.provider_form.category = Some(
             provider_preset_category(&preset)
                 .metadata_value()
                 .to_string(),
         );
         let models = preset.models.join(", ");
-        self.provider_create_name.update(cx, |state, cx| {
+        self.provider_form.name.update(cx, |state, cx| {
             state.set_value(preset.display_name.clone(), window, cx)
         });
-        self.provider_create_models
+        let website = preset.website.clone().unwrap_or_default();
+        self.provider_form
+            .website_url
+            .update(cx, |state, cx| state.set_value(website, window, cx));
+        self.provider_form
+            .models
             .update(cx, |state, cx| state.set_value(models, window, cx));
         // The header editor speaks the same override shape the record stores,
         // so a preset's rows can be written before the Provider exists.
         let headers = preset.header_override().unwrap_or_default();
-        self.provider_create_headers
+        self.provider_form
+            .headers
             .update(cx, |state, cx| state.set_value(headers, window, cx));
-        self.provider_create_headers_open = !preset.headers.is_empty();
+        self.provider_form.headers_open = !preset.headers.is_empty();
         for input in [
-            &self.provider_create_default_model,
-            &self.provider_create_models_url,
-            &self.provider_create_auth_url,
+            &self.provider_form.default_model,
+            &self.provider_form.models_url,
+            &self.provider_form.auth_url,
         ] {
             input.update(cx, |state, cx| state.set_value("", window, cx));
         }
@@ -15358,23 +14836,27 @@ impl ManagementCenter {
     fn clear_provider_create_preset(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.provider_create_preset = None;
         self.provider_create_preset_region = None;
-        self.provider_create_category = None;
-        self.provider_create_models_error = None;
+        self.provider_form.category = None;
+        self.provider_form.models_error = None;
         self.cancel_provider_create_auto_fetch();
         for input in [
-            &self.provider_create_name,
-            &self.provider_create_base_url,
-            &self.provider_create_models,
-            &self.provider_create_default_model,
-            &self.provider_create_models_url,
-            &self.provider_create_auth_url,
-            &self.provider_create_catalog_id,
+            &self.provider_form.name,
+            &self.provider_form.website_url,
+            &self.provider_form.base_url,
+            &self.provider_form.models,
+            &self.provider_form.default_model,
+            &self.provider_form.models_url,
+            &self.provider_form.auth_url,
+            &self.provider_form.catalog_id,
         ] {
             input.update(cx, |state, cx| state.set_value("", window, cx));
         }
-        self.provider_create_headers
+        self.provider_form
+            .rebuild_protocol_fields(&BTreeMap::new(), window, cx);
+        self.provider_form
+            .headers
             .update(cx, |state, cx| state.set_value("", window, cx));
-        self.provider_create_headers_open = false;
+        self.provider_form.headers_open = false;
         cx.notify();
     }
 
@@ -15394,8 +14876,19 @@ impl ManagementCenter {
             .and_then(|wire_api| regional.endpoint_for(wire_api))
             .unwrap_or_default()
             .to_string();
-        self.provider_create_base_url
+        self.provider_form
+            .base_url
             .update(cx, |state, cx| state.set_value(base_url, window, cx));
+        let mut overrides = BTreeMap::new();
+        for (protocol, url) in &regional.endpoints {
+            let Some(wire_api) = vibex_core::ProviderModelWireApi::from_wire_protocol_id(protocol)
+            else {
+                continue;
+            };
+            overrides.insert(wire_api.protocol_base_url_option_key(), url.clone());
+        }
+        self.provider_form
+            .rebuild_protocol_fields(&overrides, window, cx);
         self.provider_create_preset_region = region_id;
         // A region is a different address, so a timer about to ask the previous
         // one is stale; a Key already in the field makes the new address worth
@@ -15439,19 +14932,21 @@ impl ManagementCenter {
         // here would ask for a value the page never collects.
         let no_key = preset.as_ref().is_some_and(|preset| preset.no_key);
         let base_url = self
-            .provider_create_base_url
+            .provider_form
+            .base_url
             .read(cx)
             .value()
             .trim()
             .to_string();
         let api_key = self
-            .provider_create_api_key
+            .provider_form
+            .api_key
             .read(cx)
             .value()
             .trim()
             .to_string();
         if base_url.is_empty() || (!no_key && api_key.is_empty()) {
-            self.provider_create_models_error = Some(
+            self.provider_form.models_error = Some(
                 if base_url.is_empty() {
                     management_locale_text(
                         "Enter the API address to fetch models",
@@ -15475,7 +14970,7 @@ impl ManagementCenter {
             .into_iter()
             .find_map(|(agent_id, _)| AgentId::parse(agent_id).ok())
         else {
-            self.provider_create_models_error = Some(
+            self.provider_form.models_error = Some(
                 management_locale_text(
                     "Add an Agent first: fetching asks through an Agent's connection",
                     "请先添加 Agent：拉取模型需要借用 Agent 的连接",
@@ -15503,7 +14998,7 @@ impl ManagementCenter {
                     Some(wire_api.wire_protocol_id().to_string()),
                 )
             });
-        self.provider_create_models_error = None;
+        self.provider_form.models_error = None;
         self.mutation = Some(ManagementMutation::ProviderProbe(
             "create-page-models".to_string(),
         ));
@@ -15531,7 +15026,8 @@ impl ManagementCenter {
                 match outcome {
                     Ok(Ok(models)) if !models.is_empty() => {
                         let mut ids = this
-                            .provider_create_models
+                            .provider_form
+                            .models
                             .read(cx)
                             .value()
                             .split([',', '\n'])
@@ -15545,7 +15041,8 @@ impl ManagementCenter {
                             }
                         }
                         let text = ids.join(", ");
-                        this.provider_create_models
+                        this.provider_form
+                            .models
                             .update(cx, |state, cx| state.set_value(text, window, cx));
                         this.notice = Some(format!(
                             "{} · {}",
@@ -15559,7 +15056,7 @@ impl ManagementCenter {
                     }
                     Ok(Ok(_)) => {
                         if !quiet {
-                            this.provider_create_models_error = Some(
+                            this.provider_form.models_error = Some(
                                 management_locale_text(
                                     "The endpoint returned no models",
                                     "接口没有返回模型",
@@ -15571,13 +15068,13 @@ impl ManagementCenter {
                     }
                     Ok(Err(error)) => {
                         if !quiet {
-                            this.provider_create_models_error =
+                            this.provider_form.models_error =
                                 Some(format!("{}: {}", error.code, error.message));
                         }
                     }
                     Err(error) => {
                         if !quiet {
-                            this.provider_create_models_error = Some(error.to_string());
+                            this.provider_form.models_error = Some(error.to_string());
                         }
                     }
                 }
@@ -15654,13 +15151,15 @@ impl ManagementCenter {
             .as_ref()
             .is_some_and(|preset| preset.no_key)
             || !self
-                .provider_create_api_key
+                .provider_form
+                .api_key
                 .read(cx)
                 .value()
                 .trim()
                 .is_empty();
         !self
-            .provider_create_base_url
+            .provider_form
+            .base_url
             .read(cx)
             .value()
             .trim()
@@ -15671,7 +15170,7 @@ impl ManagementCenter {
     /// Creates the shared Provider the page draft describes.
     fn save_provider_create_page(&mut self, cx: &mut Context<Self>) {
         let Some(backend) = self.backend.clone() else {
-            self.provider_create_error = Some(
+            self.provider_form.error = Some(
                 management_error_text(
                     "Management runtime is not connected",
                     "配置中心运行时未连接",
@@ -15685,63 +15184,19 @@ impl ManagementCenter {
         if self.mutation.is_some() {
             return;
         }
-        let name = self
-            .provider_create_name
-            .read(cx)
-            .value()
-            .trim()
-            .to_string();
-        self.provider_create_name_error = name.is_empty().then(|| {
-            management_error_text(
-                "Provider name is required",
-                "请填写供应商名称",
-                "請填寫供應商名稱",
-            )
-            .to_string()
-        });
-        if self.provider_create_name_error.is_some() {
-            cx.notify();
+        let Some(name) = self.provider_form_validate(cx) else {
             return;
-        }
-        let base_url = self
-            .provider_create_base_url
-            .read(cx)
-            .value()
-            .trim()
-            .to_string();
-        if base_url.is_empty() {
-            self.provider_create_base_url_error = Some(
-                management_error_text(
-                    "Enter at least one address for this Provider",
-                    "请至少填写一个接口地址",
-                    "請至少填寫一個介面位址",
-                )
-                .to_string(),
-            );
-            cx.notify();
-            return;
-        }
-        let model_ids = self
-            .provider_create_models
-            .read(cx)
-            .value()
-            .split([',', '\n'])
-            .map(str::trim)
-            .filter(|id| !id.is_empty())
-            .fold(Vec::<String>::new(), |mut ids, id| {
-                if !ids.iter().any(|existing| existing == id) {
-                    ids.push(id.to_string());
-                }
-                ids
-            });
+        };
+        let model_ids = self.provider_form_model_ids(cx);
         let default_model = self
-            .provider_create_default_model
+            .provider_form
+            .default_model
             .read(cx)
             .value()
             .trim()
             .to_string();
         if !default_model.is_empty() && !model_ids.iter().any(|id| id == &default_model) {
-            self.provider_create_models_error = Some(
+            self.provider_form.models_error = Some(
                 management_locale_text(
                     "The default model must be one of this Provider's models",
                     "默认模型必须是该供应商的模型之一",
@@ -15752,92 +15207,14 @@ impl ManagementCenter {
             cx.notify();
             return;
         }
-        // Header rows are the one free-form field, so a malformed object is
-        // reported under the disclosure instead of being silently dropped.
-        let headers_text = self.provider_create_headers.read(cx).value().to_string();
-        let parsed_headers = match serde_json::from_str::<serde_json::Value>(&headers_text) {
-            Ok(serde_json::Value::Object(headers)) if !headers_text.trim().is_empty() => {
-                let mut parsed = Vec::new();
-                for (header, value) in headers {
-                    let header = header.trim().to_string();
-                    if header.is_empty() {
-                        continue;
-                    }
-                    let value = match value {
-                        serde_json::Value::String(value) => {
-                            vibex_core::ModelProviderHeaderValue::NonSecretLiteral(value)
-                        }
-                        serde_json::Value::Object(object) => {
-                            let Some(variable) = object
-                                .get("variable")
-                                .and_then(serde_json::Value::as_str)
-                                .and_then(vibex_core::ModelProviderHeaderVariable::from_id)
-                            else {
-                                self.provider_create_endpoint_error = Some(format!(
-                                    "{}: {header}",
-                                    management_locale_text(
-                                        "A header must be a string or a known variable",
-                                        "请求头必须是字符串或已知变量",
-                                        "請求標頭必須是字串或已知變數",
-                                    )
-                                ));
-                                cx.notify();
-                                return;
-                            };
-                            vibex_core::ModelProviderHeaderValue::DynamicVariable(variable)
-                        }
-                        _ => {
-                            self.provider_create_endpoint_error = Some(format!(
-                                "{}: {header}",
-                                management_locale_text(
-                                    "A header must be a string or a known variable",
-                                    "请求头必须是字符串或已知变量",
-                                    "請求標頭必須是字串或已知變數",
-                                )
-                            ));
-                            cx.notify();
-                            return;
-                        }
-                    };
-                    parsed.push(vibex_core::ModelProviderHeaderReference {
-                        name: header,
-                        value,
-                        redacted_hint: "created".to_string(),
-                    });
-                }
-                parsed
-            }
-            Ok(_) if headers_text.trim().is_empty() => Vec::new(),
-            Ok(_) => {
-                self.provider_create_endpoint_error = Some(
-                    management_locale_text(
-                        "Headers must be a JSON object",
-                        "请求头必须是 JSON 对象",
-                        "請求標頭必須是 JSON 物件",
-                    )
-                    .to_string(),
-                );
-                cx.notify();
-                return;
-            }
-            Err(error) => {
-                self.provider_create_endpoint_error = Some(format!(
-                    "{}: {error}",
-                    management_locale_text(
-                        "Headers JSON is invalid",
-                        "请求头 JSON 无效",
-                        "請求標頭 JSON 無效",
-                    )
-                ));
-                cx.notify();
-                return;
-            }
+        let Some(parsed_headers) = self.provider_form_parse_headers(cx) else {
+            return;
         };
         // The page may start from a preset, and a preset names the protocol its
-        // address serves. Writing it down here is what stops a saved record
+        // address serves. Writing it down for the models stops a saved record
         // from being protocol-less: a later launch, or "Fetch models" on the
-        // saved Provider, would otherwise have to guess, and a Provider
-        // created from the Anthropic preset would be read as Chat Completions.
+        // saved Provider, would otherwise have to guess, and a Provider created
+        // from the Anthropic preset would be read as Chat Completions.
         let created_wire_api = self
             .provider_create_preset
             .as_ref()
@@ -15859,94 +15236,20 @@ impl ManagementCenter {
                 capabilities: Default::default(),
             })
             .collect::<Vec<_>>();
-        // A preset publishes one address per protocol, and the page only shows
-        // the default one. Writing just that address made the saved record
-        // unable to answer an Agent that speaks another protocol: binding it to
-        // Claude then failed with `agent_model_interface_unsupported`. Keep the
-        // addresses the preset declared, with the edited field winning for the
-        // protocol it belongs to.
-        let mut endpoints = Vec::new();
-        let regional_preset = self
-            .provider_create_preset
-            .as_ref()
-            .map(|preset| preset.with_region(self.provider_create_preset_region.as_deref()));
-        if let Some(preset) = regional_preset.as_ref() {
-            for (protocol, url) in &preset.endpoints {
-                let Some(wire_api) =
-                    vibex_core::ProviderModelWireApi::from_wire_protocol_id(protocol)
-                else {
-                    continue;
-                };
-                let url = if Some(wire_api) == created_wire_api {
-                    base_url.clone()
-                } else {
-                    url.clone()
-                };
-                endpoints.push(vibex_core::ModelProviderEndpoint {
-                    id: format!("api-{}", wire_api.wire_protocol_id().replace('_', "-")),
-                    kind: vibex_core::ModelProviderEndpointKind::Api,
-                    url,
-                    wire_protocol_id: Some(wire_api.wire_protocol_id().to_string()),
-                });
-            }
-        }
-        if endpoints.is_empty() {
-            endpoints.push(vibex_core::ModelProviderEndpoint {
-                id: "api".to_string(),
-                kind: vibex_core::ModelProviderEndpointKind::Api,
-                url: base_url,
-                wire_protocol_id: created_wire_api
-                    .map(|wire_api| wire_api.wire_protocol_id().to_string()),
-            });
-        }
-        for (id, kind, url) in [
-            (
-                "models",
-                vibex_core::ModelProviderEndpointKind::ModelCatalog,
-                self.provider_create_models_url.read(cx).value().trim(),
-            ),
-            (
-                "auth",
-                vibex_core::ModelProviderEndpointKind::Auth,
-                self.provider_create_auth_url.read(cx).value().trim(),
-            ),
-        ] {
-            if !url.is_empty() {
-                endpoints.push(vibex_core::ModelProviderEndpoint {
-                    id: id.to_string(),
-                    kind,
-                    url: url.to_string(),
-                    wire_protocol_id: None,
-                });
-            }
-        }
-        let proxy_url = self
-            .provider_create_proxy_url
-            .read(cx)
-            .value()
-            .trim()
-            .to_string();
-        let proxy_policy = if self.provider_create_proxy_disabled {
-            vibex_core::ModelProviderProxyPolicy::Disabled
-        } else if proxy_url.is_empty() {
-            vibex_core::ModelProviderProxyPolicy::InheritSystem
-        } else {
-            vibex_core::ModelProviderProxyPolicy::Endpoint(proxy_url)
+        let Some(endpoints) = self.provider_form_endpoints(cx, created_wire_api) else {
+            return;
+        };
+        let Some(proxy_policy) = self.provider_form_proxy_policy(cx) else {
+            return;
         };
         let api_key = self
-            .provider_create_api_key
+            .provider_form
+            .api_key
             .read(cx)
             .value()
             .trim()
             .to_string();
-        let catalog_id = self
-            .provider_create_catalog_id
-            .read(cx)
-            .value()
-            .trim()
-            .to_string();
-        let category = self.provider_create_category.clone();
-        let only_through_groups = self.provider_create_only_through_groups;
+        let metadata = self.provider_form_metadata(cx);
         let request = vibex_core::ModelProviderProfileCreateRequest {
             display_name: name,
             vendor_hint: self
@@ -15959,14 +15262,15 @@ impl ManagementCenter {
             configured_models: models,
             default_model_id: (!default_model.is_empty()).then_some(default_model),
             headers: parsed_headers,
+            metadata,
             status: vibex_core::ModelProviderProfileStatus::Enabled,
         };
         let active_locale = locale::current_locale();
-        self.provider_create_error = None;
-        self.provider_create_name_error = None;
-        self.provider_create_base_url_error = None;
-        self.provider_create_models_error = None;
-        self.provider_create_endpoint_error = None;
+        self.provider_form.error = None;
+        self.provider_form.name_error = None;
+        self.provider_form.base_url_error = None;
+        self.provider_form.models_error = None;
+        self.provider_form.endpoint_error = None;
         self.mutation = Some(ManagementMutation::ProfileCreate);
         let this = cx.entity();
         self.mutation_task = Some(cx.spawn(async move |_, cx| {
@@ -15975,47 +15279,23 @@ impl ManagementCenter {
                 .create_model_provider_profile(vibex_backend::MutationRequest::new(request))
                 .await;
             let outcome = match created {
-                Ok(profile) => {
-                    // Metadata and the Key are written after the record exists:
-                    // a failure there leaves an editable Provider rather than a
-                    // half-created one the user has to clean up.
-                    let needs_metadata =
-                        !catalog_id.is_empty() || category.is_some() || only_through_groups;
-                    let profile = if needs_metadata {
-                        let mut profile = profile;
-                        profile.metadata.catalog_id =
-                            (!catalog_id.is_empty()).then(|| catalog_id.clone());
-                        profile.metadata.category = category.clone();
-                        profile.metadata.only_through_route_groups = only_through_groups;
-                        let expected_revision = profile.revision;
-                        backend
-                            .management()
-                            .update_model_provider_profile(vibex_backend::MutationRequest::new(
-                                vibex_core::ModelProviderProfileUpdateRequest {
-                                    profile,
-                                    expected_revision,
-                                },
-                            ))
-                            .await
-                    } else {
-                        Ok(profile)
-                    };
-                    match profile {
-                        Ok(profile) if !api_key.is_empty() => backend
-                            .management()
-                            .add_model_provider_credential(vibex_backend::MutationRequest::new(
-                                vibex_core::AddModelProviderCredentialRequest {
-                                    model_provider_profile_id: profile.id.clone(),
-                                    display_name: None,
-                                    value: api_key,
-                                },
-                            ))
-                            .await
-                            .map(|_| profile),
-                        other => other,
-                    }
-                }
-                Err(error) => Err(error),
+                // The Key goes through the v2 credential API rather than the
+                // create request, because that is the path that also stores the
+                // Secret and advances the revision the bindings read. A failure
+                // here leaves an editable Provider rather than a half-created
+                // one the user has to clean up.
+                Ok(profile) if !api_key.is_empty() => backend
+                    .management()
+                    .add_model_provider_credential(vibex_backend::MutationRequest::new(
+                        vibex_core::AddModelProviderCredentialRequest {
+                            model_provider_profile_id: profile.id.clone(),
+                            display_name: None,
+                            value: api_key,
+                        },
+                    ))
+                    .await
+                    .map(|_| profile),
+                other => other,
             };
             this.update(cx, |this, cx| {
                 this.mutation = None;
@@ -16044,13 +15324,298 @@ impl ManagementCenter {
                         this.refresh(cx);
                     }
                     Err(error) => {
-                        this.provider_create_error =
+                        this.provider_form.error =
                             Some(format!("{}: {}", error.code, error.message));
                         cx.notify();
                     }
                 }
             });
         }));
+    }
+
+    /// Validates the fields both scopes share, returning the trimmed name.
+    ///
+    /// Name and at least one address are what the backend refuses outright, so
+    /// they report under their own control instead of the form's failure lane.
+    fn provider_form_validate(&mut self, cx: &mut Context<Self>) -> Option<String> {
+        let name = self.provider_form.name.read(cx).value().trim().to_string();
+        self.provider_form.name_error = name.is_empty().then(|| {
+            management_error_text(
+                "Provider name is required",
+                "请填写供应商名称",
+                "請填寫供應商名稱",
+            )
+            .to_string()
+        });
+        let base_url = self
+            .provider_form
+            .base_url
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        let has_protocol = self.provider_form.protocol_override_count(cx) > 0;
+        self.provider_form.base_url_error = (base_url.is_empty() && !has_protocol).then(|| {
+            management_error_text(
+                "Enter at least one address for this Provider",
+                "请至少填写一个接口地址",
+                "請至少填寫一個介面位址",
+            )
+            .to_string()
+        });
+        if self.provider_form.name_error.is_some() || self.provider_form.base_url_error.is_some() {
+            self.provider_form.error = None;
+            cx.notify();
+            return None;
+        }
+        Some(name)
+    }
+
+    fn provider_form_model_ids(&self, cx: &Context<Self>) -> Vec<String> {
+        self.provider_form
+            .models
+            .read(cx)
+            .value()
+            .split([',', '\n'])
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .fold(Vec::<String>::new(), |mut ids, id| {
+                if !ids.iter().any(|existing| existing == id) {
+                    ids.push(id.to_string());
+                }
+                ids
+            })
+    }
+
+    /// Parses the header textarea into header references.
+    ///
+    /// Header rows are the one free-form field, so a malformed object is
+    /// reported under the disclosure instead of being silently dropped.
+    fn provider_form_parse_headers(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Option<Vec<vibex_core::ModelProviderHeaderReference>> {
+        let headers_text = self.provider_form.headers.read(cx).value().to_string();
+        let invalid = |this: &mut Self, cx: &mut Context<Self>, message: String| {
+            this.provider_form.endpoint_error = Some(message);
+            cx.notify();
+            None
+        };
+        let object = match serde_json::from_str::<serde_json::Value>(&headers_text) {
+            Ok(serde_json::Value::Object(headers)) if !headers_text.trim().is_empty() => headers,
+            Ok(_) if headers_text.trim().is_empty() => return Some(Vec::new()),
+            Ok(_) => {
+                return invalid(
+                    self,
+                    cx,
+                    management_locale_text(
+                        "Headers must be a JSON object",
+                        "请求头必须是 JSON 对象",
+                        "請求標頭必須是 JSON 物件",
+                    )
+                    .to_string(),
+                );
+            }
+            Err(error) => {
+                return invalid(
+                    self,
+                    cx,
+                    format!(
+                        "{}: {error}",
+                        management_locale_text(
+                            "Headers JSON is invalid",
+                            "请求头 JSON 无效",
+                            "請求標頭 JSON 無效",
+                        )
+                    ),
+                );
+            }
+        };
+        let mut parsed = Vec::new();
+        for (header, value) in object {
+            let header = header.trim().to_string();
+            if header.is_empty() {
+                continue;
+            }
+            let value = match value {
+                serde_json::Value::String(value) => {
+                    vibex_core::ModelProviderHeaderValue::NonSecretLiteral(value)
+                }
+                serde_json::Value::Object(object) => {
+                    let Some(variable) = object
+                        .get("variable")
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(vibex_core::ModelProviderHeaderVariable::from_id)
+                    else {
+                        return invalid(
+                            self,
+                            cx,
+                            format!(
+                                "{}: {header}",
+                                management_locale_text(
+                                    "A header must be a string or a known variable",
+                                    "请求头必须是字符串或已知变量",
+                                    "請求標頭必須是字串或已知變數",
+                                )
+                            ),
+                        );
+                    };
+                    vibex_core::ModelProviderHeaderValue::DynamicVariable(variable)
+                }
+                _ => {
+                    return invalid(
+                        self,
+                        cx,
+                        format!(
+                            "{}: {header}",
+                            management_locale_text(
+                                "A header must be a string or a known variable",
+                                "请求头必须是字符串或已知变量",
+                                "請求標頭必須是字串或已知變數",
+                            )
+                        ),
+                    );
+                }
+            };
+            parsed.push(vibex_core::ModelProviderHeaderReference {
+                name: header,
+                value,
+                redacted_hint: "edited".to_string(),
+            });
+        }
+        Some(parsed)
+    }
+
+    /// The endpoints the form describes: the fallback, each protocol's own
+    /// address, and the three service endpoints.
+    fn provider_form_endpoints(
+        &mut self,
+        cx: &mut Context<Self>,
+        pinned_protocol: Option<vibex_core::ProviderModelWireApi>,
+    ) -> Option<Vec<vibex_core::ModelProviderEndpoint>> {
+        let base_url = self
+            .provider_form
+            .base_url
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        let mut endpoints = Vec::new();
+        if !base_url.is_empty() {
+            endpoints.push(vibex_core::ModelProviderEndpoint {
+                id: "api".to_string(),
+                kind: vibex_core::ModelProviderEndpointKind::Api,
+                url: base_url.clone(),
+                wire_protocol_id: None,
+            });
+        }
+        endpoints.extend(self.provider_form.protocol_endpoints(cx));
+        if endpoints.is_empty() {
+            self.provider_form.base_url_error = Some(
+                management_error_text(
+                    "Enter at least one address for this Provider",
+                    "请至少填写一个接口地址",
+                    "請至少填寫一個介面位址",
+                )
+                .to_string(),
+            );
+            cx.notify();
+            return None;
+        }
+        // A protocol the record pins but has no address for still needs one;
+        // the fallback the user typed is what it gets.
+        if let Some(wire_api) = pinned_protocol
+            && !endpoints.iter().any(|endpoint| {
+                endpoint.wire_protocol_id.as_deref() == Some(wire_api.wire_protocol_id())
+            })
+            && !base_url.is_empty()
+        {
+            endpoints.push(vibex_core::ModelProviderEndpoint {
+                id: format!("api-{}", wire_api.wire_protocol_id().replace('_', "-")),
+                kind: vibex_core::ModelProviderEndpointKind::Api,
+                url: base_url,
+                wire_protocol_id: Some(wire_api.wire_protocol_id().to_string()),
+            });
+        }
+        for (id, kind, url) in [
+            (
+                "models",
+                vibex_core::ModelProviderEndpointKind::ModelCatalog,
+                self.provider_form
+                    .models_url
+                    .read(cx)
+                    .value()
+                    .trim()
+                    .to_string(),
+            ),
+            (
+                "auth",
+                vibex_core::ModelProviderEndpointKind::Auth,
+                self.provider_form
+                    .auth_url
+                    .read(cx)
+                    .value()
+                    .trim()
+                    .to_string(),
+            ),
+            (
+                "proxy",
+                vibex_core::ModelProviderEndpointKind::Proxy,
+                self.provider_form
+                    .proxy_endpoint_url
+                    .read(cx)
+                    .value()
+                    .trim()
+                    .to_string(),
+            ),
+        ] {
+            if !url.is_empty() {
+                endpoints.push(vibex_core::ModelProviderEndpoint {
+                    id: id.to_string(),
+                    kind,
+                    url,
+                    wire_protocol_id: None,
+                });
+            }
+        }
+        Some(endpoints)
+    }
+
+    fn provider_form_proxy_policy(
+        &self,
+        cx: &Context<Self>,
+    ) -> Option<vibex_core::ModelProviderProxyPolicy> {
+        let proxy_url = self
+            .provider_form
+            .proxy_url
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        Some(if self.provider_form.proxy_disabled {
+            vibex_core::ModelProviderProxyPolicy::Disabled
+        } else if proxy_url.is_empty() {
+            vibex_core::ModelProviderProxyPolicy::InheritSystem
+        } else {
+            vibex_core::ModelProviderProxyPolicy::Endpoint(proxy_url)
+        })
+    }
+
+    /// The advisory metadata the form declares.
+    fn provider_form_metadata(&self, cx: &Context<Self>) -> vibex_core::ModelProviderMetadata {
+        let text = |input: &Entity<InputState>| {
+            let value = input.read(cx).value().trim().to_string();
+            (!value.is_empty()).then_some(value)
+        };
+        vibex_core::ModelProviderMetadata {
+            note: text(&self.provider_form.note),
+            website_url: text(&self.provider_form.website_url),
+            catalog_id: text(&self.provider_form.catalog_id),
+            icon: text(&self.provider_form.icon),
+            category: self.provider_form.category.clone(),
+            only_through_route_groups: self.provider_form.only_through_groups,
+            ..Default::default()
+        }
     }
 
     /// Lets one Agent reference a route group from the global page.
@@ -17988,49 +17553,16 @@ impl ManagementCenter {
         cx: &mut Context<Self>,
     ) {
         if self.provider_model_edit_id.as_deref() == Some(model.id.as_str()) {
-            self.close_shared_provider_model_editor(cx);
+            self.close_shared_provider_model_editor(window, cx);
             return;
         }
         self.provider_model_edit_id = Some(model.id.clone());
-        self.provider_model_edit_error = None;
-        self.provider_model_edit_image_input = model.capabilities.image_input;
-        self.provider_model_edit_pdf_input = model.capabilities.pdf_input;
-        self.provider_model_edit_temperature = model.capabilities.temperature;
-        self.provider_model_edit_reasoning = model.capabilities.reasoning;
         // A lookup left over from the previously open Model must not answer for
-        // this one, and its suggestion must not describe this Model either.
+        // this one, and the shared editor's draft must start from this Model.
         self.provider_model_capability_task = None;
-        self.provider_model_capability_suggestion = None;
-        self.provider_model_capability_auto_filled = 0;
-        let context = model
-            .capabilities
-            .context_tokens
-            .map(|value| value.to_string())
-            .unwrap_or_default();
-        let output = model
-            .capabilities
-            .output_tokens
-            .map(|value| value.to_string())
-            .unwrap_or_default();
-        self.provider_model_edit_context =
-            Some(cx.new(|cx| InputState::new(window, cx).default_value(context)));
-        self.provider_model_edit_output =
-            Some(cx.new(|cx| InputState::new(window, cx).default_value(output)));
-        let name = model.display_name.clone().unwrap_or_default();
-        self.provider_model_edit_name =
-            Some(cx.new(|cx| InputState::new(window, cx).default_value(name)));
-        let efforts = model
-            .capabilities
-            .reasoning_efforts
-            .as_ref()
-            .map(ToString::to_string)
-            .unwrap_or_default();
-        self.provider_model_edit_efforts = Some(cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder("low, medium, high")
-                .default_value(efforts)
-        }));
-        self.provider_model_edit_wire_api = shared_model_wire_api(model);
+        let configured = provider_configured_model_from_catalog(model);
+        self.load_model_editor(&configured, window, cx);
+        self.model_editor.target_id = Some(model.id.clone());
         self.request_provider_model_capability_suggestion(
             profile.clone(),
             model.id.clone(),
@@ -18040,21 +17572,10 @@ impl ManagementCenter {
         cx.notify();
     }
 
-    fn close_shared_provider_model_editor(&mut self, cx: &mut Context<Self>) {
+    fn close_shared_provider_model_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.provider_model_edit_id = None;
-        self.provider_model_edit_context = None;
-        self.provider_model_edit_output = None;
-        self.provider_model_edit_name = None;
-        self.provider_model_edit_efforts = None;
-        self.provider_model_edit_wire_api = None;
-        self.provider_model_edit_image_input = None;
-        self.provider_model_edit_pdf_input = None;
-        self.provider_model_edit_temperature = None;
-        self.provider_model_edit_reasoning = None;
+        self.model_editor.clear(window, cx);
         self.provider_model_capability_task = None;
-        self.provider_model_capability_suggestion = None;
-        self.provider_model_capability_auto_filled = 0;
-        self.provider_model_edit_error = None;
         cx.notify();
     }
 
@@ -18118,46 +17639,46 @@ impl ManagementCenter {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.provider_model_capability_suggestion = suggestion;
-        self.provider_model_capability_auto_filled = 0;
-        let Some(suggestion) = self.provider_model_capability_suggestion.clone() else {
+        self.model_editor.suggestion.clone_from(&suggestion);
+        self.model_editor.suggestion_auto_filled = 0;
+        let Some(suggestion) = suggestion else {
             cx.notify();
             return;
         };
         let mut filled = 0usize;
         if let Some(value) = suggestion.number("contextTokens")
             && self
-                .provider_model_edit_context
-                .as_ref()
-                .is_some_and(|input| input.read(cx).value().trim().is_empty())
+                .model_editor
+                .context_tokens
+                .read(cx)
+                .value()
+                .trim()
+                .is_empty()
         {
-            self.set_provider_model_limit(
-                &self.provider_model_edit_context.clone(),
-                value,
-                window,
-                cx,
-            );
+            self.model_editor.context_tokens.update(cx, |state, cx| {
+                state.set_value(value.to_string(), window, cx);
+            });
             filled += 1;
         }
         if let Some(value) = suggestion.number("outputTokens")
             && self
-                .provider_model_edit_output
-                .as_ref()
-                .is_some_and(|input| input.read(cx).value().trim().is_empty())
+                .model_editor
+                .output_tokens
+                .read(cx)
+                .value()
+                .trim()
+                .is_empty()
         {
-            self.set_provider_model_limit(
-                &self.provider_model_edit_output.clone(),
-                value,
-                window,
-                cx,
-            );
+            self.model_editor.output_tokens.update(cx, |state, cx| {
+                state.set_value(value.to_string(), window, cx);
+            });
             filled += 1;
         }
         for (field, slot) in [
-            ("imageInput", &mut self.provider_model_edit_image_input),
-            ("pdfInput", &mut self.provider_model_edit_pdf_input),
-            ("temperature", &mut self.provider_model_edit_temperature),
-            ("reasoning", &mut self.provider_model_edit_reasoning),
+            ("imageInput", &mut self.model_editor.image_input),
+            ("pdfInput", &mut self.model_editor.pdf_input),
+            ("temperature", &mut self.model_editor.temperature),
+            ("reasoning", &mut self.model_editor.reasoning),
         ] {
             if slot.is_none()
                 && let Some(value) = suggestion.flag(field)
@@ -18166,111 +17687,11 @@ impl ManagementCenter {
                 filled += 1;
             }
         }
-        self.provider_model_capability_auto_filled = filled;
+        self.model_editor.suggestion_auto_filled = filled;
         cx.notify();
     }
 
-    fn set_provider_model_limit(
-        &mut self,
-        input: &Option<Entity<InputState>>,
-        value: u32,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if let Some(input) = input {
-            input.update(cx, |state, cx| {
-                state.set_value(value.to_string(), window, cx);
-            });
-        }
-    }
-
-    /// Whether the inline editor already holds the catalogue's value.
-    ///
-    /// The limits live in text fields rather than the option slots, so the
-    /// comparison reads the boxes the user is looking at. A blank box is not
-    /// an adopted value, even when the suggestion itself is empty.
-    fn provider_model_capability_is_adopted(&self, field: &str, suggested: &str, cx: &App) -> bool {
-        let current = match field {
-            "contextTokens" => self
-                .provider_model_edit_context
-                .as_ref()
-                .map(|input| input.read(cx).value().trim().to_string()),
-            "outputTokens" => self
-                .provider_model_edit_output
-                .as_ref()
-                .map(|input| input.read(cx).value().trim().to_string()),
-            "imageInput" => self
-                .provider_model_edit_image_input
-                .map(|value| value.to_string()),
-            "pdfInput" => self
-                .provider_model_edit_pdf_input
-                .map(|value| value.to_string()),
-            "temperature" => self
-                .provider_model_edit_temperature
-                .map(|value| value.to_string()),
-            "reasoning" => self
-                .provider_model_edit_reasoning
-                .map(|value| value.to_string()),
-            _ => return false,
-        };
-        current.as_deref() == Some(suggested)
-    }
-
-    /// Writes one suggested field into the inline editor's own copy.
-    fn adopt_provider_model_capability_field(
-        &mut self,
-        field: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(suggestion) = self.provider_model_capability_suggestion.clone() else {
-            return;
-        };
-        match field {
-            "contextTokens" => {
-                if let Some(value) = suggestion.number(field) {
-                    self.set_provider_model_limit(
-                        &self.provider_model_edit_context.clone(),
-                        value,
-                        window,
-                        cx,
-                    );
-                }
-            }
-            "outputTokens" => {
-                if let Some(value) = suggestion.number(field) {
-                    self.set_provider_model_limit(
-                        &self.provider_model_edit_output.clone(),
-                        value,
-                        window,
-                        cx,
-                    );
-                }
-            }
-            "imageInput" => self.provider_model_edit_image_input = suggestion.flag(field),
-            "pdfInput" => self.provider_model_edit_pdf_input = suggestion.flag(field),
-            "temperature" => self.provider_model_edit_temperature = suggestion.flag(field),
-            "reasoning" => self.provider_model_edit_reasoning = suggestion.flag(field),
-            _ => return,
-        }
-        cx.notify();
-    }
-
-    fn adopt_all_provider_model_capability_fields(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(suggestion) = self.provider_model_capability_suggestion.clone() else {
-            return;
-        };
-        for field in suggestion.fields.iter().map(|entry| entry.field.clone()) {
-            self.adopt_provider_model_capability_field(&field, window, cx);
-        }
-    }
-
-    /// Adds one model by id to a shared Provider, the Models tab's version of
-    /// the Agent dialog's "Custom model" row.
+    /// Adds a model id the endpoint does not list to a shared Provider.
     fn add_shared_provider_model(
         &mut self,
         profile_id: vibex_core::ModelProviderProfileId,
@@ -18299,7 +17720,6 @@ impl ManagementCenter {
             .iter()
             .any(|model| model.id == model_id)
         {
-            self.provider_model_edit_error = None;
             self.error = Some(
                 management_locale_text(
                     "This Provider already offers that model",
@@ -18377,6 +17797,7 @@ impl ManagementCenter {
         &mut self,
         profile_id: vibex_core::ModelProviderProfileId,
         model_id: String,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some(mut profile) = self
@@ -18392,7 +17813,7 @@ impl ManagementCenter {
             .retain(|model| model.id != model_id);
         repair_shared_default_model(&mut profile);
         if self.provider_model_edit_id.as_deref() == Some(model_id.as_str()) {
-            self.close_shared_provider_model_editor(cx);
+            self.close_shared_provider_model_editor(window, cx);
         }
         self.update_shared_provider(
             profile,
@@ -18401,61 +17822,20 @@ impl ManagementCenter {
         );
     }
 
+    /// Writes the open model's inline editor back into its record.
     fn save_shared_provider_model_inline(
         &mut self,
         profile_id: vibex_core::ModelProviderProfileId,
         model_id: String,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let context = self
-            .provider_model_edit_context
-            .as_ref()
-            .map(|input| input.read(cx).value().to_string())
-            .unwrap_or_default();
-        let output = self
-            .provider_model_edit_output
-            .as_ref()
-            .map(|input| input.read(cx).value().to_string())
-            .unwrap_or_default();
-        let context = match parse_optional_limit(&context) {
-            Ok(value) => value,
-            Err(message) => {
-                self.provider_model_edit_error = Some(message.to_string());
-                cx.notify();
-                return;
-            }
+        let Some((_, display_name, mut capabilities)) = self.model_editor.read(cx) else {
+            cx.notify();
+            return;
         };
-        let output = match parse_optional_limit(&output) {
-            Ok(value) => value,
-            Err(message) => {
-                self.provider_model_edit_error = Some(message.to_string());
-                cx.notify();
-                return;
-            }
-        };
-        let display_name = self
-            .provider_model_edit_name
-            .as_ref()
-            .map(|input| input.read(cx).value().trim().to_string())
-            .unwrap_or_default();
-        let efforts_text = self
-            .provider_model_edit_efforts
-            .as_ref()
-            .map(|input| input.read(cx).value().trim().to_string())
-            .unwrap_or_default();
-        let efforts = if efforts_text.is_empty() {
-            None
-        } else {
-            match vibex_core::ProviderModelReasoningEfforts::parse(&efforts_text) {
-                Ok(parsed) => parsed,
-                Err(reason) => {
-                    self.provider_model_edit_error =
-                        Some(declared_reasoning_efforts_error(&reason));
-                    cx.notify();
-                    return;
-                }
-            }
-        };
+        self.model_editor.mark_provenance(&mut capabilities);
+        let wire_api = self.model_editor.wire_api;
         let Some(mut profile) = self
             .providers
             .iter()
@@ -18471,261 +17851,21 @@ impl ManagementCenter {
         else {
             return;
         };
-        model.capabilities.context_tokens = context;
-        model.capabilities.output_tokens = output;
-        model.capabilities.image_input = self.provider_model_edit_image_input;
-        model.capabilities.pdf_input = self.provider_model_edit_pdf_input;
-        model.capabilities.temperature = self.provider_model_edit_temperature;
-        model.capabilities.reasoning = self.provider_model_edit_reasoning;
-        model.display_name = (!display_name.is_empty()).then_some(display_name);
-        if model.capabilities.reasoning == Some(false) {
-            model.capabilities.reasoning_efforts = None;
-        } else {
-            if efforts.is_some() {
-                model.capabilities.reasoning = Some(true);
-            }
-            model.capabilities.reasoning_efforts = efforts;
-        }
-        // A value still equal to the catalogue's is the catalogue's; anything
-        // else is the user's own answer, whether they typed it or picked it
-        // from the chips above. Records saved before any lookup existed keep
-        // whatever provenance they already carried.
-        if let Some(suggestion) = self.provider_model_capability_suggestion.as_ref() {
-            for field in [
-                "imageInput",
-                "pdfInput",
-                "temperature",
-                "reasoning",
-                "contextTokens",
-                "outputTokens",
-            ] {
-                let (suggested, current) = match field {
-                    "contextTokens" => (
-                        suggestion.number(field).map(|value| value.to_string()),
-                        model
-                            .capabilities
-                            .context_tokens
-                            .map(|value| value.to_string()),
-                    ),
-                    "outputTokens" => (
-                        suggestion.number(field).map(|value| value.to_string()),
-                        model
-                            .capabilities
-                            .output_tokens
-                            .map(|value| value.to_string()),
-                    ),
-                    _ => (
-                        suggestion.flag(field).map(|value| value.to_string()),
-                        match field {
-                            "imageInput" => model.capabilities.image_input,
-                            "pdfInput" => model.capabilities.pdf_input,
-                            "temperature" => model.capabilities.temperature,
-                            _ => model.capabilities.reasoning,
-                        }
-                        .map(|value| value.to_string()),
-                    ),
-                };
-                let Some(suggested) = suggested else {
-                    continue;
-                };
-                let adopted = current.as_deref() == Some(suggested.as_str());
-                model.capabilities.set_source(
-                    field,
-                    if adopted {
-                        vibex_core::ModelCapabilitySource::Catalog
-                    } else {
-                        vibex_core::ModelCapabilitySource::Declared
-                    },
-                );
-            }
-        }
+        model.capabilities = capabilities;
+        model.display_name = display_name;
         model.metadata.retain(|entry| entry.key != "wireApi");
-        if let Some(wire_api) = self.provider_model_edit_wire_api {
+        if let Some(wire_api) = wire_api {
             model.metadata.push(vibex_core::ProviderBindingMetadata {
                 key: "wireApi".to_string(),
                 value: wire_api.wire_protocol_id().to_string(),
             });
         }
-        self.close_shared_provider_model_editor(cx);
+        self.close_shared_provider_model_editor(window, cx);
         self.update_shared_provider(
             profile,
             management_locale_text("Model settings updated", "模型设置已更新", "模型設定已更新"),
             cx,
         );
-    }
-
-    /// Writes one of the open model's capability choices into the editor.
-    ///
-    /// The saved record is untouched until "Save model", so a catalogue
-    /// lookup or an experimental click cannot change a Provider on its own.
-    fn set_provider_model_edit_capability(
-        &mut self,
-        field: &'static str,
-        value: Option<bool>,
-        cx: &mut Context<Self>,
-    ) {
-        match field {
-            "image" => self.provider_model_edit_image_input = value,
-            "pdf" => self.provider_model_edit_pdf_input = value,
-            "temperature" => self.provider_model_edit_temperature = value,
-            "reasoning" => self.provider_model_edit_reasoning = value,
-            _ => return,
-        }
-        cx.notify();
-    }
-
-    /// The catalogue's values the open model does not hold yet, each with its
-    /// own adopt control.
-    ///
-    /// A value the automatic fill wrote is left out; when the user edits it
-    /// away, its row comes back as the way to restore it, and "adopt all"
-    /// restores every differing field at once.
-    fn render_provider_model_capability_suggestions(
-        &mut self,
-        model: &vibex_core::ModelProviderCatalogEntry,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let Some(suggestion) = self.provider_model_capability_suggestion.clone() else {
-            return div().into_any_element();
-        };
-        // A value already in the form is not a suggestion any more: the list
-        // is only the way back to a catalogue value the user has changed, and
-        // repeating the values the automatic fill just wrote made the editor
-        // look like it was still asking for them.
-        let pending = suggestion
-            .fields
-            .iter()
-            .filter(|field| {
-                !self.provider_model_capability_is_adopted(&field.field, &field.value, cx)
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        if pending.is_empty() {
-            return div().into_any_element();
-        }
-        let approximate = suggestion.approximate;
-        let auto_filled = self.provider_model_capability_auto_filled;
-        let note = if auto_filled > 0 {
-            management_locale_text(
-                "Filled from the catalogue when this model opened. Save model to keep it; apply a value to restore it.",
-                "打开时已按目录自动填入；保存模型后生效，点采用可恢复目录值。",
-                "開啟時已按目錄自動填入；儲存模型後生效，點採用可還原目錄值。",
-            )
-        } else {
-            management_locale_text(
-                "Click apply to copy a catalogue value into the form. Nothing is written until you save.",
-                "点采用即可把目录值写入表单；保存模型前不会写入记录。",
-                "點採用即可把目錄值寫入表單；儲存模型前不會寫入紀錄。",
-            )
-        };
-        let mut block = v_flex()
-            .w_full()
-            .gap_1p5()
-            .rounded(px(6.0))
-            .border_1()
-            .border_color(cx.theme().border)
-            .bg(cx.theme().muted.opacity(0.15))
-            .p_2()
-            .child(
-                h_flex()
-                    .w_full()
-                    .items_center()
-                    .justify_between()
-                    .gap_2()
-                    .child(div().text_xs().font_medium().child(management_locale_text(
-                        "Catalogue suggestion",
-                        "目录建议",
-                        "目錄建議",
-                    )))
-                    .child(
-                        Button::new(SharedString::from(format!(
-                            "management-provider-model-adopt-all-{}",
-                            model.id
-                        )))
-                        .xsmall()
-                        .outline()
-                        .label(management_locale_text(
-                            "Apply all suggestions",
-                            "采用全部建议",
-                            "採用全部建議",
-                        ))
-                        .disabled(self.mutation.is_some())
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.adopt_all_provider_model_capability_fields(window, cx)
-                        })),
-                    ),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(note),
-            );
-        for field in pending {
-            let label = match field.field.as_str() {
-                "contextTokens" => {
-                    management_locale_text("Context window", "上下文窗口", "上下文視窗")
-                }
-                "outputTokens" => management_locale_text("Max output", "最大输出", "最大輸出"),
-                "reasoning" => management_locale_text("Reasoning", "推理", "推理"),
-                "imageInput" => management_locale_text("Images", "图片输入", "圖片輸入"),
-                "pdfInput" => management_locale_text("PDF", "PDF 输入", "PDF 輸入"),
-                "temperature" => management_locale_text("Temperature", "温度参数", "溫度參數"),
-                _ => continue,
-            };
-            let shown = match field.field.as_str() {
-                "reasoning" | "imageInput" | "pdfInput" | "temperature" => {
-                    if field.value == "true" {
-                        management_locale_text("supported", "支持", "支援")
-                    } else {
-                        management_locale_text("unsupported", "不支持", "不支援")
-                    }
-                }
-                _ => field.value.as_str(),
-            };
-            let field_key = field.field.clone();
-            block = block.child(
-                h_flex()
-                    .w_full()
-                    .items_center()
-                    .justify_between()
-                    .gap_2()
-                    .child(
-                        div()
-                            .min_w_0()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(format!(
-                                "{label} · {shown}{}",
-                                if approximate {
-                                    management_locale_text(
-                                        " (approximate)",
-                                        "（近似匹配）",
-                                        "（近似比對）",
-                                    )
-                                } else {
-                                    ""
-                                }
-                            )),
-                    )
-                    .child(
-                        Button::new(SharedString::from(format!(
-                            "management-provider-model-adopt-{}-{field_key}",
-                            model.id
-                        )))
-                        .xsmall()
-                        .ghost()
-                        .label(management_locale_text("Apply", "采用", "採用"))
-                        .disabled(self.mutation.is_some())
-                        .on_click(cx.listener(
-                            move |this, _, window, cx| {
-                                this.adopt_provider_model_capability_field(&field_key, window, cx)
-                            },
-                        )),
-                    ),
-            );
-        }
-        block.into_any_element()
     }
 
     fn set_shared_provider_default_model(
@@ -18828,7 +17968,16 @@ impl ManagementCenter {
         cx: &mut Context<Self>,
     ) {
         self.shared_provider_edit_target = Some(profile.id.clone());
-        self.shared_provider_edit_error = None;
+        self.workspace_edit_revision = Some(profile.revision);
+        self.provider_form.scope = provider_workspace::ProviderEditorScope::Shared {
+            id: profile.id.clone(),
+            revision: profile.revision,
+        };
+        self.provider_form.error = None;
+        self.provider_form.name_error = None;
+        self.provider_form.base_url_error = None;
+        self.provider_form.models_error = None;
+        self.provider_form.endpoint_error = None;
         let base_url = profile
             .primary_api_endpoint()
             .map(|endpoint| endpoint.url.clone())
@@ -18873,6 +18022,8 @@ impl ManagementCenter {
         let headers_text = serde_json::to_string_pretty(&headers_json).unwrap_or_default();
         let catalog_id = profile.metadata.catalog_id.clone().unwrap_or_default();
         let icon = profile.metadata.icon.clone().unwrap_or_default();
+        let note = profile.metadata.note.clone().unwrap_or_default();
+        let website_url = profile.metadata.website_url.clone().unwrap_or_default();
         let category = profile.metadata.category.clone();
         let models_url = profile
             .endpoints
@@ -18885,41 +18036,58 @@ impl ManagementCenter {
             vibex_core::ModelProviderProxyPolicy::Endpoint(url) => (false, url.clone()),
             vibex_core::ModelProviderProxyPolicy::InheritSystem => (false, String::new()),
         };
-        let only_through_groups = profile.metadata.only_through_route_groups;
         for (input, value) in [
+            (&self.provider_form.name, profile.display_name.clone()),
+            (&self.provider_form.note, note),
+            (&self.provider_form.website_url, website_url),
+            (&self.provider_form.base_url, base_url),
+            (&self.provider_form.models, models),
             (
-                &self.shared_provider_edit_name,
-                profile.display_name.clone(),
-            ),
-            (&self.shared_provider_edit_base_url, base_url),
-            (&self.shared_provider_edit_models, models),
-            (
-                &self.shared_provider_edit_default_model,
+                &self.provider_form.default_model,
                 profile.default_model_id.clone().unwrap_or_default(),
             ),
-            (&self.shared_provider_edit_models_url, models_url),
-            (&self.shared_provider_edit_auth_url, auth_url),
-            (
-                &self.shared_provider_edit_proxy_endpoint_url,
-                proxy_endpoint_url,
-            ),
-            (&self.shared_provider_edit_catalog_id, catalog_id),
-            (&self.shared_provider_edit_icon, icon),
-            (&self.shared_provider_edit_proxy_url, proxy_url),
+            (&self.provider_form.models_url, models_url),
+            (&self.provider_form.auth_url, auth_url),
+            (&self.provider_form.proxy_endpoint_url, proxy_endpoint_url),
+            (&self.provider_form.catalog_id, catalog_id),
+            (&self.provider_form.icon, icon),
+            (&self.provider_form.proxy_url, proxy_url),
         ] {
             input.update(cx, |state, cx| state.set_value(value, window, cx));
         }
-        self.shared_provider_edit_proxy_disabled = proxy_disabled;
-        self.shared_provider_edit_headers
+        // A saved record edits its models on the Models tab; the Key field
+        // belongs to creation, so it is left blank.
+        let overrides = profile
+            .endpoints
+            .iter()
+            .filter_map(|endpoint| {
+                Some((
+                    vibex_core::ProviderModelWireApi::from_wire_protocol_id(
+                        endpoint.wire_protocol_id.as_deref()?,
+                    )?
+                    .protocol_base_url_option_key(),
+                    endpoint.url.clone(),
+                ))
+            })
+            .collect::<BTreeMap<_, _>>();
+        self.provider_form
+            .rebuild_protocol_fields(&overrides, window, cx);
+        self.provider_form.protocol_open = !overrides.is_empty();
+        self.provider_form.proxy_disabled = proxy_disabled;
+        self.provider_form
+            .headers
             .update(cx, |state, cx| state.set_value(headers_text, window, cx));
-        self.shared_provider_edit_only_through_groups = only_through_groups;
-        self.shared_provider_edit_category = category;
+        self.provider_form.headers_open = !profile.headers.is_empty();
+        self.provider_form.only_through_groups = profile.metadata.only_through_route_groups;
+        self.provider_form.category = category;
         cx.notify();
     }
 
-    fn save_shared_provider_editor(
+    /// Replaces the saved record the form describes.
+    fn save_shared_provider_form(
         &mut self,
         profile_id: vibex_core::ModelProviderProfileId,
+        expected_revision: i64,
         cx: &mut Context<Self>,
     ) {
         let Some(mut profile) = self
@@ -18930,75 +18098,21 @@ impl ManagementCenter {
         else {
             return;
         };
-        let name = self
-            .shared_provider_edit_name
-            .read(cx)
-            .value()
-            .trim()
-            .to_string();
-        if name.is_empty() {
-            self.shared_provider_edit_name_error = Some(
-                management_locale_text(
-                    "A Provider needs a name",
-                    "请填写供应商名称",
-                    "請填寫供應商名稱",
-                )
-                .to_string(),
-            );
-            cx.notify();
+        let Some(name) = self.provider_form_validate(cx) else {
             return;
-        }
-        let base_url = self
-            .shared_provider_edit_base_url
-            .read(cx)
-            .value()
-            .trim()
-            .to_string();
-        if base_url.is_empty() {
-            self.shared_provider_edit_base_url_error = Some(
-                management_locale_text(
-                    "A Provider needs at least one request URL",
-                    "请至少填写一个接口地址",
-                    "請至少填寫一個介面位址",
-                )
-                .to_string(),
-            );
-            cx.notify();
-            return;
-        }
-        let model_ids = self
-            .shared_provider_edit_models
-            .read(cx)
-            .value()
-            .split([',', '\n'])
-            .map(str::trim)
-            .filter(|id| !id.is_empty())
-            .fold(Vec::<String>::new(), |mut ids, id| {
-                if !ids.iter().any(|existing| existing == id) {
-                    ids.push(id.to_string());
-                }
-                ids
-            });
-        if model_ids.is_empty() {
-            self.shared_provider_edit_models_error = Some(
-                management_locale_text(
-                    "Add at least one model id",
-                    "请至少填写一个模型 ID",
-                    "請至少填寫一個模型 ID",
-                )
-                .to_string(),
-            );
-            cx.notify();
-            return;
-        }
+        };
+        let model_ids = self.provider_form_model_ids(cx);
         let default_model = self
-            .shared_provider_edit_default_model
+            .provider_form
+            .default_model
             .read(cx)
             .value()
             .trim()
             .to_string();
+        // A saved record edits its Models on the Models tab, so an empty list
+        // here is the tab's answer rather than a missing field on this form.
         if !default_model.is_empty() && !model_ids.iter().any(|id| id == &default_model) {
-            self.shared_provider_edit_error = Some(
+            self.provider_form.models_error = Some(
                 management_locale_text(
                     "The default model must be one of this Provider's models",
                     "默认模型必须是该供应商的模型之一",
@@ -19009,134 +18123,31 @@ impl ManagementCenter {
             cx.notify();
             return;
         }
-        let models_url = self
-            .shared_provider_edit_models_url
-            .read(cx)
-            .value()
-            .trim()
-            .to_string();
-        let auth_url = self
-            .shared_provider_edit_auth_url
-            .read(cx)
-            .value()
-            .trim()
-            .to_string();
-        let proxy_endpoint_url = self
-            .shared_provider_edit_proxy_endpoint_url
-            .read(cx)
-            .value()
-            .trim()
-            .to_string();
-        let headers_text = self
-            .shared_provider_edit_headers
-            .read(cx)
-            .value()
-            .to_string();
-        let parsed_headers = match serde_json::from_str::<serde_json::Value>(&headers_text) {
-            Ok(serde_json::Value::Object(headers)) => headers,
-            Ok(_) => {
-                self.shared_provider_edit_error = Some(
-                    management_locale_text(
-                        "Headers must be a JSON object",
-                        "请求头必须是 JSON 对象",
-                        "請求標頭必須是 JSON 物件",
-                    )
-                    .to_string(),
-                );
-                cx.notify();
-                return;
-            }
-            Err(error) if headers_text.trim().is_empty() => {
-                let _ = error;
-                serde_json::Map::new()
-            }
-            Err(error) => {
-                self.shared_provider_edit_error = Some(format!(
-                    "{}: {error}",
-                    management_locale_text(
-                        "Headers JSON is invalid",
-                        "请求头 JSON 无效",
-                        "請求標頭 JSON 無效",
-                    )
-                ));
-                cx.notify();
-                return;
-            }
+        // Header rows keep the Secret references the text form cannot show.
+        let Some(mut headers) = self.provider_form_parse_headers(cx) else {
+            return;
         };
-        let mut headers = profile
-            .headers
-            .iter()
-            .filter(|header| {
-                matches!(
-                    header.value,
-                    vibex_core::ModelProviderHeaderValue::SecretReference(_)
-                )
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        for (name, value) in parsed_headers {
-            let name = name.trim().to_string();
-            if name.is_empty() {
-                continue;
-            }
-            let value = match value {
-                serde_json::Value::String(value) => {
-                    vibex_core::ModelProviderHeaderValue::NonSecretLiteral(value)
-                }
-                serde_json::Value::Object(object) => {
-                    let variable = object
-                        .get("variable")
-                        .and_then(serde_json::Value::as_str)
-                        .and_then(vibex_core::ModelProviderHeaderVariable::from_id);
-                    let Some(variable) = variable else {
-                        self.shared_provider_edit_error = Some(format!(
-                            "{}: {name}",
-                            management_locale_text(
-                                "A header must be a string or a known variable",
-                                "请求头必须是字符串或已知变量",
-                                "請求標頭必須是字串或已知變數",
-                            )
-                        ));
-                        cx.notify();
-                        return;
-                    };
-                    vibex_core::ModelProviderHeaderValue::DynamicVariable(variable)
-                }
-                _ => {
-                    self.shared_provider_edit_error = Some(format!(
-                        "Header {name} must be a string or a known variable"
-                    ));
-                    cx.notify();
-                    return;
-                }
-            };
-            headers.push(vibex_core::ModelProviderHeaderReference {
-                name,
-                value,
-                redacted_hint: "edited".to_string(),
-            });
-        }
-        let proxy_url = self
-            .shared_provider_edit_proxy_url
-            .read(cx)
-            .value()
-            .trim()
-            .to_string();
-        let catalog_id = self
-            .shared_provider_edit_catalog_id
-            .read(cx)
-            .value()
-            .trim()
-            .to_string();
-        let icon = self
-            .shared_provider_edit_icon
-            .read(cx)
-            .value()
-            .trim()
-            .to_string();
+        headers.extend(
+            profile
+                .headers
+                .iter()
+                .filter(|header| {
+                    matches!(
+                        header.value,
+                        vibex_core::ModelProviderHeaderValue::SecretReference(_)
+                    )
+                })
+                .cloned(),
+        );
+        let Some(endpoints) = self.provider_form_endpoints(cx, None) else {
+            return;
+        };
+        let Some(proxy_policy) = self.provider_form_proxy_policy(cx) else {
+            return;
+        };
 
-        // Keep models the Provider already holds but the draft no longer
-        // lists only when they were disabled: this editor is not a place that
+        // Keep models the Provider already holds but the draft no longer lists
+        // only when they were disabled: this editor is not a place that
         // silently re-enables a model someone turned off.
         let mut configured_models = profile
             .configured_models
@@ -19164,69 +18175,27 @@ impl ManagementCenter {
                 });
             }
         }
+        let metadata = self.provider_form_metadata(cx);
         profile.display_name = name;
         profile.configured_models = configured_models;
         profile.default_model_id = (!default_model.is_empty()).then_some(default_model);
-        profile.endpoints.retain(|endpoint| {
-            endpoint.kind != vibex_core::ModelProviderEndpointKind::Api
-                || endpoint.wire_protocol_id.is_some()
-        });
-        profile.endpoints.retain(|endpoint| {
-            !matches!(
-                endpoint.kind,
-                vibex_core::ModelProviderEndpointKind::ModelCatalog
-                    | vibex_core::ModelProviderEndpointKind::Auth
-                    | vibex_core::ModelProviderEndpointKind::Proxy
-            )
-        });
-        profile.endpoints.push(vibex_core::ModelProviderEndpoint {
-            id: "api".to_string(),
-            kind: vibex_core::ModelProviderEndpointKind::Api,
-            url: base_url,
-            wire_protocol_id: None,
-        });
-        for (id, kind, url) in [
-            (
-                "models",
-                vibex_core::ModelProviderEndpointKind::ModelCatalog,
-                models_url,
-            ),
-            (
-                "auth",
-                vibex_core::ModelProviderEndpointKind::Auth,
-                auth_url,
-            ),
-            (
-                "proxy",
-                vibex_core::ModelProviderEndpointKind::Proxy,
-                proxy_endpoint_url,
-            ),
-        ] {
-            if !url.is_empty() {
-                profile.endpoints.push(vibex_core::ModelProviderEndpoint {
-                    id: id.to_string(),
-                    kind,
-                    url,
-                    wire_protocol_id: None,
-                });
-            }
-        }
-        profile.metadata.catalog_id = (!catalog_id.is_empty()).then_some(catalog_id);
-        profile.metadata.icon = (!icon.is_empty()).then_some(icon);
+        profile.endpoints = endpoints;
         profile.headers = headers;
-        self.shared_provider_edit_name_error = None;
-        self.shared_provider_edit_base_url_error = None;
-        self.shared_provider_edit_models_error = None;
-        profile.metadata.category = self.shared_provider_edit_category.clone();
-        profile.metadata.only_through_route_groups = self.shared_provider_edit_only_through_groups;
-        profile.proxy_policy = if self.shared_provider_edit_proxy_disabled {
-            vibex_core::ModelProviderProxyPolicy::Disabled
-        } else if proxy_url.is_empty() {
-            vibex_core::ModelProviderProxyPolicy::InheritSystem
-        } else {
-            vibex_core::ModelProviderProxyPolicy::Endpoint(proxy_url)
-        };
-        self.shared_provider_edit_error = None;
+        profile.proxy_policy = proxy_policy;
+        // The advisory fields the form does not own keep their values; only
+        // note, website, kind, icon, catalogue id and visibility are the
+        // form's to set.
+        profile.metadata.note = metadata.note;
+        profile.metadata.website_url = metadata.website_url;
+        profile.metadata.catalog_id = metadata.catalog_id;
+        profile.metadata.icon = metadata.icon;
+        profile.metadata.category = metadata.category;
+        profile.metadata.only_through_route_groups = metadata.only_through_route_groups;
+        profile.revision = expected_revision.max(profile.revision);
+        self.provider_form.error = None;
+        self.provider_form.name_error = None;
+        self.provider_form.base_url_error = None;
+        self.provider_form.models_error = None;
         self.update_shared_provider(
             profile,
             management_locale_text("Provider updated", "供应商已更新", "供應商已更新"),
@@ -19788,7 +18757,7 @@ impl ManagementCenter {
                         this.apply_shared_provider_success(profile);
                         if this.shared_provider_edit_target.as_ref() == Some(&updated_id) {
                             this.shared_provider_edit_target = None;
-                            this.shared_provider_edit_error = None;
+                            this.provider_form.error = None;
                         }
                         this.notice = Some(message.to_string());
                         cx.notify();
@@ -20643,145 +19612,119 @@ impl ManagementCenter {
                 ),
         );
         if expanded {
-            entry = entry.child(self.render_shared_provider_model_inline(profile, model, cx));
+            entry =
+                entry.child(self.render_shared_provider_model_inline(profile, model, window, cx));
         }
         let _ = window;
         entry.into_any_element()
     }
 
-    /// One model's settings, opened under its row: the same fields the Agent
-    /// dialog's model settings pane holds, written to the shared record.
+    /// One model's settings, opened under its row: the shared model editor,
+    /// writing this saved record instead of the Agent dialog's draft.
     fn render_shared_provider_model_inline(
         &mut self,
         profile: &vibex_core::ModelProviderProfile,
         model: &vibex_core::ModelProviderCatalogEntry,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let (Some(context), Some(output), Some(name), Some(efforts)) = (
-            self.provider_model_edit_context.clone(),
-            self.provider_model_edit_output.clone(),
-            self.provider_model_edit_name.clone(),
-            self.provider_model_edit_efforts.clone(),
-        ) else {
-            return div().into_any_element();
-        };
+        let configured = provider_configured_model_from_catalog(model);
+        if self.model_editor.target_id.as_deref() != Some(model.id.as_str()) {
+            self.load_model_editor(&configured, window, cx);
+            self.model_editor.target_id = Some(model.id.clone());
+        }
         let pending = self.mutation.is_some();
-        let error = self.provider_model_edit_error.clone();
         let profile_id = profile.id.clone();
         let model_id = model.id.clone();
-        let mut capabilities = h_flex().w_full().flex_wrap().gap_2();
-        for (field, label, value) in [
-            (
-                "image",
-                management_locale_text("Image input", "图片输入", "圖片輸入"),
-                self.provider_model_edit_image_input,
-            ),
-            (
-                "pdf",
-                management_locale_text("PDF input", "PDF 输入", "PDF 輸入"),
-                self.provider_model_edit_pdf_input,
-            ),
-            (
-                "temperature",
-                management_locale_text("Temperature", "温度参数", "溫度參數"),
-                self.provider_model_edit_temperature,
-            ),
-            (
-                "reasoning",
-                management_locale_text("Reasoning", "推理", "推理"),
-                self.provider_model_edit_reasoning,
-            ),
-        ] {
-            let choices = [
-                (None, management_locale_text("Inherit", "继承", "繼承")),
-                (Some(true), management_locale_text("Yes", "是", "是")),
-                (Some(false), management_locale_text("No", "否", "否")),
-            ];
-            let chips = h_flex()
+        let header =
+            h_flex()
+                .w_full()
                 .items_center()
-                .gap_1()
+                .gap_2()
+                .p_2()
+                .child(div().min_w_0().flex_1().text_xs().font_medium().child(
+                    management_locale_text("Model settings", "模型设置", "模型設定"),
+                ))
                 .child(
-                    div()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(label),
-                )
-                .child(
-                    ButtonGroup::new(SharedString::from(format!(
-                        "management-provider-model-{field}-{}-group",
+                    Button::new(SharedString::from(format!(
+                        "management-provider-model-delete-{}",
                         model.id
                     )))
                     .xsmall()
-                    .outline()
-                    .children(choices.into_iter().map(|(choice, choice_label)| {
-                        Button::new(SharedString::from(format!(
-                            "management-provider-model-{field}-{}-{}",
-                            model.id,
-                            match choice {
-                                None => "inherit",
-                                Some(true) => "yes",
-                                Some(false) => "no",
-                            }
-                        )))
-                        .xsmall()
-                        .label(choice_label)
-                        .selected(value == choice)
-                    }))
-                    .on_click(cx.listener(
-                        move |this, clicks: &Vec<usize>, _, cx| {
-                            if let Some((choice, _)) =
-                                clicks.first().and_then(|index| choices.get(*index))
-                            {
-                                this.set_provider_model_edit_capability(field, *choice, cx);
-                            }
-                        },
-                    )),
-                );
-            capabilities = capabilities.child(chips);
-        }
-        // Every protocol is offered here: which ones an Agent can call is a
-        // question for that Agent's dialog, not for the shared record.
-        let mut wire = h_flex().w_full().flex_wrap().gap_1p5();
-        for candidate in
-            std::iter::once(None).chain(vibex_core::ProviderModelWireApi::ALL.into_iter().map(Some))
-        {
-            let label = candidate.map_or_else(
-                || management_locale_text("Inherit", "继承", "繼承").to_string(),
-                |wire_api| provider_wire_api_label(wire_api).to_string(),
-            );
-            wire = wire.child(management_option_chip(
-                SharedString::from(format!(
-                    "management-provider-model-wire-{}-{candidate:?}",
-                    model.id
-                )),
-                SharedString::from(label),
-                self.provider_model_edit_wire_api == candidate,
-                pending,
-                None,
-                cx.listener(move |this, _, _, cx| {
-                    this.provider_model_edit_wire_api = candidate;
-                    cx.notify();
-                }),
-                cx,
-            ));
-        }
-        // Rendered before the labelling closure exists: the renderer needs the
-        // entity context mutably, and the closure keeps it borrowed.
-        let suggestions = self.render_provider_model_capability_suggestions(model, cx);
-        let labelled = |label: &'static str, control: AnyElement| {
-            v_flex()
-                .min_w_0()
-                .flex_1()
-                .gap_1()
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(label),
+                    .ghost()
+                    .danger()
+                    .icon(Icon::default().path("icons/vibex/trash-2.svg"))
+                    .tooltip(management_locale_text(
+                        "Delete this model",
+                        "删除该模型",
+                        "刪除該模型",
+                    ))
+                    .disabled(pending)
+                    .on_click(cx.listener({
+                        let profile_id = profile_id.clone();
+                        let model_id = model_id.clone();
+                        move |this, _, window, cx| {
+                            this.delete_shared_provider_model(
+                                profile_id.clone(),
+                                model_id.clone(),
+                                window,
+                                cx,
+                            )
+                        }
+                    })),
                 )
-                .child(control)
-                .into_any_element()
-        };
+                .child(
+                    Button::new(SharedString::from(format!(
+                        "management-provider-model-inline-close-{}",
+                        model.id
+                    )))
+                    .xsmall()
+                    .ghost()
+                    .icon(IconName::Close)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.close_shared_provider_model_editor(window, cx)
+                    })),
+                );
+        let footer = h_flex()
+            .w_full()
+            .items_center()
+            .justify_end()
+            .gap_2()
+            .child(
+                Button::new(SharedString::from(format!(
+                    "management-provider-model-inline-save-{}",
+                    model.id
+                )))
+                .xsmall()
+                .primary()
+                .label(management_locale_text("Save model", "保存模型", "儲存模型"))
+                .disabled(pending)
+                .on_click(cx.listener({
+                    let profile_id = profile_id.clone();
+                    let model_id = model_id.clone();
+                    move |this, _, window, cx| {
+                        this.save_shared_provider_model_inline(
+                            profile_id.clone(),
+                            model_id.clone(),
+                            window,
+                            cx,
+                        )
+                    }
+                })),
+            );
+        let editor = self.render_model_editor(
+            provider_workspace::ModelEditorConfig {
+                id_prefix: "shared",
+                wire_choices: provider_workspace::all_wire_choices(),
+                editable_id: false,
+                catalog_choices: Vec::new(),
+                pending,
+                shows_enabled: false,
+                write_through: false,
+            },
+            footer.into_any_element(),
+            cx,
+        );
         v_flex()
             .w_full()
             .gap_2()
@@ -20789,134 +19732,8 @@ impl ManagementCenter {
             .border_1()
             .border_color(cx.theme().border)
             .bg(cx.theme().muted.opacity(0.20))
-            .p_2()
-            .child(
-                h_flex()
-                    .w_full()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        div()
-                            .min_w_0()
-                            .flex_1()
-                            .text_xs()
-                            .font_medium()
-                            .child(model.id.clone()),
-                    )
-                    .child(
-                        Button::new(SharedString::from(format!(
-                            "management-provider-model-delete-{}",
-                            model.id
-                        )))
-                        .xsmall()
-                        .ghost()
-                        .danger()
-                        .icon(Icon::default().path("icons/vibex/trash-2.svg"))
-                        .tooltip(management_locale_text(
-                            "Delete this model",
-                            "删除该模型",
-                            "刪除該模型",
-                        ))
-                        .disabled(pending)
-                        .on_click(cx.listener({
-                            let profile_id = profile_id.clone();
-                            let model_id = model_id.clone();
-                            move |this, _, _, cx| {
-                                this.delete_shared_provider_model(
-                                    profile_id.clone(),
-                                    model_id.clone(),
-                                    cx,
-                                )
-                            }
-                        })),
-                    )
-                    .child(
-                        Button::new(SharedString::from(format!(
-                            "management-provider-model-inline-close-{}",
-                            model.id
-                        )))
-                        .xsmall()
-                        .ghost()
-                        .icon(IconName::Close)
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.close_shared_provider_model_editor(cx)
-                        })),
-                    ),
-            )
-            .child(labelled(
-                management_locale_text("Display name", "显示名称", "顯示名稱"),
-                Input::new(&name).small().w_full().into_any_element(),
-            ))
-            .child(labelled(
-                management_locale_text("Model API protocol", "模型接口协议", "模型介面協定"),
-                wire.into_any_element(),
-            ))
-            .child(
-                h_flex()
-                    .w_full()
-                    .items_start()
-                    .gap_2()
-                    .child(labelled(
-                        management_locale_text(
-                            "Context window (tokens)",
-                            "上下文窗口（Token）",
-                            "上下文視窗（Token）",
-                        ),
-                        Input::new(&context).small().w_full().into_any_element(),
-                    ))
-                    .child(labelled(
-                        management_locale_text(
-                            "Max output tokens",
-                            "最大输出 Token",
-                            "最大輸出 Token",
-                        ),
-                        Input::new(&output).small().w_full().into_any_element(),
-                    )),
-            )
-            .child(capabilities)
-            .child(suggestions)
-            .when(self.provider_model_edit_reasoning != Some(false), |editor| {
-                editor.child(labelled(
-                    management_locale_text("Thinking levels", "思考档位", "思考檔位"),
-                    v_flex()
-                        .w_full()
-                        .gap_1()
-                        .child(Input::new(&efforts).small().w_full())
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(management_locale_text(
-                                    "Levels separated by commas, or level=wire when the endpoint spells one differently. Empty follows the Agent default.",
-                                    "多个档位用逗号分隔，端点拼写不同时写成 档位=实际值。留空沿用 Agent 默认。",
-                                    "多個檔位用逗號分隔，端點拼寫不同時寫成 檔位=實際值。留空沿用 Agent 預設。",
-                                )),
-                        )
-                        .into_any_element(),
-                ))
-            })
-            .children(
-                error.map(|message| div().text_xs().text_color(cx.theme().danger).child(message)),
-            )
-            .child(
-                h_flex().w_full().justify_end().child(
-                    Button::new(SharedString::from(format!(
-                        "management-provider-model-inline-save-{}",
-                        model.id
-                    )))
-                    .xsmall()
-                    .primary()
-                    .label(management_locale_text("Save model", "保存模型", "儲存模型"))
-                    .disabled(pending)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.save_shared_provider_model_inline(
-                            profile_id.clone(),
-                            model_id.clone(),
-                            cx,
-                        )
-                    })),
-                ),
-            )
+            .child(header)
+            .child(editor)
             .into_any_element()
     }
 
@@ -24470,6 +23287,7 @@ impl ManagementCenter {
     fn render_profile_settings_pane(
         &mut self,
         bounded: bool,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let selected_agent_id = self.selected_agent_id.clone().unwrap_or_default();
@@ -24491,10 +23309,17 @@ impl ManagementCenter {
         let editor_context = ProfileModelEditorContext {
             agent_owns_catalog,
             catalog_choices,
-            wire_api_choices: self.projection_editor.wire_api_choices(),
-            shows_wire_api: self
+            integration_kinds: self
                 .projection_editor
-                .shows(vibex_core::AgentProjectionFormControl::WireProtocol),
+                .wire_api_choices()
+                .into_iter()
+                .map(|wire_api| {
+                    (
+                        wire_api,
+                        self.projection_editor.wire_api_integration_kind(wire_api),
+                    )
+                })
+                .collect(),
             pending,
         };
         let selection = self.profile_model_selection.clone();
@@ -24515,7 +23340,39 @@ impl ManagementCenter {
         );
 
         let body = match selected_index {
-            Some(index) => self.render_profile_model_editor(index, &editor_context, cx),
+            Some(index) => {
+                let model = self.profile_configured_models[index].clone();
+                if self.model_editor.target_id.as_deref() != Some(model.id.as_str()) {
+                    self.load_model_editor(&model, window, cx);
+                    self.model_editor.target_id = Some(model.id.clone());
+                }
+                let footer = h_flex().w_full().justify_end().child(
+                    Button::new("provider-model-reset")
+                        .xsmall()
+                        .ghost()
+                        .label(management_locale_text(
+                            "Revert this model",
+                            "丢弃该模型的修改",
+                            "捨棄該模型的修改",
+                        ))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            if let Some(index) = this.selected_profile_model_index() {
+                                let model = this.profile_configured_models[index].clone();
+                                this.load_model_editor(&model, window, cx);
+                            }
+                        })),
+                );
+                let config = provider_workspace::ModelEditorConfig {
+                    id_prefix: "profile",
+                    wire_choices: editor_context.wire_choices(),
+                    editable_id: !editor_context.agent_owns_catalog,
+                    catalog_choices: editor_context.catalog_choices.clone(),
+                    pending: editor_context.pending,
+                    shows_enabled: true,
+                    write_through: true,
+                };
+                self.render_model_editor(config, footer.into_any_element(), cx)
+            }
             None => match selected_title {
                 Some(title) => v_flex()
                     .w_full()
@@ -24580,684 +23437,6 @@ impl ManagementCenter {
         };
 
         profile_pane_shell("provider-chosen-pane", bounded, header, body, None, cx)
-    }
-
-    /// The editor for one Model, rendered under its own row.
-    ///
-    /// Every control writes into the draft immediately, so there is no Apply
-    /// step to forget and the dialog's single Save carries the whole editor.
-    fn render_profile_model_editor(
-        &mut self,
-        index: usize,
-        context: &ProfileModelEditorContext,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let ProfileModelEditorContext {
-            agent_owns_catalog,
-            catalog_choices,
-            wire_api_choices,
-            shows_wire_api,
-            pending,
-        } = context;
-        let (agent_owns_catalog, shows_wire_api, pending) =
-            (*agent_owns_catalog, *shows_wire_api, *pending);
-        let field_error = |field: ProfileModelEditField| {
-            self.profile_model_edit_error
-                .as_ref()
-                .filter(|(current, _)| *current == field)
-                .map(|(_, message)| message.clone())
-        };
-        let id_error = field_error(ProfileModelEditField::Id);
-        let reasoning_error = field_error(ProfileModelEditField::Reasoning);
-        let limits_error = field_error(ProfileModelEditField::Limits);
-        let reasoning_disabled = self.profile_model_edit_reasoning_disabled;
-        let enabled = self
-            .profile_configured_models
-            .get(index)
-            .is_none_or(|model| model.enabled);
-
-        // The editor is the settings pane's whole body, so it is a column of
-        // that panel rather than a card inside it: the panel already supplies
-        // the boundary, and a second one here would nest two boxes.
-        let mut editor = v_flex()
-            .debug_selector(|| "profile-model-editor".to_string())
-            .w_full()
-            .min_w_0()
-            .gap_4()
-            .p_3()
-            // Offering the Model is a setting of the Model, so it lives with
-            // the rest of them instead of on a list row of its own. It leads
-            // the panel because it decides whether any of the rest is read.
-            .child(
-                h_flex()
-                    .debug_selector(|| "profile-model-enable-row".to_string())
-                    .w_full()
-                    .min_w_0()
-                    .items_center()
-                    .justify_between()
-                    .gap_3()
-                    .pb_3()
-                    .border_b_1()
-                    .border_color(cx.theme().border)
-                    .child(
-                        v_flex()
-                            .min_w_0()
-                            .gap_0p5()
-                            .child(div().text_sm().font_medium().child(management_locale_text(
-                                "Offer this model",
-                                "启用该模型",
-                                "啟用該模型",
-                            )))
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(management_locale_text(
-                                        "A disabled model keeps its settings but is not offered to the Agent.",
-                                        "停用后仍保留配置，但不会提供给 Agent。",
-                                        "停用後仍保留設定，但不會提供給 Agent。",
-                                    )),
-                            ),
-                    )
-                    .child(
-                        Switch::new(SharedString::from(format!(
-                            "provider-model-enabled-{index}"
-                        )))
-                        .small()
-                        .checked(enabled)
-                        .disabled(pending)
-                        .tooltip(management_enabled_label(enabled))
-                        .on_click(cx.listener(move |this, checked, _, cx| {
-                            this.toggle_profile_model(index, *checked, cx)
-                        })),
-                    ),
-            );
-
-        if agent_owns_catalog {
-            let mut choices = v_flex().w_full().gap_2();
-            choices = choices.child(management_choice_group_label(
-                management_locale_text(
-                    "Model (from the installed Agent)",
-                    "模型（来自已安装的 Agent）",
-                    "模型（來自已安裝的 Agent）",
-                ),
-                cx,
-            ));
-            if catalog_choices.is_empty() {
-                choices = choices.child(management_field_hint(
-                    management_locale_text(
-                        "Fetch models to load the catalogue this Agent advertises.",
-                        "请先拉取模型，以载入该 Agent 自带的模型目录。",
-                        "請先擷取模型，以載入該 Agent 自帶的模型目錄。",
-                    ),
-                    cx,
-                ));
-            } else {
-                let mut options = h_flex().w_full().flex_wrap().gap_1p5();
-                for (model_id, model_wire_api) in catalog_choices.iter().cloned() {
-                    let selected = self.profile_model_edit_id.read(cx).value().trim() == model_id;
-                    let label = model_wire_api.map_or_else(
-                        || model_id.clone(),
-                        |wire_api| format!("{model_id} · {}", provider_wire_api_label(wire_api)),
-                    );
-                    let click_id = model_id.clone();
-                    options = options.child(management_option_chip(
-                        SharedString::from(format!("provider-model-catalog-{index}-{model_id}")),
-                        SharedString::from(label),
-                        selected,
-                        pending,
-                        None,
-                        cx.listener(move |this, _, window, cx| {
-                            this.set_profile_model_id_from_catalog(
-                                index,
-                                click_id.clone(),
-                                model_wire_api,
-                                window,
-                                cx,
-                            )
-                        }),
-                        cx,
-                    ));
-                }
-                choices = choices.child(options);
-            }
-            editor = editor.child(choices);
-        } else {
-            editor = editor.child(management_input_field_with_error(
-                management_locale_text("Model ID", "模型 ID", "模型 ID"),
-                &self.profile_model_edit_id,
-                false,
-                id_error.as_deref(),
-                cx,
-            ));
-        }
-        editor = editor.child(management_input_field(
-            management_locale_text("Display name", "显示名称", "顯示名稱"),
-            &self.profile_model_edit_name,
-            false,
-            cx,
-        ));
-
-        if shows_wire_api {
-            let mut wire_controls = h_flex().w_full().flex_wrap().gap_1p5();
-            let candidates = std::iter::once(None)
-                .chain(wire_api_choices.iter().copied().map(Some))
-                .collect::<Vec<_>>();
-            for candidate in candidates {
-                let integration = candidate.and_then(|wire_api| {
-                    self.projection_editor.wire_api_integration_kind(wire_api)
-                });
-                let selected = self.profile_model_edit_wire_api == candidate;
-                let label = candidate.map_or_else(
-                    || management_locale_text("Inherit", "继承", "繼承").to_string(),
-                    |wire_api| {
-                        let support = integration.map_or_else(
-                            || management_locale_text("Unsupported", "不支持", "不支援"),
-                            provider_interface_integration_label,
-                        );
-                        format!("{} · {support}", provider_wire_api_label(wire_api))
-                    },
-                );
-                let unsupported = candidate.is_some() && integration.is_none();
-                wire_controls = wire_controls.child(management_option_chip(
-                    SharedString::from(format!("provider-model-wire-{index}-{candidate:?}")),
-                    SharedString::from(label),
-                    selected,
-                    pending || unsupported,
-                    // Only the blocked chip has something extra to say; the
-                    // rest are named by their own labels.
-                    unsupported.then(|| {
-                        SharedString::from(management_locale_text(
-                            "This Agent cannot call this interface",
-                            "这个 Agent 还无法调用该接口",
-                            "這個 Agent 還無法呼叫該介面",
-                        ))
-                    }),
-                    cx.listener(move |this, _, _, cx| {
-                        this.set_profile_model_wire_api(index, candidate, cx)
-                    }),
-                    cx,
-                ));
-            }
-            editor = editor.child(
-                v_flex()
-                    .w_full()
-                    .gap_1p5()
-                    .child(management_choice_group_label(
-                        management_locale_text(
-                            "Model API protocol",
-                            "模型接口协议",
-                            "模型介面協定",
-                        ),
-                        cx,
-                    ))
-                    .child(wire_controls),
-            );
-        }
-
-        // Reasoning is two decisions, so it is two controls: whether the Model
-        // reasons at all, and which level table its endpoint accepts.
-        let mut reasoning = h_flex().w_full().flex_wrap().gap_1p5();
-        for (key, label, disabled) in [
-            (
-                "default",
-                management_locale_text(
-                    "Follow Agent default",
-                    "跟随 Agent 默认",
-                    "跟隨 Agent 預設",
-                ),
-                false,
-            ),
-            (
-                "none",
-                management_locale_text("Non-reasoning", "不支持推理", "不支援推理"),
-                true,
-            ),
-        ] {
-            let selected = reasoning_disabled == disabled;
-            reasoning = reasoning.child(management_option_chip(
-                SharedString::from(format!("provider-model-reasoning-{index}-{key}")),
-                SharedString::from(label),
-                selected,
-                pending,
-                None,
-                cx.listener(move |this, _, window, cx| {
-                    this.set_profile_model_reasoning_draft(index, disabled, window, cx)
-                }),
-                cx,
-            ));
-        }
-        editor = editor.child(
-            v_flex()
-                .w_full()
-                .gap_1p5()
-                .child(management_choice_group_label(
-                    management_locale_text("Reasoning", "推理能力", "推理能力"),
-                    cx,
-                ))
-                .child(reasoning),
-        );
-
-        if !reasoning_disabled {
-            // The levels are a set the user clicks together, and the field
-            // below stays the place a wire spelling is written, so the chips and
-            // the field are two views of one declaration rather than two
-            // answers to the same question.
-            let declared =
-                reasoning_level_entries(&self.profile_model_edit_efforts.read(cx).value());
-            let mut levels = h_flex().w_full().flex_wrap().gap_1p5();
-            for level in vibex_core::ProviderReasoningEffortLevel::ALL {
-                let selected = declared.iter().any(|entry| entry.level() == Some(level));
-                let name = level.as_str();
-                levels = levels.child(management_option_chip(
-                    SharedString::from(format!("provider-model-efforts-level-{index}-{name}")),
-                    SharedString::from(name),
-                    selected,
-                    pending,
-                    Some(SharedString::from(if selected {
-                        management_locale_text("Remove this level", "取消该档位", "取消該檔位")
-                    } else {
-                        management_locale_text("Declare this level", "声明该档位", "宣告該檔位")
-                    })),
-                    cx.listener(move |this, _, window, cx| {
-                        this.toggle_profile_model_reasoning_level(index, level, window, cx)
-                    }),
-                    cx,
-                ));
-            }
-            editor = editor.child(
-                v_flex()
-                    .w_full()
-                    .gap_1p5()
-                    .child(management_choice_group_label(
-                        management_locale_text("Thinking levels", "思考档位", "思考檔位"),
-                        cx,
-                    ))
-                    .child(levels)
-                    .child(management_input_field_with_error(
-                        management_locale_text("Declared levels", "档位列表", "檔位清單"),
-                        &self.profile_model_edit_efforts,
-                        false,
-                        reasoning_error.as_deref(),
-                        cx,
-                    ))
-                    .child(management_field_hint(
-                        management_locale_text(
-                            "Click a level to declare it and click it again to take it back. The field takes any other spelling: levels separated by commas, or level=wire when the endpoint spells one differently. Empty follows the Agent default.",
-                            "点击档位即可声明，再次点击取消。也可以在输入框自定义：多个档位用逗号分隔，端点拼写不同时写成 档位=实际值。留空沿用 Agent 默认。",
-                            "點擊檔位即可宣告，再次點擊取消。也可以在輸入框自訂：多個檔位用逗號分隔，端點拼寫不同時寫成 檔位=實際值。留空沿用 Agent 預設。",
-                        ),
-                        cx,
-                    )),
-            );
-        }
-
-        let capability_rows = self.render_profile_model_capabilities(index, pending, cx);
-        editor = editor.child(profile_editor_section(
-            management_locale_text("Advanced", "高级", "進階"),
-            None,
-            v_flex()
-                .w_full()
-                .gap_2p5()
-                .children(capability_rows)
-                .child(management_token_field(
-                    management_locale_text(
-                        "Context window (tokens)",
-                        "上下文窗口（Token）",
-                        "上下文視窗（Token）",
-                    ),
-                    &self.profile_model_edit_context_tokens,
-                    limits_error.as_deref(),
-                    &MANAGEMENT_CONTEXT_TOKEN_PRESETS,
-                    format!("provider-model-context-preset-{index}"),
-                    pending,
-                    cx,
-                ))
-                .child(management_token_field(
-                    management_locale_text(
-                        "Max output tokens",
-                        "最大输出 Token",
-                        "最大輸出 Token",
-                    ),
-                    &self.profile_model_edit_output_tokens,
-                    None,
-                    &MANAGEMENT_OUTPUT_TOKEN_PRESETS,
-                    format!("provider-model-output-preset-{index}"),
-                    pending,
-                    cx,
-                ))
-                .children(self.render_capability_suggestions(index, cx))
-                .child(management_field_hint(
-                    management_locale_text(
-                        "Click a value to declare it and click it again to clear it, or type any other count. Empty keeps the Agent's own default; only Agents that read a declared limit are affected.",
-                        "点击常用值即可填入，再次点击清除，也可以输入其他数值。留空沿用 Agent 默认；只有会读取该设置的 Agent 受影响。",
-                        "點擊常用值即可填入，再次點擊清除，也可以輸入其他數值。留空沿用 Agent 預設；只有會讀取該設定的 Agent 受影響。",
-                    ),
-                    cx,
-                ))
-                .into_any_element(),
-            cx,
-        ));
-
-        editor.into_any_element()
-    }
-
-    /// The capability fields the Agent can read, as three-state choices.
-    ///
-    /// The catalogue only suggests these; a Provider with no catalogue entry
-    /// still has to be able to declare them, so the control is here rather than
-    /// only inside the suggestion list.
-    fn render_profile_model_capabilities(
-        &mut self,
-        index: usize,
-        pending: bool,
-        cx: &mut Context<Self>,
-    ) -> Vec<AnyElement> {
-        let Some(model) = self.profile_configured_models.get(index) else {
-            return Vec::new();
-        };
-        let capabilities = model.capabilities.clone();
-        let fields = [
-            (
-                "imageInput",
-                management_locale_text("Image input", "图片输入", "圖片輸入"),
-                capabilities.image_input,
-            ),
-            (
-                "pdfInput",
-                management_locale_text("PDF input", "PDF 输入", "PDF 輸入"),
-                capabilities.pdf_input,
-            ),
-            (
-                "temperature",
-                management_locale_text("Honours temperature", "支持温度参数", "支援溫度參數"),
-                capabilities.temperature,
-            ),
-        ];
-        let mut rows = Vec::with_capacity(fields.len());
-        for (field, label, value) in fields {
-            let mut choices = h_flex().w_full().flex_wrap().gap_1p5();
-            for (choice, choice_label) in [
-                (
-                    None,
-                    management_locale_text(
-                        "Follow Agent default",
-                        "跟随 Agent 默认",
-                        "跟隨 Agent 預設",
-                    ),
-                ),
-                (
-                    Some(true),
-                    management_locale_text("Supported", "支持", "支援"),
-                ),
-                (
-                    Some(false),
-                    management_locale_text("Unsupported", "不支持", "不支援"),
-                ),
-            ] {
-                let selected = value == choice;
-                choices = choices.child(management_option_chip(
-                    SharedString::from(format!(
-                        "provider-model-capability-{index}-{field}-{}",
-                        match choice {
-                            None => "inherit",
-                            Some(true) => "yes",
-                            Some(false) => "no",
-                        }
-                    )),
-                    SharedString::from(choice_label),
-                    selected,
-                    pending,
-                    None,
-                    cx.listener(move |this, _, _, cx| {
-                        this.set_profile_model_capability(index, field, choice, cx)
-                    }),
-                    cx,
-                ));
-            }
-            rows.push(
-                v_flex()
-                    .w_full()
-                    .gap_1p5()
-                    .child(management_choice_group_label(label, cx))
-                    .child(choices)
-                    .into_any_element(),
-            );
-        }
-        rows
-    }
-
-    fn set_profile_model_capability(
-        &mut self,
-        index: usize,
-        field: &'static str,
-        value: Option<bool>,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(model) = self.profile_configured_models.get_mut(index) else {
-            return;
-        };
-        match field {
-            "imageInput" => model.capabilities.image_input = value,
-            "pdfInput" => model.capabilities.pdf_input = value,
-            "temperature" => model.capabilities.temperature = value,
-            _ => return,
-        }
-        model
-            .capabilities
-            .set_source(field, vibex_core::ModelCapabilitySource::Declared);
-        self.navigation.mark_dirty(ManagementSection::Agents, true);
-        cx.notify();
-    }
-
-    /// The catalogue's suggestions that the Model does not hold yet.
-    ///
-    /// A field with no declaration is filled as soon as the answer arrives, so
-    /// the editor opens useful instead of blank. A suggestion the form already
-    /// shows is therefore left out rather than listed with an "Apply" that
-    /// would write the value it is already displaying; only a field the user
-    /// changed still offers the way back to the catalogue's value.
-    fn render_capability_suggestions(
-        &mut self,
-        index: usize,
-        cx: &mut Context<Self>,
-    ) -> Vec<AnyElement> {
-        let Some(suggestion) = self.model_capability_suggestion.clone() else {
-            return Vec::new();
-        };
-        let capabilities = self
-            .profile_configured_models
-            .get(index)
-            .map(|model| &model.capabilities);
-        let pending = suggestion
-            .fields
-            .iter()
-            .filter(|field| {
-                capabilities.is_none_or(|capabilities| {
-                    !model_capability_matches_suggestion(capabilities, &field.field, &field.value)
-                })
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        if pending.is_empty() {
-            return Vec::new();
-        }
-        let approximate = suggestion.approximate;
-        let mut rows = Vec::new();
-        rows.push(
-            h_flex()
-                .w_full()
-                .items_center()
-                .justify_end()
-                .child(
-                    Button::new("provider-model-adopt-all")
-                        .xsmall()
-                        .outline()
-                        .label(management_locale_text(
-                            "Apply all suggestions",
-                            "采用全部建议",
-                            "採用全部建議",
-                        ))
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.adopt_all_capability_fields(window, cx)
-                        })),
-                )
-                .into_any_element(),
-        );
-        for field in pending {
-            let label = match field.field.as_str() {
-                "contextTokens" => {
-                    management_locale_text("Context window", "上下文窗口", "上下文視窗")
-                }
-                "outputTokens" => management_locale_text("Max output", "最大输出", "最大輸出"),
-                "reasoning" => management_locale_text("Reasoning", "推理", "推理"),
-                "imageInput" => management_locale_text("Images", "图片输入", "圖片輸入"),
-                "pdfInput" => management_locale_text("PDF", "PDF 输入", "PDF 輸入"),
-                "temperature" => management_locale_text("Temperature", "温度参数", "溫度參數"),
-                _ => continue,
-            };
-            let field_key = field.field.clone();
-            let suggested = field.value.clone();
-            rows.push(
-                h_flex()
-                    .w_full()
-                    .items_center()
-                    .justify_between()
-                    .gap_2()
-                    .child(
-                        div()
-                            .min_w_0()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(format!(
-                                "{} · {} {}{}",
-                                label,
-                                management_locale_text("suggested", "目录建议", "目錄建議"),
-                                suggested,
-                                if approximate {
-                                    management_locale_text(
-                                        " (approximate)",
-                                        "（近似匹配）",
-                                        "（近似比對）",
-                                    )
-                                } else {
-                                    ""
-                                }
-                            )),
-                    )
-                    .child(
-                        Button::new(SharedString::from(format!(
-                            "provider-model-adopt-{index}-{field_key}"
-                        )))
-                        .xsmall()
-                        .ghost()
-                        .label(if approximate {
-                            management_locale_text(
-                                "Apply (approximate)",
-                                "采用（近似匹配）",
-                                "採用（近似比對）",
-                            )
-                        } else {
-                            management_locale_text("Apply", "采用", "採用")
-                        })
-                        .on_click(cx.listener(
-                            move |this, _, window, cx| {
-                                this.adopt_capability_field(field_key.clone(), window, cx)
-                            },
-                        )),
-                    )
-                    .into_any_element(),
-            );
-        }
-        // A source label, so an adopted value is never mistaken for a hand-typed
-        // one later.
-        if !rows.is_empty()
-            && self
-                .profile_configured_models
-                .get(index)
-                .is_some_and(|model| model.capabilities.adopted_from_catalog().next().is_some())
-        {
-            rows.push(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(management_locale_text(
-                        "Values without a declaration were filled from the catalogue and can still be changed.",
-                        "未声明过的数值已按模型目录自动填入，仍可修改。",
-                        "未宣告過的數值已按模型目錄自動填入，仍可修改。",
-                    ))
-                    .into_any_element(),
-            );
-        }
-        rows
-    }
-
-    /// Adopts every suggested field in one gesture.
-    ///
-    /// The per-field controls remain for the case where only one value is
-    /// trusted; this is the same adoption repeated, not a different path.
-    fn adopt_all_capability_fields(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(suggestion) = self.model_capability_suggestion.clone() else {
-            return;
-        };
-        for field in suggestion.fields {
-            self.adopt_capability_field(field.field, window, cx);
-        }
-    }
-
-    /// Adopts one suggested field into the Model being edited.
-    ///
-    /// The value is written into the same field the user would type into, and
-    /// its provenance is recorded so a projection can tell it from a
-    /// declaration. Clearing the field afterwards returns it to `Declared`.
-    fn adopt_capability_field(
-        &mut self,
-        field: String,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(suggestion) = self.model_capability_suggestion.clone() else {
-            return;
-        };
-        let Some(index) = self.selected_profile_model_index() else {
-            return;
-        };
-        let Some(model) = self.profile_configured_models.get_mut(index) else {
-            return;
-        };
-        // An explicit adoption is the user's decision on a field, so it may
-        // replace a value the user typed; the control is only shown while the
-        // field differs from the catalogue, so the click states what it will
-        // do instead of writing silently.
-        // The declaration owns the mapping from a suggested field to itself, so
-        // the editor does not grow a second copy of it.
-        let mut capabilities = model.capabilities.clone();
-        if !suggestion.adopt(&mut capabilities, &field) {
-            return;
-        }
-        model.capabilities = capabilities;
-        // The visible fields follow the declaration they now hold.
-        match field.as_str() {
-            "contextTokens" => {
-                if let Some(value) = model.capabilities.context_tokens {
-                    self.profile_model_edit_context_tokens
-                        .update(cx, |state, cx| {
-                            state.set_value(value.to_string(), window, cx)
-                        });
-                }
-            }
-            "outputTokens" => {
-                if let Some(value) = model.capabilities.output_tokens {
-                    self.profile_model_edit_output_tokens
-                        .update(cx, |state, cx| {
-                            state.set_value(value.to_string(), window, cx)
-                        });
-                }
-            }
-            _ => {}
-        }
-        self.navigation.mark_dirty(ManagementSection::Agents, true);
-        cx.notify();
     }
 
     /// Checks or unchecks every picker row the current search shows.
@@ -25747,7 +23926,7 @@ impl ManagementCenter {
                         .pt_4()
                         .pb_4()
                         .child(self.render_profile_candidates_pane(true, cx))
-                        .child(self.render_profile_settings_pane(true, cx)),
+                        .child(self.render_profile_settings_pane(true, window, cx)),
                 );
             }
         } else {
@@ -25755,7 +23934,7 @@ impl ManagementCenter {
             if shows_model {
                 stacked = stacked
                     .child(self.render_profile_candidates_pane(false, cx))
-                    .child(self.render_profile_settings_pane(false, cx));
+                    .child(self.render_profile_settings_pane(false, window, cx));
             }
             body = body.child(
                 div()
@@ -27253,7 +25432,7 @@ impl ManagementCenter {
                 "wireApi",
                 Some(wire_api.wire_protocol_id().to_string()),
             );
-            self.profile_model_edit_wire_api = Some(wire_api);
+            self.model_editor.wire_api = Some(wire_api);
         }
         for (protocol, url) in &preset.endpoints {
             if let Some(wire_api) =
@@ -39369,6 +37548,19 @@ fn parse_optional_u64(value: &str) -> Result<Option<u64>, &'static str> {
 }
 
 /// The API protocol a shared Provider's model declares, if any.
+/// A saved catalogue entry as the editor's draft shape.
+fn provider_configured_model_from_catalog(
+    model: &vibex_core::ModelProviderCatalogEntry,
+) -> vibex_core::ProviderConfiguredModel {
+    vibex_core::ProviderConfiguredModel {
+        id: model.id.clone(),
+        display_name: model.display_name.clone(),
+        enabled: model.enabled,
+        wire_api: shared_model_wire_api(model),
+        capabilities: model.capabilities.clone(),
+    }
+}
+
 fn shared_model_wire_api(
     model: &vibex_core::ModelProviderCatalogEntry,
 ) -> Option<vibex_core::ProviderModelWireApi> {
@@ -45173,23 +43365,6 @@ fn empty_state(
 /// The suggestion is a string because that is how the catalogue spells the
 /// field, so the declaration is compared in the same spelling rather than
 /// re-parsing it. A missing declaration never matches.
-fn model_capability_matches_suggestion(
-    capabilities: &vibex_core::ProviderModelCapabilities,
-    field: &str,
-    suggested: &str,
-) -> bool {
-    let current = match field {
-        "contextTokens" => capabilities.context_tokens.map(|value| value.to_string()),
-        "outputTokens" => capabilities.output_tokens.map(|value| value.to_string()),
-        "reasoning" => capabilities.reasoning.map(|value| value.to_string()),
-        "imageInput" => capabilities.image_input.map(|value| value.to_string()),
-        "pdfInput" => capabilities.pdf_input.map(|value| value.to_string()),
-        "temperature" => capabilities.temperature.map(|value| value.to_string()),
-        _ => return false,
-    };
-    current.as_deref() == Some(suggested)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -45625,10 +43800,10 @@ mod tests {
             });
         });
         center.read_with(cx, |center, cx| {
-            let raw = center.provider_create_headers.read(cx).value().to_string();
+            let raw = center.provider_form.headers.read(cx).value().to_string();
             let stored: serde_json::Value = serde_json::from_str(&raw).unwrap();
             assert_eq!(stored["x-opencode-session"]["variable"], "session_id");
-            assert!(center.provider_create_headers_open);
+            assert!(center.provider_form.headers_open);
         });
     }
 
@@ -45704,7 +43879,7 @@ mod tests {
         let _ = cx.update_window(handle, |_, window, cx| {
             center.update(cx, |center, cx| {
                 center.workspace_create_choosing = false;
-                center.provider_create_name.update(cx, |state, cx| {
+                center.provider_form.name.update(cx, |state, cx| {
                     state.set_value("Provider draft", window, cx);
                 });
             });
@@ -45736,10 +43911,7 @@ mod tests {
             assert!(center.provider_create_page_open);
             assert!(!center.route_group_page_open);
             assert!(!center.workspace_create_choosing);
-            assert_eq!(
-                center.provider_create_name.read(cx).value(),
-                "Provider draft"
-            );
+            assert_eq!(center.provider_form.name.read(cx).value(), "Provider draft");
         });
 
         let _ = cx.update_window(handle, |_, window, cx| {
@@ -45791,19 +43963,26 @@ mod tests {
             .expect("Management production source should remain inspectable");
         let apply = source
             .split_once("    fn apply_profile_model_edit(")
-            .and_then(|(_, tail)| {
-                tail.split_once("\n    /// Keeps the per-Protocol interface selection")
-            })
+            .and_then(|(_, tail)| tail.split_once("\n    fn duplicate_provider_profile("))
             .map(|(body, _)| body)
             .expect("Model write-through should remain inspectable");
 
         assert!(!production.contains("save_profile_model_editor"));
         assert!(!production.contains("Apply model changes"));
-        assert!(apply.contains("ProfileModelEditField::Id"));
-        assert!(apply.contains("ProfileModelEditField::Reasoning"));
-        assert!(apply.contains("ProfileModelEditField::Limits"));
+        // The pane delegates to the shared editor's one write-through entry.
+        assert!(apply.contains("apply_model_editor(cx)"));
+        let editor = include_str!("management/provider_workspace/model_editor.rs");
+        let read = editor
+            .split_once("    pub(in crate::management) fn read(")
+            .and_then(|(_, tail)| tail.split_once("    /// Whether a field still equals"))
+            .map(|(body, _)| body)
+            .expect("the editor's read rules should remain inspectable");
+        assert!(read.contains("ModelEditError::Id"));
+        assert!(read.contains("ModelEditError::Reasoning"));
+        assert!(read.contains("ModelEditError::Limits"));
         // A field that does not parse keeps the Model's previous value.
-        assert!(apply.contains("if let Some((context, output)) = declared_limits"));
+        assert!(read.contains("declared_token_limits(&context_text, &output_text)"));
+        assert!(read.contains("if id.is_empty()"));
     }
 
     #[test]
@@ -47753,16 +45932,13 @@ mod tests {
 
                 // Opening a configured Model loads its settings.
                 center.select_profile_model("gemini-3.8-flash".to_string(), window, cx);
-                assert_eq!(
-                    center.profile_model_edit_id.read(cx).value(),
-                    "gemini-3.8-flash"
-                );
+                assert_eq!(center.model_editor.id.read(cx).value(), "gemini-3.8-flash");
 
                 // Opening a row the draft does not hold shows the command that
                 // adds it, never the previous Model's id under the new header.
                 center.select_profile_model("glm-5.1".to_string(), window, cx);
                 assert!(center.selected_profile_model_index().is_none());
-                assert!(center.profile_model_edit_id.read(cx).value().is_empty());
+                assert!(center.model_editor.id.read(cx).value().is_empty());
 
                 // Checking the row the pane is showing opens its settings, with
                 // the id that row names.
@@ -47773,7 +45949,7 @@ mod tests {
                     .expect("the catalogue row must be listed")
                     .clone();
                 center.select_profile_candidate(&glm, true, window, cx);
-                assert_eq!(center.profile_model_edit_id.read(cx).value(), "glm-5.1");
+                assert_eq!(center.model_editor.id.read(cx).value(), "glm-5.1");
                 assert_eq!(center.profile_model_selection.as_deref(), Some("glm-5.1"));
 
                 // Releasing it leaves the pane with nothing to edit, so no field
@@ -47786,7 +45962,7 @@ mod tests {
                     .clone();
                 center.select_profile_candidate(&glm, false, window, cx);
                 assert!(center.selected_profile_model_index().is_none());
-                assert!(center.profile_model_edit_id.read(cx).value().is_empty());
+                assert!(center.model_editor.id.read(cx).value().is_empty());
             });
         });
     }
@@ -47834,7 +46010,7 @@ mod tests {
 
                 center.delete_profile_model("gpt-5".to_string(), window, cx);
                 assert!(center.profile_model_selection.is_none());
-                assert!(center.profile_model_edit_id.read(cx).value().is_empty());
+                assert!(center.model_editor.id.read(cx).value().is_empty());
                 // The catalogue still advertises it, so the row survives as the
                 // plain, unconfigured row a fetch would have produced.
                 let rows = center.profile_candidate_rows();
@@ -48054,8 +46230,8 @@ mod tests {
         });
         let (create_base_url, create_key) = center.read_with(cx, |center, _| {
             (
-                center.provider_create_base_url.clone(),
-                center.provider_create_api_key.clone(),
+                center.provider_form.base_url.clone(),
+                center.provider_form.api_key.clone(),
             )
         });
         type_into(&create_base_url, "https://relay.example.com/v1", cx);
@@ -48141,8 +46317,10 @@ mod tests {
             .map(|(body, _)| body)
             .expect("the page's automatic fetch should remain inspectable");
         assert!(page_ready.contains("workspace_configurable_agents()"));
-        assert!(page_ready.contains("provider_create_base_url"));
-        assert!(page_ready.contains("provider_create_api_key"));
+        // The readiness checks read the draft's address and Key, however the
+        // field access is line-wrapped.
+        assert!(page_ready.contains(".base_url"));
+        assert!(page_ready.contains(".api_key"));
 
         // Both fields a fetch reads schedule it, in both surfaces.
         for marker in [
@@ -48176,13 +46354,15 @@ mod tests {
             .expect("Model picker should remain inspectable");
         let settings = source
             .split_once("    fn render_profile_settings_pane(")
-            .and_then(|(_, tail)| tail.split_once("    fn render_profile_model_editor("))
+            .and_then(|(_, tail)| tail.split_once("    fn render_profile_model_capabilities("))
             .map(|(body, _)| body)
             .expect("Model settings pane should remain inspectable");
-        let editor = source
-            .split_once("    fn render_profile_model_editor(")
-            .and_then(|(_, tail)| tail.split_once("\n    fn render_capability_suggestions("))
-            .map(|(body, _)| body)
+        // The editor body itself moved into the Provider workspace module so
+        // the Agent dialog and a saved record draw the very same one.
+        let editor_src = include_str!("management/provider_workspace/model_editor.rs");
+        let editor = editor_src
+            .split_once("    pub(in crate::management) fn render_model_editor(")
+            .map(|(_, tail)| tail)
             .expect("Model editor should remain inspectable");
 
         assert!(dialog.contains("self.render_profile_candidates_pane("));
@@ -48201,18 +46381,20 @@ mod tests {
         assert!(settings.contains("profile_pane_shell("));
         // The settings pane edits the selected Model, and offers to add it when
         // the Provider does not offer it yet.
-        assert!(settings.contains("self.render_profile_model_editor("));
+        assert!(settings.contains("self.render_model_editor("));
         assert!(settings.contains("provider-model-add-selected"));
         assert!(settings.contains("selected_profile_model_index()"));
         // Every group of mutually exclusive choices draws its options as chips,
         // so a choice never renders as a run of body text.
         assert!(editor.contains("management_option_chip("));
+        // The prefix is the caller's: the Agent dialog passes `profile`, a
+        // saved record passes `shared`, and the fields carry no prefix at all.
         for group in [
-            "provider-model-catalog-",
-            "provider-model-wire-",
-            "provider-model-reasoning-",
-            "provider-model-efforts-level-",
-            "provider-model-capability-",
+            "-model-catalog-",
+            "-model-wire-",
+            "-model-reasoning-",
+            "-model-efforts-",
+            "model-capability-",
         ] {
             assert!(
                 editor.contains(group),
@@ -48248,9 +46430,9 @@ mod tests {
                 // A configured Model opens its own settings.
                 center.select_profile_model("gpt-5".to_string(), window, cx);
                 assert_eq!(center.selected_profile_model_index(), Some(0));
-                assert_eq!(center.profile_model_edit_id.read(cx).value(), "gpt-5");
+                assert_eq!(center.model_editor.id.read(cx).value(), "gpt-5");
                 assert_eq!(
-                    center.profile_model_edit_context_tokens.read(cx).value(),
+                    center.model_editor.context_tokens.read(cx).value(),
                     "128000"
                 );
 
@@ -48286,7 +46468,8 @@ mod tests {
                 center.profile_configured_models = vec![declared];
                 center.profile_model_selection = Some("declared-model".to_string());
                 center
-                    .profile_model_edit_context_tokens
+                    .model_editor
+                    .context_tokens
                     .update(cx, |state, cx| state.set_value("64000", window, cx));
                 center.model_capability_suggestion =
                     Some(vibex_core::GatewayCapabilitySuggestion {
@@ -48310,14 +46493,8 @@ mod tests {
                 assert_eq!(model.capabilities.output_tokens, Some(128_000));
                 assert_eq!(model.capabilities.image_input, Some(true));
                 assert_eq!(model.capabilities.temperature, Some(false));
-                assert_eq!(
-                    center.profile_model_edit_output_tokens.read(cx).value(),
-                    "128000"
-                );
-                assert_eq!(
-                    center.profile_model_edit_context_tokens.read(cx).value(),
-                    "64000"
-                );
+                assert_eq!(center.model_editor.output_tokens.read(cx).value(), "128000");
+                assert_eq!(center.model_editor.context_tokens.read(cx).value(), "64000");
                 assert!(
                     model
                         .capabilities
@@ -48339,14 +46516,9 @@ mod tests {
         cx.update(gpui_component::init);
         let (center, cx) = cx.add_window_view(ManagementCenter::new);
         cx.update(|window, cx| {
-            let context = cx.new(|cx| InputState::new(window, cx));
-            let output = cx.new(|cx| InputState::new(window, cx));
             center.update(cx, |center, cx| {
                 center.provider_model_edit_id = Some("claude-haiku-5-5".to_string());
-                center.provider_model_edit_context = Some(context);
-                center.provider_model_edit_output = Some(output);
-                center.provider_model_edit_image_input = None;
-                center.provider_model_edit_temperature = Some(false);
+                center.model_editor.temperature = Some(false);
                 center.apply_provider_model_capability_suggestion(
                     Some(vibex_core::GatewayCapabilitySuggestion {
                         approximate: false,
@@ -48362,30 +46534,18 @@ mod tests {
                 );
 
                 assert_eq!(
-                    center
-                        .provider_model_edit_context
-                        .as_ref()
-                        .expect("context input")
-                        .read(cx)
-                        .value(),
+                    center.model_editor.context_tokens.read(cx).value(),
                     "1000000"
                 );
+                assert_eq!(center.model_editor.output_tokens.read(cx).value(), "128000");
+                assert_eq!(center.model_editor.image_input, Some(true));
                 assert_eq!(
-                    center
-                        .provider_model_edit_output
-                        .as_ref()
-                        .expect("output input")
-                        .read(cx)
-                        .value(),
-                    "128000"
-                );
-                assert_eq!(center.provider_model_edit_image_input, Some(true));
-                assert_eq!(
-                    center.provider_model_edit_temperature,
+                    center.model_editor.temperature,
                     Some(false),
                     "a declared capability must survive the automatic fill"
                 );
-                assert_eq!(center.provider_model_capability_auto_filled, 3);
+                assert_eq!(center.model_editor.suggestion_auto_filled, 3);
+                assert!(center.model_editor.suggestion.is_some());
             });
         });
     }
@@ -48404,13 +46564,17 @@ mod tests {
             .map(|(body, _)| body)
             .expect("shared model editor should remain inspectable");
         assert!(toggle.contains("request_provider_model_capability_suggestion("));
+        // Both surfaces now draw the one editor, so its own body is what the
+        // suggestions and capability chips live in.
         let inline = source
             .split_once("    fn render_shared_provider_model_inline(")
             .and_then(|(_, tail)| tail.split_once("    fn render_gateway_key_policy("))
             .map(|(body, _)| body)
             .expect("inline model editor should remain inspectable");
-        assert!(inline.contains("render_provider_model_capability_suggestions("));
-        assert!(inline.contains("set_provider_model_edit_capability("));
+        assert!(inline.contains("self.render_model_editor("));
+        let editor = include_str!("management/provider_workspace/model_editor.rs");
+        assert!(editor.contains("render_model_capability_suggestions("));
+        assert!(editor.contains("model-capability-{field}-"));
         let load = source
             .split_once("    fn load_profile_model_editor(")
             .and_then(|(_, tail)| {
@@ -48626,7 +46790,8 @@ mod tests {
         );
         assert_eq!(
             center.read_with(cx, |center, cx| center
-                .profile_model_edit_id
+                .model_editor
+                .id
                 .read(cx)
                 .value()
                 .to_string()),
@@ -49384,18 +47549,29 @@ mod tests {
             save.contains("key: \"wireApi\""),
             "the created Models carry the protocol the page recorded"
         );
-        let endpoints = save
-            .split_once("let mut endpoints = Vec::new();")
-            .and_then(|(_, tail)| tail.split_once("if endpoints.is_empty() {"))
+        // The form owns one address per protocol, so the preset's own list is
+        // what seeds them and the save path writes every one of them.
+        assert!(
+            save.contains("provider_form_endpoints(cx, created_wire_api)"),
+            "the page must write the endpoints its form describes"
+        );
+        let region = source
+            .split_once("    fn apply_provider_create_preset_region(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// Fetches the model list"))
+            .map(|(body, _)| body)
+            .expect("the preset region should remain inspectable");
+        assert!(
+            region.contains("regional.endpoints"),
+            "every protocol the preset publishes must reach the form"
+        );
+        let endpoints = source
+            .split_once("    fn provider_form_endpoints(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn provider_form_proxy_policy("))
             .map(|(body, _)| body)
             .expect("the page should build the preset's API endpoints");
         assert!(
-            endpoints.contains("preset.endpoints"),
-            "every protocol the preset publishes must reach the record"
-        );
-        assert!(
-            endpoints.contains("created_wire_api"),
-            "the edited address must name the preset's protocol"
+            endpoints.contains("pinned_protocol"),
+            "the preset's protocol must reach the fallback address"
         );
         assert!(
             endpoints.contains("wire_protocol_id: Some(wire_api.wire_protocol_id().to_string())"),
@@ -51521,13 +49697,13 @@ mod gateway_surface_tests {
     }
 
     #[test]
-    fn the_shared_provider_editor_writes_the_shared_record() {
+    fn the_provider_form_writes_either_scope() {
         let source = include_str!("management.rs");
         let save = source
-            .split_once("    fn save_shared_provider_editor(")
-            .and_then(|(_, tail)| tail.split_once("    fn render_shared_provider_editor("))
+            .split_once("    fn save_shared_provider_form(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// The identity a Key row shows"))
             .map(|(body, _)| body)
-            .expect("the shared Provider editor should remain inspectable");
+            .expect("the shared Provider form should remain inspectable");
         assert!(save.contains("update_shared_provider("));
         assert!(save.contains("configured_models"));
         assert!(save.contains("default_model_id"));
@@ -51535,8 +49711,20 @@ mod gateway_surface_tests {
         assert!(save.contains("metadata.catalog_id"));
         assert!(save.contains("metadata.only_through_route_groups"));
         assert!(save.contains("profile.headers = headers"));
+        assert!(save.contains("provider_form_metadata(cx)"));
         assert!(source.contains("provider-shared-edit-"));
         assert!(source.contains("open_shared_provider_editor_by_id"));
+        // The create request carries the same metadata, so note, website and
+        // visibility are written at creation instead of only on a later edit.
+        let create = source
+            .split_once("    fn save_provider_create_page(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// Validates the fields both scopes share")
+            })
+            .map(|(body, _)| body)
+            .expect("the create page should remain inspectable");
+        assert!(create.contains("metadata,"));
+        assert!(create.contains("provider_form_metadata(cx)"));
     }
 
     #[test]
@@ -53876,24 +52064,24 @@ mod gateway_surface_tests {
     #[test]
     fn a_catalogue_value_is_not_suggested_once_the_model_has_it() {
         let mut capabilities = vibex_core::ProviderModelCapabilities::default();
-        assert!(!model_capability_matches_suggestion(
+        assert!(!provider_workspace::capability_matches_suggestion(
             &capabilities,
             "contextTokens",
             "1000000"
         ));
         capabilities.context_tokens = Some(1_000_000);
         capabilities.image_input = Some(true);
-        assert!(model_capability_matches_suggestion(
+        assert!(provider_workspace::capability_matches_suggestion(
             &capabilities,
             "contextTokens",
             "1000000"
         ));
-        assert!(model_capability_matches_suggestion(
+        assert!(provider_workspace::capability_matches_suggestion(
             &capabilities,
             "imageInput",
             "true"
         ));
-        assert!(!model_capability_matches_suggestion(
+        assert!(!provider_workspace::capability_matches_suggestion(
             &capabilities,
             "imageInput",
             "false"
@@ -54095,7 +52283,7 @@ mod gateway_surface_tests {
             display_name: "Route group".to_string(),
             kind: vibex_core::RouteKind::ModelGroup,
             agent_model_id: Some("group".to_string()),
-            members: (0..6)
+            members: (0..10)
                 .map(|index| {
                     vibex_core::ModelRouteMember::new(
                         providers[index].id.clone(),
@@ -54388,15 +52576,16 @@ mod gateway_surface_tests {
 
     /// A map taller than the page must not crush the records to nothing.
     ///
-    /// The records card takes the height the page leaves, but a six-member map
-    /// leaves only its heading and its footer, so the table drew a 37px sliver
-    /// and looked like a card with no records in it. The card keeps a floor,
+    /// The records card takes the height the page leaves, but a ten-member map
+    /// is taller than the page on its own, so the card would keep only its
+    /// heading and its footer and the table would draw a 37px sliver: the
+    /// records looked missing rather than scrolled. The card keeps a floor,
     /// and the page scrolls to whatever no longer fits.
     #[gpui::test]
     fn the_gateway_routing_records_keep_a_height_under_a_tall_map(cx: &mut gpui::TestAppContext) {
         cx.update(gpui_component::init);
         let (center, cx) = cx.add_window_view(ManagementCenter::new);
-        let providers = (0..10)
+        let providers = (0..24)
             .map(|index| vibex_core::ModelProviderProfile {
                 display_name: format!("Provider {index:02}"),
                 configured_models: vec![vibex_core::ModelProviderCatalogEntry {
@@ -54414,7 +52603,7 @@ mod gateway_surface_tests {
             display_name: "Route group".to_string(),
             kind: vibex_core::RouteKind::ModelGroup,
             agent_model_id: Some("group".to_string()),
-            members: (0..6)
+            members: (0..10)
                 .map(|index| {
                     vibex_core::ModelRouteMember::new(
                         providers[index].id.clone(),
@@ -54426,6 +52615,7 @@ mod gateway_surface_tests {
             status: vibex_core::RouteStatus::Enabled,
             ..Default::default()
         };
+        let route_id = route.id.clone();
         cx.update(|window, cx| {
             center.update(cx, |center, cx| {
                 center.navigation.active = ManagementSection::Providers;
@@ -54436,6 +52626,7 @@ mod gateway_surface_tests {
                 let rows = (0..200)
                     .map(|index| {
                         let mut row = ledger_request(Some("primary"), None);
+                        row.model_requested = format!("group/{}/model-00", route_id.as_str());
                         row.created_at_ms = 1_700_000_000_000 - index * 1_000;
                         row
                     })
@@ -54452,11 +52643,57 @@ mod gateway_surface_tests {
             });
             cx.run_until_parked();
         }
-        let page = cx.debug_bounds("management-detail-page");
-        let map = cx.debug_bounds("management-gateway-route-map");
-        let card = cx.debug_bounds("management-gateway-requests");
-        let table = cx.debug_bounds("management-gateway-request-table");
+        let page = cx
+            .debug_bounds("management-detail-page")
+            .expect("the gateway page is drawn");
+        let map = cx
+            .debug_bounds("management-gateway-route-map")
+            .expect("the map is drawn");
+        let card = cx
+            .debug_bounds("management-gateway-requests")
+            .expect("the records card is drawn");
+        let table = cx
+            .debug_bounds("management-gateway-request-table")
+            .expect("the records table is drawn");
+        // The map is taller than the whole page, so it alone cannot leave the
+        // records a usable height: the card keeps its floor and the page
+        // scrolls to it instead.
+        assert!(
+            map.size.height > page.size.height,
+            "the map alone must outgrow the page: map={map:?} page={page:?}"
+        );
+        assert!(
+            card.size.height >= px(240.0),
+            "the records card keeps its floor under a tall map: card={card:?}"
+        );
+        assert!(
+            table.size.height >= px(3.0 * 36.0),
+            "the table keeps several rows instead of a sliver: table={table:?}"
+        );
+        assert!(
+            table.top() >= card.top() && table.bottom() <= card.bottom(),
+            "the table stays inside the card: card={card:?} table={table:?}"
+        );
         let offset = center.read_with(cx, |center, _| center.workspace_detail_scroll.max_offset());
+        assert!(
+            offset.y > px(0.0),
+            "the page scrolls to the records it cannot fit: {offset:?}"
+        );
+
+        // Scroll the records into view and check they are actually painted,
+        // not just measured below the fold.
+        cx.update(|window, cx| {
+            center.update(cx, |center, _| {
+                center
+                    .workspace_detail_scroll
+                    .set_offset(point(px(0.0), offset.y));
+            });
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+        let table = cx
+            .debug_bounds("management-gateway-request-table")
+            .expect("the records table is still drawn after scrolling");
         let ids = center.read_with(cx, |center, _| {
             center
                 .gateway_requests
@@ -54465,31 +52702,21 @@ mod gateway_surface_tests {
                 .map(|row| format!("management-gateway-request-row-{}", row.request_id.as_str()))
                 .collect::<Vec<_>>()
         });
-        let mut rows = Vec::new();
+        let mut painted = 0;
         for id in ids {
             let leaked: &'static str = id.leak();
-            rows.push((leaked, cx.debug_bounds(leaked)));
+            let Some(row) = cx.debug_bounds(leaked) else {
+                continue;
+            };
+            assert!(
+                row.top() >= table.top() && row.bottom() <= table.bottom(),
+                "a record paints inside the table: row={row:?} table={table:?}"
+            );
+            painted += 1;
         }
-        let all = cx.update(|window, _| {
-            window
-                .painted_quads()
-                .iter()
-                .filter(|quad| {
-                    let p = quad.bounds.origin;
-                    p.x.as_f32() > 600.0 && p.y.as_f32() > 500.0 && p.y.as_f32() < 700.0
-                })
-                .map(|quad| {
-                    (
-                        quad.bounds.origin.y.as_f32(),
-                        quad.bounds.size.height.as_f32(),
-                    )
-                })
-                .take(10)
-                .collect::<Vec<_>>()
-        });
-        eprintln!("quads_in_body={all:?}");
-        eprintln!(
-            "page={page:?}\nmap={map:?}\ncard={card:?}\ntable={table:?}\nscroll_max={offset:?}\nrows={rows:?}"
+        assert!(
+            painted >= 3,
+            "the table paints its records once scrolled into view"
         );
     }
 }

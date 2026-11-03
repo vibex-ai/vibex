@@ -344,7 +344,7 @@ impl ManagementCenter {
                 )
                 .item(
                     PopupMenuItem::new(management_locale_text("Route group", "路由组", "路由組"))
-                        .icon(Icon::default().path("icons/vibex/git-branch.svg"))
+                        .icon(Icon::default().path("icons/vibex/directions.svg"))
                         .on_click(group),
                 )
                 .separator()
@@ -722,7 +722,7 @@ impl ManagementCenter {
             selected,
             checked,
             workspace_card_mark(ws_icon_mark(
-                "icons/vibex/git-branch.svg",
+                "icons/vibex/directions.svg",
                 px(22.0),
                 None,
                 cx,
