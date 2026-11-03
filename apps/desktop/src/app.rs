@@ -8278,6 +8278,21 @@ fn auto_continue_should_start(
         && !paused
 }
 
+/// Whether a snapshot moved a session from a settled turn into a new one.
+///
+/// A stop's pause belongs to the turn the reader stopped. A session that was
+/// resting and is now working again has started a different turn, and the pause
+/// no longer holds anything back; a session that is already working only changed
+/// revision within the turn it was stopped in, so its pause has to survive the
+/// snapshot.
+fn session_snapshot_starts_a_turn(previous: AgentSessionState, current: AgentSessionState) -> bool {
+    matches!(previous, AgentSessionState::Idle | AgentSessionState::Error)
+        && matches!(
+            current,
+            AgentSessionState::Running | AgentSessionState::Initializing
+        )
+}
+
 fn restored_auto_continue_session_ids(state: &SessionUiState) -> BTreeSet<String> {
     state
         .auto_continue_session_overrides
@@ -19129,6 +19144,13 @@ impl VibexWorkbench {
             self.auto_continue_turn_statuses.remove(session.id.as_str());
             self.auto_continue_probe_tasks.remove(session.id.as_str());
             self.cancel_auto_continue_countdown(&session.id);
+            // A turn that starts after the reader stopped one is a different
+            // turn: the stop held back the continuation of the one before it,
+            // not of this one.
+            if session_snapshot_starts_a_turn(existing_state, session.state) {
+                self.auto_continue_paused_turn_session_ids
+                    .remove(session.id.as_str());
+            }
             // The completion probe for the superseded revision can no longer
             // answer for this one. Re-arm a waiting auto-send queue so the
             // next frame probes the current revision instead of stranding it
@@ -19924,8 +19946,10 @@ impl VibexWorkbench {
             session_state,
             AgentSessionState::Idle | AgentSessionState::Error
         ) {
-            self.auto_continue_paused_turn_session_ids
-                .remove(session_id.as_str());
+            // The turn is live, so the revision a continuation was already sent
+            // for is done with. A stop's pause is not: it has to outlive the
+            // running revision it was set on and suppress the continuation of
+            // the revision the turn settles into.
             self.auto_continue_handled_turns.remove(session_id.as_str());
         }
         let should_start = auto_continue_should_start(
@@ -20193,6 +20217,30 @@ impl VibexWorkbench {
         false
     }
 
+    /// Holds back the continuation that would follow the turn the reader
+    /// stopped, without suspending the session's own auto-continue preference.
+    ///
+    /// A stop speaks about the turn in front of the reader: the continuation
+    /// that was about to follow it must not fire, but the session stays armed
+    /// for the turns after it. The persisted suspension — the pause badge and
+    /// the "Resume auto continue" entry — belongs to the reader's explicit
+    /// pause of the countdown, and switching auto-continue off belongs to the
+    /// switch. Neither is a side effect of stopping a turn.
+    fn pause_next_auto_continue(&mut self, session_id: &VibexSessionId) {
+        if let Some(countdown) = self.auto_continue_countdowns.remove(session_id.as_str()) {
+            self.auto_continue_handled_turns.insert(
+                session_id.as_str().to_string(),
+                countdown.session_updated_at_ms,
+            );
+        }
+        self.auto_continue_countdown_tasks
+            .remove(session_id.as_str());
+        if self.auto_continue_enabled(session_id) {
+            self.auto_continue_paused_turn_session_ids
+                .insert(session_id.as_str().to_string());
+        }
+    }
+
     fn pause_auto_continue(&mut self, session_id: &VibexSessionId, cx: &mut Context<Self>) {
         // A manual pause suspends this session's auto-continue without
         // discarding its persisted preference: the pause survives restarts and
@@ -20224,7 +20272,8 @@ impl VibexWorkbench {
     }
 
     /// Lifts the persisted auto-continue suspension the user installed by
-    /// pausing the countdown or stopping the session.
+    /// pausing the countdown, together with the turn-scoped pause a stop may
+    /// have left behind.
     fn resume_auto_continue(&mut self, session_id: &VibexSessionId, cx: &mut Context<Self>) {
         if !self
             .auto_continue_paused_session_ids
@@ -20236,6 +20285,8 @@ impl VibexWorkbench {
             .session
             .auto_continue_paused_session_ids
             .clone_from(&self.auto_continue_paused_session_ids);
+        self.auto_continue_paused_turn_session_ids
+            .remove(session_id.as_str());
         self.auto_continue_handled_turns.remove(session_id.as_str());
         self.queue_ui_state();
         self.invalidate_sidebar_projection_cache();
@@ -36523,10 +36574,11 @@ impl VibexWorkbench {
         else {
             return;
         };
-        // An explicit user interrupt suspends this session's auto-continue
-        // without discarding its persisted preference. The pause survives
-        // restarts and clears when the user resumes it or sends a new message.
-        self.pause_auto_continue(&session_id, cx);
+        // An explicit user interrupt holds back the continuation that would
+        // have followed the stopped turn. It is not a cancel: the session's
+        // auto-continue preference stays on, and it is not a persisted
+        // suspension either — that belongs to the reader's own pause.
+        self.pause_next_auto_continue(&session_id);
         self.notification_suppressed_session_ids
             .insert(session_id.as_str().to_string());
         let has_queued_messages = self
@@ -105511,6 +105563,55 @@ mod tests {
     }
 
     #[test]
+    fn a_stop_pauses_only_the_turn_it_interrupted() {
+        // A session that starts working from a settled state is a different
+        // turn, so the pause a stop installed is lifted there.
+        assert!(session_snapshot_starts_a_turn(
+            AgentSessionState::Idle,
+            AgentSessionState::Running
+        ));
+        assert!(session_snapshot_starts_a_turn(
+            AgentSessionState::Error,
+            AgentSessionState::Initializing
+        ));
+        // The interrupted turn only moves revision while it winds down, and
+        // the settle that follows is exactly the revision the pause has to
+        // suppress.
+        assert!(!session_snapshot_starts_a_turn(
+            AgentSessionState::Running,
+            AgentSessionState::Running
+        ));
+        assert!(!session_snapshot_starts_a_turn(
+            AgentSessionState::Initializing,
+            AgentSessionState::Running
+        ));
+        assert!(!session_snapshot_starts_a_turn(
+            AgentSessionState::Running,
+            AgentSessionState::Idle
+        ));
+
+        let source = include_str!("app.rs");
+        let sync = source
+            .split_once("    fn sync_auto_continue_for_session(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn start_auto_continue_countdown("))
+            .map(|(body, _)| body)
+            .expect("auto-continue sync should remain inspectable");
+        // A running revision may not retire the stop's pause before the turn
+        // settles into the revision the pause exists for.
+        assert!(
+            !sync.contains("self.auto_continue_paused_turn_session_ids\n                .remove(")
+        );
+
+        let upsert = source
+            .split_once("    fn upsert_session_snapshot(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn session_turn_pending("))
+            .map(|(body, _)| body)
+            .expect("session snapshot reconciliation should remain inspectable");
+        assert!(upsert.contains("session_snapshot_starts_a_turn(existing_state, session.state)"));
+        assert!(upsert.contains("auto_continue_paused_turn_session_ids"));
+    }
+
+    #[test]
     fn auto_continue_countdown_is_five_seconds_and_localized() {
         assert_eq!(AUTO_CONTINUE_COUNTDOWN_SECONDS, 5);
         assert_eq!(AUTO_CONTINUE_TICK_INTERVAL, Duration::from_secs(1));
@@ -105643,8 +105744,21 @@ mod tests {
             .and_then(|(_, tail)| tail.split_once("\n    fn continue_session("))
             .map(|(body, _)| body)
             .expect("manual interruption should remain inspectable");
-        assert!(interrupt.contains("self.pause_auto_continue(&session_id, cx)"));
+        // A stop pauses the turn it interrupted, not the session: the
+        // preference stays on, and only the reader's own pause or switch may
+        // suspend or cancel it.
+        assert!(interrupt.contains("self.pause_next_auto_continue(&session_id)"));
+        assert!(!interrupt.contains("self.pause_auto_continue("));
         assert!(!interrupt.contains("set_auto_continue_enabled"));
+
+        let pause_next = source
+            .split_once("    fn pause_next_auto_continue(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn pause_auto_continue("))
+            .map(|(body, _)| body)
+            .expect("the stop's turn-scoped pause should remain inspectable");
+        assert!(pause_next.contains("auto_continue_paused_turn_session_ids"));
+        assert!(!pause_next.contains("auto_continue_paused_session_ids"));
+        assert!(!pause_next.contains("set_auto_continue_enabled"));
 
         let composer = source
             .split_once("    fn render_composer(")

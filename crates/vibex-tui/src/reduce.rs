@@ -5760,11 +5760,13 @@ impl App {
             let Some(session_id) = self.selected_session_id().cloned() else {
                 return Outcome::quiet();
             };
-            // Stopping a turn stops the continuation that was about to follow
-            // it: continuing a turn the reader just cancelled is the one thing
-            // auto-continue must never do.
-            let now_ms = vibex_core::unix_timestamp_ms();
-            self.auto_continue.pause(&session_id, now_ms);
+            // Stopping a turn holds back the continuation that was about to
+            // follow it: continuing a turn the reader just cancelled is the one
+            // thing auto-continue must never do. It is not a cancellation of
+            // auto-continue itself — the session stays armed for the turns
+            // after this one, and only the reader's own pause or switch may
+            // suspend the session.
+            self.auto_continue.pause_next(&session_id);
             return Outcome::effects(vec![Effect::Interrupt { session_id }]);
         }
         // Nothing left to cancel, so the reader is asking to leave. Twice: a
@@ -10361,6 +10363,10 @@ mod tests {
             AgentSessionState::Running,
             crate::app::LiveState::Ready,
         );
+        // Auto-continue is on for the session, which is the state the stop has
+        // to leave alone.
+        let session_id = vibex_core::VibexSessionId::parse("session_quit0001").expect("session id");
+        app.auto_continue.set_enabled(&session_id, true);
         let outcome = app.perform(Intent::ContextualCancel);
         assert!(
             matches!(outcome.effects.as_slice(), [Effect::Interrupt { .. }]),
@@ -10371,6 +10377,18 @@ mod tests {
             "the interrupt was taken for an instruction"
         );
         assert!(!app.quit_armed(), "stopping a turn asked about leaving");
+        // The stop pauses the next continuation of the turn in front of the
+        // reader; it does not cancel auto-continue. The preference stays on and
+        // no session-level suspension is installed, so nothing has to be
+        // resumed for the session to keep continuing itself afterwards.
+        assert!(
+            app.auto_continue.is_enabled(&session_id),
+            "stopping a turn cancelled auto-continue"
+        );
+        assert!(
+            !app.auto_continue.is_paused(&session_id),
+            "stopping a turn suspended the session instead of pausing one turn"
+        );
     }
 
     #[test]

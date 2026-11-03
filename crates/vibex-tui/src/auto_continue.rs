@@ -82,9 +82,15 @@ pub struct AutoContinue {
     /// only the enable/disable that clears one — so a pause made here is this
     /// client's until the session is switched on again or a message resumes it.
     local_paused: BTreeSet<String>,
-    /// Turns the reader stopped: the countdown was called off, so this turn
-    /// must not be started again however long it stays idle.
+    /// Turns the reader stopped: the countdown was called off, or a running
+    /// turn was interrupted, so the turn facing the reader must not be
+    /// continued however long it stays idle. A suspension of the *session* is
+    /// [`Self::local_paused`] and [`Self::authority_paused`]; this set is only
+    /// about the one turn in front of the reader.
     paused_turns: BTreeSet<String>,
+    /// Sessions seen resting on their last sync, so a resting -> working
+    /// transition can be recognized as a new turn.
+    resting: BTreeSet<String>,
     /// The session revision a continuation has already been sent for.
     handled_turns: BTreeMap<String, i64>,
     /// The last answer per session, and the revision it belongs to.
@@ -212,6 +218,25 @@ impl AutoContinue {
         let _ = updated_at_ms;
     }
 
+    /// Hold back the continuation of the turn the reader just stopped.
+    ///
+    /// This is the Desktop's stop: the turn in front of the reader must not be
+    /// continued, but the session stays armed for the turns after it — the
+    /// preference is not suspended and no resume is asked for. Only the reader's
+    /// own pause ([`Self::pause`]) or switch ([`Self::set_enabled`]) may do
+    /// that.
+    pub fn pause_next(&mut self, session_id: &VibexSessionId) {
+        let key = session_id.as_str().to_string();
+        if !self.enabled.contains(&key) {
+            return;
+        }
+        if let Some(countdown) = self.countdowns.remove(&key) {
+            self.handled_turns
+                .insert(key.clone(), countdown.updated_at_ms);
+        }
+        self.paused_turns.insert(key);
+    }
+
     /// Lift a suspension. A manual continuation is a reactivation too, which is
     /// why the Desktop clears the same state when one is sent.
     pub fn resume(&mut self, session_id: &VibexSessionId) {
@@ -267,6 +292,7 @@ impl AutoContinue {
         self.countdowns.retain(|id, _| known.contains(id));
         self.handled_turns.retain(|id, _| known.contains(id));
         self.paused_turns.retain(|id| known.contains(id));
+        self.resting.retain(|id| known.contains(id));
 
         let mut actions = Vec::new();
         for session in sessions
@@ -278,10 +304,24 @@ impl AutoContinue {
                 session.state,
                 AgentSessionState::Idle | AgentSessionState::Error
             );
+            // A session that was resting and is working again has started a new
+            // turn. A stopped turn is the one that was already running when the
+            // reader stopped it, so only that transition lifts the pause — a
+            // running revision changing under the stop is still the same turn
+            // winding down, and its settle is exactly what the pause suppresses.
+            let started_a_turn = !resting && self.resting.contains(&key);
+            if started_a_turn {
+                self.paused_turns.remove(&key);
+            }
+            if resting {
+                self.resting.insert(key.clone());
+            } else {
+                self.resting.remove(&key);
+            }
             if !resting {
                 // The turn is live, so whatever was decided about the last one
-                // is done with.
-                self.paused_turns.remove(&key);
+                // is done with. The stop's pause is not: it outlives the
+                // running revision it was set on.
                 self.handled_turns.remove(&key);
             }
             let status = self
@@ -517,6 +557,51 @@ mod tests {
         machine.sync(&sessions, 1_010, |_| false);
         assert!(machine.sync(&sessions, 1_020, |_| false).is_empty());
         assert_eq!(machine.countdown_seconds(&session_id("session_a")), Some(5));
+    }
+
+    #[test]
+    fn stopping_a_turn_pauses_only_that_turn() {
+        let running = vec![session("session_a", "p", AgentSessionState::Running, 20)];
+        let mut machine = machine();
+        // The reader is watching the turn and stops it.
+        machine.sync(&running, 1_000, |_| false);
+        machine.pause_next(&session_id("session_a"));
+        // The session is not suspended: its preference stands, and no resume
+        // has to be asked for.
+        assert!(machine.is_enabled(&session_id("session_a")));
+        assert!(!machine.is_paused(&session_id("session_a")));
+
+        // The runtime settles the interrupted turn into a new revision. Judging
+        // that revision is still worth a probe — the turn is only continued when
+        // it ended without an answer — but the countdown that would follow it is
+        // exactly what the stop holds back.
+        let settled = vec![session("session_a", "p", AgentSessionState::Idle, 30)];
+        let actions = machine.sync(&settled, 1_010, |_| false);
+        assert!(
+            matches!(actions.as_slice(), [AutoContinueAction::Probe { .. }]),
+            "the stopped turn should still be judged, not continued: {actions:?}"
+        );
+        machine.note_status(&session_id("session_a"), 30, Some(false));
+        assert!(
+            machine.sync(&settled, 1_020, |_| false).is_empty(),
+            "the stopped turn started a countdown anyway"
+        );
+        let (actions, _) = machine.tick(&settled, 1_010 + COUNTDOWN_MS * 4, |_| false);
+        assert!(actions.is_empty(), "a stopped continuation went out anyway");
+
+        // The reader sends something afterwards. That starts a new turn, and the
+        // pause belonged to the turn they stopped.
+        let working = vec![session("session_a", "p", AgentSessionState::Running, 40)];
+        machine.sync(&working, 1_020, |_| false);
+        let answered = vec![session("session_a", "p", AgentSessionState::Idle, 50)];
+        machine.sync(&answered, 1_030, |_| false);
+        machine.note_status(&session_id("session_a"), 50, Some(false));
+        machine.sync(&answered, 1_040, |_| false);
+        assert_eq!(
+            machine.countdown_seconds(&session_id("session_a")),
+            Some(5),
+            "the turn after the stopped one must be armed again"
+        );
     }
 
     #[test]

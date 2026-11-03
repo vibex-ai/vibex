@@ -2568,9 +2568,15 @@ RuntimeMenuPlacement { anchor, height, trigger_offset }
   authoritative session snapshot also invalidates them when either state or
   `updatedAtMs` changes, so an `Idle -> Error` transition cannot reuse a normal
   completion cached in the same millisecond.
-  A manual stop of an auto-continue countdown or continuation turn also writes
-  a session-level disabled override; the project default must not re-enable
-  automatic continuation until the user explicitly enables it again.
+  A manual stop of a running turn pauses only that turn: the continuation that
+  would have followed it is held back (`autoContinuePausedTurnSessionIds`),
+  while the session's auto-continue preference stays on and the next turn is
+  evaluated normally. The pause must survive the running revision it was set
+  on and suppress the revision the turn settles into; only a new turn lifts it.
+  A session-level suspension is the reader's own action — pausing the countdown,
+  or the row menu — and is persisted so a restart cannot silently resume it.
+  Switching auto-continue off is the only thing that cancels the preference,
+  and the project default must not re-enable it until the user explicitly does.
   A turn verdict is keyed to the session revision it judges, and only a verdict
   may settle one: a completion probe answer that carries no verdict may neither
   displace a cached verdict for the same revision nor cancel the probe still
@@ -2772,7 +2778,10 @@ RuntimeMenuPlacement { anchor, height, trigger_offset }
   session snapshot before clearing per-session pending state and invoking the
   auto-continue decision. Auto-continue tests cover both incomplete `Idle` and
   `Error` snapshots, explicit final-message suppression, per-session timeline
-  probe fencing, and session-update invalidation. Session-row context-menu tests
+  probe fencing, and session-update invalidation. They also prove that stopping
+  a turn pauses only that turn: the session's preference stays on, the pause
+  survives the running revision and suppresses the settle, and a new turn lifts
+  it. Session-row context-menu tests
   assert the captured row id and checked state drive the same session-scoped
   toggle as the Composer. Session mutation completion tests cover rename,
   single/optimistic batch delete, terminal create/teardown, shell switch,
