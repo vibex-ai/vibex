@@ -31620,11 +31620,14 @@ impl ManagementCenter {
                             .child(detail)
                     })),
             )
+            // A green check reads as the state at a glance; the neutral tag it
+            // replaced was easy to mistake for another disabled control.
             .when(selected, |row| {
                 row.child(
-                    Tag::color(ColorName::Neutral)
-                        .xsmall()
-                        .child(management_locale_text("Added", "已添加", "已新增")),
+                    Icon::new(IconName::Check)
+                        .size(px(16.0))
+                        .flex_none()
+                        .text_color(cx.theme().success),
                 )
             })
             .when(!selected, |row| {
