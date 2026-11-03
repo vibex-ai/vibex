@@ -387,11 +387,19 @@ impl ManagementCenter {
                 .gap_4()
                 .child(ws_field(
                     management_locale_text("Models to turn on", "启用的模型", "啟用的模型"),
-                    Some(management_locale_text(
-                        "Model ids separated by commas. Fetch fills it from the address and Key above; each model's settings live on the Models tab after saving.",
-                        "用逗号分隔的模型 ID。“拉取模型”会按上方地址与 Key 自动填入；保存后可在“模型”标签页逐个设置。",
-                        "用逗號分隔的模型 ID。「擷取模型」會依上方位址與 Key 自動填入；儲存後可在「模型」分頁逐一設定。",
-                    )),
+                    Some(if no_key {
+                        management_locale_text(
+                            "Model ids separated by commas. Fetch fills it from the address above; each model's settings live on the Models tab after saving.",
+                            "用逗号分隔的模型 ID。“拉取模型”会按上方地址自动填入；保存后可在“模型”标签页逐个设置。",
+                            "用逗號分隔的模型 ID。「擷取模型」會依上方位址自動填入；儲存後可在「模型」分頁逐一設定。",
+                        )
+                    } else {
+                        management_locale_text(
+                            "Model ids separated by commas. Fetch fills it from the address and Key above; each model's settings live on the Models tab after saving.",
+                            "用逗号分隔的模型 ID。“拉取模型”会按上方地址与 Key 自动填入；保存后可在“模型”标签页逐个设置。",
+                            "用逗號分隔的模型 ID。「擷取模型」會依上方位址與 Key 自動填入；儲存後可在「模型」分頁逐一設定。",
+                        )
+                    }),
                     h_flex()
                         .w_full()
                         .items_start()

@@ -941,25 +941,23 @@ impl ProviderConfigService {
     ///
     /// The Provider has no row yet, so the address and the credential come from
     /// the request instead of storage, and the typed key is used for exactly
-    /// this call. The draft is otherwise treated like a saved Profile: the
-    /// Models it already configures decide the wire protocol, and its Provider
-    /// options carry any per-protocol address override.
+    /// this call. A blank key is not an error: a service on this machine may
+    /// authenticate nothing, so the request leaves without a credential and
+    /// the endpoint answers for itself. The draft is otherwise treated like a
+    /// saved Profile: the Models it already configures decide the wire
+    /// protocol, and its Provider options carry any per-protocol address
+    /// override.
     pub fn fetch_agent_model_provider_draft_models(
         &self,
         request: AgentModelProviderDraftFetchModelsRequest,
     ) -> VibexResult<AgentModelProviderDraftFetchModelsResponse> {
         let api_key = request.api_key.trim();
-        if api_key.is_empty() {
-            return Err(VibexError::validation(
-                "agent_model_provider_secret_missing",
-                "Provider draft is missing an API key",
-            ));
-        }
+        let api_key = (!api_key.is_empty()).then_some(api_key);
         let profile = draft_provider_profile(&request);
         // A draft resolves its protocol the same way a shared Provider's does:
         // a declaration wins, and one that neither the draft nor its Agent
         // declares asks the endpoint until one answers.
-        let (models, diagnostics) = fetch_models_resolving_protocol(&profile, Some(api_key))?;
+        let (models, diagnostics) = fetch_models_resolving_protocol(&profile, api_key)?;
         Ok(AgentModelProviderDraftFetchModelsResponse {
             agent_id: request.agent_id,
             models: models
@@ -7304,6 +7302,10 @@ const PROVIDER_DISCOVERY_PROTOCOLS: [vibex_core::ProviderModelWireApi; 4] = [
 /// discovery most. A profile that declares its protocol keeps the
 /// single-request path; one that does not is asked in turn, and the answer says
 /// which protocol replied.
+///
+/// A missing credential does not end the walk either. A local model server
+/// authenticates nothing, and its answer is the only way to tell a keyless
+/// service from a remote one that rejects the request.
 fn fetch_models_resolving_protocol(
     profile: &ProviderProfile,
     api_key: Option<&str>,
@@ -7312,14 +7314,6 @@ fn fetch_models_resolving_protocol(
         let (models, mut diagnostics) = fetch_provider_models_with_secret(profile, api_key)?;
         diagnosed_protocol(&mut diagnostics, declared);
         return Ok((models, diagnostics));
-    }
-    if api_key.is_none() {
-        // Nothing declared and no credential: the missing key is the
-        // actionable failure, not the protocol the walk could not guess.
-        return Err(VibexError::validation(
-            "agent_model_provider_secret_missing",
-            "Provider profile is missing an available API key",
-        ));
     }
     let mut first_error: Option<VibexError> = None;
     let mut attempted = Vec::new();
@@ -7377,8 +7371,10 @@ fn diagnosed_protocol(
 /// Fetches a Provider's catalogue with a credential the caller already holds.
 ///
 /// A saved Profile resolves its own Secret; the Provider editor's unsaved draft
-/// carries the key the user typed. Everything else about the call — protocol,
-/// endpoint, and response shape — is the same either way.
+/// carries the key the user typed. `None` means the endpoint authenticates
+/// nothing, as a model server on this machine does; the OpenAI-compatible
+/// request then leaves without an `Authorization` header. Everything else about
+/// the call — protocol, endpoint, and response shape — is the same either way.
 fn fetch_provider_models_with_secret(
     profile: &ProviderProfile,
     api_key: Option<&str>,
@@ -7435,12 +7431,6 @@ fn fetch_openai_compatible_profile_models(
     api_key: Option<&str>,
     wire_api: vibex_core::ProviderModelWireApi,
 ) -> VibexResult<(Vec<String>, Vec<ProviderBindingMetadata>)> {
-    let Some(api_key) = api_key else {
-        return Err(VibexError::validation(
-            "agent_model_provider_secret_missing",
-            "Provider profile is missing an available API key",
-        ));
-    };
     let Some(base_url) = profile_protocol_base_url(profile, wire_api) else {
         return Err(VibexError::validation(
             "agent_model_provider_endpoint_missing",
@@ -7452,7 +7442,10 @@ fn fetch_openai_compatible_profile_models(
     fetch_models_from_endpoints(
         &client,
         &model_list_endpoint_candidates(base_url, profile_uses_full_api_url(profile), false),
-        |request| request.bearer_auth(api_key),
+        |request| match api_key {
+            Some(api_key) => request.bearer_auth(api_key),
+            None => request,
+        },
     )
 }
 
@@ -14149,24 +14142,78 @@ Authorization = "Bearer should-not-be-stored"
         assert_eq!(profile.default_model.as_deref(), Some("claude-draft"));
     }
 
-    /// The draft has no stored Secret, so a blank key is refused before any
-    /// request leaves the runtime instead of being sent as an empty credential.
+    /// A blank draft key means "this endpoint authenticates nothing", not a
+    /// validation failure: a local model server answers without a credential,
+    /// and the request must leave without an empty `Authorization` header.
     #[test]
-    fn provider_draft_fetch_requires_a_typed_key() {
+    fn a_draft_without_a_key_fetches_from_a_local_endpoint() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            while request
+                .windows(4)
+                .position(|part| part == b"\r\n\r\n")
+                .is_none()
+            {
+                let bytes_read = stream.read(&mut buffer).unwrap_or(0);
+                if bytes_read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..bytes_read]);
+            }
+            sender
+                .send(String::from_utf8_lossy(&request).to_string())
+                .ok();
+            let body = r#"{"data":[{"id":"local-model"}]}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            std::io::Write::write_all(&mut stream, response.as_bytes()).unwrap();
+        });
+
         let dir = tempdir().unwrap();
         let service = ProviderConfigService::new(dir.path().join("vibex.db"));
-
-        let error = service
+        let response = service
             .fetch_agent_model_provider_draft_models(AgentModelProviderDraftFetchModelsRequest {
                 agent_id: AgentId::parse("deepseek-harness").unwrap(),
-                base_url: "https://gateway.example.invalid".to_string(),
+                base_url: format!("http://{address}/v1"),
                 api_key: "   ".to_string(),
                 configured_models: Vec::new(),
-                provider_options: None,
+                provider_options: Some(ProviderOptions {
+                    schema_version: 1,
+                    entries: vec![option_entry(
+                        "wireApi",
+                        vibex_core::WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS,
+                    )],
+                }),
             })
-            .expect_err("a draft without a key must not reach the endpoint");
+            .expect("a keyless local endpoint should still list its models");
 
-        assert_eq!(error.code, "agent_model_provider_secret_missing");
+        assert_eq!(
+            response
+                .models
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["local-model"]
+        );
+        let request = receiver
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("the endpoint should have been asked");
+        assert!(
+            !request.to_ascii_lowercase().contains("authorization:"),
+            "a blank key must not be sent as an empty credential: {request}"
+        );
     }
 }
 
@@ -14387,6 +14434,49 @@ mod shared_provider_probe_tests {
                 .iter()
                 .any(|diagnostic| diagnostic.key == "wireProtocolId"),
             "the response says which protocol answered"
+        );
+    }
+
+    /// A Provider created from a local preset stores no credential. Its saved
+    /// "Fetch models" must ask without one instead of reporting a missing key.
+    #[test]
+    fn a_persisted_keyless_shared_provider_fetches_its_models() {
+        let (base_url, _requested) = spawn_shared_provider_server();
+        let dir = tempdir().unwrap();
+        let service = ProviderConfigService::new(dir.path().join("vibex.db"));
+        let created = service
+            .create_model_provider_profile(vibex_core::ModelProviderProfileCreateRequest {
+                display_name: "Local models".to_string(),
+                vendor_hint: Some("lmstudio".to_string()),
+                endpoints: vec![vibex_core::ModelProviderEndpoint {
+                    id: "api".to_string(),
+                    kind: vibex_core::ModelProviderEndpointKind::Api,
+                    url: base_url,
+                    wire_protocol_id: Some(
+                        vibex_core::WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS.to_string(),
+                    ),
+                }],
+                proxy_policy: vibex_core::ModelProviderProxyPolicy::InheritSystem,
+                credentials: Vec::new(),
+                configured_models: Vec::new(),
+                default_model_id: None,
+                headers: Vec::new(),
+                status: vibex_core::ModelProviderProfileStatus::Enabled,
+            })
+            .unwrap();
+
+        let response = service
+            .fetch_model_provider_profile_models(vibex_core::ModelProviderFetchModelsRequest {
+                model_provider_profile_id: created.id,
+            })
+            .expect("a saved keyless Provider should still list its models");
+        assert_eq!(
+            response
+                .models
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["relay-model", "second-model"]
         );
     }
 

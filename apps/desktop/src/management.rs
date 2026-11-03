@@ -9019,13 +9019,25 @@ impl ManagementCenter {
         };
         let base_url = self.profile_base_url.read(cx).value().trim().to_string();
         let api_key = self.profile_api_key.read(cx).value().trim().to_string();
-        if base_url.is_empty() || api_key.is_empty() {
+        let no_key = self
+            .provider_preset_draft
+            .as_ref()
+            .is_some_and(|preset| preset.no_key);
+        if base_url.is_empty() || (!no_key && api_key.is_empty()) {
             self.error = Some(
-                management_error_text(
-                    "Enter a request URL and a key before testing",
-                    "请先填写接口地址和 Key 再测试",
-                    "請先填寫介面位址和 Key 再測試",
-                )
+                if base_url.is_empty() {
+                    management_error_text(
+                        "Enter a request URL before testing",
+                        "请先填写接口地址再测试",
+                        "請先填寫介面位址再測試",
+                    )
+                } else {
+                    management_error_text(
+                        "Enter a request URL and a key before testing",
+                        "请先填写接口地址和 Key 再测试",
+                        "請先填寫介面位址和 Key 再測試",
+                    )
+                }
                 .into(),
             );
             cx.notify();
@@ -9097,13 +9109,25 @@ impl ManagementCenter {
         };
         let base_url = self.profile_base_url.read(cx).value().trim().to_string();
         let api_key = self.profile_api_key.read(cx).value().trim().to_string();
-        if base_url.is_empty() || api_key.is_empty() {
+        let no_key = self
+            .provider_preset_draft
+            .as_ref()
+            .is_some_and(|preset| preset.no_key);
+        if base_url.is_empty() || (!no_key && api_key.is_empty()) {
             self.error = Some(
-                management_error_text(
-                    "Enter a request URL and a key before detecting",
-                    "请先填写接口地址和 Key 再检测",
-                    "請先填寫介面位址和 Key 再偵測",
-                )
+                if base_url.is_empty() {
+                    management_error_text(
+                        "Enter a request URL before detecting",
+                        "请先填写接口地址再检测",
+                        "請先填寫介面位址再偵測",
+                    )
+                } else {
+                    management_error_text(
+                        "Enter a request URL and a key before detecting",
+                        "请先填写接口地址和 Key 再检测",
+                        "請先填寫介面位址和 Key 再偵測",
+                    )
+                }
                 .into(),
             );
             cx.notify();
@@ -9512,8 +9536,9 @@ impl ManagementCenter {
     ///
     /// The same answers the picker's own fetch command reads: a draft (a saved
     /// Provider already has a stored catalogue), an Agent whose projection takes
-    /// a caller-supplied endpoint and a Key, and both fields non-empty. Nothing
-    /// in flight counts, because a fetch already owns that lane.
+    /// a caller-supplied endpoint, and an address. A Key is needed too unless
+    /// the applied preset says its service authenticates nothing. Nothing in
+    /// flight counts, because a fetch already owns that lane.
     fn profile_draft_auto_fetch_ready(&self, cx: &Context<Self>) -> bool {
         if self.editing_profile_id.is_some() || self.mutation.is_some() {
             return false;
@@ -9527,9 +9552,12 @@ impl ManagementCenter {
             .shows(vibex_core::AgentProjectionFormControl::Endpoint)
             && self.projection_editor.fixed_endpoint().is_none()
             && self.projection_editor.credential_surface() == ProjectionCredentialSurface::ApiKey;
-        endpoint_editable
-            && !self.profile_base_url.read(cx).value().trim().is_empty()
-            && !self.profile_api_key.read(cx).value().trim().is_empty()
+        let key_ready = self
+            .provider_preset_draft
+            .as_ref()
+            .is_some_and(|preset| preset.no_key)
+            || !self.profile_api_key.read(cx).value().trim().is_empty();
+        endpoint_editable && !self.profile_base_url.read(cx).value().trim().is_empty() && key_ready
     }
 
     /// Drops a pending automatic fetch and forgets what it last asked for.
@@ -14882,6 +14910,8 @@ impl ManagementCenter {
         };
         self.provider_create_preset = Some(preset.clone());
         self.provider_create_preset_region = None;
+        // A failure from the previous preset's address is not about this one.
+        self.provider_create_models_error = None;
         let catalog_id = preset.catalog_id.clone().unwrap_or_default();
         self.provider_create_catalog_id
             .update(cx, |state, cx| state.set_value(catalog_id, window, cx));
@@ -14926,6 +14956,7 @@ impl ManagementCenter {
         self.provider_create_preset = None;
         self.provider_create_preset_region = None;
         self.provider_create_category = None;
+        self.provider_create_models_error = None;
         self.cancel_provider_create_auto_fetch();
         for input in [
             &self.provider_create_name,
@@ -14985,8 +15016,9 @@ impl ManagementCenter {
     /// The page fetch with a lane for the automatic one.
     ///
     /// `quiet` drops the failure message: an automatic fetch runs while the
-    /// user is still typing a Key, so a rejected intermediate value is not a
-    /// problem to report. The model field is the feedback either way.
+    /// user is still typing an address or a Key, so a rejected intermediate
+    /// value is not a problem to report. The model field is the feedback either
+    /// way.
     fn fetch_provider_create_models_for(
         &mut self,
         quiet: bool,
@@ -14999,6 +15031,10 @@ impl ManagementCenter {
         if self.mutation.is_some() {
             return;
         }
+        let preset = self.provider_create_preset.clone();
+        // A preset that says "No Key" hides the Key field, so requiring one
+        // here would ask for a value the page never collects.
+        let no_key = preset.as_ref().is_some_and(|preset| preset.no_key);
         let base_url = self
             .provider_create_base_url
             .read(cx)
@@ -15011,13 +15047,21 @@ impl ManagementCenter {
             .value()
             .trim()
             .to_string();
-        if base_url.is_empty() || api_key.is_empty() {
+        if base_url.is_empty() || (!no_key && api_key.is_empty()) {
             self.provider_create_models_error = Some(
-                management_locale_text(
-                    "Enter the API address and a Key to fetch models",
-                    "填写 API 地址与 Key 后才能拉取模型",
-                    "填寫 API 位址與 Key 後才能擷取模型",
-                )
+                if base_url.is_empty() {
+                    management_locale_text(
+                        "Enter the API address to fetch models",
+                        "填写 API 地址后才能拉取模型",
+                        "填寫 API 位址後才能擷取模型",
+                    )
+                } else {
+                    management_locale_text(
+                        "Enter the API address and a Key to fetch models",
+                        "填写 API 地址与 Key 后才能拉取模型",
+                        "填寫 API 位址與 Key 後才能擷取模型",
+                    )
+                }
                 .to_string(),
             );
             cx.notify();
@@ -15039,6 +15083,23 @@ impl ManagementCenter {
             cx.notify();
             return;
         };
+        // A preset names the protocol its address serves. Passing that on is
+        // what lets a keyless local server answer the list without the fetch
+        // guessing its way through every protocol.
+        let provider_options = preset
+            .as_ref()
+            .and_then(|preset| {
+                preset
+                    .with_region(self.provider_create_preset_region.as_deref())
+                    .default_wire_api()
+            })
+            .map(|wire_api| {
+                with_provider_option(
+                    vibex_core::ProviderOptions::empty(),
+                    "wireApi",
+                    Some(wire_api.wire_protocol_id().to_string()),
+                )
+            });
         self.provider_create_models_error = None;
         self.mutation = Some(ManagementMutation::ProviderProbe(
             "create-page-models".to_string(),
@@ -15053,7 +15114,7 @@ impl ManagementCenter {
                         base_url,
                         api_key,
                         configured_models: Vec::new(),
-                        provider_options: None,
+                        provider_options,
                     },
                 )
                 .await
@@ -15170,6 +15231,9 @@ impl ManagementCenter {
     }
 
     /// Whether the page draft holds what a model fetch needs.
+    ///
+    /// A no-Key preset needs only its address; every other preset still waits
+    /// for the Key the page is asking for.
     fn provider_create_auto_fetch_ready(&self, cx: &Context<Self>) -> bool {
         if !self.provider_create_page_open || self.mutation.is_some() {
             return false;
@@ -15182,18 +15246,23 @@ impl ManagementCenter {
         {
             return false;
         }
+        let key_ready = self
+            .provider_create_preset
+            .as_ref()
+            .is_some_and(|preset| preset.no_key)
+            || !self
+                .provider_create_api_key
+                .read(cx)
+                .value()
+                .trim()
+                .is_empty();
         !self
             .provider_create_base_url
             .read(cx)
             .value()
             .trim()
             .is_empty()
-            && !self
-                .provider_create_api_key
-                .read(cx)
-                .value()
-                .trim()
-                .is_empty()
+            && key_ready
     }
 
     /// Creates the shared Provider the page draft describes.
@@ -23483,7 +23552,8 @@ impl ManagementCenter {
         let editing_profile_id = self.editing_profile_id.clone();
         // A saved Profile fetches from its stored address and Secret. A draft
         // has neither yet, so its fetch appears once the editor itself holds
-        // what a fetch needs — a request URL and a key — and the Agent accepts a
+        // what a fetch needs — a request URL, and a key unless the preset says
+        // its local service needs none — and the Agent accepts a
         // caller-supplied endpoint. An Agent that pins its own endpoint owns its
         // catalogue too, and that one is only discovered after saving.
         let draft_endpoint_editable = self
@@ -23496,8 +23566,13 @@ impl ManagementCenter {
             && !selected_agent_id.is_empty();
         let draft_base_url = self.profile_base_url.read(cx).value().trim().to_string();
         let draft_api_key = self.profile_api_key.read(cx).value().trim().to_string();
-        let draft_ready =
-            draft_available && !draft_base_url.is_empty() && !draft_api_key.is_empty();
+        let draft_no_key = self
+            .provider_preset_draft
+            .as_ref()
+            .is_some_and(|preset| preset.no_key);
+        let draft_ready = draft_available
+            && !draft_base_url.is_empty()
+            && (draft_no_key || !draft_api_key.is_empty());
         let fetchable = editing_profile_id.is_some() || draft_available;
         let fetching_models = match &self.mutation {
             Some(ManagementMutation::ProviderProbe(action)) => match &editing_profile_id {
@@ -26739,10 +26814,11 @@ impl ManagementCenter {
             ResolvedLocale::ZhTw => format!("已使用 {} 預設", preset.display_name),
         });
         self.navigation.mark_dirty(ManagementSection::Agents, true);
-        // The preset itself never fetches; the debounce only becomes relevant
-        // once a Key completes the pair. Dropping the pending timer keeps one
-        // scheduled against the previous preset's address from landing here,
-        // and scheduling again asks the new address when a Key is already in.
+        // The preset itself never fetches; the debounce becomes relevant once
+        // the pair is complete — or immediately for a preset whose local
+        // service needs no Key. Dropping the pending timer keeps one scheduled
+        // against the previous preset's address from landing here, and
+        // scheduling again asks the new address when it is ready.
         self.cancel_profile_auto_fetch();
         self.schedule_profile_draft_auto_fetch(cx);
         cx.notify();
@@ -47504,6 +47580,39 @@ mod tests {
         center.update(cx, |center, cx| {
             assert!(center.provider_create_auto_fetch_ready(cx));
             assert!(center.provider_create_auto_fetch_task.is_some());
+        });
+
+        // A no-Key preset hides the Key field, so its address alone is enough
+        // to arm the same fetch.
+        center.update(cx, |center, _| {
+            center.provider_create_preset =
+                Some(vibex_core::provider_preset("lmstudio").expect("the preset ships"));
+        });
+        type_into(&create_key, "", cx);
+        type_into(&create_base_url, "http://127.0.0.1:1234/v1", cx);
+        cx.run_until_parked();
+        center.update(cx, |center, cx| {
+            assert!(center.provider_create_auto_fetch_ready(cx));
+            assert!(
+                center.provider_create_auto_fetch_task.is_some(),
+                "a no-Key preset must not wait for a Key it never collects"
+            );
+        });
+
+        // The dialog draft follows the same rule for the same preset.
+        center.update(cx, |center, _| {
+            center.provider_preset_draft =
+                Some(vibex_core::provider_preset("lmstudio").expect("the preset ships"));
+        });
+        type_into(&api_key, "", cx);
+        type_into(&base_url, "http://127.0.0.1:1234/v1", cx);
+        cx.run_until_parked();
+        center.update(cx, |center, cx| {
+            assert!(center.profile_draft_auto_fetch_ready(cx));
+            assert!(
+                center.profile_auto_fetch_task.is_some(),
+                "the dialog must not ask for a Key the preset does not use"
+            );
         });
 
         // Closing the page drops the timer, so a late one cannot fetch against
