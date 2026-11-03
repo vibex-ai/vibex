@@ -30371,15 +30371,13 @@ impl ManagementCenter {
             .min_h(px(MANAGEMENT_ROUTE_GROUP_SUGGESTIONS_MIN_HEIGHT))
             .flex_none()
             .overflow_hidden()
-            // The top edge is a lip, not a divider: rounded corners, one
-            // hairline, and the fill of a sheet pulled up from the bottom of
-            // the column. The sheet is a module like any other, so it takes
-            // the same fill the Settings page and the rest of this page's
-            // cards use instead of a plate of its own.
+            // The sheet is a module like any other, so it takes the fill the
+            // Settings page and the rest of this page's cards use instead of
+            // a plate of its own; like them it is not outlined. Rounded top
+            // corners keep it reading as a sheet pulled up from the bottom of
+            // the column rather than as another card in it.
             .rounded_tl(px(MANAGEMENT_ROUTE_GROUP_SUGGESTIONS_SHEET_RADIUS))
             .rounded_tr(px(MANAGEMENT_ROUTE_GROUP_SUGGESTIONS_SHEET_RADIUS))
-            .border_t_1()
-            .border_color(theme::module_border(cx.theme().is_dark()))
             .bg(theme::module_surface(cx.theme().is_dark()))
             .child(self.render_route_group_recommendations_resize_handle(cx))
             .child(
@@ -33559,8 +33557,6 @@ impl ManagementCenter {
                     .w_full()
                     .gap_2()
                     .rounded(px(8.0))
-                    .border_1()
-                    .border_color(theme::module_border(cx.theme().is_dark()))
                     .bg(theme::module_surface(cx.theme().is_dark()))
                     .p_3()
                     .child(
@@ -33809,8 +33805,6 @@ impl ManagementCenter {
                         .w_full()
                         .gap_2()
                         .rounded(px(8.0))
-                        .border_1()
-                        .border_color(theme::module_border(cx.theme().is_dark()))
                         .bg(theme::module_surface(cx.theme().is_dark()))
                         .p_3()
                         .child(
@@ -39978,11 +39972,15 @@ fn management_option_menu(
 ///
 /// Tiles share one width rule so a row of them forms columns, and the value
 /// takes the tone only when the tone is the news (a warning, a health verdict).
+/// `on_module` says whether the row sits inside a section or directly on the
+/// page: a tile on a module takes the raised plate so the two stay apart, a
+/// hero row on the page takes the module fill itself.
 fn management_stat_tile(
     label: &'static str,
     value: String,
     caption: String,
     tone: Option<Hsla>,
+    on_module: bool,
     cx: &App,
 ) -> AnyElement {
     v_flex()
@@ -39992,9 +39990,11 @@ fn management_stat_tile(
         .px_4()
         .py_3()
         .rounded(cx.theme().radius_lg)
-        .border_1()
-        .border_color(theme::module_border(cx.theme().is_dark()))
-        .bg(theme::module_surface(cx.theme().is_dark()))
+        .bg(if on_module {
+            theme::module_tile_surface(cx.theme().is_dark())
+        } else {
+            theme::module_surface(cx.theme().is_dark())
+        })
         .child(
             div()
                 .text_xs()
@@ -41161,8 +41161,6 @@ fn management_market_card(
         .flex_1()
         .min_h(px(MANAGEMENT_MARKET_CARD_MIN_HEIGHT))
         .rounded(cx.theme().radius_lg)
-        .border_1()
-        .border_color(theme::module_border(cx.theme().is_dark()))
         .bg(theme::module_surface(cx.theme().is_dark()))
         .p_3()
         .child(body)
@@ -43505,8 +43503,6 @@ fn detail_empty_state(
             .gap_2()
             .min_h(px(220.0))
             .rounded(px(8.0))
-            .border_1()
-            .border_color(theme::module_border(cx.theme().is_dark()))
             .bg(theme::module_surface(cx.theme().is_dark())),
     )
     .header(detail_empty_state_header(title, description, cx))
@@ -45018,8 +45014,6 @@ fn management_card_inner(
         .min_w_0()
         .gap_3()
         .rounded(px(8.0))
-        .border_1()
-        .border_color(theme::module_border(cx.theme().is_dark()))
         .bg(theme::module_surface(cx.theme().is_dark()))
         .p_4()
         .child(if let Some(icon_path) = icon_path {
@@ -54456,7 +54450,40 @@ mod gateway_surface_tests {
         let card = cx.debug_bounds("management-gateway-requests");
         let table = cx.debug_bounds("management-gateway-request-table");
         let offset = center.read_with(cx, |center, _| center.workspace_detail_scroll.max_offset());
-        eprintln!("page={page:?}\nmap={map:?}\ncard={card:?}\ntable={table:?}\nscroll_max={offset:?}");
+        let ids = center.read_with(cx, |center, _| {
+            center
+                .gateway_requests
+                .iter()
+                .take(3)
+                .map(|row| format!("management-gateway-request-row-{}", row.request_id.as_str()))
+                .collect::<Vec<_>>()
+        });
+        let mut rows = Vec::new();
+        for id in ids {
+            let leaked: &'static str = id.leak();
+            rows.push((leaked, cx.debug_bounds(leaked)));
+        }
+        let all = cx.update(|window, _| {
+            window
+                .painted_quads()
+                .iter()
+                .filter(|quad| {
+                    let p = quad.bounds.origin;
+                    p.x.as_f32() > 600.0 && p.y.as_f32() > 500.0 && p.y.as_f32() < 700.0
+                })
+                .map(|quad| {
+                    (
+                        quad.bounds.origin.y.as_f32(),
+                        quad.bounds.size.height.as_f32(),
+                    )
+                })
+                .take(10)
+                .collect::<Vec<_>>()
+        });
+        eprintln!("quads_in_body={all:?}");
+        eprintln!(
+            "page={page:?}\nmap={map:?}\ncard={card:?}\ntable={table:?}\nscroll_max={offset:?}\nrows={rows:?}"
+        );
     }
 }
 

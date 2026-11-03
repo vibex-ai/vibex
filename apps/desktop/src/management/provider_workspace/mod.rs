@@ -358,6 +358,7 @@ impl WorkspaceTraffic {
                 self.total.to_string(),
                 self.success_caption(),
                 None,
+                true,
                 cx,
             ),
             management_stat_tile(
@@ -365,6 +366,7 @@ impl WorkspaceTraffic {
                 Self::latency(self.p50),
                 format!("p95 {}", Self::latency(self.p95)),
                 None,
+                true,
                 cx,
             ),
             management_stat_tile(
@@ -373,6 +375,7 @@ impl WorkspaceTraffic {
                 management_locale_text("Counted by the gateway", "网关计数", "閘道計數")
                     .to_string(),
                 None,
+                true,
                 cx,
             ),
             management_stat_tile(
@@ -380,6 +383,7 @@ impl WorkspaceTraffic {
                 (self.total - self.succeeded).to_string(),
                 self.top_error_label(),
                 (self.total > self.succeeded).then(|| cx.theme().warning),
+                true,
                 cx,
             ),
         ])
@@ -689,8 +693,6 @@ fn ws_section_with_fill(
             section.debug_selector(move || id.to_string())
         })
         .rounded(cx.theme().radius_lg)
-        .border_1()
-        .border_color(theme::module_border(cx.theme().is_dark()))
         .bg(theme::module_surface(cx.theme().is_dark()))
         .child(
             h_flex()

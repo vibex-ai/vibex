@@ -723,8 +723,6 @@ fn create_tile(
         .gap_3()
         .p_3()
         .rounded(cx.theme().radius_lg)
-        .border_1()
-        .border_color(theme::module_border(cx.theme().is_dark()))
         .bg(theme::module_surface(cx.theme().is_dark()))
         .cursor_pointer()
         .hover(|style| {

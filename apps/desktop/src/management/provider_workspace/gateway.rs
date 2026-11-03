@@ -265,6 +265,7 @@ impl ManagementCenter {
                     })
                     .unwrap_or_else(|| gateway_runtime_text(&snapshot.runtime)),
                 Some(color),
+                false,
                 cx,
             ),
             management_stat_tile(
@@ -282,6 +283,7 @@ impl ManagementCenter {
                     management_locale_text("All available", "全部可用", "全部可用").to_string()
                 },
                 (ready < total_keys).then(|| cx.theme().warning),
+                false,
                 cx,
             ),
             management_stat_tile(
@@ -293,6 +295,7 @@ impl ManagementCenter {
                     management_locale_text("models served", "个模型对外提供", "個模型對外提供")
                 ),
                 None,
+                false,
                 cx,
             ),
             management_stat_tile(
@@ -304,6 +307,7 @@ impl ManagementCenter {
                     self.traffic_range.label()
                 ),
                 None,
+                false,
                 cx,
             ),
         ]);
@@ -381,7 +385,7 @@ impl ManagementCenter {
             .gap_3()
             .p_3()
             .rounded(cx.theme().radius)
-            .bg(cx.theme().muted.opacity(0.5))
+            .bg(theme::module_tile_surface(cx.theme().is_dark()))
             .child(
                 div()
                     .flex_1()
@@ -713,8 +717,6 @@ impl ManagementCenter {
                     .w_full()
                     .min_w_0()
                     .rounded(cx.theme().radius_lg)
-                    .border_1()
-                    .border_color(theme::module_border(cx.theme().is_dark()))
                     .bg(theme::module_surface(cx.theme().is_dark()))
                     .px_4()
                     .py_3()
@@ -823,7 +825,7 @@ impl ManagementCenter {
                                 .w_full()
                                 .h(px(4.0))
                                 .rounded_full()
-                                .bg(cx.theme().muted)
+                                .bg(theme::module_tile_surface(cx.theme().is_dark()))
                                 .child(
                                     div()
                                         .h_full()
@@ -886,6 +888,7 @@ impl ManagementCenter {
                             management_locale_text("in flight", "个进行中", "個進行中")
                         ),
                         None,
+                        true,
                         cx,
                     ),
                     management_stat_tile(
@@ -897,6 +900,7 @@ impl ManagementCenter {
                             management_locale_text("from cache", "来自缓存", "來自快取")
                         ),
                         None,
+                        true,
                         cx,
                     ),
                     management_stat_tile(
@@ -904,6 +908,7 @@ impl ManagementCenter {
                         gateway_token_count(output),
                         String::new(),
                         None,
+                        true,
                         cx,
                     ),
                 ]))

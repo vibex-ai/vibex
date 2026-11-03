@@ -494,6 +494,7 @@ impl ManagementCenter {
                     management_locale_text("Providers", "个供应商", "個供應商")
                 ),
                 None,
+                false,
                 cx,
             ),
             management_stat_tile(
@@ -506,6 +507,7 @@ impl ManagementCenter {
                 )
                 .to_string(),
                 models.is_empty().then(|| cx.theme().warning),
+                false,
                 cx,
             ),
             management_stat_tile(
@@ -523,6 +525,7 @@ impl ManagementCenter {
                 }
                 .to_string(),
                 None,
+                false,
                 cx,
             ),
             management_stat_tile(
@@ -530,6 +533,7 @@ impl ManagementCenter {
                 row.agents.len().to_string(),
                 management_locale_text("Using this group", "正在使用", "正在使用").to_string(),
                 None,
+                false,
                 cx,
             ),
         ]);

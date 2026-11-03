@@ -90031,8 +90031,6 @@ impl FoundationSettings {
                                 }
                             })
                             .rounded(px(8.0))
-                            .border_1()
-                            .border_color(theme::module_border(is_dark))
                             .bg(theme::module_surface(is_dark))
                             .px_3()
                             .py_2()
@@ -92137,8 +92135,6 @@ fn settings_group(
             this.child(
                 v_flex()
                     .rounded(px(10.0))
-                    .border_1()
-                    .border_color(theme::module_border(is_dark))
                     .bg(theme::module_surface(is_dark))
                     .px_4()
                     .py_1()

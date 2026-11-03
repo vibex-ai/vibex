@@ -285,21 +285,38 @@ pub fn tab_strip_plate(theme: &Theme) -> Hsla {
 /// A module is a titled block of rows — a settings group, a Provider section,
 /// a record card — and every one of them takes this same fill so the two
 /// places that show modules, Settings and the configuration center, read as
-/// one surface rather than two near-misses. The tone stays close to the page:
-/// in a dark appearance it is the card color toned down, in a light one the
-/// muted plate, enough to separate the module from the page without turning it
-/// into a second elevated layer.
+/// one surface rather than two near-misses.
+///
+/// The fill is solid rather than a translucent wash. Modules nest (a traffic
+/// section holds stat tiles), and two washes of one color compound into a
+/// darker patch wherever they overlap, so a card read a different tone
+/// depending on what happened to sit behind it. Solid, the tone is one value
+/// however deep it stacks, and in a light appearance it is the neutral plate
+/// itself rather than a grayed page — gray over white muddies toward a dirty
+/// warm beige once it meets the ink washes. A dark appearance flattens the same
+/// wash onto the page up front, so its plate is opaque too.
+///
+/// Modules are not outlined. The fill separates them from the page, and a
+/// hairline around every card boxed the content in instead of letting the
+/// tone do that work.
 pub fn module_surface(is_dark: bool) -> Hsla {
     if is_dark {
-        semantic_color("card", is_dark).opacity(0.35)
+        semantic_color("background", is_dark).blend(semantic_color("card", is_dark).opacity(0.35))
     } else {
-        semantic_color("muted", is_dark).opacity(0.45)
+        semantic_color("muted", is_dark)
     }
 }
 
-/// The hairline around a module panel, paired with [`module_surface`].
-pub fn module_border(is_dark: bool) -> Hsla {
-    semantic_color("border", is_dark).opacity(0.55)
+/// The fill a tile paints when it sits *on* a module.
+///
+/// A stat tile inside a section cannot take [`module_surface`] again: solid,
+/// the two would land on one color and the tile would dissolve into the card.
+/// The tile therefore climbs to the raised card, which is one step above the
+/// module in every appearance — pure white on the light module, the lighter
+/// card on the dark one — so the module reads as the ground and the tiles as
+/// the cards laid on it.
+pub fn module_tile_surface(is_dark: bool) -> Hsla {
+    semantic_color("card", is_dark)
 }
 
 pub fn apply_appearance(
@@ -864,6 +881,41 @@ mod tests {
                 theme.name,
                 plate.l,
                 page.l
+            );
+        }
+    }
+
+    /// A module is an opaque plate, and the tile that lands on it is one step
+    /// apart from it.
+    ///
+    /// Modules nest, so a translucent fill compounds wherever a tile overlaps
+    /// its section and the same card reads as a different tone. Solid, the
+    /// tone is one value at any depth — and because it is solid, the nested
+    /// tile has to take a different role rather than the same one twice.
+    #[test]
+    fn module_fills_stay_opaque_and_nested_tiles_step_off_them() {
+        let _guard = slot_guard();
+        let _slots = SlotRestore::capture();
+        // Both slots at the product default, so the helpers read the palette
+        // this ships with rather than whatever a sibling test left behind.
+        set_active_selection(&ThemeSelection::default());
+        for mode in GpuiThemeMode::ALL {
+            let is_dark = mode.is_dark();
+            let module = module_surface(is_dark);
+            let tile = module_tile_surface(is_dark);
+            assert_eq!(module.a, 1.0, "{mode:?}: a module plate is a solid fill");
+            assert_eq!(tile.a, 1.0, "{mode:?}: a tile on a module is a solid fill");
+            assert!(
+                (tile.l - module.l).abs() > 0.01,
+                "{mode:?}: the tile ({} ) and its module ({}) are one color",
+                tile.l,
+                module.l
+            );
+            // The tile is the raised one: it lifts off the module in both
+            // appearances, toward the page in light and toward the ink in dark.
+            assert!(
+                tile.l > module.l,
+                "{mode:?}: the tile must sit above its module"
             );
         }
     }

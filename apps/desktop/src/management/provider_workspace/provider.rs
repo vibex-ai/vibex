@@ -289,6 +289,7 @@ impl ManagementCenter {
                     management_locale_text("All turned on", "全部启用", "全部啟用").to_string()
                 },
                 None,
+                false,
                 cx,
             ),
             management_stat_tile(
@@ -305,6 +306,7 @@ impl ManagementCenter {
                 },
                 (ready_keys < profile.credentials.len() || profile.credentials.is_empty())
                     .then(|| cx.theme().warning),
+                false,
                 cx,
             ),
             management_stat_tile(
@@ -312,6 +314,7 @@ impl ManagementCenter {
                 health.to_string(),
                 management_locale_text("Latest probe", "最近一次探测", "最近一次探測").to_string(),
                 Some(management_provider_health_color(health_status, cx)),
+                false,
                 cx,
             ),
             management_stat_tile(
@@ -319,6 +322,7 @@ impl ManagementCenter {
                 row.agents.len().to_string(),
                 management_locale_text("Using this Provider", "正在使用", "正在使用").to_string(),
                 None,
+                false,
                 cx,
             ),
         ]);
