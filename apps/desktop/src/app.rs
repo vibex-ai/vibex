@@ -9262,6 +9262,52 @@ enum SidebarMoveSelectionKind {
     Session,
 }
 
+/// Which session rows the sidebar keeps on screen.
+///
+/// The Provider column narrows its list by what a record still needs; a session
+/// row is narrowed by the posture its status column already draws — what the
+/// Agent is doing, and what still asks for the reader. A filter never edits a
+/// session, it only decides which rows the column paints, so every action the
+/// rows carry keeps working on the sessions that remain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum SidebarSessionFilter {
+    #[default]
+    All,
+    Running,
+    WaitingForYou,
+    Unread,
+    Failed,
+    Pinned,
+}
+
+impl SidebarSessionFilter {
+    const ALL: [Self; 6] = [
+        Self::All,
+        Self::Running,
+        Self::WaitingForYou,
+        Self::Unread,
+        Self::Failed,
+        Self::Pinned,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::All => locale::text("All sessions", "全部会话", "全部會話"),
+            Self::Running => locale::text("Running", "运行中", "執行中"),
+            Self::WaitingForYou => locale::text("Waiting for you", "等待你处理", "等待你處理"),
+            Self::Unread => locale::text("Unread", "未读", "未讀"),
+            Self::Failed => locale::text("Failed", "失败", "失敗"),
+            Self::Pinned => locale::text("Pinned", "已置顶", "已置頂"),
+        }
+    }
+
+    /// Whether the column is narrowed at all, so an empty list means "nothing
+    /// matches" rather than "there is nothing".
+    fn narrowed(self) -> bool {
+        self != Self::All
+    }
+}
+
 const DELEGATED_TREE_PAGE_SIZE: usize = 64;
 const DELEGATED_TREE_NODE_LIMIT: usize = 4_096;
 const DELEGATED_TREE_BRANCH_LIMIT: usize = 64;
@@ -9768,6 +9814,12 @@ pub struct VibexWorkbench {
     sidebar_scroll: gpui::ScrollHandle,
     selected_session_scroll_anchor: gpui::ScrollAnchor,
     sidebar_batch_mode: bool,
+    /// Which sessions the column paints, chosen from the toolbar's filter menu.
+    ///
+    /// Presentation state, so it lives on the shell rather than in the
+    /// persisted arrangement: it narrows what is on screen now and is not a
+    /// statement about the sessions themselves.
+    sidebar_session_filter: SidebarSessionFilter,
     sidebar_move_selected_items: BTreeSet<SidebarOrganizationItem>,
     sidebar_move_selection_anchor: Option<SidebarOrganizationItem>,
     /// The shift/ctrl multi-selection resolved for the rows of one frame.
@@ -11510,6 +11562,7 @@ impl VibexWorkbench {
             sidebar_scroll,
             selected_session_scroll_anchor,
             sidebar_batch_mode: false,
+            sidebar_session_filter: SidebarSessionFilter::default(),
             sidebar_move_selected_items: BTreeSet::new(),
             sidebar_move_selection_anchor: None,
             sidebar_selection_index: SidebarSelectionIndex::default(),
@@ -20024,6 +20077,82 @@ impl VibexWorkbench {
         cx.notify();
     }
 
+    /// The sidebar projection with the toolbar's session filter applied.
+    ///
+    /// The filter is a presentation decision, so it is applied to the rows in
+    /// front of the projection rather than compiled into it: every action the
+    /// sidebar builds (drag, batch, menus) reads the same filtered list, and the
+    /// placement tree never learns about it. A project with no row left after
+    /// the filter leaves the column entirely, because a card that opens onto
+    /// nothing is a row the reader cannot use.
+    ///
+    /// The cache holds the unfiltered projection, so switching the filter is a
+    /// walk over the sessions rather than a rebuild of the workspaces, the
+    /// agent summaries and the organization tree.
+    fn sidebar_filtered_groups(&mut self) -> Rc<Vec<SidebarProjectProjection>> {
+        let groups = self.sidebar_workspace_groups("");
+        let filter = self.sidebar_session_filter;
+        if !filter.narrowed() {
+            return groups;
+        }
+        let unread = &self.unread_agent_completion_session_ids;
+        let pinned = &self.sidebar_state.pinned_ids;
+        let pending_user_request_ids = &self.pending_user_request_ids;
+        let turn_pending = &self.pending_agent_turn_session_ids;
+        let filtered = groups
+            .iter()
+            .filter_map(|group| {
+                let keep = |session: &AgentSession| {
+                    let state = sidebar_session_display_state(
+                        session.state,
+                        turn_pending.contains(session.id.as_str()),
+                    );
+                    let state = if session_awaits_user_input(
+                        session.state,
+                        pending_user_request_ids,
+                        session.id.as_str(),
+                    ) {
+                        AgentSessionState::NeedsInput
+                    } else {
+                        state
+                    };
+                    sidebar_session_matches_filter(session, filter, state, unread, pinned)
+                };
+                // A worktree whose band the filter emptied leaves the column
+                // with it: an empty card would claim that Worktree has no
+                // sessions, which is a statement about the repository rather
+                // than about the filter. Its `agent_summary` stays the real one
+                // wherever the card is still painted.
+                let workspaces = group
+                    .workspaces
+                    .iter()
+                    .filter_map(|workspace| {
+                        let mut workspace = workspace.clone();
+                        workspace.sessions.retain(keep);
+                        (!workspace.sessions.is_empty()).then_some(workspace)
+                    })
+                    .collect::<Vec<_>>();
+                let compact_sessions = group
+                    .compact_sessions
+                    .iter()
+                    .filter(|session| keep(session))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                (!compact_sessions.is_empty()).then(|| SidebarProjectProjection {
+                    row_id: group.row_id.clone(),
+                    project: group.project.clone(),
+                    workspaces,
+                    // The card's badges keep reporting the project's real
+                    // totals: `agent_summary` is the projection's own count and
+                    // is deliberately left alone here, exactly as it is for a
+                    // search that narrows the visible rows.
+                    compact_sessions,
+                })
+            })
+            .collect::<Vec<_>>();
+        Rc::new(filtered)
+    }
+
     fn sidebar_workspace_groups(&mut self, query: &str) -> Rc<Vec<SidebarProjectProjection>> {
         let normalized_query = query.trim().to_lowercase();
         if self.ui_state.sidebar.hierarchy_mode == SidebarHierarchyMode::Detailed
@@ -21131,6 +21260,27 @@ impl VibexWorkbench {
             .is_some_and(|node| node.parent_session_ref.is_some())
     }
 
+    /// Whether the toolbar filter keeps this session's row on screen.
+    ///
+    /// The projection already drops the rows a filter hides; this answers the
+    /// same question for the one list that is drawn from the organization tree
+    /// instead — a group's members — so a group cannot keep painting a member
+    /// the column has filtered out.
+    fn sidebar_session_visible_under_filter(&self, session: &AgentSession) -> bool {
+        let filter = self.sidebar_session_filter;
+        if !filter.narrowed() {
+            return true;
+        }
+        let state = self.sidebar_session_row_state(session);
+        sidebar_session_matches_filter(
+            session,
+            filter,
+            state,
+            &self.unread_agent_completion_session_ids,
+            &self.sidebar_state.pinned_ids,
+        )
+    }
+
     /// The member rows of one group.
     ///
     /// The rows belong to the group's own order, so they are draggable exactly
@@ -21161,6 +21311,11 @@ impl VibexWorkbench {
             let Some(session) = self.registered_session(id).cloned() else {
                 continue;
             };
+            // A group's members are drawn from the organization tree rather
+            // than the projection, so the filter has to be asked here too.
+            if !self.sidebar_session_visible_under_filter(&session) {
+                continue;
+            }
             self.sidebar_visible_session_ids.push(id.clone());
             if let Some(node) = self
                 .delegated_tree
@@ -22185,6 +22340,9 @@ impl VibexWorkbench {
         if self.sidebar_selection_index.built {
             return;
         }
+        // Scopes come from the unfiltered projection: a selected row that the
+        // current filter hides still has to compare against the band it was
+        // filed in, or extending a selection would silently drop it.
         let groups = self.sidebar_workspace_groups("");
         let scopes = self.sidebar_row_scopes(&groups);
         let selected = self.sidebar_move_selection_items();
@@ -22215,7 +22373,9 @@ impl VibexWorkbench {
         primary: &SidebarOrganizationItem,
     ) -> Rc<SidebarSelectionSlice> {
         self.refresh_sidebar_selection_index();
-        let groups = self.sidebar_workspace_groups("");
+        // The slice is what the reader sees selected, so it is resolved against
+        // the rows the column paints under the current filter.
+        let groups = self.sidebar_filtered_groups();
         match primary {
             SidebarOrganizationItem::Session(session_id) => {
                 let Some(scope) = self.sidebar_selection_index.scopes.get(session_id).cloned()
@@ -22381,7 +22541,7 @@ impl VibexWorkbench {
         // A click that does not extend the selection replaces it outright, so
         // only an extending click pays for the scope maps the range needs.
         let (groups, project_scopes) = if selection_only {
-            let groups = self.sidebar_workspace_groups("");
+            let groups = self.sidebar_filtered_groups();
             let project_scopes = self.sidebar_row_scopes(&groups);
             (groups, project_scopes)
         } else {
@@ -22466,10 +22626,58 @@ impl VibexWorkbench {
         cx.notify();
     }
 
+    /// Narrows the column to the sessions one filter names.
+    ///
+    /// A filter that hides the open session is still allowed: the reader is
+    /// looking at the timeline, not the column, and the row comes back the
+    /// moment the filter does. What a filter must not do is leave a batch
+    /// selection behind that the reader can no longer see, so the selection is
+    /// pruned to the rows that stay visible, the same rule a moved session
+    /// already follows.
+    fn set_sidebar_session_filter(&mut self, filter: SidebarSessionFilter, cx: &mut Context<Self>) {
+        if self.sidebar_session_filter == filter {
+            return;
+        }
+        self.sidebar_session_filter = filter;
+        // A batch action on hidden rows is the one state the column cannot
+        // explain, so a narrowing filter drops the rows it hides from the
+        // selection instead of quietly keeping them.
+        if filter.narrowed() {
+            let visible = self
+                .sidebar_filtered_groups()
+                .iter()
+                .flat_map(|group| &group.compact_sessions)
+                .map(|session| session.id.as_str().to_string())
+                .collect::<BTreeSet<_>>();
+            self.sidebar_state
+                .selected_ids
+                .retain(|session_id| visible.contains(session_id));
+            self.sidebar_move_selected_items.retain(|item| match item {
+                SidebarOrganizationItem::Session(session_id) => visible.contains(session_id),
+                _ => true,
+            });
+            if self
+                .sidebar_move_selection_anchor
+                .as_ref()
+                .is_some_and(|anchor| !self.sidebar_move_selected_items.contains(anchor))
+            {
+                self.sidebar_move_selection_anchor = None;
+            }
+        }
+        self.publish_sidebar_invalidation();
+        cx.notify();
+    }
+
     fn toggle_all_batch_sessions(&mut self, cx: &mut Context<Self>) {
+        // Selecting everything selects everything on screen, not everything the
+        // runtime holds: a narrowed column must not quietly check rows the
+        // reader cannot see, or the next batch action would act on sessions the
+        // current filter is hiding. Group members travel in `compact_sessions`
+        // too, so the visible projection is the complete set of painted rows.
         let all_ids = self
-            .sessions
+            .sidebar_filtered_groups()
             .iter()
+            .flat_map(|group| &group.compact_sessions)
             .map(|session| session.id.as_str().to_string())
             .collect::<BTreeSet<_>>();
         if !all_ids.is_empty() && self.sidebar_state.selected_ids == all_ids {
@@ -23888,7 +24096,7 @@ impl VibexWorkbench {
         if !self.sidebar_row_is_move_selected(&primary_item) {
             return payload_ids.to_vec();
         }
-        let groups = self.sidebar_workspace_groups("");
+        let groups = self.sidebar_filtered_groups();
         let project_scopes = self.sidebar_row_scopes(&groups);
         let mut ids = payload_ids
             .iter()
@@ -42351,6 +42559,21 @@ impl VibexWorkbench {
         let Some(session) = self.selected_session().cloned() else {
             return;
         };
+        // The button promises to bring the open session's row into view, so a
+        // filter that hides it is cleared rather than silently leaving the
+        // reader on a column with no row to scroll to. Every other frame keeps
+        // the filter: only this explicit jump widens the list.
+        if self.sidebar_session_filter.narrowed()
+            && self.sidebar_filtered_groups().iter().all(|group| {
+                !group
+                    .compact_sessions
+                    .iter()
+                    .any(|candidate| candidate.id == session.id)
+            })
+        {
+            self.sidebar_session_filter = SidebarSessionFilter::All;
+            self.publish_sidebar_invalidation();
+        }
         let mut revealed = reveal_sidebar_session(
             &mut self.sidebar_state.collapsed_ids,
             &mut self.ui_state.sidebar.collapsed_workspace_ids,
@@ -47137,18 +47360,24 @@ impl VibexWorkbench {
             BTreeMap::new()
         };
         let strings = self.strings();
-        let groups = self.sidebar_workspace_groups("");
+        let groups = self.sidebar_filtered_groups();
+        let filter_narrowed = self.sidebar_session_filter.narrowed();
         let reorder_enabled = !self.sidebar_batch_mode;
         // "All selected" only means something while the batch bar is up. It
         // used to allocate a `String` per session on every frame, visible or
         // not; the count comparison needs no allocation at all.
+        // "All selected" describes the rows on screen, so a narrowed column
+        // never claims everything is checked while its hidden rows are not.
+        let visible_session_ids = groups
+            .iter()
+            .flat_map(|group| &group.compact_sessions)
+            .map(|session| session.id.as_str().to_string())
+            .collect::<BTreeSet<_>>();
         let all_sessions_selected = self.sidebar_batch_mode
-            && !self.sessions.is_empty()
-            && self.sessions.iter().all(|session| {
-                self.sidebar_state
-                    .selected_ids
-                    .contains(session.id.as_str())
-            });
+            && !visible_session_ids.is_empty()
+            && visible_session_ids
+                .iter()
+                .all(|session_id| self.sidebar_state.selected_ids.contains(session_id));
         let selected_workspace_id = self
             .ui_state
             .workbench
@@ -47173,7 +47402,10 @@ impl VibexWorkbench {
         );
         let selected_count = self.sidebar_state.selected_ids.len();
         let group_creation = self.sidebar_group_creation_candidates();
-        let total_count = self.sessions.len();
+        // The count beside the batch bar describes the rows the column paints:
+        // a filter that hides half the runtime must not make "3 selected" read
+        // against a total the reader cannot see.
+        let total_count = visible_session_ids.len();
         let selected_count_label =
             sidebar_selected_count_label(self.resolved_locale(), selected_count, total_count);
         let collapse_label = if self.collapsed_project_restore.is_some() {
@@ -47191,6 +47423,8 @@ impl VibexWorkbench {
             cx.has_active_drag() && self.session_group_tab_removal_active;
         let root_menu_entity = cx.weak_entity();
         let toolbar_more_entity = cx.weak_entity();
+        let session_filter_entity = cx.weak_entity();
+        let session_filter_state = self.sidebar_session_filter;
         let toolbar_more_state = SidebarToolbarMoreMenuState {
             strings,
             hierarchy_mode: self.ui_state.sidebar.hierarchy_mode,
@@ -47309,6 +47543,71 @@ impl VibexWorkbench {
                                             window,
                                             cx,
                                         )
+                                    })
+                                    .anchor(gpui::Anchor::TopRight),
+                            )
+                            .child(
+                                // The Provider column puts its filter beside
+                                // the section it narrows; the same control
+                                // sits in this toolbar row for the same
+                                // reason, and the funnel stays lit while a
+                                // filter is on so the list never looks
+                                // shorter for no reason.
+                                Button::new("sidebar-session-filter")
+                                    .small()
+                                    .ghost()
+                                    .compact()
+                                    .w(px(28.0))
+                                    .h(px(28.0))
+                                    .when(session_filter_state.narrowed(), |button| {
+                                        button.selected(true)
+                                    })
+                                    .icon(sidebar_icon("icons/vibex/funnel.svg"))
+                                    .tooltip(locale::text(
+                                        "Filter sessions",
+                                        "筛选会话",
+                                        "篩選會話",
+                                    ))
+                                    .accessibility_label(locale::text(
+                                        "Filter sessions",
+                                        "筛选会话",
+                                        "篩選會話",
+                                    ))
+                                    .dropdown_menu(move |mut menu, window, cx| {
+                                        let entity = session_filter_entity.clone();
+                                        // The column's own menus latch the
+                                        // hover preview; this one is built
+                                        // inline, so it arms the latch here.
+                                        let menu_entity = cx.entity();
+                                        let _ = entity.update(cx, |this, cx| {
+                                            this.begin_sidebar_menu_hover(cx)
+                                        });
+                                        Self::hold_sidebar_hover_preview_for_menu(
+                                            &menu_entity,
+                                            &entity,
+                                            window,
+                                            cx,
+                                        );
+                                        menu = menu.label(locale::text(
+                                            "Show sessions",
+                                            "显示会话",
+                                            "顯示會話",
+                                        ));
+                                        for filter in SidebarSessionFilter::ALL {
+                                            let entity = entity.clone();
+                                            menu = menu.item(
+                                                PopupMenuItem::new(filter.label())
+                                                    .checked(filter == session_filter_state)
+                                                    .on_click(move |_, _, cx| {
+                                                        let _ = entity.update(cx, |this, cx| {
+                                                            this.set_sidebar_session_filter(
+                                                                filter, cx,
+                                                            )
+                                                        });
+                                                    }),
+                                            );
+                                        }
+                                        menu
                                     })
                                     .anchor(gpui::Anchor::TopRight),
                             )
@@ -47557,6 +47856,20 @@ impl VibexWorkbench {
                             .px_4()
                             .py_3()
                             .when(group_elements.is_empty(), |this| {
+                                // A narrowed column says so instead of claiming
+                                // there are no sessions: the reader can see the
+                                // filter is on, and the empty row is the moment
+                                // to name it and offer the way back out.
+                                let empty_text: SharedString = if filter_narrowed {
+                                    format!(
+                                        "{} · {}",
+                                        self.sidebar_session_filter.label(),
+                                        strings.sidebar_no_matching_sessions
+                                    )
+                                    .into()
+                                } else {
+                                    strings.sidebar_no_matching_sessions.into()
+                                };
                                 this.child(
                                     solid_empty_border(
                                         EmptyState::new()
@@ -47575,8 +47888,33 @@ impl VibexWorkbench {
                                                 .text_color(
                                                     cx.theme().sidebar_foreground.opacity(0.55),
                                                 )
-                                                .child(strings.sidebar_no_matching_sessions),
+                                                .child(empty_text),
                                         ),
+                                    )
+                                    // The way back out lives inside the row
+                                    // that reports the narrowing: the reader
+                                    // clears the filter where the empty list
+                                    // explains it, not by finding the funnel.
+                                    .when(
+                                        filter_narrowed,
+                                        |this| {
+                                            this.child(
+                                                Button::new("sidebar-clear-session-filter")
+                                                    .xsmall()
+                                                    .ghost()
+                                                    .label(locale::text(
+                                                        "Show all sessions",
+                                                        "显示全部会话",
+                                                        "顯示全部會話",
+                                                    ))
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.set_sidebar_session_filter(
+                                                            SidebarSessionFilter::All,
+                                                            cx,
+                                                        );
+                                                    })),
+                                            )
+                                        },
                                     ),
                                 )
                             })
@@ -78843,6 +79181,35 @@ fn sidebar_session_state_label(
     }
 }
 
+/// Whether one session answers the filter the reader chose.
+///
+/// `display_state` is resolved by the caller the way
+/// [`VibexWorkbench::sidebar_session_row_state`] resolves it, so the filter and
+/// the row can never disagree about whether a session is running, parked on the
+/// reader or failed. `unread` and `pinned` are passed in because the status
+/// column draws both from sets only the shell holds in front of the projection.
+fn sidebar_session_matches_filter(
+    session: &AgentSession,
+    filter: SidebarSessionFilter,
+    display_state: AgentSessionState,
+    unread: &BTreeSet<String>,
+    pinned: &BTreeSet<String>,
+) -> bool {
+    match filter {
+        SidebarSessionFilter::All => true,
+        // An initializing session has no row yet for the reader to watch, so it
+        // reads as running here exactly as it does in the status column.
+        SidebarSessionFilter::Running => matches!(
+            display_state,
+            AgentSessionState::Running | AgentSessionState::Initializing
+        ),
+        SidebarSessionFilter::WaitingForYou => display_state == AgentSessionState::NeedsInput,
+        SidebarSessionFilter::Unread => unread.contains(session.id.as_str()),
+        SidebarSessionFilter::Failed => display_state == AgentSessionState::Error,
+        SidebarSessionFilter::Pinned => pinned.contains(session.id.as_str()),
+    }
+}
+
 /// What a branch is holding back, in the sidebar's own words.
 struct SidebarHiddenBranch {
     /// The counts, as the one line a session row paints under its title.
@@ -103439,6 +103806,145 @@ mod tests {
         );
     }
 
+    /// The toolbar filter names the postures the status column already draws,
+    /// so a row is never hidden for a reason the reader cannot see on it.
+    #[test]
+    fn the_sidebar_session_filter_matches_the_rows_status_column() {
+        let mut session = AgentSession {
+            id: VibexSessionId::parse("session_filter").expect("session id"),
+            title: "Filter".into(),
+            project_id: ProjectId::parse("project_filter").expect("project id"),
+            workspace_id: WorkspaceId::new(),
+            workspace_root: "/tmp/vibex-filter".into(),
+            workspace_mode: WorkspaceMode::CurrentCheckout,
+            agent_id: AgentId::parse("codex").unwrap(),
+            state: AgentSessionState::Running,
+            safety: AgentSessionSafety::workspace_write_ask_on_risk(),
+            created_at_ms: 1,
+            updated_at_ms: 2,
+            last_message_at_ms: 2,
+            archived_at_ms: None,
+            deleted_at_ms: None,
+            tools: Default::default(),
+        };
+        // Unread and pinned are facts about the reader's own view of the row,
+        // not the Agent's state, so they come from the shell's sets. The session
+        // starts settled so the two are checked with nothing else true about it.
+        session.state = AgentSessionState::Idle;
+        let unread = BTreeSet::<String>::new();
+        let pinned = BTreeSet::<String>::new();
+        let keeps = |state: AgentSessionState, filter: SidebarSessionFilter| {
+            sidebar_session_matches_filter(&session, filter, state, &unread, &pinned)
+        };
+
+        assert!(keeps(AgentSessionState::Idle, SidebarSessionFilter::All));
+        assert!(keeps(
+            AgentSessionState::Running,
+            SidebarSessionFilter::Running
+        ));
+        // A session still preparing its runtime has no row of its own yet; it
+        // reads as running, exactly as the status column draws it.
+        assert!(keeps(
+            AgentSessionState::Initializing,
+            SidebarSessionFilter::Running
+        ));
+        assert!(!keeps(
+            AgentSessionState::NeedsInput,
+            SidebarSessionFilter::Running
+        ));
+        assert!(keeps(
+            AgentSessionState::NeedsInput,
+            SidebarSessionFilter::WaitingForYou
+        ));
+        assert!(keeps(
+            AgentSessionState::Error,
+            SidebarSessionFilter::Failed
+        ));
+        assert!(!keeps(
+            AgentSessionState::Running,
+            SidebarSessionFilter::Failed
+        ));
+        assert!(!keeps(
+            AgentSessionState::Idle,
+            SidebarSessionFilter::Unread
+        ));
+        assert!(!keeps(
+            AgentSessionState::Idle,
+            SidebarSessionFilter::Pinned
+        ));
+        let unread = BTreeSet::from([session.id.as_str().to_string()]);
+        let pinned = BTreeSet::from([session.id.as_str().to_string()]);
+        assert!(sidebar_session_matches_filter(
+            &session,
+            SidebarSessionFilter::Unread,
+            AgentSessionState::Idle,
+            &unread,
+            &pinned
+        ));
+        assert!(sidebar_session_matches_filter(
+            &session,
+            SidebarSessionFilter::Pinned,
+            AgentSessionState::Idle,
+            &unread,
+            &pinned
+        ));
+        // A narrowed filter is what makes an empty column say "nothing matches"
+        // instead of "there are no sessions", and it is what lights the funnel.
+        assert!(!SidebarSessionFilter::All.narrowed());
+        assert!(SidebarSessionFilter::Unread.narrowed());
+        assert!(SidebarSessionFilter::Pinned.narrowed());
+    }
+
+    /// Narrowing the column drops the rows it hides from a batch selection: an
+    /// action on a row the reader cannot see is the one state the column could
+    /// not explain.
+    #[test]
+    fn the_session_filter_prunes_a_selection_it_hides() {
+        let source = include_str!("app.rs");
+        let setter = source
+            .split_once("    fn set_sidebar_session_filter(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn toggle_all_batch_sessions("))
+            .map(|(body, _)| body)
+            .expect("the session filter setter should remain inspectable");
+
+        let filtered = setter
+            .find(".sidebar_filtered_groups()")
+            .expect("the filter should prune against the rows it leaves visible");
+        let select = setter
+            .find("self.sidebar_state\n                .selected_ids")
+            .expect("the batch selection should be pruned");
+        let group_selection = setter
+            .find("self.sidebar_move_selected_items.retain")
+            .expect("the shift/ctrl selection should be pruned");
+        assert!(filtered < select && select < group_selection);
+        assert!(setter.contains("if filter.narrowed()"));
+        assert!(setter.contains("self.publish_sidebar_invalidation();"));
+
+        // The render path paints the filtered projection, and the empty row
+        // names the filter instead of claiming the project has no sessions.
+        let render = source
+            .split_once("    fn render_agent_sidebar(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn build_sidebar_toolbar_more_menu("))
+            .map(|(body, _)| body)
+            .expect("the sidebar renderer should remain inspectable");
+        assert!(render.contains("self.sidebar_filtered_groups()"));
+        assert!(render.contains("Button::new(\"sidebar-session-filter\")"));
+        assert!(render.contains("Button::new(\"sidebar-clear-session-filter\")"));
+        assert!(render.contains("self.sidebar_session_filter.label()"));
+        assert!(render.contains("SidebarSessionFilter::ALL"));
+        // The funnel stays lit while a filter is on, so a shorter list never
+        // looks shorter for no reason.
+        assert!(render.contains(".when(session_filter_state.narrowed(), |button| {"));
+        // The menu latches the hover preview, like every other sidebar menu.
+        let filter_menu = render
+            .split_once("Button::new(\"sidebar-session-filter\")")
+            .and_then(|(_, tail)| tail.split_once("Button::new(\"sidebar-collapse-all\")"))
+            .map(|(body, _)| body)
+            .expect("the filter menu should remain inspectable");
+        assert!(filter_menu.contains("begin_sidebar_menu_hover"));
+        assert!(filter_menu.contains("hold_sidebar_hover_preview_for_menu"));
+    }
+
     #[test]
     fn parallel_session_turns_restore_selected_pending_state_independently() {
         let source = include_str!("app.rs");
@@ -111680,6 +112186,9 @@ mod tests {
             .and_then(|(_, tail)| tail.split_once("\n    fn build_sidebar_toolbar_more_menu("))
             .map(|(body, _)| body)
             .expect("sidebar renderer should remain inspectable");
+        let filter = sidebar
+            .find("Button::new(\"sidebar-session-filter\")")
+            .expect("session filter control should exist");
         let collapse = sidebar
             .find("Button::new(\"sidebar-collapse-all\")")
             .expect("collapse control should exist");
@@ -111693,7 +112202,7 @@ mod tests {
             .find("Button::new(\"sidebar-new-project\")")
             .expect("project creation control should exist");
 
-        assert!(more < collapse && collapse < locate && locate < create);
+        assert!(more < filter && filter < collapse && collapse < locate && locate < create);
         // The palette replaced the sidebar's session search: it searches far
         // more than sessions now, so it belongs to the workbench chrome rather
         // than to one project toolbar.

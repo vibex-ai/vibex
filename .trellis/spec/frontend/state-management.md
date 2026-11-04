@@ -4339,3 +4339,105 @@ if capabilities.git.supports(BackendOperation::GitWorktreeLifecycleMutate) {
 
 start_operation_assistance_task_without_blocking_other_agent_sessions();
 ```
+
+## Scenario: Desktop Sidebar Session Filter
+
+### 1. Scope / Trigger
+
+- Trigger: changing what the left column keeps on screen, the toolbar's filter
+  menu, or how a narrowed column interacts with batch selection, drag, and
+  "locate current session".
+
+### 2. Signatures
+
+```rust
+enum SidebarSessionFilter { All, Running, WaitingForYou, Unread, Failed, Pinned }
+
+fn sidebar_session_matches_filter(
+    session: &AgentSession,
+    filter: SidebarSessionFilter,
+    display_state: AgentSessionState,
+    unread: &BTreeSet<String>,
+    pinned: &BTreeSet<String>,
+) -> bool;
+
+fn VibexWorkbench::sidebar_filtered_groups(&mut self) -> Rc<Vec<SidebarProjectProjection>>;
+fn VibexWorkbench::set_sidebar_session_filter(
+    &mut self,
+    filter: SidebarSessionFilter,
+    cx: &mut Context<Self>,
+);
+```
+
+### 3. Contracts
+
+- The filter is presentation state on the shell, not part of the persisted
+  sidebar arrangement. It disappears on restart, and the remote sidebar
+  projection never learns about it.
+- `sidebar_filtered_groups` narrows the cached projection instead of compiling
+  the predicate into `sidebar_project_projections_with_workspace_order`: the
+  cache still holds every row, and switching the filter walks sessions rather
+  than rebuilding workspaces, agent summaries, and the organization tree.
+- The predicate reads the same `display_state` the status column draws
+  (`sidebar_session_display_state` plus `session_awaits_user_input`), so a row
+  is never hidden for a reason it does not also show. `Initializing` counts as
+  running, `NeedsInput` as waiting for the reader.
+- A project — and, in the detailed hierarchy, a worktree — with no visible row
+  leaves the column. Its `agent_summary` stays authoritative wherever the card
+  still paints, exactly as it does for a search that narrows rows.
+- A group's members are drawn from the organization tree rather than the
+  projection, so `render_group_navigation` asks
+  `sidebar_session_visible_under_filter` for the same answer.
+- A narrowing filter prunes the batch selection and the shift/ctrl selection to
+  the rows it leaves visible, and drops the selection anchor with them. "Select
+  all" and the batch bar's total count describe the painted rows, never the
+  runtime's complete list.
+- "Locate current session" clears the filter when it would hide the open
+  session, because the button promises to bring that row into view.
+
+### 4. Validation & Error Matrix
+
+| Condition | Required result |
+| --- | --- |
+| Filter is `All` | The cached projection is returned untouched |
+| Filter hides every session of a project | The project card leaves the column |
+| Filter hides every session of one worktree | That worktree card leaves the detailed column |
+| Empty column while a filter is on | Names the filter, offers "Show all sessions" |
+| Filter changed while a batch selection is held | Hidden rows leave the selection and the anchor |
+| Open session hidden by the current filter | Row stays hidden until the filter changes or Locate clears it |
+| Group member hidden by the filter | The group row does not paint that member |
+
+### 5. Good/Base/Bad Cases
+
+- Good: choosing "Unread" leaves exactly the sessions whose rows carry the
+  unread dot, and the funnel reads as selected until the filter is cleared.
+- Base: no filter is on, so the column paints the projection the cache already
+  holds and costs one `Rc` clone.
+- Bad: hiding rows by editing the persisted organization tree, counting hidden
+  sessions in "Select all", or filtering a row by a state the row does not draw.
+
+### 6. Tests Required
+
+- `sidebar_session_matches_filter` tests cover every filter, the initializing
+  and needs-input equivalences, and the unread/pinned shell sets.
+- A source-inspection test asserts the setter prunes both selections against the
+  filtered projection, that the renderer paints it, and that the empty row names
+  the filter with a way out.
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```rust
+// Filtering by rewriting the persisted tree, and counting hidden rows.
+self.ui_state.sidebar.organization.retain_visible(filter);
+self.sidebar_state.selected_ids = self.sessions.iter().map(id).collect();
+```
+
+#### Correct
+
+```rust
+let groups = self.sidebar_filtered_groups();
+let visible = groups.iter().flat_map(|group| &group.compact_sessions);
+self.sidebar_state.selected_ids.retain(|id| visible.any(|session| session.id == id));
+```
