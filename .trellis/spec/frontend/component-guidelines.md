@@ -167,6 +167,34 @@ stops mouse-down propagation so pressing a caption never starts a window move.
 Every button carries the localized tooltip as its `aria_label`, and the maximize
 button swaps to the restore glyph while `Window::is_maximized()` is true.
 
+### The native appearance follows the theme
+
+A window that keeps AppKit's traffic lights also keeps AppKit's window border,
+and AppKit paints both from the application's effective `NSAppearance` rather
+than from the pixels a surface happens to paint. In the unfocused state that
+tone is a dimmed neutral the system derives itself, so a light theme left on a
+dark Mac hands macOS a dark-mode chrome against a light title bar: the inactive
+lights come out near-white and read as gone until the window is focused or
+hovered. No amount of layout, `traffic_light_position`, or repaint work changes
+that — the buttons are drawn, in the wrong tone.
+
+`theme::apply_appearance` therefore pins the native appearance to the theme
+before it resolves the mode (`pin_native_appearance` → `App::set_window_appearance`):
+`Light` and `Dark` state their own side, and only `System` clears the override so
+AppKit follows the OS. Two rules keep it honest:
+
+- Pin *first*. `Theme::sync_system_appearance` reads the window appearance, so an
+  override left over from the previous theme would be read back as the system's
+  own choice.
+- Republish only on change. The appearance pass runs on every theme edit and
+  every window bind, and in `System` mode from the appearance observer itself;
+  publishing `NSAppearance` posts AppKit notifications that bring that observer
+  back around, so an unchanged value is a no-op behind a process-wide tag.
+
+This is a native-chrome rule, not a palette one: it changes nothing about the
+surfaces the workbench paints, and it is a no-op on platforms whose
+`set_window_appearance` does nothing (Linux, Windows).
+
 ### Floating window chrome
 
 `render_title_bar` is an overlay, not a layout row: it is positioned against the

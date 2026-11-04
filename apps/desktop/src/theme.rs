@@ -1,8 +1,8 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 
 use crate::typography::apply_code_font_weight;
-use gpui::{App, Hsla, Window, px};
+use gpui::{App, Hsla, Window, WindowAppearance, px};
 use gpui_component::{
     Theme, ThemeMode as ComponentThemeMode,
     highlighter::{HighlightTheme, HighlightThemeStyle},
@@ -319,12 +319,71 @@ pub fn module_tile_surface(is_dark: bool) -> Hsla {
     semantic_color("card", is_dark)
 }
 
+/// The native appearance a theme asks the platform's window chrome to adopt.
+///
+/// macOS draws its inactive traffic lights — and the window border — from the
+/// application's effective `NSAppearance`, not from the pixels behind them. A
+/// light theme left on a dark Mac therefore gets near-white inactive buttons
+/// over a light title bar: they read as gone until the window is focused or
+/// hovered, while every other app shows a dimmed trio. Pinning the native
+/// appearance to the theme keeps the chrome and the surfaces on one side.
+///
+/// `None` clears the override so AppKit follows the system setting again —
+/// which is exactly what the `System` theme wants.
+fn pinned_native_appearance(theme: ThemeMode) -> Option<WindowAppearance> {
+    match theme {
+        ThemeMode::Light => Some(WindowAppearance::Light),
+        ThemeMode::Dark => Some(WindowAppearance::Dark),
+        ThemeMode::System => None,
+    }
+}
+
+/// What [`pin_native_appearance`] last published, in the form the atomic can
+/// hold. `UNSET` only exists for the first pass and for tests.
+const NATIVE_APPEARANCE_UNSET: u8 = 0;
+const NATIVE_APPEARANCE_SYSTEM: u8 = 1;
+const NATIVE_APPEARANCE_LIGHT: u8 = 2;
+const NATIVE_APPEARANCE_DARK: u8 = 3;
+
+/// The tag [`pin_native_appearance`] stores for a requested theme.
+const fn native_appearance_tag(theme: ThemeMode) -> u8 {
+    match theme {
+        ThemeMode::Light => NATIVE_APPEARANCE_LIGHT,
+        ThemeMode::Dark => NATIVE_APPEARANCE_DARK,
+        ThemeMode::System => NATIVE_APPEARANCE_SYSTEM,
+    }
+}
+
+/// The process-wide tag of the native appearance the current pass published.
+///
+/// The appearance pass runs on every theme edit, every window bind, and — in
+/// the `System` theme — from the appearance observer itself. Publishing
+/// `NSApplication.appearance` each time posts AppKit notifications that bring
+/// the observer back around, so a pass that would republish the value it
+/// already published has to be a no-op.
+static PINNED_NATIVE_APPEARANCE: AtomicU8 = AtomicU8::new(NATIVE_APPEARANCE_UNSET);
+
+/// Publishes the theme's appearance to the platform's window chrome.
+///
+/// Called first in [`apply_appearance`], before the theme mode is resolved:
+/// the `System` branch reads the window appearance, so an override left over
+/// from the previous theme would otherwise be read back as the system's own.
+fn pin_native_appearance(theme: ThemeMode, cx: &App) {
+    let wanted = native_appearance_tag(theme);
+    if PINNED_NATIVE_APPEARANCE.swap(wanted, Ordering::Relaxed) == wanted {
+        return;
+    }
+    cx.set_window_appearance(pinned_native_appearance(theme));
+}
+
 pub fn apply_appearance(
     appearance: &AppearanceUiState,
     backdrop: Backdrop,
     window: Option<&mut Window>,
     cx: &mut App,
 ) {
+    // Pin the native chrome to the theme before anything reads the appearance.
+    pin_native_appearance(appearance.theme, cx);
     match appearance.theme {
         ThemeMode::Light => Theme::change(ComponentThemeMode::Light, window, cx),
         ThemeMode::Dark => Theme::change(ComponentThemeMode::Dark, window, cx),
@@ -600,6 +659,97 @@ mod tests {
             mode_slot(GpuiThemeMode::Dark).store(self.dark, Ordering::Relaxed);
             WALLPAPER.store(self.wallpaper, Ordering::Relaxed);
         }
+    }
+
+    /// Puts the native-appearance tag back when a test moves it.
+    struct NativeAppearanceRestore(u8);
+
+    impl NativeAppearanceRestore {
+        fn capture() -> Self {
+            Self(PINNED_NATIVE_APPEARANCE.load(Ordering::Relaxed))
+        }
+    }
+
+    impl Drop for NativeAppearanceRestore {
+        fn drop(&mut self) {
+            PINNED_NATIVE_APPEARANCE.store(self.0, Ordering::Relaxed);
+        }
+    }
+
+    /// AppKit paints the inactive traffic lights from the application's
+    /// effective appearance, not from the pixels behind them: a light theme
+    /// left on a dark Mac gets near-white inactive buttons over a light title
+    /// bar, which reads as the buttons disappearing. The theme therefore has
+    /// to state its own side, and only `System` may leave the choice to the
+    /// platform.
+    #[test]
+    fn the_native_appearance_follows_the_theme_and_system_defers() {
+        assert_eq!(
+            pinned_native_appearance(ThemeMode::Light),
+            Some(WindowAppearance::Light)
+        );
+        assert_eq!(
+            pinned_native_appearance(ThemeMode::Dark),
+            Some(WindowAppearance::Dark)
+        );
+        assert_eq!(
+            pinned_native_appearance(ThemeMode::System),
+            None,
+            "System hands the window chrome back to the platform"
+        );
+    }
+
+    /// Republishing the appearance it already published would post AppKit
+    /// notifications that bring the appearance observer straight back around,
+    /// so a frozen theme has to leave the tag alone — while `System` still
+    /// reaches the platform once, because clearing an override is a change.
+    #[gpui::test]
+    fn pinning_the_native_appearance_is_idempotent(cx: &mut gpui::TestAppContext) {
+        let _guard = slot_guard();
+        let _restore = NativeAppearanceRestore::capture();
+        PINNED_NATIVE_APPEARANCE.store(NATIVE_APPEARANCE_UNSET, Ordering::Relaxed);
+
+        cx.update(|cx| pin_native_appearance(ThemeMode::Dark, cx));
+        assert_eq!(
+            PINNED_NATIVE_APPEARANCE.load(Ordering::Relaxed),
+            native_appearance_tag(ThemeMode::Dark)
+        );
+        cx.update(|cx| pin_native_appearance(ThemeMode::Dark, cx));
+        assert_eq!(
+            PINNED_NATIVE_APPEARANCE.load(Ordering::Relaxed),
+            native_appearance_tag(ThemeMode::Dark),
+            "a repeated pass keeps the tag it already published"
+        );
+
+        cx.update(|cx| pin_native_appearance(ThemeMode::System, cx));
+        assert_eq!(
+            PINNED_NATIVE_APPEARANCE.load(Ordering::Relaxed),
+            NATIVE_APPEARANCE_SYSTEM,
+            "System still publishes the cleared override"
+        );
+    }
+
+    /// The pin has to land before the mode is resolved: `sync_system_appearance`
+    /// reads the window appearance, so an override left over from the previous
+    /// theme would be read back as the system's own choice.
+    #[test]
+    fn the_native_appearance_is_pinned_before_the_mode_is_resolved() {
+        let source = include_str!("theme.rs");
+        let pass = source
+            .split_once("pub fn apply_appearance(")
+            .and_then(|(_, tail)| tail.split_once("\nfn restore_window_plate"))
+            .map(|(body, _)| body)
+            .expect("the appearance pass should remain inspectable");
+        let pin = pass
+            .find("pin_native_appearance(appearance.theme, cx);")
+            .expect("the pass has to pin the native appearance");
+        let system = pass
+            .find("Theme::sync_system_appearance(window, cx)")
+            .expect("the pass still resolves the system mode");
+        assert!(
+            pin < system,
+            "the native appearance must be pinned before the mode is read"
+        );
     }
 
     /// A wallpaper is painted behind the workbench's surfaces, so the pass has
