@@ -522,6 +522,11 @@ strings! {
         "还没有消息 — 在下方输入",
         "還沒有訊息 — 在下方輸入"
     },
+    transcript_terminal_session => {
+        "This session runs in the Agent's own terminal — open it on the desktop to see the conversation",
+        "此会话运行在 Agent 自己的终端中 — 请到桌面端查看对话",
+        "此會話執行在 Agent 自己的終端中 — 請到桌面端查看對話"
+    },
     transcript_copy_block => { "Copy block", "复制此块", "複製此區塊" },
     transcript_copy_meta => { "Copy metadata", "复制元数据", "複製中繼資料" },
     transcript_context_compacted => {

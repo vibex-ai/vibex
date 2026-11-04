@@ -228,7 +228,10 @@ pub fn session_state_tally(
                 session.deleted_at_ms.is_none() && session_matches(session, query)
             }))
     {
-        let Some(chip) = session_state_chip(session.state) else {
+        // The header counts what the reader sees in the rows, so a terminal
+        // session is tallied by its Agent's activity rather than by the fact
+        // that the session row is open.
+        let Some(chip) = session_state_chip(vibex_ui::agent::display_state(session)) else {
             continue;
         };
         if let Some(count) = states

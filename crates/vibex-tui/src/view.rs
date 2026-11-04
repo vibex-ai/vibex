@@ -2897,7 +2897,7 @@ fn session_card_fields(
         (strings.session_workspace(), session.workspace_root.clone()),
         (
             strings.session_state(),
-            session_state_label(session.state, strings).to_string(),
+            session_state_label(vibex_ui::agent::display_state(session), strings).to_string(),
         ),
         (strings.session_card_agent(), session.agent_id.to_string()),
     ];
@@ -4528,6 +4528,18 @@ fn render_welcome(
     theme: &TuiTheme,
     strings: Strings,
 ) {
+    // A terminal-mode session keeps its conversation in the Agent's own
+    // interface, so this page has no transcript to draw. Saying so is the honest
+    // answer: an empty transcript would read as "nothing has happened yet" for a
+    // session that may be deep into a turn.
+    if app
+        .page_session_id()
+        .and_then(|session_id| app.session_by_id(session_id))
+        .is_some_and(vibex_ui::agent::is_terminal_session)
+    {
+        empty_state(frame, area, theme, strings.transcript_terminal_session());
+        return;
+    }
     if area.height < 4 {
         empty_state(frame, area, theme, strings.transcript_empty());
         return;

@@ -710,6 +710,8 @@ fn showcase_sessions(locale: Locale) -> Vec<vibex_core::AgentSession> {
             archived_at_ms: None,
             deleted_at_ms: None,
             tools: Default::default(),
+            transport: vibex_core::SessionTransport::Acp,
+            terminal: None,
         });
     }
     rows

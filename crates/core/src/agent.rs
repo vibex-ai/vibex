@@ -457,6 +457,18 @@ impl AgentSession {
     pub fn is_terminal(&self) -> bool {
         self.transport.is_terminal()
     }
+
+    /// The Agent's activity, when this session is observed through a terminal.
+    ///
+    /// `None` for an ACP session, and for a terminal session whose first
+    /// observation has not landed yet — an absent reading is not the same as a
+    /// reading of `Idle`.
+    pub fn terminal_activity(&self) -> Option<crate::terminal::TerminalActivity> {
+        self.terminal
+            .as_ref()
+            .filter(|_| self.is_terminal())
+            .map(|facts| facts.activity)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

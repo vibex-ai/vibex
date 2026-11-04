@@ -13,8 +13,8 @@ use vibex_core::{
     ElicitationRequestStatus, ElicitationResolution, ElicitationResolutionAction,
     FetchTimelineRequest, PermissionRequestStatus, RenameAgentSessionRequest,
     ResolveElicitationRequest, ResolvePermissionRequest, SendAgentMessageRequest,
-    SessionRuntimeOptionCatalog, TimelineItem, TimelineItemId, TimelineLiveEvent, TimelinePage,
-    TimelinePayload, TimelinePayloadDepth, VibexError, VibexResult, VibexSessionId,
+    SessionRuntimeOptionCatalog, TerminalActivity, TimelineItem, TimelineItemId, TimelineLiveEvent,
+    TimelinePage, TimelinePayload, TimelinePayloadDepth, VibexError, VibexResult, VibexSessionId,
 };
 use vibex_desktop_model::{
     AgentSidebarRow, ReasoningDisplayMode, SidebarState, TimelineConversationTurn, TimelineModel,
@@ -25,6 +25,34 @@ use crate::{
     AgentWorkflowView, ApprovalSurfaceModel, AsyncPhase, AsyncState, ElicitationSurfaceModel,
     ShellKind, WorkflowViewGeneration,
 };
+
+/// The state a layout should show for a session, when it is not a terminal.
+///
+/// A terminal-mode session's persisted state answers "is this session open",
+/// while the Agent inside its PTY answers the question every list actually asks:
+/// is it working, is it parked on the reader, has it settled. Both projections
+/// below fold the observation into the lifecycle enum so a layout that already
+/// switches on `AgentSessionState` keeps working, and `Unknown` stays `Idle`
+/// rather than inventing a state the reader would act on.
+pub fn display_state(session: &AgentSession) -> AgentSessionState {
+    match session.terminal_activity() {
+        Some(TerminalActivity::Working) => AgentSessionState::Running,
+        Some(TerminalActivity::Waiting) => AgentSessionState::NeedsInput,
+        Some(TerminalActivity::Idle) => AgentSessionState::Idle,
+        // No observation yet, or one that has aged out: the lifecycle state is
+        // still true, it just is not interesting. A session that failed to
+        // launch keeps reporting `Error`, because that is not an observation.
+        Some(TerminalActivity::Unknown) | None => session.state,
+    }
+}
+
+/// Whether the reader is looking at a session whose interface is a terminal.
+///
+/// A layout uses this to say where the conversation lives instead of drawing an
+/// empty timeline and a composer whose messages the runtime would refuse.
+pub fn is_terminal_session(session: &AgentSession) -> bool {
+    session.transport.is_terminal()
+}
 
 pub const AGENT_TIMELINE_PAGE_LIMIT: u32 = 500;
 /// How many conversational turns one page covers.
@@ -4038,5 +4066,110 @@ mod tests {
             assert!(!debug.contains(secret), "debug leaked {secret}");
         }
         assert!(debug.contains("timeline_item_count"));
+    }
+}
+
+#[cfg(test)]
+mod terminal_session_display_tests {
+    use super::*;
+    use vibex_core::{
+        AgentId, AgentSessionSafety, SessionTransport, TerminalActivity, TerminalActivitySource,
+        TerminalSessionFacts, VibexSessionId, WorkspaceMode,
+    };
+
+    fn session(transport: SessionTransport, activity: Option<TerminalActivity>) -> AgentSession {
+        let now = 1;
+        AgentSession {
+            id: VibexSessionId::new(),
+            title: "s".to_string(),
+            project_id: vibex_core::ProjectId::new(),
+            workspace_id: vibex_core::WorkspaceId::new(),
+            workspace_root: "/tmp".to_string(),
+            workspace_mode: WorkspaceMode::CurrentCheckout,
+            agent_id: AgentId::parse("claude").unwrap(),
+            state: AgentSessionState::Idle,
+            safety: AgentSessionSafety::workspace_write_ask_on_risk(),
+            created_at_ms: now,
+            updated_at_ms: now,
+            last_message_at_ms: now,
+            archived_at_ms: None,
+            deleted_at_ms: None,
+            tools: Default::default(),
+            transport,
+            terminal: activity.map(|activity| {
+                Box::new(TerminalSessionFacts {
+                    activity,
+                    source: TerminalActivitySource::Screen,
+                    observed_at_ms: now,
+                    ..Default::default()
+                })
+            }),
+        }
+    }
+
+    /// An ACP session answers with its own state; the observation field is not a
+    /// second source of truth for it.
+    #[test]
+    fn an_acp_session_keeps_its_lifecycle_state() {
+        let mut acp = session(SessionTransport::Acp, None);
+        acp.state = AgentSessionState::Running;
+        assert_eq!(display_state(&acp), AgentSessionState::Running);
+        assert!(!is_terminal_session(&acp));
+        assert_eq!(acp.terminal_activity(), None);
+    }
+
+    /// A terminal session reports the Agent's activity, which is the question
+    /// every list actually asks.
+    #[test]
+    fn a_terminal_session_reports_its_agent_activity() {
+        assert_eq!(
+            display_state(&session(
+                SessionTransport::Terminal,
+                Some(TerminalActivity::Working)
+            )),
+            AgentSessionState::Running
+        );
+        assert_eq!(
+            display_state(&session(
+                SessionTransport::Terminal,
+                Some(TerminalActivity::Waiting)
+            )),
+            AgentSessionState::NeedsInput
+        );
+        assert_eq!(
+            display_state(&session(
+                SessionTransport::Terminal,
+                Some(TerminalActivity::Idle)
+            )),
+            AgentSessionState::Idle
+        );
+    }
+
+    /// `Unknown` is not `Idle`: a session whose observation has not landed, or
+    /// has aged out, keeps reporting its lifecycle state rather than claiming
+    /// the Agent is resting.
+    #[test]
+    fn an_unobserved_terminal_session_does_not_claim_idleness() {
+        let mut failed = session(SessionTransport::Terminal, None);
+        failed.state = AgentSessionState::Error;
+        assert_eq!(display_state(&failed), AgentSessionState::Error);
+
+        let unknown = session(SessionTransport::Terminal, Some(TerminalActivity::Unknown));
+        assert_eq!(display_state(&unknown), AgentSessionState::Idle);
+        // And a failed launch is not overwritten by an observation.
+        let mut error_with_unknown = unknown.clone();
+        error_with_unknown.state = AgentSessionState::Error;
+        assert_eq!(display_state(&error_with_unknown), AgentSessionState::Error);
+    }
+
+    /// A terminal session is what a layout keys off to say where the
+    /// conversation lives.
+    #[test]
+    fn terminal_sessions_are_identifiable() {
+        assert!(is_terminal_session(&session(
+            SessionTransport::Terminal,
+            None
+        )));
+        assert!(!is_terminal_session(&session(SessionTransport::Acp, None)));
     }
 }
