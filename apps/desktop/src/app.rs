@@ -15053,10 +15053,55 @@ impl VibexWorkbench {
     fn sync_ssh_provisioning_settings(&self, cx: &mut Context<Self>) {
         let snapshot = self.ssh_provisioning_snapshot.clone();
         let error = self.ssh_provisioning_error.clone();
-        self.settings_view.update(cx, |settings, cx| {
+        let window = self.window_handle;
+        let settings_view = self.settings_view.clone();
+        let follow = self.settings_view.update(cx, |settings, cx| {
             settings.connections_snapshot = snapshot;
             settings.connections_error = error;
+            let follow = settings.connections_snapshot.as_ref().map(|snapshot| {
+                (
+                    snapshot.profile_id.clone(),
+                    snapshot.attempt_id,
+                    snapshot.status.is_terminal(),
+                )
+            });
             cx.notify();
+            follow
+        });
+        let Some((profile_id, attempt_id, terminal)) = follow else {
+            return;
+        };
+        let Some(window) = window else {
+            return;
+        };
+        // An attempt that starts while Settings is open brings its own dialog,
+        // so the reader lands in the progress they just asked for instead of
+        // having to find a one-line entry point first. A terminal attempt hands
+        // the result back to the row and closes the dialog.
+        settings_view.update(cx, |settings, cx| {
+            settings.connections_progress_target = Some((profile_id.clone(), attempt_id));
+            let dismissed = settings.connections_progress_dismissed.clone();
+            if terminal {
+                settings.connections_progress_target = None;
+                settings.connections_progress_open = false;
+                if dismissed.as_ref() == Some(&(profile_id.clone(), attempt_id)) {
+                    settings.connections_progress_dismissed = None;
+                }
+                return;
+            }
+            if dismissed == Some((profile_id.clone(), attempt_id)) {
+                return;
+            }
+            if settings.connections_progress_open {
+                return;
+            }
+            settings.connections_progress_open = true;
+            let settings = cx.weak_entity();
+            let _ = window.update(cx, |_, window, cx| {
+                let _ = settings.update(cx, |settings, cx| {
+                    settings.open_connections_progress_dialog(window, cx);
+                });
+            });
         });
     }
 
@@ -81074,45 +81119,6 @@ fn connection_diagnostic_title(
     }
 }
 
-fn connection_diagnostic_action_label(
-    action: crate::ssh_connection::diagnostics::SshDiagnosticAction,
-) -> &'static str {
-    use crate::ssh_connection::diagnostics::SshDiagnosticAction;
-    match action {
-        SshDiagnosticAction::Retry => locale::text("Retry", "重试", "重試"),
-        SshDiagnosticAction::InstallClient => {
-            locale::text("Install OpenSSH", "安装 OpenSSH", "安裝 OpenSSH")
-        }
-        SshDiagnosticAction::BootstrapSshd => {
-            locale::text("Bootstrap SSH", "初始化 SSH", "初始化 SSH")
-        }
-        SshDiagnosticAction::EnableRemoteLogin => {
-            locale::text("Enable Remote Login", "开启远程登录", "開啟遠端登入")
-        }
-        SshDiagnosticAction::ReviewHostKey => {
-            locale::text("Review host key", "检查主机密钥", "檢查主機金鑰")
-        }
-        SshDiagnosticAction::CheckPermissions => {
-            locale::text("Check permissions", "检查权限", "檢查權限")
-        }
-        SshDiagnosticAction::CheckDisk => {
-            locale::text("Free disk space", "清理磁盘空间", "清理磁碟空間")
-        }
-        SshDiagnosticAction::UpdateRuntime => {
-            locale::text("Update runtime", "更新运行时", "更新執行階段")
-        }
-        SshDiagnosticAction::UpdateVibex => {
-            locale::text("Update Vibex", "更新 Vibex", "更新 Vibex")
-        }
-        SshDiagnosticAction::CopyDiagnostics => {
-            locale::text("Copy diagnostics", "复制诊断", "複製診斷")
-        }
-        SshDiagnosticAction::CopyLogCommand => {
-            locale::text("Copy log command", "复制日志命令", "複製日誌命令")
-        }
-    }
-}
-
 fn settings_section_label(section: SettingsSection) -> &'static str {
     match section {
         SettingsSection::General => locale::text("General", "常规", "一般"),
@@ -82042,6 +82048,24 @@ struct FoundationSettings {
     /// The active provisioning snapshot/error mirrored from the workbench.
     connections_snapshot: Option<ProvisioningSnapshot>,
     connections_error: Option<String>,
+    /// The provisioning attempt whose dialog is open, as
+    /// `(profile id, attempt id)`.
+    ///
+    /// The attempt id is what makes this survive a Retry: the same profile
+    /// starts a new attempt, and the dialog must follow it rather than stay
+    /// bound to the failed run the reader just replaced.
+    connections_progress_target: Option<(String, u64)>,
+    /// The attempt the reader closed while it was still running. A dialog that
+    /// reopens itself on the next progress event is not dismissible at all, so
+    /// the same attempt stays closed until it finishes or the reader asks for
+    /// it again.
+    connections_progress_dismissed: Option<(String, u64)>,
+    /// Whether the provisioning dialog is currently mounted.
+    ///
+    /// Progress events arrive several times a second, so the opener has to know
+    /// it is already open; opening again on every event would stack dialogs on
+    /// top of each other.
+    connections_progress_open: bool,
     /// Hosts discovered from the user's OpenSSH config for the add panel.
     connections_hosts: Vec<SshHostEntry>,
     connections_host_warnings: Vec<String>,
@@ -82516,6 +82540,9 @@ impl FoundationSettings {
                 connections_profiles: Vec::new(),
                 connections_snapshot: None,
                 connections_error: None,
+                connections_progress_target: None,
+                connections_progress_dismissed: None,
+                connections_progress_open: false,
                 connections_hosts: Vec::new(),
                 connections_host_warnings: Vec::new(),
                 connections_selected_host: None,
@@ -86552,6 +86579,409 @@ impl FoundationSettings {
         });
     }
 
+    /// Opens the provisioning dialog for an attempt that has not finished.
+    ///
+    /// Provisioning runs for minutes across nine steps, so it gets a dialog the
+    /// reader can read and dismiss rather than a page section that owns the top
+    /// of the settings page until it either succeeds or gives up. Once the
+    /// attempt is terminal the dialog closes itself: the row's status already
+    /// says how it ended, and the diagnostics stay reachable from it.
+    fn open_connections_progress_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.connections_progress_dismissed = None;
+        self.connections_progress_open = true;
+        let entity = cx.weak_entity();
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let entity = entity.clone();
+            let (snapshot, error, log_view) = entity
+                .update(cx, |this, _| {
+                    (
+                        this.connections_snapshot.clone(),
+                        this.connections_error.clone(),
+                        this.connections_log_view.clone(),
+                    )
+                })
+                .unwrap_or((None, None, None));
+            let profile_id = snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.profile_id.clone())
+                .or_else(|| {
+                    entity
+                        .update(cx, |this, _| {
+                            this.connections_progress_target
+                                .as_ref()
+                                .map(|(profile_id, _)| profile_id.clone())
+                        })
+                        .ok()
+                        .flatten()
+                });
+            let settings = entity.clone();
+            let body = match (snapshot, profile_id) {
+                (Some(snapshot), Some(profile_id)) => Self::connections_progress_body(
+                    &snapshot, profile_id, &error, log_view, &settings, cx,
+                ),
+                _ => div()
+                    .w_full()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(locale::text(
+                        "No provisioning is running.",
+                        "当前没有正在进行的配置。",
+                        "目前沒有正在進行的設定。",
+                    ))
+                    .into_any_element(),
+            };
+            let dismiss = entity.clone();
+            dialog
+                .title(locale::text("Provisioning", "配置进度", "設定進度"))
+                .w(px(560.0))
+                .child(body)
+                .on_close({
+                    let dismiss = entity.clone();
+                    move |_, _, cx| {
+                        let _ = dismiss.update(cx, |this, cx| {
+                            this.close_connections_progress_dialog();
+                            cx.notify();
+                        });
+                    }
+                })
+                .footer(
+                    DialogFooter::new().child(
+                        Button::new("connections-progress-close")
+                            .outline()
+                            .label(locale::text("Close", "关闭", "關閉"))
+                            .on_click(move |_, window, cx| {
+                                // Closing is not cancelling: the run keeps
+                                // going and the row still reports it.
+                                let _ = dismiss.update(cx, |this, cx| {
+                                    this.close_connections_progress_dialog();
+                                    cx.notify();
+                                });
+                                window.close_dialog(cx);
+                            }),
+                    ),
+                )
+        });
+    }
+
+    /// Records that the reader closed the provisioning dialog on their own.
+    ///
+    /// Escape, the backdrop and the footer's Close all land here, so each of
+    /// them suppresses the same attempt rather than letting the next progress
+    /// event reopen the dialog the reader just dismissed.
+    fn close_connections_progress_dialog(&mut self) {
+        if self.connections_progress_open {
+            self.connections_progress_dismissed = self.connections_progress_target.clone();
+        }
+        self.connections_progress_target = None;
+        self.connections_progress_open = false;
+    }
+
+    /// One provisioning attempt, rendered as the dialog's body.
+    ///
+    /// Built as a free-standing function rather than a method so the dialog's
+    /// per-frame closure can call it without borrowing `self`; everything it
+    /// needs arrives as an argument.
+    fn connections_progress_body(
+        snapshot: &ProvisioningSnapshot,
+        profile_id: String,
+        error: &Option<String>,
+        log_view: Option<SshLogView>,
+        settings: &WeakEntity<Self>,
+        cx: &mut App,
+    ) -> AnyElement {
+        let step = snapshot.step;
+        let status = match snapshot.status {
+            ProvisioningStatus::Pending => locale::text("Waiting", "等待中", "等待中"),
+            ProvisioningStatus::Running => locale::text("Running", "进行中", "進行中"),
+            ProvisioningStatus::Cancelling => locale::text("Cancelling", "正在取消", "正在取消"),
+            ProvisioningStatus::Ready => locale::text("Ready", "已就绪", "已就緒"),
+            ProvisioningStatus::Failed => locale::text("Failed", "失败", "失敗"),
+            ProvisioningStatus::Cancelled => locale::text("Cancelled", "已取消", "已取消"),
+        };
+        let detail = snapshot.detail.clone().or_else(|| error.clone());
+        let border = cx.theme().border;
+        let muted = cx.theme().muted_foreground;
+        let success = cx.theme().success;
+        let danger = cx.theme().danger;
+        let mut body = v_flex()
+            .w_full()
+            .min_w_0()
+            .gap_2()
+            .child(
+                h_flex()
+                    .w_full()
+                    .min_w_0()
+                    .items_center()
+                    .justify_between()
+                    .gap_4()
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_sm()
+                            .font_medium()
+                            .child(format!(
+                                "{}/9 · {}",
+                                step.index() + 1,
+                                Self::connection_step_label(step)
+                            )),
+                    )
+                    .child(div().text_xs().text_color(muted).child(status)),
+            )
+            .child(
+                h_flex()
+                    .w_full()
+                    .gap_1()
+                    .children(ProvisioningStep::ALL.iter().map(|candidate| {
+                        div().h(px(4.0)).flex_1().rounded_full().bg(
+                            if candidate.index() <= step.index() {
+                                success
+                            } else {
+                                border
+                            },
+                        )
+                    })),
+            );
+        if let Some(detail) = detail {
+            body = body.child(
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .max_h(px(180.0))
+                    .overflow_hidden()
+                    .text_xs()
+                    .whitespace_normal()
+                    .text_color(if error.is_some() { danger } else { muted })
+                    .child(detail),
+            );
+        }
+        if let Some(failure) = snapshot.failure.as_ref() {
+            let diagnostic = crate::ssh_connection::diagnostics::diagnose_with_platform(
+                &failure.code,
+                &failure.message,
+                &failure.log_tail,
+                Some(profile_id.as_str()),
+                None,
+                None,
+            );
+            let diagnostic_text = diagnostic.diagnostics.clone();
+            let log_text = format!("{}\n{}", failure.message, failure.log_tail);
+            body = body.child(
+                v_flex()
+                    .w_full()
+                    .gap_1()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(danger)
+                    .p_2()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_medium()
+                            .text_color(danger)
+                            .child(connection_diagnostic_title(diagnostic.kind)),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .whitespace_normal()
+                            .text_color(muted)
+                            .child(diagnostic.message.clone()),
+                    )
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .justify_end()
+                            .gap_2()
+                            .child(
+                                Button::new("connections-diagnostic-copy")
+                                    .small()
+                                    .ghost()
+                                    .label(locale::text("Copy diagnostics", "复制诊断", "複製診斷"))
+                                    .on_click(move |_, _, cx| {
+                                        cx.write_to_clipboard(ClipboardItem::new_string(
+                                            diagnostic_text.clone(),
+                                        ));
+                                    }),
+                            )
+                            .child(
+                                Button::new("connections-progress-copy-log")
+                                    .small()
+                                    .ghost()
+                                    .label(locale::text("Copy log", "复制日志", "複製日誌"))
+                                    .on_click(move |_, _, cx| {
+                                        cx.write_to_clipboard(ClipboardItem::new_string(
+                                            log_text.clone(),
+                                        ));
+                                    }),
+                            )
+                            .child(
+                                Button::new("connections-diagnostic-view-log")
+                                    .small()
+                                    .ghost()
+                                    .label(locale::text("View log", "查看日志", "檢視日誌"))
+                                    .on_click({
+                                        let settings = settings.clone();
+                                        let profile_id = profile_id.clone();
+                                        move |_, _, cx| {
+                                            let _ = settings.update(cx, |this, cx| {
+                                                this.request_ssh_log(profile_id.clone(), cx)
+                                            });
+                                        }
+                                    }),
+                            )
+                            .when_some(diagnostic.log_command.clone(), |this, command| {
+                                this.child(
+                                    Button::new("connections-diagnostic-log-command")
+                                        .small()
+                                        .ghost()
+                                        .label(locale::text(
+                                            "Copy log command",
+                                            "复制日志命令",
+                                            "複製日誌命令",
+                                        ))
+                                        .on_click(move |_, _, cx| {
+                                            cx.write_to_clipboard(ClipboardItem::new_string(
+                                                command.clone(),
+                                            ));
+                                        }),
+                                )
+                            }),
+                    ),
+            );
+        }
+        // The remote server log is fetched on request because it lives on the
+        // other machine; while it is open its own Close drops it again.
+        if let Some(view) = log_view.filter(|view| view.profile_id == profile_id) {
+            let text = if let Some(error) = &view.error {
+                format!(
+                    "{}\n{error}",
+                    locale::text("Log unavailable", "无法读取日志", "無法讀取日誌")
+                )
+            } else if view.loading {
+                locale::text("Loading log…", "正在读取日志…", "正在讀取日誌…").to_string()
+            } else {
+                view.text.clone()
+            };
+            let copy_text = text.clone();
+            let settings_for_close = settings.clone();
+            body = body.child(
+                v_flex()
+                    .w_full()
+                    .gap_1()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(border)
+                    .p_2()
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .justify_between()
+                            .child(div().text_xs().font_medium().child(locale::text(
+                                "Server log",
+                                "服务器日志",
+                                "伺服器日誌",
+                            )))
+                            .child(
+                                h_flex()
+                                    .gap_1()
+                                    .child(
+                                        Button::new("connections-log-copy")
+                                            .small()
+                                            .ghost()
+                                            .label(locale::text("Copy log", "复制日志", "複製日誌"))
+                                            .on_click(move |_, _, cx| {
+                                                cx.write_to_clipboard(ClipboardItem::new_string(
+                                                    copy_text.clone(),
+                                                ));
+                                            }),
+                                    )
+                                    .child(
+                                        Button::new("connections-log-close")
+                                            .small()
+                                            .ghost()
+                                            .label(locale::text("Close", "关闭", "關閉"))
+                                            .on_click(move |_, _, cx| {
+                                                let _ =
+                                                    settings_for_close.update(cx, |this, cx| {
+                                                        this.connections_log_view = None;
+                                                        cx.notify();
+                                                    });
+                                            }),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .w_full()
+                            .max_h(px(180.0))
+                            .overflow_hidden()
+                            .text_xs()
+                            .whitespace_normal()
+                            .text_color(muted)
+                            .child(text),
+                    ),
+            );
+        }
+        let mut actions: Vec<AnyElement> = Vec::new();
+        match snapshot.status {
+            ProvisioningStatus::Pending
+            | ProvisioningStatus::Running
+            | ProvisioningStatus::Cancelling => {
+                actions.push(
+                    Button::new("connections-provisioning-cancel")
+                        .small()
+                        .outline()
+                        .label(locale::text("Cancel provisioning", "取消配置", "取消設定"))
+                        .on_click({
+                            let settings = settings.clone();
+                            move |_, _, cx| {
+                                let _ = settings.update(cx, |this, cx| {
+                                    let workbench = this.workbench.clone();
+                                    cx.defer(move |cx| {
+                                        let _ = workbench.update(cx, |workbench, cx| {
+                                            workbench.cancel_ssh_provisioning(cx)
+                                        });
+                                    });
+                                });
+                            }
+                        })
+                        .into_any_element(),
+                );
+            }
+            ProvisioningStatus::Failed | ProvisioningStatus::Cancelled => {
+                actions.push(
+                    Button::new("connections-provisioning-retry")
+                        .small()
+                        .outline()
+                        .label(locale::text("Retry", "重试", "重試"))
+                        .on_click({
+                            let settings = settings.clone();
+                            let profile_id = profile_id.clone();
+                            move |_, _, cx| {
+                                let _ = settings.update(cx, |this, cx| {
+                                    this.connections_progress_dismissed = None;
+                                    let workbench = this.workbench.clone();
+                                    let profile_id = profile_id.clone();
+                                    cx.defer(move |cx| {
+                                        let _ = workbench.update(cx, |workbench, cx| {
+                                            workbench.start_ssh_profile_provisioning(profile_id, cx)
+                                        });
+                                    });
+                                });
+                            }
+                        })
+                        .into_any_element(),
+                );
+            }
+            ProvisioningStatus::Ready => {}
+        }
+        if !actions.is_empty() {
+            body = body.child(h_flex().w_full().justify_end().gap_2().children(actions));
+        }
+        body.into_any_element()
+    }
+
     fn render_connections_page(&self, stacked: bool, cx: &mut Context<Self>) -> AnyElement {
         // The three add flows are dialogs over the page, not sections inside
         // it. A page that grew a section whenever a button was pressed pushed
@@ -86591,12 +87021,45 @@ impl FoundationSettings {
                 this.open_connections_wsl_dialog(window, cx);
             }));
         let mut groups = Vec::new();
-        if self.connections_snapshot.is_some() || self.connections_error.is_some() {
+        // A finished attempt belongs to its row, not to the page: the row's
+        // status lane already says how it ended. An attempt that is still
+        // running gets a one-line entry point, and its detail lives in a
+        // dismissible dialog so a failure can never trap the settings page.
+        let in_flight = self
+            .connections_snapshot
+            .as_ref()
+            .filter(|snapshot| !snapshot.status.is_terminal());
+        if in_flight.is_some() || self.connections_error.is_some() {
+            let summary = self
+                .connections_snapshot
+                .as_ref()
+                .filter(|snapshot| !snapshot.status.is_terminal())
+                .map(|snapshot| {
+                    format!(
+                        "{}/9 · {}",
+                        snapshot.step.index() + 1,
+                        Self::connection_step_label(snapshot.step)
+                    )
+                })
+                .or_else(|| {
+                    self.connections_error
+                        .clone()
+                        .map(|error| error.lines().next().unwrap_or_default().to_string())
+                })
+                .unwrap_or_default();
             groups.push(SettingsGroup::new(
                 locale::text("Provisioning", "配置进度", "設定進度"),
-                vec![self.connections_progress_panel(
-                    self.connections_snapshot.as_ref(),
-                    self.connections_error.as_deref(),
+                vec![setting_row(
+                    locale::text("Remote runtime setup", "远程运行时配置", "遠端執行階段設定"),
+                    div().text_xs().whitespace_normal().child(summary),
+                    Button::new("connections-progress-open")
+                        .small()
+                        .outline()
+                        .label(locale::text("Show progress", "查看进度", "檢視進度"))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.open_connections_progress_dialog(window, cx);
+                        })),
+                    stacked,
                     cx,
                 )],
             ));
@@ -86678,8 +87141,8 @@ impl FoundationSettings {
                 "添加 SSH 连接",
                 "新增 SSH 連線",
             ))
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.load_connections_discovery(cx);
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.open_connections_add_dialog(window, cx);
             }));
         v_flex()
             .w_full()
@@ -86845,405 +87308,6 @@ impl FoundationSettings {
             },
         ));
         cx.notify();
-    }
-
-    fn connections_progress_panel(
-        &self,
-        snapshot: Option<&ProvisioningSnapshot>,
-        error: Option<&str>,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let is_dark = cx.theme().is_dark();
-        let muted = theme::semantic_color("muted-foreground", is_dark);
-        let border = theme::semantic_color("border", is_dark);
-        // The shared catalog has no `success`/`danger` roles: the framework
-        // theme carries them as aliases of `chart-2` and `destructive`.
-        let success = cx.theme().success;
-        let danger = cx.theme().danger;
-        let step = snapshot
-            .map(|snapshot| snapshot.step)
-            .unwrap_or(ProvisioningStep::ResolvingHost);
-        let status = snapshot
-            .map(|snapshot| snapshot.status)
-            .map(|status| match status {
-                ProvisioningStatus::Pending => locale::text("Waiting", "等待中", "等待中"),
-                ProvisioningStatus::Running => locale::text("Running", "进行中", "進行中"),
-                ProvisioningStatus::Cancelling => {
-                    locale::text("Cancelling", "正在取消", "正在取消")
-                }
-                ProvisioningStatus::Ready => locale::text("Ready", "已就绪", "已就緒"),
-                ProvisioningStatus::Failed => locale::text("Failed", "失败", "失敗"),
-                ProvisioningStatus::Cancelled => locale::text("Cancelled", "已取消", "已取消"),
-            })
-            .unwrap_or_else(|| locale::text("Waiting", "等待中", "等待中"));
-        let detail = snapshot
-            .and_then(|snapshot| snapshot.detail.clone())
-            .or_else(|| error.map(str::to_string));
-        let profile = snapshot.and_then(|snapshot| {
-            self.connections_profiles
-                .iter()
-                .find(|profile| profile.id == snapshot.profile_id)
-        });
-        let log_profile_id = profile
-            .map(|profile| profile.id.clone())
-            .or_else(|| snapshot.map(|snapshot| snapshot.profile_id.clone()));
-        let host_alias = profile
-            .map(|profile| {
-                if profile.ssh_alias.is_empty() {
-                    profile.host.as_str()
-                } else {
-                    profile.ssh_alias.as_str()
-                }
-            })
-            .or_else(|| snapshot.map(|_| "the remote host"));
-        let log_path = profile.map(|profile| {
-            format!(
-                "{}/.local/state/vibex/server/server.log",
-                profile.remote_home
-            )
-        });
-        let diagnostic =
-            if let Some(failure) = snapshot.and_then(|snapshot| snapshot.failure.as_ref()) {
-                Some(crate::ssh_connection::diagnostics::diagnose_with_platform(
-                    &failure.code,
-                    &failure.message,
-                    &failure.log_tail,
-                    host_alias,
-                    log_path.as_deref(),
-                    profile.and_then(|profile| profile.remote_os.as_deref()),
-                ))
-            } else {
-                error.map(|error| {
-                    let (code, message) = error
-                        .split_once(':')
-                        .map(|(code, message)| (code.trim(), message.trim()))
-                        .unwrap_or(("ssh_unknown", error));
-                    crate::ssh_connection::diagnostics::diagnose_with_platform(
-                        code,
-                        message,
-                        "",
-                        host_alias,
-                        log_path.as_deref(),
-                        profile.and_then(|profile| profile.remote_os.as_deref()),
-                    )
-                })
-            };
-        let mut actions = Vec::new();
-        if let Some(snapshot) = snapshot {
-            let workbench = self.workbench.clone();
-            match snapshot.status {
-                ProvisioningStatus::Running
-                | ProvisioningStatus::Cancelling
-                | ProvisioningStatus::Pending => {
-                    let cancel_workbench = workbench.clone();
-                    actions.push(
-                        Button::new("connections-provisioning-cancel")
-                            .small()
-                            .outline()
-                            .label(locale::text("Cancel", "取消", "取消"))
-                            .on_click(cx.listener(move |_, _, _, cx| {
-                                let workbench = cancel_workbench.clone();
-                                cx.defer(move |cx| {
-                                    let _ = workbench.update(cx, |workbench, cx| {
-                                        workbench.cancel_ssh_provisioning(cx)
-                                    });
-                                });
-                            }))
-                            .into_any_element(),
-                    );
-                }
-                ProvisioningStatus::Failed | ProvisioningStatus::Cancelled => {
-                    let profile_id = snapshot.profile_id.clone();
-                    let retry_workbench = workbench.clone();
-                    actions.push(
-                        Button::new("connections-provisioning-retry")
-                            .small()
-                            .outline()
-                            .label(locale::text("Retry", "重试", "重試"))
-                            .on_click(cx.listener(move |_, _, _, cx| {
-                                let workbench = retry_workbench.clone();
-                                let profile_id = profile_id.clone();
-                                cx.defer(move |cx| {
-                                    let _ = workbench.update(cx, |workbench, cx| {
-                                        workbench.start_ssh_profile_provisioning(profile_id, cx)
-                                    });
-                                });
-                            }))
-                            .into_any_element(),
-                    );
-                }
-                ProvisioningStatus::Ready => {}
-            }
-        }
-        v_flex()
-            .w_full()
-            .min_w_0()
-            .gap_2()
-            .py(px(14.0))
-            .child(
-                h_flex()
-                    .w_full()
-                    .min_w_0()
-                    .items_center()
-                    .justify_between()
-                    .gap_4()
-                    .child(
-                        div()
-                            .min_w_0()
-                            .truncate()
-                            .text_sm()
-                            .font_medium()
-                            .child(format!(
-                                "{}/9 · {}",
-                                step.index() + 1,
-                                Self::connection_step_label(step)
-                            )),
-                    )
-                    .child(div().text_xs().text_color(muted).child(status)),
-            )
-            .child(
-                h_flex()
-                    .w_full()
-                    .gap_1()
-                    .children(ProvisioningStep::ALL.iter().map(|candidate| {
-                        div().h(px(4.0)).flex_1().rounded_full().bg(
-                            if candidate.index() <= step.index() {
-                                success
-                            } else {
-                                border
-                            },
-                        )
-                    })),
-            )
-            .when_some(detail, |this, detail| {
-                this.child(
-                    div()
-                        .w_full()
-                        .min_w_0()
-                        .text_xs()
-                        .whitespace_normal()
-                        .text_color(if error.is_some() { danger } else { muted })
-                        .child(detail),
-                )
-            })
-            .when_some(diagnostic, |this, diagnostic| {
-                let diagnostic_text = diagnostic.diagnostics.clone();
-                let log_command = diagnostic.log_command.clone();
-                let hints = diagnostic
-                    .actions
-                    .iter()
-                    .filter(|action| {
-                        !matches!(
-                            action,
-                            crate::ssh_connection::diagnostics::SshDiagnosticAction::CopyDiagnostics
-                                | crate::ssh_connection::diagnostics::SshDiagnosticAction::CopyLogCommand
-                        )
-                    })
-                    .map(|action| connection_diagnostic_action_label(*action))
-                    .collect::<Vec<_>>()
-                    .join(" · ");
-                this.child(
-                    v_flex()
-                        .w_full()
-                        .gap_1()
-                        .rounded_md()
-                        .border_1()
-                        .border_color(danger)
-                        .p_2()
-                        .child(
-                            div()
-                                .text_sm()
-                                .font_medium()
-                                .text_color(danger)
-                                .child(connection_diagnostic_title(diagnostic.kind)),
-                        )
-                        .child(
-                            div()
-                                .text_xs()
-                                .whitespace_normal()
-                                .text_color(muted)
-                                .child(diagnostic.message.clone()),
-                        )
-                        .when(!diagnostic.host_key_fingerprints.is_empty(), |this| {
-                            this.child(
-                                div()
-                                    .text_xs()
-                                    .text_color(danger)
-                                    .child(format!(
-                                        "{}: {}",
-                                        locale::text(
-                                            "Host key fingerprints",
-                                            "主机密钥指纹",
-                                            "主機金鑰指紋"
-                                        ),
-                                        diagnostic.host_key_fingerprints.join(" / ")
-                                    )),
-                            )
-                        })
-                        .when_some(diagnostic.guidance.clone(), |this, guidance| {
-                            this.child(
-                                div()
-                                    .text_xs()
-                                    .whitespace_normal()
-                                    .text_color(muted)
-                                    .child(guidance),
-                            )
-                        })
-                        .when(!hints.is_empty(), |this| {
-                            this.child(
-                                div()
-                                    .text_xs()
-                                    .text_color(muted)
-                                    .child(format!(
-                                        "{}: {hints}",
-                                        locale::text("Next", "下一步", "下一步")
-                                    )),
-                            )
-                        })
-                        .child(
-                            h_flex()
-                                .w_full()
-                                .justify_end()
-                                .gap_2()
-                                .child(
-                                    Button::new("connections-diagnostic-copy")
-                                        .small()
-                                        .ghost()
-                                        .label(locale::text(
-                                            "Copy diagnostics",
-                                            "复制诊断",
-                                            "複製診斷"
-                                        ))
-                                        .on_click(cx.listener(move |_, _, _, cx| {
-                                            cx.write_to_clipboard(ClipboardItem::new_string(
-                                                diagnostic_text.clone(),
-                                            ));
-                                        })),
-                                )
-                                .when_some(log_profile_id.clone(), |this, profile_id| {
-                                    this.child(
-                                        Button::new("connections-diagnostic-view-log")
-                                            .small()
-                                            .ghost()
-                                            .label(locale::text(
-                                                "View log",
-                                                "查看日志",
-                                                "檢視日誌",
-                                            ))
-                                            .on_click(cx.listener(move |this, _, _, cx| {
-                                                this.request_ssh_log(profile_id.clone(), cx)
-                                            })),
-                                    )
-                                })
-                                .when_some(log_command, |this, command| {
-                                    this.child(
-                                        Button::new("connections-diagnostic-log-command")
-                                            .small()
-                                            .ghost()
-                                            .label(locale::text(
-                                                "Copy log command",
-                                                "复制日志命令",
-                                                "複製日誌命令",
-                                            ))
-                                            .on_click(cx.listener(move |_, _, _, cx| {
-                                                cx.write_to_clipboard(ClipboardItem::new_string(
-                                                    command.clone(),
-                                                ));
-                                            })),
-                                    )
-                                }),
-                        ),
-                )
-            })
-            .when_some(
-                self.connections_log_view
-                    .clone()
-                    .filter(|view| log_profile_id.as_deref() == Some(view.profile_id.as_str())),
-                |this, view| {
-                    let text = if let Some(error) = &view.error {
-                        format!("{}
-{error}", locale::text("Log unavailable", "无法读取日志", "無法讀取日誌"))
-                    } else if view.loading {
-                        locale::text("Loading log…", "正在读取日志…", "正在讀取日誌…").to_string()
-                    } else {
-                        view.text.clone()
-                    };
-                    let copy_text = text.clone();
-                    this.child(
-                        v_flex()
-                            .w_full()
-                            .gap_1()
-                            .rounded_md()
-                            .border_1()
-                            .border_color(border)
-                            .p_2()
-                            .child(
-                                h_flex()
-                                    .w_full()
-                                    .justify_between()
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .font_medium()
-                                            .child(locale::text(
-                                                "Server log",
-                                                "服务器日志",
-                                                "伺服器日誌",
-                                            )),
-                                    )
-                                    .child(
-                                        h_flex()
-                                            .gap_1()
-                                            .child(
-                                                Button::new("connections-log-copy")
-                                                    .small()
-                                                    .ghost()
-                                                    .label(locale::text(
-                                                        "Copy log",
-                                                        "复制日志",
-                                                        "複製日誌",
-                                                    ))
-                                                    .on_click(cx.listener(move |_, _, _, cx| {
-                                                        cx.write_to_clipboard(
-                                                            ClipboardItem::new_string(
-                                                                copy_text.clone(),
-                                                            ),
-                                                        );
-                                                    })),
-                                            )
-                                            .child(
-                                                Button::new("connections-log-close")
-                                                    .small()
-                                                    .ghost()
-                                                    .label(locale::text(
-                                                        "Close",
-                                                        "关闭",
-                                                        "關閉",
-                                                    ))
-                                                    .on_click(cx.listener(|this, _, _, cx| {
-                                                        this.connections_log_view = None;
-                                                        cx.notify();
-                                                    })),
-                                            ),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .w_full()
-                                    .max_h(px(220.0))
-                                    .overflow_hidden()
-                                    .text_xs()
-                                    .whitespace_normal()
-                                    .text_color(muted)
-                                    .child(text),
-                            ),
-                    )
-                },
-            )
-            .when(!actions.is_empty(), |this| {
-                this.child(h_flex().w_full().justify_end().gap_2().children(actions))
-            })
-            .into_any_element()
     }
 
     fn connection_step_label(step: ProvisioningStep) -> &'static str {
@@ -111719,6 +111783,107 @@ mod tests {
         }
     }
 
+    /// Every entry point on the page must open the add dialog.
+    ///
+    /// The empty state kept the old "discover hosts" call after the form moved
+    /// into a dialog, so its own Add SSH connection button did nothing: it
+    /// loaded a host list that only the dialog ever rendered.
+    #[test]
+    fn every_add_entry_point_opens_the_ssh_dialog() {
+        let source = include_str!("app.rs");
+        let empty = source
+            .split_once("    fn render_connections_empty_state(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn connections_rows("))
+            .map(|(body, _)| body)
+            .expect("the empty state should remain inspectable");
+        assert!(
+            empty.contains("open_connections_add_dialog"),
+            "the empty state's Add SSH connection must open the dialog"
+        );
+        assert!(
+            !empty.contains("load_connections_discovery"),
+            "loading discovery alone paints nothing: the hosts render in the dialog"
+        );
+
+        let page = source
+            .split_once("    fn render_connections_page(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_connections_empty_state("))
+            .map(|(body, _)| body)
+            .expect("the Connections page should remain inspectable");
+        for opener in [
+            "open_connections_add_dialog",
+            "open_connections_bootstrap_dialog",
+            "open_connections_wsl_dialog",
+            "open_connections_progress_dialog",
+        ] {
+            assert!(page.contains(opener), "the page must route {opener}");
+        }
+    }
+
+    /// Provisioning is a dialog the reader can close, not a page section.
+    ///
+    /// A failed run used to mount above the list with no dismissal, so the
+    /// settings page could not be returned to its own content. The dialog keeps
+    /// a Close in its footer, closing does not cancel the run, and the attempt
+    /// stays closed until it finishes or Retry replaces it.
+    #[test]
+    fn provisioning_reports_in_a_closable_dialog() {
+        let source = include_str!("app.rs");
+        let opener = source
+            .split_once("    fn open_connections_progress_dialog(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// One provisioning attempt"))
+            .map(|(body, _)| body)
+            .expect("the provisioning dialog should remain inspectable");
+        assert!(opener.contains("window.open_dialog(cx"));
+        assert!(
+            opener.contains("connections-progress-close"),
+            "the dialog needs a Close of its own"
+        );
+        let close = opener
+            .split_once("Button::new(\"connections-progress-close\")")
+            .and_then(|(_, tail)| tail.split_once("window.close_dialog(cx)"))
+            .map(|(body, _)| body)
+            .expect("the Close should remain inspectable");
+        assert!(
+            close.contains("close_connections_progress_dialog"),
+            "closing while the run continues has to remember the dismissal"
+        );
+        let helper = source
+            .split_once("    fn close_connections_progress_dialog(")
+            .and_then(|(_, tail)| tail.split_once("\n    }\n"))
+            .map(|(body, _)| body)
+            .expect("the dismissal should remain inspectable");
+        assert!(
+            helper.contains("connections_progress_dismissed"),
+            "the dismissal is what keeps the next progress event from reopening"
+        );
+        assert!(
+            opener.contains(".on_close("),
+            "Escape and the backdrop must record the same dismissal as Close"
+        );
+        assert!(
+            source.contains("connections_progress_open"),
+            "progress events arrive repeatedly, so the opener must know it is open"
+        );
+        assert!(
+            !close.contains("cancel_ssh_provisioning"),
+            "closing the dialog must not cancel the provisioning run"
+        );
+
+        // The page keeps an entry point for a running attempt, so dismissing
+        // the dialog does not lose the progress.
+        let page = source
+            .split_once("    fn render_connections_page(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_connections_empty_state("))
+            .map(|(body, _)| body)
+            .expect("the Connections page should remain inspectable");
+        assert!(page.contains("connections-progress-open"));
+        assert!(
+            !page.contains("connections_progress_panel"),
+            "the inline panel must not come back"
+        );
+    }
+
     /// A probe or WSL failure outlives its dialog.
     ///
     /// Both submit and close their dialog, so the failure text cannot live in
@@ -111891,7 +112056,7 @@ mod tests {
         assert!(source.contains("connections_profiles: Vec<SshConnectionProfile>"));
         assert!(source.contains("SshProfileStore::at_home"));
         assert!(source.contains("fn connections_rows("));
-        assert!(source.contains("fn connections_progress_panel("));
+        assert!(source.contains("fn open_connections_progress_dialog("));
         assert!(source.contains("fn load_connections_discovery("));
         assert!(source.contains("fn probe_connections_host("));
         assert!(source.contains("connections-host-"));
@@ -112050,9 +112215,11 @@ mod tests {
     #[test]
     fn connections_page_only_reads_authored_semantic_roles() {
         let source = include_str!("app.rs");
+        // Every renderer this section owns, from the page through the
+        // provisioning dialog and the detail cards.
         let connections = source
-            .split_once("    fn connections_progress_panel(")
-            .and_then(|(_, tail)| tail.split_once("\n    fn connection_detail("))
+            .split_once("    fn render_connections_page(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_archived_page("))
             .map(|(body, _)| body)
             .expect("the Connections renderers should remain inspectable");
         let authored: BTreeSet<&str> = vibex_ui::default_theme(GpuiThemeMode::Dark)
@@ -112072,7 +112239,10 @@ mod tests {
             );
             checked += 1;
         }
-        assert!(checked >= 2, "the page should read authored roles");
+        assert!(
+            checked >= 2,
+            "the Connections surfaces should read authored semantic roles"
+        );
     }
 
     /// The import button lives on the settings page, and the settings page is
