@@ -1727,12 +1727,11 @@ mod tests {
         }
         // Ollama's own server is local and unlisted, so a suggestion must
         // never be attempted for it.
-        for preset_id in [PROVIDER_PRESET_OLLAMA] {
-            assert!(
-                provider_preset(preset_id).unwrap().catalog_id.is_none(),
-                "{preset_id} has no models.dev provider"
-            );
-        }
+        let preset_id = PROVIDER_PRESET_OLLAMA;
+        assert!(
+            provider_preset(preset_id).unwrap().catalog_id.is_none(),
+            "{preset_id} has no models.dev provider"
+        );
     }
 
     #[test]

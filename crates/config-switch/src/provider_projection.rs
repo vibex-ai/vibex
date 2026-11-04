@@ -11872,10 +11872,18 @@ mod shared_record_authority_tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// The backfill still creates a record that is missing.
+    /// The compatibility backfill still creates a record that is missing.
     ///
-    /// Authority is not the same as "stop projecting": a legacy row with no shared
-    /// record yet still needs one, or its Provider would vanish from the v2 side.
+    /// Authority is not the same as "stop projecting": a legacy row written
+    /// without a shared record — by an older build, or by a writer that only
+    /// knows the v1 shape — still needs one, or its Provider would vanish from
+    /// the v2 side.
+    ///
+    /// The backfill runs as part of the migration chain, not on every
+    /// connection: `open_connection` asks the database whether it is current
+    /// and skips the chain when it is. So the case is exercised the way it
+    /// really happens — a legacy row appears behind an already-current
+    /// database, and the next migration run projects it.
     #[test]
     fn the_backfill_still_creates_a_missing_record() {
         let dir = std::env::temp_dir().join(format!(
@@ -11887,7 +11895,7 @@ mod shared_record_authority_tests {
         service.open_connection().unwrap();
 
         // A legacy row written directly, with no projection behind it.
-        let conn = service.open_connection().unwrap();
+        let mut conn = service.open_connection().unwrap();
         let legacy = vibex_core::ProviderProfile {
             id: vibex_core::ProviderProfileId::new(),
             agent_id: vibex_core::AgentId::parse("opencode").unwrap(),
@@ -11917,9 +11925,19 @@ mod shared_record_authority_tests {
             deleted_at_ms: None,
         };
         vibex_db::ProviderProfileRepository::insert(&conn, &legacy).unwrap();
-        drop(conn);
 
-        let conn = service.open_connection().unwrap();
+        // A current database skips the chain, so this read proves the backfill
+        // is what the projection depends on rather than something a plain open
+        // performs.
+        let unprojected =
+            vibex_db::ModelProviderProfileRepository::get_by_legacy_profile(&conn, &legacy.id)
+                .unwrap();
+        assert!(
+            unprojected.is_none(),
+            "a plain open must not run the backfill on a current database"
+        );
+
+        vibex_db::apply_migrations(&mut conn).unwrap();
         let projected =
             vibex_db::ModelProviderProfileRepository::get_by_legacy_profile(&conn, &legacy.id)
                 .unwrap();

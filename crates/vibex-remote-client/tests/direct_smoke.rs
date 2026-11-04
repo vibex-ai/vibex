@@ -162,29 +162,39 @@ async fn direct_gateway_pair_and_v2_handshake_smoke() {
     .expect("construct auto transport");
     auto.connect().await.expect("connect auto transport");
     gateway.stop().await.expect("stop gateway for recovery");
-    let close = tokio::time::timeout(Duration::from_secs(3), async {
+    // Stopping the gateway can be observed two ways, and which one arrives
+    // first is a race: the socket closes and the transport reports it, or the
+    // reconnect budget runs out before that event is delivered and the
+    // selection reports that no candidate answered. Both say the same thing —
+    // the gateway the transport was using is gone — so either ends the wait,
+    // and the recovery check below is what proves the transport noticed.
+    let closed = tokio::time::timeout(Duration::from_secs(3), async {
         loop {
-            let event = auto
-                .next_domain_event()
-                .await
-                .expect("read gateway close")
-                .expect("gateway close event");
-            if matches!(
-                event,
-                RemoteTransportEvent::Closed
-                    | RemoteTransportEvent::Control(RemoteControlMessageV2::Close(_))
-            ) {
-                break event;
+            let event = auto.next_domain_event().await;
+            match event {
+                Ok(Some(
+                    RemoteTransportEvent::Closed
+                    | RemoteTransportEvent::Control(RemoteControlMessageV2::Close(_)),
+                )) => break,
+                Ok(Some(_)) => continue,
+                Ok(None) => break,
+                Err(error) => {
+                    assert_eq!(
+                        error.kind,
+                        vibex_backend::BackendErrorKind::Offline,
+                        "an unexpected failure while the gateway was stopping: {error:?}"
+                    );
+                    break;
+                }
             }
         }
     })
-    .await
-    .expect("gateway close timeout");
-    assert!(matches!(
-        close,
-        RemoteTransportEvent::Closed
-            | RemoteTransportEvent::Control(RemoteControlMessageV2::Close(_))
-    ));
+    .await;
+    assert!(
+        closed.is_ok(),
+        "the transport never noticed the stopped gateway: state={:?}",
+        auto.state()
+    );
     let retry_started = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             if auto.state().reconnect_attempt >= 1 {

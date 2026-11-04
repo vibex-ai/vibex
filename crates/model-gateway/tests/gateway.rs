@@ -380,6 +380,18 @@ fn database_path() -> std::path::PathBuf {
 /// only; reads of the renamed document stay concurrent.
 static TEST_SECRET_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Writes one Key through the host-file store under the suite's write lock.
+///
+/// Every Key this suite stores goes through here. The store rewrites one JSON
+/// document, so an unguarded write in one test can lose the temporary file a
+/// concurrent test is renaming into place — which then fails as a write error
+/// in whichever test happened to lose the race, not in the one that caused it.
+fn store_test_secret(lookup_key: &str, secret: &str) {
+    configure_test_secrets();
+    let _guard = TEST_SECRET_LOCK.lock().unwrap();
+    secrets::store_provider_secret(lookup_key, secret).unwrap();
+}
+
 fn configure_test_secrets() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
@@ -399,12 +411,8 @@ fn seed_upstream(
     models: &[&str],
     api_key: &str,
 ) -> ModelProviderProfileId {
-    configure_test_secrets();
     let lookup_key = format!("vibex-test-secret-{}", RequestId::new().as_str());
-    {
-        let _guard = TEST_SECRET_LOCK.lock().unwrap();
-        secrets::store_provider_secret(&lookup_key, api_key).unwrap();
-    }
+    store_test_secret(&lookup_key, api_key);
     let credential = ModelProviderCredentialReference {
         id: RequestId::new(),
         display_name: "Primary".to_string(),
@@ -517,12 +525,8 @@ fn seed_untyped_upstream(
     models: &[&str],
     api_key: &str,
 ) -> ModelProviderProfileId {
-    configure_test_secrets();
     let lookup_key = format!("vibex-test-secret-{}", RequestId::new().as_str());
-    {
-        let _guard = TEST_SECRET_LOCK.lock().unwrap();
-        secrets::store_provider_secret(&lookup_key, api_key).unwrap();
-    }
+    store_test_secret(&lookup_key, api_key);
     let credential = ModelProviderCredentialReference {
         id: RequestId::new(),
         display_name: "Primary".to_string(),
@@ -1097,7 +1101,7 @@ async fn a_preferred_key_is_tried_before_the_provider_order() {
             .unwrap()
             .unwrap();
         let lookup_key = format!("vibex-test-secret-{}", RequestId::new().as_str());
-        secrets::store_provider_secret(&lookup_key, "sk-good").unwrap();
+        store_test_secret(&lookup_key, "sk-good");
         let credential = ModelProviderCredentialReference {
             id: RequestId::new(),
             display_name: "Backup".to_string(),
@@ -1286,7 +1290,7 @@ async fn a_cooling_key_is_skipped_and_the_second_key_answers() {
             .unwrap()
             .unwrap();
         let lookup_key = format!("vibex-test-secret-{}", RequestId::new().as_str());
-        secrets::store_provider_secret(&lookup_key, "sk-cooling").unwrap();
+        store_test_secret(&lookup_key, "sk-cooling");
         let credential = ModelProviderCredentialReference {
             id: RequestId::new(),
             display_name: "Cooling".to_string(),
@@ -1379,7 +1383,7 @@ async fn a_failover_records_the_refused_key_and_why_it_moved_on() {
             .unwrap()
             .unwrap();
         let lookup_key = format!("vibex-test-secret-{}", RequestId::new().as_str());
-        secrets::store_provider_secret(&lookup_key, "sk-backup").unwrap();
+        store_test_secret(&lookup_key, "sk-backup");
         let credential = ModelProviderCredentialReference {
             id: RequestId::new(),
             display_name: "Backup".to_string(),
@@ -1475,7 +1479,7 @@ async fn a_first_try_success_on_a_multi_key_provider_is_not_a_failover() {
             .unwrap()
             .unwrap();
         let lookup_key = format!("vibex-test-secret-{}", RequestId::new().as_str());
-        secrets::store_provider_secret(&lookup_key, "sk-second").unwrap();
+        store_test_secret(&lookup_key, "sk-second");
         profile.credentials.push(ModelProviderCredentialReference {
             id: RequestId::new(),
             display_name: "Secondary".to_string(),

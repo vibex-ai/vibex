@@ -1579,29 +1579,64 @@ mod tests {
         assert_eq!(env.gate.prompt_gate_events().last(), Some(&false));
     }
 
+    /// A missed seamless deadline waits instead of failing the switch.
+    ///
+    /// The deadline is how long the switch expects the turn to take, not a
+    /// cutoff: the turn is still the reader's work, so failing here would fall
+    /// back to the previous runtime and discard every message queued behind
+    /// the switch. The reader keeps seeing "waiting for current work", and the
+    /// switch finishes when the turn really ends.
     #[tokio::test]
-    async fn seamless_timeout_keeps_source_and_projects_actionable_error() {
+    async fn seamless_timeout_keeps_waiting_until_the_turn_ends() {
         let env = TestEnvironment::new("wait-timeout", 10);
         env.gate.set_active_turn(true);
-        env.service
+        let initial = env
+            .service
             .set_desired_runtime(env.request("wait-timeout", 0, "model-target"))
             .await
             .unwrap();
-        let failed = wait_for_status(
+        let switch_id = initial.pending_switch_id.clone().unwrap();
+        let waiting = wait_for_status(
             &env.service,
             &env.session_id,
-            SessionRuntimeSelectionStatus::FailedUsingPrevious,
+            SessionRuntimeSelectionStatus::WaitingForCurrentWork,
         )
         .await;
-        assert_eq!(failed.desired, env.effective);
-        assert_eq!(failed.effective, env.effective);
+        assert_eq!(waiting.pending_switch_id.as_ref(), Some(&switch_id));
         assert_eq!(
-            failed.current_binding_id.as_ref(),
+            waiting.current_binding_id.as_ref(),
             Some(&env.source_binding.binding_id)
         );
-        let error = failed.actionable_error.unwrap();
-        assert_eq!(error.code, "runtime_switch_wait_timeout");
-        assert!(error.message.contains("did not finish"));
+        assert!(waiting.actionable_error.is_none());
+
+        // Past the deadline nothing fails: the switch is still waiting, the
+        // source is still current, and the prompt gate stays closed.
+        sleep(Duration::from_millis(60)).await;
+        let still_waiting = env.service.get_selection_state(&env.session_id).unwrap();
+        assert_eq!(
+            still_waiting.status,
+            SessionRuntimeSelectionStatus::WaitingForCurrentWork
+        );
+        assert_eq!(still_waiting.pending_switch_id.as_ref(), Some(&switch_id));
+        assert_eq!(
+            still_waiting.current_binding_id.as_ref(),
+            Some(&env.source_binding.binding_id)
+        );
+        assert!(still_waiting.actionable_error.is_none());
+
+        // The turn ends, and the switch that outlived its deadline commits.
+        env.gate.set_active_turn(false);
+        let ready = wait_for_status(
+            &env.service,
+            &env.session_id,
+            SessionRuntimeSelectionStatus::Ready,
+        )
+        .await;
+        assert_eq!(
+            ready.desired.model,
+            vibex_core::RuntimeModelSelection::explicit("model-target")
+        );
+        assert!(ready.actionable_error.is_none());
         assert!(env.gate.cancel_calls().is_empty());
         assert_eq!(env.gate.prompt_gate_events().last(), Some(&false));
     }
