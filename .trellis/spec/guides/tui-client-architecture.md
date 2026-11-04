@@ -267,6 +267,25 @@ Rules that make this work:
   scrolled away cannot keep a stale hit rect; `run.rs` does nothing but
   hit-test. A click on a hint runs the intent its key would run, so the mouse
   cannot grow a second, divergent command set.
+* **A printed key is a control.** Anywhere the interface draws `key label` —
+  the queue band's `Alt+E edit`, the dock's `Alt+G open`, a modal footer's
+  `Esc close`, the settings footer, the composing page's `Ctrl+W change` — the
+  legend is published as a `KeyHintRegion` (rect plus chord) and a press is put
+  through `handle_key` as that chord's `KeyEvent`. That is stronger than the
+  intent path above and deliberately so: the key already has a meaning in the
+  mode the reader is in, including the pre-table modes a form or a filter
+  answers before the binding table, so the legend cannot disagree with it. The
+  chord is read back from the text that was drawn (`Chord::from_hint`), which
+  is what keeps a translated strip honest: a `↑↓` in a picker's footer is two
+  one-cell targets, one per arrow, and `↑↓`/`←→` are the only pairs that split
+  — `J/K` names one reorder step, not two directions.
+* **A band's rows are published, not counted.** The queue band and the dock
+  scroll to keep their cursors visible, and both list only the subset that
+  belongs to the session on screen. `FrameRegions::queue_rows` and
+  `dock_rows` carry the row each drawn line shows, so a click or a hover maps
+  a line to the thing under the pointer. Counting from the top of the rect
+  instead would select a different message than the one the reader is pointing
+  at, the moment the band had scrolled.
 * **The banner row has one owner.** `BannerPriority` orders the claimants
   (transient < tip < mode < warning); `App::set_banner` refuses to displace a
   higher-priority message, and `refresh_banner` re-derives the row from the

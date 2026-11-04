@@ -151,7 +151,7 @@ fn event_loop(
                 drained += 1;
                 match event {
                     Event::Key(key) if key.kind != KeyEventKind::Release => {
-                        if handle_key(app, worker, guard, key)? {
+                        if handle_key(app, worker, Some(guard), key)? {
                             return Ok(ExitReason::UserQuit);
                         }
                         dirty = true;
@@ -160,7 +160,7 @@ fn event_loop(
                         questions_due = true;
                     }
                     Event::Mouse(mouse) => {
-                        if handle_mouse(app, worker, mouse) {
+                        if handle_mouse(app, worker, Some(guard), mouse)? {
                             dirty = true;
                         }
                     }
@@ -534,10 +534,16 @@ fn terminal_keys_bytes(key: KeyEvent) -> Option<String> {
     }
 }
 
+/// Reduce one key press. `true` means the program should exit.
+///
+/// The terminal guard is what `$EDITOR` needs — handing the screen over and
+/// taking it back — and it is optional because a press can also arrive from a
+/// click on a key legend, where there is no editor to open and, in a test, no
+/// terminal to hand over. Only that one branch reads it.
 fn handle_key(
     app: &mut App,
     worker: &Worker,
-    guard: &mut TerminalGuard,
+    guard: Option<&mut TerminalGuard>,
     key: KeyEvent,
 ) -> BackendResult<bool> {
     let key = normalized_key(key);
@@ -1114,6 +1120,11 @@ fn handle_key(
 
     // `$EDITOR` hands the terminal over, so it runs outside the reducer.
     if intent == crate::action::Intent::EditComposerExternally {
+        // No legend advertises this chord, so a pointer press never reaches
+        // here; without a terminal there is nothing to hand the editor.
+        let Some(guard) = guard else {
+            return Ok(false);
+        };
         let body = app.composer.text().to_string();
         let edited = with_terminal_restored(guard, || {
             crate::terminal::edit_in_editor("Vibex draft", &body)
@@ -1484,7 +1495,12 @@ fn handle_composer_key(
 /// The mouse is an enhancement, never the only path: every gesture here has a
 /// keyboard equivalent, and the transcript stays readable if the terminal has no
 /// mouse reporting at all.
-fn handle_mouse(app: &mut App, worker: &Worker, mouse: MouseEvent) -> bool {
+fn handle_mouse(
+    app: &mut App,
+    worker: &Worker,
+    guard: Option<&mut TerminalGuard>,
+    mouse: MouseEvent,
+) -> BackendResult<bool> {
     // A sign-in terminal that asked for the mouse owns it: the program drew a
     // list and asked the terminal to report clicks, which is exactly the mode
     // the emulator records. A click the client kept for itself would be a click
@@ -1497,9 +1513,9 @@ fn handle_mouse(app: &mut App, worker: &Worker, mouse: MouseEvent) -> bool {
                 data: bytes,
             }]),
         );
-        return true;
+        return Ok(true);
     }
-    match mouse.kind {
+    Ok(match mouse.kind {
         MouseEventKind::ScrollUp => {
             // The switcher owns the wheel while it is up: it is the list on
             // screen, and scrolling the transcript behind a modal is not a
@@ -1507,19 +1523,19 @@ fn handle_mouse(app: &mut App, worker: &Worker, mouse: MouseEvent) -> bool {
             if app.runtime_picker_is_open() {
                 let outcome = app.step_runtime_picker(-3);
                 dispatch_all(worker, &outcome);
-                return true;
+                return Ok(true);
             }
             // On the session list the wheel moves the list: the transcript
             // behind it is not what the reader is looking at, and a list that
             // only answers the arrow keys is a list that cannot be scanned.
             if app.page == crate::app::Page::Sessions && app.overlay.is_none() {
                 app.scroll_session_list(-3);
-                return true;
+                return Ok(true);
             }
             if app.page == crate::app::Page::Management && app.overlay.is_none() {
                 let outcome = app.scroll_config_area(-3, mouse.column, mouse.row);
                 dispatch_all(worker, &outcome);
-                return true;
+                return Ok(true);
             }
             app.scroll_lines(-3);
             // The wheel is the other way to reach the top of the loaded
@@ -1534,16 +1550,16 @@ fn handle_mouse(app: &mut App, worker: &Worker, mouse: MouseEvent) -> bool {
             if app.runtime_picker_is_open() {
                 let outcome = app.step_runtime_picker(3);
                 dispatch_all(worker, &outcome);
-                return true;
+                return Ok(true);
             }
             if app.page == crate::app::Page::Sessions && app.overlay.is_none() {
                 app.scroll_session_list(3);
-                return true;
+                return Ok(true);
             }
             if app.page == crate::app::Page::Management && app.overlay.is_none() {
                 let outcome = app.scroll_config_area(3, mouse.column, mouse.row);
                 dispatch_all(worker, &outcome);
-                return true;
+                return Ok(true);
             }
             app.scroll_lines(3);
             true
@@ -1555,7 +1571,7 @@ fn handle_mouse(app: &mut App, worker: &Worker, mouse: MouseEvent) -> bool {
                 && rect_contains(rect, mouse.column, mouse.row)
             {
                 app.banner = None;
-                return true;
+                return Ok(true);
             }
             // The modal's close affordance is the one chrome control the mouse
             // owns, and it only exists while a modal is open.
@@ -1571,7 +1587,7 @@ fn handle_mouse(app: &mut App, worker: &Worker, mouse: MouseEvent) -> bool {
                 // The control goes with the modal it belonged to; the pointer
                 // is over the cell, not over the affordance that has left.
                 app.hovered_modal_close = false;
-                return true;
+                return Ok(true);
             }
             // A command palette row runs the command under the pointer. The
             // palette is a menu, and the hover has already moved the cursor onto
@@ -1585,7 +1601,7 @@ fn handle_mouse(app: &mut App, worker: &Worker, mouse: MouseEvent) -> bool {
             {
                 let outcome = app.select_palette_row(row, true);
                 dispatch_all(worker, &outcome);
-                return true;
+                return Ok(true);
             }
             // The configuration centre's own controls come first: a tab, an
             // area and a record's action button are each a control, and a
@@ -1594,7 +1610,7 @@ fn handle_mouse(app: &mut App, worker: &Worker, mouse: MouseEvent) -> bool {
                 && let Some(outcome) = app.click_config_control(mouse.column, mouse.row)
             {
                 dispatch_all(worker, &outcome);
-                return true;
+                return Ok(true);
             }
             // The devices page has its own strip and its own rows, which the
             // shared list region cannot describe: the pairing rows are ways to
@@ -1604,7 +1620,7 @@ fn handle_mouse(app: &mut App, worker: &Worker, mouse: MouseEvent) -> bool {
                 && let Some(outcome) = app.click_device_control(mouse.column, mouse.row)
             {
                 dispatch_all(worker, &outcome);
-                return true;
+                return Ok(true);
             }
             // The completion drawer's panel names are controls, like the strips
             // above: a press on one switches the panel the same way `←`/`→` do.
@@ -1619,7 +1635,7 @@ fn handle_mouse(app: &mut App, worker: &Worker, mouse: MouseEvent) -> bool {
                     .copied()
                 && app.select_completion_tab(tab)
             {
-                return true;
+                return Ok(true);
             }
             // The switcher's rows select and activate exactly as the other
             // lists do, headings included: a heading is the control that folds
@@ -1632,10 +1648,25 @@ fn handle_mouse(app: &mut App, worker: &Worker, mouse: MouseEvent) -> bool {
                 let repeat = app.double_click_at(mouse.column, mouse.row);
                 let outcome = app.select_runtime_picker_row(row, repeat);
                 dispatch_all(worker, &outcome);
-                return true;
+                return Ok(true);
+            }
+            // A `key label` legend is the key itself, so the press is put
+            // through the keyboard's own dispatcher rather than a second
+            // interpretation of what the legend meant. That is what keeps the
+            // queue's `Alt+E` and a form's `Esc` behaving exactly as they do
+            // from the keys — including the modes that answer a key before the
+            // binding table does.
+            if let Some(chord) = app
+                .regions
+                .key_hints
+                .iter()
+                .find(|hint| rect_contains(hint.rect, mouse.column, mouse.row))
+                .map(|hint| hint.chord)
+            {
+                return handle_key(app, worker, guard, chord.event());
             }
             if app.overlay.is_some() {
-                return false;
+                return Ok(false);
             }
             // A row's own control acts on the row it was drawn for, not on the
             // row the cursor happens to be on: the pointer chose the target,
@@ -1651,7 +1682,7 @@ fn handle_mouse(app: &mut App, worker: &Worker, mouse: MouseEvent) -> bool {
                 app.set_selection(crate::keymap::Scope::Sessions, action.row);
                 let outcome = app.perform(action.intent);
                 dispatch_all(worker, &outcome);
-                return true;
+                return Ok(true);
             }
             // A hint in the shortcut band is a button: clicking it runs the
             // intent the key would have run.
@@ -1664,7 +1695,7 @@ fn handle_mouse(app: &mut App, worker: &Worker, mouse: MouseEvent) -> bool {
             {
                 let outcome = app.perform(intent);
                 dispatch_all(worker, &outcome);
-                return true;
+                return Ok(true);
             }
             // A list row selects; a second click on the same row activates it.
             if let Some(region) = app.regions.list.clone()
@@ -1674,7 +1705,7 @@ fn handle_mouse(app: &mut App, worker: &Worker, mouse: MouseEvent) -> bool {
                 if region.scope == crate::keymap::Scope::Management {
                     let outcome = app.click_config_row(index, repeat);
                     dispatch_all(worker, &outcome);
-                    return true;
+                    return Ok(true);
                 }
                 app.set_selection(region.scope, index);
                 // A heading is a control, not a row to open: it folds on the
@@ -1696,7 +1727,7 @@ fn handle_mouse(app: &mut App, worker: &Worker, mouse: MouseEvent) -> bool {
                         app.toggle_child_branch_at(index).into_iter().collect(),
                     );
                     dispatch_all(worker, &outcome);
-                    return true;
+                    return Ok(true);
                 }
                 if repeat || heading {
                     let intent = match region.scope {
@@ -1708,7 +1739,7 @@ fn handle_mouse(app: &mut App, worker: &Worker, mouse: MouseEvent) -> bool {
                     let outcome = app.perform(intent);
                     dispatch_all(worker, &outcome);
                 }
-                return true;
+                return Ok(true);
             }
             // A turn tick scrolls to that turn.
             if let Some((_, turn)) = app
@@ -1724,46 +1755,46 @@ fn handle_mouse(app: &mut App, worker: &Worker, mouse: MouseEvent) -> bool {
                     app.scroll.offset = app.transcript.line_of_block(block);
                     app.set_selection(crate::keymap::Scope::Agent, block);
                 }
-                return true;
+                return Ok(true);
             }
             // A dock row selects; a second click on the same row opens it, the
             // same contract the other lists use.
             if let Some(region) = app.regions.dock
                 && rect_contains(region, mouse.column, mouse.row)
             {
-                let index = usize::from(mouse.row - region.y);
-                if index < app.dock_rows().len() {
-                    app.dock_selection = Some(index);
+                let line = usize::from(mouse.row - region.y);
+                if let Some(row) = app.regions.dock_rows.get(line).copied() {
+                    app.dock_selection = Some(row);
                     if app.double_click_at(mouse.column, mouse.row) {
                         app.activate_dock_row();
                     }
                 }
-                return true;
+                return Ok(true);
             }
             // The queue band selects a held message.
             if let Some(region) = app.regions.queue
                 && rect_contains(region, mouse.column, mouse.row)
             {
-                let index = usize::from(mouse.row - region.y);
-                if index < app.queued_messages.len() {
-                    app.queue_selection = Some(index);
+                let line = usize::from(mouse.row - region.y);
+                if let Some(row) = app.regions.queue_rows.get(line).copied() {
+                    app.queue_selection = Some(row);
                     if app.double_click_at(mouse.column, mouse.row) {
                         app.edit_queued_message();
                     }
                 }
-                return true;
+                return Ok(true);
             }
             // The composer takes the keyboard from a click anywhere in its box,
             // and from a text row it also takes the caret: a click leaves the
             // selection empty, a drag fills it, and typing over it replaces it.
             if app.click_composer(mouse.column, mouse.row) {
-                return true;
+                return Ok(true);
             }
             if app.page != Page::Agent {
-                return false;
+                return Ok(false);
             }
             let Some((line, column)) = mouse_cell(app, mouse.column, mouse.row) else {
-                return false;
+                return Ok(false);
             };
             // The fold's own rows put a turn's process away: the title above an
             // open section, the rule below it, and the single title row a shut
@@ -1790,7 +1821,7 @@ fn handle_mouse(app: &mut App, worker: &Worker, mouse: MouseEvent) -> bool {
                     Vec::new()
                 };
                 dispatch_all(worker, &Outcome::effects(effects));
-                return true;
+                return Ok(true);
             }
             // The block's own row opens the block: the one its disclosure is
             // drawn on. A fold draws the turn's title over the work it opens,
@@ -1810,7 +1841,7 @@ fn handle_mouse(app: &mut App, worker: &Worker, mouse: MouseEvent) -> bool {
                 app.pin_transcript_view();
                 let outcome = app.perform(crate::action::Intent::ToggleBlockExpanded);
                 dispatch_all(worker, &outcome);
-                return true;
+                return Ok(true);
             }
             let now = Instant::now();
             let double_click = app.last_click.is_some_and(|(at, last_line, last_column)| {
@@ -1818,7 +1849,7 @@ fn handle_mouse(app: &mut App, worker: &Worker, mouse: MouseEvent) -> bool {
             });
             if double_click {
                 app.last_click = None;
-                return app.select_word_at(line, column);
+                return Ok(app.select_word_at(line, column));
             }
             app.last_click = Some((now, line, column));
             app.clear_text_selection();
@@ -1837,7 +1868,7 @@ fn handle_mouse(app: &mut App, worker: &Worker, mouse: MouseEvent) -> bool {
             {
                 let outcome = app.select_palette_row(row, false);
                 dispatch_all(worker, &outcome);
-                return outcome.dirty;
+                return Ok(outcome.dirty);
             }
             // The modal's close affordance is a control before it is a click
             // target: the pointer resting on it is how the reader learns it can
@@ -1855,6 +1886,14 @@ fn handle_mouse(app: &mut App, worker: &Worker, mouse: MouseEvent) -> bool {
                 .iter()
                 .find(|(rect, _)| rect_contains(*rect, mouse.column, mouse.row))
                 .map(|(_, intent)| *intent);
+            // A legend lights for the same reason a button does: the pointer
+            // resting on it is how the reader learns it can be pressed.
+            let key_hint = app
+                .regions
+                .key_hints
+                .iter()
+                .find(|hint| rect_contains(hint.rect, mouse.column, mouse.row))
+                .map(|hint| hint.chord);
             // A control inside a list row answers the same way, and carries the
             // row it belongs to so the right one lights up.
             let row_action = app
@@ -1865,23 +1904,25 @@ fn handle_mouse(app: &mut App, worker: &Worker, mouse: MouseEvent) -> bool {
                 .map(|action| (action.row, action.intent));
             if app.hover != hover
                 || app.hovered_hint != hint
+                || app.hovered_key_hint != key_hint
                 || app.hovered_row_action != row_action
                 || app.hovered_modal_close != close
             {
                 app.hover = hover;
                 app.hovered_hint = hint;
+                app.hovered_key_hint = key_hint;
                 app.hovered_row_action = row_action;
                 app.hovered_modal_close = close;
-                return true;
+                return Ok(true);
             }
             false
         }
         MouseEventKind::Drag(MouseButton::Left) => {
             if app.draft_selecting {
-                return app.drag_draft_selection(mouse.column, mouse.row);
+                return Ok(app.drag_draft_selection(mouse.column, mouse.row));
             }
             let Some((line, column)) = mouse_cell_clamped(app, mouse.column, mouse.row) else {
-                return false;
+                return Ok(false);
             };
             app.extend_text_selection(line, column)
         }
@@ -1891,18 +1932,18 @@ fn handle_mouse(app: &mut App, worker: &Worker, mouse: MouseEvent) -> bool {
             if app.draft_selecting {
                 app.draft_selecting = false;
                 let Some(text) = app.composer.selected_text() else {
-                    return true;
+                    return Ok(true);
                 };
                 let message = app.strings.copied().to_string();
                 app.toast(Toast::success(message));
                 worker.dispatch(crate::app::Effect::Clipboard { text });
-                return true;
+                return Ok(true);
             }
             if !app.finish_text_selection() {
-                return true;
+                return Ok(true);
             }
             let Some(text) = app.selected_text() else {
-                return true;
+                return Ok(true);
             };
             let message = app.strings.copied().to_string();
             app.toast(Toast::success(message));
@@ -1910,7 +1951,7 @@ fn handle_mouse(app: &mut App, worker: &Worker, mouse: MouseEvent) -> bool {
             true
         }
         _ => false,
-    }
+    })
 }
 
 /// How long two clicks count as one double click.
@@ -1929,8 +1970,9 @@ fn hover_target(app: &App, column: u16, row: u16) -> Option<(crate::keymap::Scop
         return Some((scope, index));
     }
     let region = app.regions.queue?;
-    rect_contains(region, column, row)
-        .then(|| (crate::keymap::Scope::Agent, usize::from(row - region.y)))
+    let line = usize::from(row.checked_sub(region.y)?);
+    let message = *app.regions.queue_rows.get(line)?;
+    rect_contains(region, column, row).then_some((crate::keymap::Scope::Agent, message))
 }
 
 fn rect_contains(rect: ratatui::layout::Rect, column: u16, row: u16) -> bool {
@@ -2005,7 +2047,7 @@ fn pump_terminal_clipboard(
         Progress::Interrupted => {
             *read = None;
             let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
-            Ok(if handle_key(app, worker, guard, ctrl_c)? {
+            Ok(if handle_key(app, worker, Some(guard), ctrl_c)? {
                 ClipboardPump::Quit
             } else {
                 ClipboardPump::Waiting
@@ -3788,6 +3830,10 @@ mod tests {
             width: 116,
             height: 1,
         });
+        // The band lists the messages held for the session on screen, in the
+        // window it scrolled to. The first drawn line here is the queue's
+        // third message, so that is the row a pointer on it is over.
+        app.regions.queue_rows.push(2);
         assert_eq!(hover_target(&app, 40, 2), None, "a row above the band");
         assert_eq!(
             hover_target(&app, 200, 2),
@@ -3796,7 +3842,8 @@ mod tests {
         );
         assert_eq!(
             hover_target(&app, 40, 30),
-            Some((crate::keymap::Scope::Agent, 0))
+            Some((crate::keymap::Scope::Agent, 2)),
+            "the pointer is over the message the band drew, not the first one"
         );
         assert_eq!(hover_target(&app, 40, 31), None, "a row below the band");
     }
@@ -4721,6 +4768,364 @@ mod tests {
         assert_eq!(app.composer.text(), "keep this draft");
     }
 
+    /// The queue band's legends are controls, not decoration: a click on
+    /// `Alt+E edit` does what pressing `Alt+E` does.
+    #[test]
+    fn a_click_on_a_queue_legend_presses_its_key() {
+        let worker = isolation_worker();
+        let mut app = isolation_app();
+        let session = isolation_session(vibex_core::VibexSessionId::new(), "codex");
+        app.agent
+            .apply_sessions(Ok(vec![session.clone()]))
+            .expect("sessions apply");
+        app.agent.state.selected_session_id = Some(session.id.clone());
+        app.agent.state.active_session.resolve(session);
+        app.navigate_to(Page::Agent);
+        app.enqueue_message("fix the flake".to_string());
+        // The queue's legends are drawn only while its cursor is in it.
+        app.queue_selection = Some(0);
+
+        let mut screen =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+        screen
+            .draw(|frame| crate::view::render(frame, &mut app))
+            .unwrap();
+        // The legend under the pointer is the one for editing, and it is
+        // published where the band drew it.
+        let edit = app
+            .regions
+            .key_hints
+            .iter()
+            .find(|hint| hint.chord == "alt+e".parse().unwrap())
+            .map(|hint| hint.rect)
+            .expect("the queue band publishes an edit legend");
+
+        let _ = handle_mouse(
+            &mut app,
+            &worker,
+            None,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: edit.x,
+                row: edit.y,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+        assert_eq!(
+            app.composer.text(),
+            "fix the flake",
+            "the click did not take the held message back into the draft"
+        );
+        assert!(app.queued_messages.is_empty(), "the message is still held");
+    }
+
+    /// A legend the drafter could aim at but not use would be worse than none:
+    /// every one the queue draws resolves to a key the table binds.
+    #[test]
+    fn every_queue_legend_names_a_bound_key() {
+        for legend in ["Alt+↑↓", "Alt+E", "Alt+X", "Alt+J/K", "Alt+S", "Alt+Enter"] {
+            let chord = crate::keymap::Chord::from_hint(legend)
+                .unwrap_or_else(|| panic!("{legend} is not read as a key"));
+            assert!(
+                crate::keymap::DEFAULT_BINDINGS
+                    .iter()
+                    .any(|binding| binding.chord == chord),
+                "{legend} is not bound to anything"
+            );
+        }
+    }
+
+    /// The dock prints its own key legends while its cursor owns the list, and
+    /// they are presses too: the panel exists to act on the work in flight.
+    #[test]
+    fn a_click_on_a_dock_legend_presses_its_key() {
+        let worker = isolation_worker();
+        let mut app = isolation_app();
+        let session = isolation_session(vibex_core::VibexSessionId::new(), "codex");
+        app.agent
+            .apply_sessions(Ok(vec![session.clone()]))
+            .expect("sessions apply");
+        app.agent.state.selected_session_id = Some(session.id.clone());
+        app.agent.state.active_session.resolve(session);
+        app.navigate_to(Page::Agent);
+        app.enqueue_message("fix the flake".to_string());
+        app.perform(crate::action::Intent::ToggleDock);
+        assert!(app.dock_is_focused(), "the dock does not own its cursor");
+
+        let mut screen =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+        screen
+            .draw(|frame| crate::view::render(frame, &mut app))
+            .unwrap();
+        // `Alt+H` hides the finished rows; the click has to reach the key, not
+        // a second copy of what the key was thought to mean.
+        let hide = app
+            .regions
+            .key_hints
+            .iter()
+            .find(|hint| hint.chord == "alt+h".parse().unwrap())
+            .map(|hint| hint.rect)
+            .expect("the dock publishes a hide-done legend");
+
+        let _ = handle_mouse(
+            &mut app,
+            &worker,
+            None,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: hide.x,
+                row: hide.y,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+        // The reducer toggles the panel's own filter, which is the observable
+        // effect of the key the legend names.
+        assert!(
+            app.dock_hide_done,
+            "the click did not run the key the legend names"
+        );
+    }
+
+    /// A modal's footer is a row of controls, not a caption: its `Esc` closes
+    /// the box exactly as the key does.
+    #[test]
+    fn a_click_on_a_modal_footer_closes_it() {
+        let worker = isolation_worker();
+        let mut app = isolation_app();
+        app.navigate_to(Page::Agent);
+        app.perform(crate::action::Intent::OpenCommandPalette);
+        assert!(app.overlay.is_some(), "the palette did not open");
+
+        let mut screen =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+        screen
+            .draw(|frame| crate::view::render(frame, &mut app))
+            .unwrap();
+        let close = app
+            .regions
+            .key_hints
+            .iter()
+            .find(|hint| hint.chord.code == KeyCode::Esc)
+            .map(|hint| hint.rect)
+            .expect("the footer publishes its close legend");
+
+        let _ = handle_mouse(
+            &mut app,
+            &worker,
+            None,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: close.x,
+                row: close.y,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+        assert!(
+            app.overlay.is_none(),
+            "the footer's Esc did not close the box"
+        );
+    }
+
+    /// A footer that draws `↑↓` is two targets, not one: the arrow under the
+    /// pointer is the direction its press takes.
+    #[test]
+    fn the_two_halves_of_an_arrow_legend_step_opposite_ways() {
+        let worker = isolation_worker();
+        let mut app = isolation_app();
+        app.navigate_to(Page::Agent);
+        app.perform(crate::action::Intent::OpenCommandPalette);
+        // Three commands, so a step down from the first is observable.
+        app.overlay = Some(crate::app::Overlay::Palette {
+            query: String::new(),
+            selected: 0,
+        });
+
+        let mut screen =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+        screen
+            .draw(|frame| crate::view::render(frame, &mut app))
+            .unwrap();
+        let up = app
+            .regions
+            .key_hints
+            .iter()
+            .find(|hint| hint.chord.code == KeyCode::Up)
+            .map(|hint| hint.rect)
+            .expect("the footer publishes the up half");
+        let down = app
+            .regions
+            .key_hints
+            .iter()
+            .find(|hint| hint.chord.code == KeyCode::Down)
+            .map(|hint| hint.rect)
+            .expect("the footer publishes the down half");
+        assert_eq!(up.y, down.y, "the two halves are not on one row");
+        assert_eq!(
+            down.x,
+            up.x + 1,
+            "the halves are not the two cells of the glyph pair"
+        );
+
+        let selected = |app: &crate::App| match &app.overlay {
+            Some(crate::app::Overlay::Palette { selected, .. }) => *selected,
+            other => panic!("the palette is not open: {other:?}"),
+        };
+        let first = selected(&app);
+        let click = |app: &mut crate::App, x: u16| {
+            let _ = handle_mouse(
+                app,
+                &worker,
+                None,
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: x,
+                    row: up.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+            );
+        };
+        click(&mut app, down.x);
+        assert_ne!(selected(&app), first, "the down half did not step down");
+        click(&mut app, up.x);
+        assert_eq!(
+            selected(&app),
+            first,
+            "the up half did not step back the way it came"
+        );
+    }
+
+    /// The settings footer names the keys of the mode it is in, and they are
+    /// presses: the footer is the only place the mode says what it answers to.
+    #[test]
+    fn a_click_on_a_settings_footer_legend_presses_its_key() {
+        let worker = isolation_worker();
+        let mut app = isolation_app();
+        app.navigate_to(Page::Settings);
+        // Browse mode's footer starts with `↑↓`, so a step down is observable.
+        app.set_selection(crate::keymap::Scope::Settings, 0);
+
+        let mut screen =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+        screen
+            .draw(|frame| crate::view::render(frame, &mut app))
+            .unwrap();
+        let down = app
+            .regions
+            .key_hints
+            .iter()
+            .find(|hint| hint.chord.code == KeyCode::Down)
+            .map(|hint| hint.rect)
+            .expect("the settings footer publishes its down legend");
+
+        let _ = handle_mouse(
+            &mut app,
+            &worker,
+            None,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: down.x,
+                row: down.y,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+        assert_eq!(
+            app.selection_for(crate::keymap::Scope::Settings),
+            1,
+            "the click did not step the settings cursor"
+        );
+    }
+
+    /// A click on a scrolled queue band selects the message the band drew, not
+    /// the one whose index happens to match the line number.
+    #[test]
+    fn a_click_on_a_scrolled_queue_band_selects_the_row_under_the_pointer() {
+        let worker = isolation_worker();
+        let mut app = isolation_app();
+        let session = isolation_session(vibex_core::VibexSessionId::new(), "codex");
+        app.agent
+            .apply_sessions(Ok(vec![session.clone()]))
+            .expect("sessions apply");
+        app.agent.state.selected_session_id = Some(session.id.clone());
+        app.agent.state.active_session.resolve(session);
+        app.navigate_to(Page::Agent);
+        for index in 0..5 {
+            app.enqueue_message(format!("held {index}"));
+        }
+        // The cursor on the last message scrolls the window, so the first rows
+        // are off the top and the line numbers no longer match the indexes.
+        app.queue_selection = Some(4);
+
+        let mut screen =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+        screen
+            .draw(|frame| crate::view::render(frame, &mut app))
+            .unwrap();
+        let band = app.regions.queue.expect("the queue band has a rect");
+        let rows = app.regions.queue_rows.clone();
+        assert!(
+            rows.len() < 5 && rows[0] > 0,
+            "the fixture did not scroll: {rows:?} shows the whole queue from its first row"
+        );
+        let top_row = rows[0];
+
+        let _ = handle_mouse(
+            &mut app,
+            &worker,
+            None,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: band.x + 2,
+                row: band.y,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+        assert_eq!(
+            app.queue_selection,
+            Some(top_row),
+            "the click did not land on the row the band drew at the top"
+        );
+    }
+
+    /// The new-session page names the keys that change where the message will
+    /// go, and those names are presses: the page offers no button for either.
+    #[test]
+    fn a_click_on_the_new_session_hints_switches_the_runtime() {
+        let worker = isolation_worker();
+        let mut app = isolation_app();
+        app.navigate_to(Page::NewSession);
+
+        let mut screen =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+        screen
+            .draw(|frame| crate::view::render(frame, &mut app))
+            .unwrap();
+        // The runtime switcher is a modal this opens, so the observable answer
+        // is the overlay rather than a field on the page.
+        let switch = app
+            .regions
+            .hints
+            .iter()
+            .find(|(_, intent)| *intent == crate::action::Intent::SwitchAgentRuntime)
+            .map(|(rect, _)| *rect)
+            .expect("the page publishes its runtime key");
+
+        let _ = handle_mouse(
+            &mut app,
+            &worker,
+            None,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: switch.x,
+                row: switch.y,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+        assert!(
+            app.overlay.is_some(),
+            "the click on the runtime key did not open the switcher"
+        );
+    }
+
     /// The wheel moves the session list's window and leaves the cursor where
     /// the reader put it: a list that answers only the arrow keys is a list
     /// that cannot be scanned.
@@ -4763,9 +5168,10 @@ mod tests {
         let before = app.session_scroll;
         let selected = app.selection_for(crate::keymap::Scope::Sessions);
         for kind in [MouseEventKind::ScrollDown, MouseEventKind::ScrollDown] {
-            handle_mouse(
+            let _ = handle_mouse(
                 &mut app,
                 &worker,
+                None,
                 MouseEvent {
                     kind,
                     column: 10,
@@ -4828,9 +5234,10 @@ mod tests {
 
         // Row 0 is the workspace heading; the two sessions follow it.
         let list = app.regions.list.clone().expect("the list is clickable");
-        handle_mouse(
+        let _ = handle_mouse(
             &mut app,
             &worker,
+            None,
             MouseEvent {
                 kind: MouseEventKind::Down(MouseButton::Left),
                 column: list.rect.x + 3,
@@ -4848,9 +5255,10 @@ mod tests {
             "one click did not fold the heading:\n{folded}"
         );
         // The same click again opens it.
-        handle_mouse(
+        let _ = handle_mouse(
             &mut app,
             &worker,
+            None,
             MouseEvent {
                 kind: MouseEventKind::Down(MouseButton::Left),
                 column: list.rect.x + 3,
@@ -5087,9 +5495,10 @@ mod tests {
         // test's.
         let pointed = app.sidebar_rows()[2].label.clone();
         let rename = control(&app, 2, Intent::BeginRenameSession);
-        handle_mouse(
+        let _ = handle_mouse(
             &mut app,
             &worker,
+            None,
             MouseEvent {
                 kind: MouseEventKind::Down(MouseButton::Left),
                 column: rename.x,
@@ -5116,9 +5525,10 @@ mod tests {
         app.perform(Intent::Back);
         conversation_frame(&mut app, 100, 30);
         let delete = control(&app, 2, Intent::DeleteSession);
-        handle_mouse(
+        let _ = handle_mouse(
             &mut app,
             &worker,
+            None,
             MouseEvent {
                 kind: MouseEventKind::Down(MouseButton::Left),
                 column: delete.right() - 1,
@@ -5317,9 +5727,10 @@ mod tests {
             app.selection_for(crate::keymap::Scope::Sessions),
             app.overlay.clone(),
         );
-        handle_mouse(
+        let _ = handle_mouse(
             &mut app,
             &worker,
+            None,
             MouseEvent {
                 kind: MouseEventKind::Down(MouseButton::Left),
                 column: control.rect.x,
@@ -5390,9 +5801,10 @@ mod tests {
             app.selected_session_id().cloned(),
         );
         for _ in 0..2 {
-            handle_mouse(
+            let _ = handle_mouse(
                 &mut app,
                 &worker,
+                None,
                 MouseEvent {
                     kind: MouseEventKind::Down(MouseButton::Left),
                     column: list.rect.x + 3,
@@ -5433,9 +5845,10 @@ mod tests {
         // The affordance answers the pointer before it answers the click: the
         // pointer resting on it is how the reader learns it can be pressed.
         assert!(!app.hovered_modal_close, "the affordance started lit");
-        handle_mouse(
+        let _ = handle_mouse(
             &mut app,
             &worker,
+            None,
             MouseEvent {
                 kind: MouseEventKind::Moved,
                 column: close.x,
@@ -5447,9 +5860,10 @@ mod tests {
             app.hovered_modal_close,
             "the close affordance ignored the pointer"
         );
-        handle_mouse(
+        let _ = handle_mouse(
             &mut app,
             &worker,
+            None,
             MouseEvent {
                 kind: MouseEventKind::Moved,
                 column: close.x,
@@ -5461,9 +5875,10 @@ mod tests {
             !app.hovered_modal_close,
             "the affordance stayed lit after the pointer left it"
         );
-        handle_mouse(
+        let _ = handle_mouse(
             &mut app,
             &worker,
+            None,
             MouseEvent {
                 kind: MouseEventKind::Moved,
                 column: close.x,
@@ -5473,9 +5888,10 @@ mod tests {
         );
 
         // The affordance answers while the modal is up.
-        handle_mouse(
+        let _ = handle_mouse(
             &mut app,
             &worker,
+            None,
             MouseEvent {
                 kind: MouseEventKind::Down(MouseButton::Left),
                 column: close.x,
@@ -5511,9 +5927,10 @@ mod tests {
         // The next click at that cell is not a second close, because there is
         // nothing there to close.
         let page = app.page;
-        handle_mouse(
+        let _ = handle_mouse(
             &mut app,
             &worker,
+            None,
             MouseEvent {
                 kind: MouseEventKind::Down(MouseButton::Left),
                 column: close.x,
@@ -5573,9 +5990,10 @@ mod tests {
 
         // The pointer resting on a row moves the cursor onto it, whichever row
         // that is: the highlight follows the pointer the way the arrows do.
-        handle_mouse(
+        let _ = handle_mouse(
             &mut app,
             &worker,
+            None,
             MouseEvent {
                 kind: MouseEventKind::Moved,
                 column: cell.0,
@@ -5599,9 +6017,10 @@ mod tests {
             .iter()
             .position(Option::is_none)
             .expect("no heading was drawn");
-        handle_mouse(
+        let _ = handle_mouse(
             &mut app,
             &worker,
+            None,
             MouseEvent {
                 kind: MouseEventKind::Moved,
                 column: region.rect.x + 2,
@@ -5620,9 +6039,10 @@ mod tests {
 
         // A click runs the row it landed on: the palette is a menu, and the
         // pointer has already taken the highlight on it.
-        handle_mouse(
+        let _ = handle_mouse(
             &mut app,
             &worker,
+            None,
             MouseEvent {
                 kind: MouseEventKind::Down(MouseButton::Left),
                 column: cell.0,
@@ -5660,9 +6080,10 @@ mod tests {
             "the banner's row outlived the banner"
         );
         app.clear_text_selection();
-        handle_mouse(
+        let _ = handle_mouse(
             &mut app,
             &worker,
+            None,
             MouseEvent {
                 kind: MouseEventKind::Down(MouseButton::Left),
                 column: banner.x + 1,
@@ -5708,9 +6129,10 @@ mod tests {
                 .any(|(rect, _)| rect_contains(*rect, cell.0, cell.1)),
             "the test clicked a control the page drew"
         );
-        handle_mouse(
+        let _ = handle_mouse(
             &mut app,
             &worker,
+            None,
             MouseEvent {
                 kind: MouseEventKind::Down(MouseButton::Left),
                 column: cell.0,
@@ -5770,9 +6192,10 @@ mod tests {
         assert_eq!(app.selection_for(crate::keymap::Scope::Agent), 0);
         conversation_frame(&mut app, 100, 30);
         let area = app.regions.scrollback;
-        handle_mouse(
+        let _ = handle_mouse(
             &mut app,
             &worker,
+            None,
             MouseEvent {
                 kind: MouseEventKind::Down(MouseButton::Left),
                 column: area.x + 3,
@@ -5798,9 +6221,10 @@ mod tests {
         assert!(!app.transcript.blocks()[2].expanded && !app.transcript.blocks()[3].expanded);
         conversation_frame(&mut app, 100, 30);
         let area = app.regions.scrollback;
-        handle_mouse(
+        let _ = handle_mouse(
             &mut app,
             &worker,
+            None,
             MouseEvent {
                 kind: MouseEventKind::Down(MouseButton::Left),
                 column: area.x + 3,
@@ -5907,9 +6331,10 @@ mod tests {
         let area = app.regions.scrollback;
         let control = app.transcript.fold_control_lines(answer)[0];
         let offset = app.transcript.scroll_offset();
-        handle_mouse(
+        let _ = handle_mouse(
             &mut app,
             &worker,
+            None,
             MouseEvent {
                 kind: MouseEventKind::Down(MouseButton::Left),
                 column: area.x + 3,
@@ -5931,9 +6356,10 @@ mod tests {
         let opened = conversation_frame(&mut app, 100, 30);
         assert!(opened.contains("Worked for"), "{opened}");
         let header = app.transcript.line_of_block(head) + 2;
-        handle_mouse(
+        let _ = handle_mouse(
             &mut app,
             &worker,
+            None,
             MouseEvent {
                 kind: MouseEventKind::Down(MouseButton::Left),
                 column: area.x + 3,
@@ -6467,9 +6893,10 @@ mod tests {
             other => panic!("the picker is not up: {other:?}"),
         };
         let click = |app: &mut App, line: usize| {
-            handle_mouse(
+            let _ = handle_mouse(
                 app,
                 &worker,
+                None,
                 MouseEvent {
                     kind: MouseEventKind::Down(MouseButton::Left),
                     column: region.rect.x,

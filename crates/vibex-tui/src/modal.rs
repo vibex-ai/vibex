@@ -245,7 +245,7 @@ impl<'a> ModalChrome<'a> {
 }
 
 /// The regions the chrome resolved, so a caller can hit-test and fill them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModalLayout {
     /// The whole popup, border included.
     pub area: Rect,
@@ -255,6 +255,14 @@ pub struct ModalLayout {
     pub footer: Option<Rect>,
     /// The close affordance on the top border, for mouse hit-testing.
     pub close: Option<Rect>,
+    /// Each footer legend that was actually drawn, with the key it names.
+    ///
+    /// A footer hint is a control the reader can see, and it was inert to the
+    /// pointer. The chrome is the only code that knows where a hint wrapped to,
+    /// so it reports the cells rather than making the mouse layer re-run the
+    /// wrap: a hint that did not fit on the last rows is not a target, and a
+    /// reader clicking empty space must not press a key that was never drawn.
+    pub hints: Vec<(Rect, &'static str)>,
 }
 
 /// Shadow whatever the popup is about to cover.
@@ -406,6 +414,7 @@ pub fn render_modal(
             .saturating_sub(chrome.sizing.v_pad),
     };
     let mut footer = None;
+    let mut hint_rects: Vec<(Rect, &'static str)> = Vec::new();
     if footer_height > 0 {
         let footer_area = Rect {
             x: inner.x + chrome.sizing.h_pad,
@@ -413,14 +422,48 @@ pub fn render_modal(
             width: inner.width.saturating_sub(chrome.sizing.h_pad * 2),
             height: footer_height,
         };
-        let visible = rows
-            .iter()
-            .rev()
-            .take(usize::from(footer_height))
-            .rev()
-            .cloned()
-            .collect::<Vec<_>>();
-        frame.render_widget(Paragraph::new(Text::from(visible)), footer_area);
+        let shown = rows.len().min(usize::from(footer_height));
+        let skip = rows.len() - shown;
+        // Each row is centred in the footer, so a legend's column is the row's
+        // own offset plus the inset the centring adds. Only the rows that fit
+        // are reported: a legend the reader cannot see is not a target.
+        let mut painted = Vec::with_capacity(shown);
+        for (line, row) in rows.into_iter().skip(skip).enumerate() {
+            let inset = usize::from(footer_area.width.saturating_sub(row.line.width() as u16)) / 2;
+            for (offset, width, key) in &row.hints {
+                let x = footer_area.x + (inset + offset) as u16;
+                let y = footer_area.y + line as u16;
+                // `↑↓` is two keys drawn as one legend, so it is two targets:
+                // the arrow under the pointer is the direction the press
+                // means, and each glyph is one cell wide where the glyph set
+                // has the arrows at all.
+                if let Some(halves) = split_pair(key) {
+                    for (column, chord) in halves {
+                        hint_rects.push((
+                            Rect {
+                                x: x + column,
+                                y,
+                                width: 1,
+                                height: 1,
+                            },
+                            chord,
+                        ));
+                    }
+                    continue;
+                }
+                hint_rects.push((
+                    Rect {
+                        x,
+                        y,
+                        width: *width as u16,
+                        height: 1,
+                    },
+                    *key,
+                ));
+            }
+            painted.push(row.line);
+        }
+        frame.render_widget(Paragraph::new(Text::from(painted)), footer_area);
         footer = Some(footer_area);
     }
 
@@ -429,13 +472,39 @@ pub fn render_modal(
         content,
         footer,
         close: close_rect,
+        hints: hint_rects,
     })
 }
 
+/// One wrapped footer row, with where each legend landed inside it.
+struct HintRow {
+    line: Line<'static>,
+    /// Columns from the row's left edge, and the legend's width, for each hint
+    /// drawn on this row. The row is centred when it is painted, so the offset
+    /// is kept relative and resolved against the footer's rect.
+    hints: Vec<(usize, usize, &'static str)>,
+}
+
+/// A legend that draws two directions side by side, as the two keys it names.
+///
+/// The pair is written the way a terminal reader writes it — `↑↓` for the two
+/// arrows — and each glyph sits in its own cell, so each half is its own press.
+/// `J/K` is the same shape in letters, but those letters are a legend for the
+/// one key the queue's reorder means, not two directions a pointer could pick
+/// between, so only the arrow pair is split.
+fn split_pair(key: &'static str) -> Option<[(u16, &'static str); 2]> {
+    match key {
+        "↑↓" => Some([(0, "↑"), (1, "↓")]),
+        "←→" => Some([(0, "←"), (1, "→")]),
+        _ => None,
+    }
+}
+
 /// Greedily wrap footer hints into centered rows of `key label` pairs.
-fn hint_rows(hints: &[ModalHint], width: usize) -> Vec<Line<'static>> {
+fn hint_rows(hints: &[ModalHint], width: usize) -> Vec<HintRow> {
     let mut rows = Vec::new();
     let mut current: Vec<Span<'static>> = Vec::new();
+    let mut placed: Vec<(usize, usize, &'static str)> = Vec::new();
     let mut used = 0usize;
     for hint in hints {
         let text = format!("{} {}", hint.key, hint.label);
@@ -446,13 +515,17 @@ fn hint_rows(hints: &[ModalHint], width: usize) -> Vec<Line<'static>> {
             display_width(HINT_SEPARATOR)
         };
         if !current.is_empty() && used + separator + width_used > width {
-            rows.push(Line::from(std::mem::take(&mut current)).alignment(Alignment::Center));
+            rows.push(HintRow {
+                line: Line::from(std::mem::take(&mut current)).alignment(Alignment::Center),
+                hints: std::mem::take(&mut placed),
+            });
             used = 0;
         }
         if !current.is_empty() {
             current.push(Span::styled(HINT_SEPARATOR, Style::default()));
             used += display_width(HINT_SEPARATOR);
         }
+        placed.push((used, width_used, hint.key));
         current.push(Span::styled(
             hint.key.to_string(),
             Style::default().add_modifier(Modifier::BOLD),
@@ -465,7 +538,10 @@ fn hint_rows(hints: &[ModalHint], width: usize) -> Vec<Line<'static>> {
         used += width_used;
     }
     if !current.is_empty() {
-        rows.push(Line::from(current).alignment(Alignment::Center));
+        rows.push(HintRow {
+            line: Line::from(current).alignment(Alignment::Center),
+            hints: placed,
+        });
     }
     rows
 }
@@ -662,6 +738,7 @@ mod tests {
         assert!(rows.len() > 1, "a narrow footer must wrap");
         for row in &rows {
             let text = row
+                .line
                 .spans
                 .iter()
                 .map(|span| span.content.as_ref())
@@ -672,6 +749,7 @@ mod tests {
         let wide = hint_rows(&hints, 200);
         assert_eq!(wide.len(), 1);
         let joined = wide[0]
+            .line
             .spans
             .iter()
             .map(|span| span.content.as_ref())
@@ -805,6 +883,7 @@ mod tests {
             content: Rect::default(),
             footer: None,
             close: None,
+            hints: Vec::new(),
         });
         terminal
             .draw(|frame| {

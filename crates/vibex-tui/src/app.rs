@@ -1352,6 +1352,9 @@ pub struct App {
     /// The click target the pointer is over, so a control can show it can be
     /// pressed before the reader presses it.
     pub hovered_hint: Option<crate::action::Intent>,
+    /// The key legend the pointer is over, so the legend can light the way a
+    /// button does before it is pressed.
+    pub hovered_key_hint: Option<crate::keymap::Chord>,
     /// The control inside a list row the pointer is over: the row it belongs to
     /// and the intent it would run.
     ///
@@ -1682,8 +1685,24 @@ pub struct FrameRegions {
     pub composer_scroll: u16,
     /// The queue band's rows, for click-to-select.
     pub queue: Option<ratatui::layout::Rect>,
+    /// The cursor row each drawn line of the queue band shows, top to bottom.
+    ///
+    /// The band scrolls to keep its cursor visible and lists only the messages
+    /// held for the session on screen, so the line at the top is not the first
+    /// row and the number on it is not its index in the whole queue. A click
+    /// that counted lines from the top would select a different message than
+    /// the row under the pointer, which is the one mistake this branch cannot
+    /// make.
+    pub queue_rows: Vec<usize>,
     /// The dock panel's rows, for click-to-select.
     pub dock: Option<ratatui::layout::Rect>,
+    /// The dock row each drawn line of the panel shows, top to bottom.
+    ///
+    /// The panel scrolls to keep its cursor visible and drops a row to the
+    /// "more" line when the rest does not fit, so the line at the top is not
+    /// the panel's first row. A click that counted from the top would open a
+    /// different row than the one under the pointer.
+    pub dock_rows: Vec<usize>,
     /// The composer's whole band, borders included: a click anywhere in the box
     /// takes the keyboard, and only the text rows can also take the caret.
     pub composer_band: Option<ratatui::layout::Rect>,
@@ -1718,6 +1737,14 @@ pub struct FrameRegions {
     pub turns: Vec<(ratatui::layout::Rect, usize)>,
     /// The shortcut band's hints, so a click runs the same intent as the key.
     pub hints: Vec<(ratatui::layout::Rect, crate::action::Intent)>,
+    /// Key legends drawn as `key label`, so a click presses the key they name.
+    ///
+    /// Every surface that prints a key rather than a button publishes it here:
+    /// the queue and dock bands' own legends, a modal's footer, the settings
+    /// footer and the new-session page's bracketed hints. A press runs the key
+    /// through the same `handle_key` path the keyboard uses, so a legend can
+    /// never grow an interaction of its own.
+    pub key_hints: Vec<KeyHintRegion>,
     /// The controls a list row draws for itself, each with the row it belongs
     /// to. A button acts on its own row, which is not always the cursor's — the
     /// pointer is what chose it — so the row index rides with the rect.
@@ -1739,6 +1766,9 @@ impl FrameRegions {
     pub fn begin_frame(&mut self) {
         self.turns.clear();
         self.hints.clear();
+        self.key_hints.clear();
+        self.queue_rows.clear();
+        self.dock_rows.clear();
         self.row_actions.clear();
         self.config_tabs.clear();
         self.config_sections.clear();
@@ -1799,6 +1829,21 @@ pub struct RowActionRegion {
     pub rect: ratatui::layout::Rect,
     pub row: usize,
     pub intent: crate::action::Intent,
+}
+
+/// One `key label` legend a surface drew, as a press target.
+///
+/// The legend is the only thing a reader with a pointer has to aim at on a band
+/// that offers keys instead of buttons: the queue's `Alt+E edit` is a control
+/// the reader can see, and it was inert. Publishing the rect and the key it
+/// names lets the mouse press exactly what the keyboard would, through the same
+/// dispatcher — the legend does not carry an intent of its own, because the key
+/// is the contract.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyHintRegion {
+    pub rect: ratatui::layout::Rect,
+    /// The key the legend names, read back from the text it was drawn with.
+    pub chord: crate::keymap::Chord,
 }
 
 /// Where the runtime switcher drew its rows.
@@ -2139,6 +2184,7 @@ impl App {
             search: None,
             hover: None,
             hovered_hint: None,
+            hovered_key_hint: None,
             hovered_row_action: None,
             hovered_modal_close: false,
             history_selection: 0,

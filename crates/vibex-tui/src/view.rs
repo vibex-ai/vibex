@@ -20,7 +20,7 @@ use vibex_ui::shell::ShellKind;
 
 use crate::action::Intent;
 use crate::app::{App, Availability, BannerTone, ComposerMode, Overlay, Page, ToastTone};
-use crate::keymap::Scope;
+use crate::keymap::{Chord, Scope};
 use crate::layout::Bands;
 use crate::locale::Strings;
 use crate::modal::{self, ModalChrome, ModalHint, ModalLayout, ModalSizing};
@@ -3301,6 +3301,69 @@ fn render_banner(
     );
 }
 
+/// The `Alt+X` legends a band prints along its header, split into presses.
+///
+/// A band's hint line is one localized string — `Alt+↑↓ pick · Alt+E edit · …` —
+/// because it is a sentence, and a sentence translates as a whole. The pointer
+/// still needs each legend on its own, so the drawn text is read back at the
+/// separators the same locales use, and each segment is measured where it lands
+/// on screen. Splitting the *rendered* string rather than the catalogue keeps
+/// the two in step: a locale that reorders or reword its legends gets hit rects
+/// on the words it actually drew.
+///
+/// Returns the spans to draw; the press rects go into the frame's regions. A
+/// segment whose text is not a key at all — the `type` a form's footer names —
+/// is drawn but not pressable, so nothing pretends it is.
+fn key_hint_legend(
+    app: &mut App,
+    theme: &TuiTheme,
+    area: Rect,
+    row: u16,
+    text: &str,
+) -> Vec<Span<'static>> {
+    let style = Style::default().fg(theme.roles.gray_dim);
+    let mut spans = Vec::new();
+    let mut column = area.x;
+    for (index, segment) in text.split(" · ").enumerate() {
+        if index > 0 {
+            let separator = " · ";
+            spans.push(Span::styled(separator, style));
+            column += display_width(separator) as u16;
+        }
+        let width = display_width(segment) as u16;
+        // The band may be narrower than the sentence; a legend drawn past the
+        // edge is clipped, and a hit rect over cells that are not on screen
+        // would answer a click the reader cannot see themselves making. A
+        // segment that starts on the last cell still gets that one cell — the
+        // first character of its key is the part the reader aims at.
+        let visible = width.min(area.right().saturating_sub(column));
+        let chord = Chord::from_hint(segment.split_whitespace().next().unwrap_or(""))
+            .filter(|_| visible > 0);
+        spans.push(Span::styled(
+            segment.to_string(),
+            match chord {
+                Some(chord) if app.hovered_key_hint == Some(chord) => {
+                    Style::default().fg(theme.roles.gray_bright)
+                }
+                _ => style,
+            },
+        ));
+        if let Some(chord) = chord {
+            app.regions.key_hints.push(crate::app::KeyHintRegion {
+                rect: Rect {
+                    x: column,
+                    y: row,
+                    width: visible,
+                    height: 1,
+                },
+                chord,
+            });
+        }
+        column += width;
+    }
+    spans
+}
+
 /// The queued-message band.
 ///
 /// Queued prompts are held back until the running turn ends, so they are shown
@@ -3322,12 +3385,22 @@ fn render_queue_band(
         Style::default().fg(theme.roles.gray_dim),
     )];
     // The keys are only worth listing while the queue has something to act on,
-    // and only while the cursor is in it.
+    // and only while the cursor is in it. Each legend is its own press target,
+    // so `Alt+E` can be clicked the way it can be pressed.
     if app.queue_selection.is_some() {
-        header.push(Span::styled(
-            format!("  {}", strings.queue_hint()),
-            Style::default().fg(theme.roles.gray_dim),
-        ));
+        let lead = display_width(&header[0].content) as u16 + 2;
+        let spans = key_hint_legend(
+            app,
+            theme,
+            Rect {
+                x: area.x + lead,
+                width: area.width.saturating_sub(lead),
+                ..area
+            },
+            area.y,
+            strings.queue_hint(),
+        );
+        header.extend(spans);
     }
     app.regions.queue = Some(Rect {
         y: area.y + 1,
@@ -3364,6 +3437,7 @@ fn render_queue_band(
         .unwrap_or(0)
         .min(usize::from(area.width) / 3);
     for (row, at) in held.iter().enumerate().skip(offset).take(visible) {
+        app.regions.queue_rows.push(row);
         let message = &app.queued_messages[*at];
         let active = app.queue_selection == Some(row);
         let prefix = if active { "▸ " } else { "  " };
@@ -3448,10 +3522,19 @@ fn render_dock_band(
             .add_modifier(Modifier::BOLD),
     )];
     if focused {
-        header.push(Span::styled(
-            format!("  {}", strings.dock_hint()),
-            Style::default().fg(theme.roles.gray_dim),
-        ));
+        let lead = display_width(&header[0].content) as u16 + 2;
+        let spans = key_hint_legend(
+            app,
+            theme,
+            Rect {
+                x: area.x + lead,
+                width: area.width.saturating_sub(lead),
+                ..area
+            },
+            area.y,
+            strings.dock_hint(),
+        );
+        header.extend(spans);
     }
     let mut lines = vec![Line::from(header)];
     if rows.is_empty() {
@@ -3478,6 +3561,7 @@ fn render_dock_band(
     let hidden = rows.len().saturating_sub(offset + capacity);
     let shown = rows.iter().enumerate().skip(offset).take(capacity);
     for (index, row) in shown {
+        app.regions.dock_rows.push(index);
         let active = focused && index == selected;
         let base = if active {
             theme.selected()
@@ -4193,23 +4277,34 @@ fn render_new_session(
     } else {
         format!("{agent} · {model}")
     };
-    lines.push(setting_row(
-        area.width,
-        strings.session_runtime_label(),
-        &runtime,
-        theme,
-        Some(strings.runtime_switch_hint()),
-    ));
-    // A path is longer than any terminal: the tail is the part that says where
-    // the session will work, so that is the part kept whole while the folders
-    // above it fold to their initials.
-    lines.push(setting_row(
-        area.width,
-        strings.session_workspace_label(),
-        &app.drawn_new_session_workspace(),
-        theme,
-        Some(strings.workspace_switch_hint()),
-    ));
+    let switches = [
+        (
+            Intent::SwitchAgentRuntime,
+            strings.session_runtime_label(),
+            runtime,
+            strings.runtime_switch_hint(),
+        ),
+        (
+            Intent::SwitchWorkspace,
+            strings.session_workspace_label(),
+            app.drawn_new_session_workspace(),
+            strings.workspace_switch_hint(),
+        ),
+    ];
+    // Each row ends in a key: `Ctrl+G` swaps the Agent, `Ctrl+W` the workspace.
+    // The reader can see the chord, so it is a press, and the press is the key
+    // — looked up by the intent the row is about rather than by re-reading the
+    // translated sentence, because a locale may put the chord anywhere in it.
+    let mut switch_hints = Vec::new();
+    for (intent, label, value, hint) in switches {
+        let line = setting_row(area.width, label, &value, theme, Some(hint));
+        if let Some(chord) = app.keymap.chord_for(intent)
+            && let Some(column) = legend_column(&line, &chord.display())
+        {
+            switch_hints.push((intent, lines.len(), column, chord));
+        }
+        lines.push(line);
+    }
 
     // The draft's vocabulary is not repeated here: the empty composer under
     // this page spells out `/ commands @ files $ skills` itself, and the page
@@ -4224,6 +4319,17 @@ fn render_new_session(
         height: body as u16,
         ..area
     };
+    for (intent, row, column, chord) in switch_hints {
+        app.regions.hints.push((
+            Rect {
+                x: area.x + column,
+                y: region.y + row as u16,
+                width: display_width(&chord.display()) as u16,
+                height: 1,
+            },
+            intent,
+        ));
+    }
     frame.render_widget(Paragraph::new(Text::from(lines)), region);
     // The Agent's mark in the sentence is a picture the terminal holds rather
     // than a cell this frame draws, so it is *asked* for once the row it belongs
@@ -4384,6 +4490,23 @@ fn setting_row(
         ),
         Span::styled(hint, theme.dimmed(theme.roles.gray)),
     ])
+}
+
+/// The cell a chord sits at inside an already-composed line.
+///
+/// A setting row centres itself with a run of spaces, and the hint is the last
+/// span on it, so the chord's column is the width of everything before it plus
+/// wherever the chord starts inside the hint. Measuring the composed line is
+/// what keeps the hit rect on the cells the reader sees, whatever the locale
+/// put around the key.
+fn legend_column(line: &Line<'static>, chord: &str) -> Option<u16> {
+    let mut before_hint = 0usize;
+    for span in line.spans.iter().rev().skip(1) {
+        before_hint += display_width(span.content.as_ref());
+    }
+    let hint = line.spans.last()?.content.as_ref();
+    let offset = hint.find(chord)?;
+    Some((before_hint + display_width(&hint[..offset])) as u16)
 }
 
 /// One centred line of already-styled spans.
@@ -7826,7 +7949,7 @@ fn render_settings_rows(
 fn render_settings_footer(
     frame: &mut Frame<'_>,
     area: Rect,
-    app: &App,
+    app: &mut App,
     theme: &TuiTheme,
     strings: Strings,
 ) {
@@ -7860,23 +7983,56 @@ fn render_settings_footer(
         Style::default().fg(theme.roles.accent_user),
     );
     let mut spans = vec![rule];
+    // The footer's keys are controls like every other legend: a reader who can
+    // see `Enter edit` can click it. Each pair is published where it lands, so
+    // the press goes through the same dispatcher the key does.
+    let mut column = area.x + display_width(&spans[0].content) as u16;
     for (index, (key, label)) in hints.iter().enumerate() {
         if index > 0 {
+            let separator = "  │  ";
             spans.push(Span::styled(
-                "  │  ",
+                separator,
                 Style::default().fg(theme.roles.gray_dim),
             ));
+            column += display_width(separator) as u16;
         }
-        spans.push(Span::styled(
-            format!("{key} "),
-            Style::default()
-                .fg(theme.roles.gray_bright)
-                .add_modifier(Modifier::BOLD),
-        ));
+        let text = format!("{key} {label}");
+        let width = display_width(&text) as u16;
+        let chord = Chord::from_hint(key).filter(|_| column < area.right());
+        if let Some(chord) = chord {
+            let hovered = app.hovered_key_hint == Some(chord);
+            app.regions.key_hints.push(crate::app::KeyHintRegion {
+                rect: Rect {
+                    x: column,
+                    y: area.y,
+                    width: width.min(area.right() - column),
+                    height: 1,
+                },
+                chord,
+            });
+            spans.push(Span::styled(
+                format!("{key} "),
+                Style::default()
+                    .fg(if hovered {
+                        theme.roles.accent_user
+                    } else {
+                        theme.roles.gray_bright
+                    })
+                    .add_modifier(Modifier::BOLD),
+            ));
+        } else {
+            spans.push(Span::styled(
+                format!("{key} "),
+                Style::default()
+                    .fg(theme.roles.gray_bright)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
         spans.push(Span::styled(
             label.to_string(),
             Style::default().fg(theme.roles.gray_dim),
         ));
+        column += width;
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
@@ -8558,6 +8714,18 @@ fn render_modal(
     // is the box the frame took; a box that was drawn is the popup's own rect.
     app.regions.modal = Some(layout.as_ref().map_or(area, |layout| layout.area));
     app.regions.modal_close = layout.as_ref().and_then(|layout| layout.close);
+    // A footer hint is a key printed on a control the pointer can see, so it is
+    // pressed the way its key is. The chrome reports the cells because it is
+    // the only code that knows where a hint wrapped to.
+    if let Some(layout) = layout.as_ref() {
+        for (rect, key) in &layout.hints {
+            if let Some(chord) = Chord::from_hint(key) {
+                app.regions
+                    .key_hints
+                    .push(crate::app::KeyHintRegion { rect: *rect, chord });
+            }
+        }
+    }
     layout
 }
 
@@ -10494,15 +10662,28 @@ fn render_elicitation_card(frame: &mut Frame<'_>, area: Rect, app: &mut App, the
         scroll,
         theme,
     );
-    render_card_rows(
-        frame,
-        text,
-        top + height.saturating_sub(footer_rows),
-        footer_rows,
-        &card.footer,
-        0,
-        theme,
-    );
+    let footer_top = top + height.saturating_sub(footer_rows);
+    render_card_rows(frame, text, footer_top, footer_rows, &card.footer, 0, theme);
+    // The footer names the keys the card answers to, and a card that takes the
+    // composer's place would otherwise be the one panel whose printed keys do
+    // nothing when clicked. A footer that wrapped has no one row per key, so
+    // only the unwrapped form is published; the keys still work.
+    if footer_rows == card.footer.len() {
+        for (line, column, width, key) in card.footer_keys {
+            let Some(chord) = Chord::from_hint(&key) else {
+                continue;
+            };
+            app.regions.key_hints.push(crate::app::KeyHintRegion {
+                rect: Rect {
+                    x: text.x + column,
+                    y: text.y + (footer_top + line) as u16,
+                    width,
+                    height: 1,
+                },
+                chord,
+            });
+        }
+    }
 }
 
 /// How many display rows these lines take at `width` columns.
@@ -10546,6 +10727,14 @@ fn render_card_rows(
 
 /// The card's rows, split so the renderer can scroll the middle and the layout
 /// can measure the whole.
+/// One key in a card's footer: the line it is on, the column it starts at, its
+/// width, and the text it was drawn with.
+///
+/// The four travel together because a footer is translated and may wrap: a
+/// caller that had only the key's text would have to find it in the finished
+/// line, which is a guess about what the translation put around it.
+type FooterKey = (usize, u16, u16, String);
+
 struct ElicitationCard {
     /// The tab strip and the open question.
     header: Vec<Line<'static>>,
@@ -10553,8 +10742,15 @@ struct ElicitationCard {
     body: Vec<Line<'static>>,
     /// The body row the option cursor is on, so the window can follow it.
     cursor: usize,
-    /// The key legend.
+    /// The key legend, with the column of each key inside its line.
+    ///
+    /// The footer is the card's only place to say what it answers to, and a
+    /// pointer aimed at `Enter` there means the same thing the key does. The
+    /// columns ride with the lines rather than being recovered by guessing
+    /// which span is a key: a label may contain a middot or a space, and a
+    /// footer is translated.
     footer: Vec<Line<'static>>,
+    footer_keys: Vec<FooterKey>,
 }
 
 /// How many option rows the card shows before the list starts scrolling.
@@ -10743,11 +10939,13 @@ fn elicitation_card(
         }
     }
 
+    let (footer_lines, footer_keys) = elicitation_hints(form, strings, theme);
     ElicitationCard {
         header,
         body,
         cursor,
-        footer: elicitation_hints(form, strings, theme),
+        footer: footer_lines,
+        footer_keys,
     }
 }
 
@@ -10840,11 +11038,17 @@ fn option_description(description: Option<&str>, theme: &TuiTheme) -> Option<Lin
 }
 
 /// The key legend under the card, in the keys the open tab answers to.
+/// The card's key legend, and where each key sits inside it.
+///
+/// The key's text rides with its column so a pointer press lands on the cells
+/// the reader is reading: the footer is composed here, and re-finding a key in
+/// the finished text would guess at a translation that happens to contain the
+/// same character.
 fn elicitation_hints(
     form: &crate::app::ElicitationForm,
     strings: Strings,
     theme: &TuiTheme,
-) -> Vec<Line<'static>> {
+) -> (Vec<Line<'static>>, Vec<FooterKey>) {
     let mut hints = vec![("Tab".to_string(), strings.hint_switch().to_string())];
     if form.confirming() {
         hints.push((
@@ -10876,17 +11080,23 @@ fn elicitation_hints(
     hints.push(("Esc".to_string(), strings.elicitation_dismiss().to_string()));
 
     let mut spans = vec![Span::raw(" ")];
+    let mut keys = Vec::new();
+    let mut column = 1u16;
     for (index, (key, label)) in hints.into_iter().enumerate() {
         if index > 0 {
             spans.push(Span::styled(" · ", theme.dimmed(theme.roles.gray_dim)));
+            column += 3;
         }
+        let width = display_width(&key) as u16;
+        keys.push((1, column, width, key.clone()));
         spans.push(Span::styled(key, theme.muted()));
         spans.push(Span::styled(
             format!(" {label}"),
             theme.dimmed(theme.roles.gray_dim),
         ));
+        column += width + 1 + display_width(&label) as u16;
     }
-    vec![Line::from(""), Line::from(spans)]
+    (vec![Line::from(""), Line::from(spans)], keys)
 }
 
 /// Whether the open question is typed into rather than chosen from.
@@ -11952,6 +12162,81 @@ mod tests {
 
     fn strings() -> Strings {
         Strings::for_locale(crate::locale::Locale::En)
+    }
+
+    /// The elicitation card's footer is a row of keys, and each one is
+    /// published on the cells it was drawn in: the card takes the composer's
+    /// place, and its printed keys used to be the only inert ones on screen.
+    #[test]
+    fn the_elicitation_footer_names_the_cells_of_its_keys() {
+        let strings = strings();
+        let theme = TuiTheme::resolve(
+            Some("vibex-dark"),
+            vibex_ui::GpuiThemeMode::Dark,
+            crate::theme::ColorCapability {
+                mode: crate::theme::ColorMode::TrueColor,
+                glyphs: crate::theme::GlyphMode::Unicode,
+            },
+        );
+        let form = crate::app::ElicitationForm {
+            request: vibex_core::ElicitationRequest {
+                id: vibex_core::RequestId::new(),
+                session_id: vibex_core::VibexSessionId::new(),
+                provider_request_id: None,
+                tool_call_id: None,
+                message: "Which one?".into(),
+                title: None,
+                description: None,
+                fields: vec![vibex_core::ElicitationField {
+                    id: "choice".into(),
+                    title: "Choice".into(),
+                    description: None,
+                    required: true,
+                    kind: vibex_core::ElicitationFieldKind::Text {
+                        min_length: None,
+                        max_length: None,
+                        pattern: None,
+                        format: None,
+                        default: None,
+                        options: vec![
+                            vibex_core::ElicitationOption {
+                                value: "a".into(),
+                                title: "A".into(),
+                                description: None,
+                            },
+                            vibex_core::ElicitationOption {
+                                value: "b".into(),
+                                title: "B".into(),
+                                description: None,
+                            },
+                        ],
+                    },
+                }],
+                status: vibex_core::ElicitationRequestStatus::Pending,
+                requested_at_ms: 0,
+            },
+            field: 0,
+            choice: 0,
+        };
+        let (lines, keys) = elicitation_hints(&form, strings, &theme);
+        assert!(!keys.is_empty(), "the footer names no keys");
+        let text = lines
+            .last()
+            .expect("the footer has its legend row")
+            .to_string();
+        for (line, column, width, key) in &keys {
+            assert_eq!(*line, 1, "every key is on the legend row");
+            // The columns are the cells the key occupies in the drawn line.
+            let cell = text
+                .chars()
+                .skip(*column as usize)
+                .take(*width as usize)
+                .collect::<String>();
+            assert!(
+                Chord::from_hint(&cell).is_some(),
+                "{cell:?} at column {column} is not a key, and {key} was reported there"
+            );
+        }
     }
 
     /// A narrow Provider table drops whole columns but never the state one.

@@ -66,6 +66,80 @@ impl Chord {
         Self { code, modifiers }
     }
 
+    /// The chord a key legend is naming.
+    ///
+    /// A hint is drawn as `key label`, and the key half is written for a human:
+    /// `^S` is the terminal's shorthand for `Ctrl+S`, `Space` and `↑` are
+    /// spelled out, and `J/K` names the pair a list walks with. A pointer
+    /// pressing that legend should press the key it names, so the text is read
+    /// back the way the reader reads it.
+    ///
+    /// A pair names one chord here, and it is the forward one: a caller that
+    /// can do better — the modal footer splits `↑↓` into its two cells, so the
+    /// arrow under the pointer picks the direction — handles the halves and
+    /// never asks this function about the pair.
+    ///
+    /// `None` is text rather than a key — a footer that says `type` is
+    /// describing an editor, not a chord — and such a legend is not clickable.
+    pub fn from_hint(text: &str) -> Option<Chord> {
+        let text = text.trim();
+        if text.is_empty() || text.eq_ignore_ascii_case("type") {
+            return None;
+        }
+        // `^S` is the one shorthand that does not spell its modifier.
+        if let Some(rest) = text.strip_prefix('^') {
+            let mut characters = rest.chars();
+            let character = characters.next()?;
+            return characters
+                .next()
+                .is_none()
+                .then(|| Chord::ctrl(character.to_ascii_lowercase()));
+        }
+        // Shift+Tab is BackTab in the wire vocabulary, whatever the text says.
+        if text.eq_ignore_ascii_case("shift+tab") {
+            return Some(Chord::plain(KeyCode::BackTab));
+        }
+        let mut modifiers = KeyModifiers::NONE;
+        let mut code = None;
+        for part in text.split('+') {
+            match part.to_ascii_lowercase().as_str() {
+                "ctrl" | "control" => modifiers |= KeyModifiers::CONTROL,
+                "alt" | "meta" | "option" => modifiers |= KeyModifiers::ALT,
+                "shift" => modifiers |= KeyModifiers::SHIFT,
+                // A bare `s` is the letter, never the `Shift` modifier the
+                // chord parser also accepts as an abbreviation: `Alt+S` is the
+                // schedule key on the queue band, and reading its last part as
+                // a modifier would leave it with no key at all.
+                part => {
+                    code = Some(match part {
+                        "↑↓" | "↓" => KeyCode::Down,
+                        "↑" => KeyCode::Up,
+                        "←→" | "→" => KeyCode::Right,
+                        "←" => KeyCode::Left,
+                        "j/k" => KeyCode::Char('j'),
+                        "k/j" => KeyCode::Char('k'),
+                        other => parse_code(other)?,
+                    });
+                }
+            }
+        }
+        Some(Chord {
+            code: code?,
+            modifiers,
+        })
+    }
+
+    /// The key press this chord names.
+    ///
+    /// A legend is pressed by sending the key it advertises through the same
+    /// dispatcher the keyboard uses, which is what keeps a clickable hint from
+    /// growing a second command path. [`Self::from_event`] normalises a live
+    /// press into this form, so the round trip is exact for everything the
+    /// tables hold.
+    pub fn event(&self) -> KeyEvent {
+        KeyEvent::new(self.code, self.modifiers)
+    }
+
     /// Compact display form, e.g. `Ctrl+P` or `Shift+Enter`.
     pub fn display(&self) -> String {
         let mut parts = Vec::new();

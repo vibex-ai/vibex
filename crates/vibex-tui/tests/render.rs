@@ -4253,6 +4253,33 @@ fn the_queue_band_shows_the_cursor_and_its_keys() {
     assert!(screen.contains('▸'), "the cursor is not drawn:\n{screen}");
 }
 
+/// The queue band's legends are drawn where the frame says they are, so a
+/// pointer aimed at `Alt+E edit` lands on the words the reader can see.
+#[test]
+fn the_queue_band_publishes_a_press_for_every_legend_it_draws() {
+    let mut app = app(120, 40);
+    app.navigate_to(Page::Agent);
+    enter_session(&mut app, "session_queue0004");
+    app.enqueue_message("held message".to_string());
+    // The band lists its keys only while its cursor is in it.
+    app.queue_selection = Some(0);
+    let screens = render(&mut app, 120, 40);
+    let published: Vec<_> = app.regions.key_hints.iter().map(|hint| hint.rect).collect();
+    for legend in ["Alt+E", "Alt+X", "Alt+S", "Alt+Enter"] {
+        let (row, column) = screens
+            .iter()
+            .enumerate()
+            .find_map(|(row, line)| line.find(legend).map(|column| (row, column)))
+            .unwrap_or_else(|| panic!("{legend} is not drawn:\n{}", text(&screens)));
+        assert!(
+            published.iter().any(|rect| rect.y as usize == row
+                && (rect.x as usize) <= column
+                && column < (rect.x + rect.width) as usize),
+            "{legend} was drawn at {row},{column} but nothing is pressable there"
+        );
+    }
+}
+
 #[test]
 fn the_queue_band_says_when_a_held_message_will_go_out() {
     // A message held for the clock and a message held for a turn read the same
