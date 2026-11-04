@@ -118,7 +118,10 @@ gpui-kit-assets = "0.8.0"
 # version the component crate already resolves, so the graph keeps one copy.
 gpui-base = "0.8.0"
 image = { version = "=0.25.10", default-features = false }
-tray-icon = { version = "0.24.2", default-features = false }
+# The Linux backend is chosen per target in the desktop crate: `ksni` on Linux
+# so the tray does not drag in the GTK 3 binding, and no default feature
+# elsewhere because macOS and Windows do not need one.
+tray-icon = { version = "0.26.1", default-features = false }
 # The Markdown parser the component text view renders with. The clients read
 # their plain-text and resource projections through it, so it stays a direct
 # dependency of the shared UI layer.

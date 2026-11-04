@@ -6,10 +6,10 @@
 //! scheduler, automation runner, Relay, diagnostics, and backup semantics stay
 //! authoritative.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -36,7 +36,7 @@ use vibex_core::{
 };
 use vibex_db::{
     AutomationGraphRepository, RemoteAuditRepository, RemoteDeviceRepository,
-    ScheduledTaskRepository, apply_migrations, open_database,
+    ScheduledTaskRepository, apply_migrations, database_is_current, open_database,
 };
 use vibex_diagnostics::assert_no_sensitive_sentinels;
 use vibex_remote::RemoteTrustService;
@@ -1076,41 +1076,18 @@ impl Drop for ManagementMutationClaim {
     }
 }
 
-/// Databases this process has already migrated.
+/// Opens the shared database, migrating it only when it is behind this build.
 ///
 /// The Config Center reads several repositories per snapshot and each one
 /// opened a fresh connection. Running the whole migration chain for every read
-/// made the bundle take seconds; the fingerprint still reruns it when a file is
-/// restored or replaced.
-static MIGRATED_DATABASES: OnceLock<Mutex<HashSet<(PathBuf, u64, u128)>>> = OnceLock::new();
-
-fn database_fingerprint(path: &Path) -> (PathBuf, u64, u128) {
-    let (size, modified) = fs::metadata(path)
-        .map(|metadata| {
-            let modified = metadata
-                .modified()
-                .ok()
-                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|duration| duration.as_nanos())
-                .unwrap_or(0);
-            (metadata.len(), modified)
-        })
-        .unwrap_or((0, 0));
-    (path.to_path_buf(), size, modified)
-}
-
+/// made the bundle take seconds, so the recorded schema version — which lives in
+/// the database itself and therefore follows a restored or replaced file — is
+/// what decides whether the chain has to run again.
 fn migrated(path: &Path) -> VibexResult<rusqlite::Connection> {
     let mut connection = open_database(path)?;
-    let fingerprint = database_fingerprint(path);
-    let migrated = MIGRATED_DATABASES.get_or_init(|| Mutex::new(HashSet::new()));
-    let mut migrated = migrated
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if !migrated.contains(&fingerprint) {
+    if !database_is_current(&connection)? {
         apply_migrations(&mut connection)?;
-        migrated.insert(fingerprint);
     }
-    drop(migrated);
     Ok(connection)
 }
 

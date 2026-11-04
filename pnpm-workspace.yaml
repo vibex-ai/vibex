@@ -6,3 +6,11 @@ onlyBuiltDependencies:
 
 allowBuilds:
   esbuild: true
+
+# GHSA-g3hv-75wg-m249: minimatch below 11.0.1 amplifies attacker-controlled
+# glob patterns. Every copy in this workspace is a lint-time transitive
+# dependency of ESLint and typescript-eslint, so the fixed line can be forced
+# without touching any shipped artifact. Drop this override once every ESLint
+# dependency accepts minimatch >= 11.0.1 on its own.
+overrides:
+  "minimatch@<11.0.1": 11.0.4

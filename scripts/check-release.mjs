@@ -103,8 +103,12 @@ function validatePackaging() {
   for (const configPath of linuxPackagingConfigs) {
     const config = source(configPath);
     assert(
-      config.includes("libayatana-appindicator3-1 | libappindicator3-1"),
-      `${configPath} is missing its system-tray runtime dependency`
+      config.includes("libgtk-3-0"),
+      `${configPath} is missing its GTK 3 runtime dependency`
+    );
+    assert(
+      !config.includes("appindicator"),
+      `${configPath} still asks for a tray runtime the ksni backend does not use`
     );
   }
   for (const configPath of appImagePackagingConfigs) {
@@ -142,20 +146,26 @@ function validatePackaging() {
   for (const dependency of [
     "libglib2.0-dev",
     "libgtk-3-dev",
-    "libayatana-appindicator3-dev",
     "libwebkit2gtk-4.1-dev"
   ]) {
     assert(workflow.includes(dependency), `candidate workflow is missing ${dependency}`);
   }
+  assert(
+    !workflow.includes("appindicator"),
+    "candidate workflow still installs a dev package the ksni tray does not build against"
+  );
   const releaseWorkflow = workflowSource(".github/workflows/release.yml");
   for (const dependency of [
     "libglib2.0-dev",
     "libgtk-3-dev",
-    "libayatana-appindicator3-dev",
     "libwebkit2gtk-4.1-dev"
   ]) {
     assert(releaseWorkflow.includes(dependency), `publish workflow is missing ${dependency}`);
   }
+  assert(
+    !releaseWorkflow.includes("appindicator"),
+    "publish workflow still installs a dev package the ksni tray does not build against"
+  );
   const releaseMatrix = [
     ["linux", "x86_64", "ubuntu-24.04", "x86_64-unknown-linux-gnu"],
     ["linux", "aarch64", "ubuntu-24.04", "aarch64-unknown-linux-gnu"],

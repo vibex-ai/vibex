@@ -12,7 +12,6 @@ pkgbase = vibex-bin
 	depends = glib2
 	depends = glibc
 	depends = gtk3
-	depends = libayatana-appindicator
 	depends = libxcb
 	depends = libxkbcommon
 	depends = libxkbcommon-x11

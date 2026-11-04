@@ -4,7 +4,7 @@ use std::fs;
 use std::path::Component;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use semver::Version;
@@ -74,7 +74,7 @@ use vibex_db::{
     ProviderHealthRepository, ProviderInjectionPreviewRepository,
     ProviderModelRuntimeOptionSnapshotRepository, ProviderProfileRepository,
     ProviderSecretReferenceRepository, ProviderUsageRepository, SkillRepository, apply_migrations,
-    open_database,
+    database_is_current, open_database,
 };
 
 pub mod computer_skill;
@@ -3632,40 +3632,14 @@ impl ProviderConfigService {
         // Center snapshot calls dozens of them. Migrations are process-wide
         // and already applied at startup, so repeating the whole migration
         // chain for each read was turning a snapshot into seconds of work.
-        // The fingerprint keeps a restored or replaced database migrating.
-        let fingerprint = database_fingerprint(&self.db_path);
-        let migrated = MIGRATED_DATABASES.get_or_init(|| Mutex::new(HashSet::new()));
-        let mut migrated = migrated
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if !migrated.contains(&fingerprint) {
+        // The recorded schema version is the cache: it lives in the database
+        // itself, so a restored or replaced file reports the version it really
+        // carries and runs the chain again without a filesystem probe.
+        if !database_is_current(&conn)? {
             apply_migrations(&mut conn)?;
-            migrated.insert(fingerprint);
         }
-        drop(migrated);
         Ok(conn)
     }
-}
-
-/// Databases this process has already migrated.
-///
-/// Keyed by path, size and modification time so a restored or replaced file
-/// runs the chain again instead of trusting a stale entry.
-static MIGRATED_DATABASES: OnceLock<Mutex<HashSet<(PathBuf, u64, u128)>>> = OnceLock::new();
-
-fn database_fingerprint(path: &Path) -> (PathBuf, u64, u128) {
-    let (size, modified) = fs::metadata(path)
-        .map(|metadata| {
-            let modified = metadata
-                .modified()
-                .ok()
-                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|duration| duration.as_nanos())
-                .unwrap_or(0);
-            (metadata.len(), modified)
-        })
-        .unwrap_or((0, 0));
-    (path.to_path_buf(), size, modified)
 }
 
 const ACP_CONFIG_OPTION_KEY: &str = "acp.config.v1";

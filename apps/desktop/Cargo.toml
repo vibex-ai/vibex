@@ -95,8 +95,13 @@ vibex-terminal = { path = "../../crates/terminal" }
 [target.'cfg(target_os = "linux")'.dependencies]
 gpui_wgpu = { package = "gpui-pre-wgpu", version = "=0.3.9" }
 libc.workspace = true
-gtk = { version = "0.18" }
-tray-icon = { workspace = true, features = ["gtk"] }
+# GTK 3 is still read for the desktop's caption layout and initialized so the
+# AppIndicator-era trays keep working; the crate line is 0.19 so it pulls a
+# glib without the `VariantStrIter` unsoundness (RUSTSEC-2024-0429).
+gtk = { version = "0.19" }
+# StatusNotifierItem instead of libappindicator: the latter pins `gtk ^0.18`
+# and would keep the vulnerable glib in the graph on its own.
+tray-icon = { workspace = true, features = ["ksni"] }
 
 [dev-dependencies]
 axum.workspace = true

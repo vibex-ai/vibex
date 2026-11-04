@@ -25,7 +25,6 @@ depends=(
   'glib2'
   'glibc'
   'gtk3'
-  'libayatana-appindicator'
   'libxcb'
   'libxkbcommon'
   'libxkbcommon-x11'

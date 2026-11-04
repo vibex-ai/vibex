@@ -15768,6 +15768,30 @@ pub fn current_schema_version(conn: &Connection) -> VibexResult<i64> {
     Ok(version)
 }
 
+/// Whether `conn` already carries every migration this build knows about.
+///
+/// Callers that open a connection per read use this instead of a process-wide
+/// "already migrated this path" cache: the answer lives in the database, so a
+/// restored, replaced, or freshly created file reports what it really carries.
+/// A database created before `schema_migrations` existed answers `false`, and
+/// [`apply_migrations`] then creates the table and everything after it.
+pub fn database_is_current(conn: &Connection) -> VibexResult<bool> {
+    let tracked = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(storage_err(
+            "schema_probe_failed",
+            "failed to inspect the database schema",
+        ))?;
+    if tracked == 0 {
+        return Ok(false);
+    }
+    Ok(current_schema_version(conn)? >= CURRENT_SCHEMA_VERSION)
+}
+
 pub fn run_smoke(path: &Path) -> VibexResult<DatabaseSmokeResult> {
     let mut conn = open_database(path)?;
     let applied_migrations = apply_migrations(&mut conn)?;
@@ -18844,6 +18868,30 @@ mod tests {
     use vibex_core::{
         RemoteAuditAction, RemoteAuditOutcome, RemoteAuditTargetKind, RemoteDevicePermissionLevel,
     };
+
+    #[test]
+    fn a_fresh_connection_reports_whether_it_needs_migrating() {
+        let temp = temp_db_path("schema-current");
+        let mut conn = open_database(&temp).unwrap();
+        // A file that has never carried a schema cannot claim to be current.
+        assert!(!database_is_current(&conn).unwrap());
+
+        apply_migrations(&mut conn).unwrap();
+        assert!(database_is_current(&conn).unwrap());
+
+        // A database a newer build wrote still counts as current here: only the
+        // migrations this build knows about have to be present.
+        conn.execute(
+            "INSERT INTO schema_migrations (version, name, applied_at_ms)
+             VALUES (?1, ?2, ?3)",
+            params![CURRENT_SCHEMA_VERSION + 1, "future", unix_timestamp_ms()],
+        )
+        .unwrap();
+        assert!(database_is_current(&conn).unwrap());
+
+        drop(conn);
+        cleanup_db(temp);
+    }
 
     #[test]
     fn migration_smoke_round_trips_sentinel() {
