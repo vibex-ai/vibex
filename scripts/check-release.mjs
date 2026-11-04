@@ -131,6 +131,14 @@ function validatePackaging() {
     assert(desktopEntry.includes(`StartupWMClass=${applicationId}`), `${channel} desktop entry app id drifted`);
     assert(desktopEntry.includes("Icon=vibex-desktop"), `${channel} desktop entry icon drifted`);
     assert(
+      /^Categories=\S+;$/mu.test(desktopEntry),
+      `${channel} desktop entry needs one main Categories value; appimagetool refuses an empty or missing key`
+    );
+    assert(
+      config.includes('category = "Developer Tool"'),
+      `${channel} Packager config must categorize the generated entry too`
+    );
+    assert(
       !config.includes("../web/dist") && !config.includes("../mobile-wasm/dist"),
       `${channel} desktop package must not embed browser or mobile runtime assets`
     );

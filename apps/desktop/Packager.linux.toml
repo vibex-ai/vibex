@@ -6,6 +6,7 @@ description = "Vibex native GPUI preview with Terminal, PDF, and Office content 
 authors = ["Vibex"]
 publisher = "Vibex"
 copyright = "Copyright 2026 Vibex"
+category = "Developer Tool"
 binariesDir = "../../target/release"
 outDir = "../../target/hosted-packages"
 icons = [

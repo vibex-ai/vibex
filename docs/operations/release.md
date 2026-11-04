@@ -288,8 +288,8 @@ Linux `.deb` files the Release already carries:
    `.SRCINFO`, and pushes to `master`.
 
 The package installs the GUI plus the `vibex` terminal client and renders its
-own desktop entry: the packaged entry keeps `NoDisplay=true` and an empty
-`Categories` list, which would hide the application from every menu.
+own desktop entry: the packaged entry keeps `NoDisplay=true`, so it stays hidden
+from application menus and the AUR package supplies the visible one.
 
 Local dry run before a release:
 

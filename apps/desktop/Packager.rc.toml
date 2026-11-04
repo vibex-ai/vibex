@@ -6,6 +6,7 @@ description = "Vibex opt-in release candidate"
 authors = ["Vibex"]
 publisher = "Vibex"
 copyright = "Copyright 2026 Vibex"
+category = "Developer Tool"
 binariesDir = "../../target/release"
 outDir = "../../target/release-packages/rc"
 icons = [

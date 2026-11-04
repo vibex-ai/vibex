@@ -28,6 +28,15 @@ embeds the other product's assets.
 - AppImage packaging stays x86_64-only. The linuxdeploy toolchain cannot
   process cross-architecture binaries, so aarch64 releases ship the `.deb`
   package instead of an AppImage.
+- Every desktop entry that reaches the AppDir must carry exactly one main
+  `Categories=` value. linuxdeploy picks the desktop file to promote to the
+  AppDir root by directory order, so both the checked-in app-id entry and the
+  entry cargo-packager generates from `category` have to be valid:
+  `appimagetool` aborts with `.desktop file is missing a Categories= key` when
+  the entry it happens to pick has an empty or absent key. The generator is
+  configured through `category`, because it always writes `Categories=` (empty
+  when unset) and would otherwise silently depend on which file linuxdeploy
+  chose. `pnpm check:release` enforces both.
 
 ## Linux deb Packaging Rules
 

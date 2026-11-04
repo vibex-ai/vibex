@@ -4,6 +4,7 @@ Comment=Vibex stable desktop application
 Exec=vibex-desktop
 Icon=vibex-desktop
 NoDisplay=true
+Categories=Development;
 StartupWMClass=dev.vibex.desktop
 Terminal=false
 Type=Application

@@ -6,6 +6,7 @@ description = "Production-shaped desktop preview package"
 authors = ["Vibex"]
 publisher = "Vibex"
 copyright = "Copyright 2026 Vibex"
+category = "Developer Tool"
 binariesDir = "../../target/release"
 outDir = "../../target/hosted-packages"
 icons = [

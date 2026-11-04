@@ -4,6 +4,7 @@ Comment=Vibex opt-in release candidate
 Exec=vibex-desktop
 Icon=vibex-desktop
 NoDisplay=true
+Categories=Development;
 StartupWMClass=dev.vibex.desktop.rc
 Terminal=false
 Type=Application

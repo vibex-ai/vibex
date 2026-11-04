@@ -4,6 +4,7 @@ Comment=Vibex preview release
 Exec=vibex-desktop
 Icon=vibex-desktop
 NoDisplay=true
+Categories=Development;
 StartupWMClass=dev.vibex.desktop.preview
 Terminal=false
 Type=Application
