@@ -656,6 +656,16 @@ pub struct ModelProviderMetadata {
     pub auto_refresh_models: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub model_aliases: Vec<ProviderModelAlias>,
+    /// The saved Provider whose user-defined preset this record was created
+    /// from.
+    ///
+    /// A Provider made from a template is itself a saved record, so without
+    /// this marker it would appear as a template of its own and every copy
+    /// would spawn the next — a chain nobody asked for, growing with each
+    /// duplicate. Recording the origin keeps the record a first-class Provider
+    /// while excluding it from the library that produced it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preset_source_provider_id: Option<String>,
 }
 
 /// One local model id mapped to the upstream id the Provider serves.

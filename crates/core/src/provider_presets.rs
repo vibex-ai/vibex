@@ -1497,10 +1497,16 @@ pub fn user_provider_preset(profile: &crate::ModelProviderProfile) -> Option<Pro
 /// that exists is a starting point even before it is in use. Deleted records
 /// are left out by the caller's own list, so this function has no filter of its
 /// own.
+///
+/// A record created *from* a template is left out on purpose. It is a saved
+/// Provider in every other sense — Agents bind it, the list draws it, its Key
+/// works — but listing it here would make each copy the seed of the next one,
+/// so a library of near-identical rows would grow out of a single duplicate.
 pub fn user_provider_presets(profiles: &[crate::ModelProviderProfile]) -> Vec<ProviderPreset> {
     let mut presets = profiles
         .iter()
         .filter(|profile| profile.deleted_at_ms.is_none())
+        .filter(|profile| profile.metadata.preset_source_provider_id.is_none())
         .filter_map(user_provider_preset)
         .collect::<Vec<_>>();
     presets.sort_by(|left, right| {
@@ -2299,5 +2305,55 @@ mod tests {
                 .all(|preset| preset.id.starts_with(USER_PROVIDER_PRESET_PREFIX)),
             "a template can never shadow a shipped preset"
         );
+    }
+
+    /// A record created from a template is not a template itself.
+    ///
+    /// Without this, every copy would seed the next one and the library would
+    /// grow a chain of near-identical rows out of a single duplicate.
+    #[test]
+    fn a_provider_copied_from_a_template_is_not_a_template() {
+        let original = crate::ModelProviderProfile {
+            display_name: "House relay".to_string(),
+            endpoints: vec![crate::ModelProviderEndpoint {
+                id: "api".to_string(),
+                kind: crate::ModelProviderEndpointKind::Api,
+                url: "https://relay.example.com/v1".to_string(),
+                wire_protocol_id: Some(crate::WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS.to_string()),
+            }],
+            ..Default::default()
+        };
+        let copy = crate::ModelProviderProfile {
+            display_name: "House relay copy".to_string(),
+            endpoints: original.endpoints.clone(),
+            metadata: crate::ModelProviderMetadata {
+                preset_source_provider_id: Some(original.id.as_str().to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let presets = user_provider_presets(&[original.clone(), copy.clone()]);
+        assert_eq!(
+            presets
+                .iter()
+                .map(|preset| preset.display_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["House relay"],
+            "only the Provider the reader configured is a template"
+        );
+        assert!(
+            user_provider_preset_for(
+                std::slice::from_ref(&copy),
+                &user_provider_preset_id(copy.id.as_str()),
+            )
+            .is_none(),
+            "the copy is never addressed as a template either"
+        );
+
+        // Removing the marker — what an older record simply never had — is the
+        // only thing that makes the copy a template again.
+        let mut adopted = copy;
+        adopted.metadata.preset_source_provider_id = None;
+        assert_eq!(user_provider_presets(&[adopted]).len(), 1);
     }
 }

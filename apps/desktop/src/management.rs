@@ -8127,6 +8127,14 @@ impl ManagementCenter {
                     .then(|| self.profile_note.read(cx).value().trim().to_string()),
                 website_url: (!self.profile_website_url.read(cx).value().trim().is_empty())
                     .then(|| self.profile_website_url.read(cx).value().trim().to_string()),
+                // A Provider made here from a user-defined template is a copy
+                // of a saved record, so it must not become a template itself;
+                // that is how a library would grow a copy of a copy of a copy.
+                preset_source_provider_id: self
+                    .provider_preset_draft
+                    .as_ref()
+                    .filter(|preset| preset.is_user_defined())
+                    .and_then(|preset| preset.source_provider_id.clone()),
                 ..Default::default()
             },
             status: vibex_core::ModelProviderProfileStatus::Enabled,
@@ -15417,6 +15425,17 @@ impl ManagementCenter {
             .trim()
             .to_string();
         let metadata = self.provider_form_metadata(cx);
+        // A Provider made from a template remembers which record it came from,
+        // so the library that offered the template never lists its own copy.
+        let template_source = self
+            .provider_create_preset
+            .as_ref()
+            .filter(|preset| preset.is_user_defined())
+            .and_then(|preset| preset.source_provider_id.clone());
+        let metadata = vibex_core::ModelProviderMetadata {
+            preset_source_provider_id: template_source,
+            ..metadata
+        };
         // A shipped preset's id is the vendor slug the projection and the
         // catalogue key off. A user-defined template's id is prefixed and names
         // no vendor, so the record keeps no hint rather than inventing one.
@@ -51837,6 +51856,78 @@ mod gateway_surface_tests {
                 "a record with no headers opens the section closed"
             );
         });
+    }
+
+    /// A Provider created from a template records where it came from, so it
+    /// never becomes a template of its own.
+    ///
+    /// Both creation paths write the marker: the global create page and the
+    /// Agent dialog are the two places a template can be applied, and a copy
+    /// made through either one has to stay out of the library.
+    #[gpui::test]
+    fn a_provider_created_from_a_template_is_marked_so(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let (center, cx) = cx.add_window_view(ManagementCenter::new);
+        let handle = cx.windows().pop().expect("test window");
+        let profile = vibex_core::ModelProviderProfile {
+            display_name: "House relay".to_string(),
+            endpoints: vec![vibex_core::ModelProviderEndpoint {
+                id: "api".to_string(),
+                kind: vibex_core::ModelProviderEndpointKind::Api,
+                url: "https://relay.example.com/v1".to_string(),
+                wire_protocol_id: Some(
+                    vibex_core::WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS.to_string(),
+                ),
+            }],
+            ..Default::default()
+        };
+        let source_id = profile.id.as_str().to_string();
+        let preset_id = vibex_core::user_provider_preset_id(&source_id);
+        cx.update(|_, cx| {
+            center.update(cx, |center, _| center.providers = vec![profile.clone()]);
+        });
+        let _ = cx.update_window(handle, |_, window, cx| {
+            center.update(cx, |center, cx| {
+                center.open_provider_create_page(Some(&preset_id), window, cx);
+            });
+        });
+
+        let applied = center.read_with(cx, |center, _| {
+            center
+                .provider_create_preset
+                .as_ref()
+                .and_then(|preset| preset.source_provider_id.clone())
+        });
+        assert_eq!(
+            applied.as_deref(),
+            Some(source_id.as_str()),
+            "the applied template names the record it copies"
+        );
+
+        // The Agent dialog keeps the template on its own draft field, and its
+        // create request fills the marker from exactly that field.
+        let dialog = center.read_with(cx, |center, _| {
+            center
+                .provider_preset_draft
+                .as_ref()
+                .filter(|preset| preset.is_user_defined())
+                .and_then(|preset| preset.source_provider_id.clone())
+        });
+        assert!(
+            dialog.is_none(),
+            "the create page applies to the page draft, not the dialog's"
+        );
+        let source = include_str!("management.rs");
+        assert!(
+            source.contains(
+                "preset_source_provider_id: self\n                    .provider_preset_draft"
+            ),
+            "the dialog's create request writes the marker from its applied template"
+        );
+        assert!(
+            source.contains("preset_source_provider_id: template_source"),
+            "the create page writes the marker from its applied template"
+        );
     }
 
     /// The chooser is two tabs, and each half owns the list and the command

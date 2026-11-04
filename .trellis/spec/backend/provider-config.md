@@ -5783,6 +5783,18 @@ ProviderConfigService::{
   beside the favorites in the app data directory, keyed by the saved record's
   id: the Provider and its Key survive, which is what the confirmation says,
   and a shipped preset offers no delete control at all.
+- **A Provider created from a template is not itself a template.** Both
+  creation paths (the global create page and the Agent dialog) write
+  `metadata.presetSourceProviderId` from the applied template's
+  `sourceProviderId`, and `user_provider_presets` skips any record carrying it.
+  Without the marker every copy would seed the next one: duplicate a Provider
+  once, and the library grows a chain of near-identical rows nobody authored by
+  hand. The record stays a first-class Provider everywhere else — Agents bind
+  it, the sidebar lists it, its Key works; only the library that produced it
+  ignores it. Clearing the field is what adopts a record as a template again, so
+  the exclusion is a property of the record rather than a hidden list, and it
+  survives edits because the provider editor copies the marker through
+  untouched fields rather than rebuilding the metadata wholesale.
 - **The TUI's Providers table mirrors the gateway's hierarchy.** The gateway
   row is followed by one row per group member Provider (`├`) and one per Key
   (`│ ├`), so the reader can see which account is cooling without opening the
