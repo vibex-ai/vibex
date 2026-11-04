@@ -16130,6 +16130,55 @@ impl VibexWorkbench {
         cx.notify();
     }
 
+    /// Deletes the runtime side of a removed SSH connection.
+    ///
+    /// The profile is already gone from the store by the time this runs, so
+    /// everything else this machine kept for it is torn down from the profile
+    /// the settings page passed in: an in-flight provisioning run, the tunnel
+    /// that profile owned, and the runtime binding with its saved credential.
+    /// A connection that never paired has none of those and is simply a
+    /// no-op past the cancel check.
+    fn remove_ssh_connection_runtime(
+        &mut self,
+        profile: SshConnectionProfile,
+        cx: &mut Context<Self>,
+    ) {
+        let provisioning_matches = self
+            .ssh_provisioning_snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.profile_id == profile.id);
+        if provisioning_matches {
+            // Dropping the service signals its worker; the snapshot is cleared
+            // so the Connections page stops offering progress for a profile
+            // that no longer exists.
+            self.ssh_provisioning = None;
+            self.ssh_provisioning_task = None;
+            self.ssh_provisioning_snapshot = None;
+            self.ssh_provisioning_error = None;
+            self.sync_ssh_provisioning_settings(cx);
+        }
+        let tunnel_matches = self.ssh_tunnel_spec.as_ref().is_some_and(|spec| {
+            spec.local_port == profile.local_tunnel_port
+                && spec.destination.host == profile.host
+                && spec.destination.port == profile.port
+                && spec.destination.user == profile.user
+        });
+        if tunnel_matches {
+            // Dropping the process closes the forward; bumping the generation
+            // stops the monitor task from rebuilding it for a deleted profile.
+            self.ssh_tunnel = None;
+            self.ssh_tunnel_spec = None;
+            self.ssh_tunnel_generation = self.ssh_tunnel_generation.wrapping_add(1);
+            self.ssh_tunnel_task = None;
+        }
+        if let Some(runtime_id) = profile.registered_runtime_id
+            && self.runtime_registry.remote(&runtime_id).is_some()
+        {
+            self.remove_runtime(runtime_id, cx);
+        }
+        cx.notify();
+    }
+
     /// Releases the local authority so it can be handed to another runtime.
     ///
     /// Detaching the shell's own references is not enough: the session poll and
@@ -82091,6 +82140,12 @@ struct FoundationSettings {
     connections_probe_task: Option<Task<()>>,
     connections_log_view: Option<SshLogView>,
     connections_log_task: Option<Task<()>>,
+    /// A removal that failed, kept on the page beside the list it acted on.
+    ///
+    /// Removing a connection is the one action on this list that deletes
+    /// something, so a refused write has to say why instead of leaving the row
+    /// in place with no explanation.
+    connections_remove_error: Option<String>,
     connections_wsl_open: bool,
     connections_wsl_distros: Vec<String>,
     connections_wsl_selected: Option<String>,
@@ -82567,6 +82622,7 @@ impl FoundationSettings {
                 connections_probe_task: None,
                 connections_log_view: None,
                 connections_log_task: None,
+                connections_remove_error: None,
                 connections_wsl_open: false,
                 connections_wsl_distros: Vec::new(),
                 connections_wsl_selected: None,
@@ -85948,6 +86004,132 @@ impl FoundationSettings {
         cx.notify();
     }
 
+    /// Asks before deleting a connection, because the profile is the only
+    /// record of how to reach that host.
+    ///
+    /// A connection that never finished pairing has no runtime to remove and
+    /// no runtime-manager row of its own, so this dialog is its only way out.
+    /// The confirmation names the connection and says what goes with it.
+    fn confirm_remove_ssh_connection(
+        &mut self,
+        profile_id: String,
+        profile_name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let entity = cx.weak_entity();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let entity = entity.clone();
+            let profile_id = profile_id.clone();
+            let profile_name = profile_name.clone();
+            let title = locale::text(
+                "Remove this SSH connection?",
+                "移除此 SSH 连接？",
+                "移除此 SSH 連線？",
+            );
+            let description = match locale::current_locale() {
+                locale::ResolvedLocale::ZhCn => format!(
+                    "“{profile_name}”的连接配置会被删除。这台机器上保存的配对凭据和隧道会一并移除；远端运行时和工作区文件不受影响。"
+                ),
+                locale::ResolvedLocale::ZhTw => format!(
+                    "「{profile_name}」的連線設定會被刪除。這台機器上儲存的配對憑證與通道會一併移除；遠端執行階段與工作區檔案不受影響。"
+                ),
+                locale::ResolvedLocale::En => format!(
+                    "The saved settings for \u{201c}{profile_name}\u{201d} are deleted. This machine's pairing credential and tunnel go with them; the remote runtime and workspace files are left alone."
+                ),
+            };
+            dialog
+                .title(title)
+                .child(div().whitespace_normal().child(description))
+                .footer(
+                    DialogFooter::new()
+                        .child(DialogClose::new().child(
+                            Button::new("connections-remove-cancel")
+                                .outline()
+                                .label(locale::text("Cancel", "取消", "取消")),
+                        ))
+                        .child(DialogAction::new().child(
+                            Button::new("connections-remove-confirm")
+                                .danger()
+                                .label(locale::text("Remove", "移除", "移除")),
+                        )),
+                )
+                .on_ok(move |_, _, cx| {
+                    let profile_id = profile_id.clone();
+                    let _ = entity.update(cx, |this, cx| {
+                        this.remove_ssh_connection(&profile_id, cx)
+                    });
+                    true
+                })
+        });
+    }
+
+    /// Deletes one saved SSH connection and everything this machine stored for
+    /// it.
+    ///
+    /// The row is the truth for the list, so the store is the first thing to
+    /// change: a profile that disappears from the store but whose runtime
+    /// removal failed is a stale runtime the manager can still remove, while
+    /// the reverse would leave a row that cannot be removed at all.
+    fn remove_ssh_connection(&mut self, profile_id: &str, cx: &mut Context<Self>) {
+        let Some(home_dir) = self.home_dir.clone() else {
+            self.connections_remove_error = Some(
+                locale::text(
+                    "The desktop home is unavailable, so the connection was not removed.",
+                    "无法访问桌面数据目录，连接未移除。",
+                    "無法存取桌面資料目錄，連線未移除。",
+                )
+                .to_string(),
+            );
+            cx.notify();
+            return;
+        };
+        let store = SshProfileStore::at_home(&home_dir);
+        let mut profiles = match store.load() {
+            Ok(profiles) => profiles,
+            Err(error) => {
+                self.connections_remove_error = Some(format!("{}: {}", error.code, error.message));
+                cx.notify();
+                return;
+            }
+        };
+        let Some(index) = profiles.iter().position(|profile| profile.id == profile_id) else {
+            // Already gone: refresh so the list stops showing it.
+            self.reload_connections_profiles();
+            self.connections_remove_error = None;
+            cx.notify();
+            return;
+        };
+        let profile = profiles.remove(index);
+        if let Err(error) = store.save(&profiles) {
+            self.connections_remove_error = Some(format!("{}: {}", error.code, error.message));
+            cx.notify();
+            return;
+        }
+        self.connections_remove_error = None;
+        self.connections_log_view = None;
+        if self
+            .connections_progress_target
+            .as_ref()
+            .is_some_and(|(pending, _)| pending == profile_id)
+        {
+            // Progress for a connection that no longer exists has nowhere to
+            // land: close the dialog rather than reporting a deleted profile.
+            self.connections_progress_target = None;
+            self.connections_progress_open = false;
+        }
+        self.reload_connections_profiles();
+        // The workbench owns the runtime, its tunnel and any provisioning run,
+        // so the teardown lives there rather than in this settings view.
+        let workbench = self.workbench.clone();
+        cx.defer(move |cx| {
+            let _ = workbench.update(cx, |workbench, cx| {
+                workbench.remove_ssh_connection_runtime(profile, cx)
+            });
+        });
+        cx.notify();
+    }
+
     fn probe_connections_host(&mut self, alias: String, cx: &mut Context<Self>) {
         if matches!(
             self.connections_probe_state,
@@ -87086,8 +87268,9 @@ impl FoundationSettings {
         let list_rows = if rows.is_empty() {
             vec![self.render_connections_empty_state(cx)]
         } else {
+            let settings = cx.weak_entity();
             rows.iter()
-                .map(|row| Self::connection_row(row, stacked, cx))
+                .map(|row| Self::connection_row(row, stacked, settings.clone(), cx))
                 .collect()
         };
         let leading = h_flex()
@@ -87115,6 +87298,17 @@ impl FoundationSettings {
             );
         }
         if let Some(error) = &self.connections_wsl_error {
+            notices.push(
+                div()
+                    .w_full()
+                    .text_xs()
+                    .text_color(cx.theme().danger)
+                    .whitespace_normal()
+                    .child(error.clone())
+                    .into_any_element(),
+            );
+        }
+        if let Some(error) = &self.connections_remove_error {
             notices.push(
                 div()
                     .w_full()
@@ -87349,7 +87543,17 @@ impl FoundationSettings {
         }
     }
 
-    fn connection_row(row: &ConnectionDisplayRow, stacked: bool, cx: &App) -> AnyElement {
+    /// One saved connection, with the actions that act on it.
+    ///
+    /// Removal lives on the row rather than in the runtime manager: a profile
+    /// that never finished pairing has no runtime row there, so this menu is
+    /// the only place the connection can be deleted from.
+    fn connection_row(
+        row: &ConnectionDisplayRow,
+        stacked: bool,
+        settings: WeakEntity<Self>,
+        cx: &App,
+    ) -> AnyElement {
         let is_dark = cx.theme().is_dark();
         let foreground = theme::semantic_color("foreground", is_dark);
         let muted = theme::semantic_color("muted-foreground", is_dark);
@@ -87402,6 +87606,9 @@ impl FoundationSettings {
             "连接操作尚未接入。",
             "連線操作尚未接入。",
         ));
+        let remove_id = row.id.clone();
+        let remove_name = row.name.clone();
+        let remove_settings = settings.clone();
         let menu = Button::new(SharedString::from(format!("connections-{}-menu", row.id)))
             .small()
             .ghost()
@@ -87410,14 +87617,30 @@ impl FoundationSettings {
             .px_0()
             .tooltip(locale::text("Connection actions", "连接操作", "連線操作"))
             .icon(IconName::Ellipsis)
-            .dropdown_menu(|menu, _, _| {
+            .dropdown_menu(move |menu, _, _| {
+                let remove_id = remove_id.clone();
+                let remove_name = remove_name.clone();
+                let remove_settings = remove_settings.clone();
                 menu.item(PopupMenuItem::new(locale::text("Edit", "编辑", "編輯")).disabled(true))
                     .item(
                         PopupMenuItem::new(locale::text("Reconnect", "重新连接", "重新連線"))
                             .disabled(true),
                     )
                     .separator()
-                    .item(PopupMenuItem::new(locale::text("Remove", "移除", "移除")).disabled(true))
+                    .item(
+                        PopupMenuItem::new(locale::text("Remove", "移除", "移除")).on_click(
+                            move |_, window, cx| {
+                                let _ = remove_settings.update(cx, |this, cx| {
+                                    this.confirm_remove_ssh_connection(
+                                        remove_id.clone(),
+                                        remove_name.clone(),
+                                        window,
+                                        cx,
+                                    )
+                                });
+                            },
+                        ),
+                    )
             })
             .anchor(Anchor::TopRight);
         let actions = h_flex()
@@ -112236,6 +112459,71 @@ mod tests {
         assert!(row.contains("IconName::Ellipsis"));
         assert!(row.contains("connection_primary_label"));
         assert!(row.contains("semantic_color(\"muted-foreground\""));
+    }
+
+    /// A saved connection can be deleted from its own row.
+    ///
+    /// The row menu used to disable every action, which left a connection that
+    /// never finished pairing with no way out at all: the runtime manager only
+    /// lists runtimes, and an unpaired profile has none. Removal now asks first,
+    /// deletes the profile from the store, and hands the runtime teardown back
+    /// to the workbench that owns the tunnel and the provisioning run.
+    #[test]
+    fn connection_rows_can_remove_a_profile_that_never_paired() {
+        let source = include_str!("app.rs");
+        let row = source
+            .split_once("    fn connection_row(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn connection_detail("))
+            .map(|(body, _)| body)
+            .expect("the Connections row should remain inspectable");
+        assert!(
+            row.contains("confirm_remove_ssh_connection"),
+            "the row's Remove item must open the confirmation"
+        );
+        assert!(
+            !row.contains(
+                "PopupMenuItem::new(locale::text(\"Remove\", \"移除\", \"移除\")).disabled("
+            ),
+            "Remove must stay actionable; an unpaired profile has no other way out"
+        );
+
+        let confirm = source
+            .split_once("    fn confirm_remove_ssh_connection(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// Deletes one saved SSH connection"))
+            .map(|(body, _)| body)
+            .expect("the removal confirmation should remain inspectable");
+        assert!(confirm.contains("window.open_dialog(cx"));
+        assert!(confirm.contains("connections-remove-confirm"));
+        assert!(confirm.contains("connections-remove-cancel"));
+        assert!(confirm.contains("remove_ssh_connection("));
+
+        let remove = source
+            .split_once("    fn remove_ssh_connection(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// Asks before deleting a connection")
+                    .or_else(|| tail.split_once("\n    fn probe_connections_host("))
+            })
+            .map(|(body, _)| body)
+            .expect("the connection removal should remain inspectable");
+        assert!(
+            remove.contains("profiles.retain(") || remove.contains("profiles.remove("),
+            "removal has to change the profile store, not only the rendered list"
+        );
+        assert!(remove.contains("store.save(&profiles)"));
+        assert!(remove.contains("remove_ssh_connection_runtime"));
+        assert!(
+            remove.contains("connections_remove_error"),
+            "a refused write must be reported where the list is"
+        );
+
+        let teardown = source
+            .split_once("    fn remove_ssh_connection_runtime(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// Releases the local authority"))
+            .map(|(body, _)| body)
+            .expect("the workbench teardown should remain inspectable");
+        assert!(teardown.contains("ssh_provisioning_snapshot"));
+        assert!(teardown.contains("ssh_tunnel_generation"));
+        assert!(teardown.contains("remove_runtime(runtime_id, cx)"));
     }
 
     /// The Connections page paints its status inks from the framework theme,
