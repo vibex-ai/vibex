@@ -58,6 +58,12 @@ pub use pairing::{MobileCredentialBundle, MobileRemoteRouteBundle};
 pub(crate) fn open_root_window(data_dir: PathBuf, cx: &mut App) {
     let tokio_handle = background_connection::tokio_handle();
     gpui_tokio::init_from_handle(cx, tokio_handle.clone());
+    // The transport starts recovery from `apply_lifecycle_signal`, which the
+    // Android host calls on the render thread — where no ambient reactor
+    // exists. Hand it this process-lifetime runtime so a resume's reconnect
+    // rides the connection's own runtime instead of panicking the render
+    // thread, which Android cannot unwind.
+    vibex_remote_client::install_background_runtime(tokio_handle.clone());
     // gpui-kit registers the global theme and the overlay state every
     // component reads, so it has to be initialized before the first
     // window opens.

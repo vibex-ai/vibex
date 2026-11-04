@@ -1143,6 +1143,24 @@ Agent timeline service:
   connect attempt ends in a refused credential: a phone killed in the
   background must come back to a page that can start a connection, never to a
   control that cannot succeed.
+- The resume window must cover the transport's own reconnect budget, not just
+  look long. Eight attempts with backoff up to fifteen seconds spend ~46s
+  sleeping before a single attempt sends a byte, and every attempt may then
+  spend its own connect time. A window shorter than that gives up on a
+  transport that is still working: it drops a connection that would have come
+  back and paints the pairing page while the abandoned socket reconnects behind
+  it. Resume polling also stops while the app is backgrounded again, so a wait
+  left behind cannot decide for a phone that went back to the pocket.
+- A lifecycle signal is delivered synchronously from a host thread, and that
+  thread is not a Tokio worker: Android calls `onResume`/`onPause` on the
+  render thread. Work a signal starts must therefore never call bare
+  `tokio::spawn`, which panics with "there is no reactor running"; a panic on
+  the Android render thread unwinds into a looper callback that cannot unwind
+  and aborts the process, which surfaces as the app flashing closed or
+  repainting black the moment a phone returns to a dropped connection. A host
+  with a process-lifetime runtime installs it once
+  (`install_background_runtime`), and the transport prefers the ambient runtime
+  so work started on its own reactor stays there.
 
 Do not let feature hooks own independent reconnect loops. One transport layer
 owns reconnect, replay, auth refresh, and queue draining.

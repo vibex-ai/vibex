@@ -4880,7 +4880,68 @@ fn spawn_background<F>(future: F)
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
-    tokio::spawn(future);
+    // A host may deliver a lifecycle signal synchronously from a thread that is
+    // not a runtime worker — Android's `onResume` runs on the render thread, and
+    // iOS's app delegate on the main thread. A bare `tokio::spawn` there panics
+    // with "there is no reactor running", and a panic on Android's render thread
+    // unwinds into a looper callback that cannot unwind, which aborts the
+    // process: the app closes, or repaints black, the moment a phone returns to
+    // a connection that had already dropped.
+    if let Some(handle) = background_handle() {
+        handle.spawn(future);
+    }
+}
+
+/// The runtime the transport hands background work to.
+///
+/// The ambient runtime wins, so work a connection started from its own
+/// reactor stays on it. A host thread has none, which is why
+/// [`install_background_runtime`] exists: a client that owns a process-lifetime
+/// runtime — the mobile app does — registers it once, and every later signal
+/// lands on that one runtime instead of a second one.
+#[cfg(not(target_family = "wasm"))]
+fn background_handle() -> Option<tokio::runtime::Handle> {
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        return Some(handle);
+    }
+    if let Some(handle) = INSTALLED_RUNTIME.get() {
+        return Some(handle.clone());
+    }
+    // No ambient reactor and nothing installed: recovery must still run. This
+    // is the last resort, not the intended path — a client with its own runtime
+    // installs it through [`install_background_runtime`].
+    FALLBACK_RUNTIME
+        .get_or_init(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .thread_name("vibex-remote-background")
+                .build()
+                .ok()
+        })
+        .as_ref()
+        .map(|runtime| runtime.handle().clone())
+}
+
+#[cfg(not(target_family = "wasm"))]
+static INSTALLED_RUNTIME: std::sync::OnceLock<tokio::runtime::Handle> = std::sync::OnceLock::new();
+
+#[cfg(not(target_family = "wasm"))]
+static FALLBACK_RUNTIME: std::sync::OnceLock<Option<tokio::runtime::Runtime>> =
+    std::sync::OnceLock::new();
+
+/// Registers the runtime background recovery should use when the caller is not
+/// already inside one.
+///
+/// `apply_lifecycle_signal` is synchronous and is called from UI threads, while
+/// the recovery it starts needs a reactor. A host that owns a process-lifetime
+/// runtime calls this once at startup so recovery rides the same runtime as the
+/// connection it is recovering, rather than a second one this crate would
+/// otherwise have to build. Later calls are ignored: one runtime owns recovery
+/// for the life of the process.
+#[cfg(not(target_family = "wasm"))]
+pub fn install_background_runtime(handle: tokio::runtime::Handle) {
+    let _ = INSTALLED_RUNTIME.set(handle);
 }
 
 async fn sleep_for(duration: Duration) {
@@ -5706,6 +5767,34 @@ mod tests {
         let config = test_config("https://desktop.example");
         assert_eq!(config.client_id, "vibex-mobile");
         assert_eq!(config.client_type, vibex_core::RemoteClientType::Mobile);
+    }
+
+    /// A host delivers lifecycle signals synchronously from its UI thread, and
+    /// that thread is not a Tokio worker. Recovery work the signal starts must
+    /// still be scheduled: a bare `tokio::spawn` there panics with "there is no
+    /// reactor running", and on Android a panic on the render thread aborts the
+    /// process — the app closes, or paints black, the moment a phone returns to
+    /// a connection that had already dropped.
+    #[test]
+    fn lifecycle_signal_from_a_host_thread_schedules_recovery_without_panicking() {
+        let transport = AutoRemoteTransport::new(AutoRemoteTransportConfig {
+            remote: test_config("https://desktop.example"),
+            direct_candidates: vec![DirectCandidate {
+                url: "https://desktop.example".to_string(),
+                label: "direct".to_string(),
+                priority: 0,
+                tls_certificate_der: None,
+            }],
+            relay: None,
+        })
+        .expect("a bounded Direct candidate is a valid Auto configuration");
+        // A connection that was live marks automatic recovery enabled; that is
+        // what turns a resume into the reselection this test exercises.
+        transport.reselection_enabled.store(true, Ordering::Release);
+        // Every state but `Online` reaches the reselection arm, and that is the
+        // arm a phone takes when it comes back to a socket that had gone away.
+        assert_ne!(transport.state().state, RemoteConnectionState::Online);
+        transport.apply_lifecycle_signal(RemoteLifecycleSignal::AppResumed);
     }
 
     #[test]

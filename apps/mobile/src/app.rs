@@ -188,7 +188,21 @@ static REASONING_SUMMARY_CACHE: LazyLock<ReasoningSummaryCache> =
     LazyLock::new(|| ReasoningSummaryCache(Mutex::new(BTreeMap::new())));
 const MAX_INLINE_ATTACHMENT_BYTES: usize = 64 * 1024 * 1024;
 const RESUME_RECOVERY_POLL_INTERVAL: Duration = Duration::from_millis(100);
-const RESUME_RECOVERY_POLL_ATTEMPTS: usize = 600;
+/// How long a resumed phone waits for the transport to finish recovering.
+///
+/// The transport owns reconnect, so this window has to cover the transport's
+/// own budget. Its schedule already spends ~46s asleep (eight attempts,
+/// exponential backoff capped at fifteen seconds), and each attempt may then
+/// spend its own connect time on top. Even the pathological shape — every
+/// attempt waiting the fifteen-second cap — is 120s of pure backoff. A shorter
+/// window gave up on a transport that was still working, dropped a connection
+/// that would have come back, and showed the pairing page while the socket it
+/// had just abandoned was reconnecting behind it.
+///
+/// Three minutes covers that worst case and still leaves each attempt room to
+/// connect. Waiting longer is not free — the page under the wait is stale — so
+/// this stays tied to the reconnect budget rather than growing without bound.
+const RESUME_RECOVERY_POLL_ATTEMPTS: usize = 1800;
 const RUNTIME_FEATURE_VALUE_LIMIT: usize = 256;
 
 /// What a resumed phone should do about the connection it came back to.
@@ -4433,6 +4447,16 @@ impl MobileApp {
             };
             let mut unrecoverable = None;
             for _ in 0..RESUME_RECOVERY_POLL_ATTEMPTS {
+                // A phone that went back to the pocket is not waiting for a
+                // page any more, and the wait it left behind must not decide
+                // for it: keep polling would let the expiry below tear the
+                // connection down while the reader is away from the app.
+                if entity
+                    .read_with(cx, |this, _| this.app_backgrounded)
+                    .unwrap_or(true)
+                {
+                    return;
+                }
                 match resume_recovery_outcome(backend.connection_state().state) {
                     ResumeRecoveryOutcome::Recovered => {
                         let _ = entity.update(cx, |this, cx| {
@@ -39676,6 +39700,85 @@ mod tests {
         assert!(
             hint_is_shown(cx, Tone::Warning),
             "the phone says why it left the workspace"
+        );
+    }
+
+    /// A phone that goes back to the pocket mid-wait is not waiting for a page
+    /// any more. The wait it left behind must not tear the connection down
+    /// while the reader is away: an expiry that fires in the background would
+    /// drop a socket the next resume could have used, and land the phone on the
+    /// pairing page behind its own back.
+    #[gpui::test]
+    fn a_resume_wait_stops_when_the_app_is_backgrounded_again(cx: &mut TestAppContext) {
+        cx.update(bind_keys);
+        init_kit_globals(cx);
+        let data_dir = tempfile::tempdir().expect("temporary mobile data directory");
+        let mut bundle = host_bundle("runtime-a", "studio");
+        bundle.route = Some(crate::pairing::MobileRemoteRouteBundle {
+            local_network: None,
+            direct_candidates: vec![bundle.record.server_url.clone()],
+            relay: None,
+        });
+        let backend = bundle.backend().expect("valid saved runtime");
+        let host_id = bundle.host_id().to_string();
+        let (app, cx) = add_rooted_window_view(cx, |window, cx| {
+            let mut app = MobileApp::new_for_test(data_dir.path().to_path_buf(), window, cx);
+            app.remember_host(&bundle, RemoteServerKind::Desktop);
+            app.persist_known_hosts();
+            app.mode = RootMode::Workspace;
+            app.backend = Some(backend.clone());
+            app.controller = Some(AgentWorkflowController::new(
+                backend.clone(),
+                backend.capability_snapshot().agent,
+            ));
+            app
+        });
+        cx.run_until_parked();
+
+        app.update(cx, |app, cx| {
+            app.wait_for_resume_recovery(backend.clone(), cx);
+        });
+        // The phone goes back to the pocket before the window can expire.
+        app.update(cx, |app, _| {
+            app.app_backgrounded = true;
+        });
+        cx.executor().advance_clock(
+            RESUME_RECOVERY_POLL_INTERVAL * (RESUME_RECOVERY_POLL_ATTEMPTS as u32 + 1),
+        );
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.backend.is_some(),
+                "a wait that ended in the background must not drop the connection"
+            );
+            assert_eq!(app.mode, RootMode::Workspace);
+            assert_eq!(app.active_host_id.as_deref(), Some(host_id.as_str()));
+        });
+    }
+
+    /// The wait has to outlast the transport's own reconnect budget. Eight
+    /// attempts backing off up to fifteen seconds already spend ~46s asleep,
+    /// before any attempt's connect time; a window that expires inside that
+    /// budget abandons a transport that is still working.
+    #[test]
+    fn the_resume_window_outlasts_the_transports_reconnect_budget() {
+        let attempts = vibex_remote_client::RemoteClientConfig::new(
+            "https://desktop.example",
+            vibex_core::RemoteAuthProof {
+                device_id: vibex_core::DeviceId::new(),
+                auth_token: "token".to_string(),
+            },
+        )
+        .max_reconnect_attempts;
+        // The documented worst case: `reconnect_max` between every attempt.
+        let mut backoff = std::time::Duration::ZERO;
+        for _ in 0..attempts {
+            backoff += std::time::Duration::from_secs(15);
+        }
+        assert!(
+            RESUME_RECOVERY_POLL_INTERVAL * (RESUME_RECOVERY_POLL_ATTEMPTS as u32) > backoff,
+            "the resume window must leave the transport's backoff its full room"
         );
     }
 
