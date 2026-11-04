@@ -2442,6 +2442,32 @@ fn native_settings_are_offered_for_import() {
     assert!(rows[0].importable);
     assert!(!rows[1].importable, "an unreadable candidate was offered");
 
+    // The chip says what happens to the Key, not just whether something is
+    // missing: a CC Switch Key travels with the record, so it must not read as
+    // the same warning as a file that leaves an empty placeholder behind.
+    let mut migrated = native_import_preview();
+    migrated.items.push(
+        serde_json::from_value(serde_json::json!({
+            "importItemId": "request_three",
+            "source": "cc_switch",
+            "providerKind": "claude",
+            "agentId": "claude",
+            "displayName": "Migrated account",
+            "configuredModels": [],
+            "providerOptions": {"schemaVersion": 1, "entries": [
+                {"key": "nativeSource", "value": "cc-switch"}
+            ]},
+            "secretReferences": [],
+            "status": "needs_secret_setup",
+            "redactedFields": [],
+            "diagnostics": []
+        }))
+        .expect("a CC Switch item"),
+    );
+    let rows = vibex_tui::config_center::native_import_rows(Some(&migrated), app.strings);
+    assert_eq!(rows[2].chip, app.strings.config_state_key_migrates());
+    assert_eq!(rows[2].tone, vibex_tui::config_center::ConfigTone::Ok);
+
     // Importing the first one names it and the sources it came from.
     let outcome = app.perform(vibex_tui::action::Intent::ConfirmOverlay);
     match outcome.effects.as_slice() {

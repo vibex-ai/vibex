@@ -73,9 +73,10 @@ use vibex_core::{
     AutomationRunCancelRequest, AutomationRunId, AutomationRunResumeRequest,
     AutomationRunStartRequest, AutomationRunStatus, AutomationRunStep, AutomationRunTrigger,
     BackupCreatePayload, BackupInspectPayload, BackupRestorePayload, DiagnosticExportPayload,
-    ProviderKind, ScheduledTask, ScheduledTaskCreateRequest, ScheduledTaskId,
-    ScheduledTaskIntervalSchedule, ScheduledTaskRun, ScheduledTaskSchedule,
-    TerminalAuthActionDescriptor, VibexError, VibexResult, WorkspaceMode, unix_timestamp_ms,
+    ProviderKind, ProviderSecretBackend, ProviderSecretSetupState, ScheduledTask,
+    ScheduledTaskCreateRequest, ScheduledTaskId, ScheduledTaskIntervalSchedule, ScheduledTaskRun,
+    ScheduledTaskSchedule, TerminalAuthActionDescriptor, VibexError, VibexResult, WorkspaceMode,
+    unix_timestamp_ms,
 };
 use vibex_desktop_model::{
     AgentOrderEntry, AgentOrdering, AutomationGraphDraft, ManagementNavigation, ManagementSection,
@@ -1148,12 +1149,6 @@ enum ManagementMutation {
     BackupRestore,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct NativeImportReport {
-    imported: usize,
-    missing_secrets: usize,
-}
-
 struct ManagementTaskSuccess {
     message: String,
     agent_install_state: Option<(AgentId, vibex_core::AgentManagedInstallState)>,
@@ -1164,7 +1159,6 @@ struct ManagementTaskSuccess {
     /// The Prompt a save created or updated, so the editor can follow the
     /// record it just wrote instead of guessing an id.
     prompt: Option<vibex_core::Prompt>,
-    native_import_report: Option<NativeImportReport>,
     native_import_preview: Option<vibex_core::ProviderNativeImportPreview>,
 }
 
@@ -1180,7 +1174,6 @@ impl ManagementTaskSuccess {
             provider_profiles: Vec::new(),
             recovery_destination: None,
             prompt: None,
-            native_import_report: None,
             native_import_preview: None,
         }
     }
@@ -1192,7 +1185,6 @@ impl ManagementTaskSuccess {
             provider_profiles: Vec::new(),
             recovery_destination: Some(destination),
             prompt: None,
-            native_import_report: None,
             native_import_preview: None,
         }
     }
@@ -1204,7 +1196,6 @@ impl ManagementTaskSuccess {
             provider_profiles: Vec::new(),
             recovery_destination: None,
             prompt: Some(prompt),
-            native_import_report: None,
             native_import_preview: None,
         }
     }
@@ -1218,7 +1209,6 @@ impl From<String> for ManagementTaskSuccess {
             provider_profiles: Vec::new(),
             recovery_destination: None,
             prompt: None,
-            native_import_report: None,
             native_import_preview: None,
         }
     }
@@ -1396,7 +1386,6 @@ pub struct ManagementCenter {
     model_provider_agent_ids: BTreeSet<String>,
     acp_configs: Vec<(String, vibex_core::AcpProviderConfig)>,
     native_import_preview: Option<vibex_core::ProviderNativeImportPreview>,
-    native_import_report: Option<NativeImportReport>,
     agent_profile_states: Vec<AgentProviderProfileState>,
     provider_display_order: BTreeMap<String, i64>,
     projection_states: Vec<AgentProviderProjectionState>,
@@ -2924,7 +2913,6 @@ impl ManagementCenter {
             model_provider_agent_ids: BTreeSet::new(),
             acp_configs: Vec::new(),
             native_import_preview: None,
-            native_import_report: None,
             native_import_picker: None,
             native_import_picked: BTreeSet::new(),
             native_import_active_source: vibex_core::ProviderNativeImportSource::Codex,
@@ -11032,9 +11020,6 @@ impl ManagementCenter {
                             agent.apply_managed_install_state(state);
                         }
                         this.apply_provider_profile_success(&success.provider_profiles);
-                        if let Some(report) = success.native_import_report {
-                            this.native_import_report = Some(report);
-                        }
                         if let Some(preview) = success.native_import_preview {
                             this.native_import_preview = Some(preview);
                         }
@@ -14164,14 +14149,12 @@ impl ManagementCenter {
                             this.native_import_empty_note = this.notice.clone();
                         } else {
                             this.native_import_empty_note = None;
-                            // Everything importable starts checked: the picker
-                            // is a way to leave records out, not a quiz that
-                            // makes the reader re-pick what the machine already
-                            // said it could import.
-                            //
-                            // The dialog opens on the first source that has a
-                            // row, so it never starts on a tab that was only
-                            // worth showing in a previous read.
+                            // Nothing starts checked: importing a Provider
+                            // writes records the reader would then have to
+                            // find and remove, so the batch they get is one
+                            // they asked for. The read only decides which tab
+                            // opens, and that is the first source with a row,
+                            // never one that was only worth showing before.
                             let first_source = preview
                                 .items
                                 .iter()
@@ -14179,7 +14162,7 @@ impl ManagementCenter {
                                     items.iter().any(|id| id == item.import_item_id.as_str())
                                 })
                                 .map(|item| item.source);
-                            this.native_import_picked = items.into_iter().collect();
+                            this.native_import_picked.clear();
                             if let Some(source) = first_source {
                                 this.native_import_active_source = source;
                             }
@@ -14409,10 +14392,6 @@ impl ManagementCenter {
                         (ResolvedLocale::ZhTw, missing) => format!(
                             "已匯入 {imported} 個供應商設定，其中 {missing} 個需要補充 API Key"
                         ),
-                    });
-                    this.native_import_report = Some(NativeImportReport {
-                        imported,
-                        missing_secrets: missing_secret_count,
                     });
                     this.apply_provider_profile_success(&imported_profiles);
                 }
@@ -16487,7 +16466,7 @@ impl ManagementCenter {
             let id = item.import_item_id.as_str().to_string();
             let toggled = id.clone();
             let checked = picked.contains(id.as_str());
-            let status_note = native_import_item_status_note(item.status);
+            let status_note = native_import_item_status_note(item);
             let mut meta = Vec::new();
             if let Some(base_url) = item.base_url.as_deref() {
                 meta.push(compact_native_import_url(base_url));
@@ -16593,7 +16572,7 @@ impl ManagementCenter {
                     .when_some(status_note, |row, note| {
                         row.child(
                             div().flex_none().child(
-                                Tag::color(native_import_status_color(item.status))
+                                Tag::color(native_import_status_color(item))
                                     .xsmall()
                                     .child(note),
                             ),
@@ -16751,39 +16730,6 @@ impl ManagementCenter {
                     this.native_import_active_source = *source;
                     cx.notify();
                 }
-            }))
-            .into_any_element()
-    }
-
-    fn render_native_import_report(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let Some(report) = self.native_import_report else {
-            return div().into_any_element();
-        };
-        let message = if report.missing_secrets > 0 {
-            format!(
-                "{} {} · {} {}",
-                management_locale_text("Imported", "已导入", "已匯入"),
-                report.imported,
-                management_locale_text("need keys", "需要 Key", "需要 Key"),
-                report.missing_secrets
-            )
-        } else {
-            format!(
-                "{} {}",
-                management_locale_text("Imported", "已导入", "已匯入"),
-                report.imported
-            )
-        };
-        let alert = if report.missing_secrets > 0 {
-            Alert::warning("management-provider-import-report", message)
-        } else {
-            Alert::success("management-provider-import-report", message)
-        };
-        alert
-            .small()
-            .on_close(cx.listener(|this, _, _, cx| {
-                this.native_import_report = None;
-                cx.notify();
             }))
             .into_any_element()
     }
@@ -18349,26 +18295,32 @@ impl ManagementCenter {
     /// The credential id is never drawn. A Key is identified by the value it
     /// contains, and the full value exists on screen only after the eye is
     /// clicked.
+    ///
+    /// [`ProviderKeyDisplay::has_value`] is the credential's own state, not a
+    /// guess from the mask: an imported placeholder is a Key with a name and no
+    /// Secret behind it, and drawing the fixed mask for it made an empty row
+    /// look like a stored Key. It says so instead, and offers no eye, because
+    /// there is nothing to show.
     fn render_provider_key_value(
         &self,
         profile_id: &vibex_core::ModelProviderProfileId,
         credential_id: &vibex_core::RequestId,
-        masked_hint: &str,
-        display_name: &str,
-        can_reveal: bool,
+        key: ProviderKeyDisplay<'_>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let row_key = provider_key_row_key(profile_id, credential_id);
         let revealed = self.revealed_provider_keys.get(&row_key);
         let revealing = self.revealing_provider_key.as_deref() == Some(row_key.as_str());
-        let fallback = if masked_hint.trim().is_empty() {
+        let fallback = if !key.has_value {
+            management_locale_text("Not configured", "未配置", "未設定")
+        } else if key.masked_hint.trim().is_empty() {
             "********"
         } else {
-            masked_hint
+            key.masked_hint
         };
         let shown = revealed.map(String::as_str).unwrap_or(fallback);
         let generated_name = format!("Key {}", credential_id.as_str());
-        let custom_name = display_name.trim();
+        let custom_name = key.display_name.trim();
         let custom_name =
             (!custom_name.is_empty() && custom_name != generated_name && custom_name != shown)
                 .then_some(custom_name);
@@ -18390,39 +18342,46 @@ impl ManagementCenter {
                             .min_w_0()
                             .truncate()
                             .text_sm()
-                            .font_family(cx.theme().mono_font_family.clone())
+                            .when(key.has_value, |value| {
+                                value.font_family(cx.theme().mono_font_family.clone())
+                            })
+                            .when(!key.has_value, |value| {
+                                value.text_color(cx.theme().muted_foreground)
+                            })
                             .child(shown.to_string()),
                     )
-                    .child(
-                        Button::new(SharedString::from(format!(
-                            "management-provider-key-reveal-{}-{}",
-                            profile_id.as_str(),
-                            credential_id.as_str()
-                        )))
-                        .xsmall()
-                        .ghost()
-                        .compact()
-                        .icon(if revealed.is_some() {
-                            IconName::EyeOff
-                        } else {
-                            IconName::Eye
-                        })
-                        .tooltip(label)
-                        .accessibility_label(label)
-                        .disabled(!can_reveal || revealing)
-                        .loading(revealing)
-                        .on_click(cx.listener({
-                            let profile_id = profile_id.clone();
-                            let credential_id = credential_id.clone();
-                            move |this, _, _, cx| {
-                                this.toggle_provider_key_reveal(
-                                    profile_id.clone(),
-                                    credential_id.clone(),
-                                    cx,
-                                )
-                            }
-                        })),
-                    ),
+                    .when(key.has_value, |row| {
+                        row.child(
+                            Button::new(SharedString::from(format!(
+                                "management-provider-key-reveal-{}-{}",
+                                profile_id.as_str(),
+                                credential_id.as_str()
+                            )))
+                            .xsmall()
+                            .ghost()
+                            .compact()
+                            .icon(if revealed.is_some() {
+                                IconName::EyeOff
+                            } else {
+                                IconName::Eye
+                            })
+                            .tooltip(label)
+                            .accessibility_label(label)
+                            .disabled(!key.can_reveal || revealing)
+                            .loading(revealing)
+                            .on_click(cx.listener({
+                                let profile_id = profile_id.clone();
+                                let credential_id = credential_id.clone();
+                                move |this, _, _, cx| {
+                                    this.toggle_provider_key_reveal(
+                                        profile_id.clone(),
+                                        credential_id.clone(),
+                                        cx,
+                                    )
+                                }
+                            })),
+                        )
+                    }),
             )
             .children(custom_name.map(|name| {
                 div()
@@ -36451,15 +36410,119 @@ fn native_import_item_glyph(kind: ProviderKind, label: &str, cx: &App) -> AnyEle
     )
 }
 
+/// What a Key row draws, and what it may promise.
+///
+/// A Key is identified by its value, and the row's job is to say whether there
+/// is one. The credential record is the only thing that answers that: a
+/// placeholder is a real record with no Secret behind it, and a stored Secret
+/// may still be one this runtime cannot read back.
+#[derive(Debug, Clone, Copy)]
+struct ProviderKeyDisplay<'a> {
+    /// The fingerprint the row shows, empty until the Secret has been read
+    /// once.
+    masked_hint: &'a str,
+    /// The user-given name, when there is one.
+    display_name: &'a str,
+    /// Whether a Secret value exists behind the reference.
+    has_value: bool,
+    /// Whether that Secret is one this runtime can read back.
+    can_reveal: bool,
+}
+
+impl<'a> ProviderKeyDisplay<'a> {
+    /// The row for a shared credential record.
+    fn from_credential(
+        credential: &'a vibex_core::ModelProviderCredentialReference,
+    ) -> ProviderKeyDisplay<'a> {
+        ProviderKeyDisplay {
+            masked_hint: &credential.masked_hint,
+            display_name: &credential.display_name,
+            has_value: provider_credential_has_value(credential),
+            can_reveal: provider_credential_can_reveal(credential),
+        }
+    }
+
+    /// The row for a gateway key, which carries no setup state of its own.
+    ///
+    /// The gateway summary is a read of the same Provider record, so the
+    /// credential is looked up beside it. A Key whose record is missing — a
+    /// snapshot older than the record — falls back to its mask, which is the
+    /// only evidence left.
+    fn from_gateway_key(
+        key: &'a vibex_core::GatewayKeySummary,
+        credential: Option<&'a vibex_core::ModelProviderCredentialReference>,
+    ) -> ProviderKeyDisplay<'a> {
+        match credential {
+            Some(credential) => ProviderKeyDisplay::from_credential(credential),
+            None => ProviderKeyDisplay {
+                masked_hint: &key.masked_hint,
+                display_name: &key.display_name,
+                has_value: !key.masked_hint.trim().is_empty(),
+                can_reveal: !key.masked_hint.trim().is_empty(),
+            },
+        }
+    }
+}
+
+/// Whether a credential actually has a Secret behind it.
+///
+/// A placeholder is a Key record with a kind and a lookup key but no value, so
+/// the setup state — not the presence of the record — is what decides whether
+/// the row can promise a value.
+fn provider_credential_has_value(
+    credential: &vibex_core::ModelProviderCredentialReference,
+) -> bool {
+    credential
+        .credential
+        .secret_reference()
+        .is_some_and(|reference| reference.setup_state == ProviderSecretSetupState::Available)
+}
+
+/// Whether a credential's Secret is one this runtime can read back.
+fn provider_credential_can_reveal(
+    credential: &vibex_core::ModelProviderCredentialReference,
+) -> bool {
+    provider_credential_has_value(credential)
+        && credential
+            .credential
+            .secret_reference()
+            .is_some_and(|reference| {
+                matches!(
+                    reference.backend,
+                    ProviderSecretBackend::OsKeychain | ProviderSecretBackend::HostFile
+                )
+            })
+}
+
+/// Whether importing this item carries its Key along with the settings.
+///
+/// CC Switch keeps the Key inside its own database, so the import copies it
+/// into Vibex's secret store and the new Provider starts working. Every other
+/// source only ever contributes a placeholder, because the value is either not
+/// in the file or not something Vibex may copy. The two cases share the
+/// `NeedsSecretSetup` status, which is why the row has to ask this question
+/// before it warns about a missing Key.
+fn native_import_moves_its_secret(item: &vibex_core::ProviderNativeImportItem) -> bool {
+    provider_option_value(&item.provider_options, PROVIDER_OPTION_NATIVE_SOURCE)
+        == Some("cc-switch")
+}
+
 /// The Tag colour an import status takes.
 ///
-/// Only the two states that need the reader's attention carry a colour; an
+/// Only the states that need the reader's attention carry a warning colour; an
 /// importable row says nothing, because a tag on every row would make the
-/// exception invisible.
-fn native_import_status_color(status: vibex_core::ProviderNativeImportItemStatus) -> ColorName {
-    match status {
+/// exception invisible. A CC Switch Key is not a warning: it is information
+/// about how the import behaves.
+fn native_import_status_color(item: &vibex_core::ProviderNativeImportItem) -> ColorName {
+    match item.status {
         vibex_core::ProviderNativeImportItemStatus::Importable => ColorName::Gray,
-        vibex_core::ProviderNativeImportItemStatus::NeedsSecretSetup => ColorName::Amber,
+        vibex_core::ProviderNativeImportItemStatus::NeedsSecretSetup => {
+            if native_import_moves_its_secret(item) {
+                ColorName::Blue
+            } else {
+                ColorName::Amber
+            }
+        }
         vibex_core::ProviderNativeImportItemStatus::Partial => ColorName::Blue,
         vibex_core::ProviderNativeImportItemStatus::BlockedByParseError => ColorName::Red,
     }
@@ -36529,22 +36592,34 @@ fn native_import_empty_body(message: String, cx: &mut Context<ManagementCenter>)
 
 /// What an import item's status means for the reader, or `None` when it is
 /// simply importable.
+///
+/// The copy names what happens to the Key, because that is the only thing the
+/// statuses disagree about: one source carries its Key across, another leaves
+/// an empty placeholder behind, and a third file has no Key at all.
 fn native_import_item_status_note(
-    status: vibex_core::ProviderNativeImportItemStatus,
+    item: &vibex_core::ProviderNativeImportItem,
 ) -> Option<&'static str> {
-    match status {
+    match item.status {
         vibex_core::ProviderNativeImportItemStatus::Importable => None,
         vibex_core::ProviderNativeImportItemStatus::NeedsSecretSetup => {
-            Some(management_locale_text(
-                "Needs a Key after import",
-                "导入后需要补充 Key",
-                "匯入後需要補充 Key",
-            ))
+            if native_import_moves_its_secret(item) {
+                Some(management_locale_text(
+                    "Key moves with the import",
+                    "Key 会随导入一起迁移",
+                    "Key 會隨匯入一起遷移",
+                ))
+            } else {
+                Some(management_locale_text(
+                    "Key value must be added after import",
+                    "导入后需要填写 Key 值",
+                    "匯入後需要填寫 Key 值",
+                ))
+            }
         }
         vibex_core::ProviderNativeImportItemStatus::Partial => Some(management_locale_text(
-            "Imports what the file declares",
-            "只导入文件中声明的部分",
-            "只匯入檔案中宣告的部分",
+            "The file has no Key; only its configuration imports",
+            "文件不含 Key，仅导入配置",
+            "檔案不含 Key，僅匯入設定",
         )),
         vibex_core::ProviderNativeImportItemStatus::BlockedByParseError => Some(
             management_locale_text("Cannot be read", "无法读取", "無法讀取"),
@@ -45539,7 +45614,8 @@ mod tests {
             created_at_ms: 1,
         };
 
-        let items = pending_native_import_items(&preview, &[imported_profile], &[codex, claude]);
+        let items =
+            pending_native_import_items(&preview, &[imported_profile], &[codex.clone(), claude]);
         assert_eq!(
             items,
             vec!["request_codex", "request_claude"],
@@ -45552,17 +45628,53 @@ mod tests {
             vibex_core::ProviderNativeImportSource::Codex
         );
         assert_eq!(
-            native_import_item_status_note(preview.items[3].status),
+            native_import_item_status_note(&preview.items[3]),
             Some(management_locale_text(
-                "Needs a Key after import",
-                "导入后需要补充 Key",
-                "匯入後需要補充 Key",
+                "Key value must be added after import",
+                "导入后需要填写 Key 值",
+                "匯入後需要填寫 Key 值",
+            ))
+        );
+        let importable = native_import_item(
+            "request_importable",
+            vibex_core::ProviderNativeImportSource::Codex,
+            &codex,
+            vibex_core::ProviderNativeImportItemStatus::Importable,
+            provider_options(&[]),
+        );
+        assert_eq!(
+            native_import_item_status_note(&importable),
+            None,
+            "an ordinary item carries no warning"
+        );
+        // A CC Switch Key is copied into Vibex during the import, so the same
+        // status means the opposite thing there: no warning colour, and a note
+        // that says the Key travels with the record.
+        let mut migrated = importable.clone();
+        migrated.provider_options = provider_options(&[
+            (PROVIDER_OPTION_NATIVE_SOURCE, "cc-switch"),
+            (PROVIDER_OPTION_CC_SWITCH_DB_PATH, "/tmp/cc-switch.db"),
+            (PROVIDER_OPTION_CC_SWITCH_PROVIDER_ID, "migrated"),
+            (PROVIDER_OPTION_CC_SWITCH_APP_TYPE, "codex"),
+        ]);
+        migrated.status = vibex_core::ProviderNativeImportItemStatus::NeedsSecretSetup;
+        assert_eq!(
+            native_import_status_color(&migrated),
+            ColorName::Blue,
+            "a Key that moves with the import is information, not a warning"
+        );
+        assert_eq!(
+            native_import_item_status_note(&migrated),
+            Some(management_locale_text(
+                "Key moves with the import",
+                "Key 会随导入一起迁移",
+                "Key 會隨匯入一起遷移",
             ))
         );
         assert_eq!(
-            native_import_item_status_note(vibex_core::ProviderNativeImportItemStatus::Importable),
-            None,
-            "an ordinary item carries no warning"
+            native_import_status_color(&preview.items[3]),
+            ColorName::Amber,
+            "a placeholder Key is the case the reader has to finish"
         );
         for source in native_import_sources() {
             assert!(
@@ -49798,7 +49910,6 @@ mod gateway_surface_tests {
     fn native_import_is_a_picker_grouped_by_source() {
         let source = include_str!("management.rs");
         for marker in [
-            "management-provider-import-report",
             "native_import_picker",
             "ManagementNativeImportDialog",
             "fn present_native_import_picker(",
@@ -49813,6 +49924,16 @@ mod gateway_surface_tests {
         ] {
             assert!(source.contains(marker), "import flow must keep {marker}");
         }
+        // Importing writes records the reader then has to clean up, so the
+        // picker starts with nothing checked: the batch is the one they asked
+        // for. The completion already reports itself through the notice toast,
+        // so the Providers column does not keep a second banner about it.
+        let production = source.split("#[cfg(test)]").next().unwrap_or(source);
+        assert!(!production.contains("management-provider-import-report"));
+        assert!(
+            !production.contains("render_native_import_report"),
+            "the import result is a toast, not a banner above the Provider list"
+        );
         // Grouping is by import source, so the picker names the sources the
         // authority reads rather than inventing its own categories. One source
         // is open at a time, and the rows of that source are a bounded list, so
@@ -49885,7 +50006,8 @@ mod gateway_surface_tests {
         assert!(!body.contains(".overflow_y_scrollbar()"));
     }
 
-    /// A source the machine has records for is the one the dialog opens on.
+    /// A source the machine has records for is the one the dialog opens on,
+    /// and the read starts with nothing checked.
     #[test]
     fn native_import_opens_on_a_source_that_has_records() {
         let source = include_str!("management.rs");
@@ -49896,6 +50018,84 @@ mod gateway_surface_tests {
             .map(|(body, _)| body)
             .expect("the preview read should remain inspectable");
         assert!(scan.contains("this.native_import_active_source = source"));
+        // Opening the picker is not a choice: the reader decides what to write,
+        // so the list arrives unselected and the confirm button stays disabled
+        // until they pick something.
+        assert!(
+            scan.contains("this.native_import_picked.clear()"),
+            "the picker must open with nothing checked"
+        );
+        assert!(
+            !scan.contains("this.native_import_picked = items"),
+            "the read must not pre-check every candidate"
+        );
+        // The row's own state decides whether the warning is about a Key the
+        // reader has to supply or one the import carries across.
+        assert!(source.contains("native_import_moves_its_secret(item)"));
+    }
+
+    /// An imported placeholder is a Key with no Secret, and says so.
+    ///
+    /// The row used to fall back to the fixed mask whenever `masked_hint` was
+    /// empty, so a placeholder looked exactly like a stored Key; the eye then
+    /// failed when clicked. The state, not the mask, is what the row reads.
+    #[test]
+    fn a_key_without_a_value_does_not_wear_a_mask() {
+        let placeholder = vibex_core::ModelProviderCredentialReference {
+            status: vibex_core::AgentCredentialStatus::Missing,
+            credential: vibex_core::AgentCredential::ApiKey {
+                secret: vibex_core::ProjectionSecretReference {
+                    id: vibex_core::RequestId::new(),
+                    backend: ProviderSecretBackend::Placeholder,
+                    setup_state: ProviderSecretSetupState::Missing,
+                    lookup_key: "OPENAI_API_KEY".to_string(),
+                    redacted_hint: "not configured".to_string(),
+                    revision: 1,
+                    legacy_secret_reference_id: None,
+                },
+                target_hint: None,
+            },
+            ..Default::default()
+        };
+        assert!(!provider_credential_has_value(&placeholder));
+        assert!(!provider_credential_can_reveal(&placeholder));
+
+        let mut stored = placeholder.clone();
+        stored.status = vibex_core::AgentCredentialStatus::Ready;
+        stored.masked_hint = "sk-********abcd".to_string();
+        if let vibex_core::AgentCredential::ApiKey { secret, .. } = &mut stored.credential {
+            secret.backend = ProviderSecretBackend::OsKeychain;
+            secret.setup_state = ProviderSecretSetupState::Available;
+        }
+        assert!(provider_credential_has_value(&stored));
+        assert!(provider_credential_can_reveal(&stored));
+
+        // An environment reference is a real value but not one this runtime can
+        // read back, so the row shows it without offering the eye.
+        let mut environment = stored.clone();
+        if let vibex_core::AgentCredential::ApiKey { secret, .. } = &mut environment.credential {
+            secret.backend = ProviderSecretBackend::Environment;
+        }
+        assert!(provider_credential_has_value(&environment));
+        assert!(!provider_credential_can_reveal(&environment));
+
+        let source = include_str!("management.rs");
+        let renderer = source
+            .split_once("    fn render_provider_key_value(")
+            .map(|(_, tail)| {
+                tail.split("\n    /// Reveals one Key")
+                    .next()
+                    .unwrap_or(tail)
+            })
+            .expect("the Key row should remain inspectable");
+        assert!(
+            renderer.contains("Not configured"),
+            "a placeholder must name its state instead of wearing a mask"
+        );
+        assert!(
+            !renderer.contains("let fallback = if masked_hint.trim().is_empty()"),
+            "the mask fallback must not be the only thing the row knows"
+        );
     }
 
     #[test]
@@ -51755,6 +51955,14 @@ mod gateway_surface_tests {
         }
         // Picking again replays the request rather than unpinning it.
         assert!(source.contains("stage.replay(cx)"));
+        // A replay is paced by the map's own clock, so the map has to ask for
+        // the frames that carry it: nothing else invalidates the map while a
+        // picked walk plays out.
+        let stage = include_str!("management/provider_workspace/route_stage.rs");
+        assert!(
+            stage.contains("fn pulse_soon(") && stage.contains("PULSE_TICK_MS"),
+            "a replay must schedule its own frames, or it freezes on its first one"
+        );
         // A failed request names why in the record, not only in the message the
         // Agent showed: the code is the one thing a reader can look up.
         assert!(source.contains("gateway_request_error_code(request)"));

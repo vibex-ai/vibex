@@ -5728,6 +5728,15 @@ ProviderConfigService::{
   reader drags replaces the share-out until the table itself changes width —
   the `ColumnWidthsChanged` subscription records the layout and the next render
   hands it to the delegate, since the table emits from inside its own update.
+- **The map owns its wheel.** The route map is wider than the page it sits on,
+  so it has its own horizontal scroller (`RouteStage::map_scroll`) and stops
+  the wheel with `on_scroll_wheel(... stop_propagation())`. A plain mouse wheel
+  has only a vertical axis; the horizontal scroller turns those lines into
+  sideways travel, and once the map is at its edge the same unclamped event
+  would otherwise reach the page's vertical scroller and move the whole Routing
+  tab. The listener is what keeps the wheel inside the map at the edge too, so
+  only the map ever moves. The scrollbar is a sibling of the scroller rather
+  than a child: attached to the moving content it would slide with it.
 - **The map asks for frames only while something travels.** A dot in flight,
   a shaking member or a fresh refusal tag asks for animation frames; a request
   that is only waiting redraws on a ~15 fps timer for its pulse and flowing
@@ -5735,6 +5744,15 @@ ProviderConfigService::{
   window, nothing moves and the map shows where each request stands. Every
   animation frame re-renders the views above the map as well, so the map owns
   no work beyond its own frame.
+- **A picked request's replay carries its own clock.** The map paces a walk
+  itself, so nothing else invalidates it while the replay plays out: a frame
+  that starts a replay and asks for no next one leaves the dot frozen at its
+  Agent until the reader clicks something. `RouteStage::pulse_soon` therefore
+  schedules the slow tick whenever the drawn frame still has work left —
+  `StageLooks::ambient`: a dot waiting out its hold, a flowing wire, a replay
+  whose first leg has not begun, or a request still in flight. A travelling
+  dot still takes `request_animation_frame`; once the dot is home (`landed`)
+  the ticking stops rather than spinning.
 - **A created Provider is verified by one real minimal request, and the check
   cannot undo it.** The save writes the row first and probes it afterwards, so a
   blocked probe — a proxy, a rate limit, a vendor that refuses this client — is
