@@ -728,9 +728,12 @@ fn prompt_height(app: &App, width: u16) -> u16 {
     if !app.page.is_session_page() {
         return 0;
     }
-    // The block's two border columns, then the prompt arrow's two.
+    // The draft's column, measured the way [`render_composer`] paints it: the
+    // box's edge and padding column on each side, then the prompt arrow. The
+    // two must agree or the band is sized for a wrap the painter does not
+    // make — a two-row draft in a one-row box scrolls its first row away.
     let text_width = usize::from(width)
-        .saturating_sub(2)
+        .saturating_sub(usize::from(BOX_EDGE_COLUMNS + 2))
         .saturating_sub(crate::glyphs::PROMPT_ARROW_WIDTH);
     let rows = app
         .composer
@@ -12469,6 +12472,139 @@ mod tests {
                 usize::from(bands.scrollback.width),
                 "at {columns} columns the helper and the band disagree"
             );
+        }
+    }
+
+    /// The prompt band must wrap the draft at the width the composer paints in.
+    ///
+    /// The band is sized from `prompt_height`, which measures the draft itself,
+    /// and the composer then paints into the rect the band produced. When the
+    /// two disagreed by the padding columns, a draft that wrapped in the
+    /// painter did not wrap in the measurer: the band stayed one row short, the
+    /// renderer scrolled to keep the caret visible, and the *first* row of a
+    /// two-row draft was pushed out of a box that had no room for it. Typing
+    /// on until the band grew brought it back — the reader's report was a line
+    /// that vanished and then reappeared.
+    #[test]
+    fn the_prompt_band_wraps_the_draft_at_the_width_the_composer_paints() {
+        // The composer's own inset, spelled the way `render_composer` does it:
+        // one edge column, one padding column, on each side of the text.
+        fn painted_width(band: u16) -> usize {
+            usize::from(band)
+                .saturating_sub(usize::from(BOX_EDGE_COLUMNS + 2))
+                .saturating_sub(crate::glyphs::PROMPT_ARROW_WIDTH)
+        }
+        for columns in [40u16, 60, 80, 100, 120, 160] {
+            // A draft of exactly the painted width wraps to one row; one more
+            // character makes it two. The band has to grow on the same input.
+            let painted = painted_width(columns);
+            let draft = "x".repeat(painted + 1);
+            let mut app = App::new(
+                vibex_backend::DisconnectedBackend::facade(),
+                crate::app::AppOptions::default(),
+            );
+            app.terminal_images = crate::terminal_image::ImageSupport::forced(
+                crate::terminal_image::ImageProtocol::None,
+            );
+            app.resize(columns, 40);
+            app.navigate_to(Page::Agent);
+            app.composer.set_text(draft.clone());
+
+            let bands = crate::layout::compute(
+                Rect::new(0, 0, columns, 40),
+                crate::layout::BandRequest {
+                    prompt: prompt_height(&app, columns),
+                    prompt_gap: 1,
+                    ..crate::layout::BandRequest::default()
+                },
+            );
+            let band = bands.prompt;
+            // The rows the painter would draw, against the rows the band left
+            // inside its padding and context line.
+            let rows = app.composer.display_row_count(painted_width(band.width));
+            let room = usize::from(band.height).saturating_sub(3);
+            assert_eq!(
+                rows,
+                room,
+                "at {columns} columns the band has {room} draft rows for a draft \
+                 that wraps to {rows} in the {}-column painter",
+                painted_width(band.width)
+            );
+        }
+    }
+
+    /// Type a two-line draft a character at a time and never lose a line.
+    ///
+    /// The band is measured from the draft, then the draft is painted into the
+    /// rect that measurement produced. Typing one character can change both at
+    /// once — a wrap starts a new display row *and* grows the band — so the
+    /// two have to be checked on every keystroke, not on the settled text.
+    #[test]
+    fn every_keystroke_of_a_two_line_draft_keeps_both_lines_on_screen() {
+        for columns in [40u16, 61, 80, 100, 137] {
+            let mut app = App::new(
+                vibex_backend::DisconnectedBackend::facade(),
+                crate::app::AppOptions::default(),
+            );
+            app.terminal_images = crate::terminal_image::ImageSupport::forced(
+                crate::terminal_image::ImageProtocol::None,
+            );
+            app.resize(columns, 40);
+            app.navigate_to(Page::Agent);
+            app.composer.set_text(String::new());
+
+            // The first line is long enough to wrap, which is where the band
+            // and the painter disagree about how many rows the draft takes.
+            let first = "a".repeat(usize::from(columns).saturating_mul(2));
+            let mut typed = String::new();
+            for character in first
+                .chars()
+                .chain(std::iter::once('\n'))
+                .chain("bc".chars())
+            {
+                typed.push(character);
+                app.composer.set_text(typed.clone());
+                app.composer.move_to_end();
+
+                let backend = ratatui::backend::TestBackend::new(columns, 40);
+                let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+                terminal
+                    .draw(|frame| render(frame, &mut app))
+                    .expect("frame draws");
+                let buffer = terminal.backend().buffer().clone();
+                let screen = (0..40)
+                    .map(|row| {
+                        (0..columns)
+                            .map(|column| {
+                                buffer
+                                    .cell((column, row))
+                                    .map(|cell| cell.symbol().to_string())
+                                    .unwrap_or_default()
+                            })
+                            .collect::<String>()
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+
+                // The caret is on the last row the draft occupies, so that row
+                // is on screen by construction. Every line before it has to be
+                // too, or the box is showing a suffix of the draft.
+                let painted = app
+                    .regions
+                    .composer
+                    .expect("the composer publishes its rows");
+                let painted_width =
+                    usize::from(painted.width).saturating_sub(crate::glyphs::PROMPT_ARROW_WIDTH);
+                let total = app.composer.display_row_count(painted_width);
+                let visible = usize::from(painted.height).max(1);
+                assert_eq!(
+                    app.regions.composer_scroll,
+                    0,
+                    "at {columns} columns, after typing {} characters, a \
+                     {total}-row draft was scrolled in a {visible}-row box\n{screen}",
+                    typed.chars().count(),
+                );
+            }
         }
     }
 
