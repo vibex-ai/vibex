@@ -5728,6 +5728,15 @@ ProviderConfigService::{
   reader drags replaces the share-out until the table itself changes width —
   the `ColumnWidthsChanged` subscription records the layout and the next render
   hands it to the delegate, since the table emits from inside its own update.
+- **The map owns its wheel.** The route map is wider than the page it sits on,
+  so it has its own horizontal scroller (`RouteStage::map_scroll`) and stops
+  the wheel with `on_scroll_wheel(... stop_propagation())`. A plain mouse wheel
+  has only a vertical axis; the horizontal scroller turns those lines into
+  sideways travel, and once the map is at its edge the same unclamped event
+  would otherwise reach the page's vertical scroller and move the whole Routing
+  tab. The listener is what keeps the wheel inside the map at the edge too, so
+  only the map ever moves. The scrollbar is a sibling of the scroller rather
+  than a child: attached to the moving content it would slide with it.
 - **The map asks for frames only while something travels.** A dot in flight,
   a shaking member or a fresh refusal tag asks for animation frames; a request
   that is only waiting redraws on a ~15 fps timer for its pulse and flowing

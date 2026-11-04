@@ -194,6 +194,9 @@ pub(crate) struct RouteStage {
     /// replay test, which cannot wait on a timer that a headless run never
     /// fires.
     ambient: bool,
+    /// The map's own sideways scroll. The wheel is taken here rather than by
+    /// the page, so the map can never drag the reader's page up or down.
+    map_scroll: ScrollHandle,
 }
 
 impl RouteStage {
@@ -203,6 +206,7 @@ impl RouteStage {
             replay_from_ms: 0,
             pulse: None,
             ambient: false,
+            map_scroll: ScrollHandle::new(),
         }
     }
 
@@ -1236,10 +1240,23 @@ impl Render for RouteStage {
         let hub = self.render_hub(&looks, &geometry, cx);
         let lanes = self.render_lanes(&looks, now, still, &geometry, cx);
 
-        div()
-            .id("management-route-stage")
+        // The map scrolls sideways on its own. A plain wheel has only a
+        // vertical axis, and the map is wider than the page it sits on, so the
+        // scroller turns that wheel into sideways movement — but the page
+        // around the map also listens for it, and at the horizontal edge the
+        // clamped delta would go on to scroll the reader's page up or down.
+        // Taking the wheel here keeps every turn of it inside the map: the
+        // scroller has already moved the content by the time this listener
+        // runs (bubble goes innermost first), so stopping the event only
+        // keeps it from leaving.
+        let scroller = div()
+            .id("management-route-stage-scroll")
+            .debug_selector(|| "route-stage-scroll".to_string())
             .w_full()
-            .overflow_x_scrollbar()
+            .min_w_0()
+            .overflow_x_scroll()
+            .track_scroll(&self.map_scroll)
+            .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
             .child(
                 div()
                     .relative()
@@ -1258,6 +1275,19 @@ impl Render for RouteStage {
                             .child(lanes),
                     )
                     .child(sky),
+            );
+
+        div()
+            .id("management-route-stage")
+            .relative()
+            .w_full()
+            .child(scroller)
+            // A sibling of the scroller, not a child: attached to the moving
+            // content the bar would slide with it (see `pinned_scrollbar`).
+            .child(
+                gpui_component::scroll::Scrollbar::horizontal(&self.map_scroll)
+                    .id("management-route-stage-scrollbar")
+                    .viewport_from_layout(),
             )
     }
 }
@@ -2384,5 +2414,113 @@ mod tests {
                 "an Agent's wire must come from the green ladder, got {hue:?}"
             );
         }
+    }
+
+    /// A wheel over the map moves the map sideways and nothing else.
+    ///
+    /// The map is wider than the page it lives on, and a plain wheel only has
+    /// a vertical axis. GPUI's horizontal scroller turns those lines sideways,
+    /// but without a listener the same event also reaches the page's own
+    /// scroller and moves it vertically once the map has run out of sideways
+    /// travel. The map takes the wheel itself, so the page never moves.
+    #[gpui::test]
+    fn the_map_takes_the_wheel_so_the_page_never_scrolls(cx: &mut gpui::TestAppContext) {
+        use gpui::{ParentElement as _, ScrollDelta, ScrollWheelEvent, point};
+
+        struct Page {
+            stage: gpui::Entity<RouteStage>,
+            page_scroll: ScrollHandle,
+        }
+
+        impl gpui::Render for Page {
+            fn render(
+                &mut self,
+                _: &mut gpui::Window,
+                _: &mut gpui::Context<Self>,
+            ) -> impl gpui::IntoElement {
+                gpui::div()
+                    .id("page")
+                    .size_full()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.page_scroll)
+                    .child(
+                        gpui::div()
+                            .w(px(520.0))
+                            .child(gpui::div().h(px(4000.0)).child(self.stage.clone())),
+                    )
+            }
+        }
+
+        cx.update(gpui_component::init);
+        let now = vibex_core::unix_timestamp_ms();
+        let stage = cx.new(|_| RouteStage::new());
+        stage.update(cx, |stage, cx| stage.set_model(busy_model(now), cx));
+        let page_scroll = ScrollHandle::new();
+        let page_probe = page_scroll.clone();
+        let (page, cx) = cx.add_window_view(|window, cx| {
+            let page = Page {
+                stage: stage.clone(),
+                page_scroll,
+            };
+            gpui_component::Root::new(cx.new(|_| page), window, cx)
+        });
+        page.update(cx, |_, cx| cx.notify());
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        let map = cx
+            .debug_bounds("route-stage-scroll")
+            .expect("the map's scroller should be laid out");
+        assert!(
+            stage.read_with(cx, |stage, _| stage.map_scroll.max_offset().x) > px(0.0),
+            "the map must be wider than its viewport for this test to mean anything"
+        );
+        assert_eq!(page_probe.offset().y, px(0.0));
+
+        // A plain wheel: vertical lines, as a mouse sends them.
+        let wheel = |delta: ScrollDelta| ScrollWheelEvent {
+            position: map.center(),
+            delta,
+            modifiers: Default::default(),
+            touch_phase: gpui::TouchPhase::Moved,
+        };
+        cx.simulate_event(wheel(ScrollDelta::Lines(point(0.0, -3.0))));
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        assert!(
+            stage.read_with(cx, |stage, _| stage.map_scroll.offset().x) < px(0.0),
+            "the wheel must move the map sideways"
+        );
+        assert_eq!(
+            page_probe.offset().y,
+            px(0.0),
+            "the page must not scroll while the map can still move"
+        );
+
+        // Run the map out of sideways travel and keep turning the wheel: the
+        // page still must not move, which is what the listener is for.
+        let max = stage.read_with(cx, |stage, _| stage.map_scroll.max_offset().x);
+        stage.update(cx, |stage, cx| {
+            stage.map_scroll.set_offset(point(-max, px(0.0)));
+            cx.notify();
+        });
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.simulate_event(wheel(ScrollDelta::Lines(point(0.0, -3.0))));
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        assert!(
+            stage.read_with(cx, |stage, _| stage.map_scroll.offset().x) == -max,
+            "the map stays at its horizontal edge"
+        );
+        assert_eq!(
+            page_probe.offset().y,
+            px(0.0),
+            "a wheel over the map must never move the page, even at the edge"
+        );
     }
 }
