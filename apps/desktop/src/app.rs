@@ -54936,14 +54936,19 @@ impl VibexWorkbench {
                 });
                 let highlighted =
                     keyboard_selected || (is_selected && keyboard_selection.is_none());
+                let row_id = format!("{menu_prefix}-runtime-route:{group_key}");
+                // The row paints its own hover wash. It cannot lean on the
+                // accordion item's `.hover(...)` style: the item is disabled so
+                // nothing folds, and the framework only installs that style on
+                // a trigger it lets the reader click. The item therefore keeps
+                // the rest fill, and the pointer's wash rides on the row below.
                 let background = if is_selected {
                     selected_background
                 } else if highlighted {
                     highlight_background
                 } else {
-                    rest_background
+                    hover_blend(&row_id, rest_background, highlight_background)
                 };
-                let row_id = format!("{menu_prefix}-runtime-route:{group_key}");
                 let heading_body = || {
                     div()
                         .w_full()
@@ -55047,7 +55052,6 @@ impl VibexWorkbench {
                             .into_any_element()
                     }
                 };
-                let hover = highlight_background;
                 accordion = accordion.item(move |item| {
                     item.disabled(true)
                         .open(false)
@@ -55055,7 +55059,6 @@ impl VibexWorkbench {
                         .bg(background)
                         .border_b_0()
                         .rounded(px(6.0))
-                        .hover(move |style| style.bg(hover).rounded(px(6.0)))
                         .title(title)
                 });
                 continue;
@@ -110036,6 +110039,20 @@ mod tests {
              GPUI drags the bar up with the rows"
         );
         assert!(grouped_models.contains("scroll_row_into_view(&reveal_scroll, bounds, window)"));
+        // Route rows are the selectable rows of their group, so they need the
+        // same pointer feedback as a model row. The accordion item they sit in
+        // is disabled to stop it folding, and a disabled item's `.hover(...)`
+        // is never installed, so the wash has to be painted by the row itself.
+        assert!(
+            grouped_models.contains("hover_blend(&row_id, rest_background, highlight_background)"),
+            "a route row must blend its own hover wash; the disabled accordion \
+             item around it does not receive one"
+        );
+        assert!(
+            !grouped_models.contains(".hover(move |style| style.bg(hover)"),
+            "a disabled accordion item never installs `.hover(...)`, so the wash \
+             must not be asked of it"
+        );
         assert!(menu_opening.contains("runtime_provider_scroll_to_selection = true;"));
         assert!(menu_opening.contains("runtime_agent_row_reveal_pending = true;"));
         assert!(
