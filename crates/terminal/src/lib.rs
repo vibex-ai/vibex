@@ -50,6 +50,8 @@ pub struct TerminalManager {
     /// The runtime's dev-server detector. Installed after composition, because
     /// the browser service it reports to is built after the terminals are.
     output_observer: Arc<Mutex<Option<TerminalOutputObserver>>>,
+    /// Byte taps registered by session observers, keyed by terminal.
+    output_taps: Arc<Mutex<HashMap<TerminalId, TerminalOutputTap>>>,
 }
 
 /// Observes raw terminal output as it arrives.
@@ -59,6 +61,15 @@ pub struct TerminalManager {
 /// and hands any readiness probe to the runtime's own executor.
 pub type TerminalOutputObserver =
     Arc<dyn Fn(&TerminalId, &WorkspaceId, &[u8]) + Send + Sync + 'static>;
+
+/// Per-terminal byte taps, for callers that need the stream rather than a tail.
+///
+/// The dev-server detector above wants one scan of a bounded tail. A terminal
+/// session's observer has to feed an emulator byte for byte, on a thread that
+/// cannot block, so registration is separate and delivery is a `try_send` into
+/// the caller's own bounded queue: a slow consumer loses bytes instead of
+/// stalling the PTY.
+pub type TerminalOutputTap = Arc<dyn Fn(&TerminalId, &[u8]) + Send + Sync + 'static>;
 
 type TerminalRuntimeHandle = Arc<Mutex<TerminalRuntime>>;
 
@@ -160,6 +171,7 @@ impl TerminalManager {
             ring_capacity: ring_capacity.max(1),
             raw_observation_capacity: None,
             output_observer: Arc::new(Mutex::new(None)),
+            output_taps: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -174,6 +186,7 @@ impl TerminalManager {
                 raw_observation_capacity.max(MIN_RAW_OBSERVATION_CAPACITY),
             ),
             output_observer: Arc::new(Mutex::new(None)),
+            output_taps: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -189,6 +202,22 @@ impl TerminalManager {
     pub fn set_output_observer(&self, observer: TerminalOutputObserver) {
         if let Ok(mut slot) = self.output_observer.lock() {
             *slot = Some(observer);
+        }
+    }
+
+    /// Registers a byte tap for one terminal.
+    ///
+    /// Replaces any previous tap for that terminal. The tap runs on the PTY
+    /// reader thread, so it must hand the bytes to its own queue and return.
+    pub fn set_output_tap(&self, terminal_id: &TerminalId, tap: TerminalOutputTap) {
+        if let Ok(mut taps) = self.output_taps.lock() {
+            taps.insert(terminal_id.clone(), tap);
+        }
+    }
+
+    pub fn clear_output_tap(&self, terminal_id: &TerminalId) {
+        if let Ok(mut taps) = self.output_taps.lock() {
+            taps.remove(terminal_id);
         }
     }
 
@@ -378,10 +407,37 @@ impl TerminalManager {
     pub fn restore_command(
         &self,
         workspace_root: impl AsRef<Path>,
-        mut session: TerminalSession,
+        session: TerminalSession,
         argv: &[String],
         env: Vec<(String, String)>,
     ) -> VibexResult<TerminalSession> {
+        self.restore_command_inner(workspace_root, session, argv, env, true)
+    }
+
+    /// Rebuilds an explicit-command terminal that is not a workspace tab.
+    ///
+    /// Used for a terminal-mode session whose entry was already removed: the
+    /// reader is looking at the session, not at the terminal list, so it must
+    /// not resurface there.
+    pub fn restore_session_command(
+        &self,
+        workspace_root: impl AsRef<Path>,
+        session: TerminalSession,
+        argv: &[String],
+        env: Vec<(String, String)>,
+    ) -> VibexResult<TerminalSession> {
+        self.restore_command_inner(workspace_root, session, argv, env, true)
+    }
+
+    fn restore_command_inner(
+        &self,
+        workspace_root: impl AsRef<Path>,
+        session: TerminalSession,
+        argv: &[String],
+        env: Vec<(String, String)>,
+        persist_on_shutdown: bool,
+    ) -> VibexResult<TerminalSession> {
+        let mut session = session;
         let (command_name, args) = argv.split_first().ok_or_else(|| {
             VibexError::validation(
                 "terminal_command_invalid",
@@ -429,7 +485,7 @@ impl TerminalManager {
         }
         sanitize_terminal_environment(&mut command);
         declare_pty_terminal_environment(&mut command);
-        self.spawn_runtime_with_command(cwd, session, command, true)
+        self.spawn_runtime_with_command(cwd, session, command, persist_on_shutdown)
     }
 
     fn spawn_runtime(
@@ -504,6 +560,7 @@ impl TerminalManager {
             Arc::downgrade(&writer),
             buffer.clone(),
             Arc::clone(&self.output_observer),
+            Arc::clone(&self.output_taps),
         );
         let runtime = TerminalRuntime {
             session: session.clone(),
@@ -953,6 +1010,7 @@ fn spawn_reader_thread(
     writer: Weak<Mutex<PtyWriter>>,
     buffer: Arc<Mutex<TerminalBuffer>>,
     output_observer: Arc<Mutex<Option<TerminalOutputObserver>>>,
+    output_taps: Arc<Mutex<HashMap<TerminalId, TerminalOutputTap>>>,
 ) {
     thread::spawn(move || {
         let mut bytes = [0_u8; 4096];
@@ -966,6 +1024,12 @@ fn spawn_reader_thread(
                         && let Some(observer) = slot.as_ref()
                     {
                         observer(&terminal_id, &workspace_id, &bytes[..count]);
+                    }
+                    // A tap must only enqueue: this is the PTY reader thread.
+                    if let Ok(taps) = output_taps.lock()
+                        && let Some(tap) = taps.get(&terminal_id)
+                    {
+                        tap(&terminal_id, &bytes[..count]);
                     }
                     let Some(writer) = writer.upgrade() else {
                         break;
@@ -2192,6 +2256,7 @@ mod tests {
             Arc::downgrade(&writer),
             buffer,
             Arc::new(Mutex::new(Some(observer))),
+            Arc::new(Mutex::new(HashMap::new())),
         );
 
         let deadline = std::time::Instant::now() + Duration::from_secs(5);

@@ -27614,6 +27614,39 @@ impl SessionTerminalRepository {
         Ok(())
     }
 
+    /// Every recorded terminal-mode session, for a runtime restart.
+    pub fn list_all(conn: &Connection) -> VibexResult<Vec<SessionTerminalRecord>> {
+        let mut stmt = conn
+            .prepare(
+                "
+                SELECT session_id, terminal_id, workspace_id, argv_json, cwd,
+                    activity, activity_source, activity_observed_at_ms,
+                    activity_confirmations, cli_title, cli_cwd, native_session_id,
+                    waiting_since_ms, completed_at_ms
+                FROM session_terminals
+                ORDER BY created_at_ms ASC
+                ",
+            )
+            .map_err(storage_err(
+                "session_terminal_list_failed",
+                "failed to list session terminals",
+            ))?;
+        let rows = stmt
+            .query_map([], map_session_terminal)
+            .map_err(storage_err(
+                "session_terminal_list_failed",
+                "failed to list session terminals",
+            ))?;
+        let mut records = Vec::new();
+        for row in rows {
+            records.push(row.map_err(storage_err(
+                "session_terminal_decode_failed",
+                "failed to decode a session terminal",
+            ))?);
+        }
+        Ok(records)
+    }
+
     /// Reads the link for one session, if the PTY was ever started.
     pub fn get(
         conn: &Connection,

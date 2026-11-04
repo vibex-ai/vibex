@@ -54,6 +54,7 @@ vibex-model-gateway = { path = "../model-gateway" }
 vibex-relay = { path = "../relay" }
 vibex-remote = { path = "../remote" }
 vibex-terminal = { path = "../terminal" }
+vibex-terminal-ui = { path = "../vibex-terminal-ui" }
 webpki-root-certs.workspace = true
 zip.workspace = true
 

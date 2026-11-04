@@ -20,6 +20,7 @@ mod remote_connectivity;
 mod session_terminal;
 mod sidebar_organization;
 mod storage;
+mod terminal_observation;
 mod timeline_display_settings;
 mod usage;
 mod vibex_use;
@@ -54,11 +55,11 @@ use vibex_core::{
     AgentAuthContextId, AgentAuthContextLogoutPreview, AgentAuthContextLogoutRequest,
     AgentAuthContextMutationResult, AgentAuthContextRefreshModelsRequest,
     AgentAuthContextVerifyRequest, AgentAuthenticateRequest, AgentAuthenticateResult,
-    AgentAuthenticationCancelRequest, AgentLogoutRequest, AgentRuntimeKind, AgentSession,
+    AgentAuthenticationCancelRequest, AgentId, AgentLogoutRequest, AgentRuntimeKind, AgentSession,
     AgentTimelineDisplaySettings, AgentTokenUsage, FetchTimelineRequest, OpenWorkspaceRequest,
     ProjectId, ProjectRecord, ProviderProfileId, TerminalCreateRequest, TerminalId,
     TerminalSession, TerminalSwitchShellRequest, TimelinePage, TimelinePayload, VibexError,
-    VibexResult, VibexSessionId, WorkspaceId, WorkspaceMode, WorkspaceRecord,
+    VibexResult, VibexSessionId, WorkspaceId, WorkspaceMode, WorkspaceRecord, unix_timestamp_ms,
 };
 use vibex_db::{
     TerminalSessionRepository, WorkspaceRepository, apply_migrations, default_database_path,
@@ -2518,6 +2519,11 @@ pub struct TerminalHandle {
     db_path: PathBuf,
     manager: TerminalManager,
     lifecycle: Arc<Mutex<()>>,
+    /// What the runtime can see of a terminal-mode Agent, keyed by terminal.
+    ///
+    /// Shared rather than owned because the byte tap runs on the PTY reader
+    /// thread: it has to reach the same observation set the sweep uses.
+    observations: Arc<Mutex<terminal_observation::TerminalObservations>>,
 }
 
 impl TerminalHandle {
@@ -3398,6 +3404,9 @@ impl DesktopRuntime {
                 db_path: db_path.clone(),
                 manager: terminals,
                 lifecycle: Arc::new(Mutex::new(())),
+                observations: Arc::new(Mutex::new(
+                    terminal_observation::TerminalObservations::new(),
+                )),
             },
             scheduled: ScheduledHandle {
                 db_path: db_path.clone(),
@@ -3648,6 +3657,20 @@ impl DesktopRuntime {
         startup_stage("startup_reconciliation_spawn", || {
             runtime.spawn_startup_reconciliation()
         })?;
+        // A terminal-mode session that survived the restart has a row but no
+        // process. Rebuilding it is a startup stage of its own so a failing
+        // Agent is reported against its own session rather than failing the
+        // runtime.
+        startup_stage("session_terminal_restore", || {
+            let restored = runtime.restore_session_terminals()?;
+            for session in restored {
+                runtime.agent.manager().announce_created_session(&session);
+            }
+            Ok(())
+        })?;
+        startup_stage("terminal_observation_spawn", || {
+            runtime.spawn_terminal_observation_sweep()
+        })?;
         let bootstrap_started = Instant::now();
         eprintln!("vibex-startup: stage-begin stage=managed_agent_bootstrap_spawn");
         let bootstrap = (|| {
@@ -3718,6 +3741,53 @@ impl DesktopRuntime {
             let _ = self.agent.runtime_lifecycle.stop().await;
             return Err(error);
         }
+        Ok(())
+    }
+
+    /// Re-reads every watched terminal on a slow tick.
+    ///
+    /// A screen can settle without new bytes, so byte-driven observation alone
+    /// would leave a finished Agent showing `working` forever and would never
+    /// let `working -> idle` accumulate the confirmations it needs. The sweep is
+    /// the clock both of those depend on.
+    fn spawn_terminal_observation_sweep(self: &Arc<Self>) -> VibexResult<()> {
+        let mut tasks = self.tasks.lock().map_err(|_| {
+            VibexError::process(
+                "desktop_runtime_task_lock_failed",
+                "desktop runtime task ownership is unavailable",
+            )
+        })?;
+        let weak_runtime = Arc::downgrade(self);
+        tasks.push(tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(300));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                let Some(runtime) = weak_runtime.upgrade() else {
+                    break;
+                };
+                let updates = runtime.scan_terminal_observations();
+                if updates.is_empty() {
+                    continue;
+                }
+                for update in updates {
+                    if let Ok(session_id) = vibex_core::VibexSessionId::parse(update.session_id)
+                        && let Err(error) = runtime.agent.manager().record_terminal_observation(
+                            &session_id,
+                            update.activity,
+                            update.source,
+                            update.observed_at_ms,
+                        )
+                    {
+                        tracing::warn!(
+                            target: "vibex_desktop",
+                            error_code = %error.code,
+                            "terminal observation write failed"
+                        );
+                    }
+                }
+            }
+        }));
         Ok(())
     }
 
@@ -4561,6 +4631,156 @@ impl DesktopRuntime {
 
     pub fn terminals(&self) -> TerminalHandle {
         self.terminals.clone()
+    }
+
+    /// Starts observing a terminal-mode session's PTY.
+    ///
+    /// The tap only enqueues bytes; the emulator and the rules run in
+    /// [`TerminalHandle::scan_terminal_observations`].
+    pub fn watch_session_terminal(
+        &self,
+        terminal_id: &TerminalId,
+        session_id: impl Into<String>,
+        agent_id: &AgentId,
+        rows: u16,
+        cols: u16,
+    ) -> VibexResult<()> {
+        let handle = self.terminals.clone();
+        {
+            let mut observations = handle.observations.lock().map_err(|_| {
+                VibexError::process(
+                    "terminal_observation_lock_failed",
+                    "the terminal observation set is unavailable",
+                )
+            })?;
+            observations.watch(
+                terminal_id.clone(),
+                session_id,
+                agent_id.clone(),
+                rows,
+                cols,
+            );
+        }
+        let observations = Arc::clone(&handle.observations);
+        let watched = terminal_id.clone();
+        handle.manager().set_output_tap(
+            terminal_id,
+            Arc::new(move |_, bytes: &[u8]| {
+                // PTY reader thread: enqueue and return. A poisoned lock means
+                // the runtime is shutting down, and losing a read is preferable
+                // to stalling the Agent.
+                if let Ok(mut observations) = observations.lock() {
+                    observations.observe(&watched, bytes, unix_timestamp_ms());
+                }
+            }),
+        );
+        Ok(())
+    }
+
+    pub fn unwatch_session_terminal(&self, terminal_id: &TerminalId) {
+        self.terminals.manager().clear_output_tap(terminal_id);
+        if let Ok(mut observations) = self.terminals.observations.lock() {
+            observations.unwatch(terminal_id);
+        }
+    }
+
+    /// Re-confirms every watched terminal and returns what changed.
+    ///
+    /// The sweep exists because a screen can settle without new bytes: a TUI
+    /// that stops repainting must still be re-read once its reading ages out,
+    /// and `working -> idle` needs several agreeing scans.
+    pub fn scan_terminal_observations(&self) -> Vec<terminal_observation::ObservationUpdate> {
+        let Ok(mut observations) = self.terminals.observations.lock() else {
+            return Vec::new();
+        };
+        observations.scan_all(unix_timestamp_ms())
+    }
+
+    /// Rebuilds the PTY of every terminal-mode session recorded on disk.
+    ///
+    /// A runtime restart must not silently strand a session that was created in
+    /// terminal mode: the row survives, so the page would draw an empty
+    /// terminal. The recorded argv is what makes the rebuild the *same*
+    /// command — a resume id or a model override is not recoverable from the
+    /// shell name alone.
+    ///
+    /// A session whose command cannot be rebuilt keeps its row and is marked
+    /// `Error`, which is the honest answer: the reader sees which session did
+    /// not come back instead of an empty page.
+    pub fn restore_session_terminals(&self) -> VibexResult<Vec<AgentSession>> {
+        let mut connection = open_database(&self.config.database_path)?;
+        apply_migrations(&mut connection)?;
+        let pending = vibex_db::SessionTerminalRepository::list_all(&connection)?;
+        if pending.is_empty() {
+            return Ok(Vec::new());
+        }
+        let Some(launcher) = self.agent.manager().session_terminal_launcher() else {
+            return Ok(Vec::new());
+        };
+        let mut restored = Vec::new();
+        for record in pending {
+            let Some(session) = vibex_db::SessionRepository::get(&connection, &record.session_id)?
+            else {
+                // The session was deleted while its link row survived a crash.
+                let _ =
+                    vibex_db::SessionTerminalRepository::delete(&connection, &record.session_id);
+                continue;
+            };
+            if !session.transport.is_terminal() {
+                continue;
+            }
+            // Already running: the caller restored it earlier in this process.
+            if self
+                .terminals
+                .manager()
+                .snapshot(&record.terminal_id)
+                .is_ok()
+            {
+                continue;
+            }
+            let spec = vibex_core::TerminalSessionLaunchSpec {
+                workspace_id: record.workspace_id.clone(),
+                workspace_root: session.workspace_root.clone(),
+                argv: record.argv.clone(),
+                env: Vec::new(),
+                title: session.title.clone(),
+                rows: 24,
+                cols: 100,
+            };
+            match launcher.restore(&spec, &record.terminal_id) {
+                Ok(Some(handle)) => {
+                    vibex_db::SessionTerminalRepository::upsert(
+                        &connection,
+                        &session.id,
+                        &handle.terminal_id,
+                        &record.workspace_id,
+                        &record.argv,
+                        &session.workspace_root,
+                    )?;
+                    let _ = self.watch_session_terminal(
+                        &handle.terminal_id,
+                        session.id.as_str().to_string(),
+                        &session.agent_id,
+                        24,
+                        100,
+                    );
+                    restored.push(session);
+                }
+                Ok(None) | Err(_) => {
+                    vibex_db::SessionRepository::update_state(
+                        &connection,
+                        &session.id,
+                        vibex_core::AgentSessionState::Error,
+                    )?;
+                    if let Some(updated) =
+                        vibex_db::SessionRepository::get(&connection, &session.id)?
+                    {
+                        restored.push(updated);
+                    }
+                }
+            }
+        }
+        Ok(restored)
     }
 
     /// Lists persisted and currently running terminals for a workspace. Active

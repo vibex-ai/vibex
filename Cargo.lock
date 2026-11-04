@@ -10104,6 +10104,7 @@ dependencies = [
  "vibex-relay",
  "vibex-remote",
  "vibex-terminal",
+ "vibex-terminal-ui",
  "webpki-root-certs",
  "zip",
 ]

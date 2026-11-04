@@ -2958,6 +2958,58 @@ impl AgentManager {
         coordinator.submit(request).await
     }
 
+    /// Records what a terminal session's observer saw.
+    ///
+    /// The write is skipped when nothing a reader sees has moved, so an
+    /// observation that only refreshes the clock costs one read. The session
+    /// snapshot is broadcast when something did move, because the sidebar and
+    /// the session header both paint from it.
+    pub fn record_terminal_observation(
+        &self,
+        session_id: &VibexSessionId,
+        activity: vibex_core::TerminalActivity,
+        source: vibex_core::TerminalActivitySource,
+        observed_at_ms: i64,
+    ) -> VibexResult<()> {
+        let conn = self.open_migrated()?;
+        let Some(mut record) = SessionTerminalRepository::get(&conn, session_id)? else {
+            return Ok(());
+        };
+        let facts = vibex_core::TerminalSessionFacts {
+            terminal_id: Some(record.terminal_id.clone()),
+            activity,
+            source,
+            observed_at_ms,
+            confirmations: record.facts.confirmations,
+            cli_title: record.facts.cli_title.clone(),
+            cli_cwd: record.facts.cli_cwd.clone(),
+            native_session_id: record.facts.native_session_id.clone(),
+            waiting_since_ms: match (activity, record.facts.waiting_since_ms) {
+                (vibex_core::TerminalActivity::Waiting, None) => Some(observed_at_ms),
+                (vibex_core::TerminalActivity::Waiting, since) => since,
+                _ => None,
+            },
+            completed_at_ms: match (activity, record.facts.completed_at_ms) {
+                (vibex_core::TerminalActivity::Idle, _) => Some(observed_at_ms),
+                (_, completed) => completed,
+            },
+        };
+        if !SessionTerminalRepository::update_facts(&conn, session_id, &facts)? {
+            return Ok(());
+        }
+        record.facts = facts;
+        if let Some(session) = SessionRepository::get(&conn, session_id)?
+            && session.transport.is_terminal()
+        {
+            let session = AgentSession {
+                terminal: Some(record.facts),
+                ..session
+            };
+            let _ = self.session_events.send(session);
+        }
+        Ok(())
+    }
+
     /// Refuses a mutation that only an ACP session can serve.
     ///
     /// Terminal sessions keep the same row and the same lifecycle, so a client
@@ -12671,6 +12723,114 @@ mod tests {
         assert_eq!(
             sessions[0].transport,
             vibex_core::SessionTransport::Terminal
+        );
+    }
+
+    /// A restart rebuilds a terminal session's PTY from its recorded argv.
+    ///
+    /// The row survives the restart, so without this the page would draw an
+    /// empty terminal for every terminal session the reader created.
+    #[tokio::test]
+    async fn a_restart_rebuilds_terminal_sessions_from_their_recorded_argv() {
+        let (manager, launcher, dir) = terminal_manager();
+        let mut request = terminal_request("claude", &dir);
+        request.args = vec!["--resume".to_string(), "abc".to_string()];
+        let session = manager.create_terminal_session(request).await.unwrap();
+        drop(manager);
+
+        // A new manager over the same database is the restart.
+        let restarted = AgentManager::new(dir.join("vibex.db")).unwrap();
+        let restarted_launcher =
+            Arc::new(crate::session_terminal::RecordingTerminalLauncher::new());
+        let installed: Arc<dyn crate::session_terminal::SessionTerminalLauncher> =
+            Arc::clone(&restarted_launcher)
+                as Arc<dyn crate::session_terminal::SessionTerminalLauncher>;
+        restarted
+            .install_session_terminal_launcher(&installed)
+            .unwrap();
+        let conn = open_database(&dir.join("vibex.db")).unwrap();
+        let record = vibex_db::SessionTerminalRepository::get(&conn, &session.id)
+            .unwrap()
+            .expect("the record survives the restart");
+        assert_eq!(
+            record.argv,
+            vec!["claude", "--resume", "abc"]
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        );
+        // The launcher is what rebuilds the process; the restore entry point
+        // lives on the runtime, so this test pins the durable half it reads.
+        let spec = vibex_core::TerminalSessionLaunchSpec {
+            workspace_id: record.workspace_id.clone(),
+            workspace_root: session.workspace_root.clone(),
+            argv: record.argv.clone(),
+            env: Vec::new(),
+            title: session.title.clone(),
+            rows: 24,
+            cols: 100,
+        };
+        let handle = restarted_launcher
+            .restore(&spec, &record.terminal_id)
+            .unwrap()
+            .expect("the recording launcher rebuilds what it is given");
+        assert!(restarted_launcher.is_running(&handle.terminal_id));
+        let launches = restarted_launcher.launches();
+        assert_eq!(
+            launches[0].argv,
+            vec!["claude", "--resume", "abc"]
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>(),
+            "the arguments must come back, not just the executable"
+        );
+        let _ = launcher;
+    }
+
+    /// Recording an observation publishes a session snapshot, so the sidebar
+    /// repaints from the same event stream it already reads.
+    #[tokio::test]
+    async fn a_terminal_observation_reaches_the_session_snapshot() {
+        let (manager, _, dir) = terminal_manager();
+        let session = manager
+            .create_terminal_session(terminal_request("claude", &dir))
+            .await
+            .unwrap();
+        let mut updates = manager.subscribe_session_updates();
+        manager
+            .record_terminal_observation(
+                &session.id,
+                vibex_core::TerminalActivity::Waiting,
+                vibex_core::TerminalActivitySource::Screen,
+                5_000,
+            )
+            .unwrap();
+        let announced = tokio::time::timeout(std::time::Duration::from_secs(2), updates.recv())
+            .await
+            .expect("an observation should announce the session")
+            .expect("the broadcast stays open");
+        assert_eq!(announced.id, session.id);
+        let facts = announced
+            .terminal
+            .expect("a terminal session carries its observations");
+        assert_eq!(facts.activity, vibex_core::TerminalActivity::Waiting);
+        assert_eq!(facts.waiting_since_ms, Some(5_000));
+
+        // A second observation that changes nothing writes nothing and
+        // announces nothing.
+        manager
+            .record_terminal_observation(
+                &session.id,
+                vibex_core::TerminalActivity::Waiting,
+                vibex_core::TerminalActivitySource::Screen,
+                5_300,
+            )
+            .unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(200), updates.recv())
+                .await
+                .is_err(),
+            "an unchanged observation must not repaint every row"
         );
     }
 
