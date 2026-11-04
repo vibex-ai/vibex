@@ -3076,8 +3076,15 @@ impl DesktopRuntime {
                 )
             })?;
         let runtime_probe = acp_runtime.runtime_probe_service();
+        // One observation set for the whole runtime: the launcher's byte tap and
+        // the sweep below must watch the same terminals.
+        let terminal_observations =
+            Arc::new(Mutex::new(terminal_observation::TerminalObservations::new()));
         manager.install_session_terminal_launcher(
-            &session_terminal::TerminalManagerSessionLauncher::shared(terminals.clone()),
+            &session_terminal::TerminalManagerSessionLauncher::shared(
+                terminals.clone(),
+                Arc::clone(&terminal_observations),
+            ),
         )?;
         let manager = Arc::new(manager);
         let db_path = manager.database_path().to_path_buf();
@@ -3404,9 +3411,7 @@ impl DesktopRuntime {
                 db_path: db_path.clone(),
                 manager: terminals,
                 lifecycle: Arc::new(Mutex::new(())),
-                observations: Arc::new(Mutex::new(
-                    terminal_observation::TerminalObservations::new(),
-                )),
+                observations: terminal_observations,
             },
             scheduled: ScheduledHandle {
                 db_path: db_path.clone(),
@@ -4646,33 +4651,15 @@ impl DesktopRuntime {
         cols: u16,
     ) -> VibexResult<()> {
         let handle = self.terminals.clone();
-        {
-            let mut observations = handle.observations.lock().map_err(|_| {
-                VibexError::process(
-                    "terminal_observation_lock_failed",
-                    "the terminal observation set is unavailable",
-                )
-            })?;
-            observations.watch(
-                terminal_id.clone(),
-                session_id,
-                agent_id.clone(),
-                rows,
-                cols,
-            );
-        }
-        let observations = Arc::clone(&handle.observations);
-        let watched = terminal_id.clone();
-        handle.manager().set_output_tap(
+        let session_id = session_id.into();
+        session_terminal::watch_session_terminal(
+            &handle.manager(),
+            &handle.observations,
             terminal_id,
-            Arc::new(move |_, bytes: &[u8]| {
-                // PTY reader thread: enqueue and return. A poisoned lock means
-                // the runtime is shutting down, and losing a read is preferable
-                // to stalling the Agent.
-                if let Ok(mut observations) = observations.lock() {
-                    observations.observe(&watched, bytes, unix_timestamp_ms());
-                }
-            }),
+            &session_id,
+            agent_id,
+            rows,
+            cols,
         );
         Ok(())
     }
@@ -4738,24 +4725,46 @@ impl DesktopRuntime {
             {
                 continue;
             }
+            // Credentials are re-resolved from the Profile rather than read
+            // back: the link row stores which Profile was used, never what it
+            // resolved to.
+            let env = match record.provider_profile_id.as_ref() {
+                Some(profile_id) => match self
+                    .agent
+                    .manager()
+                    .terminal_session_env_overlays(profile_id, &session)
+                {
+                    Ok(env) => env,
+                    Err(error) => {
+                        tracing::warn!(
+                            target: "vibex_desktop",
+                            error_code = %error.code,
+                            "terminal session profile could not be re-resolved"
+                        );
+                        Vec::new()
+                    }
+                },
+                None => Vec::new(),
+            };
             let spec = vibex_core::TerminalSessionLaunchSpec {
                 workspace_id: record.workspace_id.clone(),
                 workspace_root: session.workspace_root.clone(),
                 argv: record.argv.clone(),
-                env: Vec::new(),
+                env,
                 title: session.title.clone(),
                 rows: 24,
                 cols: 100,
             };
             match launcher.restore(&spec, &record.terminal_id) {
                 Ok(Some(handle)) => {
-                    vibex_db::SessionTerminalRepository::upsert(
+                    vibex_db::SessionTerminalRepository::upsert_with_profile(
                         &connection,
                         &session.id,
                         &handle.terminal_id,
                         &record.workspace_id,
                         &record.argv,
                         &session.workspace_root,
+                        record.provider_profile_id.as_ref(),
                     )?;
                     let _ = self.watch_session_terminal(
                         &handle.terminal_id,

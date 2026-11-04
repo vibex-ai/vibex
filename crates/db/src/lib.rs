@@ -27520,6 +27520,7 @@ fn apply_session_transport(conn: &mut Connection, applied: &mut Vec<String>) -> 
             activity_confirmations INTEGER NOT NULL DEFAULT 0,
             cli_title TEXT NULL,
             cli_cwd TEXT NULL,
+            provider_profile_id TEXT NULL,
             native_session_id TEXT NULL,
             waiting_since_ms INTEGER NULL,
             completed_at_ms INTEGER NULL,
@@ -27534,6 +27535,28 @@ fn apply_session_transport(conn: &mut Connection, applied: &mut Vec<String>) -> 
         "migration_apply_failed",
         "failed to create the session terminal table",
     ))?;
+    // A database that already has the table from an earlier build of this
+    // migration needs the column added rather than the table created.
+    let profile_present: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('session_terminals') WHERE name = 'provider_profile_id'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(storage_err(
+            "migration_apply_failed",
+            "failed to inspect session terminal columns",
+        ))?;
+    if profile_present == 0 {
+        conn.execute(
+            "ALTER TABLE session_terminals ADD COLUMN provider_profile_id TEXT NULL",
+            [],
+        )
+        .map_err(storage_err(
+            "migration_apply_failed",
+            "failed to add the session terminal provider profile",
+        ))?;
+    }
     conn.execute(
         "INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
         params![VERSION, NAME, unix_timestamp_ms()],
@@ -27571,6 +27594,9 @@ pub struct SessionTerminalRecord {
     pub workspace_id: WorkspaceId,
     pub argv: Vec<String>,
     pub cwd: String,
+    /// The Provider Profile the Agent was launched with, so a restart can
+    /// re-resolve its credentials instead of persisting them.
+    pub provider_profile_id: Option<ProviderProfileId>,
     pub facts: vibex_core::TerminalSessionFacts,
 }
 
@@ -27583,19 +27609,38 @@ impl SessionTerminalRepository {
         argv: &[String],
         cwd: &str,
     ) -> VibexResult<()> {
+        Self::upsert_with_profile(conn, session_id, terminal_id, workspace_id, argv, cwd, None)
+    }
+
+    /// Records the link together with the Provider Profile it was launched
+    /// with.
+    ///
+    /// The profile id is what lets a restart re-resolve credentials: persisting
+    /// the resolved environment instead would put secrets in the database.
+    #[allow(clippy::too_many_arguments)]
+    pub fn upsert_with_profile(
+        conn: &Connection,
+        session_id: &VibexSessionId,
+        terminal_id: &TerminalId,
+        workspace_id: &WorkspaceId,
+        argv: &[String],
+        cwd: &str,
+        provider_profile_id: Option<&ProviderProfileId>,
+    ) -> VibexResult<()> {
         let now = unix_timestamp_ms();
         conn.execute(
             "
             INSERT INTO session_terminals (
                 session_id, terminal_id, workspace_id, argv_json, cwd,
-                activity_observed_at_ms, created_at_ms, updated_at_ms
+                provider_profile_id, activity_observed_at_ms, created_at_ms, updated_at_ms
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?6)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?7)
             ON CONFLICT(session_id) DO UPDATE SET
                 terminal_id = excluded.terminal_id,
                 workspace_id = excluded.workspace_id,
                 argv_json = excluded.argv_json,
                 cwd = excluded.cwd,
+                provider_profile_id = excluded.provider_profile_id,
                 updated_at_ms = excluded.updated_at_ms
             ",
             params![
@@ -27604,6 +27649,7 @@ impl SessionTerminalRepository {
                 workspace_id.as_str(),
                 json_to_db(&argv)?,
                 cwd,
+                provider_profile_id.map(ProviderProfileId::as_str),
                 now,
             ],
         )
@@ -27620,7 +27666,7 @@ impl SessionTerminalRepository {
             .prepare(
                 "
                 SELECT session_id, terminal_id, workspace_id, argv_json, cwd,
-                    activity, activity_source, activity_observed_at_ms,
+                    provider_profile_id, activity, activity_source, activity_observed_at_ms,
                     activity_confirmations, cli_title, cli_cwd, native_session_id,
                     waiting_since_ms, completed_at_ms
                 FROM session_terminals
@@ -27655,7 +27701,7 @@ impl SessionTerminalRepository {
         conn.query_row(
             "
             SELECT session_id, terminal_id, workspace_id, argv_json, cwd,
-                activity, activity_source, activity_observed_at_ms,
+                provider_profile_id, activity, activity_source, activity_observed_at_ms,
                 activity_confirmations, cli_title, cli_cwd, native_session_id,
                 waiting_since_ms, completed_at_ms
             FROM session_terminals
@@ -27686,7 +27732,7 @@ impl SessionTerminalRepository {
             .prepare(
                 "
                 SELECT session_id, terminal_id, workspace_id, argv_json, cwd,
-                    activity, activity_source, activity_observed_at_ms,
+                    provider_profile_id, activity, activity_source, activity_observed_at_ms,
                     activity_confirmations, cli_title, cli_cwd, native_session_id,
                     waiting_since_ms, completed_at_ms
                 FROM session_terminals
@@ -27807,17 +27853,28 @@ fn map_session_terminal(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionTerm
         workspace_id: parse_id_sql(row.get(2)?, WorkspaceId::parse)?,
         argv: json_from_db_sql(row.get(3)?)?,
         cwd: row.get(4)?,
+        provider_profile_id: row
+            .get::<_, Option<String>>(5)?
+            .map(|value| parse_id(value, ProviderProfileId::parse))
+            .transpose()
+            .map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    5,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?,
         facts: vibex_core::TerminalSessionFacts {
             terminal_id: Some(parse_id_sql(row.get(1)?, TerminalId::parse)?),
-            activity: enum_from_db_sql(row.get(5)?)?,
-            source: enum_from_db_sql(row.get(6)?)?,
-            observed_at_ms: row.get(7)?,
-            confirmations: row.get(8)?,
-            cli_title: row.get(9)?,
-            cli_cwd: row.get(10)?,
-            native_session_id: row.get(11)?,
-            waiting_since_ms: row.get(12)?,
-            completed_at_ms: row.get(13)?,
+            activity: enum_from_db_sql(row.get(6)?)?,
+            source: enum_from_db_sql(row.get(7)?)?,
+            observed_at_ms: row.get(8)?,
+            confirmations: row.get(9)?,
+            cli_title: row.get(10)?,
+            cli_cwd: row.get(11)?,
+            native_session_id: row.get(12)?,
+            waiting_since_ms: row.get(13)?,
+            completed_at_ms: row.get(14)?,
         },
     })
 }

@@ -13,7 +13,7 @@
 use std::path::PathBuf;
 
 use vibex_core::{
-    TerminalId, TerminalSessionHandle, TerminalSessionLaunchSpec, VibexError, VibexResult,
+    AgentId, TerminalId, TerminalSessionHandle, TerminalSessionLaunchSpec, VibexError, VibexResult,
     WorkspaceId,
 };
 
@@ -34,6 +34,25 @@ pub trait SessionTerminalLauncher: Send + Sync + 'static {
 
     /// Whether the PTY is still running.
     fn is_running(&self, terminal_id: &TerminalId) -> bool;
+
+    /// Starts observing a session's terminal.
+    ///
+    /// Called after the link row is committed, so the observer can attribute
+    /// bytes to a session. The default is a no-op: a launcher that owns no
+    /// observation surface still satisfies the contract, it just never reports
+    /// activity.
+    fn watch_session(
+        &self,
+        _terminal_id: &TerminalId,
+        _session_id: &str,
+        _agent_id: &AgentId,
+        _rows: u16,
+        _cols: u16,
+    ) {
+    }
+
+    /// Stops observing, after a session's terminal is gone.
+    fn unwatch_session(&self, _terminal_id: &TerminalId) {}
 
     /// Rebuilds a PTY whose process is gone, keeping the recorded argv.
     ///
@@ -57,11 +76,20 @@ pub trait SessionTerminalLauncher: Send + Sync + 'static {
 pub struct RecordingTerminalLauncher {
     launches: std::sync::Mutex<Vec<TerminalSessionLaunchSpec>>,
     running: std::sync::Mutex<std::collections::HashSet<TerminalId>>,
+    /// Sessions this launcher was asked to observe, in call order.
+    watched: std::sync::Mutex<Vec<(TerminalId, String)>>,
 }
 
 impl RecordingTerminalLauncher {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn watched(&self) -> Vec<(TerminalId, String)> {
+        self.watched
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     pub fn launches(&self) -> Vec<TerminalSessionLaunchSpec> {
@@ -98,6 +126,20 @@ impl SessionTerminalLauncher for RecordingTerminalLauncher {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(terminal_id);
         Ok(())
+    }
+
+    fn watch_session(
+        &self,
+        terminal_id: &TerminalId,
+        session_id: &str,
+        _agent_id: &AgentId,
+        _rows: u16,
+        _cols: u16,
+    ) {
+        self.watched
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push((terminal_id.clone(), session_id.to_string()));
     }
 
     fn is_running(&self, terminal_id: &TerminalId) -> bool {

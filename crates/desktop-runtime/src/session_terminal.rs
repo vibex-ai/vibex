@@ -24,16 +24,36 @@ use vibex_terminal::{TerminalCommandRequest, TerminalManager};
 #[derive(Clone)]
 pub struct TerminalManagerSessionLauncher {
     manager: TerminalManager,
+    /// The observation set the runtime also reads for its periodic sweep.
+    ///
+    /// Shared rather than created here because the sweep and the byte tap must
+    /// agree on which terminals are watched; two sets would publish from one and
+    /// sweep the other.
+    observations:
+        std::sync::Arc<std::sync::Mutex<crate::terminal_observation::TerminalObservations>>,
 }
 
 impl TerminalManagerSessionLauncher {
-    pub fn new(manager: TerminalManager) -> Arc<Self> {
-        Arc::new(Self { manager })
+    pub fn new(
+        manager: TerminalManager,
+        observations: std::sync::Arc<
+            std::sync::Mutex<crate::terminal_observation::TerminalObservations>,
+        >,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            manager,
+            observations,
+        })
     }
 
     /// The same launcher behind the trait the Agent manager installs.
-    pub fn shared(manager: TerminalManager) -> Arc<dyn SessionTerminalLauncher> {
-        Self::new(manager)
+    pub fn shared(
+        manager: TerminalManager,
+        observations: std::sync::Arc<
+            std::sync::Mutex<crate::terminal_observation::TerminalObservations>,
+        >,
+    ) -> Arc<dyn SessionTerminalLauncher> {
+        Self::new(manager, observations)
     }
 
     fn request(spec: &TerminalSessionLaunchSpec) -> VibexResult<TerminalCommandRequest> {
@@ -62,6 +82,46 @@ impl TerminalManagerSessionLauncher {
     }
 }
 
+/// Registers a session's terminal for observation.
+///
+/// The tap runs on the PTY reader thread and only enqueues bytes; the emulator
+/// and the rules are read by the runtime's sweep. Kept as one function so the
+/// launcher and the runtime's own `watch_session_terminal` cannot drift.
+pub fn watch_session_terminal(
+    manager: &TerminalManager,
+    observations: &std::sync::Arc<
+        std::sync::Mutex<crate::terminal_observation::TerminalObservations>,
+    >,
+    terminal_id: &TerminalId,
+    session_id: &str,
+    agent_id: &vibex_core::AgentId,
+    rows: u16,
+    cols: u16,
+) {
+    {
+        let Ok(mut observations) = observations.lock() else {
+            return;
+        };
+        observations.watch(
+            terminal_id.clone(),
+            session_id,
+            agent_id.clone(),
+            rows,
+            cols,
+        );
+    }
+    let observations = std::sync::Arc::clone(observations);
+    let watched = terminal_id.clone();
+    manager.set_output_tap(
+        terminal_id,
+        std::sync::Arc::new(move |_, bytes: &[u8]| {
+            if let Ok(mut observations) = observations.lock() {
+                observations.observe(&watched, bytes, vibex_core::unix_timestamp_ms());
+            }
+        }),
+    );
+}
+
 impl SessionTerminalLauncher for TerminalManagerSessionLauncher {
     fn launch(&self, spec: &TerminalSessionLaunchSpec) -> VibexResult<TerminalSessionHandle> {
         let root = PathBuf::from(&spec.workspace_root);
@@ -78,6 +138,32 @@ impl SessionTerminalLauncher for TerminalManagerSessionLauncher {
             Ok(_) => Ok(()),
             Err(error) if error.code == "terminal_not_found" => Ok(()),
             Err(error) => Err(error),
+        }
+    }
+
+    fn watch_session(
+        &self,
+        terminal_id: &TerminalId,
+        session_id: &str,
+        agent_id: &vibex_core::AgentId,
+        rows: u16,
+        cols: u16,
+    ) {
+        watch_session_terminal(
+            &self.manager,
+            &self.observations,
+            terminal_id,
+            session_id,
+            agent_id,
+            rows,
+            cols,
+        );
+    }
+
+    fn unwatch_session(&self, terminal_id: &TerminalId) {
+        self.manager.clear_output_tap(terminal_id);
+        if let Ok(mut observations) = self.observations.lock() {
+            observations.unwatch(terminal_id);
         }
     }
 
@@ -127,6 +213,9 @@ mod tests {
     fn a_launch_spec_needs_an_executable() {
         let launcher = TerminalManagerSessionLauncher {
             manager: TerminalManager::new(),
+            observations: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::terminal_observation::TerminalObservations::new(),
+            )),
         };
         let spec = TerminalSessionLaunchSpec {
             workspace_id: vibex_core::WorkspaceId::new(),

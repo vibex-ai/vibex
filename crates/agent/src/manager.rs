@@ -1392,13 +1392,14 @@ impl AgentManager {
                 return Err(error.with_diagnostic("sessionId", session.id.as_str().to_string()));
             }
         };
-        SessionTerminalRepository::upsert(
+        SessionTerminalRepository::upsert_with_profile(
             &conn,
             &session.id,
             &handle.terminal_id,
             &spec.workspace_id,
             &spec.argv,
             &spec.workspace_root,
+            request.provider_profile_id.as_ref(),
         )?;
         let created = SessionRepository::get(&conn, &session.id)?.ok_or_else(|| {
             VibexError::storage(
@@ -1406,6 +1407,16 @@ impl AgentManager {
                 "the terminal session could not be reloaded",
             )
         })?;
+        // Observation starts only after the link row is committed: the observer
+        // attributes bytes to a session, and a session whose row does not exist
+        // yet has nothing to attribute them to.
+        launcher.watch_session(
+            &handle.terminal_id,
+            created.id.as_str(),
+            &created.agent_id,
+            spec.rows,
+            spec.cols,
+        );
         self.publish_root_session_update(&conn, created.clone());
         Ok(created)
     }
@@ -1425,9 +1436,21 @@ impl AgentManager {
         request: &CreateTerminalSessionRequest,
         session: &AgentSession,
     ) -> VibexResult<Vec<(String, String)>> {
-        let Some(profile_id) = request.provider_profile_id.as_ref() else {
-            return Ok(Vec::new());
-        };
+        match request.provider_profile_id.as_ref() {
+            Some(profile_id) => self.terminal_session_env_overlays(profile_id, session),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// The environment overlays a Profile-backed terminal Agent inherits.
+    ///
+    /// Exposed so a restart can rebuild them from the recorded Profile id
+    /// instead of persisting resolved credentials.
+    pub fn terminal_session_env_overlays(
+        &self,
+        profile_id: &ProviderProfileId,
+        session: &AgentSession,
+    ) -> VibexResult<Vec<(String, String)>> {
         let conn = self.open_migrated()?;
         let profile = ProviderProfileRepository::get(&conn, profile_id)?.ok_or_else(|| {
             VibexError::validation(
@@ -5255,6 +5278,7 @@ impl AgentManager {
             return;
         };
         for terminal_id in terminal_ids {
+            launcher.unwatch_session(terminal_id);
             if let Err(error) = launcher.kill(terminal_id) {
                 // Best effort: a process that survives its kill must not keep
                 // the deleted row alive. The metric is how an operator notices.
@@ -12723,6 +12747,56 @@ mod tests {
         assert_eq!(
             sessions[0].transport,
             vibex_core::SessionTransport::Terminal
+        );
+    }
+
+    /// Creating a terminal session registers it for observation.
+    ///
+    /// The sidebar cannot report activity it never watches, and the registration
+    /// has to happen after the link row commits so the observer has a session to
+    /// attribute bytes to.
+    #[tokio::test]
+    async fn creating_a_terminal_session_starts_observing_it() {
+        let (manager, launcher, dir) = terminal_manager();
+        let session = manager
+            .create_terminal_session(terminal_request("claude", &dir))
+            .await
+            .unwrap();
+        let watched = launcher.watched();
+        assert_eq!(watched.len(), 1, "the new session must be watched");
+        assert_eq!(watched[0].1, session.id.as_str());
+
+        // Deleting it stops the observation as well as the process.
+        manager.delete_session(&session.id).await.unwrap();
+        assert!(!launcher.is_running(&watched[0].0));
+    }
+
+    /// A terminal session records which Profile it ran with, and never the
+    /// credentials that Profile resolved to.
+    #[tokio::test]
+    async fn a_terminal_session_records_its_provider_profile_not_its_secrets() {
+        let (manager, _, dir) = terminal_manager();
+        let session = manager
+            .create_terminal_session(terminal_request("claude", &dir))
+            .await
+            .unwrap();
+        let conn = open_database(&dir.join("vibex.db")).unwrap();
+        let record = vibex_db::SessionTerminalRepository::get(&conn, &session.id)
+            .unwrap()
+            .unwrap();
+        // The request named no Profile, so the link says so rather than
+        // guessing one.
+        assert_eq!(record.provider_profile_id, None);
+        let stored: String = conn
+            .query_row(
+                "SELECT argv_json FROM session_terminals WHERE session_id = ?1",
+                rusqlite::params![session.id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            !stored.contains("API_KEY") && !stored.contains("TOKEN"),
+            "the recorded argv must not carry credential material: {stored}"
         );
     }
 
