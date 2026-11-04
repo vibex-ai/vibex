@@ -1419,6 +1419,15 @@ pub struct ManagementCenter {
     /// Providers the user starred, persisted beside the other desktop UI state.
     provider_favorites: BTreeSet<String>,
     provider_favorites_path: Option<PathBuf>,
+    /// Templates the user removed from the preset library, keyed by the saved
+    /// Provider they were built from.
+    ///
+    /// A template is a projection of a saved Provider, so "delete this
+    /// template" has nothing of its own to delete. The answer is remembered
+    /// here, which keeps the Provider record intact and makes the removal
+    /// stick across restarts.
+    dismissed_user_presets: BTreeSet<String>,
+    dismissed_user_presets_path: Option<PathBuf>,
     /// Which half of the Providers page the left column is showing.
     ///
     /// Providers and route groups are two kinds of record the same page owns,
@@ -3204,6 +3213,8 @@ impl ManagementCenter {
             provider_sort: ProviderSort::Name,
             provider_favorites: BTreeSet::new(),
             provider_favorites_path: None,
+            dismissed_user_presets: BTreeSet::new(),
+            dismissed_user_presets_path: None,
             providers_sidebar_tab: ProviderSidebarTab::Providers,
             selected_global_route_id: None,
             profile_editor_open: false,
@@ -5849,6 +5860,7 @@ impl ManagementCenter {
         self.agent_model_source_defaults = snapshot.agent_model_source_defaults;
         self.catalog_status = snapshot.catalog_status;
         self.ensure_provider_favorites_loaded();
+        self.ensure_dismissed_user_presets_loaded();
         self.provider_profiles = snapshot.provider_profiles;
         self.provider_display_order = snapshot.provider_display_order;
         self.provider_display_order_drag_state = None;
@@ -14872,20 +14884,25 @@ impl ManagementCenter {
         cx.notify();
     }
 
-    /// Fills the page draft from one built-in preset.
+    /// Fills the page draft from one preset.
     ///
     /// Only the starting values move: the name, the default protocol's
     /// address, its model ids, the headers its gateway requires, and the
     /// catalogue id the record keeps as advisory metadata. A preset declares
     /// no default model and no key, so those are cleared rather than inherited
     /// from the previous choice.
+    ///
+    /// A user-defined template is applied the same way, with one difference:
+    /// it carries the saved record's own model list instead of naming a
+    /// catalogue entry, because no catalogue entry describes a hand-made
+    /// relay. Neither kind carries a Key.
     fn apply_provider_create_preset(
         &mut self,
         preset_id: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(preset) = vibex_core::provider_preset(preset_id) else {
+        let Some(preset) = self.provider_preset_by_id(preset_id) else {
             return;
         };
         self.provider_create_preset = Some(preset.clone());
@@ -14896,11 +14913,12 @@ impl ManagementCenter {
         self.provider_form
             .catalog_id
             .update(cx, |state, cx| state.set_value(catalog_id, window, cx));
-        self.provider_form.category = Some(
-            provider_preset_category(&preset)
-                .metadata_value()
-                .to_string(),
-        );
+        // A template keeps the kind its record declared rather than deriving a
+        // kind from the address: a self-hosted relay on a LAN address is a
+        // relay, and the form's own choice should not be re-guessed. The
+        // library heading a template sits under is not a record kind, so it
+        // never reaches this field.
+        self.provider_form.category = Some(self.provider_preset_record_kind(&preset));
         self.provider_form.name.update(cx, |state, cx| {
             state.set_value(preset.display_name.clone(), window, cx)
         });
@@ -14908,14 +14926,26 @@ impl ManagementCenter {
         self.provider_form
             .website_url
             .update(cx, |state, cx| state.set_value(website, window, cx));
-        // The model ids are the catalogue's answer, not the preset's: it names
-        // the entry, and the read below fills the list, so a vendor's new model
-        // appears without a release. The field starts empty rather than keeping
-        // the previous preset's ids.
+        // A template carries its record's ids; a shipped preset names only the
+        // catalogue entry, and the read below fills the list, so a vendor's new
+        // model appears without a release. Either way the field starts from
+        // this preset rather than keeping the previous choice's ids.
+        let models = preset.models.join(", ");
         self.provider_form
             .models
-            .update(cx, |state, cx| state.set_value("", window, cx));
-        self.request_provider_create_catalog_models(&preset, window, cx);
+            .update(cx, |state, cx| state.set_value(models, window, cx));
+        // A template inherits its record's catalogue id, but its own list is
+        // what the reader configured — asking the catalogue here would replace
+        // that list with the entry's ids, which is exactly the hand-tuned
+        // selection the template exists to preserve.
+        if preset.is_user_defined() {
+            // A catalogue answer about the previous choice must not land on
+            // this draft either.
+            self.provider_preset_models_target = None;
+            self.provider_preset_models_task = None;
+        } else {
+            self.request_provider_create_catalog_models(&preset, window, cx);
+        }
         // The header editor speaks the same override shape the record stores,
         // so a preset's rows can be written before the Provider exists. A
         // preset without headers leaves the empty object the draft starts on,
@@ -14927,12 +14957,35 @@ impl ManagementCenter {
             .headers
             .update(cx, |state, cx| state.set_value(headers, window, cx));
         self.provider_form.headers_open = !preset.headers.is_empty();
-        for input in [
-            &self.provider_form.default_model,
-            &self.provider_form.models_url,
-            &self.provider_form.auth_url,
-        ] {
+        // A template names a default model and the endpoints the saved record
+        // used; a shipped preset names neither and leaves them empty.
+        let default_model = preset.models.first().cloned().unwrap_or_default();
+        self.provider_form
+            .default_model
+            .update(cx, |state, cx| state.set_value(default_model, window, cx));
+        let saved_source = self.user_defined_preset_source(&preset).cloned();
+        for input in [&self.provider_form.models_url, &self.provider_form.auth_url] {
             input.update(cx, |state, cx| state.set_value("", window, cx));
+        }
+        if let Some(profile) = saved_source {
+            for (input, kind) in [
+                (
+                    &self.provider_form.models_url,
+                    vibex_core::ModelProviderEndpointKind::ModelCatalog,
+                ),
+                (
+                    &self.provider_form.auth_url,
+                    vibex_core::ModelProviderEndpointKind::Auth,
+                ),
+            ] {
+                let url = profile
+                    .endpoints
+                    .iter()
+                    .find(|endpoint| endpoint.kind == kind)
+                    .map(|endpoint| endpoint.url.clone())
+                    .unwrap_or_default();
+                input.update(cx, |state, cx| state.set_value(url, window, cx));
+            }
         }
         self.apply_provider_create_preset_region(None, window, cx);
         // The preset writes the address the fetch would ask; a timer left over
@@ -15364,12 +15417,17 @@ impl ManagementCenter {
             .trim()
             .to_string();
         let metadata = self.provider_form_metadata(cx);
+        // A shipped preset's id is the vendor slug the projection and the
+        // catalogue key off. A user-defined template's id is prefixed and names
+        // no vendor, so the record keeps no hint rather than inventing one.
+        let vendor_hint = self
+            .provider_create_preset
+            .as_ref()
+            .filter(|preset| !preset.is_user_defined())
+            .map(|preset| preset.id.clone());
         let request = vibex_core::ModelProviderProfileCreateRequest {
             display_name: name,
-            vendor_hint: self
-                .provider_create_preset
-                .as_ref()
-                .map(|preset| preset.id.clone()),
+            vendor_hint,
             endpoints,
             proxy_policy,
             credentials: Vec::new(),
@@ -16302,6 +16360,132 @@ impl ManagementCenter {
             self.provider_favorites.insert(profile_id);
         }
         self.save_provider_favorites();
+        cx.notify();
+    }
+
+    /// Reads the templates the user removed from the preset library.
+    fn ensure_dismissed_user_presets_loaded(&mut self) {
+        let Some(runtime) = self.runtime.as_ref() else {
+            return;
+        };
+        if self.dismissed_user_presets_path.is_none() {
+            let path = runtime
+                .config()
+                .home_dir
+                .join("management-provider-preset-dismissals.json");
+            if let Ok(bytes) = std::fs::read(&path)
+                && let Ok(ids) = serde_json::from_slice::<Vec<String>>(&bytes)
+            {
+                self.dismissed_user_presets = ids.into_iter().collect();
+            }
+            self.dismissed_user_presets_path = Some(path);
+        }
+    }
+
+    fn save_dismissed_user_presets(&self) {
+        let Some(path) = self.dismissed_user_presets_path.as_ref() else {
+            return;
+        };
+        if let Ok(bytes) = serde_json::to_vec_pretty(
+            &self
+                .dismissed_user_presets
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>(),
+        ) {
+            let _ = std::fs::write(path, bytes);
+        }
+    }
+
+    /// Removes a user-defined template from the library.
+    ///
+    /// The saved Provider is deliberately left alone: the template is a copy of
+    /// it, and a reader who deletes the copy almost never means "delete the
+    /// Provider every Agent here uses". The dismissal is remembered by the
+    /// record's id, so the template can be brought back by restoring the same
+    /// Provider — or by clearing the dismissal — without touching any record.
+    fn dismiss_user_preset(&mut self, preset: &vibex_core::ProviderPreset, cx: &mut Context<Self>) {
+        let Some(source_id) = preset.source_provider_id.clone() else {
+            return;
+        };
+        self.dismissed_user_presets.insert(source_id.clone());
+        self.save_dismissed_user_presets();
+        // A form already filled from the removed template keeps its values; only
+        // the library row goes away, which is what the reader asked for.
+        self.notice = Some(match locale::current_locale() {
+            ResolvedLocale::En => format!("Removed the {} template", preset.display_name),
+            ResolvedLocale::ZhCn => format!("已移除“{}”模板", preset.display_name),
+            ResolvedLocale::ZhTw => format!("已移除「{}」範本", preset.display_name),
+        });
+        cx.notify();
+    }
+
+    /// The confirmation in front of a template removal.
+    ///
+    /// It names the saved Provider, because that is the record the reader might
+    /// expect to lose — and the sentence says it stays.
+    fn confirm_dismiss_user_preset(
+        &mut self,
+        preset: vibex_core::ProviderPreset,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let entity = cx.weak_entity();
+        let active_locale = locale::current_locale();
+        let title = match active_locale {
+            ResolvedLocale::En => format!("Remove the {} template?", preset.display_name),
+            ResolvedLocale::ZhCn => format!("移除“{}”模板？", preset.display_name),
+            ResolvedLocale::ZhTw => format!("移除「{}」範本？", preset.display_name),
+        };
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let entity = entity.clone();
+            let preset = preset.clone();
+            alert
+                .title(title.clone())
+                .description(management_locale_text_for(
+                    active_locale,
+                    "The template stops appearing in the preset list. The Provider it was built from keeps working, with its Key and its models.",
+                    "该模板不再出现在预设列表中。生成它的供应商不受影响，Key 和模型都保留。",
+                    "該範本不再出現在預設清單中。產生它的供應商不受影響，Key 和模型都保留。",
+                ))
+                .confirm()
+                .ok_text(management_delete_profile_label())
+                .cancel_text(management_locale_text_for(
+                    active_locale,
+                    "Cancel",
+                    "取消",
+                    "取消",
+                ))
+                .ok_variant(ButtonVariant::Danger)
+                .on_ok(move |_, _, cx| {
+                    let _ = entity.update(cx, |this, cx| {
+                        this.dismiss_user_preset(&preset, cx)
+                    });
+                    true
+                })
+        });
+    }
+
+    /// Brings back every template the user removed.
+    ///
+    /// This is the way out of a dismissal, and it is a page-level command
+    /// rather than a per-record one: the dismissed record's row is gone from
+    /// the library, so the only place left to offer the undo is where the
+    /// library itself is drawn.
+    fn restore_dismissed_user_presets(&mut self, cx: &mut Context<Self>) {
+        if self.dismissed_user_presets.is_empty() {
+            return;
+        }
+        self.dismissed_user_presets.clear();
+        self.save_dismissed_user_presets();
+        self.notice = Some(
+            management_locale_text(
+                "Removed templates are back",
+                "已恢复被移除的模板",
+                "已恢復被移除的範本",
+            )
+            .to_string(),
+        );
         cx.notify();
     }
 
@@ -24332,12 +24516,82 @@ impl ManagementCenter {
         available
     }
 
+    /// Every preset the library can offer: the table that ships with the
+    /// binary, then one user-defined template per saved Provider.
+    ///
+    /// A template is a projection of a record, not a second record: it is
+    /// rebuilt from the saved Providers on every read, so editing or deleting
+    /// the Provider shows up here without a migration.
+    fn provider_library_presets(&self) -> Vec<vibex_core::ProviderPreset> {
+        let mut presets = vibex_core::provider_presets();
+        let saved = self
+            .providers
+            .iter()
+            .filter(|profile| !profile.metadata.only_through_route_groups)
+            .filter(|profile| !self.dismissed_user_presets.contains(profile.id.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        presets.extend(vibex_core::user_provider_presets(&saved));
+        presets
+    }
+
+    /// One preset of either kind, by the id it advertises.
+    ///
+    /// A user-defined template is resolved against the saved Providers rather
+    /// than the shipped table: its id never names a built-in preset, so the two
+    /// lookups cannot disagree about which record a form came from.
+    fn provider_preset_by_id(&self, preset_id: &str) -> Option<vibex_core::ProviderPreset> {
+        let saved = self.providers.to_vec();
+        vibex_core::user_provider_preset_for(&saved, preset_id)
+            .or_else(|| vibex_core::provider_preset(preset_id))
+    }
+
+    /// The saved Provider a user-defined template was built from.
+    fn user_defined_preset_source(
+        &self,
+        preset: &vibex_core::ProviderPreset,
+    ) -> Option<&vibex_core::ModelProviderProfile> {
+        let source_id = preset.source_provider_id.as_deref()?;
+        self.providers
+            .iter()
+            .find(|profile| profile.id.as_str() == source_id)
+    }
+
+    /// The record kind a preset describes, before the library heading is
+    /// decided.
+    ///
+    /// The two are different questions. A template always sits under
+    /// "User-defined", but the form's Kind field still asks what the record is —
+    /// a vendor, a relay, or a local server — and a template of a relay must
+    /// open on "Relay", not on the library's own heading.
+    fn provider_preset_record_kind(&self, preset: &vibex_core::ProviderPreset) -> String {
+        if preset.is_user_defined() {
+            if let Some(declared) = preset.category.clone()
+                && ProviderPresetCategory::ALL
+                    .iter()
+                    .filter(|known| **known != ProviderPresetCategory::UserDefined)
+                    .any(|known| known.metadata_value() == declared)
+            {
+                return declared;
+            }
+            // A record saved before the Kind field existed has no declaration.
+            // Its address is the only evidence left, and the library's own
+            // classifier already reads that.
+            return provider_preset_category(preset)
+                .metadata_value()
+                .to_string();
+        }
+        provider_preset_category(preset)
+            .metadata_value()
+            .to_string()
+    }
+
     /// The preset library under its kind headings, in the order it draws them.
     fn provider_picker_preset_sections(
         &self,
         query: &str,
     ) -> Vec<(ProviderPresetCategory, Vec<vibex_core::ProviderPreset>)> {
-        let matching = provider_preset_tiles(vibex_core::provider_presets(), query);
+        let matching = provider_preset_tiles(self.provider_library_presets(), query);
         ProviderPresetCategory::ALL
             .into_iter()
             .filter_map(|category| {
@@ -24887,12 +25141,19 @@ impl ManagementCenter {
                 .providers
                 .iter()
                 .filter(|profile| self.provider_picker_provider_in_use(profile))
-                .filter_map(|profile| {
-                    profile
-                        .metadata
-                        .catalog_id
-                        .clone()
-                        .or_else(|| profile.vendor_hint.clone())
+                .flat_map(|profile| {
+                    // Three answers name the same saved record: the catalogue
+                    // entry a shipped preset shares, the vendor hint a preset id
+                    // matches, and the record's own id a user-defined template
+                    // is built from. A template's id is prefixed, so it is the
+                    // record id that marks it as already added.
+                    [
+                        profile.metadata.catalog_id.clone(),
+                        profile.vendor_hint.clone(),
+                        Some(profile.id.as_str().to_string()),
+                    ]
+                    .into_iter()
+                    .flatten()
                 })
                 .collect::<BTreeSet<String>>();
             let mut sections = v_flex().w_full().min_w_0().gap_1();
@@ -25474,19 +25735,24 @@ impl ManagementCenter {
         .or_else(|| preset.default_wire_api())
     }
 
-    /// Fills the draft from a built-in preset.
+    /// Fills the draft from a preset.
     ///
     /// The protocol is written explicitly into `provider_options["wireApi"]`
     /// rather than left to be inferred. The editor otherwise falls back to
     /// "the first protocol that has a URL", which silently re-labels an
     /// Anthropic preset as Chat Completions the next time the dialog opens.
+    ///
+    /// A user-defined template fills the same fields from the saved record it
+    /// was built from, models included, and never touches the Key: the
+    /// template is a starting point for a *new* account, and the saved record's
+    /// credential stays with the saved record.
     fn apply_provider_preset(
         &mut self,
         preset_id: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(preset) = vibex_core::provider_preset(preset_id) else {
+        let Some(preset) = self.provider_preset_by_id(preset_id) else {
             return;
         };
         self.provider_preset_draft = Some(preset.clone());
@@ -25503,12 +25769,14 @@ impl ManagementCenter {
         }
         self.apply_preset_endpoints(&preset, window, cx);
         self.apply_preset_headers(&preset, window, cx);
-        // The model list is the catalogue's answer for the entry the preset
-        // names. The ids are declared entries, which is what a manual add
-        // produces too; the capabilities stay empty rather than being guessed
-        // from the id, and the catalogue offers them again when a row opens.
-        // The protocol follows the Agent, not the preset's own order, so the
-        // saved record and the binding agree.
+        // The model list is the catalogue's answer for the entry a shipped
+        // preset names. A user-defined template carries its own ids, because no
+        // catalogue entry describes a hand-made relay. Either way the ids are
+        // declared entries, which is what a manual add produces too; the
+        // capabilities stay empty rather than being guessed from the id, and
+        // the catalogue offers them again when a row opens. The protocol
+        // follows the Agent, not the preset's own order, so the saved record
+        // and the binding agree.
         let start_wire_api = self.preset_start_wire_api(&preset);
         // The draft starts with no rows and the catalogue read below fills
         // them, so the answer is the one the record is built from.
@@ -25516,7 +25784,29 @@ impl ManagementCenter {
         self.profile_available_models.clear();
         self.profile_model_selection = None;
         self.clear_profile_model_editor(window, cx);
-        self.request_profile_preset_catalog_models(preset.clone(), start_wire_api, window, cx);
+        if preset.models.is_empty() {
+            self.request_profile_preset_catalog_models(preset.clone(), start_wire_api, window, cx);
+        } else {
+            // A template's ids are already known, so the catalogue is not
+            // asked; the list it would answer with is a different vendor's.
+            self.provider_preset_models_target = None;
+            self.provider_preset_models_task = None;
+            self.profile_configured_models = preset
+                .models
+                .iter()
+                .map(|id| vibex_core::ProviderConfiguredModel {
+                    id: id.clone(),
+                    display_name: None,
+                    enabled: true,
+                    wire_api: start_wire_api,
+                    capabilities: Default::default(),
+                })
+                .collect();
+            self.profile_available_models = self.profile_configured_models.clone();
+            if let Some(first) = self.profile_configured_models.first() {
+                self.profile_model_selection = Some(first.id.clone());
+            }
+        }
         if let Some(hint) = preset.key_hint.as_deref() {
             // The hint is a placeholder, not a value: it tells the user what
             // the vendor's keys look like without typing anything.
@@ -37525,10 +37815,16 @@ enum ProviderPresetCategory {
     Vendor,
     Relay,
     Local,
+    /// Templates built from the user's own saved Providers.
+    ///
+    /// It sits last because it is the shortest list and the one a reader
+    /// arrives at after the library has answered "which vendor is this"; a
+    /// template is a copy of something the reader already made.
+    UserDefined,
 }
 
 impl ProviderPresetCategory {
-    const ALL: [Self; 3] = [Self::Vendor, Self::Relay, Self::Local];
+    const ALL: [Self; 4] = [Self::Vendor, Self::Relay, Self::Local, Self::UserDefined];
 
     /// The value this category stores in a Provider's metadata.
     fn metadata_value(self) -> &'static str {
@@ -37536,6 +37832,7 @@ impl ProviderPresetCategory {
             Self::Vendor => "vendor",
             Self::Relay => "relay",
             Self::Local => "local",
+            Self::UserDefined => "user",
         }
     }
 
@@ -37544,6 +37841,7 @@ impl ProviderPresetCategory {
             Self::Vendor => management_locale_text("Vendors", "供应商", "供應商"),
             Self::Relay => management_locale_text("Relays", "中转", "中轉"),
             Self::Local => management_locale_text("Local", "本机", "本機"),
+            Self::UserDefined => management_locale_text("User-defined", "用户自定义", "使用者自訂"),
         }
     }
 
@@ -37557,6 +37855,8 @@ impl ProviderPresetCategory {
             Self::Relay => "icons/vibex/git-branch.svg",
             // A local server is hardware in front of the reader.
             Self::Local => "icons/vibex/server.svg",
+            // A template is the reader's own record, not a published one.
+            Self::UserDefined => "icons/vibex/pencil.svg",
         }
     }
 }
@@ -40942,6 +41242,9 @@ fn provider_preset_matches(preset: &vibex_core::ProviderPreset, query: &str) -> 
     if let Some(plan_note) = preset.plan_note.as_deref() {
         haystacks.push(plan_note.to_lowercase());
     }
+    // A template is remembered by the Provider it copies, so its own models are
+    // search terms: "gpt-5" should find the box that offers it.
+    haystacks.extend(preset.models.iter().map(|model| model.to_lowercase()));
     haystacks.extend(preset.endpoints.values().map(|url| url.to_lowercase()));
     haystacks.iter().any(|haystack| haystack.contains(&query))
 }
@@ -40958,6 +41261,12 @@ fn provider_preset_host(url: &str) -> String {
 }
 
 fn provider_preset_category(preset: &vibex_core::ProviderPreset) -> ProviderPresetCategory {
+    // A template is the reader's own record, whatever that record's kind was:
+    // it sits under its own heading, so deleting it is the same gesture for
+    // every template and a vendor name can never hide one among the vendors.
+    if preset.is_user_defined() {
+        return ProviderPresetCategory::UserDefined;
+    }
     let local = preset.no_key
         || preset.id.contains("ollama")
         || preset.id.contains("lmstudio")
@@ -41081,7 +41390,11 @@ fn provider_source_rows(
             row = row.child(provider_source_tile(
                 preset,
                 pending,
-                added.contains(&preset.id),
+                added.contains(&preset.id)
+                    || preset
+                        .source_provider_id
+                        .as_ref()
+                        .is_some_and(|source| added.contains(source)),
                 selected,
                 selected.then(|| scroll_anchor.clone()).flatten(),
                 cx,
@@ -41111,6 +41424,7 @@ fn provider_source_tile(
     cx: &mut Context<ManagementCenter>,
 ) -> AnyElement {
     let preset_id = preset.id.clone();
+    let removable = preset.is_user_defined().then(|| preset.clone());
     // One source is one line: its mark, then its name. The row takes an equal
     // share of a line that holds a fixed number of columns, so every line of the
     // library is the same height and the same widths, and the name is the whole
@@ -41155,6 +41469,28 @@ fn provider_source_tile(
                     .text_color(cx.theme().primary),
             )
         })
+        // A template is the reader's own row and can be removed here; a shipped
+        // preset is the build's table and offers no delete control at all.
+        .children(removable.map(|removable| {
+            Button::new(SharedString::from(format!(
+                "management-provider-preset-delete-{}",
+                removable.id
+            )))
+            .xsmall()
+            .ghost()
+            .compact()
+            .icon(Icon::default().path("icons/vibex/trash-2.svg"))
+            .tooltip(management_locale_text(
+                "Remove this template",
+                "移除该模板",
+                "移除該範本",
+            ))
+            .disabled(pending)
+            .on_click(cx.listener(move |this, _, window, cx| {
+                cx.stop_propagation();
+                this.confirm_dismiss_user_preset(removable.clone(), window, cx);
+            }))
+        }))
         .into_any_element()
 }
 
@@ -41167,9 +41503,16 @@ fn provider_source_tile(
 fn provider_source_logo(preset: &vibex_core::ProviderPreset, size: Pixels, cx: &App) -> AnyElement {
     let profile = vibex_core::ModelProviderProfile {
         display_name: preset.display_name.clone(),
-        vendor_hint: Some(preset.id.clone()),
+        // A template's id is prefixed, so the vendor hint is the saved record's
+        // own vendor — otherwise the mark would look up `user:model_provider_…`
+        // and fall back to an initial the record already had a logo for.
+        vendor_hint: preset
+            .source_provider_id
+            .clone()
+            .or_else(|| Some(preset.id.clone())),
         metadata: vibex_core::ModelProviderMetadata {
             catalog_id: preset.catalog_id.clone(),
+            icon: preset.icon.clone(),
             ..Default::default()
         },
         ..Default::default()
@@ -51178,12 +51521,19 @@ mod gateway_surface_tests {
     /// Every preset lands in exactly one group, and the grouping says what the
     /// rows have in common: a vendor, a relay, or a local server.
     #[test]
-    fn the_source_step_has_three_categories_and_logo_tiles() {
+    fn the_source_step_has_four_categories_and_logo_tiles() {
         let source = include_str!("management.rs");
         assert_eq!(
             ProviderPresetCategory::ALL.map(|category| category.label()),
-            ["Vendors", "Relays", "Local"]
+            ["Vendors", "Relays", "Local", "User-defined"]
         );
+        // The user-defined kind sits last and is not a record kind the library
+        // can file a shipped preset under.
+        assert_eq!(
+            ProviderPresetCategory::ALL.last(),
+            Some(&ProviderPresetCategory::UserDefined)
+        );
+        assert_eq!(ProviderPresetCategory::UserDefined.metadata_value(), "user");
         let presets = vibex_core::provider_presets();
         let anthropic = presets
             .iter()
@@ -51259,14 +51609,23 @@ mod gateway_surface_tests {
             presets.len(),
             "every preset must belong to exactly one kind"
         );
-        assert!(counts.len() >= 3, "all three kinds ship presets");
+        assert!(counts.len() >= 3, "all three shipped kinds carry presets");
 
         // Each kind is named and given a mark: the heading is what keeps a long
-        // library readable, so none of the three may be blank.
+        // library readable, so none of them may be blank. The user-defined kind
+        // is the one a fresh install does not draw, because it has no saved
+        // Provider to build a template from yet.
         let mut icons = BTreeSet::new();
         for category in ProviderPresetCategory::ALL {
             assert!(!category.label().trim().is_empty());
             assert!(icons.insert(category.icon()), "each kind has its own mark");
+            if category == ProviderPresetCategory::UserDefined {
+                assert!(
+                    !counts.contains_key(&category),
+                    "a shipped preset is never filed under the user-defined kind"
+                );
+                continue;
+            }
             assert!(
                 counts.contains_key(&category),
                 "{} ships no preset",
@@ -51327,6 +51686,157 @@ mod gateway_surface_tests {
             nothing.is_empty(),
             "an unmatched term leaves no source to show"
         );
+    }
+
+    /// A saved Provider is offered as a user-defined template: it sits under
+    /// its own heading, it carries the record's models, and it never carries a
+    /// credential.
+    #[gpui::test]
+    fn saved_providers_become_user_defined_presets(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        // Dismissing a template announces it, and the announcement is a hint on
+        // the layer the window's Base Root owns.
+        cx.update(hint_layer::init);
+        let mut built = None;
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            let center = cx.new(|cx| ManagementCenter::new(window, cx));
+            let root = gpui_base::Root::new(center.clone(), window, cx);
+            built = Some(center);
+            root
+        });
+        let center = built.expect("the management window builds its center");
+        let profile = vibex_core::ModelProviderProfile {
+            display_name: "House relay".to_string(),
+            endpoints: vec![vibex_core::ModelProviderEndpoint {
+                id: "api".to_string(),
+                kind: vibex_core::ModelProviderEndpointKind::Api,
+                url: "https://relay.example.com/v1".to_string(),
+                wire_protocol_id: Some(
+                    vibex_core::WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS.to_string(),
+                ),
+            }],
+            configured_models: vec![vibex_core::ModelProviderCatalogEntry {
+                id: "gpt-5".to_string(),
+                display_name: None,
+                enabled: true,
+                metadata: Vec::new(),
+                capabilities: Default::default(),
+            }],
+            metadata: vibex_core::ModelProviderMetadata {
+                category: Some("relay".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let provider_id = profile.id.as_str().to_string();
+        cx.update(|_, cx| {
+            center.update(cx, |center, _| center.providers = vec![profile.clone()]);
+        });
+
+        let library = center.read_with(cx, |center, _| center.provider_library_presets());
+        let template = library
+            .iter()
+            .find(|preset| preset.is_user_defined())
+            .expect("the saved Provider produces a template");
+        assert_eq!(template.display_name, "House relay");
+        assert_eq!(template.models, vec!["gpt-5".to_string()]);
+        assert_eq!(
+            provider_preset_category(template),
+            ProviderPresetCategory::UserDefined
+        );
+        // The heading is the library's, while the form's Kind field keeps the
+        // record's own kind.
+        assert_eq!(
+            center.read_with(cx, |center, _| center.provider_preset_record_kind(template)),
+            "relay"
+        );
+        assert_eq!(
+            template.id,
+            vibex_core::user_provider_preset_id(&provider_id)
+        );
+
+        // Removing the template takes the row out of the library and leaves
+        // the saved Provider in place, which is the whole promise of the
+        // dialog.
+        cx.update(|_, cx| {
+            center.update(cx, |center, cx| center.dismiss_user_preset(template, cx));
+        });
+        let library = center.read_with(cx, |center, _| center.provider_library_presets());
+        assert!(
+            !library.iter().any(|preset| preset.is_user_defined()),
+            "a dismissed template leaves the library"
+        );
+        assert_eq!(
+            center.read_with(cx, |center, _| center.providers.len()),
+            1,
+            "the saved Provider survives its template"
+        );
+
+        // The removal is reversible from the library that drew it.
+        cx.update(|_, cx| {
+            center.update(cx, |center, cx| center.restore_dismissed_user_presets(cx));
+        });
+        let library = center.read_with(cx, |center, _| center.provider_library_presets());
+        assert!(
+            library.iter().any(|preset| preset.is_user_defined()),
+            "restoring brings back every removed template"
+        );
+    }
+
+    /// Applying a template fills the form from the saved record and leaves the
+    /// Key field alone.
+    #[gpui::test]
+    fn applying_a_user_template_never_copies_the_key(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let (center, cx) = cx.add_window_view(ManagementCenter::new);
+        let handle = cx.windows().pop().expect("test window");
+        let profile = vibex_core::ModelProviderProfile {
+            display_name: "House relay".to_string(),
+            endpoints: vec![vibex_core::ModelProviderEndpoint {
+                id: "api".to_string(),
+                kind: vibex_core::ModelProviderEndpointKind::Api,
+                url: "https://relay.example.com/v1".to_string(),
+                wire_protocol_id: Some(
+                    vibex_core::WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS.to_string(),
+                ),
+            }],
+            configured_models: vec![vibex_core::ModelProviderCatalogEntry {
+                id: "gpt-5".to_string(),
+                display_name: None,
+                enabled: true,
+                metadata: Vec::new(),
+                capabilities: Default::default(),
+            }],
+            ..Default::default()
+        };
+        let preset_id = vibex_core::user_provider_preset_id(profile.id.as_str());
+        cx.update(|_, cx| {
+            center.update(cx, |center, _| center.providers = vec![profile.clone()]);
+        });
+        let _ = cx.update_window(handle, |_, window, cx| {
+            center.update(cx, |center, cx| {
+                center.open_provider_create_page(Some(&preset_id), window, cx);
+            });
+        });
+        center.read_with(cx, |center, cx| {
+            assert_eq!(
+                center.provider_form.name.read(cx).value().trim(),
+                "House relay"
+            );
+            assert_eq!(
+                center.provider_form.base_url.read(cx).value().trim(),
+                "https://relay.example.com/v1"
+            );
+            assert_eq!(center.provider_form.models.read(cx).value().trim(), "gpt-5");
+            assert!(
+                center.provider_form.api_key.read(cx).value().is_empty(),
+                "a template never carries the saved record's Key"
+            );
+            assert!(
+                !center.provider_form.headers_open,
+                "a record with no headers opens the section closed"
+            );
+        });
     }
 
     /// The chooser is two tabs, and each half owns the list and the command
@@ -51547,9 +52057,7 @@ mod gateway_surface_tests {
         let source = include_str!("management.rs");
         let custom = source
             .split_once("    fn choose_custom_provider(")
-            .and_then(|(_, tail)| {
-                tail.split_once("\n    /// Fills the draft from a built-in preset.")
-            })
+            .and_then(|(_, tail)| tail.split_once("\n    /// Fills the draft from a preset."))
             .map(|(body, _)| body)
             .expect("the custom chooser should remain inspectable");
         assert!(
@@ -51695,9 +52203,7 @@ mod gateway_surface_tests {
 
         let picking = source
             .split_once("    fn choose_provider_preset(")
-            .and_then(|(_, tail)| {
-                tail.split_once("\n    /// Fills the draft from a built-in preset.")
-            })
+            .and_then(|(_, tail)| tail.split_once("\n    /// Fills the draft from a preset."))
             .map(|(body, _)| body)
             .expect("the preset chooser should remain inspectable");
         assert!(picking.contains("apply_provider_preset(preset_id"));
@@ -51705,9 +52211,7 @@ mod gateway_surface_tests {
 
         let custom = source
             .split_once("    fn choose_custom_provider(")
-            .and_then(|(_, tail)| {
-                tail.split_once("\n    /// Fills the draft from a built-in preset.")
-            })
+            .and_then(|(_, tail)| tail.split_once("\n    /// Fills the draft from a preset."))
             .map(|(body, _)| body)
             .expect("the custom chooser should remain inspectable");
         assert!(

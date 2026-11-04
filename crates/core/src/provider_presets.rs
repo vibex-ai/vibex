@@ -123,11 +123,13 @@ pub struct ProviderPreset {
     pub regions: Vec<ProviderPresetRegion>,
     /// Only model ids with this prefix belong to the plan.
     ///
-    /// A preset never carries a model list of its own: the ids come from the
-    /// models.dev catalogue entry `catalog_id` names, so a vendor's new model
+    /// A shipped preset never carries a model list of its own: the ids come from
+    /// the models.dev catalogue entry `catalog_id` names, so a vendor's new model
     /// reaches the picker on the next catalogue refresh instead of waiting for
     /// a release. This prefix is the one thing the catalogue cannot express,
-    /// because a plan and its vendor's metered API share an entry.
+    /// because a plan and its vendor's metered API share an entry. A
+    /// user-defined template is the exception to "no list of its own"; see
+    /// [`Self::models`].
     pub only: Option<String>,
     pub endpoint_hint: Option<String>,
     /// Static price description, when the preset is a paid plan rather than a
@@ -140,9 +142,40 @@ pub struct ProviderPreset {
     /// an empty list leaves the header editor untouched.
     #[serde(default)]
     pub headers: Vec<ProviderPresetHeader>,
+    /// The model ids this preset carries of its own.
+    ///
+    /// A shipped preset leaves this empty: its ids come from the models.dev
+    /// entry `catalog_id` names, so a vendor's new model reaches the picker on
+    /// the next catalogue refresh. A user-defined template is the exception —
+    /// nothing else knows the model list the saved Provider was configured
+    /// with, so the template carries it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<String>,
+    /// The saved Provider a user-defined template was built from.
+    ///
+    /// `None` for every preset that ships with the binary. The value is what a
+    /// removal names: the record survives, so the answer has to be remembered
+    /// against the record rather than against the template's own id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_provider_id: Option<String>,
+    /// The bundled icon key the saved record carried, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
+    /// The picker kind the saved record declared: `vendor`, `relay`, or `local`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
 }
 
 impl ProviderPreset {
+    /// Whether this preset is one the user's own saved Providers produced.
+    ///
+    /// A user-defined template sits under its own heading in the library and is
+    /// the only kind a reader can remove. It carries no credential, so creating
+    /// from it still asks for a Key.
+    pub fn is_user_defined(&self) -> bool {
+        self.source_provider_id.is_some()
+    }
+
     /// The address for one wire protocol, with the region already applied.
     pub fn endpoint_for(&self, wire_api: ProviderModelWireApi) -> Option<&str> {
         self.endpoints
@@ -434,6 +467,10 @@ fn preset(id: &str, display_name: &str, endpoint_entries: &[(&str, &str)]) -> Pr
         plan_note: None,
         caveats: Vec::new(),
         headers: Vec::new(),
+        models: Vec::new(),
+        source_provider_id: None,
+        icon: None,
+        category: None,
     }
 }
 
@@ -1336,6 +1373,156 @@ pub fn provider_preset(id: &str) -> Option<ProviderPreset> {
         .find(|preset| preset.id == id.trim())
 }
 
+/// The id a saved Provider's user-defined template is addressed by.
+///
+/// The prefix keeps a template apart from the shipped table, so a saved record
+/// whose display name matches a vendor cannot shadow that vendor's preset.
+pub const USER_PROVIDER_PRESET_PREFIX: &str = "user:";
+
+/// The id of the template a saved Provider is offered as.
+pub fn user_provider_preset_id(provider_id: &str) -> String {
+    format!("{USER_PROVIDER_PRESET_PREFIX}{}", provider_id.trim())
+}
+
+/// Builds the template a saved Provider offers in the preset library.
+///
+/// This is a projection, not a copy: the template carries the record's name,
+/// its addresses, its models and its advisory metadata, and deliberately no
+/// credential. A Provider created from it starts with an empty Key field, which
+/// is the reminder that the saved record's Key stays with the saved record.
+///
+/// `None` when the record holds nothing a template could fill: a Provider with
+/// no API address would open a form the user still has to complete from
+/// scratch, which is what the "Custom" tile is for.
+pub fn user_provider_preset(profile: &crate::ModelProviderProfile) -> Option<ProviderPreset> {
+    let mut endpoints = BTreeMap::new();
+    for endpoint in profile
+        .endpoints
+        .iter()
+        .filter(|endpoint| endpoint.kind == crate::ModelProviderEndpointKind::Api)
+    {
+        // A protocol-specific endpoint is the one a template can reproduce;
+        // the unmarked fallback would compete with it for the same key.
+        let Some(protocol) = endpoint.wire_protocol_id.as_deref() else {
+            continue;
+        };
+        if crate::ProviderModelWireApi::from_wire_protocol_id(protocol).is_some() {
+            endpoints.insert(protocol.to_string(), endpoint.url.clone());
+        }
+    }
+    if endpoints.is_empty() {
+        // A record created from a single address keeps it as the unmarked
+        // fallback. That address is still the one to offer, under the protocol
+        // the record starts on.
+        let wire_api = profile
+            .configured_models
+            .iter()
+            .find_map(|model| {
+                model
+                    .metadata
+                    .iter()
+                    .find(|entry| entry.key == "wireApi")
+                    .and_then(|entry| {
+                        crate::ProviderModelWireApi::from_wire_protocol_id(&entry.value)
+                    })
+            })
+            .or(Some(crate::ProviderModelWireApi::OpenaiChatCompletions))?;
+        let url = profile
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.kind == crate::ModelProviderEndpointKind::Api)
+            .map(|endpoint| endpoint.url.clone())?;
+        endpoints.insert(wire_api.wire_protocol_id().to_string(), url);
+    }
+    let models = profile
+        .configured_models
+        .iter()
+        .filter(|model| model.enabled)
+        .map(|model| model.id.clone())
+        .collect::<Vec<_>>();
+    let headers = profile
+        .headers
+        .iter()
+        .filter_map(|header| {
+            let value = match &header.value {
+                crate::ModelProviderHeaderValue::NonSecretLiteral(value) => {
+                    ProviderPresetHeaderValue::Literal(value.clone())
+                }
+                crate::ModelProviderHeaderValue::DynamicVariable(variable) => {
+                    ProviderPresetHeaderValue::Variable(*variable)
+                }
+                // A Secret reference has no value a template may carry: the
+                // Secret belongs to the record, and a copy would be a second
+                // copy of the credential.
+                crate::ModelProviderHeaderValue::SecretReference(_) => return None,
+            };
+            Some(ProviderPresetHeader {
+                name: header.name.clone(),
+                value,
+            })
+        })
+        .collect::<Vec<_>>();
+    let website = profile.metadata.website_url.clone();
+    Some(ProviderPreset {
+        id: user_provider_preset_id(profile.id.as_str()),
+        display_name: profile.display_name.clone(),
+        catalog_id: profile.metadata.catalog_id.clone(),
+        endpoints,
+        website,
+        keys_url: None,
+        key_hint: None,
+        // A template carries no credential, so the Key field stays visible and
+        // empty: the Provider made from it is a new account, not a second name
+        // for the saved one.
+        no_key: false,
+        regions: Vec::new(),
+        only: None,
+        endpoint_hint: profile
+            .primary_api_endpoint()
+            .map(|endpoint| endpoint.url.clone()),
+        plan_note: None,
+        caveats: Vec::new(),
+        headers,
+        models,
+        source_provider_id: Some(profile.id.as_str().to_string()),
+        icon: profile.metadata.icon.clone(),
+        category: profile.metadata.category.clone(),
+    })
+}
+
+/// Every user-defined template the saved Providers produce, in display order.
+///
+/// A template is offered for every visible saved record, whether or not an
+/// Agent binds it: the library is where a Provider is looked up, and a record
+/// that exists is a starting point even before it is in use. Deleted records
+/// are left out by the caller's own list, so this function has no filter of its
+/// own.
+pub fn user_provider_presets(profiles: &[crate::ModelProviderProfile]) -> Vec<ProviderPreset> {
+    let mut presets = profiles
+        .iter()
+        .filter(|profile| profile.deleted_at_ms.is_none())
+        .filter_map(user_provider_preset)
+        .collect::<Vec<_>>();
+    presets.sort_by(|left, right| {
+        left.display_name
+            .to_lowercase()
+            .cmp(&right.display_name.to_lowercase())
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    presets
+}
+
+/// Looks a user-defined template up in the saved Providers it came from.
+pub fn user_provider_preset_for(
+    profiles: &[crate::ModelProviderProfile],
+    preset_id: &str,
+) -> Option<ProviderPreset> {
+    let preset_id = preset_id.trim();
+    user_provider_presets(profiles)
+        .into_iter()
+        .find(|preset| preset.id == preset_id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1954,6 +2141,163 @@ mod tests {
         assert_eq!(
             anyrouter.endpoint_for(ProviderModelWireApi::OpenaiResponses),
             Some("http://anyrouter.top/v1")
+        );
+    }
+
+    /// A saved Provider becomes a template that fills the same fields and
+    /// carries no credential.
+    #[test]
+    fn a_saved_provider_becomes_a_keyless_template() {
+        let profile = crate::ModelProviderProfile {
+            display_name: "House relay".to_string(),
+            vendor_hint: Some("acme".to_string()),
+            endpoints: vec![
+                crate::ModelProviderEndpoint {
+                    id: "api".to_string(),
+                    kind: crate::ModelProviderEndpointKind::Api,
+                    url: "https://relay.example.com/v1".to_string(),
+                    wire_protocol_id: Some(
+                        crate::WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS.to_string(),
+                    ),
+                },
+                crate::ModelProviderEndpoint {
+                    id: "api-anthropic".to_string(),
+                    kind: crate::ModelProviderEndpointKind::Api,
+                    url: "https://relay.example.com/anthropic".to_string(),
+                    wire_protocol_id: Some(crate::WIRE_PROTOCOL_ANTHROPIC_MESSAGES.to_string()),
+                },
+                crate::ModelProviderEndpoint {
+                    id: "models".to_string(),
+                    kind: crate::ModelProviderEndpointKind::ModelCatalog,
+                    url: "https://relay.example.com/models".to_string(),
+                    wire_protocol_id: None,
+                },
+            ],
+            configured_models: vec![
+                crate::ModelProviderCatalogEntry {
+                    id: "gpt-5".to_string(),
+                    display_name: None,
+                    enabled: true,
+                    metadata: Vec::new(),
+                    capabilities: Default::default(),
+                },
+                crate::ModelProviderCatalogEntry {
+                    id: "retired-model".to_string(),
+                    display_name: None,
+                    enabled: false,
+                    metadata: Vec::new(),
+                    capabilities: Default::default(),
+                },
+            ],
+            headers: vec![crate::ModelProviderHeaderReference {
+                name: "X-Relay".to_string(),
+                value: crate::ModelProviderHeaderValue::NonSecretLiteral("on".to_string()),
+                redacted_hint: String::new(),
+            }],
+            metadata: crate::ModelProviderMetadata {
+                website_url: Some("https://relay.example.com".to_string()),
+                category: Some("relay".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let preset = user_provider_preset(&profile).expect("a saved Provider is a template");
+        assert!(preset.is_user_defined());
+        assert_eq!(preset.display_name, "House relay");
+        assert_eq!(
+            preset.endpoint_for(ProviderModelWireApi::OpenaiChatCompletions),
+            Some("https://relay.example.com/v1")
+        );
+        assert_eq!(
+            preset.endpoint_for(ProviderModelWireApi::AnthropicMessages),
+            Some("https://relay.example.com/anthropic")
+        );
+        assert_eq!(preset.models, vec!["gpt-5".to_string()]);
+        assert_eq!(preset.category.as_deref(), Some("relay"));
+        // No credential crosses into the template, in any field.
+        assert!(preset.keys_url.is_none());
+        assert!(preset.key_hint.is_none());
+        assert_eq!(
+            preset.source_provider_id.as_deref(),
+            Some(profile.id.as_str())
+        );
+        let raw = serde_json::to_string(&preset).unwrap();
+        assert!(!raw.contains("apiKey"));
+    }
+
+    /// A record whose only address is the unmarked fallback still becomes a
+    /// template, under the protocol it starts on.
+    #[test]
+    fn a_single_address_record_still_becomes_a_template() {
+        let profile = crate::ModelProviderProfile {
+            display_name: "Work relay".to_string(),
+            endpoints: vec![crate::ModelProviderEndpoint {
+                id: "api".to_string(),
+                kind: crate::ModelProviderEndpointKind::Api,
+                url: "https://work.example.com/v1".to_string(),
+                wire_protocol_id: None,
+            }],
+            configured_models: vec![crate::ModelProviderCatalogEntry {
+                id: "claude-sonnet-4".to_string(),
+                display_name: None,
+                enabled: true,
+                metadata: vec![crate::ProviderBindingMetadata {
+                    key: "wireApi".to_string(),
+                    value: crate::WIRE_PROTOCOL_ANTHROPIC_MESSAGES.to_string(),
+                }],
+                capabilities: Default::default(),
+            }],
+            ..Default::default()
+        };
+        let preset = user_provider_preset(&profile).expect("the fallback address is enough");
+        assert_eq!(
+            preset.endpoint_for(ProviderModelWireApi::AnthropicMessages),
+            Some("https://work.example.com/v1")
+        );
+    }
+
+    /// A record with no address has nothing a template could prefill.
+    #[test]
+    fn a_record_without_an_address_yields_no_template() {
+        let profile = crate::ModelProviderProfile {
+            display_name: "Empty".to_string(),
+            ..Default::default()
+        };
+        assert!(user_provider_preset(&profile).is_none());
+    }
+
+    /// Templates are ordered by name, and an id addresses exactly one of them.
+    #[test]
+    fn user_templates_are_ordered_and_addressable() {
+        let make = |name: &str| crate::ModelProviderProfile {
+            display_name: name.to_string(),
+            endpoints: vec![crate::ModelProviderEndpoint {
+                id: "api".to_string(),
+                kind: crate::ModelProviderEndpointKind::Api,
+                url: format!("https://{name}.example.com/v1"),
+                wire_protocol_id: Some(crate::WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS.to_string()),
+            }],
+            ..Default::default()
+        };
+        let profiles = vec![make("zeta"), make("alpha")];
+        let presets = user_provider_presets(&profiles);
+        assert_eq!(
+            presets
+                .iter()
+                .map(|preset| preset.display_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alpha", "zeta"]
+        );
+        assert!(
+            user_provider_preset_for(&profiles, &presets[0].id).is_some(),
+            "a template is found by the id it advertises"
+        );
+        assert!(
+            presets
+                .iter()
+                .all(|preset| preset.id.starts_with(USER_PROVIDER_PRESET_PREFIX)),
+            "a template can never shadow a shipped preset"
         );
     }
 }

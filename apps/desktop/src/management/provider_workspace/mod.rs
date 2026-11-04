@@ -1595,6 +1595,42 @@ mod tests {
         assert!(gallery.contains(".child(custom)\n                .child(catalog)"));
     }
 
+    /// A user-defined template is the only kind of preset the gallery lets a
+    /// reader remove, and it says where it lives.
+    #[test]
+    fn only_user_defined_templates_are_removable() {
+        let gallery = CREATE
+            .split_once("fn render_workspace_create_gallery(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_workspace_create_form("))
+            .map(|(body, _)| body)
+            .expect("the create gallery should remain inspectable");
+        assert!(gallery.contains("if preset.is_user_defined() {"));
+        assert!(gallery.contains("confirm_dismiss_user_preset(removable.clone(), window, cx)"));
+        // A shipped preset's tile still goes through the same create path.
+        assert!(gallery.contains("this.apply_provider_create_preset(&preset_id, window, cx);"));
+        assert!(
+            !gallery.contains("confirm_dismiss_user_preset(preset.clone()"),
+            "only the branch that saw a template may offer its removal"
+        );
+
+        assert!(
+            gallery.contains("management-provider-create-restore-templates"),
+            "the removed templates have a way back from the library that lost them"
+        );
+
+        let rows = include_str!("../../management.rs");
+        let tile = rows
+            .split_once("fn provider_source_tile(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n/// One preset's logo, drawn at its own colours")
+            })
+            .map(|(body, _)| body)
+            .expect("the source row should remain inspectable");
+        assert!(tile.contains("preset.is_user_defined().then(|| preset.clone())"));
+        assert!(tile.contains("confirm_dismiss_user_preset"));
+        assert!(tile.contains("cx.stop_propagation()"));
+    }
+
     /// The gateway's "Models served" list names the model, never the routing
     /// address. `group/<route id>/<model>` is how a request is addressed; the
     /// route id in the middle is not a label a reader can use.

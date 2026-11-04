@@ -5766,6 +5766,23 @@ ProviderConfigService::{
   chosen. "Custom provider" sits at the foot of the list and resets the draft the
   way a fresh dialog does, so a preset that was looked at and left behind cannot
   leave its addresses in a form the user asked to start empty.
+- **A saved Provider is also a library template, and the template is a
+  projection, not a record.** A fourth heading ("User-defined", below Local,
+  with its own mark) lists one template per saved Provider that has an API
+  address. It is rebuilt from the shared records on every read — `id` prefixed
+  `user:` so it can never shadow a shipped preset, `sourceProviderId` naming the
+  record it came from — so an edited or deleted Provider changes the library
+  with no migration. The template carries the record's addresses per wire
+  protocol, its enabled model ids, its literal and dynamic headers, and its
+  advisory name, icon, website and catalogue id. It never carries a credential:
+  a Secret-valued header is dropped, and creating from the template still shows
+  the Key field because the new Provider is a new account. The name, not the
+  template id, remains the vendor hint of a record created from a shipped
+  preset; a record created from a template writes no vendor hint, because a
+  prefixed id names no vendor. Removing a template is a dismissal remembered
+  beside the favorites in the app data directory, keyed by the saved record's
+  id: the Provider and its Key survive, which is what the confirmation says,
+  and a shipped preset offers no delete control at all.
 - **The TUI's Providers table mirrors the gateway's hierarchy.** The gateway
   row is followed by one row per group member Provider (`├`) and one per Key
   (`│ ├`), so the reader can see which account is cooling without opening the

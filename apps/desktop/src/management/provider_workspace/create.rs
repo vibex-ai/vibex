@@ -58,6 +58,9 @@ impl ManagementCenter {
                 ProviderPresetCategory::Vendor => "management-provider-create-kind-vendor",
                 ProviderPresetCategory::Relay => "management-provider-create-kind-relay",
                 ProviderPresetCategory::Local => "management-provider-create-kind-local",
+                ProviderPresetCategory::UserDefined => {
+                    "management-provider-create-kind-user-defined"
+                }
             };
             chips = chips.child(
                 Button::new(SharedString::from(format!(
@@ -112,13 +115,65 @@ impl ManagementCenter {
                             .map(|url| provider_preset_host(url))
                     })
                     .unwrap_or_default();
-                let note = if preset.no_key {
+                let note = if preset.is_user_defined() {
+                    // A template is the reader's own record: the tag says what
+                    // the row is, because it copies a saved Provider rather
+                    // than naming a vendor the build ships.
+                    Some(management_locale_text("Template", "模板", "範本"))
+                } else if preset.no_key {
                     Some(management_locale_text("No Key", "无需 Key", "無需 Key"))
                 } else if preset.plan_note.is_some() {
                     Some(management_locale_text("Plan", "套餐", "方案"))
                 } else {
                     None
                 };
+                if preset.is_user_defined() {
+                    // A template is removable, and only a template: a shipped
+                    // preset is the build's own table, not the reader's record.
+                    let tile = create_tile(
+                        SharedString::from(format!(
+                            "management-provider-create-preset-{}",
+                            preset.id
+                        )),
+                        provider_source_logo(preset, px(38.0), cx),
+                        preset.display_name.clone(),
+                        host,
+                        note,
+                        cx.listener(move |this, _, window, cx| {
+                            this.apply_provider_create_preset(&preset_id, window, cx);
+                            this.workspace_create_choosing = false;
+                            cx.notify();
+                        }),
+                        cx,
+                    );
+                    let removable = preset.clone();
+                    let delete = Button::new(SharedString::from(format!(
+                        "management-provider-create-preset-delete-{}",
+                        removable.id
+                    )))
+                    .xsmall()
+                    .ghost()
+                    .compact()
+                    .icon(Icon::default().path("icons/vibex/trash-2.svg"))
+                    .tooltip(management_locale_text(
+                        "Remove this template",
+                        "移除该模板",
+                        "移除該範本",
+                    ))
+                    .disabled(self.mutation.is_some())
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.confirm_dismiss_user_preset(removable.clone(), window, cx);
+                    }));
+                    grid = grid.child(
+                        div()
+                            .relative()
+                            .flex_none()
+                            .child(tile)
+                            .child(div().absolute().top_1().right_1().child(delete)),
+                    );
+                    continue;
+                }
                 grid = grid.child(create_tile(
                     SharedString::from(format!("management-provider-create-preset-{}", preset.id)),
                     provider_source_logo(preset, px(38.0), cx),
@@ -153,6 +208,34 @@ impl ManagementCenter {
                         grid.into_any_element(),
                         cx,
                     )),
+            );
+        }
+
+        // A removed template is restorable from the library that drew it: the
+        // dismissed record's own row is gone, so the undo lives where the
+        // library is, not on a record that no longer appears.
+        if !self.dismissed_user_presets.is_empty() {
+            catalog = catalog.child(
+                h_flex()
+                    .w_full()
+                    .min_w_0()
+                    .items_center()
+                    .gap_2()
+                    .pt_2()
+                    .child(
+                        Button::new("management-provider-create-restore-templates")
+                            .xsmall()
+                            .ghost()
+                            .label(management_locale_text(
+                                "Restore removed templates",
+                                "恢复已移除的模板",
+                                "恢復已移除的範本",
+                            ))
+                            .disabled(self.mutation.is_some())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.restore_dismissed_user_presets(cx)
+                            })),
+                    ),
             );
         }
 
@@ -402,9 +485,15 @@ impl ManagementCenter {
 fn preset_logo_tile(preset: &vibex_core::ProviderPreset, size: Pixels, cx: &App) -> AnyElement {
     let profile = vibex_core::ModelProviderProfile {
         display_name: preset.display_name.clone(),
-        vendor_hint: Some(preset.id.clone()),
+        // A template's mark belongs to the saved record it copies, not to the
+        // prefixed id the library addresses it by.
+        vendor_hint: preset
+            .source_provider_id
+            .clone()
+            .or_else(|| Some(preset.id.clone())),
         metadata: vibex_core::ModelProviderMetadata {
             catalog_id: preset.catalog_id.clone(),
+            icon: preset.icon.clone(),
             ..Default::default()
         },
         ..Default::default()
