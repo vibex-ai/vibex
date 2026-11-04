@@ -16,7 +16,7 @@ use super::routes::{
 };
 use super::*;
 
-use gpui::{Div, Pixels, Stateful};
+use gpui::{Div, Edges, Pixels, Stateful};
 use std::rc::Rc;
 
 /// The clock column's width. Its text never changes shape, so it does not
@@ -33,10 +33,22 @@ const ROUTE_COST_SHARE: f32 = 0.30;
 /// being readable, so the drag stops there.
 const ROUTE_LANE_FLOOR: Pixels = px(72.0);
 
-/// The empty column the table paints after the last lane, which takes width
-/// from the same row. Subtracting it keeps the lanes from overflowing the
-/// table by a few pixels and raising a scrollbar nobody asked for.
-const ROUTE_TRAILING_WIDTH: Pixels = px(12.0);
+/// The rounding slack left after the last lane.
+///
+/// The table lays a width out in device pixels, so a lane cut to a fraction of
+/// one can come out a hair wider than the share-out asked for and raise a
+/// horizontal scrollbar nobody wanted. One pixel absorbs that hair; anything
+/// wider is a visible band of blank row at the end of every record, which is
+/// what this column was when it held the whole scrollbar's width.
+const ROUTE_TRAILING_WIDTH: Pixels = px(1.0);
+
+/// The room the vertical scrollbar needs at the end of a row.
+///
+/// The kit paints the bar over the table's right edge rather than beside the
+/// lanes, so the right-aligned lane hands it this much back as padding. The
+/// lanes still fill the card exactly; without the padding the metrics would run
+/// under the bar whenever the records scroll.
+const ROUTE_SCROLLBAR_ROOM: Pixels = px(8.0);
 
 /// How the four lanes fill the table.
 ///
@@ -202,13 +214,18 @@ impl RouteColumn {
     }
 
     fn column(self, width: Pixels) -> Column {
-        // The widget's own cell padding is all these lanes need.
+        // The widget's own cell padding is all these lanes need, except at the
+        // far right where the scrollbar paints over the lane.
+        let padding = Edges {
+            right: ROUTE_SCROLLBAR_ROOM,
+            ..Default::default()
+        };
         let column = Column::new(self.key(), self.name())
             .width(width)
             .min_width(ROUTE_LANE_FLOOR)
             .resizable(true);
         match self {
-            Self::Cost => column.text_right(),
+            Self::Cost => column.text_right().paddings(padding),
             Self::Time | Self::Asked | Self::Answered => column,
         }
     }
@@ -246,18 +263,22 @@ impl TableDelegate for RouteRequestsTableDelegate {
             .into_any_element()
     }
 
-    /// The gutter after the last lane.
+    /// The rounding slack after the last lane.
     ///
     /// The kit's own is a rem-sized box, which would leave the share-out a
-    /// fraction of a lane short or long whenever the root font differs from
-    /// the default. This one is the constant the layout subtracts, so the four
-    /// lanes and the gutter always add up to the table exactly.
+    /// fraction of a lane short or long whenever the root font differs from the
+    /// default. This one is the constant the layout subtracts, so the four
+    /// lanes and the slack always add up to the table exactly.
     fn render_last_empty_col(
         &mut self,
         _window: &mut Window,
         _cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
-        div().w(ROUTE_TRAILING_WIDTH).h_full().flex_shrink_0()
+        div()
+            .debug_selector(|| "management-gateway-request-gutter".to_string())
+            .w(ROUTE_TRAILING_WIDTH)
+            .h_full()
+            .flex_shrink_0()
     }
 
     fn render_td(
@@ -271,19 +292,26 @@ impl TableDelegate for RouteRequestsTableDelegate {
             return div().into_any_element();
         };
         let parts = route_row_parts(row, &self.data, cx);
+        // The cell's own box is as tall as the row, but a plain `div` inside it
+        // only takes the height of its text and is laid out from the cell's
+        // top, so every value sat above the row's middle. Wrapping the value in
+        // a full-height line and centring it puts the text on the row's centre
+        // line, whichever column it is in.
+        let cell = h_flex().size_full().min_w_0().items_center();
         match RouteColumn::at(col_ix) {
-            RouteColumn::Time => div()
-                .min_w_0()
-                .truncate()
-                .text_xs()
-                .text_color(cx.theme().muted_foreground)
-                .font_family(cx.theme().mono_font_family.clone())
-                .child(gateway_clock(parts.at_ms))
+            RouteColumn::Time => cell
+                .child(
+                    div()
+                        .debug_selector(|| format!("management-gateway-request-time-{row_ix}"))
+                        .min_w_0()
+                        .truncate()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .font_family(cx.theme().mono_font_family.clone())
+                        .child(gateway_clock(parts.at_ms)),
+                )
                 .into_any_element(),
-            RouteColumn::Asked => h_flex()
-                .w_full()
-                .min_w_0()
-                .items_center()
+            RouteColumn::Asked => cell
                 .gap_1p5()
                 .child(div().flex_none().size(px(8.0)).rounded_full().bg(parts.hue))
                 .child(agent_brand_icon(&parts.agent_key, px(14.0), None))
@@ -312,32 +340,8 @@ impl TableDelegate for RouteRequestsTableDelegate {
                 })
                 .into_any_element(),
             RouteColumn::Answered => {
-                let id = row.id().clone();
-                let click_id = id.clone();
-                let debug_id = id.clone();
                 let failed = parts.failed;
-                // The record is the way into its route: a click picks it and
-                // pins the map above, a second click replays it.
-                let on_click = {
-                    let view = self.view.clone();
-                    cx.listener(move |_, _, _, cx| {
-                        let _ = view
-                            .update(cx, |view, cx| view.pick_gateway_route(click_id.clone(), cx));
-                    })
-                };
-                h_flex()
-                    .id(SharedString::from(format!(
-                        "management-gateway-request-row-{}",
-                        id.as_str()
-                    )))
-                    .debug_selector(move || {
-                        format!("management-gateway-request-row-{}", debug_id.as_str())
-                    })
-                    .w_full()
-                    .min_w_0()
-                    .items_center()
-                    .gap_1p5()
-                    .on_click(on_click)
+                cell.gap_1p5()
                     .child(div().flex_none().size(px(6.0)).rounded_full().bg(parts.dot))
                     .child(
                         div()
@@ -371,14 +375,18 @@ impl TableDelegate for RouteRequestsTableDelegate {
                     )
                     .into_any_element()
             }
-            RouteColumn::Cost => div()
-                .w_full()
-                .min_w_0()
-                .truncate()
-                .text_xs()
-                .text_color(cx.theme().muted_foreground)
-                .font_family(cx.theme().mono_font_family.clone())
-                .child(parts.metrics.join(" · "))
+            RouteColumn::Cost => cell
+                .justify_end()
+                .child(
+                    div()
+                        .debug_selector(|| format!("management-gateway-request-cost-{row_ix}"))
+                        .min_w_0()
+                        .truncate()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .font_family(cx.theme().mono_font_family.clone())
+                        .child(parts.metrics.join(" · ")),
+                )
                 .into_any_element(),
         }
     }
@@ -406,16 +414,37 @@ impl TableDelegate for RouteRequestsTableDelegate {
             .child(text)
     }
 
+    /// The record's row, and the click that picks it.
+    ///
+    /// The listener sits on the row rather than on one of its cells: the row
+    /// plate is what the reader sees as one record, so every pixel of it — the
+    /// clock, the model, the metrics, the empty space past a short value — is
+    /// the way into that record's route. A click on a cell's text would only
+    /// cover the glyphs, and a click on the row's empty right-hand part would
+    /// do nothing.
     fn render_tr(
         &mut self,
         row_ix: usize,
         _window: &mut Window,
         cx: &mut Context<TableState<Self>>,
     ) -> Stateful<Div> {
-        let row = div().id(("management-gateway-request", row_ix));
         let Some(record) = self.row(row_ix) else {
-            return row;
+            return div().id(("management-gateway-request", row_ix));
         };
+        let id = record.id().clone();
+        let click_id = id.clone();
+        let debug_id = id.clone();
+        let view = self.view.clone();
+        let on_click = cx.listener(move |_, _, _, cx| {
+            let _ = view.update(cx, |view, cx| view.pick_gateway_route(click_id.clone(), cx));
+        });
+        let row = div()
+            .id(SharedString::from(format!(
+                "management-gateway-request-row-{}",
+                id.as_str()
+            )))
+            .debug_selector(move || format!("management-gateway-request-row-{}", debug_id.as_str()))
+            .on_click(on_click);
         // A picked record keeps the picked look it had in the list, so the
         // map above and the record below always name the same request. The
         // table merges this row's style after its own, so the plate and the
@@ -631,6 +660,20 @@ mod tests {
             );
             assert!(lanes.iter().all(|lane| *lane > 0.0));
         }
+    }
+
+    /// What the lanes leave is the rounding slack, not a blank column: the
+    /// table paints its own trailing column at whatever this costs, and a wide
+    /// one shows as an empty band after the last lane on every row.
+    #[test]
+    fn the_lanes_leave_only_rounding_slack() {
+        assert!(
+            ROUTE_TRAILING_WIDTH <= px(2.0),
+            "the trailing column must stay rounding slack, got {ROUTE_TRAILING_WIDTH:?}"
+        );
+        // The scrollbar's room is padding inside the last lane, so it does not
+        // eat into the width the lanes are given.
+        assert!(ROUTE_SCROLLBAR_ROOM > px(0.0));
     }
 
     /// The clock keeps its width and the text lanes grow with the window, so a

@@ -51953,6 +51953,26 @@ mod gateway_surface_tests {
                 "the request record must keep {marker}"
             );
         }
+        // The click is on the row, not on one cell's text: every pixel of the
+        // record is the way into its route, including the empty space past a
+        // short value and the columns that carry no handler of their own.
+        let render_tr = table
+            .split_once("fn render_tr(")
+            .map(|(_, rest)| rest)
+            .expect("the delegate renders its rows");
+        assert!(
+            render_tr.contains(".on_click(on_click)"),
+            "the click must be registered on the row, not on a cell"
+        );
+        let render_td = table
+            .split_once("fn render_td(")
+            .and_then(|(_, rest)| rest.split_once("fn render_empty("))
+            .map(|(body, _)| body)
+            .expect("the delegate renders its cells");
+        assert!(
+            !render_td.contains(".on_click("),
+            "a cell must not carry a second click target of its own"
+        );
         // Picking again replays the request rather than unpinning it.
         assert!(source.contains("stage.replay(cx)"));
         // A replay is paced by the map's own clock, so the map has to ask for
@@ -52828,6 +52848,191 @@ mod gateway_surface_tests {
         );
     }
 
+    /// The records reach the card's right edge, with no band of empty row past
+    /// the last lane.
+    ///
+    /// The delegate's trailing column used to reserve the whole width of the
+    /// kit's vertical scrollbar, so every row ended in a blank gutter. What is
+    /// left is a pixel of rounding slack; the scrollbar is given room by the
+    /// right-aligned lane's own padding instead.
+    #[gpui::test]
+    fn the_last_lane_reaches_the_cards_edge(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let (center, cx) = cx.add_window_view(ManagementCenter::new);
+        cx.update(|_, cx| {
+            center.update(cx, |center, cx| {
+                center.navigation.active = ManagementSection::Providers;
+                center.selected_global_provider_id = Some(GATEWAY_ROW_ID.to_string());
+                center.gateway_detail_tab = GatewayDetailTab::Routing;
+                let rows = (0..12)
+                    .map(|index| {
+                        let mut row = ledger_request(Some("primary"), None);
+                        row.created_at_ms = 1_700_000_000_000 - index * 1_000;
+                        row
+                    })
+                    .collect::<Vec<_>>();
+                center.apply_gateway_request_page(rows, false);
+                cx.notify();
+            });
+        });
+        cx.simulate_resize(gpui::size(px(1440.0), px(900.0)));
+        for _ in 0..4 {
+            cx.update(|window, cx| {
+                let _ = window.draw(cx);
+            });
+            cx.run_until_parked();
+        }
+
+        let table = cx
+            .debug_bounds("management-gateway-request-table")
+            .expect("the records table is drawn");
+        // The trailing column the table paints after its own lanes.
+        let gutter = cx
+            .debug_bounds("management-gateway-request-gutter")
+            .expect("the table paints its trailing column");
+        assert!(
+            gutter.size.width <= px(2.0),
+            "the gutter must be rounding slack, not a blank column: {gutter:?}"
+        );
+        let lanes = center.read_with(cx, |center, cx| {
+            let table = center.route_requests_table.as_ref()?.read(cx);
+            Some((0..4).map(|lane| table.col_width(lane)).collect::<Vec<_>>())
+        });
+        let lanes = lanes.expect("the records table exists");
+        let total: f32 = lanes.iter().flatten().map(|lane| f32::from(*lane)).sum();
+        assert!(
+            total >= f32::from(table.size.width) - 2.0,
+            "the lanes must fill the {table:?} table, got {total}px"
+        );
+        // The metrics are right-aligned inside the last lane, so the room the
+        // scrollbar needs has to come out of that lane's padding.
+        if let Some(cost) = cx.debug_bounds("management-gateway-request-cost-0") {
+            assert!(
+                cost.right() <= table.right() - px(4.0),
+                "the metrics must clear the scrollbar: cost={cost:?} table={table:?}"
+            );
+        }
+    }
+
+    /// Every part of a record is the way into its route.
+    ///
+    /// The row plate is one record, so a click on its clock, on the metrics, or
+    /// on the empty space to the right of a short value has to pin the map just
+    /// like a click on the answering Provider's name. The handler used to sit
+    /// on one cell's text, which left the rest of the row inert.
+    #[gpui::test]
+    fn clicking_anywhere_on_a_record_pins_the_route_map(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let (center, cx) = cx.add_window_view(ManagementCenter::new);
+        cx.update(|_, cx| {
+            center.update(cx, |center, cx| {
+                center.navigation.active = ManagementSection::Providers;
+                center.selected_global_provider_id = Some(GATEWAY_ROW_ID.to_string());
+                center.gateway_detail_tab = GatewayDetailTab::Routing;
+                let rows = (0..12)
+                    .map(|index| {
+                        let mut row = ledger_request(Some("primary"), None);
+                        row.created_at_ms = 1_700_000_000_000 - index * 1_000;
+                        row
+                    })
+                    .collect::<Vec<_>>();
+                center.apply_gateway_request_page(rows, false);
+                cx.notify();
+            });
+        });
+        cx.simulate_resize(gpui::size(px(1440.0), px(900.0)));
+        for _ in 0..4 {
+            cx.update(|window, cx| {
+                let _ = window.draw(cx);
+            });
+            cx.run_until_parked();
+        }
+
+        let (id, debug_id) = center.read_with(cx, |center, _| {
+            let row = center.gateway_requests.first().expect("a record");
+            (
+                row.request_id.clone(),
+                format!("management-gateway-request-row-{}", row.request_id.as_str()),
+            )
+        });
+        let leaked: &'static str = debug_id.leak();
+        let row = cx
+            .debug_bounds(leaked)
+            .expect("the first record is laid out");
+        // The far right of the row: past every value, where nothing carries a
+        // handler of its own.
+        let empty = gpui::point(row.right() - px(4.0), row.center().y);
+        cx.simulate_click(empty, gpui::Modifiers::none());
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            center.read_with(cx, |center, _| center.gateway_route_pinned.clone()),
+            Some(id),
+            "a click on the empty part of a record must pick it"
+        );
+    }
+
+    /// A record's values sit on the row's centre line, not above it.
+    ///
+    /// The cell's box is as tall as the row, but a bare `div` inside it takes
+    /// only its text's height and starts at the cell's top, which left every
+    /// value riding high in its lane.
+    #[gpui::test]
+    fn a_records_values_are_centred_on_their_row(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let (center, cx) = cx.add_window_view(ManagementCenter::new);
+        cx.update(|_, cx| {
+            center.update(cx, |center, cx| {
+                center.navigation.active = ManagementSection::Providers;
+                center.selected_global_provider_id = Some(GATEWAY_ROW_ID.to_string());
+                center.gateway_detail_tab = GatewayDetailTab::Routing;
+                let rows = (0..12)
+                    .map(|index| {
+                        let mut row = ledger_request(Some("primary"), None);
+                        row.created_at_ms = 1_700_000_000_000 - index * 1_000;
+                        row
+                    })
+                    .collect::<Vec<_>>();
+                center.apply_gateway_request_page(rows, false);
+                cx.notify();
+            });
+        });
+        cx.simulate_resize(gpui::size(px(1440.0), px(900.0)));
+        for _ in 0..4 {
+            cx.update(|window, cx| {
+                let _ = window.draw(cx);
+            });
+            cx.run_until_parked();
+        }
+
+        let id = center.read_with(cx, |center, _| {
+            format!(
+                "management-gateway-request-row-{}",
+                center.gateway_requests[0].request_id.as_str()
+            )
+        });
+        let leaked: &'static str = id.leak();
+        let row = cx
+            .debug_bounds(leaked)
+            .expect("the first record is laid out");
+        let mid = row.center().y;
+        for lane in [
+            "management-gateway-request-time-0",
+            "management-gateway-request-cost-0",
+        ] {
+            let Some(cell) = cx.debug_bounds(lane) else {
+                continue;
+            };
+            let delta = (cell.center().y - mid).as_f32().abs();
+            assert!(
+                delta <= 1.0,
+                "{lane} must be centred on the row: row={row:?} cell={cell:?}"
+            );
+        }
+    }
+
     /// The Routing tab's map keeps its height and the records card takes the
     /// height left over, so the table always has somewhere to scroll.
     #[gpui::test]
@@ -53016,8 +53221,12 @@ mod gateway_surface_tests {
             let Some(row) = cx.debug_bounds(leaked) else {
                 continue;
             };
+            // The row's selector covers its whole plate now, so the last record
+            // in view is cut by the table's bottom edge rather than sitting
+            // inside it. What matters is that the record reached the visible
+            // part of the table instead of still being below the fold.
             assert!(
-                row.top() >= table.top() && row.bottom() <= table.bottom(),
+                row.bottom() > table.top() && row.top() < table.bottom(),
                 "a record paints inside the table: row={row:?} table={table:?}"
             );
             painted += 1;
