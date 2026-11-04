@@ -15,6 +15,8 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 
+use gpui_component::table::TableEvent;
+
 pub(super) use super::route_stage::agent_hue;
 use super::route_stage::{
     FlightClock, HubState, LaneTone, RouteStage, StageAgent, StageFlight, StageHub, StageKey,
@@ -2476,7 +2478,10 @@ impl ManagementCenter {
                     let delegate = RouteRequestsTableDelegate::new(view, snapshot);
                     TableState::new(delegate, window, cx)
                         .col_movable(false)
-                        .col_resizable(false)
+                        // Boundaries drag; the headings do not reorder. The
+                        // lanes also take the width the card leaves, so the
+                        // records fill it instead of hugging the left edge.
+                        .col_resizable(true)
                         .col_selectable(false)
                         // One click picks the request, and picking it again
                         // replays it. A table selection on top of that would
@@ -2485,10 +2490,55 @@ impl ManagementCenter {
                         .sortable(false)
                         .loop_selection(false)
                 });
+                // A width the reader drags is theirs from then on; the table
+                // reports it once the drag ends. The callback only records it:
+                // the table is mid-update while it emits, so its delegate is
+                // told on the next render instead of from inside its own event.
+                self.route_requests_subscription =
+                    Some(cx.subscribe(&table, |this, _, event: &TableEvent, cx| {
+                        let TableEvent::ColumnWidthsChanged(widths) = event else {
+                            return;
+                        };
+                        let mut lanes = [px(0.0); 4];
+                        for (lane, next) in lanes.iter_mut().enumerate() {
+                            let Some(width) = widths.get(lane) else {
+                                return;
+                            };
+                            *next = *width;
+                        }
+                        this.route_requests_dragged = Some(lanes);
+                        cx.notify();
+                    }));
                 self.route_requests_table = Some(table.clone());
                 table
             }
         };
+        if let Some(dragged) = self.route_requests_dragged.take() {
+            table.update(cx, |table, cx| {
+                if table.delegate_mut().set_chosen(dragged) {
+                    table.refresh(cx);
+                }
+            });
+            self.route_requests_laid_width = self.route_requests_width.get();
+        } else {
+            // The width only exists after the wrapper has been laid out, so it
+            // is read here a frame later and handed to the delegate there.
+            // Applying it from prepaint would mean refreshing the table while
+            // it paints.
+            let measured = px(self.route_requests_width.get());
+            if f32::from(measured) > 0.0
+                && (f32::from(measured) - self.route_requests_laid_width).abs() > 0.5
+            {
+                table.update(cx, |table, cx| {
+                    if table.delegate_mut().set_available(measured) {
+                        table.refresh(cx);
+                    }
+                });
+                self.route_requests_laid_width = f32::from(measured);
+            }
+        }
+        let width_target = cx.weak_entity();
+        let width_slot = self.route_requests_width.clone();
         div()
             .id("management-gateway-request-table")
             .debug_selector(|| "management-gateway-request-table".to_string())
@@ -2496,6 +2546,18 @@ impl ManagementCenter {
             .min_w_0()
             .flex_1()
             .min_h_0()
+            .on_prepaint(move |bounds, _, cx| {
+                let width = f32::from(bounds.size.width);
+                if !width.is_finite() || (width - width_slot.get()).abs() <= 0.5 {
+                    return;
+                }
+                // Recorded for the next render: this frame is already drawn.
+                width_slot.set(width);
+                let target = width_target.clone();
+                cx.defer(move |cx| {
+                    let _ = target.update(cx, |_, cx| cx.notify());
+                });
+            })
             .child(
                 DataTable::new(&table)
                     .bordered(false)

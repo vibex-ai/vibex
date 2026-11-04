@@ -2,10 +2,11 @@
 //!
 //! Agents stand on the left, the gateway in the middle and the members of the
 //! route groups on the right, joined by wires. A request is a dot in its
-//! Agent's colour: it leaves the Agent, passes through the gateway and lands
-//! on the member that was tried first, where it waits while that member
-//! answers. A refusal shakes the member and names why; the dot returns to the
-//! gateway and goes on to the next member. An answer flies home as a ring.
+//! Agent's shade of the theme's green: it leaves the Agent, passes through the
+//! gateway and lands on the member that was tried first, where it waits while
+//! that member answers. A refusal shakes the member and names why; the dot
+//! returns to the gateway and goes on to the next member. An answer flies home
+//! as a ring.
 //!
 //! The map decides nothing. Its rows and every verdict come from the gateway's
 //! own events and ledger (`routes.rs` builds the [`StageModel`]); the map only
@@ -999,21 +1000,17 @@ fn paint_wire(window: &mut Window, line: &Polyline, look: WireLook, ink: Ink, no
     }
 }
 
-/// The colour an Agent's requests fly in: one of the theme's chart hues,
-/// chosen by its id so it stays the same from one request to the next. None
-/// is the danger colour, which on this map means a refusal.
+/// The colour an Agent's requests fly in: one step of the theme's green chart
+/// ladder, chosen by its id so it stays the same from one request to the next.
+///
+/// Every Agent flies green: this is a traffic map, and a request moving
+/// through the gateway is a healthy one whatever Agent sent it. The middle
+/// three steps are the ones that read on both appearances — the ladder's ends
+/// are too pale for a light page and too dark for a dark one — and the danger
+/// colour stays free to mean a refusal.
 pub(crate) fn agent_hue(agent_id: &str, cx: &App) -> Hsla {
     let theme = cx.theme();
-    let palette = [
-        theme.chart_1,
-        theme.chart_2,
-        theme.chart_3,
-        theme.chart_4,
-        theme.chart_5,
-        theme.blue,
-        theme.cyan,
-        theme.magenta,
-    ];
+    let palette = [theme.chart_2, theme.chart_3, theme.chart_4];
     let hash = agent_id.bytes().fold(0u32, |hash, byte| {
         hash.wrapping_mul(31).wrapping_add(byte as u32)
     });
@@ -2232,5 +2229,41 @@ mod tests {
             notified.get(),
             "a newly pinned request must invalidate the route stage without a hover"
         );
+    }
+
+    /// Every Agent flies green. The map is traffic, not a category chart, and
+    /// a purple, blue or magenta wire read as a different kind of event than
+    /// the rest of the gateway's page.
+    #[gpui::test]
+    fn every_agent_flies_the_maps_green(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let (hues, greens) = cx.update(|cx| {
+            let theme = cx.theme();
+            let greens = [theme.chart_2, theme.chart_3, theme.chart_4];
+            let hues = [
+                "deepseek",
+                "codex-cli",
+                "claude-code",
+                "gemini",
+                "opencode",
+                "cursor",
+                "amp",
+                "kimi",
+                "copilot",
+            ]
+            .map(|id| agent_hue(id, cx));
+            (hues, greens)
+        });
+        for hue in hues {
+            let green = greens.iter().any(|green| {
+                (hue.h - green.h).abs() < 0.02
+                    && (hue.s - green.s).abs() < 0.02
+                    && (hue.l - green.l).abs() < 0.02
+            });
+            assert!(
+                green,
+                "an Agent's wire must come from the green ladder, got {hue:?}"
+            );
+        }
     }
 }

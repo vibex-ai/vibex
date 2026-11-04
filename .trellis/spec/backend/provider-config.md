@@ -5711,6 +5711,23 @@ ProviderConfigService::{
   member in `failedAttempts`, a member none of whose Keys refused was passed
   over, and the Keys left over belong to the member that answered. A `rejected`
   row walked nowhere — the map shows the gateway turning it back.
+- **Every wire on the map is green.** An Agent's dot and the wires it lights
+  take one of the theme's green chart steps (`agent_hue`, hash of the agent id
+  so an Agent keeps its shade); the palette is the three middle steps, which
+  read on both appearances. The map is traffic, not a category chart: a
+  purple, blue or magenta wire read as a different kind of event, and the one
+  chromatic accent the page spends there should say "a request moved". The
+  danger colour stays free to mean a refusal, and the status dot keeps the
+  ladder's own `success`.
+- **The records fill the card and their boundaries drag.** The Routing tab's
+  table (`routes_delegate.rs`) lays its four lanes out against the width the
+  card measured: a fixed clock column and three text lanes sharing the rest,
+  floored so a narrow window scrolls sideways rather than cutting the headings.
+  Without the share-out every lane sat at 100px and the records hugged the left
+  edge of a table twice their width. Column resize is on, and a width the
+  reader drags replaces the share-out until the table itself changes width —
+  the `ColumnWidthsChanged` subscription records the layout and the next render
+  hands it to the delegate, since the table emits from inside its own update.
 - **The map asks for frames only while something travels.** A dot in flight,
   a shaking member or a fresh refusal tag asks for animation frames; a request
   that is only waiting redraws on a ~15 fps timer for its pulse and flowing

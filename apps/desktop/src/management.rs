@@ -4,6 +4,7 @@
 //! navigation, input entities, loading generations, and redacted projections;
 //! durable records and side effects stay behind `DesktopRuntime::management`.
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::num::IntErrorKind;
 use std::ops::Range;
@@ -1449,6 +1450,18 @@ pub struct ManagementCenter {
     /// The Routing tab's request records, made once and then handed each
     /// redraw's rows. `None` until the tab first draws.
     route_requests_table: Option<Entity<provider_workspace::RouteRequestsTable>>,
+    /// The width the records table was last drawn at, in pixels. Measured on
+    /// the wrapper after layout, so the lanes can take the card's width.
+    route_requests_width: Rc<Cell<f32>>,
+    /// The width the delegate was last laid out at, so a frame that only
+    /// repeats the same measurement does not refresh the table.
+    route_requests_laid_width: f32,
+    /// A layout the reader dragged out, waiting to be folded into the
+    /// delegate. The table emits its width change from inside its own update,
+    /// where its delegate cannot be reached.
+    route_requests_dragged: Option<[Pixels; 4]>,
+    /// The width-change subscription of the records table, kept alive with it.
+    route_requests_subscription: Option<Subscription>,
     /// Requests the gateway is serving right now, newest last.
     ///
     /// The ledger draws them ahead of finished rows: a request that is still
@@ -3061,6 +3074,10 @@ impl ManagementCenter {
             gateway_requests_loading: false,
             gateway_requests_generation: 0,
             route_requests_table: None,
+            route_requests_width: Rc::new(Cell::new(0.0)),
+            route_requests_laid_width: 0.0,
+            route_requests_dragged: None,
+            route_requests_subscription: None,
             gateway_inflight: Vec::new(),
             gateway_route_stage: None,
             gateway_route_pinned: None,
@@ -49819,6 +49836,19 @@ mod gateway_surface_tests {
             source.contains("DataTable::new(&table)"),
             "the records are drawn as the kit's DataTable"
         );
+        // The boundaries drag: a reader can give a lane the width its records
+        // need, and the layout they chose is kept.
+        for marker in [
+            ".col_resizable(true)",
+            "TableEvent::ColumnWidthsChanged",
+            "set_chosen(",
+            "set_available(",
+        ] {
+            assert!(
+                source.contains(marker),
+                "the records must keep their resizable lanes: {marker}"
+            );
+        }
         // The card sizes itself to the page and the table scrolls inside it,
         // so the records never stretch the card with every request — but it
         // keeps a floor, or a tall map would crush it to its heading.
@@ -52231,6 +52261,71 @@ mod gateway_surface_tests {
                 .map(|table| table.read(cx).delegate().rows_count(cx));
             assert_eq!(rows, Some(30), "every request row is offered to the table");
         });
+    }
+
+    /// The records fill the card they sit in: the lanes share its width
+    /// instead of each keeping a fixed hundred pixels and leaving the right
+    /// half of the table empty.
+    #[gpui::test]
+    fn the_gateway_records_take_the_width_of_their_card(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let (center, cx) = cx.add_window_view(ManagementCenter::new);
+        cx.update(|_, cx| {
+            center.update(cx, |center, cx| {
+                center.navigation.active = ManagementSection::Providers;
+                center.selected_global_provider_id = Some(GATEWAY_ROW_ID.to_string());
+                center.gateway_detail_tab = GatewayDetailTab::Routing;
+                let rows = (0..12)
+                    .map(|index| {
+                        let mut row = ledger_request(Some("primary"), None);
+                        row.created_at_ms = 1_700_000_000_000 - index * 1_000;
+                        row
+                    })
+                    .collect::<Vec<_>>();
+                center.apply_gateway_request_page(rows, false);
+                cx.notify();
+            });
+        });
+        cx.simulate_resize(gpui::size(px(1440.0), px(900.0)));
+        // The width is measured on one frame and applied on the next, so the
+        // table is drawn a few times before its columns settle.
+        for _ in 0..4 {
+            cx.update(|window, cx| {
+                let _ = window.draw(cx);
+            });
+            cx.run_until_parked();
+        }
+
+        let table = cx
+            .debug_bounds("management-gateway-request-table")
+            .expect("the records table is drawn");
+        let lanes = center.read_with(cx, |center, cx| {
+            let table = center.route_requests_table.as_ref()?;
+            let table = table.read(cx);
+            Some((0..4).map(|lane| table.col_width(lane)).collect::<Vec<_>>())
+        });
+        let lanes = lanes
+            .expect("the records table exists")
+            .into_iter()
+            .flatten();
+        let widths = lanes.clone().map(f32::from).collect::<Vec<_>>();
+        let total: f32 = widths.iter().sum();
+        let width = f32::from(table.size.width);
+        assert!(
+            total >= width - 40.0,
+            "the lanes should fill the {width}px table, got {total}px"
+        );
+        assert!(
+            total <= width + 1.0,
+            "the lanes must not overflow the table and raise a scrollbar: \
+             {total}px in {width}px"
+        );
+        // The old layout gave every lane 100px, which is what left the card's
+        // right half empty; the text lanes are now several times that.
+        assert!(
+            widths[1..].iter().all(|lane| *lane > 200.0),
+            "the text lanes should take the room: {widths:?}"
+        );
     }
 
     /// The Routing tab's map keeps its height and the records card takes the

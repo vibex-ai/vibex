@@ -19,10 +19,50 @@ use super::*;
 use gpui::{Div, Pixels, Stateful};
 use std::rc::Rc;
 
-/// The width every column asks for, which is also its minimum. The table
-/// shares whatever is left over between the columns, so a wide window reads
-/// each lane in full instead of leaving it half empty.
-const ROUTE_COLUMN_HINT: Pixels = px(100.0);
+/// The clock column's width. Its text never changes shape, so it does not
+/// take part in the share-out; only the three text lanes grow.
+const ROUTE_TIME_WIDTH: Pixels = px(96.0);
+
+/// How much of the rest each text lane asks for. Asked takes the most: it
+/// carries the Agent, the model and the route group's tag on one line.
+const ROUTE_ASKED_SHARE: f32 = 0.38;
+const ROUTE_ANSWERED_SHARE: f32 = 0.32;
+const ROUTE_COST_SHARE: f32 = 0.30;
+
+/// The shortest a lane may be dragged. Below this even the heading stops
+/// being readable, so the drag stops there.
+const ROUTE_LANE_FLOOR: Pixels = px(72.0);
+
+/// The empty column the table paints after the last lane, which takes width
+/// from the same row. Subtracting it keeps the lanes from overflowing the
+/// table by a few pixels and raising a scrollbar nobody asked for.
+const ROUTE_TRAILING_WIDTH: Pixels = px(12.0);
+
+/// How the four lanes fill the table.
+///
+/// The clock keeps a fixed width and the three text lanes share the rest, so
+/// the records fill the card instead of hugging its left edge and leaving the
+/// right half empty. The shares always sum to the room there is, so the lanes
+/// do not overflow and raise a scrollbar nobody asked for. A table too narrow
+/// for three readable lanes keeps them at the floor and scrolls instead of
+/// squeezing the headings into one another.
+fn route_lane_widths(available: Pixels) -> [Pixels; 4] {
+    let usable = (f32::from(available) - f32::from(ROUTE_TRAILING_WIDTH)).max(0.0);
+    let rest = (usable - f32::from(ROUTE_TIME_WIDTH)).max(0.0);
+    let lanes = [
+        (rest * ROUTE_ASKED_SHARE).max(f32::from(ROUTE_LANE_FLOOR)),
+        (rest * ROUTE_ANSWERED_SHARE).max(f32::from(ROUTE_LANE_FLOOR)),
+        (rest * ROUTE_COST_SHARE).max(f32::from(ROUTE_LANE_FLOOR)),
+    ];
+    [ROUTE_TIME_WIDTH, px(lanes[0]), px(lanes[1]), px(lanes[2])]
+}
+
+/// Whether two layouts place every lane at the same pixel.
+fn same_widths(left: [Pixels; 4], right: [Pixels; 4]) -> bool {
+    left.iter()
+        .zip(&right)
+        .all(|(left, right)| (f32::from(*left) - f32::from(*right)).abs() <= 0.5)
+}
 
 /// The records table, kept in step with the rows it paints.
 pub(in crate::management) struct RouteRequestsTableDelegate {
@@ -30,6 +70,12 @@ pub(in crate::management) struct RouteRequestsTableDelegate {
     view: WeakEntity<ManagementCenter>,
     /// The rows, and everything the rows say besides the record itself.
     data: Rc<RouteRequestsSnapshot>,
+    /// The widths the table is told to draw with.
+    widths: [Pixels; 4],
+    /// The width the current layout was chosen for. A drag keeps the widths
+    /// it produced while this still matches; a window that changes size lays
+    /// the lanes out afresh.
+    laid_for: Pixels,
 }
 
 /// What the records table paints, as one value.
@@ -49,7 +95,42 @@ pub(super) struct RouteRequestsSnapshot {
 
 impl RouteRequestsTableDelegate {
     pub(super) fn new(view: WeakEntity<ManagementCenter>, data: Rc<RouteRequestsSnapshot>) -> Self {
-        Self { view, data }
+        Self {
+            view,
+            data,
+            widths: route_lane_widths(px(0.0)),
+            laid_for: px(0.0),
+        }
+    }
+
+    /// Takes the width the table has to fill, as the tab measured it.
+    ///
+    /// Returns whether the columns moved: the table has to be refreshed then,
+    /// because it keeps its own copy of the widths once laid out. A drag only
+    /// lasts as long as the table keeps its width; a resize lays the lanes out
+    /// afresh, since a drag's widths were chosen against the old row.
+    pub(super) fn set_available(&mut self, available: Pixels) -> bool {
+        if !f32::from(available).is_finite() || available <= px(0.0) {
+            return false;
+        }
+        if (f32::from(available) - f32::from(self.laid_for)).abs() <= 0.5 {
+            return false;
+        }
+        self.laid_for = available;
+        let widths = route_lane_widths(available);
+        let changed = !same_widths(widths, self.widths);
+        self.widths = widths;
+        changed
+    }
+
+    /// Folds in the layout the reader dragged out.
+    ///
+    /// Returns whether the columns moved. The drag outranks the share-out at
+    /// the width it was made at, so the lanes stay where they were put.
+    pub(super) fn set_chosen(&mut self, chosen: [Pixels; 4]) -> bool {
+        let changed = !same_widths(chosen, self.widths);
+        self.widths = chosen;
+        changed
     }
 
     /// Takes the rows and the filters as they are now, and says whether the
@@ -120,15 +201,15 @@ impl RouteColumn {
         Self::ALL.get(col_ix).copied().unwrap_or(Self::Time)
     }
 
-    fn column(self) -> Column {
+    fn column(self, width: Pixels) -> Column {
         // The widget's own cell padding is all these lanes need.
+        let column = Column::new(self.key(), self.name())
+            .width(width)
+            .min_width(ROUTE_LANE_FLOOR)
+            .resizable(true);
         match self {
-            Self::Cost => Column::new(self.key(), self.name())
-                .width(ROUTE_COLUMN_HINT)
-                .text_right(),
-            Self::Time | Self::Asked | Self::Answered => {
-                Column::new(self.key(), self.name()).width(ROUTE_COLUMN_HINT)
-            }
+            Self::Cost => column.text_right(),
+            Self::Time | Self::Asked | Self::Answered => column,
         }
     }
 }
@@ -143,7 +224,8 @@ impl TableDelegate for RouteRequestsTableDelegate {
     }
 
     fn column(&self, col_ix: usize, _cx: &App) -> Column {
-        RouteColumn::at(col_ix).column()
+        let lane = col_ix.min(RouteColumn::ALL.len() - 1);
+        RouteColumn::at(col_ix).column(self.widths[lane])
     }
 
     fn render_th(
@@ -509,5 +591,125 @@ fn route_row_parts(
         detail,
         tags,
         metrics,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::routes::WalkStep;
+    use super::*;
+
+    fn widths(available: f32) -> [f32; 4] {
+        route_lane_widths(px(available)).map(f32::from)
+    }
+
+    /// The lanes fill the row they are given: no leftover on the right, and
+    /// no overflow that would raise a horizontal scrollbar for nothing.
+    #[test]
+    fn the_lanes_share_the_width_they_are_given() {
+        for available in [640.0f32, 900.0, 1_280.0, 1_880.0] {
+            let lanes = widths(available);
+            let total: f32 = lanes.iter().sum();
+            assert!(
+                total >= available - f32::from(ROUTE_TRAILING_WIDTH) - 0.5
+                    && total <= available - f32::from(ROUTE_TRAILING_WIDTH) + 0.5,
+                "{available}px should be shared out, got {total}px from {lanes:?}"
+            );
+            assert!(lanes.iter().all(|lane| *lane > 0.0));
+        }
+    }
+
+    /// The clock keeps its width and the text lanes grow with the window, so a
+    /// wider card reads more of each record rather than leaving air on the
+    /// right.
+    #[test]
+    fn a_wider_table_gives_the_text_lanes_more_room() {
+        let narrow = widths(700.0);
+        let wide = widths(1_400.0);
+        assert_eq!(narrow[0], wide[0], "the clock column is fixed");
+        for lane in 1..4 {
+            assert!(
+                wide[lane] > narrow[lane],
+                "lane {lane} should grow: {} -> {}",
+                narrow[lane],
+                wide[lane]
+            );
+        }
+    }
+
+    /// A very narrow window keeps the lanes readable instead of crushing
+    /// them; the table scrolls sideways from there.
+    #[test]
+    fn a_narrow_table_keeps_the_lanes_readable() {
+        let lanes = route_lane_widths(px(200.0));
+        assert_eq!(lanes[1], ROUTE_LANE_FLOOR);
+        assert_eq!(lanes[2], ROUTE_LANE_FLOOR);
+        assert_eq!(lanes[3], ROUTE_LANE_FLOOR);
+        assert!(
+            lanes.iter().map(|lane| f32::from(*lane)).sum::<f32>() > 200.0,
+            "a table this narrow scrolls rather than cutting the headings"
+        );
+    }
+
+    /// Dragging a boundary outranks the share-out at the width it was made
+    /// at, and resizing the window lays the lanes out again.
+    #[test]
+    fn a_dragged_layout_wins_until_the_table_resizes() {
+        let mut delegate = RouteRequestsTableDelegate {
+            view: WeakEntity::new_invalid(),
+            data: Rc::new(RouteRequestsSnapshot {
+                rows: Vec::new(),
+                pinned: None,
+                now: 0,
+                data: Rc::new(EmptyFacts),
+                empty: RouteRequestsEmpty::Range,
+                loading: false,
+            }),
+            widths: route_lane_widths(px(1000.0)),
+            laid_for: px(1000.0),
+        };
+        let dragged = [px(96.0), px(520.0), px(220.0), px(164.0)];
+        assert!(delegate.set_chosen(dragged));
+        // The widths are read straight off the delegate: `column` needs an
+        // `App`, and the layout is what this test is about.
+        assert_eq!(delegate.widths[1], dragged[1]);
+        // The same width arriving again leaves the drag alone.
+        assert!(!delegate.set_available(px(1000.0)));
+        assert_eq!(delegate.widths, dragged);
+        // A new width is a new row, so the lanes are laid out for it.
+        assert!(delegate.set_available(px(1300.0)));
+        assert_ne!(delegate.widths, dragged);
+        assert_eq!(delegate.widths[0], ROUTE_TIME_WIDTH);
+    }
+
+    struct EmptyFacts;
+
+    impl RouteRequestsData for EmptyFacts {
+        fn route_name(&self, _model: &str) -> Option<String> {
+            None
+        }
+        fn provider_name(&self, _profile: &vibex_core::ModelProviderProfileId) -> String {
+            String::new()
+        }
+        fn provider_label(
+            &self,
+            _profile: &vibex_core::ModelProviderProfileId,
+            _recorded: Option<&str>,
+        ) -> String {
+            String::new()
+        }
+        fn ledger_walk(&self, _request: &vibex_core::GatewayRequestSummary) -> Vec<WalkStep> {
+            Vec::new()
+        }
+        fn walk_moves(&self, _walk: &[WalkStep]) -> usize {
+            0
+        }
+        fn failure_text(
+            &self,
+            _request: &vibex_core::GatewayRequestSummary,
+            _walk: &[WalkStep],
+        ) -> String {
+            String::new()
+        }
     }
 }
