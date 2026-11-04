@@ -2329,6 +2329,7 @@ pub enum RemoteProviderOperationKind {
     FetchAgentModelProviderProfileModels,
     FetchAgentModelProviderDraftModels,
     ModelCapabilitySuggestion,
+    CatalogOfferedModels,
     ModelCanonicalIds,
     ModelGatewaySnapshot,
     UpdateModelGatewaySettings,
@@ -2810,6 +2811,19 @@ pub struct RemoteModelCapabilitySuggestionRequest {
 #[serde(rename_all = "camelCase")]
 pub struct RemoteModelCapabilitySuggestionResponse {
     pub suggestion: Option<crate::GatewayCapabilitySuggestion>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteCatalogOfferedModelsRequest {
+    pub auth: RemoteAuthProof,
+    pub request: crate::CatalogOfferedModelsRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteCatalogOfferedModelsResponse {
+    pub models: Vec<crate::CatalogOfferedModel>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -4003,6 +4017,7 @@ pub enum RemoteProviderRequest {
     FetchAgentModelProviderProfileModels(RemoteAgentModelProviderProfileFetchModelsRequest),
     FetchAgentModelProviderDraftModels(RemoteAgentModelProviderDraftFetchModelsRequest),
     ModelCapabilitySuggestion(RemoteModelCapabilitySuggestionRequest),
+    CatalogOfferedModels(RemoteCatalogOfferedModelsRequest),
     ModelCanonicalIds(RemoteModelCanonicalIdsRequest),
     ModelGatewaySnapshot(RemoteModelGatewaySnapshotRequest),
     UpdateModelGatewaySettings(RemoteModelGatewaySettingsUpdateRequest),
@@ -4231,6 +4246,7 @@ impl RemoteProviderRequest {
             Self::ModelCapabilitySuggestion(_) => {
                 RemoteProviderOperationKind::ModelCapabilitySuggestion
             }
+            Self::CatalogOfferedModels(_) => RemoteProviderOperationKind::CatalogOfferedModels,
             Self::ModelCanonicalIds(_) => RemoteProviderOperationKind::ModelCanonicalIds,
             Self::ModelGatewaySnapshot(_) => RemoteProviderOperationKind::ModelGatewaySnapshot,
             Self::UpdateModelGatewaySettings(_) => {

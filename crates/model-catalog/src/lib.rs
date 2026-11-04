@@ -79,6 +79,29 @@ mod tests {
         }
     }
 
+    /// The bundled asset has to answer for every preset that names a
+    /// catalogue entry.
+    ///
+    /// The asset is what a first launch and an offline machine have instead of
+    /// the network, and a Provider's model list now comes from it. A preset
+    /// whose entry is missing would open an empty picker with no way to fill
+    /// it, so the mismatch fails here rather than in a user's editor.
+    #[test]
+    fn the_bundled_catalog_covers_every_preset_entry() {
+        let catalog = parse_catalog(include_str!("../assets/models-dev-bundled.json"))
+            .expect("the bundled catalogue parses");
+        for preset in vibex_core::provider_presets() {
+            let Some(catalog_id) = preset.catalog_id.as_deref() else {
+                continue;
+            };
+            assert!(
+                catalog.provider(catalog_id).is_some(),
+                "{} names `{catalog_id}`, which the bundled catalogue does not carry",
+                preset.id
+            );
+        }
+    }
+
     /// A `cost` object in the upstream document is not read into the catalog,
     /// so serialising the parsed catalog cannot leak money either.
     #[test]

@@ -3041,6 +3041,38 @@ impl ManagementBackend for NativeBackend {
         })
     }
 
+    fn catalog_offered_models(
+        &self,
+        request: vibex_core::CatalogOfferedModelsRequest,
+    ) -> BackendFuture<'_, Vec<vibex_core::CatalogOfferedModel>> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            let models = runtime
+                .model_catalog()
+                .offered_models(&request.provider_id, vibex_core::unix_timestamp_ms());
+            let prefix = request
+                .only
+                .as_deref()
+                .map(str::trim)
+                .filter(|only| !only.is_empty());
+            Ok(models
+                .into_iter()
+                .filter(|model| prefix.is_none_or(|prefix| model.id.starts_with(prefix)))
+                .map(|model| vibex_core::CatalogOfferedModel {
+                    id: model.id,
+                    display_name: model.display_name,
+                    context_tokens: model.context_tokens,
+                    output_tokens: model.output_tokens,
+                    reasoning: model.reasoning,
+                    image_input: model.image_input,
+                    pdf_input: model.pdf_input,
+                    temperature: model.temperature,
+                })
+                .collect())
+        })
+    }
+
     fn model_canonical_ids(
         &self,
         request: vibex_core::ModelCanonicalIdsRequest,

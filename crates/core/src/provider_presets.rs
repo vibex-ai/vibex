@@ -121,14 +121,15 @@ pub struct ProviderPreset {
     /// The service runs on this machine and needs no credential.
     pub no_key: bool,
     pub regions: Vec<ProviderPresetRegion>,
-    /// Model ids the preset offers out of the box.
-    pub models: Vec<String>,
-    /// The vendor's model-list endpoint is unusable, so a missing list falls
-    /// back to `models` instead of failing.
-    pub no_list: bool,
-    pub endpoint_hint: Option<String>,
     /// Only model ids with this prefix belong to the plan.
+    ///
+    /// A preset never carries a model list of its own: the ids come from the
+    /// models.dev catalogue entry `catalog_id` names, so a vendor's new model
+    /// reaches the picker on the next catalogue refresh instead of waiting for
+    /// a release. This prefix is the one thing the catalogue cannot express,
+    /// because a plan and its vendor's metered API share an entry.
     pub only: Option<String>,
+    pub endpoint_hint: Option<String>,
     /// Static price description, when the preset is a paid plan rather than a
     /// metered API. This is vendor copy, not a computed amount.
     pub plan_note: Option<String>,
@@ -225,12 +226,15 @@ impl ProviderPreset {
         preset
     }
 
-    /// The model list a new Provider should carry.
+    /// The model ids this preset is allowed to offer, out of the catalogue's
+    /// own list.
     ///
-    /// `only` filters the vendor's list; `models` fills in when the vendor's
-    /// endpoint cannot answer at all.
-    pub fn offered_models(&self, fetched: &[String]) -> Vec<String> {
-        let filtered = fetched
+    /// `only` is the one filter the catalogue cannot express: a plan and its
+    /// vendor's metered API share an entry, so the prefix is what keeps a
+    /// Token Plan from offering models its key cannot spend on. Everything
+    /// else is the catalogue's answer.
+    pub fn offered_models(&self, catalogue: &[String]) -> Vec<String> {
+        catalogue
             .iter()
             .filter(|model| {
                 self.only
@@ -238,17 +242,7 @@ impl ProviderPreset {
                     .is_none_or(|prefix| model.starts_with(prefix))
             })
             .cloned()
-            .collect::<Vec<_>>();
-        if filtered.is_empty() && (self.no_list || self.only.is_some()) {
-            return self.models.clone();
-        }
-        let mut models = filtered;
-        for model in &self.models {
-            if !models.contains(model) {
-                models.push(model.clone());
-            }
-        }
-        models
+            .collect()
     }
 
     /// The `headerOverrideJson` value a Provider created from this preset
@@ -287,7 +281,16 @@ impl ProviderPreset {
     /// written into the Provider options because that is the field the
     /// projection reads back; leaving it implicit lets an editor fall back to
     /// "the first protocol that has a URL".
-    pub fn draft_profile(&self, agent_id: &crate::AgentId) -> crate::ProviderProfile {
+    ///
+    /// `models` is the catalogue's list for this preset, already filtered by
+    /// [`Self::offered_models`]. A preset does not carry one of its own, so a
+    /// caller that has no catalogue passes an empty slice and gets a draft
+    /// whose model list the editor fills after the first fetch.
+    pub fn draft_profile(
+        &self,
+        agent_id: &crate::AgentId,
+        models: &[String],
+    ) -> crate::ProviderProfile {
         let mut profile = crate::ProviderProfile::local_default(crate::ProviderKind::Acp);
         profile.id = crate::ProviderProfileId::parse(format!(
             "provider_preset_{}",
@@ -303,9 +306,8 @@ impl ProviderPreset {
         profile.base_url = wire_api
             .and_then(|wire_api| self.endpoint_for(wire_api))
             .map(str::to_string);
-        profile.default_model = self.models.first().cloned();
-        profile.configured_models = self
-            .models
+        profile.default_model = models.first().cloned();
+        profile.configured_models = models
             .iter()
             .map(|model| crate::ProviderConfiguredModel {
                 id: model.clone(),
@@ -416,12 +418,7 @@ fn endpoints(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
         .collect()
 }
 
-fn preset(
-    id: &str,
-    display_name: &str,
-    endpoint_entries: &[(&str, &str)],
-    models: &[&str],
-) -> ProviderPreset {
+fn preset(id: &str, display_name: &str, endpoint_entries: &[(&str, &str)]) -> ProviderPreset {
     ProviderPreset {
         id: id.to_string(),
         display_name: display_name.to_string(),
@@ -432,14 +429,22 @@ fn preset(
         key_hint: None,
         no_key: false,
         regions: Vec::new(),
-        models: models.iter().map(|model| (*model).to_string()).collect(),
-        no_list: false,
         endpoint_hint: None,
         only: None,
         plan_note: None,
         caveats: Vec::new(),
         headers: Vec::new(),
     }
+}
+
+/// Builds a minimal preset for tests outside this module.
+#[cfg(test)]
+pub(crate) fn preset_for_test(
+    id: &str,
+    display_name: &str,
+    endpoint_entries: &[(&str, &str)],
+) -> ProviderPreset {
+    preset(id, display_name, endpoint_entries)
 }
 
 /// The header OpenCode's gateways route a request by.
@@ -474,7 +479,6 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
                 PROVIDER_PRESET_ANTHROPIC,
                 "Anthropic",
                 &[(messages, "https://api.anthropic.com")],
-                &["claude-sonnet-4-5", "claude-opus-4-1", "claude-haiku-4-5"],
             )
         },
         ProviderPreset {
@@ -489,7 +493,6 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
                     (chat, "https://api.openai.com/v1"),
                     (responses, "https://api.openai.com/v1"),
                 ],
-                &["gpt-5", "gpt-5-mini", "o4-mini"],
             )
         },
         ProviderPreset {
@@ -500,7 +503,6 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
                 PROVIDER_PRESET_GOOGLE_GEMINI,
                 "Google Gemini",
                 &[(gemini, "https://generativelanguage.googleapis.com")],
-                &["gemini-2.5-pro", "gemini-2.5-flash"],
             )
         },
         ProviderPreset {
@@ -515,7 +517,6 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
                     (chat, "https://api.deepseek.com/v1"),
                     (messages, "https://api.deepseek.com/anthropic"),
                 ],
-                &["deepseek-chat", "deepseek-reasoner"],
             )
         },
         ProviderPreset {
@@ -529,7 +530,6 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
                     (chat, "https://api.moonshot.cn/v1"),
                     (messages, "https://api.moonshot.cn/anthropic"),
                 ],
-                &["kimi-k2", "kimi-k2-turbo"],
             )
         },
         ProviderPreset {
@@ -545,7 +545,6 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
                 PROVIDER_PRESET_ZHIPU_GLM,
                 "Zhipu GLM",
                 &[(chat, "https://open.bigmodel.cn/api/paas/v4")],
-                &["glm-4.6", "glm-4.5-air"],
             )
         },
         ProviderPreset {
@@ -560,11 +559,6 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
                     (responses, "https://openrouter.ai/api/v1"),
                     (messages, "https://openrouter.ai/api"),
                 ],
-                &[
-                    "deepseek/deepseek-chat",
-                    "anthropic/claude-sonnet-4.5",
-                    "openai/gpt-5",
-                ],
             )
         },
         ProviderPreset {
@@ -576,7 +570,6 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
                 PROVIDER_PRESET_XAI,
                 "xAI",
                 &[(chat, "https://api.x.ai/v1")],
-                &["grok-4.7", "grok-4.6", "grok-4.5"],
             )
         },
         ProviderPreset {
@@ -587,11 +580,6 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
                 PROVIDER_PRESET_MISTRAL,
                 "Mistral",
                 &[(chat, "https://api.mistral.ai/v1")],
-                &[
-                    "mistral-large-latest",
-                    "mistral-small-latest",
-                    "codestral-latest",
-                ],
             )
         },
         ProviderPreset {
@@ -603,7 +591,6 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
                 PROVIDER_PRESET_GROQ,
                 "Groq",
                 &[(chat, "https://api.groq.com/openai/v1")],
-                &["llama-3.3-70b-versatile", "openai/gpt-oss-120b"],
             )
         },
         ProviderPreset {
@@ -619,24 +606,16 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
                 PROVIDER_PRESET_SILICONFLOW,
                 "SiliconFlow",
                 &[(chat, "https://api.siliconflow.cn/v1")],
-                &[
-                    "deepseek-ai/DeepSeek-V3",
-                    "Qwen/Qwen3-32B",
-                    "Qwen/Qwen3-Coder-480B-A35B-Instruct",
-                ],
             )
         },
         ProviderPreset {
             website: Some("https://ollama.com".to_string()),
             no_key: true,
-            no_list: false,
             endpoint_hint: Some("A model server on this machine; no API key is needed".to_string()),
-            models: vec!["llama3.3".to_string(), "qwen3".to_string()],
             ..preset(
                 PROVIDER_PRESET_OLLAMA,
                 "Ollama",
                 &[(chat, "http://127.0.0.1:11434/v1")],
-                &[],
             )
         },
         ProviderPreset {
@@ -647,7 +626,6 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
                 "cohere",
                 "Cohere",
                 &[(chat, "https://api.cohere.ai/compatibility/v1")],
-                &["command-a-03-2025", "command-r-plus-08-2024"],
             )
         },
         ProviderPreset {
@@ -658,11 +636,6 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
                 "together",
                 "Together AI",
                 &[(chat, "https://api.together.xyz/v1")],
-                &[
-                    "deepseek-ai/DeepSeek-V3",
-                    "Qwen/Qwen3-235B-A22B-Instruct-2507-tput",
-                    "meta-llama/Llama-3.3-70B-Instruct-Turbo",
-                ],
             )
         },
         ProviderPreset {
@@ -673,10 +646,6 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
                 "fireworks",
                 "Fireworks AI",
                 &[(chat, "https://api.fireworks.ai/inference/v1")],
-                &[
-                    "accounts/fireworks/models/deepseek-v3",
-                    "accounts/fireworks/models/qwen3-235b-a22b",
-                ],
             )
         },
         ProviderPreset {
@@ -687,7 +656,6 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
                 "perplexity",
                 "Perplexity",
                 &[(chat, "https://api.perplexity.ai")],
-                &["sonar-pro", "sonar-reasoning-pro"],
             )
         },
         ProviderPreset {
@@ -698,7 +666,6 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
                 "cerebras",
                 "Cerebras",
                 &[(chat, "https://api.cerebras.ai/v1")],
-                &["llama-3.3-70b", "qwen-3-32b"],
             )
         },
         ProviderPreset {
@@ -709,21 +676,15 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
                 "deepinfra",
                 "DeepInfra",
                 &[(chat, "https://api.deepinfra.com/v1/openai")],
-                &[
-                    "deepseek-ai/DeepSeek-V3",
-                    "Qwen/Qwen3-235B-A22B-Instruct-2507",
-                ],
             )
         },
         ProviderPreset {
-            catalog_id: Some("hyperbolic".to_string()),
             website: Some("https://hyperbolic.xyz".to_string()),
             keys_url: Some("https://app.hyperbolic.xyz/settings".to_string()),
             ..preset(
                 "hyperbolic",
                 "Hyperbolic",
                 &[(chat, "https://api.hyperbolic.xyz/v1")],
-                &["deepseek-ai/DeepSeek-V3", "Qwen/Qwen3-235B-A22B"],
             )
         },
         ProviderPreset {
@@ -734,7 +695,6 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
                 "nebius",
                 "Nebius",
                 &[(chat, "https://api.studio.nebius.com/v1")],
-                &["deepseek-ai/DeepSeek-V3", "Qwen/Qwen3-235B-A22B"],
             )
         },
         ProviderPreset {
@@ -745,7 +705,6 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
                 "novita",
                 "Novita AI",
                 &[(chat, "https://api.novita.ai/v3/openai")],
-                &["deepseek/deepseek-v3", "qwen/qwen3-235b-a22b-fp8"],
             )
         },
         ProviderPreset {
@@ -756,7 +715,6 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
                 "sambanova",
                 "SambaNova",
                 &[(chat, "https://api.sambanova.ai/v1")],
-                &["DeepSeek-V3-0324", "Meta-Llama-3.3-70B-Instruct"],
             )
         },
         ProviderPreset {
@@ -770,7 +728,6 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
                 "minimax",
                 "MiniMax",
                 &[(chat, "https://api.minimax.io/v1")],
-                &["MiniMax-M2", "MiniMax-Text-01"],
             )
         },
         ProviderPreset {
@@ -781,18 +738,15 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
                 "qwen",
                 "Qwen (DashScope)",
                 &[(chat, "https://dashscope.aliyuncs.com/compatible-mode/v1")],
-                &["qwen3-max", "qwen3-coder-plus", "qwen3-235b-a22b"],
             )
         },
         ProviderPreset {
-            catalog_id: Some("baidu".to_string()),
             website: Some("https://cloud.baidu.com/product/wenxinworkshop".to_string()),
             keys_url: Some("https://console.bce.baidu.com/iam/#/iam/apikey/list".to_string()),
             ..preset(
                 "qianfan",
                 "Baidu Qianfan",
                 &[(chat, "https://qianfan.baidubce.com/v2")],
-                &["ernie-4.5-8k-preview", "ernie-x1-32k-preview"],
             )
         },
         ProviderPreset {
@@ -803,40 +757,33 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
                 "doubao",
                 "ByteDance Doubao",
                 &[(chat, "https://ark.cn-beijing.volces.com/api/v3")],
-                &["doubao-seed-1-6-250615", "doubao-1-5-pro-32k-250115"],
             )
         },
         ProviderPreset {
-            catalog_id: Some("tencent".to_string()),
             website: Some("https://cloud.tencent.com/product/hunyuan".to_string()),
             keys_url: Some("https://console.cloud.tencent.com/hunyuan".to_string()),
             ..preset(
                 "hunyuan",
                 "Tencent Hunyuan",
                 &[(chat, "https://api.hunyuan.cloud.tencent.com/v1")],
-                &["hunyuan-turbos-latest", "hunyuan-large"],
             )
         },
         ProviderPreset {
-            catalog_id: Some("iflytek".to_string()),
             website: Some("https://xinghuo.xfyun.cn".to_string()),
             keys_url: Some("https://console.xfyun.cn/services/bmxh".to_string()),
             ..preset(
                 "spark",
                 "iFlytek Spark",
                 &[(chat, "https://spark-api-open.xf-yun.com/v1")],
-                &["4.0Ultra", "generalv3.5"],
             )
         },
         ProviderPreset {
-            catalog_id: Some("yi".to_string()),
             website: Some("https://www.lingyiwanwu.com".to_string()),
             keys_url: Some("https://platform.lingyiwanwu.com/apikeys".to_string()),
             ..preset(
                 "yi",
                 "01.AI Yi",
                 &[(chat, "https://api.lingyiwanwu.com/v1")],
-                &["yi-lightning", "yi-large"],
             )
         },
         ProviderPreset {
@@ -847,18 +794,15 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
                 "stepfun",
                 "StepFun",
                 &[(chat, "https://api.stepfun.com/v1")],
-                &["step-2-16k", "step-1v-8k"],
             )
         },
         ProviderPreset {
-            catalog_id: Some("baichuan".to_string()),
             website: Some("https://www.baichuan-ai.com".to_string()),
             keys_url: Some("https://platform.baichuan-ai.com/console/apikey".to_string()),
             ..preset(
                 "baichuan",
                 "Baichuan",
                 &[(chat, "https://api.baichuan-ai.com/v1")],
-                &["Baichuan4", "Baichuan3-Turbo"],
             )
         },
         ProviderPreset {
@@ -869,18 +813,15 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
                 "upstage",
                 "Upstage",
                 &[(chat, "https://api.upstage.ai/v1")],
-                &["solar-pro2", "solar-mini"],
             )
         },
         ProviderPreset {
-            catalog_id: Some("reka".to_string()),
             website: Some("https://www.reka.ai".to_string()),
             keys_url: Some("https://platform.reka.ai".to_string()),
             ..preset(
                 "reka",
                 "Reka",
                 &[(chat, "https://api.reka.ai/v1")],
-                &["reka-core", "reka-flash"],
             )
         },
         ProviderPreset {
@@ -891,7 +832,6 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
                 "ai21",
                 "AI21 Labs",
                 &[(chat, "https://api.ai21.com/studio/v1")],
-                &["jamba-large-1.7", "jamba-mini-1.7"],
             )
         },
         ProviderPreset {
@@ -902,18 +842,16 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
                 "nvidia",
                 "NVIDIA NIM",
                 &[(chat, "https://integrate.api.nvidia.com/v1")],
-                &["deepseek-ai/deepseek-v3.1", "qwen/qwen3-235b-a22b"],
             )
         },
         ProviderPreset {
-            catalog_id: Some("github".to_string()),
+            catalog_id: Some("github-copilot".to_string()),
             website: Some("https://github.com/marketplace/models".to_string()),
             keys_url: Some("https://github.com/settings/tokens".to_string()),
             ..preset(
                 "github-models",
                 "GitHub Models",
                 &[(chat, "https://models.inference.ai.azure.com")],
-                &["gpt-4.1", "gpt-4.1-mini"],
             )
         },
         ProviderPreset {
@@ -924,7 +862,6 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
                 "aihubmix",
                 "AiHubMix",
                 &[(chat, "https://aihubmix.com/v1")],
-                &["gpt-4.1", "claude-sonnet-4-20250514"],
             )
         },
         ProviderPreset {
@@ -935,25 +872,20 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
                 "vercel-gateway",
                 "Vercel AI Gateway",
                 &[(chat, "https://ai-gateway.vercel.sh/v1")],
-                &["openai/gpt-4.1", "anthropic/claude-sonnet-4"],
             )
         },
         ProviderPreset {
             website: Some("https://lmstudio.ai".to_string()),
             no_key: true,
-            no_list: false,
             endpoint_hint: Some("A model server on this machine; no API key is needed".to_string()),
-            models: vec!["local-model".to_string()],
             ..preset(
                 "lmstudio",
                 "LM Studio",
                 &[(chat, "http://127.0.0.1:1234/v1")],
-                &[],
             )
         },
         ProviderPreset {
             website: Some("https://usemagpie.ai".to_string()),
-            no_list: false,
             key_hint: Some(
                 "magpie on this machine, or a gateway key for a remote Magpie".to_string(),
             ),
@@ -970,7 +902,6 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
                     (messages, "http://127.0.0.1:3425"),
                     (gemini, "http://127.0.0.1:3425"),
                 ],
-                &[],
             )
         },
         ProviderPreset {
@@ -987,38 +918,23 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
                     (responses, "https://opencode.ai/zen/go/v1"),
                     (messages, "https://opencode.ai/zen/go"),
                 ],
-                &[],
             )
         },
         ProviderPreset {
             plan_note: Some("$9.99/month".to_string()),
+            catalog_id: Some("cline-pass".to_string()),
             website: Some("https://docs.cline.bot/getting-started/clinepass".to_string()),
             keys_url: Some("https://app.cline.bot".to_string()),
-            // The vendor's own model list answers with its metered models only,
-            // never the plan's, so the plan's list is written here and `only`
-            // keeps a metered model from being mistaken for a covered one. A
-            // fetch that returns none of them therefore falls back to this
-            // list instead of reporting that the account has no models.
+            // The vendor's own `/models` answers with its metered catalogue
+            // only, never the plan's ids. The catalogue entry carries both, so
+            // `only` is what keeps a metered id from being mistaken for a
+            // covered one.
             only: Some("cline-pass/".to_string()),
             caveats: vec![ProviderPresetCaveat::ModelListExcludesPlan],
             ..preset(
                 PROVIDER_PRESET_CLINEPASS,
                 "ClinePass",
                 &[(chat, "https://api.cline.bot/api/v1")],
-                &[
-                    "cline-pass/glm-5.3",
-                    "cline-pass/glm-5.3-flash",
-                    "cline-pass/kimi-k3",
-                    "cline-pass/deepseek-v4-pro",
-                    "cline-pass/deepseek-v4.1-flash",
-                    "cline-pass/mimo-v2.5",
-                    "cline-pass/mimo-v2.5-pro",
-                    "cline-pass/minimax-m3",
-                    "cline-pass/muse-spark-1.3-contributor",
-                    "cline-pass/qwen3.8-max",
-                    "cline-pass/qwen3.7-max",
-                    "cline-pass/qwen3.7-plus",
-                ],
             )
         },
         // The second region of a vendor whose two hosts take different keys.
@@ -1033,7 +949,6 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
                     (chat, "https://api.moonshot.cn/v1"),
                     (messages, "https://api.moonshot.cn/anthropic"),
                 ],
-                &["kimi-k2.6", "kimi-k2.7-code", "kimi-k3"],
             )
         },
         // A membership's own endpoint: it serves the coding models alone and
@@ -1051,7 +966,6 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
                     (chat, "https://api.kimi.com/coding/v1"),
                     (messages, "https://api.kimi.com/coding"),
                 ],
-                &["k3", "k3.1-pro", "kimi-for-coding"],
             )
         },
         // The same vendor's international host. The catalogue names it apart
@@ -1067,7 +981,6 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
                     (chat, "https://api.z.ai/api/paas/v4"),
                     (messages, "https://api.z.ai/api/anthropic"),
                 ],
-                &["glm-4.7", "glm-4.6", "glm-4.5-air"],
             )
         },
         // A subscription served at its own path: its key is refused at the
@@ -1087,7 +1000,6 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
                     (responses, "https://open.bigmodel.cn/api/v1"),
                     (messages, "https://open.bigmodel.cn/api/anthropic"),
                 ],
-                &["glm-5.3", "glm-5.3-flash", "glm-5.3-highspeed", "glm-4.6v"],
             )
         },
         ProviderPreset {
@@ -1104,7 +1016,6 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
                     (chat, "https://api.minimaxi.com/v1"),
                     (messages, "https://api.minimaxi.com/anthropic"),
                 ],
-                &["MiniMax-M2.7", "MiniMax-M2.5", "MiniMax-M2"],
             )
         },
         ProviderPreset {
@@ -1123,7 +1034,6 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
                     (chat, "https://api.minimax.io/v1"),
                     (messages, "https://api.minimax.io/anthropic"),
                 ],
-                &["MiniMax-M3.1-Flash", "MiniMax-M3", "MiniMax-M2.7"],
             )
         },
         // StepFun's two hosts and its subscription. The plan's key is refused
@@ -1140,7 +1050,6 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
                     (chat, "https://api.stepfun.ai/v1"),
                     (messages, "https://api.stepfun.ai"),
                 ],
-                &["step-3.7-flash", "step-3.5-flash", "step-5-preview"],
             )
         },
         ProviderPreset {
@@ -1159,7 +1068,6 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
                     (chat, "https://api.stepfun.ai/step_plan/v1"),
                     (messages, "https://api.stepfun.ai/step_plan"),
                 ],
-                &["step-3.7-flash", "step-3.5-flash", "step-5-preview"],
             )
         },
         ProviderPreset {
@@ -1178,7 +1086,6 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
                     (chat, "https://api.stepfun.com/step_plan/v1"),
                     (messages, "https://api.stepfun.com/step_plan"),
                 ],
-                &["step-3.7-flash", "step-3.5-flash", "step-router-v1"],
             )
         },
         // An inference aggregator: one token reaches many vendors' open
@@ -1193,11 +1100,6 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
                 &[
                     (chat, "https://api-inference.modelscope.cn/v1"),
                     (responses, "https://api-inference.modelscope.cn/v1"),
-                ],
-                &[
-                    "Qwen/Qwen3-235B-A22B-Instruct-2507",
-                    "Qwen/Qwen3-Coder-30B-A3B-Instruct",
-                    "ZhipuAI/GLM-4.6",
                 ],
             )
         },
@@ -1217,7 +1119,6 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
                     (responses, "https://opencode.ai/zen/v1"),
                     (messages, "https://opencode.ai/zen"),
                 ],
-                &[],
             )
         },
         // Xiaomi sells a metered API and a regional subscription, each on its
@@ -1233,7 +1134,6 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
                     (chat, "https://api.xiaomimimo.com/v1"),
                     (responses, "https://api.xiaomimimo.com/v1"),
                 ],
-                &["mimo-v2.6-pro", "mimo-v2.5-pro", "mimo-v2.6-flash"],
             )
         },
         ProviderPreset {
@@ -1250,7 +1150,6 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
                     (responses, "https://token-plan-cn.xiaomimimo.com/v1"),
                     (messages, "https://token-plan-cn.xiaomimimo.com/anthropic"),
                 ],
-                &["mimo-v2.6-pro", "mimo-v2.5-pro", "mimo-v2.6-flash"],
             )
         },
         ProviderPreset {
@@ -1266,7 +1165,6 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
                     (responses, "https://token-plan-ams.xiaomimimo.com/v1"),
                     (messages, "https://token-plan-ams.xiaomimimo.com/anthropic"),
                 ],
-                &["mimo-v2.6-pro", "mimo-v2.5-pro", "mimo-v2.6-flash"],
             )
         },
         ProviderPreset {
@@ -1282,7 +1180,6 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
                     (responses, "https://token-plan-sgp.xiaomimimo.com/v1"),
                     (messages, "https://token-plan-sgp.xiaomimimo.com/anthropic"),
                 ],
-                &["mimo-v2.6-pro", "mimo-v2.5-pro", "mimo-v2.6-flash"],
             )
         },
         // Tencent's three answers. TokenHub is the metered gateway; the two
@@ -1299,7 +1196,6 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
                     (responses, "https://tokenhub.tencentmaas.com/v1"),
                     (messages, "https://tokenhub.tencentmaas.com"),
                 ],
-                &["hy3", "hy4-preview", "hy3-preview"],
             )
         },
         ProviderPreset {
@@ -1318,7 +1214,6 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
                         "https://api.lkeap.cloud.tencent.com/plan/anthropic",
                     ),
                 ],
-                &["hy3", "hy4-preview"],
             )
         },
         ProviderPreset {
@@ -1337,7 +1232,6 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
                         "https://api.lkeap.cloud.tencent.com/coding/anthropic",
                     ),
                 ],
-                &["hunyuan-2.0-instruct", "glm-5", "kimi-k2.5", "minimax-m2.5"],
             )
         },
         // The Ark Coding Plan's quota is spent at /api/coding/v3 alone: a key
@@ -1356,12 +1250,6 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
                     (chat, "https://ark.cn-beijing.volces.com/api/coding/v3"),
                     (responses, "https://ark.cn-beijing.volces.com/api/coding/v3"),
                     (messages, "https://ark.cn-beijing.volces.com/api/coding"),
-                ],
-                &[
-                    "doubao-seed-2.1-turbo",
-                    "deepseek-v4-pro",
-                    "glm-5.3",
-                    "kimi-k2.7-code",
                 ],
             )
         },
@@ -1384,7 +1272,6 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
                         "https://coding.dashscope.aliyuncs.com/apps/anthropic",
                     ),
                 ],
-                &["qwen3.5-plus", "qwen3-coder-plus", "kimi-k2.5", "glm-5"],
             )
         },
         // A relay: one key answers for several vendors' models, over both the
@@ -1400,7 +1287,6 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
                     (responses, "http://anyrouter.top/v1"),
                     (messages, "http://anyrouter.top"),
                 ],
-                &[],
             )
         },
         ProviderPreset {
@@ -1413,7 +1299,6 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
                     (chat, "https://amr-link.open-design.ai/v1"),
                     (messages, "https://amr-link.open-design.ai/v1"),
                 ],
-                &[],
             )
         },
         ProviderPreset {
@@ -1433,7 +1318,6 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
                     (responses, "https://api.commandcode.ai/provider/v1"),
                     (messages, "https://api.commandcode.ai/provider"),
                 ],
-                &[],
             )
         },
     ];
@@ -1590,11 +1474,15 @@ mod tests {
 
     /// A plan's record says what its vendor's list cannot.
     ///
-    /// The plans here are served at their own paths and list the metered
-    /// models, not the covered ones, so the ids are written in and the caveat
-    /// says why. A plan without its own models would present an empty picker.
+    /// A plan preset names a catalogue entry and says why its list needs a
+    /// caveat, but it does not carry the ids itself.
+    ///
+    /// The plans are served at their own paths and vendors list the metered
+    /// models rather than the covered ones, so the caveat explains what the
+    /// catalogue cannot express. The ids still come from the catalogue entry:
+    /// writing them here would be the table this change removed.
     #[test]
-    fn every_plan_preset_carries_its_own_models() {
+    fn every_plan_preset_points_at_a_catalogue_entry_and_explains_itself() {
         for preset_id in [
             PROVIDER_PRESET_ZHIPU_CODING_PLAN,
             PROVIDER_PRESET_MINIMAX_CODING_PLAN,
@@ -1608,12 +1496,12 @@ mod tests {
         ] {
             let preset = provider_preset(preset_id).expect("the plan ships");
             assert!(
-                !preset.models.is_empty(),
-                "{preset_id} must carry the plan's own model ids"
+                preset.catalog_id.is_some(),
+                "{preset_id} must name the catalogue entry its models come from"
             );
             assert!(
                 !preset.caveats.is_empty(),
-                "{preset_id} must say why its list is written rather than fetched"
+                "{preset_id} must say what its vendor's list leaves out"
             );
         }
     }
@@ -1636,6 +1524,7 @@ mod tests {
             (PROVIDER_PRESET_SILICONFLOW, "siliconflow"),
             (PROVIDER_PRESET_COMMANDCODE, "commandcode"),
             (PROVIDER_PRESET_OPENCODE_GO, "opencode-go"),
+            (PROVIDER_PRESET_CLINEPASS, "cline-pass"),
         ] {
             assert_eq!(
                 provider_preset(preset_id).unwrap().catalog_id.as_deref(),
@@ -1643,9 +1532,9 @@ mod tests {
                 "{preset_id} must point at its models.dev provider"
             );
         }
-        // These two are not listed by models.dev, so a suggestion must never
-        // be attempted for them.
-        for preset_id in [PROVIDER_PRESET_OLLAMA, PROVIDER_PRESET_CLINEPASS] {
+        // Ollama's own server is local and unlisted, so a suggestion must
+        // never be attempted for it.
+        for preset_id in [PROVIDER_PRESET_OLLAMA] {
             assert!(
                 provider_preset(preset_id).unwrap().catalog_id.is_none(),
                 "{preset_id} has no models.dev provider"
@@ -1690,31 +1579,16 @@ mod tests {
             xai.endpoint_for(ProviderModelWireApi::OpenaiChatCompletions),
             Some("https://api.x.ai/v1")
         );
-        assert!(xai.models.iter().all(|model| model.starts_with("grok-")));
-
         let mistral = provider_preset(PROVIDER_PRESET_MISTRAL).unwrap();
         assert_eq!(
             mistral.endpoint_for(ProviderModelWireApi::OpenaiChatCompletions),
             Some("https://api.mistral.ai/v1")
         );
-        assert!(
-            mistral
-                .models
-                .iter()
-                .any(|model| model == "mistral-large-latest")
-        );
-
         let groq = provider_preset(PROVIDER_PRESET_GROQ).unwrap();
         assert_eq!(
             groq.endpoint_for(ProviderModelWireApi::OpenaiChatCompletions),
             Some("https://api.groq.com/openai/v1")
         );
-        assert!(
-            groq.models
-                .iter()
-                .any(|model| model == "llama-3.3-70b-versatile")
-        );
-
         let siliconflow = provider_preset(PROVIDER_PRESET_SILICONFLOW).unwrap();
         assert_eq!(
             siliconflow.endpoint_for(ProviderModelWireApi::OpenaiChatCompletions),
@@ -1728,8 +1602,10 @@ mod tests {
         // The vendor serves an OpenAI-compatible surface on both regions.
         for preset in [xai, mistral, groq, siliconflow] {
             assert!(!preset.no_key);
-            assert!(!preset.models.is_empty());
             assert!(preset.keys_url.is_some());
+            // The model list is not the preset's to carry: a vendor the
+            // catalogue knows names its entry, and the ids come from there.
+            assert!(preset.catalog_id.is_some());
         }
     }
 
@@ -1737,7 +1613,7 @@ mod tests {
     fn a_preset_draft_carries_its_catalog_id() {
         let agent_id = crate::AgentId::parse("codex").unwrap();
         let deepseek = provider_preset(PROVIDER_PRESET_DEEPSEEK).unwrap();
-        let draft = deepseek.draft_profile(&agent_id);
+        let draft = deepseek.draft_profile(&agent_id, &[]);
         assert!(
             draft
                 .provider_options
@@ -1746,7 +1622,7 @@ mod tests {
                 .any(|entry| { entry.key == "catalogId" && entry.value == "deepseek" })
         );
         let ollama = provider_preset(PROVIDER_PRESET_OLLAMA).unwrap();
-        let draft = ollama.draft_profile(&agent_id);
+        let draft = ollama.draft_profile(&agent_id, &[]);
         assert!(
             !draft
                 .provider_options
@@ -1779,7 +1655,7 @@ mod tests {
             // The draft is the profile a preset-driven creation starts from,
             // so the header has to ride in its options rather than only in the
             // preset's own field.
-            let draft = preset.draft_profile(&agent_id);
+            let draft = preset.draft_profile(&agent_id, &[]);
             let option = draft
                 .provider_options
                 .entries
@@ -1796,7 +1672,7 @@ mod tests {
         assert!(deepseek.header_override().is_none());
         assert!(
             !deepseek
-                .draft_profile(&agent_id)
+                .draft_profile(&agent_id, &[])
                 .provider_options
                 .entries
                 .iter()
@@ -1841,7 +1717,7 @@ mod tests {
             opencode_go.wire_api_for_agent(&claude),
             Some(ProviderModelWireApi::AnthropicMessages)
         );
-        let draft = opencode_go.draft_profile(&claude);
+        let draft = opencode_go.draft_profile(&claude, &[]);
         assert_eq!(
             draft.base_url.as_deref(),
             opencode_go.endpoint_for(ProviderModelWireApi::AnthropicMessages)
@@ -1851,10 +1727,12 @@ mod tests {
                 && entry.value == ProviderModelWireApi::AnthropicMessages.wire_protocol_id()
         }));
 
-        // A preset that ships its own model list stamps the same protocol on
-        // every row, so the saved record does not disagree with its option.
+        // Every Model the draft starts with is stamped with that same
+        // protocol, so the saved record does not disagree with its option.
         let deepseek = provider_preset(PROVIDER_PRESET_DEEPSEEK).unwrap();
-        let draft = deepseek.draft_profile(&claude);
+        let catalogue = vec!["deepseek-v4-pro".to_string(), "deepseek-flash".to_string()];
+        let draft = deepseek.draft_profile(&claude, &catalogue);
+        assert_eq!(draft.default_model.as_deref(), Some("deepseek-v4-pro"));
         assert!(!draft.configured_models.is_empty());
         assert!(
             draft
@@ -1879,7 +1757,6 @@ mod tests {
                 crate::WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS,
                 "https://chat.example.invalid",
             )],
-            &["m"],
         );
         assert_eq!(
             chat_only.wire_api_for_agent(&claude),
@@ -1900,15 +1777,22 @@ mod tests {
     /// machine authenticates with a gateway key.
     ///
     /// Its model ids are `provider/model` and depend on the Providers the user
-    /// configured inside Magpie, so the preset carries no list; the catalogue
-    /// is fetched from the gateway once the Provider exists.
+    /// configured inside Magpie, so the preset names no catalogue entry and the
+    /// list is fetched from the gateway once the Provider exists.
     #[test]
     fn magpie_is_a_gateway_for_every_wire_protocol_and_takes_a_key() {
         let preset = provider_preset(PROVIDER_PRESET_MAGPIE).expect("the preset ships");
         assert!(!preset.no_key);
         assert!(preset.keys_url.is_none());
         assert!(preset.key_hint.is_some());
-        assert!(preset.models.is_empty(), "models come from the gateway");
+        assert!(
+            preset.catalog_id.is_none(),
+            "Magpie's models come from the gateway, not the catalogue"
+        );
+        assert!(
+            preset.offered_models(&[]).is_empty(),
+            "a preset with no catalogue answer offers nothing"
+        );
         assert_eq!(
             preset.endpoint_for(ProviderModelWireApi::OpenaiChatCompletions),
             Some("http://127.0.0.1:3425/v1")
@@ -1940,22 +1824,30 @@ mod tests {
     }
 
     #[test]
-    fn offered_models_filter_and_fall_back() {
-        let mut preset = preset("example", "Example", &[], &["plan-a", "plan-b"]);
+    fn offered_models_keep_only_the_plan_prefix_in_catalogue_order() {
+        let mut preset = preset("example", "Example", &[]);
         preset.only = Some("plan-".to_string());
-        // A vendor list that excludes the plan still finds the plan models.
+        // The catalogue's order is kept; ids outside the plan are dropped.
         assert_eq!(
-            preset.offered_models(&["other-model".to_string()]),
-            vec!["plan-a".to_string(), "plan-b".to_string()]
-        );
-        // A vendor list that includes a plan model keeps it, in vendor order.
-        assert_eq!(
-            preset.offered_models(&["plan-c".to_string(), "other".to_string()]),
-            vec![
-                "plan-c".to_string(),
+            preset.offered_models(&[
+                "plan-b".to_string(),
+                "other-model".to_string(),
                 "plan-a".to_string(),
-                "plan-b".to_string()
-            ]
+            ]),
+            vec!["plan-b".to_string(), "plan-a".to_string()]
+        );
+        // A catalogue answer that names no plan id offers nothing: there is no
+        // private list to fall back to.
+        assert!(
+            preset
+                .offered_models(&["other-model".to_string()])
+                .is_empty()
+        );
+        // A preset with no prefix takes the catalogue's whole answer.
+        let open = crate::provider_presets::preset_for_test("open", "Open", &[]);
+        assert_eq!(
+            open.offered_models(&["a".to_string(), "b".to_string()]),
+            vec!["a".to_string(), "b".to_string()]
         );
     }
 
@@ -1991,24 +1883,31 @@ mod tests {
     fn a_plan_preset_carries_what_its_vendor_list_omits() {
         let cline = provider_preset(PROVIDER_PRESET_CLINEPASS).unwrap();
         assert_eq!(cline.only.as_deref(), Some("cline-pass/"));
-        assert!(cline.models.len() > 1);
         assert_eq!(
             cline.caveats,
             vec![ProviderPresetCaveat::ModelListExcludesPlan]
         );
-        // The vendor's list answers with metered models only, so the plan's own
-        // list is what the editor must start from rather than an empty one.
+        // A catalogue entry that lists the whole plan answers in full, and the
+        // vendor's metered ids are dropped: a ClinePass key cannot spend them.
+        let catalogue = vec![
+            "gpt-5".to_string(),
+            "cline-pass/glm-5.3".to_string(),
+            "cline-pass/kimi-k3".to_string(),
+        ];
         assert_eq!(
-            cline.offered_models(&["gpt-5".to_string(), "claude-sonnet-5".to_string()]),
-            cline.models
+            cline.offered_models(&catalogue),
+            vec![
+                "cline-pass/glm-5.3".to_string(),
+                "cline-pass/kimi-k3".to_string()
+            ]
         );
-        // A list that does mention plan models keeps them, adds the rest.
-        let offered = cline.offered_models(&["cline-pass/glm-5.3".to_string()]);
-        assert_eq!(
-            offered.first().map(String::as_str),
-            Some("cline-pass/glm-5.3")
+        // A catalogue answer that names none of the plan's ids leaves the list
+        // empty rather than falling back to a table the binary would carry.
+        assert!(
+            cline
+                .offered_models(&["gpt-5".to_string(), "claude-sonnet-5".to_string()])
+                .is_empty()
         );
-        assert_eq!(offered.len(), cline.models.len());
 
         let command = provider_preset(PROVIDER_PRESET_COMMANDCODE).unwrap();
         assert_eq!(

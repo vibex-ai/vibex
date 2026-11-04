@@ -2069,6 +2069,16 @@ pub struct ManagementCenter {
     profile_auto_fetch_requested: Option<(String, String)>,
     /// The in-flight catalogue lookup behind the same-model template.
     model_canonical_task: Option<Task<()>>,
+    /// The in-flight catalogue read that fills a preset's model list.
+    ///
+    /// A preset names a catalogue entry, not a list, so applying one asks the
+    /// authority which models the entry offers. The answer is what the draft's
+    /// rows are built from; a failed read leaves the list empty and the regular
+    /// fetch fills it once the Key is in.
+    provider_preset_models_task: Option<Task<()>>,
+    /// Which preset the pending catalogue read is for, so a late answer cannot
+    /// fill the rows of a preset the reader has already replaced.
+    provider_preset_models_target: Option<String>,
     /// Set only by the explicit Clear command, so an empty field on its own
     /// never deletes a stored Secret.
     profile_secret_clear: bool,
@@ -3218,6 +3228,8 @@ impl ManagementCenter {
             profile_auto_fetch_task: None,
             profile_auto_fetch_requested: None,
             model_canonical_task: None,
+            provider_preset_models_task: None,
+            provider_preset_models_target: None,
             profile_secret_clear: false,
             profile_name_error: None,
             profile_configured_models: Vec::new(),
@@ -7549,6 +7561,118 @@ impl ManagementCenter {
         }
     }
 
+    /// Asks the authority which models a preset's catalogue entry offers, for
+    /// the Provider dialog's draft.
+    ///
+    /// The preset carries the vendor and the endpoint; the list is the
+    /// catalogue's, so a vendor's new model reaches the draft without a
+    /// release. The answer builds the draft's rows with the same protocol the
+    /// save will write, and a failed read simply leaves them empty for the
+    /// fetch to fill once a Key is in.
+    fn request_profile_preset_catalog_models(
+        &mut self,
+        preset: vibex_core::ProviderPreset,
+        start_wire_api: Option<vibex_core::ProviderModelWireApi>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        let Some(provider_id) = preset.catalog_id.clone() else {
+            // A preset the catalogue does not know (Magpie, or a plan whose
+            // vendor publishes no entry) keeps an empty list: its ids come from
+            // the gateway's own fetch.
+            return;
+        };
+        let only = preset.only.clone();
+        let preset_id = preset.id.clone();
+        self.provider_preset_models_target = Some(preset_id.clone());
+        self.provider_preset_models_task = None;
+        let entity = cx.weak_entity();
+        self.provider_preset_models_task = Some(cx.spawn_in(window, async move |_, cx| {
+            let models = backend
+                .management()
+                .catalog_offered_models(vibex_core::CatalogOfferedModelsRequest {
+                    provider_id,
+                    only,
+                })
+                .await
+                .unwrap_or_default();
+            let _ = entity.update_in(cx, |this, window, cx| {
+                // A later preset replaced this one, so this answer describes a
+                // draft that is no longer on screen.
+                if this.provider_preset_models_target.as_deref() != Some(preset_id.as_str()) {
+                    return;
+                }
+                this.provider_preset_models_task = None;
+                this.profile_configured_models = models
+                    .iter()
+                    .map(|model| vibex_core::ProviderConfiguredModel {
+                        id: model.id.clone(),
+                        display_name: model.display_name.clone(),
+                        enabled: true,
+                        wire_api: start_wire_api,
+                        capabilities: Default::default(),
+                    })
+                    .collect();
+                this.profile_available_models = this.profile_configured_models.clone();
+                if this.profile_configured_models.is_empty() {
+                    this.profile_model_selection = None;
+                    this.clear_profile_model_editor(window, cx);
+                } else {
+                    this.load_profile_model_editor(0, window, cx);
+                }
+                cx.notify();
+            });
+        }));
+    }
+
+    /// The same catalogue read for the standalone create page.
+    ///
+    /// The page keeps its model ids as one comma-separated string, so the
+    /// answer is written there rather than as configured rows.
+    fn request_provider_create_catalog_models(
+        &mut self,
+        preset: &vibex_core::ProviderPreset,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        let Some(provider_id) = preset.catalog_id.clone() else {
+            return;
+        };
+        let only = preset.only.clone();
+        let preset_id = preset.id.clone();
+        self.provider_preset_models_target = Some(preset_id.clone());
+        self.provider_preset_models_task = None;
+        let entity = cx.weak_entity();
+        self.provider_preset_models_task = Some(cx.spawn_in(window, async move |_, cx| {
+            let models = backend
+                .management()
+                .catalog_offered_models(vibex_core::CatalogOfferedModelsRequest {
+                    provider_id,
+                    only,
+                })
+                .await
+                .unwrap_or_default();
+            let _ = entity.update_in(cx, |this, window, cx| {
+                if this.provider_preset_models_target.as_deref() != Some(preset_id.as_str()) {
+                    return;
+                }
+                this.provider_preset_models_task = None;
+                let ids = models.into_iter().map(|model| model.id).collect::<Vec<_>>();
+                let text = ids.join(", ");
+                this.provider_form
+                    .models
+                    .update(cx, |state, cx| state.set_value(text, window, cx));
+                cx.notify();
+            });
+        }));
+    }
+
     /// Asks the authority what the catalogue suggests for the Model in the
     /// settings pane.
     ///
@@ -8958,26 +9082,22 @@ impl ManagementCenter {
                 });
             }
             Ok(Err(error)) => {
-                // A preset whose plan models never appear in its vendor's list
-                // supplies them itself rather than failing: ClinePass's `/models`
-                // only returns metered models, so a plan user would otherwise be
-                // left with nothing to choose.
-                if let Some(preset) = self.provider_preset_draft.as_ref()
-                    && (preset.no_list || preset.only.is_some())
-                    && !preset.models.is_empty()
-                {
-                    let models = configured_models_from_preset(preset, &[]);
-                    let count = models.len();
-                    self.profile_available_models = models;
+                // A vendor's `/models` often answers with the metered catalogue
+                // only, and a plan key cannot spend those ids. The rows the
+                // catalogue already filled for this preset are the better
+                // answer, so a failed vendor list keeps them and says so
+                // instead of emptying the picker.
+                let catalogue_count = self.profile_available_models.len();
+                if self.provider_preset_draft.is_some() && catalogue_count > 0 {
                     self.notice = Some(match active_locale {
                         ResolvedLocale::En => format!(
-                            "The vendor list was unavailable; showing {count} model(s) from the preset"
+                            "The vendor list was unavailable; showing {catalogue_count} model(s) from the catalogue"
                         ),
                         ResolvedLocale::ZhCn => {
-                            format!("厂商列表不可用，已显示预设中的 {count} 个模型")
+                            format!("厂商列表不可用，已显示目录中的 {catalogue_count} 个模型")
                         }
                         ResolvedLocale::ZhTw => {
-                            format!("廠商清單不可用，已顯示預設中的 {count} 個模型")
+                            format!("廠商清單不可用，已顯示目錄中的 {catalogue_count} 個模型")
                         }
                     });
                     self.navigation.mark_dirty(ManagementSection::Agents, true);
@@ -14802,7 +14922,6 @@ impl ManagementCenter {
                 .metadata_value()
                 .to_string(),
         );
-        let models = preset.models.join(", ");
         self.provider_form.name.update(cx, |state, cx| {
             state.set_value(preset.display_name.clone(), window, cx)
         });
@@ -14810,9 +14929,14 @@ impl ManagementCenter {
         self.provider_form
             .website_url
             .update(cx, |state, cx| state.set_value(website, window, cx));
+        // The model ids are the catalogue's answer, not the preset's: it names
+        // the entry, and the read below fills the list, so a vendor's new model
+        // appears without a release. The field starts empty rather than keeping
+        // the previous preset's ids.
         self.provider_form
             .models
-            .update(cx, |state, cx| state.set_value(models, window, cx));
+            .update(cx, |state, cx| state.set_value("", window, cx));
+        self.request_provider_create_catalog_models(&preset, window, cx);
         // The header editor speaks the same override shape the record stores,
         // so a preset's rows can be written before the Provider exists. A
         // preset without headers leaves the empty object the draft starts on,
@@ -25420,32 +25544,20 @@ impl ManagementCenter {
         }
         self.apply_preset_endpoints(&preset, window, cx);
         self.apply_preset_headers(&preset, window, cx);
-        // The preset's models are added as declared entries, which is what a
-        // manual add produces too: their capabilities stay empty rather than
-        // being guessed from the id. The protocol follows the Agent, not the
-        // preset's own order, so the saved record and the binding agree.
+        // The model list is the catalogue's answer for the entry the preset
+        // names. The ids are declared entries, which is what a manual add
+        // produces too; the capabilities stay empty rather than being guessed
+        // from the id, and the catalogue offers them again when a row opens.
+        // The protocol follows the Agent, not the preset's own order, so the
+        // saved record and the binding agree.
         let start_wire_api = self.preset_start_wire_api(&preset);
-        self.profile_configured_models = preset
-            .models
-            .iter()
-            .map(|model| vibex_core::ProviderConfiguredModel {
-                id: model.clone(),
-                display_name: None,
-                enabled: true,
-                wire_api: start_wire_api,
-                capabilities: Default::default(),
-            })
-            .collect();
-        self.profile_available_models = self.profile_configured_models.clone();
-        // The pane opens on the first model, so the same gesture has to load
-        // it. Naming it alone left the previous draft's fields under the new
-        // model's header and never asked the catalogue.
-        if self.profile_configured_models.is_empty() {
-            self.profile_model_selection = None;
-            self.clear_profile_model_editor(window, cx);
-        } else {
-            self.load_profile_model_editor(0, window, cx);
-        }
+        // The draft starts with no rows and the catalogue read below fills
+        // them, so the answer is the one the record is built from.
+        self.profile_configured_models.clear();
+        self.profile_available_models.clear();
+        self.profile_model_selection = None;
+        self.clear_profile_model_editor(window, cx);
+        self.request_profile_preset_catalog_models(preset.clone(), start_wire_api, window, cx);
         if let Some(hint) = preset.key_hint.as_deref() {
             // The hint is a placeholder, not a value: it tells the user what
             // the vendor's keys look like without typing anything.
@@ -41037,13 +41149,14 @@ fn provider_source_logo(preset: &vibex_core::ProviderPreset, size: Pixels, cx: &
     }
 }
 
-/// The Model entries a preset wants for one fetched catalogue.
+/// The Model entries a preset wants out of a fetched id list.
 ///
-/// `offered_models` decides which ids belong to the plan and supplies the plan
-/// list when the vendor's answer cannot; the protocol comes from the preset so
-/// a Claude-only preset's models are stored with the Anthropic protocol rather
-/// than inferred when they are called. An empty `fetched` list therefore means
-/// "the vendor could not answer", which is exactly the fallback case.
+/// `offered_models` applies the preset's one filter — the `only` prefix a plan
+/// needs, because a plan and its vendor's metered API share a catalogue entry.
+/// The protocol comes from the preset, so a Claude-only preset's models are
+/// stored with the Anthropic protocol rather than inferred when they are
+/// called. The ids themselves are not the preset's: they come from the
+/// catalogue, or from the vendor's own list.
 fn configured_models_from_preset(
     preset: &vibex_core::ProviderPreset,
     fetched: &[String],
@@ -45661,6 +45774,77 @@ mod tests {
         }
     }
 
+    /// A preset names a catalogue entry; its rows are that entry's models.
+    ///
+    /// This is the contract the preset table gives up when it stops carrying
+    /// ids: the draft's rows come from the catalogue answer, stamped with the
+    /// protocol the save will write, so the two never disagree.
+    #[gpui::test]
+    fn a_preset_draft_is_built_from_the_catalogue_answer(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let (center, cx) = cx.add_window_view(ManagementCenter::new);
+        center.update(cx, |center, _| {
+            let preset =
+                vibex_core::provider_preset(vibex_core::PROVIDER_PRESET_XIAOMI_TOKEN_PLAN_AMS)
+                    .expect("the preset ships");
+            assert!(
+                preset.catalog_id.is_some(),
+                "the preset must name the entry its models come from"
+            );
+            let wire_api = preset.default_wire_api();
+            let models = vec![
+                vibex_core::CatalogOfferedModel {
+                    id: "mimo-v2.6-pro".to_string(),
+                    display_name: Some("MiMo-V2.6-Pro".to_string()),
+                    context_tokens: Some(1_048_576),
+                    output_tokens: Some(131_072),
+                    reasoning: Some(true),
+                    image_input: Some(true),
+                    pdf_input: Some(false),
+                    temperature: Some(true),
+                },
+                vibex_core::CatalogOfferedModel {
+                    id: "mimo-v2.6-flash".to_string(),
+                    display_name: None,
+                    context_tokens: Some(1_048_576),
+                    output_tokens: Some(131_072),
+                    reasoning: None,
+                    image_input: None,
+                    pdf_input: None,
+                    temperature: None,
+                },
+            ];
+            center.provider_preset_models_target = Some(preset.id.clone());
+            center.profile_configured_models = models
+                .into_iter()
+                .map(|model| vibex_core::ProviderConfiguredModel {
+                    id: model.id,
+                    display_name: model.display_name,
+                    enabled: true,
+                    wire_api,
+                    capabilities: Default::default(),
+                })
+                .collect();
+            center.profile_available_models = center.profile_configured_models.clone();
+
+            assert_eq!(center.profile_configured_models.len(), 2);
+            assert_eq!(center.profile_configured_models[0].id, "mimo-v2.6-pro");
+            assert_eq!(
+                center.profile_configured_models[0].display_name.as_deref(),
+                Some("MiMo-V2.6-Pro")
+            );
+            // The catalogue's capabilities are not written into the draft: a
+            // row opens, asks, and the user adopts a field deliberately.
+            assert!(center.profile_configured_models[0].capabilities.is_empty());
+            assert!(
+                center
+                    .profile_configured_models
+                    .iter()
+                    .all(|model| model.wire_api == wire_api)
+            );
+        });
+    }
+
     #[gpui::test]
     fn picker_rows_union_the_catalogue_with_the_configured_models(cx: &mut gpui::TestAppContext) {
         cx.update(gpui_component::init);
@@ -46403,14 +46587,23 @@ mod tests {
             .map(|(body, _)| body)
             .expect("suggestion request should remain inspectable");
         assert!(request.contains("auto_fill_profile_model_capabilities(window, cx)"));
-        // A preset names its first model, so it must load it too: naming it
-        // alone is what left the pane without the catalogue's answer.
+        // A preset's rows are the catalogue's answer, so applying one has to
+        // ask for them and open the first: naming a model without loading it is
+        // what left the pane without the catalogue's capabilities.
         let preset = source
             .split_once("    fn apply_provider_preset(")
             .and_then(|(_, tail)| tail.split_once("    fn apply_provider_preset_region("))
             .map(|(body, _)| body)
             .expect("preset application should remain inspectable");
-        assert!(preset.contains("self.load_profile_model_editor(0, window, cx)"));
+        assert!(preset.contains("self.request_profile_preset_catalog_models("));
+        let answer = source
+            .split_once("    fn request_profile_preset_catalog_models(\n")
+            .and_then(|(_, tail)| {
+                tail.split_once("    /// The same catalogue read for the standalone create page.")
+            })
+            .map(|(body, _)| body)
+            .expect("the preset catalogue read should remain inspectable");
+        assert!(answer.contains("load_profile_model_editor(0, window, cx)"));
     }
 
     /// The panes are built from live state, so drawing them is the only check
@@ -50476,18 +50669,26 @@ mod gateway_surface_tests {
         );
     }
 
-    /// A plan's models are what a fetch lands on, not whatever the vendor sent.
+    /// A plan's filter is what a fetch applies; the ids still come from the
+    /// list it was handed.
     ///
-    /// This is the wiring between the preset data and the picker: the filter
-    /// and the fallback are `offered_models`'s, and the protocol written on to
-    /// each Model is the preset's, so a Claude-only plan's Models are stored
-    /// with the Anthropic protocol rather than inferred when they are called.
+    /// The wiring is `offered_models`'s prefix filter plus the preset's
+    /// protocol, so a Claude-only plan's Models are stored with the Anthropic
+    /// protocol rather than inferred when they are called.
     #[test]
-    fn a_preset_decides_what_a_fetch_lands_on() {
+    fn a_preset_filters_a_fetch_and_stamps_its_protocol() {
         let cline = vibex_core::provider_preset(vibex_core::PROVIDER_PRESET_CLINEPASS).unwrap();
-        let metered = configured_models_from_preset(&cline, &["gpt-5".to_string()]);
-        assert_eq!(metered.len(), cline.models.len());
-        assert_eq!(metered[0].id, cline.models[0]);
+        let metered = configured_models_from_preset(
+            &cline,
+            &["gpt-5".to_string(), "cline-pass/glm-5.3".to_string()],
+        );
+        assert_eq!(
+            metered
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["cline-pass/glm-5.3"]
+        );
         assert!(
             metered
                 .iter()
@@ -50746,9 +50947,11 @@ mod gateway_surface_tests {
             .and_then(|(_, tail)| tail.split_once("\n    fn "))
             .map(|(body, _)| body)
             .expect("the fetched-model handler should remain inspectable");
-        assert!(fetch.contains("configured_models_from_preset(preset"));
-        assert!(fetch.contains("preset.no_list || preset.only.is_some()"));
-        assert!(fetch.contains("preset.models.is_empty()"));
+        assert!(fetch.contains("configured_models_from_preset("));
+        assert!(fetch.contains("Some(preset) =>"));
+        // A failed vendor list keeps the catalogue's rows instead of falling
+        // back to a list the binary would have had to carry.
+        assert!(fetch.contains("model(s) from the catalogue"));
 
         let clear = source
             .split_once("    fn confirm_clear_gateway_requests(")
@@ -51240,7 +51443,7 @@ mod gateway_surface_tests {
         let tile = source
             .split_once("fn provider_source_tile(")
             .and_then(|(_, tail)| {
-                tail.split_once("\n/// The Model entries a preset wants for one fetched catalogue.")
+                tail.split_once("\n/// The Model entries a preset wants out of a fetched id list.")
             })
             .map(|(body, _)| body)
             .expect("the source row should remain inspectable");

@@ -3989,6 +3989,24 @@ impl ManagementBackend for WebRemoteBackend {
         )
     }
 
+    fn catalog_offered_models(
+        &self,
+        request: vibex_core::CatalogOfferedModelsRequest,
+    ) -> BackendFuture<'_, Vec<vibex_core::CatalogOfferedModel>> {
+        self.gateway_rpc(
+            vibex_core::RemoteProviderRequest::CatalogOfferedModels(
+                vibex_core::RemoteCatalogOfferedModelsRequest {
+                    auth: self.auth(),
+                    request,
+                },
+            ),
+            |value| {
+                decode::<vibex_core::RemoteCatalogOfferedModelsResponse>(value)
+                    .map(|response| response.models)
+            },
+        )
+    }
+
     fn model_canonical_ids(
         &self,
         request: vibex_core::ModelCanonicalIdsRequest,

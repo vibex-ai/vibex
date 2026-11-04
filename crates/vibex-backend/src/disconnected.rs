@@ -894,6 +894,13 @@ impl ManagementBackend for DisconnectedBackend {
         disconnected_future!()
     }
 
+    fn catalog_offered_models(
+        &self,
+        _request: vibex_core::CatalogOfferedModelsRequest,
+    ) -> BackendFuture<'_, Vec<vibex_core::CatalogOfferedModel>> {
+        disconnected_future!()
+    }
+
     fn model_canonical_ids(
         &self,
         _request: vibex_core::ModelCanonicalIdsRequest,

@@ -43,6 +43,41 @@ pub struct CatalogModel {
     pub reasoning_efforts: Option<ProviderModelReasoningEfforts>,
 }
 
+impl CatalogModel {
+    /// Whether a Provider should start out carrying this model.
+    ///
+    /// Three answers decide it, and each of them is data the catalogue
+    /// publishes rather than a guess about the id:
+    ///
+    /// - `deprecated` is a retired model. A new Provider offering one would be
+    ///   offering an id its vendor has already said it is winding down.
+    /// - The model has to answer with text, because a Provider is configured
+    ///   for an Agent session. Speech, image and video endpoints are skipped.
+    /// - It has to announce tool calling; an Agent that cannot call a tool
+    ///   cannot run, so such a model is not a candidate however good its chat
+    ///   answers are.
+    ///
+    /// An entry that publishes no modality list keeps the benefit of the
+    /// doubt: older and third-party catalogue entries omit it, and treating an
+    /// omission as "not text" would hide real models.
+    pub fn is_offered(&self) -> bool {
+        if self
+            .status
+            .as_deref()
+            .is_some_and(|status| status.eq_ignore_ascii_case("deprecated"))
+        {
+            return false;
+        }
+        if let Some(modalities) = self.modalities.as_ref()
+            && !modalities.output.is_empty()
+            && !modalities.output.iter().any(|output| output == "text")
+        {
+            return false;
+        }
+        !matches!(self.tool_call, Some(false))
+    }
+}
+
 /// The modality lists a catalogue model advertises.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CatalogModalities {
@@ -154,6 +189,29 @@ impl Catalog {
     pub fn canonical_model_id(&self, provider_id: &str, model_id: &str) -> Option<String> {
         self.suggestion(provider_id, model_id)
             .and_then(|suggestion| suggestion.model.canonical_model_id)
+    }
+
+    /// The models a Provider can actually be offered, in catalogue order.
+    ///
+    /// This is the list a new Provider starts from, so it cannot be a vendor's
+    /// inventory: the catalogue files speech, image and video endpoints under
+    /// the same provider, and offering `whisper-large-v3` beside `gpt-5` would
+    /// make every picker a catalogue dump. A model qualifies when it answers
+    /// with text and announces tool calling, because that is what an Agent
+    /// session needs; one the vendor marks `deprecated` is left out as well,
+    /// since a retired id is not a model a Provider should start carrying.
+    ///
+    /// An unknown provider answers empty rather than defaulted, so a caller can
+    /// tell "the catalogue knows nothing" from "the vendor serves nothing".
+    pub fn offered_models(&self, provider_id: &str) -> Vec<&CatalogModel> {
+        let Some(provider) = self.provider(provider_id) else {
+            return Vec::new();
+        };
+        provider
+            .models
+            .values()
+            .filter(|model| model.is_offered())
+            .collect()
     }
 }
 
@@ -389,6 +447,40 @@ mod tests {
         );
         assert_eq!(catalog.canonical_model_id("p", "mystery"), None);
         assert_eq!(catalog.canonical_model_id("unknown", "m"), None);
+    }
+
+    /// The offered list is what a new Provider starts from, so it must skip
+    /// the entries a session cannot use and the ids a vendor retired.
+    #[test]
+    fn offered_models_keep_only_usable_conversation_entries() {
+        let catalog = parse_catalog(
+            r#"{"p":{"name":"P","models":{
+                "chat":{"tool_call":true,"modalities":{"input":["text"],"output":["text"]}},
+                "retired":{"tool_call":true,"status":"deprecated",
+                           "modalities":{"input":["text"],"output":["text"]}},
+                "speech":{"tool_call":false,"modalities":{"input":["text"],"output":["audio"]}},
+                "image":{"tool_call":false,"modalities":{"input":["text"],"output":["image"]}},
+                "no-tools":{"tool_call":false,"modalities":{"input":["text"],"output":["text"]}},
+                "silent-about-tools":{"modalities":{"input":["text"],"output":["text"]}},
+                "silent-about-modalities":{"tool_call":true}
+            }}}"#,
+        )
+        .unwrap();
+        let offered = catalog
+            .offered_models("p")
+            .into_iter()
+            .map(|model| model.id.as_str())
+            .collect::<Vec<_>>();
+        // An entry that publishes no modality list, or says nothing about
+        // tools, keeps the benefit of the doubt: older and third-party entries
+        // omit those fields, and treating an omission as "no" would hide real
+        // conversation models.
+        assert_eq!(
+            offered,
+            vec!["chat", "silent-about-modalities", "silent-about-tools"]
+        );
+        // An unknown provider has nothing to offer rather than a default.
+        assert!(catalog.offered_models("unknown").is_empty());
     }
 
     #[test]

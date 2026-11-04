@@ -4197,7 +4197,7 @@ impl App {
                 // preset carries survive.
                 let mut provider_options = preset
                     .as_ref()
-                    .map(|preset| preset.draft_profile(&agent_id).provider_options);
+                    .map(|preset| preset.draft_profile(&agent_id, &[]).provider_options);
                 if let Some(options) = provider_options.as_mut()
                     && let Some(url) = form.optional("base_url")
                     && let Some(wire_api) = preset_wire_api
@@ -4713,11 +4713,13 @@ impl App {
         {
             field.value = url.to_string();
         }
+        // The model ids are the catalogue's, not the preset's, so the form
+        // starts empty and the read below fills it.
         if let Some(field) = form.field_mut("default_model") {
-            field.value = preset.models.first().cloned().unwrap_or_default();
+            field.value = String::new();
         }
         if let Some(field) = form.field_mut("models") {
-            field.value = preset.models.join("\n");
+            field.value = String::new();
         }
         if let Some(field) = form.field_mut("agent") {
             field.value = agent_id.as_str().to_string();
@@ -4734,7 +4736,62 @@ impl App {
                 .unwrap_or_else(|| preset.id.clone())
         )));
         self.overlay = Some(Overlay::Form { form });
-        Outcome::effects(vec![])
+        // A preset whose vendor the catalogue knows asks for that entry's
+        // models; one the catalogue does not know keeps an empty list for the
+        // save-time fetch to fill from the endpoint.
+        match preset.catalog_id.as_deref() {
+            Some(provider_id) => Outcome::effects(vec![Effect::CatalogOfferedModels {
+                provider_id: provider_id.to_string(),
+                only: preset.only.clone(),
+            }]),
+            None => Outcome::effects(vec![]),
+        }
+    }
+
+    /// Writes a catalogue answer into the open new-Provider form.
+    ///
+    /// The form is identified by the catalogue entry it was opened for, so a
+    /// read that lands after the reader moved to another preset cannot fill the
+    /// wrong list. Only the ids and the default model are written: the reader's
+    /// own edits to the other fields are left alone.
+    pub fn fill_preset_models(
+        &mut self,
+        provider_id: &str,
+        only: Option<&str>,
+        models: Vec<vibex_core::CatalogOfferedModel>,
+    ) {
+        let Some(Overlay::Form { form }) = self.overlay.as_mut() else {
+            return;
+        };
+        let Some(pending) = self
+            .management_data
+            .pending_provider_preset
+            .as_deref()
+            .and_then(vibex_core::provider_preset)
+        else {
+            return;
+        };
+        if pending.catalog_id.as_deref() != Some(provider_id) || pending.only.as_deref() != only {
+            return;
+        }
+        let mut ids = models
+            .into_iter()
+            .map(|model| model.id)
+            .filter(|id| only.is_none_or(|prefix| id.starts_with(prefix)))
+            .collect::<Vec<_>>();
+        if ids.is_empty() {
+            return;
+        }
+        let default = ids.remove(0);
+        if let Some(field) = form.field_mut("default_model") {
+            field.value = default.clone();
+        }
+        if let Some(field) = form.field_mut("models") {
+            field.value = std::iter::once(default)
+                .chain(ids)
+                .collect::<Vec<_>>()
+                .join("\n");
+        }
     }
 
     fn workspace_browse(&mut self, path: String) -> Outcome {
@@ -7429,7 +7486,7 @@ impl App {
             Intent::OverlayFoldOpen => self.fold_runtime_row(selected, false),
             Intent::OverlayFoldClosed => self.fold_runtime_row(selected, true),
             Intent::StarRuntimeModel => self.star_runtime_row(selected),
-            Intent::ManageRuntimeAccount => self.open_runtime_account(selected),
+            Intent::ManageRuntimeAccount => self.open_runtime_agent_page(selected),
             // `Tab` is the two halves of the switcher: the catalogue, and the
             // run options of the entry the reader has picked. They are views
             // rather than one list because the catalogue is as long as the
@@ -7712,14 +7769,14 @@ impl App {
         Outcome::effects(vec![])
     }
 
-    /// Send the reader to the highlighted Agent's account in the management
-    /// pages.
+    /// Send the reader to the highlighted Agent's sign-in row on the Agents
+    /// page.
     ///
-    /// The catalogue can say that an account needs attention; it cannot sign in.
+    /// The catalogue can say that an Agent needs attention; it cannot sign in.
     /// The Agents page owns that, and the Agent waits on the app for the list to
     /// arrive so the page lands on the row the reader asked about instead of on
     /// whichever Agent happened to be first.
-    fn open_runtime_account(&mut self, selected: usize) -> Outcome {
+    fn open_runtime_agent_page(&mut self, selected: usize) -> Outcome {
         let Some(option) = self.runtime_picker_highlighted_entry(selected) else {
             return Outcome::quiet();
         };

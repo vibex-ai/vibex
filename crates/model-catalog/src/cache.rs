@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::fetch::{CatalogFetchError, catalog_url, parse_catalog};
-use crate::suggest::{Catalog, SuggestSource};
+use crate::suggest::{Catalog, CatalogModel, SuggestSource};
 use crate::{CATALOG_SCHEMA_VERSION, CATALOG_TTL_MS};
 
 /// What a cache read produced.
@@ -196,6 +196,26 @@ impl CatalogCache {
                 suggestion
             })
     }
+
+    /// The models a Provider starts out offering, from the cache only.
+    ///
+    /// A Provider is configured against one catalogue entry, so this is what
+    /// keeps its model list from being a table in the binary: the ids come from
+    /// the same document the capability suggestions do, and a vendor's new
+    /// model appears the next time the catalogue is refreshed.
+    pub fn offered_models(&self, provider_id: &str, now_ms: i64) -> Vec<CatalogModel> {
+        let state = self.load(now_ms);
+        state
+            .catalog()
+            .map(|catalog| {
+                catalog
+                    .offered_models(provider_id)
+                    .into_iter()
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
 }
 
 #[cfg(test)]
@@ -220,7 +240,7 @@ mod tests {
     fn a_missing_cache_reads_the_bundled_fallback_not_an_error() {
         let (directory, cache) = cache();
         assert!(matches!(cache.load(1), CatalogState::Bundled(_)));
-        assert!(cache.suggest("deepseek", "deepseek-chat", 1).is_some());
+        assert!(cache.suggest("deepseek", "deepseek-v4-pro", 1).is_some());
         let _ = std::fs::remove_dir_all(directory);
     }
 

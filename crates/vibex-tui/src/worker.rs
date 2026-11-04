@@ -175,6 +175,16 @@ pub enum AppMessage {
     LanPairing(BackendResult<Option<Box<vibex_core::RemoteLanPairingWindowSnapshot>>>),
     Audit(BackendResult<Vec<vibex_core::RemoteAuditRecord>>),
     Profiles(BackendResult<Vec<vibex_core::ProviderProfileSummary>>),
+    /// The models one catalogue entry offers, for the new-Provider form.
+    ///
+    /// `provider_id` names the entry the answer is about, and `only` is the
+    /// prefix a plan needs; both travel back so the form is filled only while
+    /// it is still the one that asked.
+    CatalogOfferedModels {
+        provider_id: String,
+        only: Option<String>,
+        models: BackendResult<Vec<vibex_core::CatalogOfferedModel>>,
+    },
     Gateway(BackendResult<vibex_core::GatewaySnapshot>),
     GatewayRequests(BackendResult<Vec<vibex_core::GatewayRequestSummary>>),
     /// One profile as the authority holds it, read for an editor.
@@ -2203,6 +2213,22 @@ impl Dispatch {
             Effect::ListProfiles => {
                 let result = self.facade.management().list_profiles().await;
                 self.send(AppMessage::Profiles(result));
+            }
+            Effect::CatalogOfferedModels { provider_id, only } => {
+                let request = vibex_core::CatalogOfferedModelsRequest {
+                    provider_id: provider_id.clone(),
+                    only: only.clone(),
+                };
+                let models = self
+                    .facade
+                    .management()
+                    .catalog_offered_models(request)
+                    .await;
+                self.send(AppMessage::CatalogOfferedModels {
+                    provider_id,
+                    only,
+                    models,
+                });
             }
             Effect::LoadGateway => {
                 let result = self.facade.management().model_gateway_snapshot().await;

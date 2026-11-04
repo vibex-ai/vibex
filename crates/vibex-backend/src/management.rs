@@ -228,6 +228,17 @@ pub trait ManagementBackend: BackendBound {
         request: ModelCapabilitySuggestionRequest,
     ) -> BackendFuture<'_, Option<GatewayCapabilitySuggestion>>;
 
+    /// The models one catalogue entry offers, for a new Provider to start with.
+    ///
+    /// A Provider's model list is not carried by its preset: the preset names
+    /// the entry, and this reads the ids — and the capabilities that go with
+    /// them — out of the same catalogue the per-field suggestions come from.
+    /// Like those suggestions it never blocks on the network.
+    fn catalog_offered_models(
+        &self,
+        request: vibex_core::CatalogOfferedModelsRequest,
+    ) -> BackendFuture<'_, Vec<vibex_core::CatalogOfferedModel>>;
+
     /// The catalogue's vendor-independent id for several models at once.
     ///
     /// A same-model suggestion compares every configured model across

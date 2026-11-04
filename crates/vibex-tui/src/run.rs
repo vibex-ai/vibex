@@ -2771,6 +2771,19 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
                 );
             }
         },
+        AppMessage::CatalogOfferedModels {
+            provider_id,
+            only,
+            models,
+        } => {
+            match models {
+                Ok(models) => app.fill_preset_models(&provider_id, only.as_deref(), models),
+                // A catalogue read that fails leaves the form's model list as
+                // it is: the save-time fetch still asks the endpoint, and the
+                // reader can type an id.
+                Err(error) => app.toast(Toast::danger(error.message)),
+            }
+        }
         AppMessage::ProviderTest(result) => match result {
             Ok(tested) => {
                 let body = format!("{:?}\n\n{}\n{}", tested.status, tested.code, tested.message);

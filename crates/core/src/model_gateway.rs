@@ -1803,6 +1803,47 @@ pub struct ModelCapabilitySuggestionRequest {
     pub model_id: String,
 }
 
+/// The editor's question: which models does this catalogue entry offer?
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogOfferedModelsRequest {
+    /// The catalogue's provider id, such as `deepseek`.
+    pub provider_id: String,
+    /// Only ids with this prefix belong to the answer.
+    ///
+    /// A plan and its vendor's metered API share one catalogue entry, so the
+    /// prefix is the one filter the caller applies on top of the catalogue's
+    /// own list. `None` takes the entry as it stands.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub only: Option<String>,
+}
+
+/// One model a catalogue entry offers, as the Provider editor needs it.
+///
+/// This is the catalogue's answer in the Provider's own shape, not a
+/// suggestion: it is what a new Provider's model list is built from. The
+/// capability fields are the catalogue's values, offered without provenance so
+/// that a caller which adopts them can record where they came from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogOfferedModel {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_input: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pdf_input: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<bool>,
+}
+
 /// One model the caller wants the catalogue to identify.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

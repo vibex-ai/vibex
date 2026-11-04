@@ -9636,6 +9636,14 @@ pub enum Effect {
     },
     ListAudit,
     ListProfiles,
+    /// Ask the catalogue which models a preset's entry offers.
+    ///
+    /// A preset names the vendor, not the ids, so the new-Provider form cannot
+    /// fill its model list until this answers.
+    CatalogOfferedModels {
+        provider_id: String,
+        only: Option<String>,
+    },
     /// Read the local model gateway.
     LoadGateway,
     /// Read the gateway's recent request ledger.
@@ -9963,6 +9971,7 @@ impl Effect {
             Effect::RevokeDevice { .. } => "revoke_device",
             Effect::ListAudit => "audit",
             Effect::ListProfiles => "profiles",
+            Effect::CatalogOfferedModels { .. } => "catalog_offered_models",
             Effect::LoadGateway => "gateway",
             Effect::SetGatewayEnabled { .. } => "gateway_toggle",
             Effect::SetGatewayKey { .. } => "gateway_key",

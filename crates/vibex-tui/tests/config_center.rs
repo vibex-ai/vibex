@@ -1557,7 +1557,18 @@ fn a_provider_profile_can_be_made_from_nothing() {
         "`n` did not open the preset list: {:?}",
         app.overlay
     );
-    app.perform(vibex_tui::action::Intent::ConfirmOverlay);
+    let opening = app.perform(vibex_tui::action::Intent::ConfirmOverlay);
+    // The model ids come from the catalogue, not from the preset, so opening
+    // the form asks for its entry's list instead of filling one in. The answer
+    // arrives as a message; this asserts the question was asked.
+    assert!(
+        matches!(
+            opening.effects.as_slice(),
+            [vibex_tui::app::Effect::CatalogOfferedModels { .. }]
+        ),
+        "the preset did not ask the catalogue for its models: {:?}",
+        opening.effects
+    );
     let Some(Overlay::Form { form }) = app.overlay.clone() else {
         panic!("choosing a preset opened no form");
     };
@@ -1579,9 +1590,12 @@ fn a_provider_profile_can_be_made_from_nothing() {
         !form.value("base_url").unwrap_or_default().is_empty(),
         "the preset left the address empty"
     );
-    assert!(
-        !form.value("models").unwrap_or_default().is_empty(),
-        "the preset left the model list empty"
+    // The list starts empty: it is the catalogue's answer, which a headless
+    // test cannot receive.
+    assert_eq!(
+        form.value("models").unwrap_or_default(),
+        "",
+        "a list the preset carries itself is the table this design removed"
     );
 
     // The reader renames it and lists two Models of their own.
