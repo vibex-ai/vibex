@@ -31,7 +31,7 @@ use gpui_component::{
 use vibex_backend::BackendFacade;
 use vibex_desktop_model::{LocaleMode, PROJECT_DIRECTORY_FAVORITE_LIMIT};
 
-use crate::gpui_ext::PinnedScrollbar as _;
+use crate::gpui_ext::{PinnedScrollbar as _, ScrollGutter as _};
 use crate::locale::{self, ResolvedLocale};
 use crate::spinner::Spinner;
 
@@ -1127,6 +1127,9 @@ impl gpui::Render for DirectoryPickerDialog {
                 .track_scroll(&self.list_scroll)
                 .overflow_y_scroll()
                 .pinned_scrollbar(&self.list_scroll, ScrollbarAxis::Vertical)
+                // The row's trailing affordance — a star, a size — ends at
+                // the region's edge, so the bar's lane is kept clear.
+                .scroll_gutter()
                 .gap(px(2.0))
                 .pt(px(2.0))
                 .pb(px(4.0))
@@ -1246,6 +1249,9 @@ impl gpui::Render for DirectoryPickerDialog {
                     .track_scroll(&self.rail_scroll)
                     .overflow_y_scroll()
                     .pinned_scrollbar(&self.rail_scroll, ScrollbarAxis::Vertical)
+                    // A starred location's unstar control sits at the row's
+                    // trailing edge, so the rail keeps the bar's lane clear.
+                    .scroll_gutter()
                     .children(rail_rows),
             );
 

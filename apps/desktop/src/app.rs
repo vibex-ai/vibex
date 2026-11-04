@@ -16271,6 +16271,10 @@ impl VibexWorkbench {
             .relative()
             .w_full()
             .min_h_0()
+            // The rows end in a details chevron flush with this region's
+            // trailing edge; the bar keeps a lane of its own so the thumb
+            // never covers it.
+            .scroll_gutter()
             .track_scroll(&self.runtime_manager_list_scroll)
             .overflow_y_scroll()
             .children(rows)
@@ -16828,6 +16832,9 @@ impl VibexWorkbench {
                     .id("runtime-manager-detail-scroll")
                     .relative()
                     .min_h_0()
+                    // Long values wrap to this region's edge, so the bar gets
+                    // a lane of its own instead of covering their last words.
+                    .scroll_gutter()
                     .track_scroll(&self.runtime_manager_detail_scroll)
                     .overflow_y_scroll()
                     .children(rows)
@@ -55375,6 +55382,9 @@ impl VibexWorkbench {
                     .flex_1()
                     .px(px(6.0))
                     .py(px(6.0))
+                    // The group headings end in a chevron and the model rows
+                    // in a check, both flush with this region's edge.
+                    .scroll_gutter()
                     .track_scroll(&provider_scroll)
                     // `overflow_y_scrollbar()` wraps the element in a
                     // `Scrollable` whose inner div carries its own keyed
@@ -72477,6 +72487,10 @@ fn render_agent_file_diff_scroll_area(
                         .relative()
                         .track_scroll(scroll)
                         .overflow_scroll()
+                        // A two-axis bar: the vertical thumb covers the last
+                        // line's trailing glyphs and the horizontal one the
+                        // last row, so both lanes are kept clear.
+                        .scroll_gutter_both()
                         .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
                         .children(rows)
                         .pinned_scrollbar(scroll, ScrollbarAxis::Both),

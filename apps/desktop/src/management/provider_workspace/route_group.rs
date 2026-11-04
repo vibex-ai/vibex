@@ -986,6 +986,11 @@ impl ManagementCenter {
                         .w_full()
                         .min_h_0()
                         .flex_1()
+                        // The member rows end in a remove button and the
+                        // palette rows in a check or plus, all flush with this
+                        // region's trailing edge. The bar keeps a lane of its
+                        // own so the thumb never paints over them.
+                        .scroll_gutter()
                         .track_scroll(&self.workspace_route_members_scroll)
                         .overflow_y_scroll()
                         .child(content)

@@ -224,6 +224,8 @@ pub(crate) fn home_surface(
         .relative()
         .size_full()
         .min_h_0()
+        // No gutter: the body below insets its own content by `.px_6()`,
+        // which is wider than the bar's lane.
         .overflow_y_scrollbar()
         .child(
             v_flex()

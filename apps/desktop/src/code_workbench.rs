@@ -14251,6 +14251,9 @@ impl CodeRightRail {
             .min_size_full()
             .px_1()
             .py_1()
+            // The rows are what the two-axis bar paints over, so their own box
+            // reserves the lane on both edges.
+            .scroll_gutter_both()
             .children(rows);
         let scroll_area = v_flex()
             .id("file-search-scroll")

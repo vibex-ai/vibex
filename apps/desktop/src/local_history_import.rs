@@ -34,7 +34,7 @@ use vibex_desktop_runtime::DesktopRuntime;
 
 use crate::app::VibexWorkbench;
 use crate::assets::agent_brand_icon;
-use crate::gpui_ext::PinnedScrollbar as _;
+use crate::gpui_ext::{PinnedScrollbar as _, ScrollGutter as _};
 use crate::hint_layer::{self, hint_notification};
 use crate::locale::{self, ResolvedLocale};
 use crate::skeleton;
@@ -1419,6 +1419,9 @@ impl Render for LocalHistoryImportDialog {
                 .id("local-history-list")
                 .flex_1()
                 .min_h_0()
+                // Session rows end in a status label flush with this region's
+                // edge, so the bar keeps a lane of its own.
+                .scroll_gutter()
                 .track_scroll(&self.list_scroll)
                 .overflow_y_scroll()
                 .pinned_scrollbar(&self.list_scroll, ScrollbarAxis::Vertical)

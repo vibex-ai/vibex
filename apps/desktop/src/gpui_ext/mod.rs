@@ -88,6 +88,16 @@ pub trait ScrollGutter: Styled + Sized {
     fn scroll_gutter(self) -> Self {
         self.pr(SCROLLBAR_GUTTER)
     }
+
+    /// Reserves the lane on both edges a two-axis bar paints against.
+    ///
+    /// A `ScrollbarAxis::Both` region draws a vertical bar on its trailing
+    /// edge and a horizontal one along its bottom, so reserving only the
+    /// trailing lane leaves the horizontal thumb over the last line of
+    /// content.
+    fn scroll_gutter_both(self) -> Self {
+        self.pr(SCROLLBAR_GUTTER).pb(SCROLLBAR_GUTTER)
+    }
 }
 
 impl<T: Styled> ScrollGutter for T {}
@@ -399,13 +409,20 @@ mod tests {
     }
     /// Every scroll region has to keep the overlay bar off its own content.
     ///
-    /// `overflow_y_scrollbar()` positions the bar against the scroll
-    /// container's padding box, so a region whose trailing inset is under
-    /// [`SCROLLBAR_GUTTER`] lets the bar cover its last column — a defect that
-    /// is invisible in code review and only shows up in a screenshot. This
-    /// walks every scroll region in the desktop crate and requires each one to
-    /// reserve the gutter itself or to pad its trailing edge by at least that
-    /// much already.
+    /// The bar is positioned against the scroll container's padding box, so a
+    /// region whose trailing inset is under [`SCROLLBAR_GUTTER`] lets the bar
+    /// cover its last column — a defect that is invisible in code review and
+    /// only shows up in a screenshot. This walks every scroll region in the
+    /// desktop crate and requires each one to reserve the gutter itself or to
+    /// pad its trailing edge by at least that much already.
+    ///
+    /// Both builders are covered. `overflow_y_scrollbar()` positions the bar
+    /// from the region's own padding; `pinned_scrollbar` draws it against the
+    /// box that copies the scroller's layout, so the scroller's own trailing
+    /// padding is what keeps the rows out from under it. A pinned call whose
+    /// chain also carries the tracked handle is a scroller itself and is
+    /// checked here; a pin chained onto an outer container is not, because the
+    /// rows live in the tracked child and that child has its own check.
     ///
     /// A region whose content carries its own margins is listed in
     /// [`PADDED_BY_THEIR_CONTENT`] with the reason, so the exception is stated
@@ -414,12 +431,20 @@ mod tests {
     fn scroll_regions_reserve_the_scrollbar_gutter() {
         /// Scroll regions whose children inset themselves by at least the
         /// gutter, so the region must not add a second one.
-        const PADDED_BY_THEIR_CONTENT: [(&str, &str); 1] = [("office_surface.rs", "render")];
+        const PADDED_BY_THEIR_CONTENT: [(&str, &str); 2] = [
+            // Every body under this region insets itself by at least the
+            // gutter, so the region must not add a second one.
+            ("office_surface.rs", "render"),
+            // The home body is one column inset by `.px_6()`; the region wraps
+            // it directly, so the bar already clears every child.
+            ("arena/mod.rs", "home_surface"),
+        ];
 
         /// Builder calls that leave at least [`SCROLLBAR_GUTTER`] on the
         /// trailing edge.
-        const CLEARS_THE_BAR: [&str; 11] = [
+        const CLEARS_THE_BAR: [&str; 12] = [
             ".scroll_gutter()",
+            ".scroll_gutter_both()",
             ".p_3()",
             ".p_4()",
             ".p_5()",
@@ -457,21 +482,38 @@ mod tests {
     }
 
     /// Source files that contain scroll regions.
-    const SCROLL_REGION_SOURCES: [(&str, &str); 8] = [
+    const SCROLL_REGION_SOURCES: [(&str, &str); 13] = [
         ("app.rs", include_str!("../app.rs")),
         ("code_workbench.rs", include_str!("../code_workbench.rs")),
+        (
+            "directory_picker.rs",
+            include_str!("../directory_picker.rs"),
+        ),
         (
             "local_history_import.rs",
             include_str!("../local_history_import.rs"),
         ),
         ("management.rs", include_str!("../management.rs")),
+        (
+            "management/provider_workspace/mod.rs",
+            include_str!("../management/provider_workspace/mod.rs"),
+        ),
+        (
+            "management/provider_workspace/route_group.rs",
+            include_str!("../management/provider_workspace/route_group.rs"),
+        ),
         ("native_content.rs", include_str!("../native_content.rs")),
         ("office_surface.rs", include_str!("../office_surface.rs")),
         ("pdf_surface.rs", include_str!("../pdf_surface.rs")),
         ("usage.rs", include_str!("../usage.rs")),
+        (
+            "timeline_activity.rs",
+            include_str!("../timeline_activity.rs"),
+        ),
+        ("arena/mod.rs", include_str!("../arena/mod.rs")),
     ];
 
-    /// Every `overflow_y_scrollbar()` builder chain, with its 1-based line.
+    /// Every vertical scroll region's builder chain, with its 1-based line.
     ///
     /// A chain is the run of `.method()` continuation lines around the call,
     /// which is where a caller's padding lives. Deliberately not "the whole
@@ -479,7 +521,18 @@ mod tests {
     /// next region's padding, which would make this guard pass for the wrong
     /// reason.
     fn scroll_region_chains(source: &str) -> Vec<(usize, String)> {
-        scroll_chains_containing(source, "overflow_y_scrollbar()")
+        let mut chains = scroll_chains_containing(source, "overflow_y_scrollbar()");
+        for (line, chain) in scroll_chains_containing(source, "pinned_scrollbar(") {
+            // A pin chained onto an outer container draws its bar against
+            // that container, but the rows are in the tracked child: the
+            // child's own chain is the one that must keep the lane, and it is
+            // checked on its own. Only a pin whose chain is also the scroller
+            // is a scroll region in its own right.
+            if chain.contains(".track_scroll(") {
+                chains.push((line, chain));
+            }
+        }
+        chains
     }
 
     /// Every builder chain containing `needle`, with the 1-based line where
@@ -631,9 +684,9 @@ mod tests {
             ScrollHandle, StatefulInteractiveElement as _, Styled as _, TestAppContext, Window,
             div, prelude::*, px,
         };
-        use gpui_component::v_flex;
+        use gpui_component::{h_flex, v_flex};
 
-        use super::super::{PinnedScrollbar as _, pinned_scrollbar};
+        use super::super::{PinnedScrollbar as _, ScrollGutter as _, pinned_scrollbar};
 
         /// A content-sized panel whose body scrolls: the shape that used to let
         /// the bar ride up with the rows.
@@ -822,6 +875,94 @@ mod tests {
             assert!(
                 row_after >= viewport.origin.y,
                 "the last row must not sit above the region that clips it"
+            );
+        }
+
+        /// A pinned list whose rows end in a control at the region's edge.
+        struct GutterProbe {
+            scroll: ScrollHandle,
+        }
+
+        impl Render for GutterProbe {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                v_flex()
+                    .w(px(260.0))
+                    .h(px(120.0))
+                    .min_h_0()
+                    .overflow_hidden()
+                    .child(
+                        v_flex()
+                            .id("gutter-probe-scroll")
+                            .debug_selector(|| "gutter-probe-scroll".to_string())
+                            .w_full()
+                            .min_h_0()
+                            .flex_1()
+                            .scroll_gutter()
+                            .track_scroll(&self.scroll)
+                            .overflow_y_scroll()
+                            .pinned_scrollbar(
+                                &self.scroll,
+                                gpui_component::scroll::ScrollbarAxis::Vertical,
+                            )
+                            .child(
+                                v_flex()
+                                    .w_full()
+                                    .min_h_0()
+                                    // The row ends in a control flush with the
+                                    // region's trailing edge — the shape of a
+                                    // member's remove button.
+                                    .child(
+                                        h_flex().w_full().justify_end().child(
+                                            div()
+                                                .debug_selector(|| {
+                                                    "gutter-probe-trailing".to_string()
+                                                })
+                                                .w(px(16.0))
+                                                .h(px(16.0)),
+                                        ),
+                                    )
+                                    .children(
+                                        (0..20).map(|_| div().h(px(20.0)).flex_none().w_full()),
+                                    ),
+                            ),
+                    )
+            }
+        }
+
+        /// The pinned bar keeps clear of the trailing control.
+        ///
+        /// This is the exact defect in the Members card: a pinned list whose
+        /// rows end in a remove button had its thumb drawn 16px inside the
+        /// card, over the button. The gutter has to move the rows out from
+        /// under the bar, so the trailing control's right edge stays to the
+        /// left of the bar's ink.
+        #[gpui::test]
+        fn the_pinned_bar_clears_the_rows_trailing_control(cx: &mut TestAppContext) {
+            cx.update(gpui_component::init);
+            let (_, cx) = cx.add_window_view(|_, _| GutterProbe {
+                scroll: ScrollHandle::new(),
+            });
+            cx.update(|window, cx| {
+                let _ = window.draw(cx);
+            });
+            cx.run_until_parked();
+
+            let region = cx
+                .debug_bounds("gutter-probe-scroll")
+                .expect("the region should be laid out");
+            let trailing = cx
+                .debug_bounds("gutter-probe-trailing")
+                .expect("the trailing control should be laid out");
+            assert!(
+                cx.debug_bounds("scrollbar-overlay").is_some(),
+                "the region should own its bar"
+            );
+            // gpui-base insets the thumb 4px and lets it grow to 8px wide, so
+            // the bar's ink reaches 12px in from the trailing edge.
+            assert!(
+                f32::from(region.right() - trailing.right()) >= 12.0,
+                "the row must stop before the bar's lane: region={region:?} \
+                 trailing={trailing:?}"
             );
         }
     }
