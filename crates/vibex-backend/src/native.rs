@@ -423,6 +423,23 @@ impl AgentBackend for NativeBackend {
         })
     }
 
+    fn create_terminal_session(
+        &self,
+        request: MutationRequest<vibex_core::CreateTerminalSessionRequest>,
+    ) -> BackendFuture<'_, AgentSession> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .agent()
+                .manager()
+                .create_terminal_session(request.payload)
+                .await
+                .map_err(Into::into)
+        })
+    }
+
     fn create_session(
         &self,
         request: MutationRequest<CreateAgentSessionRequest>,

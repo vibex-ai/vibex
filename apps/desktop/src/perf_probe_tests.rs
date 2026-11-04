@@ -1593,6 +1593,8 @@ fn probe_unrevealed_body_frames(cx: &mut TestAppContext) {
                 archived_at_ms: None,
                 deleted_at_ms: None,
                 tools: Default::default(),
+                transport: vibex_core::SessionTransport::Acp,
+                terminal: None,
             });
             workbench.conversation_turns_cache_key = None;
             workbench.rebuild_timeline_sizes();

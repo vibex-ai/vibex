@@ -247,6 +247,31 @@ impl TerminalManager {
         workspace_root: impl AsRef<Path>,
         request: TerminalCommandRequest,
     ) -> VibexResult<TerminalSession> {
+        // ACP host terminals are parked for the agent to read and release; they
+        // are not part of any workspace the reader returns to, so they do not
+        // join the persisted session set.
+        self.create_command_inner(workspace_root, request, false)
+    }
+
+    /// Starts an explicit command that survives a runtime restart.
+    ///
+    /// A terminal-mode Agent session is a place the reader returns to, unlike
+    /// the tool terminals the ACP host owns, so its process is persisted with
+    /// the other interactive terminals.
+    pub fn create_command_persistent(
+        &self,
+        workspace_root: impl AsRef<Path>,
+        request: TerminalCommandRequest,
+    ) -> VibexResult<TerminalSession> {
+        self.create_command_inner(workspace_root, request, true)
+    }
+
+    fn create_command_inner(
+        &self,
+        workspace_root: impl AsRef<Path>,
+        request: TerminalCommandRequest,
+        persist_on_shutdown: bool,
+    ) -> VibexResult<TerminalSession> {
         let command_name = request.command.trim();
         if command_name.is_empty() || command_name.contains(['\0', '\n', '\r']) {
             return Err(VibexError::validation(
@@ -299,7 +324,7 @@ impl TerminalManager {
         }
         sanitize_terminal_environment(&mut command);
         declare_pty_terminal_environment(&mut command);
-        self.spawn_runtime_with_command(cwd, session, command, false)
+        self.spawn_runtime_with_command(cwd, session, command, persist_on_shutdown)
     }
 
     pub fn restore(
@@ -342,6 +367,69 @@ impl TerminalManager {
         session.updated_at_ms = now;
         session.closed_at_ms = None;
         self.spawn_runtime(cwd, session)
+    }
+
+    /// Rebuilds an explicit-command terminal from its recorded argv.
+    ///
+    /// [`Self::restore`] only knows a shell name, which is all a plain terminal
+    /// tab has. A terminal-mode Agent was started with arguments — a resume id,
+    /// a model override — and rebuilding it without them would silently start a
+    /// different session, so this path takes the argv back.
+    pub fn restore_command(
+        &self,
+        workspace_root: impl AsRef<Path>,
+        mut session: TerminalSession,
+        argv: &[String],
+        env: Vec<(String, String)>,
+    ) -> VibexResult<TerminalSession> {
+        let (command_name, args) = argv.split_first().ok_or_else(|| {
+            VibexError::validation(
+                "terminal_command_invalid",
+                "a restored terminal command needs at least an executable",
+            )
+        })?;
+        if command_name.trim().is_empty() || command_name.contains(['\0', '\n', '\r']) {
+            return Err(VibexError::validation(
+                "terminal_command_invalid",
+                "terminal command must be non-empty and single-line",
+            ));
+        }
+        {
+            let existing = self.lock_sessions()?.get(&session.id).cloned();
+            if let Some(handle) = existing {
+                let mut runtime = lock_runtime(&handle)?;
+                refresh_exit_status(&mut runtime)?;
+                if runtime.session.status == TerminalStatus::Running {
+                    return Ok(runtime.session.clone());
+                }
+                drop(runtime);
+                self.lock_sessions()?.remove(&session.id);
+            }
+        }
+        let workspace_root = canonical_workspace_root(workspace_root.as_ref())?;
+        let cwd = restore_cwd(&workspace_root, &session.cwd);
+        let now = unix_timestamp_ms();
+        session.title = if session.title.trim().is_empty() {
+            shell_title(command_name)
+        } else {
+            session.title
+        };
+        session.shell = command_name.to_string();
+        session.cwd = cwd.to_string_lossy().to_string();
+        session.rows = if session.rows == 0 { 24 } else { session.rows };
+        session.cols = if session.cols == 0 { 80 } else { session.cols };
+        session.status = TerminalStatus::Running;
+        session.updated_at_ms = now;
+        session.closed_at_ms = None;
+        let mut command = CommandBuilder::new(command_name);
+        command.args(args);
+        command.cwd(cwd.as_os_str());
+        for (key, value) in env {
+            command.env(key, value);
+        }
+        sanitize_terminal_environment(&mut command);
+        declare_pty_terminal_environment(&mut command);
+        self.spawn_runtime_with_command(cwd, session, command, true)
     }
 
     fn spawn_runtime(

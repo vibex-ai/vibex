@@ -7814,6 +7814,8 @@ impl MobileApp {
             archived_at_ms: None,
             deleted_at_ms: None,
             tools: Default::default(),
+            transport: vibex_core::SessionTransport::Acp,
+            terminal: None,
         };
         let optimistic_message = (armed_command.is_none()
             && (!prompt.is_empty() || !attachments.is_empty()))
@@ -38855,6 +38857,8 @@ mod tests {
                 archived_at_ms: None,
                 deleted_at_ms: None,
                 tools: Default::default(),
+                transport: vibex_core::SessionTransport::Acp,
+                terminal: None,
             });
             app.controller = Some(controller);
             app
@@ -38971,6 +38975,8 @@ mod tests {
                 archived_at_ms: None,
                 deleted_at_ms: None,
                 tools: Default::default(),
+                transport: vibex_core::SessionTransport::Acp,
+                terminal: None,
             });
             app.controller = Some(controller);
             app.sidebar_view
@@ -44111,6 +44117,8 @@ fn session_opened(cx: &mut Context<Self>) {
                 archived_at_ms: None,
                 deleted_at_ms: None,
                 tools: Default::default(),
+                transport: vibex_core::SessionTransport::Acp,
+                terminal: None,
             }
         }
 
@@ -44190,6 +44198,8 @@ fn session_opened(cx: &mut Context<Self>) {
                 archived_at_ms: None,
                 deleted_at_ms: None,
                 tools: Default::default(),
+                transport: vibex_core::SessionTransport::Acp,
+                terminal: None,
             }
         }
 
@@ -44268,6 +44278,8 @@ fn session_opened(cx: &mut Context<Self>) {
                 archived_at_ms: None,
                 deleted_at_ms: None,
                 tools: Default::default(),
+                transport: vibex_core::SessionTransport::Acp,
+                terminal: None,
             }
         }
         fn send(
@@ -44950,6 +44962,8 @@ fn agent_icon_path(",
                     archived_at_ms: None,
                     deleted_at_ms: None,
                     tools: Default::default(),
+                    transport: vibex_core::SessionTransport::Acp,
+                    terminal: None,
                 },
                 runtime.clone(),
                 Some(PendingMobileUserMessage {

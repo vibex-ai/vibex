@@ -162,26 +162,26 @@ use vibex_desktop_model::{
     GitSelectionKey, GitWorkbenchMode, LocaleMode, MAX_EDITOR_AUTOSAVE_DELAY_MS,
     MIN_EDITOR_AUTOSAVE_DELAY_MS, MessageSendKey, NavigationHistory, NetworkProxyMode,
     NetworkProxyUiState, NewSessionLocation, NewSessionProjectTicket, NewSessionSubmissionStage,
-    NewSessionWorkspaceState, PreviewWindowMode, RUNTIME_SELECTION_PREFERENCE_LIMIT,
-    ReasoningDisplayMode, ReasoningExpansionMode, RuntimeCascadeChoice, RuntimeCascadeProjection,
-    RuntimeModelFavorite, SESSION_GROUP_SPLIT_SCALE, SIDEBAR_AUTO_ARCHIVE_MAX_DAYS,
-    SessionContentWidthMode, SessionGroupLayout, SessionGroupPane, SessionGroupSplitPosition,
-    SessionGroupUiState, SessionUiState, SidebarHierarchyMode, SidebarMutationOutcome,
-    SidebarMutationRejection, SidebarOrganizationItem, SidebarOrganizationScope,
-    SidebarOrganizationState, SidebarOrganizationView, SidebarProjectAppearance,
-    SidebarProjectLogo, SidebarProjectLogoColor, SidebarProjectProjection, SidebarQueuedSend,
-    SidebarScheduledSend, SidebarState, SidebarUiState, SidebarWorkspaceProjection,
-    StartupDestination, TerminalOpenMode, TerminalWorkingDirectory, ThemeMode as ModelThemeMode,
-    ThrottledUiStateWriter, TimelineAnchorSpan, TimelineConversationTurn,
-    TimelineDelegationProjection, TimelineFollowState, TimelineModel, TimelineProcessActivityGroup,
-    TimelineRow, TimelineRowKind, UiStateStore, UnifiedDiffLineKind, WorkbenchRoute,
-    WorkspaceContextProjection, WorkspaceLayoutState, WorkspaceStateScope,
-    WorktreeLifecycleDisplayState, active_collaborations, clamp_editor_autosave_delay_ms,
-    complete_string_order, composer_trigger_at, current_active_goal, current_agent_plan,
-    custom_worktree_path_is_absolute, has_managed_child_agent_delegations,
-    is_runtime_model_favorite, move_string_relative, move_strings_relative, ordered_agent_ids,
-    parse_unified_diff, runtime_auth_source_use_count, runtime_selection_use_count,
-    sidebar_project_custom_logo_file_is_valid, sidebar_project_items,
+    NewSessionTransport, NewSessionWorkspaceState, PreviewWindowMode,
+    RUNTIME_SELECTION_PREFERENCE_LIMIT, ReasoningDisplayMode, ReasoningExpansionMode,
+    RuntimeCascadeChoice, RuntimeCascadeProjection, RuntimeModelFavorite,
+    SESSION_GROUP_SPLIT_SCALE, SIDEBAR_AUTO_ARCHIVE_MAX_DAYS, SessionContentWidthMode,
+    SessionGroupLayout, SessionGroupPane, SessionGroupSplitPosition, SessionGroupUiState,
+    SessionUiState, SidebarHierarchyMode, SidebarMutationOutcome, SidebarMutationRejection,
+    SidebarOrganizationItem, SidebarOrganizationScope, SidebarOrganizationState,
+    SidebarOrganizationView, SidebarProjectAppearance, SidebarProjectLogo, SidebarProjectLogoColor,
+    SidebarProjectProjection, SidebarQueuedSend, SidebarScheduledSend, SidebarState,
+    SidebarUiState, SidebarWorkspaceProjection, StartupDestination, TerminalOpenMode,
+    TerminalWorkingDirectory, ThemeMode as ModelThemeMode, ThrottledUiStateWriter,
+    TimelineAnchorSpan, TimelineConversationTurn, TimelineDelegationProjection,
+    TimelineFollowState, TimelineModel, TimelineProcessActivityGroup, TimelineRow, TimelineRowKind,
+    UiStateStore, UnifiedDiffLineKind, WorkbenchRoute, WorkspaceContextProjection,
+    WorkspaceLayoutState, WorkspaceStateScope, WorktreeLifecycleDisplayState,
+    active_collaborations, clamp_editor_autosave_delay_ms, complete_string_order,
+    composer_trigger_at, current_active_goal, current_agent_plan, custom_worktree_path_is_absolute,
+    has_managed_child_agent_delegations, is_runtime_model_favorite, move_string_relative,
+    move_strings_relative, ordered_agent_ids, parse_unified_diff, runtime_auth_source_use_count,
+    runtime_selection_use_count, sidebar_project_custom_logo_file_is_valid, sidebar_project_items,
     sidebar_project_items_for_workspace, sidebar_project_projections_with_workspace_order,
     sidebar_root_items, split_share, timeline_agent_message_count_after_sequence,
     timeline_conversation_turns, timeline_conversation_turns_with_leading_turn_start,
@@ -8632,6 +8632,11 @@ struct SidebarSessionStatusColumn {
     /// The hover group whose action cluster paints over this column, for the
     /// rows that own one.
     hover_group: Option<SharedString>,
+    /// What a terminal-mode Agent is doing, when the row is one.
+    ///
+    /// A terminal session's lifecycle state only says whether the session is
+    /// open; this is the fact the row exists to report.
+    terminal: Option<vibex_core::TerminalSessionFacts>,
 }
 
 #[derive(Clone)]
@@ -8757,6 +8762,42 @@ impl Render for SidebarView {
         let owner = cx.entity_id();
         motion::with_hover_owner(owner, || {
             workbench.update(cx, |this, cx| this.render_agent_sidebar(cx))
+        })
+    }
+}
+
+/// The terminal-mode session's own render boundary.
+///
+/// It exists for the same reason [`TimelineView`] does: the Agent's TUI repaints
+/// on its own clock, and asking the whole workbench to rebuild on every frame of
+/// a full-screen CLI would redraw the sidebar and every parked pane with it.
+/// Keeping the surface behind its own entity means a terminal frame refreshes
+/// only the surface.
+///
+/// It is also the layer that owns the `Window` a [`TerminalSurface`] needs to
+/// construct itself, which is why the page cannot be built inline from
+/// `render_column_page`.
+struct SessionTerminalView {
+    workbench: WeakEntity<VibexWorkbench>,
+}
+
+impl SessionTerminalView {
+    fn new(workbench: &Entity<VibexWorkbench>, cx: &mut Context<Self>) -> Self {
+        cx.observe(workbench, |_, _, cx| cx.notify()).detach();
+        Self {
+            workbench: workbench.downgrade(),
+        }
+    }
+}
+
+impl Render for SessionTerminalView {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let Some(workbench) = self.workbench.upgrade() else {
+            return Empty.into_any_element();
+        };
+        let owner = cx.entity_id();
+        motion::with_hover_owner(owner, || {
+            workbench.update(cx, |this, cx| this.render_session_terminal_page(window, cx))
         })
     }
 }
@@ -9391,6 +9432,17 @@ fn debug_wsl_artifact(
 
 pub struct VibexWorkbench {
     focus_handle: FocusHandle,
+    /// One terminal surface per terminal-mode session, keyed by session id.
+    ///
+    /// Held here rather than in [`SessionView`] because that cache evicts the
+    /// coldest conversations; a session view is rebuilt for free, while a
+    /// dropped `TerminalSurface` would close the Agent's PTY and take the
+    /// running turn with it.
+    session_terminal_surfaces: BTreeMap<String, Entity<TerminalSurface>>,
+    /// The terminal-mode session whose surface is currently polling.
+    active_session_terminal_id: Option<String>,
+    /// The session page's terminal render boundary, created on first use.
+    session_terminal_view: Option<Entity<SessionTerminalView>>,
     config: Option<DesktopRuntimeConfig>,
     runtime: Option<Arc<DesktopRuntime>>,
     /// The computer-use runtime, kept so the panel can be opened from anywhere
@@ -11361,6 +11413,9 @@ impl VibexWorkbench {
             .collect();
         let mut this = Self {
             focus_handle,
+            session_terminal_surfaces: BTreeMap::new(),
+            active_session_terminal_id: None,
+            session_terminal_view: None,
             config,
             runtime: None,
             computer_runtime: None,
@@ -21510,6 +21565,7 @@ impl VibexWorkbench {
                     has_unread_completion: false,
                     pinned: self.sidebar_state.pinned_ids.contains(&session_id),
                     hover_group: None,
+                    terminal: terminal_row_facts(session),
                 },
                 cx,
             )
@@ -38245,6 +38301,114 @@ impl VibexWorkbench {
         self.refresh_suggestions(ComposerTarget::NewSession, window, cx);
     }
 
+    /// Creates the drafted session as a terminal-mode one.
+    ///
+    /// There is no optimistic row and no queued first message: a terminal
+    /// session is usable the moment its PTY starts, and the reader's first
+    /// prompt is typed into the Agent's own interface. The draft's text is
+    /// therefore not carried into the Agent; the page says so before the button
+    /// is pressed.
+    fn submit_new_terminal_session(
+        &mut self,
+        agent_id: &AgentId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(backend) = self.backend.clone() else {
+            self.new_session_error = Some("Local backend is not ready".into());
+            cx.notify();
+            return;
+        };
+        let _ = window;
+        let selected_workspace = self.new_session_workspace.selected_workspace().cloned();
+        let origin_workspace = self
+            .new_session_workspace
+            .origin_workspace_id
+            .as_ref()
+            .and_then(|workspace_id| {
+                self.workspaces
+                    .iter()
+                    .find(|(_, workspace)| workspace.id == *workspace_id)
+                    .map(|(_, workspace)| workspace.clone())
+            });
+        // A worktree session is not offered in terminal mode yet: creating one
+        // is a Git mutation whose progress the ACP page reports through the
+        // timeline, and a terminal session has no timeline to report it in.
+        if self.new_session_workspace.location == NewSessionLocation::NewWorktree
+            && selected_workspace.is_none()
+        {
+            self.new_session_error = Some(
+                "Terminal sessions run in a current checkout; create the worktree first".into(),
+            );
+            cx.notify();
+            return;
+        }
+        let workspace_root = selected_workspace
+            .as_ref()
+            .map(|workspace| workspace.root_path.clone())
+            .or_else(|| {
+                origin_workspace
+                    .as_ref()
+                    .map(|workspace| workspace.root_path.clone())
+            })
+            .unwrap_or_else(|| self.new_session_workspace.project_root.clone());
+        let workspace_mode = selected_workspace
+            .as_ref()
+            .or(origin_workspace.as_ref())
+            .map(|workspace| workspace.mode)
+            .unwrap_or(WorkspaceMode::CurrentCheckout);
+        let provider_profile_id = self
+            .new_session_runtime_selection
+            .as_ref()
+            .and_then(|selection| selection.provider_profile_id().cloned());
+        let request = vibex_core::CreateTerminalSessionRequest {
+            session_id: None,
+            agent_id: agent_id.clone(),
+            workspace_root,
+            workspace_mode,
+            title: None,
+            safety: None,
+            args: Vec::new(),
+            provider_profile_id,
+            rows: 24,
+            cols: 100,
+        };
+        self.agent_action_pending = true;
+        self.new_session_error = None;
+        let generation = self.session_generation;
+        let entity = cx.weak_entity();
+        self.agent_action_task = Some(cx.spawn(async move |_, cx| {
+            let created = backend
+                .agent()
+                .create_terminal_session(MutationRequest::new(request).with_idempotency_key(
+                    format!("gpui:new-session:terminal:{}", unix_timestamp_ms()),
+                ))
+                .await;
+            let _ = entity.update(cx, |this, cx| {
+                this.agent_action_pending = false;
+                this.agent_action_task = None;
+                if this.session_generation != generation {
+                    return;
+                }
+                match created {
+                    Ok(session) => {
+                        this.new_session_open = false;
+                        this.new_session_draft_initialized = false;
+                        this.selected_session_id = Some(session.id.clone());
+                        this.sessions.retain(|existing| existing.id != session.id);
+                        this.sessions.insert(0, session);
+                        this.publish_sidebar_invalidation();
+                        this.queue_ui_state();
+                    }
+                    Err(error) => {
+                        this.new_session_error = Some(format!("{}: {}", error.code, error.message));
+                    }
+                }
+                cx.notify();
+            });
+        }));
+    }
+
     fn submit_new_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.new_session_open || self.agent_action_pending || self.pending_new_session.is_some()
         {
@@ -38284,6 +38448,13 @@ impl VibexWorkbench {
             self.new_session_error =
                 Some("The selected Agent runtime is no longer available".into());
             cx.notify();
+            return;
+        }
+        // A terminal-mode session has no runtime binding to select, but it does
+        // need the workspace it will run in, so the branch happens before any
+        // ACP mutation is composed.
+        if self.ui_state.session.new_session_transport.is_terminal() {
+            self.submit_new_terminal_session(&selection.agent_id, window, cx);
             return;
         }
         let selected_workspace = self.new_session_workspace.selected_workspace().cloned();
@@ -38437,6 +38608,8 @@ impl VibexWorkbench {
             archived_at_ms: None,
             deleted_at_ms: None,
             tools: session_tools.clone(),
+            transport: vibex_core::SessionTransport::Acp,
+            terminal: None,
         };
         if optimistic_session.title != agent_session_fallback_title(&selection.agent_id) {
             self.pending_new_session_titles.insert(
@@ -52866,6 +53039,7 @@ impl VibexWorkbench {
             has_unread_completion,
             pinned,
             hover_group,
+            terminal,
         } = status;
         let strings = self.strings();
         // The attention glyph answers the user, so it outranks the optimistic
@@ -52891,6 +53065,11 @@ impl VibexWorkbench {
         // the clock, and its countdown stands where the state's mark would.
         let status_mark = if let Some(at_ms) = scheduled_at_ms {
             Some(self.render_scheduled_session_indicator(session_id.as_str(), at_ms, cx))
+        } else if let Some(facts) = terminal.as_ref() {
+            // A terminal session's row reports what the Agent inside the PTY is
+            // doing, not the session's own lifecycle: the row exists to answer
+            // "can I leave it alone".
+            sidebar_terminal_activity_mark(prefix, session_id.as_str(), facts, cx)
         } else {
             sidebar_session_state_mark(
                 prefix,
@@ -53356,6 +53535,7 @@ impl VibexWorkbench {
                 has_unread_completion,
                 pinned,
                 hover_group: Some(hover_group.clone()),
+                terminal: terminal_row_facts(session),
             },
             cx,
         );
@@ -55880,6 +56060,91 @@ impl VibexWorkbench {
             .into_any_element()
     }
 
+    /// The new-session transport switch.
+    ///
+    /// The choice is made once, here, because it is not a preference a session
+    /// can change later: a terminal-mode session is born in its PTY and the
+    /// Agent owns the conversation inside it. The second option is disabled for
+    /// an Agent this release has not verified, so the panel cannot advertise a
+    /// mode that would fail on submit.
+    fn render_new_session_transport_switch(
+        &self,
+        agent_id: Option<&AgentId>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let supported = agent_id
+            .map(|agent_id| vibex_core::terminal_session_support(agent_id).is_supported())
+            .unwrap_or(false);
+        let current = self.ui_state.session.new_session_transport;
+        let disabled_label = if supported {
+            String::new()
+        } else {
+            crate::locale::text(
+                "This Agent has no verified terminal mode",
+                "该 Agent 尚未验证终端模式",
+                "該 Agent 尚未驗證終端模式",
+            )
+            .to_string()
+        };
+        let options = [
+            (
+                NewSessionTransport::Acp,
+                "new-session-transport-acp",
+                crate::locale::text("Vibex interface", "Vibex 界面", "Vibex 介面"),
+                false,
+            ),
+            (
+                NewSessionTransport::Terminal,
+                "new-session-transport-terminal",
+                crate::locale::text("Native terminal", "原生终端", "原生終端"),
+                !supported,
+            ),
+        ];
+        let mut row = h_flex()
+            .id("new-session-transport")
+            .flex_none()
+            .items_center()
+            .gap_1();
+        for (mode, id, label, option_disabled) in options {
+            let selected = current == mode;
+            let tooltip = if option_disabled {
+                disabled_label.clone()
+            } else if mode.is_terminal() {
+                crate::locale::text(
+                    "The Agent runs its own interface in a terminal. Approvals and file changes happen there.",
+                    "Agent 在终端里运行自己的界面，审批和文件改动都在终端内完成。",
+                    "Agent 在終端裡執行自己的介面，審批和檔案改動都在終端內完成。",
+                )
+                .to_string()
+            } else {
+                crate::locale::text(
+                    "Vibex draws the conversation, approvals, and file changes.",
+                    "由 Vibex 绘制对话、审批和文件改动。",
+                    "由 Vibex 繪製對話、審批和檔案改動。",
+                )
+                .to_string()
+            };
+            row = row.child(
+                Button::new(id)
+                    .xsmall()
+                    .ghost()
+                    .selected(selected)
+                    .disabled(option_disabled)
+                    .tooltip(tooltip)
+                    .label(label)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if this.ui_state.session.new_session_transport == mode {
+                            return;
+                        }
+                        this.ui_state.session.new_session_transport = mode;
+                        this.queue_ui_state();
+                        cx.notify();
+                    })),
+            );
+        }
+        row.into_any_element()
+    }
+
     fn render_new_session_runtime_cascade(
         &mut self,
         selection: Option<SessionRuntimeSelection>,
@@ -56235,6 +56500,10 @@ impl VibexWorkbench {
             .as_ref()
             .map(|projection| projection.features.clone())
             .unwrap_or_default();
+        let transport_switch = self.render_new_session_transport_switch(
+            selection.as_ref().map(|selection| &selection.agent_id),
+            cx,
+        );
         let runtime_controls_cascade = self.render_new_session_runtime_cascade(
             selection.clone(),
             self.runtime_catalog.clone(),
@@ -57730,6 +57999,7 @@ impl VibexWorkbench {
                                                         )
                                                         .children(runtime_controls_other),
                                                 )
+                                                .child(transport_switch)
                                                 .child(
                                                     h_flex()
                                                         .id("new-session-runtime-controls-cascade")
@@ -70713,6 +70983,211 @@ impl VibexWorkbench {
             .into_any_element()
     }
 
+    /// The page a terminal-mode session draws instead of a timeline.
+    ///
+    /// Everything the Agent says is inside its own TUI, so this surface is the
+    /// whole conversation: no timeline, no composer, no permission cards. What
+    /// Vibex keeps outside that rectangle — the sidebar dot, the title, unread,
+    /// archive — is drawn by the shell around it exactly as for any session.
+    fn render_session_terminal_page(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Some(session) = self.selected_session().cloned() else {
+            return empty_center_content();
+        };
+        let strings = self.strings();
+        let terminal_id = session
+            .terminal
+            .as_ref()
+            .and_then(|facts| facts.terminal_id.clone());
+        let (Some(terminal_id), Some(transport)) = (terminal_id, self.terminal_transport(cx))
+        else {
+            return self.render_session_terminal_placeholder(&session, cx);
+        };
+        let key = session.id.as_str().to_string();
+        let workspace_root = std::path::PathBuf::from(&session.workspace_root);
+        if let std::collections::btree_map::Entry::Vacant(entry) =
+            self.session_terminal_surfaces.entry(key.clone())
+        {
+            let transport = transport.transport;
+            let surface_session = session.clone();
+            let surface_terminal = TerminalSession {
+                id: terminal_id.clone(),
+                workspace_id: surface_session.workspace_id.clone(),
+                title: surface_session.title.clone(),
+                shell: String::new(),
+                cwd: surface_session.workspace_root.clone(),
+                rows: 24,
+                cols: 100,
+                status: vibex_core::TerminalStatus::Running,
+                created_at_ms: surface_session.created_at_ms,
+                updated_at_ms: surface_session.updated_at_ms,
+                closed_at_ms: None,
+            };
+            let surface = cx.new(|cx| {
+                TerminalSurface::from_session_shared_session_with_transport(
+                    transport,
+                    workspace_root,
+                    surface_terminal,
+                    window,
+                    cx,
+                )
+            });
+            entry.insert(surface);
+        }
+        self.sync_session_terminal_surface_activity(cx);
+        let body = self
+            .session_terminal_surfaces
+            .get(&key)
+            .cloned()
+            .map(|surface| {
+                surface
+                    .cached(StyleRefinement::default().size_full())
+                    .into_any_element()
+            })
+            .unwrap_or_else(|| self.render_session_terminal_placeholder(&session, cx));
+        v_flex()
+            .id("session-terminal-page")
+            .size_full()
+            .min_w_0()
+            .min_h_0()
+            .child(self.render_session_terminal_header(&session, strings, cx))
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .child(body),
+            )
+            .into_any_element()
+    }
+
+    /// The one line above the grid.
+    ///
+    /// A terminal session has no timeline to carry the "approvals happen in the
+    /// terminal" contract, so the page states it once, beside the Agent's name,
+    /// instead of leaving the reader to discover it at the first prompt.
+    fn render_session_terminal_header(
+        &self,
+        session: &AgentSession,
+        strings: &'static Strings,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let _ = strings;
+        let activity = session
+            .terminal
+            .as_ref()
+            .map(|facts| facts.activity)
+            .unwrap_or(vibex_core::TerminalActivity::Unknown);
+        let activity_label = terminal_activity_label(activity);
+        h_flex()
+            .id("session-terminal-header")
+            .flex_none()
+            .w_full()
+            .min_w_0()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .py_2()
+            .border_b_1()
+            .border_color(cx.theme().border)
+            .child(
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .text_sm()
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .child(session.title.clone()),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(session.agent_id.as_str().to_string()),
+            )
+            .child(div().flex_1())
+            .child(
+                div()
+                    .flex_none()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(activity_label),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(crate::locale::text(
+                        "Approvals happen in the terminal",
+                        "审批在终端内完成",
+                        "審批在終端內完成",
+                    )),
+            )
+            .into_any_element()
+    }
+
+    /// What the page shows when the session has no running PTY.
+    fn render_session_terminal_placeholder(
+        &self,
+        session: &AgentSession,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let _ = cx;
+        let message = if session.state == vibex_core::AgentSessionState::Error {
+            crate::locale::text(
+                "The Agent did not start in this session's terminal.",
+                "该会话的终端未能启动 Agent。",
+                "該會話的終端未能啟動 Agent。",
+            )
+        } else {
+            crate::locale::text(
+                "This session's terminal is not running.",
+                "该会话的终端未运行。",
+                "該會話的終端未執行。",
+            )
+        };
+        div()
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .p_6()
+            .child(div().text_sm().child(message))
+            .into_any_element()
+    }
+
+    /// Keeps exactly the visible terminal-mode session polling.
+    fn sync_session_terminal_surface_activity(&mut self, cx: &mut Context<Self>) {
+        let desired = (self.ui_state.workbench.active_tab == "agent"
+            && !self.new_session_open
+            && !self.settings_open)
+            .then(|| {
+                self.selected_session()
+                    .map(|session| session.id.as_str().to_string())
+            })
+            .flatten()
+            .filter(|key| self.session_terminal_surfaces.contains_key(key));
+        if desired == self.active_session_terminal_id {
+            return;
+        }
+        if let Some(active) = self.active_session_terminal_id.take()
+            && let Some(surface) = self.session_terminal_surfaces.get(&active)
+        {
+            surface.update(cx, |surface, cx| surface.set_active(false, cx));
+        }
+        if let Some(key) = desired {
+            if let Some(surface) = self.session_terminal_surfaces.get(&key) {
+                surface.update(cx, |surface, cx| surface.set_active(true, cx));
+            }
+            self.active_session_terminal_id = Some(key);
+        }
+    }
+
     fn render_runtime_failure(
         &mut self,
         code: String,
@@ -70993,6 +71468,19 @@ impl VibexWorkbench {
     }
 
     /// The focused timeline's render boundary, created on first use.
+    fn ensure_session_terminal_view(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Entity<SessionTerminalView> {
+        if let Some(view) = self.session_terminal_view.as_ref() {
+            return view.clone();
+        }
+        let workbench = cx.entity();
+        let view = cx.new(|cx| SessionTerminalView::new(&workbench, cx));
+        self.session_terminal_view = Some(view.clone());
+        view
+    }
+
     fn ensure_timeline_view(&mut self, cx: &mut Context<Self>) -> Entity<TimelineView> {
         if let Some(view) = self.timeline_view.as_ref() {
             return view.clone();
@@ -71790,6 +72278,16 @@ impl VibexWorkbench {
     fn render_column_page(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let page = if let Some((group_id, group)) = self.active_session_group() {
             self.render_session_group_workspace(&group_id, &group, cx)
+        } else if self
+            .selected_session()
+            .is_some_and(AgentSession::is_terminal)
+        {
+            // A terminal-mode session has no timeline: the Agent owns its own
+            // interface inside the PTY, so the column hands the page over
+            // instead of drawing an empty conversation beside it.
+            self.ensure_session_terminal_view(cx)
+                .cached(StyleRefinement::default().size_full())
+                .into_any_element()
         } else {
             self.ensure_timeline_view(cx)
                 .cached(StyleRefinement::default().size_full())
@@ -79168,6 +79666,18 @@ fn sidebar_delete_project_description(
     }
 }
 
+/// How a terminal-mode session's observed activity reads in the session header.
+fn terminal_activity_label(activity: vibex_core::TerminalActivity) -> &'static str {
+    match activity {
+        vibex_core::TerminalActivity::Working => crate::locale::text("Working", "运行中", "執行中"),
+        vibex_core::TerminalActivity::Waiting => {
+            crate::locale::text("Waiting for you", "等待你操作", "等待你操作")
+        }
+        vibex_core::TerminalActivity::Idle => crate::locale::text("Idle", "空闲", "閒置"),
+        vibex_core::TerminalActivity::Unknown => crate::locale::text("Unknown", "未知", "未知"),
+    }
+}
+
 fn sidebar_session_state_label(
     state: AgentSessionState,
     strings: &'static Strings,
@@ -79393,6 +79903,55 @@ fn session_status_mark_for(
             sidebar_status_dot(cx.theme().sidebar_foreground.opacity(0.35))
         }
         AgentSessionState::Idle => sidebar_status_dot(cx.theme().success.opacity(0.78)),
+    }
+}
+
+/// The observation facts a sidebar row paints, when the session is a terminal.
+///
+/// An ACP session answers the same question through its lifecycle state, so the
+/// two never race: exactly one of them produces a mark.
+fn terminal_row_facts(session: &AgentSession) -> Option<vibex_core::TerminalSessionFacts> {
+    session
+        .transport
+        .is_terminal()
+        .then(|| session.terminal.clone())
+        .flatten()
+}
+
+/// The mark a terminal-mode session's row shows.
+///
+/// A terminal session's persisted state answers "is the session open", while the
+/// Agent's activity answers the question the row exists for: is it working, and
+/// is it parked on me. `Unknown` draws nothing rather than a fake idle dot —
+/// claiming idle while the CLI waits on an approval prompt is a claim the
+/// reader would act on.
+fn sidebar_terminal_activity_mark(
+    prefix: &'static str,
+    session_id: &str,
+    facts: &vibex_core::TerminalSessionFacts,
+    cx: &App,
+) -> Option<AnyElement> {
+    use vibex_core::TerminalActivity;
+    match facts.activity {
+        TerminalActivity::Working => Some(session_status_mark_for(
+            format!("{prefix}-terminal-working-{session_id}"),
+            AgentSessionState::Running,
+            false,
+            cx,
+        )),
+        TerminalActivity::Waiting => Some(sidebar_attention_icon(
+            format!("{prefix}-terminal-waiting-{session_id}"),
+            crate::locale::text(
+                "Terminal is waiting for you",
+                "终端在等你操作",
+                "終端在等你操作",
+            ),
+            cx,
+        )),
+        // Idle and Unknown both draw nothing: the row's time label already says
+        // when something last happened, and a dot for "possibly idle" would be
+        // the same lie in a smaller shape.
+        TerminalActivity::Idle | TerminalActivity::Unknown => None,
     }
 }
 
@@ -99886,6 +100445,8 @@ mod tests {
             archived_at_ms: None,
             deleted_at_ms: None,
             tools: Default::default(),
+            transport: vibex_core::SessionTransport::Acp,
+            terminal: None,
         }
     }
 
@@ -100996,6 +101557,8 @@ mod tests {
             archived_at_ms: None,
             deleted_at_ms: None,
             tools: Default::default(),
+            transport: vibex_core::SessionTransport::Acp,
+            terminal: None,
         };
         let mut timestamp_only_update = session.clone();
         timestamp_only_update.updated_at_ms = 3;
@@ -103340,6 +103903,8 @@ mod tests {
                 archived_at_ms: None,
                 deleted_at_ms: None,
                 tools: Default::default(),
+                transport: vibex_core::SessionTransport::Acp,
+                terminal: None,
             }
         }
 
@@ -103826,6 +104391,8 @@ mod tests {
             archived_at_ms: None,
             deleted_at_ms: None,
             tools: Default::default(),
+            transport: vibex_core::SessionTransport::Acp,
+            terminal: None,
         };
         // Unread and pinned are facts about the reader's own view of the row,
         // not the Agent's state, so they come from the shell's sets. The session
@@ -104194,6 +104761,109 @@ mod tests {
             .expect("session removal should remain inspectable");
         assert!(removal.contains("self.composer_drafts"));
         assert!(removal.contains(".retain(|session_id| !session_ids.contains(session_id));"));
+    }
+
+    /// A terminal-mode session draws its own surface instead of an empty
+    /// timeline, and an ACP session keeps the timeline it had.
+    #[test]
+    fn a_terminal_session_takes_the_column_and_the_timeline_keeps_the_rest() {
+        let source = include_str!("app.rs");
+        let page = source
+            .split_once("    fn render_column_page(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_shell("))
+            .map(|(body, _)| body)
+            .expect("the column page should remain inspectable");
+        let terminal = page
+            .find("AgentSession::is_terminal")
+            .expect("a terminal session must be recognized before the timeline arm");
+        let timeline = page
+            .find("ensure_timeline_view(cx)")
+            .expect("an ACP session still renders the timeline");
+        assert!(terminal < timeline);
+        assert!(page.contains("ensure_session_terminal_view(cx)"));
+        // The duel overlay wraps every arm, including the terminal one.
+        assert!(page.contains("crate::arena::session_surface(&self.session_companion, page, cx)"));
+    }
+
+    /// The session page's terminal is held at the workbench, not in the session
+    /// view cache.
+    ///
+    /// `SessionView` is an LRU that drops the coldest conversation, and a
+    /// dropped `TerminalSurface` closes the PTY it was handed. Keeping the two
+    /// apart is what lets a reader switch sessions without stopping the Agent.
+    #[test]
+    fn a_session_terminal_survives_the_session_view_cache() {
+        let source = include_str!("app.rs");
+        let view = source
+            .split_once("pub struct SessionView {")
+            .and_then(|(_, tail)| tail.split_once("\nstruct SessionGroupPaneView"))
+            .map(|(body, _)| body)
+            .expect("the session view should remain inspectable");
+        assert!(!view.contains("session_terminal_surfaces"));
+        assert!(
+            source.contains("session_terminal_surfaces: BTreeMap<String, Entity<TerminalSurface>>")
+        );
+        assert!(source.contains("fn sync_session_terminal_surface_activity("));
+        // The surface must not own its process: the session owns it, so a
+        // surface rebuilt for a page change cannot stop the Agent.
+        assert!(
+            source.contains("from_session_shared_session_with_transport")
+                || include_str!("terminal_surface.rs")
+                    .contains("from_session_shared_session_with_transport")
+        );
+    }
+
+    /// The new-session page offers terminal mode only for an Agent this release
+    /// verified, so the panel cannot advertise a mode that fails on submit.
+    #[test]
+    fn the_new_session_transport_switch_disables_unverified_agents() {
+        let source = include_str!("app.rs");
+        let switch = source
+            .split_once("    fn render_new_session_transport_switch(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_new_session_runtime_cascade("))
+            .map(|(body, _)| body)
+            .expect("the transport switch should remain inspectable");
+        assert!(switch.contains("terminal_session_support(agent_id).is_supported()"));
+        assert!(switch.contains(".disabled(option_disabled)"));
+        assert!(switch.contains("ui_state.session.new_session_transport = mode"));
+        let panel = source
+            .split_once("    fn render_new_session_panel(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn show_turn_preview_rail("))
+            .map(|(body, _)| body)
+            .expect("the new-session panel should remain inspectable");
+        assert!(panel.contains(".child(transport_switch)"));
+    }
+
+    /// Submitting in terminal mode never composes an ACP create request.
+    #[test]
+    fn terminal_mode_submission_skips_the_acp_creation_request() {
+        let source = include_str!("app.rs");
+        let submit = source
+            .split_once("    fn submit_new_session(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn choose_runtime_selection("))
+            .map(|(body, _)| body)
+            .expect("new-session submission should remain inspectable");
+        let branch = submit
+            .find("if self.ui_state.session.new_session_transport.is_terminal()")
+            .expect("terminal mode must branch before the ACP request is built");
+        let acp_request = submit
+            .find("let create_request = CreateAgentSessionRequest {")
+            .expect("the ACP request should still exist for the other mode");
+        assert!(branch < acp_request);
+        assert!(
+            submit.contains("self.submit_new_terminal_session(&selection.agent_id, window, cx);")
+        );
+
+        let terminal = source
+            .split_once("    fn submit_new_terminal_session(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn submit_new_session("))
+            .map(|(body, _)| body)
+            .expect("the terminal submission should remain inspectable");
+        assert!(terminal.contains("create_terminal_session("));
+        // The draft's text belongs to the reader's next terminal prompt, not to
+        // a timeline message this path could never deliver.
+        assert!(!terminal.contains("send_message"));
+        assert!(!terminal.contains("CreateAgentSessionRequest"));
     }
 
     #[test]
@@ -105821,6 +106491,8 @@ mod tests {
             archived_at_ms: None,
             deleted_at_ms: None,
             tools: Default::default(),
+            transport: vibex_core::SessionTransport::Acp,
+            terminal: None,
         };
         let session_id = VibexSessionId::parse("session_elicitation_form_a").expect("session id");
         let other_session_id =

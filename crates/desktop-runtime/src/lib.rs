@@ -17,6 +17,7 @@ pub mod network_proxy;
 mod rc_import;
 mod relay;
 mod remote_connectivity;
+mod session_terminal;
 mod sidebar_organization;
 mod storage;
 mod timeline_display_settings;
@@ -3069,6 +3070,9 @@ impl DesktopRuntime {
                 )
             })?;
         let runtime_probe = acp_runtime.runtime_probe_service();
+        manager.install_session_terminal_launcher(
+            &session_terminal::TerminalManagerSessionLauncher::shared(terminals.clone()),
+        )?;
         let manager = Arc::new(manager);
         let db_path = manager.database_path().to_path_buf();
         let team_budget = vibex_use::load_budget_policy(&config.home_dir, &db_path)?;
@@ -5364,6 +5368,8 @@ mod tests {
             archived_at_ms: None,
             deleted_at_ms: None,
             tools: Default::default(),
+            transport: vibex_core::SessionTransport::Acp,
+            terminal: None,
         };
         SessionRepository::insert(&conn, &session).unwrap();
         let selection =

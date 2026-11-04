@@ -13,6 +13,7 @@ pub mod runtime_route;
 pub mod runtime_selection;
 pub mod runtime_switch;
 pub mod scheduler;
+pub mod session_terminal;
 pub mod smoke_workspace;
 pub mod state_machine;
 pub(crate) mod storage_retry;
@@ -77,6 +78,7 @@ pub use scheduler::{
     DEFAULT_SCHEDULED_TASK_DUE_LIMIT, DEFAULT_SCHEDULED_TASK_STALE_AFTER_MS,
     ScheduledTaskRunOutcome, ScheduledTaskRunner, ScheduledTaskTickResult, next_run_after,
 };
+pub use session_terminal::{RecordingTerminalLauncher, SessionTerminalLauncher, TerminalWorkspace};
 pub use smoke_workspace::{
     AGENT_SMOKE_FORBIDDEN_ROOT_ENV, AGENT_SMOKE_WORKSPACE_ENV, forbidden_agent_smoke_root,
     reject_forbidden_agent_smoke_workspace, resolve_agent_smoke_workspace,

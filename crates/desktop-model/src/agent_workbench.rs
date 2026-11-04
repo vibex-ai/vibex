@@ -1927,6 +1927,8 @@ mod tests {
             archived_at_ms: None,
             deleted_at_ms: None,
             tools: Default::default(),
+            transport: vibex_core::SessionTransport::Acp,
+            terminal: None,
         }
     }
 

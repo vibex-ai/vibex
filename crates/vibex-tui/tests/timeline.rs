@@ -46,6 +46,8 @@ fn app(payloads: Vec<TimelinePayload>, state: AgentSessionState) -> App {
         archived_at_ms: None,
         deleted_at_ms: None,
         tools: Default::default(),
+        transport: vibex_core::SessionTransport::Acp,
+        terminal: None,
     };
     let id = session.id.clone();
     app.agent.state.selected_session_id = Some(id.clone());

@@ -230,6 +230,26 @@ pub trait AgentBackend: BackendBound {
         request: MutationRequest<CreateAgentSessionRequest>,
     ) -> BackendFuture<'_, AgentSession>;
 
+    /// Creates a Logical Session whose Agent runs in its own terminal.
+    ///
+    /// Separate from [`Self::create_session`] because the two agree only on the
+    /// row they produce: an ACP session materializes a runtime binding and
+    /// owns a timeline, while a terminal session starts a CLI and owns none.
+    /// A backend with no PTY answers with `terminal_session_unsupported`
+    /// instead of pretending the mode exists.
+    fn create_terminal_session(
+        &self,
+        request: MutationRequest<vibex_core::CreateTerminalSessionRequest>,
+    ) -> BackendFuture<'_, AgentSession> {
+        let _ = request;
+        Box::pin(async {
+            Err(crate::BackendError::unsupported(
+                "terminal_session_unsupported",
+                "this backend cannot start terminal-mode sessions",
+            ))
+        })
+    }
+
     fn fetch_timeline(&self, request: FetchTimelineRequest) -> BackendFuture<'_, TimelinePage>;
 
     /// Reads one timeline item back at full payload depth.

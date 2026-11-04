@@ -3904,6 +3904,8 @@ mod tests {
             archived_at_ms: None,
             deleted_at_ms: None,
             tools: Default::default(),
+            transport: vibex_core::SessionTransport::Acp,
+            terminal: None,
         }
     }
 
@@ -5156,6 +5158,8 @@ mod tests {
                 archived_at_ms: None,
                 deleted_at_ms: None,
                 tools: Default::default(),
+                transport: vibex_core::SessionTransport::Acp,
+                terminal: None,
             })
             .collect::<Vec<_>>();
         app.agent.apply_sessions(Ok(sessions)).expect("apply");
@@ -5222,6 +5226,8 @@ mod tests {
                 archived_at_ms: None,
                 deleted_at_ms: None,
                 tools: Default::default(),
+                transport: vibex_core::SessionTransport::Acp,
+                terminal: None,
             })
             .collect::<Vec<_>>();
         app.agent.apply_sessions(Ok(sessions)).expect("apply");
@@ -5299,6 +5305,8 @@ mod tests {
                 archived_at_ms: None,
                 deleted_at_ms: None,
                 tools: Default::default(),
+                transport: vibex_core::SessionTransport::Acp,
+                terminal: None,
             })
             .collect::<Vec<_>>();
         app.agent
@@ -5473,6 +5481,8 @@ mod tests {
                 archived_at_ms: None,
                 deleted_at_ms: None,
                 tools: Default::default(),
+                transport: vibex_core::SessionTransport::Acp,
+                terminal: None,
             })
             .collect::<Vec<_>>();
         app.agent.apply_sessions(Ok(sessions)).expect("apply");
@@ -5570,6 +5580,8 @@ mod tests {
                 archived_at_ms: None,
                 deleted_at_ms: None,
                 tools: Default::default(),
+                transport: vibex_core::SessionTransport::Acp,
+                terminal: None,
             }]))
             .expect("apply");
         app.navigate_to(Page::Sessions);
@@ -5704,6 +5716,8 @@ mod tests {
                 archived_at_ms: None,
                 deleted_at_ms: None,
                 tools: Default::default(),
+                transport: vibex_core::SessionTransport::Acp,
+                terminal: None,
             }]))
             .expect("apply");
         app.navigate_to(Page::Sessions);
@@ -5774,6 +5788,8 @@ mod tests {
                 archived_at_ms: None,
                 deleted_at_ms: None,
                 tools: Default::default(),
+                transport: vibex_core::SessionTransport::Acp,
+                terminal: None,
             })
             .collect::<Vec<_>>();
         app.agent.apply_sessions(Ok(sessions)).expect("apply");

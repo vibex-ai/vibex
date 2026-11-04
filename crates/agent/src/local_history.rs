@@ -5714,6 +5714,8 @@ pub fn session_shell_for_materialized(
         // An imported history has no recorded answer; it follows the Agent
         // like every session that predates the field.
         tools: Default::default(),
+        transport: vibex_core::SessionTransport::Acp,
+        terminal: None,
     }
 }
 

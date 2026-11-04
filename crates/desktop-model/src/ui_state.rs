@@ -217,6 +217,28 @@ pub enum TerminalWorkingDirectory {
 /// input by the panel's height, which is what a fresh install starts with. The
 /// `Composer` mode is the older single-surface behavior: the input itself is
 /// replaced by the terminal until the reader goes back to the conversation.
+/// How the new-session page will run the Agent it is about to create.
+///
+/// The choice is not a preference a session can change later: a terminal-mode
+/// session is born in its PTY and stays there, because the Agent owns the
+/// conversation inside it. That is why this lives on the draft rather than on a
+/// created session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum NewSessionTransport {
+    /// Vibex drives the Agent over ACP and draws the structured timeline.
+    #[default]
+    Acp,
+    /// The Agent CLI runs in a terminal and owns its own interface.
+    Terminal,
+}
+
+impl NewSessionTransport {
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, Self::Terminal)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum TerminalOpenMode {
@@ -1533,6 +1555,13 @@ impl ComposerUiState {
 pub struct SessionUiState {
     pub content_width: SessionContentWidthMode,
     pub turn_preview_rail: bool,
+    /// How the new-session page last ran its Agent.
+    ///
+    /// Remembered so a reader who works in terminal mode does not re-pick it
+    /// for every session. It only seeds the draft: the created session records
+    /// its own transport and never follows this value.
+    #[serde(default)]
+    pub new_session_transport: NewSessionTransport,
     #[serde(default)]
     pub reasoning_display_mode: ReasoningDisplayMode,
     #[serde(default)]
@@ -1590,6 +1619,7 @@ impl Default for SessionUiState {
         Self {
             content_width: SessionContentWidthMode::Standard,
             turn_preview_rail: true,
+            new_session_transport: NewSessionTransport::Acp,
             reasoning_display_mode: ReasoningDisplayMode::LatestAtBottom,
             reasoning_expanded_by_default: false,
             reasoning_expansion_mode: ReasoningExpansionMode::Window,

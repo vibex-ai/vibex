@@ -770,6 +770,8 @@ fn the_prompt_names_the_runtime_the_session_is_on() {
             archived_at_ms: None,
             deleted_at_ms: None,
             tools: Default::default(),
+            transport: vibex_core::SessionTransport::Acp,
+            terminal: None,
         });
     // The session is on the second entry, so the second one is what the line
     // has to name.
@@ -1057,6 +1059,8 @@ fn open_session_on(app: &mut App, desired: vibex_core::SessionRuntimeSelection) 
             archived_at_ms: None,
             deleted_at_ms: None,
             tools: Default::default(),
+            transport: vibex_core::SessionTransport::Acp,
+            terminal: None,
         });
     app.agent.state.selected_session_id = Some(session_id);
     app.agent
@@ -2122,6 +2126,8 @@ fn seeded_session(id: &str, title: &str) -> vibex_core::AgentSession {
         archived_at_ms: None,
         deleted_at_ms: None,
         tools: Default::default(),
+        transport: vibex_core::SessionTransport::Acp,
+        terminal: None,
     }
 }
 

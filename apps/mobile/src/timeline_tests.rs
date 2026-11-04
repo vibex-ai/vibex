@@ -94,6 +94,8 @@ fn open_timeline<'a>(
                 archived_at_ms: None,
                 deleted_at_ms: None,
                 tools: Default::default(),
+                transport: vibex_core::SessionTransport::Acp,
+                terminal: None,
             });
             let items: Vec<_> = std::iter::once(TimelinePayload::UserMessage(UserMessagePayload {
                 text: "Review the implementation".into(),

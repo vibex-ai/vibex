@@ -85,6 +85,12 @@ enum TerminalSurfaceMode {
     Standalone,
     Preview,
     Composer,
+    /// The session page's own surface.
+    ///
+    /// A terminal-mode session gives the whole column to the Agent CLI, so this
+    /// mode draws no tabs, no toolbar, and the smallest padding the grid can
+    /// take while staying readable.
+    Session,
 }
 
 impl TerminalSurfaceMode {
@@ -97,6 +103,7 @@ impl TerminalSurfaceMode {
             Self::Standalone => TERMINAL_HORIZONTAL_PADDING,
             Self::Preview => PREVIEW_TERMINAL_PADDING,
             Self::Composer => COMPOSER_TERMINAL_PADDING,
+            Self::Session => COMPOSER_TERMINAL_PADDING,
         }
     }
 
@@ -105,6 +112,7 @@ impl TerminalSurfaceMode {
             Self::Standalone => TERMINAL_VERTICAL_PADDING,
             Self::Preview => PREVIEW_TERMINAL_PADDING,
             Self::Composer => COMPOSER_TERMINAL_PADDING,
+            Self::Session => COMPOSER_TERMINAL_PADDING,
         }
     }
 }
@@ -379,6 +387,35 @@ impl TerminalSurface {
             None,
             false,
             TerminalSurfaceMode::Preview,
+            false,
+            window,
+            cx,
+        )
+    }
+
+    /// Attaches a terminal-mode session's PTY to the session page.
+    ///
+    /// The surface never owns the process: closing the session is what stops
+    /// the Agent, and a surface dropped because the reader changed pages must
+    /// leave it running. That is why `owns_initial_sessions` is false here.
+    pub fn from_session_shared_session_with_transport(
+        transport: Arc<dyn TerminalTransport>,
+        workspace_root: PathBuf,
+        session: TerminalSession,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let workspace_id = session.workspace_id.clone();
+        Self::build(
+            transport,
+            workspace_root,
+            workspace_id,
+            vec![TerminalTab::new(session)],
+            Some(0),
+            "Attached to this session's terminal".into(),
+            None,
+            false,
+            TerminalSurfaceMode::Session,
             false,
             window,
             cx,
@@ -3007,6 +3044,21 @@ mod tests {
         assert!(!TerminalSurfaceMode::Composer.shows_chrome());
         assert_eq!(TerminalSurfaceMode::Composer.horizontal_padding(), 4.0);
         assert!(TerminalSurfaceMode::Standalone.shows_chrome());
+    }
+
+    /// A terminal-mode session gives the whole column to the Agent, so its
+    /// surface draws no tabs and no toolbar, and takes the compact inset.
+    #[test]
+    fn a_session_terminal_draws_no_chrome() {
+        assert!(!TerminalSurfaceMode::Session.shows_chrome());
+        assert_eq!(
+            TerminalSurfaceMode::Session.horizontal_padding(),
+            COMPOSER_TERMINAL_PADDING
+        );
+        assert_eq!(
+            TerminalSurfaceMode::Session.vertical_padding(),
+            COMPOSER_TERMINAL_PADDING
+        );
     }
 
     #[test]

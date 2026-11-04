@@ -74,6 +74,8 @@ async fn relay_e2ee_remote_v2_handshake_rpc_event_revoke_and_reconnect_smoke() {
         archived_at_ms: None,
         deleted_at_ms: None,
         tools: Default::default(),
+        transport: vibex_core::SessionTransport::Acp,
+        terminal: None,
     };
     SessionRepository::insert(&connection, &session).unwrap();
 

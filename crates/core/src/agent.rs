@@ -436,6 +436,23 @@ pub struct AgentSession {
     /// Empty follows the Agent preference.
     #[serde(default, skip_serializing_if = "SessionToolSettings::is_inherit")]
     pub tools: SessionToolSettings,
+    /// How this session reaches its Agent.
+    ///
+    /// Absent on rows that predate the field, which are all ACP sessions.
+    #[serde(default)]
+    pub transport: crate::terminal::SessionTransport,
+    /// What Vibex can currently observe about a terminal-mode Agent.
+    ///
+    /// `None` for every ACP session, so their serialized shape does not change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal: Option<crate::terminal::TerminalSessionFacts>,
+}
+
+impl AgentSession {
+    /// Whether the Agent owns its own interface inside a PTY.
+    pub fn is_terminal(&self) -> bool {
+        self.transport.is_terminal()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

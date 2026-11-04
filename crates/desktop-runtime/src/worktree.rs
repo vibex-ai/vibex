@@ -5840,6 +5840,8 @@ mod tests {
             archived_at_ms: None,
             deleted_at_ms: None,
             tools: Default::default(),
+            transport: vibex_core::SessionTransport::Acp,
+            terminal: None,
         };
         let connection = open_database(&fixture.coordinator.db_path).unwrap();
         SessionRepository::insert(&connection, &assistance_session).unwrap();
@@ -6541,6 +6543,8 @@ mod tests {
                 archived_at_ms: None,
                 deleted_at_ms: None,
                 tools: Default::default(),
+                transport: vibex_core::SessionTransport::Acp,
+                terminal: None,
             },
         )
         .collect::<Vec<_>>();

@@ -38,6 +38,7 @@ pub mod remote_v2;
 pub mod runtime;
 pub mod scheduled_task;
 pub mod terminal;
+pub mod terminal_agent;
 pub mod time;
 pub mod timeline;
 pub mod usage;
@@ -615,10 +616,13 @@ pub use scheduled_task::{
     ScheduledTaskSchedule, ScheduledTaskStatus, ScheduledTaskUpdateRequest,
 };
 pub use terminal::{
+    CreateTerminalSessionRequest, SessionTransport, TerminalActivity, TerminalActivitySource,
     TerminalAuthActionDescriptor, TerminalCreateRequest, TerminalOutputChunk,
-    TerminalResizeRequest, TerminalSession, TerminalShell, TerminalSnapshot, TerminalStatus,
-    TerminalSwitchShellRequest, TerminalWriteRequest,
+    TerminalResizeRequest, TerminalSession, TerminalSessionFacts, TerminalSessionHandle,
+    TerminalSessionLaunchSpec, TerminalSessionSupport, TerminalShell, TerminalSnapshot,
+    TerminalStatus, TerminalSwitchShellRequest, TerminalWriteRequest,
 };
+pub use terminal_agent::{native_cli_executable, terminal_session_support};
 pub use time::unix_timestamp_ms;
 pub mod team;
 pub use team::*;

@@ -242,6 +242,8 @@ fn create_e2e_durable_session(
         archived_at_ms: None,
         deleted_at_ms: None,
         tools: Default::default(),
+        transport: vibex_core::SessionTransport::Acp,
+        terminal: None,
     };
     SessionRepository::insert(&conn, &session)?;
     let selection =

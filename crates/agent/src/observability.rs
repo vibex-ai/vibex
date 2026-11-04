@@ -45,6 +45,8 @@ pub enum RuntimeMetricName {
     DelegationDeadline,
     DelegationDelivery,
     DelegationPresentation,
+    /// A deleted terminal-mode session whose PTY would not stop.
+    TerminalSessionStopFailure,
 }
 
 impl RuntimeMetricName {
@@ -80,6 +82,7 @@ impl RuntimeMetricName {
             Self::DelegationDeadline => "delegation_deadline_total",
             Self::DelegationDelivery => "delegation_delivery_total",
             Self::DelegationPresentation => "delegation_presentation_total",
+            Self::TerminalSessionStopFailure => "terminal_session_stop_failure_total",
         }
     }
 }

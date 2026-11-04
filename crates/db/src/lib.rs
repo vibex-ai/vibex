@@ -97,7 +97,7 @@ pub use runtime::{
     SwitchOperationJournalRepository, SwitchOperationRecord,
 };
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 87;
+pub const CURRENT_SCHEMA_VERSION: i64 = 88;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Copy)]
@@ -2671,9 +2671,9 @@ impl SessionRepository {
                 workspace_mode, state,
                 permission_mode, ask_on_risk, bypass_all_permissions,
                 created_at_ms, updated_at_ms, archived_at_ms, deleted_at_ms,
-                current_agent_id, tools_json
+                current_agent_id, tools_json, transport
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
             ",
             params![
                 session.id.as_str(),
@@ -2691,7 +2691,8 @@ impl SessionRepository {
                 session.archived_at_ms,
                 session.deleted_at_ms,
                 session.agent_id.as_str(),
-                json_to_db(&session.tools)?
+                json_to_db(&session.tools)?,
+                enum_to_db(&session.transport)?
             ],
         )
         .map_err(storage_err(
@@ -2775,7 +2776,7 @@ impl SessionRepository {
                          WHERE agent_timeline_items.session_id = agent_sessions.session_id),
                         created_at_ms
                     ) AS last_message_at_ms,
-                    archived_at_ms, deleted_at_ms, current_agent_id, tools_json
+                    archived_at_ms, deleted_at_ms, current_agent_id, tools_json, transport
                 FROM agent_sessions
                 WHERE session_id = ?1 AND deleted_at_ms IS NULL
                 ",
@@ -2850,7 +2851,7 @@ impl SessionRepository {
                      WHERE agent_timeline_items.session_id = agent_sessions.session_id),
                     created_at_ms
                 ) AS last_message_at_ms,
-                archived_at_ms, deleted_at_ms, current_agent_id, tools_json
+                archived_at_ms, deleted_at_ms, current_agent_id, tools_json, transport
             FROM agent_sessions
             WHERE deleted_at_ms IS NULL
             {}
@@ -3086,7 +3087,7 @@ impl SessionRepository {
                          WHERE agent_timeline_items.session_id = agent_sessions.session_id),
                         created_at_ms
                     ) AS last_message_at_ms,
-                    archived_at_ms, deleted_at_ms, current_agent_id, tools_json
+                    archived_at_ms, deleted_at_ms, current_agent_id, tools_json, transport
                 FROM agent_sessions
                 WHERE deleted_at_ms IS NULL
                     AND archived_at_ms IS NOT NULL
@@ -12597,6 +12598,10 @@ pub fn apply_migrations(conn: &mut Connection) -> VibexResult<Vec<String>> {
     // Recorded after the older tail so a migrated database reports an ascending
     // version list; it needs the v2 Provider rows the backfill above creates.
     provider_projection::migrate_opencode_session_header(conn, &mut applied)?;
+    // Terminal-mode sessions keep the same `agent_sessions` row and add the
+    // terminal they run in beside it, so the column and the link table are
+    // recorded last and independent of the ACP tables above.
+    apply_session_transport(conn, &mut applied)?;
     Ok(applied)
 }
 
@@ -17343,6 +17348,10 @@ fn map_agent_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentSession> 
         deleted_at_ms: row.get(14)?,
         agent_id: parse_id_sql(row.get(15)?, AgentId::parse)?,
         tools: json_from_db_sql(row.get(16)?)?,
+        transport: enum_from_db_sql(row.get(17)?)?,
+        // The observation facts live in `session_terminals` and are read by the
+        // repository that owns that table, not by the session row itself.
+        terminal: None,
     })
 }
 
@@ -18934,6 +18943,8 @@ mod tests {
             archived_at_ms: None,
             deleted_at_ms: None,
             tools: Default::default(),
+            transport: vibex_core::SessionTransport::Acp,
+            terminal: None,
         };
         SessionRepository::insert(&conn, &parent).unwrap();
         let delegation = AgentDelegation::single_turn_legacy(
@@ -18973,6 +18984,8 @@ mod tests {
             archived_at_ms: None,
             deleted_at_ms: None,
             tools: Default::default(),
+            transport: vibex_core::SessionTransport::Acp,
+            terminal: None,
         };
         SessionRepository::insert(&conn, &child).unwrap();
         let attached = AgentDelegationRepository::attach_claimed_child_session(
@@ -19084,6 +19097,8 @@ mod tests {
                 archived_at_ms: None,
                 deleted_at_ms: None,
                 tools: Default::default(),
+                transport: vibex_core::SessionTransport::Acp,
+                terminal: None,
             };
             SessionRepository::insert(conn, &session).unwrap();
             session
@@ -19297,6 +19312,8 @@ mod tests {
             archived_at_ms: None,
             deleted_at_ms: None,
             tools: Default::default(),
+            transport: vibex_core::SessionTransport::Acp,
+            terminal: None,
         };
         SessionRepository::insert(&conn, &session).unwrap();
         let auth_context = AgentAuthContextRepository::ensure_default(&conn, &agent_id).unwrap();
@@ -19431,6 +19448,7 @@ mod tests {
                 "85:agent_discovery_latest_only",
                 "86:agent_session_tool_settings",
                 "87:opencode_session_header",
+                "88:agent_session_transport",
             ]
         );
         let agent_models: (Option<String>, Option<String>) = conn
@@ -19602,6 +19620,7 @@ mod tests {
                 "85:agent_discovery_latest_only",
                 "86:agent_session_tool_settings",
                 "87:opencode_session_header",
+                "88:agent_session_transport",
             ]
         );
         let activation_completed_at_ms: Option<i64> = conn
@@ -19680,6 +19699,8 @@ mod tests {
             archived_at_ms: None,
             deleted_at_ms: None,
             tools: Default::default(),
+            transport: vibex_core::SessionTransport::Acp,
+            terminal: None,
         };
         SessionRepository::insert(&conn, &session).unwrap();
         conn.execute(
@@ -19756,6 +19777,7 @@ mod tests {
                 "85:agent_discovery_latest_only",
                 "86:agent_session_tool_settings",
                 "87:opencode_session_header",
+                "88:agent_session_transport",
             ]
         );
         let stored: (String, Option<String>, Option<i64>) = conn
@@ -19946,6 +19968,7 @@ mod tests {
                 "85:agent_discovery_latest_only",
                 "86:agent_session_tool_settings",
                 "87:opencode_session_header",
+                "88:agent_session_transport",
             ]
         );
         assert_eq!(
@@ -20072,6 +20095,8 @@ mod tests {
             archived_at_ms: None,
             deleted_at_ms: None,
             tools: Default::default(),
+            transport: vibex_core::SessionTransport::Acp,
+            terminal: None,
         };
         SessionRepository::insert(&conn, &session).unwrap();
         let selection = SessionRuntimeSelection {
@@ -20612,6 +20637,8 @@ mod tests {
             archived_at_ms: None,
             deleted_at_ms: None,
             tools: Default::default(),
+            transport: vibex_core::SessionTransport::Acp,
+            terminal: None,
         };
         SessionRepository::insert(&conn, &session).unwrap();
 
@@ -20669,6 +20696,8 @@ mod tests {
             archived_at_ms: None,
             deleted_at_ms: None,
             tools: Default::default(),
+            transport: vibex_core::SessionTransport::Acp,
+            terminal: None,
         };
         SessionRepository::insert(&conn, &session).unwrap();
 
@@ -21399,6 +21428,7 @@ mod tests {
                 "85:agent_discovery_latest_only",
                 "86:agent_session_tool_settings",
                 "87:opencode_session_header",
+                "88:agent_session_transport",
             ]
         );
         let managed = ManagedWorktreeRepository::get_by_id(&conn, &worktree_id)
@@ -23102,6 +23132,8 @@ mod tests {
             archived_at_ms: None,
             deleted_at_ms: None,
             tools: Default::default(),
+            transport: vibex_core::SessionTransport::Acp,
+            terminal: None,
         };
         SessionRepository::insert(&conn, &session).unwrap();
 
@@ -23236,6 +23268,8 @@ mod tests {
             archived_at_ms: None,
             deleted_at_ms: None,
             tools: Default::default(),
+            transport: vibex_core::SessionTransport::Acp,
+            terminal: None,
         };
         SessionRepository::insert(&conn, &session).unwrap();
         SessionRepository::update_state(&conn, &session.id, AgentSessionState::Idle).unwrap();
@@ -23323,6 +23357,8 @@ mod tests {
             archived_at_ms: None,
             deleted_at_ms: None,
             tools: Default::default(),
+            transport: vibex_core::SessionTransport::Acp,
+            terminal: None,
         };
         SessionRepository::insert(&conn, &session).unwrap();
         SessionRepository::update_state(&conn, &session.id, AgentSessionState::Idle).unwrap();
@@ -23500,6 +23536,8 @@ mod tests {
             archived_at_ms: None,
             deleted_at_ms: None,
             tools: Default::default(),
+            transport: vibex_core::SessionTransport::Acp,
+            terminal: None,
         };
         SessionRepository::insert(&conn, &session).unwrap();
         SessionRepository::update_state(&conn, &session.id, AgentSessionState::Idle).unwrap();
@@ -23649,6 +23687,8 @@ mod tests {
             archived_at_ms: None,
             deleted_at_ms: None,
             tools: Default::default(),
+            transport: vibex_core::SessionTransport::Acp,
+            terminal: None,
         };
         SessionRepository::insert(&conn, &session).unwrap();
         SessionRepository::update_state(&conn, &session.id, state).unwrap();
@@ -24157,6 +24197,8 @@ mod tests {
             archived_at_ms: None,
             deleted_at_ms: None,
             tools: Default::default(),
+            transport: vibex_core::SessionTransport::Acp,
+            terminal: None,
         };
         SessionRepository::insert(&conn, &session).unwrap();
         SessionRepository::update_state(&conn, &session.id, AgentSessionState::Running).unwrap();
@@ -24463,6 +24505,8 @@ mod tests {
             archived_at_ms: None,
             deleted_at_ms: None,
             tools: Default::default(),
+            transport: vibex_core::SessionTransport::Acp,
+            terminal: None,
         };
         SessionRepository::insert(conn, &session).unwrap();
         SessionRepository::update_state(conn, &session.id, AgentSessionState::Idle).unwrap();
@@ -24738,6 +24782,8 @@ mod tests {
             archived_at_ms: None,
             deleted_at_ms: None,
             tools: Default::default(),
+            transport: vibex_core::SessionTransport::Acp,
+            terminal: None,
         };
         SessionRepository::insert(&conn, &session).unwrap();
         SessionRepository::update_state(&conn, &session.id, AgentSessionState::Idle).unwrap();
@@ -24955,6 +25001,8 @@ mod tests {
             archived_at_ms: None,
             deleted_at_ms: None,
             tools: Default::default(),
+            transport: vibex_core::SessionTransport::Acp,
+            terminal: None,
         };
         SessionRepository::insert(&conn, &session).unwrap();
         SessionRepository::update_state(&conn, &session.id, AgentSessionState::Idle).unwrap();
@@ -25217,6 +25265,8 @@ mod tests {
             archived_at_ms: None,
             deleted_at_ms: None,
             tools: Default::default(),
+            transport: vibex_core::SessionTransport::Acp,
+            terminal: None,
         };
         let appended = TimelineRepository::insert_session_and_append_many(
             &mut conn,
@@ -25294,6 +25344,8 @@ mod tests {
             archived_at_ms: None,
             deleted_at_ms: None,
             tools: Default::default(),
+            transport: vibex_core::SessionTransport::Acp,
+            terminal: None,
         };
         SessionRepository::insert(&conn, &session).unwrap();
 
@@ -25359,6 +25411,8 @@ mod tests {
             archived_at_ms: None,
             deleted_at_ms: None,
             tools: Default::default(),
+            transport: vibex_core::SessionTransport::Acp,
+            terminal: None,
         };
         TimelineRepository::insert_session_and_append_many(
             &mut conn,
@@ -25416,6 +25470,8 @@ mod tests {
             archived_at_ms: None,
             deleted_at_ms: None,
             tools: Default::default(),
+            transport: vibex_core::SessionTransport::Acp,
+            terminal: None,
         };
         SessionRepository::insert(&conn, &session).unwrap();
 
@@ -25525,6 +25581,8 @@ mod tests {
             archived_at_ms: None,
             deleted_at_ms: None,
             tools: Default::default(),
+            transport: vibex_core::SessionTransport::Acp,
+            terminal: None,
         };
         SessionRepository::insert(&conn, &session).unwrap();
         for index in 1..=25 {
@@ -25634,6 +25692,8 @@ mod tests {
             archived_at_ms: None,
             deleted_at_ms: None,
             tools: Default::default(),
+            transport: vibex_core::SessionTransport::Acp,
+            terminal: None,
         };
         SessionRepository::insert(&conn, &session).unwrap();
         for index in 1..=12 {
@@ -25786,6 +25846,8 @@ mod tests {
             archived_at_ms: None,
             deleted_at_ms: None,
             tools: Default::default(),
+            transport: vibex_core::SessionTransport::Acp,
+            terminal: None,
         };
         SessionRepository::insert(&conn, &session).unwrap();
         let mut starts = Vec::new();
@@ -26476,6 +26538,8 @@ mod tests {
             archived_at_ms: None,
             deleted_at_ms: None,
             tools: Default::default(),
+            transport: vibex_core::SessionTransport::Acp,
+            terminal: None,
         };
         SessionRepository::insert(&conn, &session).unwrap();
 
@@ -27110,8 +27174,13 @@ mod tests {
         cleanup_db(temp);
     }
 
-    /// Adds the tool map column a frozen-schema fixture needs before the
-    /// current repository can insert a session into it.
+    /// Adds the columns a frozen-schema fixture needs before the current
+    /// repository can insert a session into it.
+    ///
+    /// A fixture frozen at an older version predates columns that only later
+    /// migrations add, while the insert always writes the current shape. Both
+    /// are added here so the fixture can exercise the migration under test
+    /// instead of failing on the repository's own write.
     fn ensure_session_tools_column(conn: &Connection) -> VibexResult<()> {
         let present: i64 = conn
             .query_row(
@@ -27131,6 +27200,26 @@ mod tests {
             .map_err(storage_err(
                 "migration_apply_failed",
                 "failed to add Agent session tool settings",
+            ))?;
+        }
+        let transport_present: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('agent_sessions') WHERE name = 'transport'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(storage_err(
+                "migration_apply_failed",
+                "failed to inspect Agent session columns",
+            ))?;
+        if transport_present == 0 {
+            conn.execute(
+                "ALTER TABLE agent_sessions ADD COLUMN transport TEXT NOT NULL DEFAULT 'acp'",
+                [],
+            )
+            .map_err(storage_err(
+                "migration_apply_failed",
+                "failed to add the Agent session transport column",
             ))?;
         }
         Ok(())
@@ -27185,4 +27274,517 @@ mod migration_regression_tests {
             .unwrap();
         assert!(columns.iter().any(|column| column == "metadata_json"));
     }
+
+    /// A database created before terminal-mode sessions gains the transport
+    /// column and the terminal link table, and keeps every existing row on ACP.
+    #[test]
+    fn a_v87_database_gains_the_session_transport_without_touching_old_rows() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        apply_migrations(&mut conn).unwrap();
+
+        let workspace_root = std::env::temp_dir().join(format!(
+            "vibex-schema-v87-transport-{}",
+            RequestId::new().as_str()
+        ));
+        let (project, workspace) =
+            WorkspaceRepository::ensure(&conn, &workspace_root, WorkspaceMode::CurrentCheckout)
+                .unwrap();
+        let now = unix_timestamp_ms();
+        let session = AgentSession {
+            id: VibexSessionId::new(),
+            title: "Pre-v88 session".to_string(),
+            project_id: project.id,
+            workspace_id: workspace.id,
+            workspace_root: workspace.root_path,
+            workspace_mode: workspace.mode,
+            agent_id: AgentId::parse("claude").unwrap(),
+            state: AgentSessionState::Idle,
+            safety: AgentSessionSafety::workspace_write_ask_on_risk(),
+            created_at_ms: now,
+            updated_at_ms: now,
+            last_message_at_ms: now,
+            archived_at_ms: None,
+            deleted_at_ms: None,
+            tools: Default::default(),
+            transport: vibex_core::SessionTransport::Acp,
+            terminal: None,
+        };
+        SessionRepository::insert(&conn, &session).unwrap();
+
+        // Rewind to the shape of a database that predates this migration.
+        conn.execute("DELETE FROM schema_migrations WHERE version > 87", [])
+            .unwrap();
+        conn.execute_batch(
+            "DROP TABLE session_terminals; ALTER TABLE agent_sessions DROP COLUMN transport;",
+        )
+        .unwrap();
+
+        let applied = apply_migrations(&mut conn).unwrap();
+        assert!(
+            applied
+                .iter()
+                .any(|migration| migration == "88:agent_session_transport")
+        );
+        let stored = SessionRepository::get(&conn, &session.id)
+            .unwrap()
+            .expect("the pre-migration session must survive");
+        assert_eq!(stored.transport, vibex_core::SessionTransport::Acp);
+        assert_eq!(stored.terminal, None);
+        assert!(
+            SessionTerminalRepository::get(&conn, &session.id)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// Observation writes are skipped when nothing a reader sees has moved, so
+    /// a liveness tick cannot keep reordering the sidebar.
+    #[test]
+    fn terminal_observation_writes_only_when_presentation_changes() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        apply_migrations(&mut conn).unwrap();
+        let workspace_root = std::env::temp_dir().join(format!(
+            "vibex-session-terminal-facts-{}",
+            RequestId::new().as_str()
+        ));
+        let (project, workspace) =
+            WorkspaceRepository::ensure(&conn, &workspace_root, WorkspaceMode::CurrentCheckout)
+                .unwrap();
+        let now = unix_timestamp_ms();
+        let session = AgentSession {
+            id: VibexSessionId::new(),
+            title: "Terminal session".to_string(),
+            project_id: project.id,
+            workspace_id: workspace.id.clone(),
+            workspace_root: workspace.root_path.clone(),
+            workspace_mode: workspace.mode,
+            agent_id: AgentId::parse("claude").unwrap(),
+            state: AgentSessionState::Idle,
+            safety: AgentSessionSafety::workspace_write_ask_on_risk(),
+            created_at_ms: now,
+            updated_at_ms: now,
+            last_message_at_ms: now,
+            archived_at_ms: None,
+            deleted_at_ms: None,
+            tools: Default::default(),
+            transport: vibex_core::SessionTransport::Terminal,
+            terminal: None,
+        };
+        SessionRepository::insert(&conn, &session).unwrap();
+        SessionTerminalRepository::upsert(
+            &conn,
+            &session.id,
+            &TerminalId::new(),
+            &workspace.id,
+            &["claude".to_string()],
+            &workspace.root_path,
+        )
+        .unwrap();
+
+        // The link row starts at the all-unknown presentation, so a
+        // freshness-only tick on that baseline writes nothing: a 250ms
+        // liveness poll must not keep reordering the sidebar.
+        let mut facts = vibex_core::TerminalSessionFacts {
+            observed_at_ms: now,
+            ..Default::default()
+        };
+        assert!(!SessionTerminalRepository::update_facts(&conn, &session.id, &facts).unwrap());
+        // A new activity is a presentation change and is written.
+        facts.activity = vibex_core::TerminalActivity::Working;
+        facts.source = vibex_core::TerminalActivitySource::Process;
+        assert!(SessionTerminalRepository::update_facts(&conn, &session.id, &facts).unwrap());
+        // So is a heartbeat that keeps the live observation from ageing out.
+        facts.observed_at_ms = now + TERMINAL_FACT_HEARTBEAT_MS;
+        assert!(SessionTerminalRepository::update_facts(&conn, &session.id, &facts).unwrap());
+        // Refreshing that observation again from a later tick is not.
+        facts.observed_at_ms = now + TERMINAL_FACT_HEARTBEAT_MS + 250;
+        assert!(!SessionTerminalRepository::update_facts(&conn, &session.id, &facts).unwrap());
+        // A title the CLI published is a presentation change.
+        facts.cli_title = Some("claude — vibex".to_string());
+        assert!(SessionTerminalRepository::update_facts(&conn, &session.id, &facts).unwrap());
+
+        let stored = SessionTerminalRepository::get(&conn, &session.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.facts.activity, vibex_core::TerminalActivity::Working);
+        assert_eq!(stored.facts.cli_title.as_deref(), Some("claude — vibex"));
+        assert_eq!(stored.argv, vec!["claude".to_string()]);
+    }
+
+    /// A terminal session is deleted with its link row, and its facts never
+    /// leak into an ACP session.
+    #[test]
+    fn deleting_a_terminal_session_removes_its_link() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        apply_migrations(&mut conn).unwrap();
+        let workspace_root = std::env::temp_dir().join(format!(
+            "vibex-session-terminal-delete-{}",
+            RequestId::new().as_str()
+        ));
+        let (project, workspace) =
+            WorkspaceRepository::ensure(&conn, &workspace_root, WorkspaceMode::CurrentCheckout)
+                .unwrap();
+        let now = unix_timestamp_ms();
+        let session = AgentSession {
+            id: VibexSessionId::new(),
+            title: "Terminal session".to_string(),
+            project_id: project.id,
+            workspace_id: workspace.id.clone(),
+            workspace_root: workspace.root_path.clone(),
+            workspace_mode: workspace.mode,
+            agent_id: AgentId::parse("codex").unwrap(),
+            state: AgentSessionState::Idle,
+            safety: AgentSessionSafety::workspace_write_ask_on_risk(),
+            created_at_ms: now,
+            updated_at_ms: now,
+            last_message_at_ms: now,
+            archived_at_ms: None,
+            deleted_at_ms: None,
+            tools: Default::default(),
+            transport: vibex_core::SessionTransport::Terminal,
+            terminal: None,
+        };
+        SessionRepository::insert(&conn, &session).unwrap();
+        SessionTerminalRepository::upsert(
+            &conn,
+            &session.id,
+            &TerminalId::new(),
+            &workspace.id,
+            &["codex".to_string()],
+            &workspace.root_path,
+        )
+        .unwrap();
+        SessionRepository::delete(&conn, &session.id).unwrap();
+        assert!(
+            SessionTerminalRepository::get(&conn, &session.id)
+                .unwrap()
+                .is_none()
+        );
+    }
+}
+
+/// Records how a session reaches its Agent, plus the terminal a terminal-mode
+/// session runs in.
+///
+/// A terminal session keeps Vibex's session row — sidebar, title, archive,
+/// search, notifications — while the Agent CLI owns everything inside the PTY.
+/// The column therefore only carries the transport switch; the terminal's
+/// argv and identity live in `session_terminals`, which may be absent while the
+/// PTY is being restarted.
+fn apply_session_transport(conn: &mut Connection, applied: &mut Vec<String>) -> VibexResult<()> {
+    const VERSION: i64 = 88;
+    const NAME: &str = "agent_session_transport";
+    if migration_applied(conn, VERSION)? {
+        return Ok(());
+    }
+    // A database restored from a newer snapshot can already carry the column
+    // while its recorded version is older; adding it again would abort here and
+    // strand every later migration.
+    let present: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('agent_sessions') WHERE name = 'transport'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(storage_err(
+            "migration_apply_failed",
+            "failed to inspect Agent session columns",
+        ))?;
+    if present == 0 {
+        conn.execute(
+            "ALTER TABLE agent_sessions ADD COLUMN transport TEXT NOT NULL DEFAULT 'acp'",
+            [],
+        )
+        .map_err(storage_err(
+            "migration_apply_failed",
+            "failed to add the Agent session transport column",
+        ))?;
+    }
+    // Observed evidence is stored beside the row rather than on it: the sidebar
+    // reads it constantly, a missing row must read as `unknown`, and a session
+    // whose PTY is restarting has no terminal yet.
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS session_terminals (
+            session_id TEXT PRIMARY KEY REFERENCES agent_sessions(session_id) ON DELETE CASCADE,
+            terminal_id TEXT NOT NULL,
+            workspace_id TEXT NOT NULL REFERENCES workspaces(workspace_id),
+            argv_json TEXT NOT NULL,
+            cwd TEXT NOT NULL,
+            activity TEXT NOT NULL DEFAULT 'unknown',
+            activity_source TEXT NOT NULL DEFAULT 'none',
+            activity_observed_at_ms INTEGER NOT NULL DEFAULT 0,
+            activity_confirmations INTEGER NOT NULL DEFAULT 0,
+            cli_title TEXT NULL,
+            cli_cwd TEXT NULL,
+            native_session_id TEXT NULL,
+            waiting_since_ms INTEGER NULL,
+            completed_at_ms INTEGER NULL,
+            created_at_ms INTEGER NOT NULL,
+            updated_at_ms INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_session_terminals_terminal
+            ON session_terminals(terminal_id);
+        ",
+    )
+    .map_err(storage_err(
+        "migration_apply_failed",
+        "failed to create the session terminal table",
+    ))?;
+    conn.execute(
+        "INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
+        params![VERSION, NAME, unix_timestamp_ms()],
+    )
+    .map_err(storage_err(
+        "migration_record_failed",
+        "failed to record the Agent session transport migration",
+    ))?;
+    applied.push(format!("{VERSION}:{NAME}"));
+    Ok(())
+}
+
+/// The terminal a terminal-mode session runs in, plus what Vibex has observed
+/// about the Agent inside it.
+///
+/// The session row stays the sidebar's identity; this table is the observation
+/// contract beside it. A missing row means the PTY is not running (or is being
+/// restarted), which a reader must treat as `unknown` rather than as idle.
+pub struct SessionTerminalRepository;
+
+/// How often a terminal observation is rewritten even though nothing a reader
+/// sees has moved.
+///
+/// Readers age an observation back to `unknown` when it is older than the
+/// freshness window, so the stored clock has to keep advancing while the PTY is
+/// alive. Five seconds is slower than the observation cadence and well inside
+/// the sidebar's tolerance.
+pub const TERMINAL_FACT_HEARTBEAT_MS: i64 = 5_000;
+
+/// One durable link between a Logical Session and its terminal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionTerminalRecord {
+    pub session_id: VibexSessionId,
+    pub terminal_id: TerminalId,
+    pub workspace_id: WorkspaceId,
+    pub argv: Vec<String>,
+    pub cwd: String,
+    pub facts: vibex_core::TerminalSessionFacts,
+}
+
+impl SessionTerminalRepository {
+    pub fn upsert(
+        conn: &Connection,
+        session_id: &VibexSessionId,
+        terminal_id: &TerminalId,
+        workspace_id: &WorkspaceId,
+        argv: &[String],
+        cwd: &str,
+    ) -> VibexResult<()> {
+        let now = unix_timestamp_ms();
+        conn.execute(
+            "
+            INSERT INTO session_terminals (
+                session_id, terminal_id, workspace_id, argv_json, cwd,
+                activity_observed_at_ms, created_at_ms, updated_at_ms
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?6)
+            ON CONFLICT(session_id) DO UPDATE SET
+                terminal_id = excluded.terminal_id,
+                workspace_id = excluded.workspace_id,
+                argv_json = excluded.argv_json,
+                cwd = excluded.cwd,
+                updated_at_ms = excluded.updated_at_ms
+            ",
+            params![
+                session_id.as_str(),
+                terminal_id.as_str(),
+                workspace_id.as_str(),
+                json_to_db(&argv)?,
+                cwd,
+                now,
+            ],
+        )
+        .map_err(storage_err(
+            "session_terminal_upsert_failed",
+            "failed to record the session terminal",
+        ))?;
+        Ok(())
+    }
+
+    /// Reads the link for one session, if the PTY was ever started.
+    pub fn get(
+        conn: &Connection,
+        session_id: &VibexSessionId,
+    ) -> VibexResult<Option<SessionTerminalRecord>> {
+        conn.query_row(
+            "
+            SELECT session_id, terminal_id, workspace_id, argv_json, cwd,
+                activity, activity_source, activity_observed_at_ms,
+                activity_confirmations, cli_title, cli_cwd, native_session_id,
+                waiting_since_ms, completed_at_ms
+            FROM session_terminals
+            WHERE session_id = ?1
+            ",
+            params![session_id.as_str()],
+            map_session_terminal,
+        )
+        .optional()
+        .map_err(storage_err(
+            "session_terminal_lookup_failed",
+            "failed to read the session terminal",
+        ))
+    }
+
+    /// Lists the links for a set of sessions, keyed by session id.
+    ///
+    /// The sidebar reads this once per session list rather than once per row.
+    pub fn list_for_sessions(
+        conn: &Connection,
+        session_ids: &[VibexSessionId],
+    ) -> VibexResult<BTreeMap<VibexSessionId, SessionTerminalRecord>> {
+        let mut records = BTreeMap::new();
+        if session_ids.is_empty() {
+            return Ok(records);
+        }
+        let mut stmt = conn
+            .prepare(
+                "
+                SELECT session_id, terminal_id, workspace_id, argv_json, cwd,
+                    activity, activity_source, activity_observed_at_ms,
+                    activity_confirmations, cli_title, cli_cwd, native_session_id,
+                    waiting_since_ms, completed_at_ms
+                FROM session_terminals
+                WHERE session_id = ?1
+                ",
+            )
+            .map_err(storage_err(
+                "session_terminal_lookup_failed",
+                "failed to read session terminals",
+            ))?;
+        for session_id in session_ids {
+            if let Some(record) = stmt
+                .query_row(params![session_id.as_str()], map_session_terminal)
+                .optional()
+                .map_err(storage_err(
+                    "session_terminal_lookup_failed",
+                    "failed to read the session terminal",
+                ))?
+            {
+                records.insert(session_id.clone(), record);
+            }
+        }
+        Ok(records)
+    }
+
+    /// Writes observation facts, and only when a reader would see a change.
+    ///
+    /// A liveness tick every 250ms must not rewrite this row: `updated_at_ms`
+    /// feeds session ordering, so a freshness-only write would make every
+    /// terminal session climb the sidebar forever.
+    pub fn update_facts(
+        conn: &Connection,
+        session_id: &VibexSessionId,
+        facts: &vibex_core::TerminalSessionFacts,
+    ) -> VibexResult<bool> {
+        let Some(existing) = Self::get(conn, session_id)? else {
+            return Ok(false);
+        };
+        // Two reasons to write: a reader-visible change, or a heartbeat that
+        // keeps a live observation from ageing into `unknown`. Anything faster
+        // would rewrite the row (and its `updated_at_ms`, which orders the
+        // sidebar) on every liveness tick.
+        let presentation_changed = !existing.facts.same_presentation(facts);
+        let heartbeat_due = facts
+            .observed_at_ms
+            .saturating_sub(existing.facts.observed_at_ms)
+            >= TERMINAL_FACT_HEARTBEAT_MS;
+        if !presentation_changed && !heartbeat_due {
+            return Ok(false);
+        }
+        let now = unix_timestamp_ms();
+        conn.execute(
+            "
+            UPDATE session_terminals
+            SET activity = ?2,
+                activity_source = ?3,
+                activity_observed_at_ms = ?4,
+                activity_confirmations = ?5,
+                cli_title = ?6,
+                cli_cwd = ?7,
+                native_session_id = ?8,
+                waiting_since_ms = ?9,
+                completed_at_ms = ?10,
+                updated_at_ms = ?11
+            WHERE session_id = ?1
+            ",
+            params![
+                session_id.as_str(),
+                enum_to_db(&facts.activity)?,
+                enum_to_db(&facts.source)?,
+                facts.observed_at_ms,
+                facts.confirmations,
+                facts.cli_title,
+                facts.cli_cwd,
+                facts.native_session_id,
+                facts.waiting_since_ms,
+                facts.completed_at_ms,
+                now,
+            ],
+        )
+        .map_err(storage_err(
+            "session_terminal_update_failed",
+            "failed to record terminal observations",
+        ))?;
+        Ok(true)
+    }
+
+    /// Removes the link named by a terminal, after the session itself is gone.
+    pub fn delete_for_terminal(conn: &Connection, terminal_id: &TerminalId) -> VibexResult<()> {
+        conn.execute(
+            "DELETE FROM session_terminals WHERE terminal_id = ?1",
+            params![terminal_id.as_str()],
+        )
+        .map_err(storage_err(
+            "session_terminal_delete_failed",
+            "failed to delete the session terminal",
+        ))?;
+        Ok(())
+    }
+
+    pub fn delete(conn: &Connection, session_id: &VibexSessionId) -> VibexResult<()> {
+        conn.execute(
+            "DELETE FROM session_terminals WHERE session_id = ?1",
+            params![session_id.as_str()],
+        )
+        .map_err(storage_err(
+            "session_terminal_delete_failed",
+            "failed to delete the session terminal",
+        ))?;
+        Ok(())
+    }
+}
+
+fn map_session_terminal(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionTerminalRecord> {
+    Ok(SessionTerminalRecord {
+        session_id: parse_id_sql(row.get(0)?, VibexSessionId::parse)?,
+        terminal_id: parse_id_sql(row.get(1)?, TerminalId::parse)?,
+        workspace_id: parse_id_sql(row.get(2)?, WorkspaceId::parse)?,
+        argv: json_from_db_sql(row.get(3)?)?,
+        cwd: row.get(4)?,
+        facts: vibex_core::TerminalSessionFacts {
+            terminal_id: Some(parse_id_sql(row.get(1)?, TerminalId::parse)?),
+            activity: enum_from_db_sql(row.get(5)?)?,
+            source: enum_from_db_sql(row.get(6)?)?,
+            observed_at_ms: row.get(7)?,
+            confirmations: row.get(8)?,
+            cli_title: row.get(9)?,
+            cli_cwd: row.get(10)?,
+            native_session_id: row.get(11)?,
+            waiting_since_ms: row.get(12)?,
+            completed_at_ms: row.get(13)?,
+        },
+    })
 }

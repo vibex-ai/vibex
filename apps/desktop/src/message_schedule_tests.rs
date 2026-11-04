@@ -138,6 +138,8 @@ fn a_waiting_schedule_names_its_session_after_the_message() {
         archived_at_ms: None,
         deleted_at_ms: None,
         tools: Default::default(),
+        transport: vibex_core::SessionTransport::Acp,
+        terminal: None,
     };
     let session_id = VibexSessionId::new();
     let placeholder = session(&session_id, "deepseek-harness session");

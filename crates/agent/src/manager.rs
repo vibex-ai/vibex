@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 
 use tokio::sync::{Mutex as AsyncMutex, broadcast, mpsc};
 use tokio::time::{Duration, sleep};
+use vibex_config_switch::ProviderConfigService;
 use vibex_config_switch::secrets::resolve_provider_secret_reference;
 use vibex_core::{
     AgentAuthCatalog, AgentAuthContextStatus, AgentAuthenticateRequest, AgentAuthenticateResult,
@@ -18,14 +19,14 @@ use vibex_core::{
     AgentSessionRestoreMethod, AgentSessionSafety, AgentSessionState, AgentUsageCounterOrigin,
     AgentUsageExecutionContext, AgentUsageStreamAttribution, BindingState,
     CancelAgentDelegationRequest, ContinueAgentTurnRequest, CreateAgentDelegationRequest,
-    CreateAgentSessionRequest, DelegationExecution, DelegationRuntimeSummary,
-    DelegationTaskEventKind, DelegationTaskPhase, ElicitationRequest, ExecutionOutcome,
-    ExecutionResultRange, FetchTimelineItemRequest, FetchTimelineRequest, ForkAgentSessionRequest,
-    GoalChangeKind, GoalPayload, GoalSnapshot, LocalHistoryImportResult, LocalHistoryScanResult,
-    LocalHistorySelection, LocalHistoryTimelineEntry, McpSecretTarget, McpServer,
-    McpServerSecretReference, McpServerTransportKind, MessageAttachment, MessageProvenance,
-    MessageSubmissionId, PermissionRequest, ProjectId, PromptKind, PromptStatus, ProviderBinding,
-    ProviderBindingMetadata, ProviderCapabilities, ProviderCapabilitiesResponse,
+    CreateAgentSessionRequest, CreateTerminalSessionRequest, DelegationExecution,
+    DelegationRuntimeSummary, DelegationTaskEventKind, DelegationTaskPhase, ElicitationRequest,
+    ExecutionOutcome, ExecutionResultRange, FetchTimelineItemRequest, FetchTimelineRequest,
+    ForkAgentSessionRequest, GoalChangeKind, GoalPayload, GoalSnapshot, LocalHistoryImportResult,
+    LocalHistoryScanResult, LocalHistorySelection, LocalHistoryTimelineEntry, McpSecretTarget,
+    McpServer, McpServerSecretReference, McpServerTransportKind, MessageAttachment,
+    MessageProvenance, MessageSubmissionId, PermissionRequest, ProjectId, PromptKind, PromptStatus,
+    ProviderBinding, ProviderBindingMetadata, ProviderCapabilities, ProviderCapabilitiesResponse,
     ProviderDefaultScopeKind, ProviderKind, ProviderNativeBinding, ProviderProfile,
     ProviderProfileDefaultScope, ProviderProfileId, ProviderProfileStatus,
     RenameAgentSessionRequest, ResolveElicitationRequest, ResolvePermissionRequest, RetryPhase,
@@ -48,9 +49,9 @@ use vibex_db::{
     LocalHistoryImportRepository, LocalHistoryImportWrite, McpServerRepository,
     MessageSubmissionRepository, PermissionRepository, PromptRepository, ProviderProfileRepository,
     RuntimeBindingRepository, RuntimeSwitchRepository, SessionOwnershipRepository,
-    SessionRepository, SkillRepository, TimelineAppend, TimelineRepository,
-    VibexUseEventRepository, VibexUseExecutionRepository, WorkspaceRepository, apply_migrations,
-    open_database, transition_delegation,
+    SessionRepository, SessionTerminalRepository, SkillRepository, TimelineAppend,
+    TimelineRepository, VibexUseEventRepository, VibexUseExecutionRepository, WorkspaceRepository,
+    apply_migrations, open_database, transition_delegation,
 };
 
 use crate::adapter::{
@@ -68,6 +69,14 @@ use crate::observability::{RuntimeMetricName, RuntimeMetricResult, RuntimeObserv
 use crate::runtime_lifecycle::{RuntimeLeaseGuard, RuntimeLifecycleService};
 use crate::runtime_selection::RuntimeSelectionService;
 use crate::state_machine::validate_transition;
+
+/// Diagnostic identity of the Provider projection a terminal session launched
+/// with.
+///
+/// The ACP path publishes the same value into the Agent environment so a
+/// support bundle can tell which projection a process ran against. A terminal
+/// session inherits it for the same reason.
+const TERMINAL_SESSION_PROJECTION_FINGERPRINT_ENV: &str = "__VIBEX_PROVIDER_PROJECTION_FINGERPRINT";
 
 mod delegation_budget;
 mod delegation_cancellation;
@@ -234,6 +243,13 @@ pub struct AgentManager {
     /// need the live answer, so each turn registers here for its whole lifetime
     /// and an RAII guard releases the entry on every exit path.
     active_turn_sessions: Arc<StdMutex<HashSet<String>>>,
+    /// The PTY host a terminal-mode session starts its Agent in.
+    ///
+    /// Installed by the composition root that owns the terminal manager. A
+    /// manager without it can still read and manage terminal sessions, but
+    /// cannot create or restart one — which is the honest answer for a headless
+    /// process that owns no PTY.
+    session_terminal_launcher: OnceLock<Arc<dyn crate::session_terminal::SessionTerminalLauncher>>,
 }
 
 /// Releases a session's in-flight turn slot when its turn future ends.
@@ -656,6 +672,7 @@ impl AgentManager {
             context_bridge,
             session_event_pumps: Arc::new(StdMutex::new(HashSet::new())),
             active_turn_sessions: Arc::new(StdMutex::new(HashSet::new())),
+            session_terminal_launcher: OnceLock::new(),
         };
         manager.recover_interrupted_sessions(&mut conn)?;
         Ok(manager)
@@ -908,6 +925,31 @@ impl AgentManager {
         })?;
         *slot = Some(config);
         Ok(())
+    }
+
+    /// Installs the PTY host terminal-mode sessions start their Agent in.
+    ///
+    /// Set once: a runtime owns one terminal manager, and a second one would
+    /// leave sessions split across two process tables.
+    pub fn install_session_terminal_launcher(
+        &self,
+        launcher: &Arc<dyn crate::session_terminal::SessionTerminalLauncher>,
+    ) -> VibexResult<()> {
+        self.session_terminal_launcher
+            .set(Arc::clone(launcher))
+            .map_err(|_| {
+                VibexError::conflict(
+                    "session_terminal_launcher_already_installed",
+                    "a terminal launcher is already installed for this runtime",
+                )
+            })
+    }
+
+    /// The installed PTY host, if this runtime can start terminal sessions.
+    pub fn session_terminal_launcher(
+        &self,
+    ) -> Option<Arc<dyn crate::session_terminal::SessionTerminalLauncher>> {
+        self.session_terminal_launcher.get().cloned()
     }
 
     /// The installed computer-use MCP launch configuration, if any.
@@ -1217,6 +1259,207 @@ impl AgentManager {
         })
     }
 
+    /// Creates a Logical Session whose Agent runs in its own terminal.
+    ///
+    /// This is a separate entry point rather than a flag on
+    /// [`Self::create_session`] on purpose. An ACP session *is* a runtime
+    /// binding: it resolves a Provider, commits a switch, and spawns a process
+    /// that speaks ACP. A terminal session has none of that — no adapter, no
+    /// binding, no timeline — so routing it through the ACP creation path would
+    /// mean teaching every fence there to special-case a session that will never
+    /// satisfy them.
+    ///
+    /// What the two share is the row: the sidebar, title, archive, search, and
+    /// notification paths all keep working because this is still an
+    /// `AgentSession`, just one whose conversation lives in the PTY.
+    pub async fn create_terminal_session(
+        &self,
+        request: CreateTerminalSessionRequest,
+    ) -> VibexResult<AgentSession> {
+        let launcher = self.session_terminal_launcher().ok_or_else(|| {
+            VibexError::capability(
+                "terminal_session_unsupported",
+                "this runtime cannot start terminal-mode sessions",
+            )
+        })?;
+        // The support check runs before the enabled check so an Agent this
+        // release cannot run in a terminal says exactly that, instead of
+        // answering with whatever its Config Center switch happens to be.
+        match vibex_core::terminal_session_support(&request.agent_id) {
+            vibex_core::TerminalSessionSupport::Supported => {}
+            vibex_core::TerminalSessionSupport::Unverified => {
+                return Err(VibexError::capability(
+                    "terminal_session_agent_unverified",
+                    "terminal mode is not verified for this Agent in this release",
+                )
+                .with_diagnostic("agentId", request.agent_id.as_str()));
+            }
+            vibex_core::TerminalSessionSupport::Unavailable => {
+                return Err(VibexError::capability(
+                    "terminal_session_agent_unsupported",
+                    "this Agent has no native terminal",
+                )
+                .with_diagnostic("agentId", request.agent_id.as_str()));
+            }
+        }
+        // Enabled-ness is checked here even though no runtime is resolved: a
+        // disabled Agent must not become runnable merely because the terminal
+        // path skips the runtime registry.
+        self.resolve_enabled_agent(Some(request.agent_id.clone()), ProviderKind::Acp, true)?;
+        let executable = vibex_core::native_cli_executable(&request.agent_id).ok_or_else(|| {
+            VibexError::capability(
+                "terminal_session_agent_unsupported",
+                "this Agent has no native terminal",
+            )
+            .with_diagnostic("agentId", request.agent_id.as_str())
+        })?;
+        // Arguments and the working directory are the only launch inputs a
+        // caller controls, and both are rejected rather than sanitized: a
+        // control character in an argument is a caller bug, not something to
+        // strip into a different command.
+        if request
+            .args
+            .iter()
+            .any(|argument| argument.chars().any(char::is_control))
+        {
+            return Err(VibexError::validation(
+                "terminal_session_argument_invalid",
+                "terminal session arguments cannot contain control characters",
+            ));
+        }
+        let mut argv = Vec::with_capacity(request.args.len() + 1);
+        argv.push(executable.to_string());
+        argv.extend(request.args.iter().cloned());
+
+        let conn = self.open_migrated()?;
+        let (project, workspace) =
+            WorkspaceRepository::ensure(&conn, &request.workspace_root, request.workspace_mode)?;
+        let now = unix_timestamp_ms();
+        let title = request
+            .title
+            .as_deref()
+            .and_then(normalize_agent_session_title)
+            .unwrap_or_else(|| format!("{} terminal", request.agent_id));
+        let session = AgentSession {
+            id: request.session_id.clone().unwrap_or_default(),
+            title,
+            project_id: project.id,
+            workspace_id: workspace.id.clone(),
+            workspace_root: workspace.root_path.clone(),
+            workspace_mode: workspace.mode,
+            agent_id: request.agent_id.clone(),
+            // A terminal session is usable the moment its process starts, so
+            // there is no `Initializing` phase to leave behind.
+            state: AgentSessionState::Idle,
+            safety: request
+                .safety
+                .clone()
+                .unwrap_or_else(AgentSessionSafety::workspace_write_ask_on_risk),
+            created_at_ms: now,
+            updated_at_ms: now,
+            last_message_at_ms: now,
+            archived_at_ms: None,
+            deleted_at_ms: None,
+            tools: Default::default(),
+            transport: vibex_core::SessionTransport::Terminal,
+            terminal: Some(vibex_core::TerminalSessionFacts::default()),
+        };
+        if request.title.is_some() {
+            SessionRepository::lock_title(&conn, &session.id)?;
+        }
+        SessionRepository::insert(&conn, &session)?;
+        let spec = vibex_core::TerminalSessionLaunchSpec {
+            workspace_id: workspace.id,
+            workspace_root: workspace.root_path,
+            argv,
+            env: self.terminal_session_env(&request, &session)?,
+            title: session.title.clone(),
+            rows: request.rows,
+            cols: request.cols,
+        };
+        let handle = match launcher.launch(&spec) {
+            Ok(handle) => handle,
+            Err(error) => {
+                // The row survives: a reader must see "this session exists but
+                // its Agent did not start", which is also what lets them retry.
+                // The state is written directly rather than through the
+                // transition validator, which models an ACP turn lifecycle and
+                // has no edge from the `Idle` a terminal session is born in.
+                SessionRepository::update_state(&conn, &session.id, AgentSessionState::Error)?;
+                let failed =
+                    SessionRepository::get(&conn, &session.id)?.unwrap_or_else(|| session.clone());
+                self.publish_root_session_update(&conn, failed.clone());
+                return Err(error.with_diagnostic("sessionId", session.id.as_str().to_string()));
+            }
+        };
+        SessionTerminalRepository::upsert(
+            &conn,
+            &session.id,
+            &handle.terminal_id,
+            &spec.workspace_id,
+            &spec.argv,
+            &spec.workspace_root,
+        )?;
+        let created = SessionRepository::get(&conn, &session.id)?.ok_or_else(|| {
+            VibexError::storage(
+                "terminal_session_missing_after_create",
+                "the terminal session could not be reloaded",
+            )
+        })?;
+        self.publish_root_session_update(&conn, created.clone());
+        Ok(created)
+    }
+
+    /// Environment overlays a terminal-mode Agent inherits.
+    ///
+    /// This is the same Provider projection the ACP path launches with, so a
+    /// Profile-backed Claude or Codex reaches its configured endpoint with the
+    /// same credentials the GUI session would use. The PTY host still owns the
+    /// terminal's own identity variables; it applies those itself rather than
+    /// receiving them here.
+    ///
+    /// A Profile whose projection cannot be resolved fails the creation instead
+    /// of launching an Agent that would silently talk to the wrong endpoint.
+    fn terminal_session_env(
+        &self,
+        request: &CreateTerminalSessionRequest,
+        session: &AgentSession,
+    ) -> VibexResult<Vec<(String, String)>> {
+        let Some(profile_id) = request.provider_profile_id.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let conn = self.open_migrated()?;
+        let profile = ProviderProfileRepository::get(&conn, profile_id)?.ok_or_else(|| {
+            VibexError::validation(
+                "provider_profile_not_found",
+                "Provider Profile was not found",
+            )
+            .with_diagnostic("providerProfileId", profile_id.as_str())
+        })?;
+        if profile.agent_id != session.agent_id || profile.status != ProviderProfileStatus::Enabled
+        {
+            return Err(VibexError::validation(
+                "provider_profile_route_mismatch",
+                "the Provider Profile does not belong to this Agent",
+            ));
+        }
+        let service = ProviderConfigService::new(self.db_path.clone());
+        let projection = service
+            .resolve_legacy_agent_provider_projection(profile_id, &session.workspace_root)
+            .map_err(|error| {
+                error.with_diagnostic("providerProfileId", profile_id.as_str().to_string())
+            })?;
+        let mut env = projection.child_environment();
+        // The projection fingerprint is a diagnostic identity the ACP path also
+        // publishes, so a support bundle can tell which projection a session
+        // ran against.
+        env.push((
+            TERMINAL_SESSION_PROJECTION_FINGERPRINT_ENV.to_string(),
+            projection.fingerprint.clone(),
+        ));
+        Ok(env)
+    }
+
     pub async fn create_session(
         &self,
         mut request: CreateAgentSessionRequest,
@@ -1501,6 +1744,8 @@ impl AgentManager {
             archived_at_ms: None,
             deleted_at_ms: None,
             tools: request.tools.clone(),
+            transport: vibex_core::SessionTransport::Acp,
+            terminal: None,
         };
         let copied_items = TimelineRepository::insert_session_and_append_many(
             &mut conn,
@@ -2695,6 +2940,11 @@ impl AgentManager {
         &self,
         request: SendAgentMessageRequest,
     ) -> VibexResult<Vec<TimelineItem>> {
+        // A terminal session has no runtime binding and no timeline to append
+        // to: the reader types into the PTY. Refusing here keeps a queued
+        // message or an old client from reaching the ACP materialization path,
+        // which would fail much later with a misleading error.
+        self.reject_terminal_session(&request.session_id)?;
         let coordinator = self
             .message_submission
             .get()
@@ -2706,6 +2956,27 @@ impl AgentManager {
                 )
             })?;
         coordinator.submit(request).await
+    }
+
+    /// Refuses a mutation that only an ACP session can serve.
+    ///
+    /// Terminal sessions keep the same row and the same lifecycle, so a client
+    /// that does not know about the transport split will call ACP-only
+    /// operations on them. Answering with a typed conflict is what lets that
+    /// client disable the control instead of surfacing a storage failure.
+    fn reject_terminal_session(&self, session_id: &VibexSessionId) -> VibexResult<()> {
+        let conn = self.open_migrated()?;
+        let Some(session) = SessionRepository::get(&conn, session_id)? else {
+            return Ok(());
+        };
+        if session.transport.is_terminal() {
+            return Err(VibexError::conflict(
+                "session_transport_mismatch",
+                "this session runs in a terminal and does not accept timeline messages",
+            )
+            .with_diagnostic("sessionId", session_id.as_str().to_string()));
+        }
+        Ok(())
     }
 
     pub(crate) async fn dispatch_message_direct(
@@ -4874,10 +5145,22 @@ impl AgentManager {
             session_ids.push(session_id.clone());
 
             let mut runtimes = Vec::new();
+            let mut terminal_ids = Vec::new();
             for candidate_id in &session_ids {
                 let Some(session) = SessionRepository::get(&transaction, candidate_id)? else {
                     continue;
                 };
+                if session.transport.is_terminal() {
+                    // A terminal session owns no provider runtime; what has to
+                    // stop is its PTY, and the link row is the only place that
+                    // names it.
+                    if let Some(record) =
+                        SessionTerminalRepository::get(&transaction, candidate_id)?
+                    {
+                        terminal_ids.push(record.terminal_id);
+                    }
+                    continue;
+                }
                 if let Some(runtime) = self.runtime_for_close(&transaction, &session) {
                     runtimes.push(runtime);
                 }
@@ -4892,9 +5175,9 @@ impl AgentManager {
                 )
                 .with_diagnostic("error", error.to_string())
             })?;
-            (runtimes, session_ids)
+            (runtimes, session_ids, terminal_ids)
         };
-        let (runtimes, removed_ids) = runtimes;
+        let (runtimes, removed_ids, terminal_ids) = runtimes;
         // The row is gone, so no snapshot can say so: the ids are the only
         // account of the deletion a client drawing a session list can get.
         // Published after the commit, because until then the deletion can still
@@ -4903,7 +5186,37 @@ impl AgentManager {
         for runtime in runtimes {
             self.close_provider_session(Some(runtime)).await;
         }
+        self.stop_session_terminals(&terminal_ids);
         Ok(())
+    }
+
+    /// Stops the PTYs of deleted terminal sessions.
+    ///
+    /// Best effort and after the commit: a process that refuses to die must not
+    /// keep the row alive, and a runtime without a launcher (a headless build
+    /// that owns no PTY) simply has nothing to stop.
+    fn stop_session_terminals(&self, terminal_ids: &[vibex_core::TerminalId]) {
+        if terminal_ids.is_empty() {
+            return;
+        }
+        let Some(launcher) = self.session_terminal_launcher() else {
+            return;
+        };
+        for terminal_id in terminal_ids {
+            if let Err(error) = launcher.kill(terminal_id) {
+                // Best effort: a process that survives its kill must not keep
+                // the deleted row alive. The metric is how an operator notices.
+                let _ = error;
+                self.observability.increment(
+                    crate::RuntimeMetricName::TerminalSessionStopFailure,
+                    None,
+                    crate::RuntimeMetricResult::Failure,
+                );
+            }
+            if let Ok(conn) = self.open_migrated() {
+                let _ = SessionTerminalRepository::delete_for_terminal(&conn, terminal_id);
+            }
+        }
     }
 
     /// Best-effort release of provider runtime resources (long-lived agent
@@ -11859,6 +12172,8 @@ mod tests {
             archived_at_ms: None,
             deleted_at_ms: None,
             tools: Default::default(),
+            transport: vibex_core::SessionTransport::Acp,
+            terminal: None,
         };
         SessionRepository::insert(conn, &session).unwrap();
         session
@@ -12196,5 +12511,230 @@ mod tests {
             vibex_core::verify_browser_mcp_session_token(secret, &other_token).as_deref(),
             Some(session_id.as_str())
         );
+    }
+    // -----------------------------------------------------------------------
+    // Terminal-mode sessions
+    // -----------------------------------------------------------------------
+
+    use crate::session_terminal::SessionTerminalLauncher as _;
+
+    use vibex_core::RequestId;
+
+    fn terminal_manager() -> (
+        AgentManager,
+        Arc<crate::session_terminal::RecordingTerminalLauncher>,
+        PathBuf,
+    ) {
+        let dir = std::env::temp_dir().join(format!(
+            "vibex-terminal-session-{}",
+            RequestId::new().as_str()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let manager = AgentManager::new(dir.join("vibex.db")).unwrap();
+        let launcher = Arc::new(crate::session_terminal::RecordingTerminalLauncher::new());
+        let installed: Arc<dyn crate::session_terminal::SessionTerminalLauncher> =
+            Arc::clone(&launcher) as Arc<dyn crate::session_terminal::SessionTerminalLauncher>;
+        manager
+            .install_session_terminal_launcher(&installed)
+            .unwrap();
+        (manager, launcher, dir)
+    }
+
+    fn terminal_request(agent: &str, root: &std::path::Path) -> CreateTerminalSessionRequest {
+        CreateTerminalSessionRequest {
+            session_id: None,
+            agent_id: AgentId::parse(agent).unwrap(),
+            workspace_root: root.to_string_lossy().into_owned(),
+            workspace_mode: vibex_core::WorkspaceMode::CurrentCheckout,
+            title: None,
+            safety: None,
+            args: Vec::new(),
+            provider_profile_id: None,
+            rows: 24,
+            cols: 100,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_terminal_session_starts_the_native_cli_and_records_the_link() {
+        let (manager, launcher, dir) = terminal_manager();
+        let session = manager
+            .create_terminal_session(terminal_request("claude", &dir))
+            .await
+            .unwrap();
+        assert_eq!(session.transport, vibex_core::SessionTransport::Terminal);
+        assert_eq!(session.state, AgentSessionState::Idle);
+        // The row is usable immediately, and it is a real session: the sidebar
+        // reads the same table an ACP session lives in.
+        let stored = manager.get_session(&session.id).await.unwrap();
+        assert_eq!(stored.transport, vibex_core::SessionTransport::Terminal);
+        let launches = launcher.launches();
+        assert_eq!(launches.len(), 1);
+        // The adapter binary speaks ACP on stdio; the native CLI is what a
+        // terminal session must start.
+        assert_eq!(launches[0].argv, vec!["claude".to_string()]);
+        let conn = open_database(&dir.join("vibex.db")).unwrap();
+        let link = vibex_db::SessionTerminalRepository::get(&conn, &session.id)
+            .unwrap()
+            .expect("the session must record its terminal");
+        assert_eq!(link.argv, vec!["claude".to_string()]);
+        assert!(launcher.is_running(&link.terminal_id));
+    }
+
+    #[tokio::test]
+    async fn a_terminal_session_appends_arguments_verbatim() {
+        let (manager, launcher, dir) = terminal_manager();
+        let mut request = terminal_request("codex", &dir);
+        request.args = vec!["--model".to_string(), "gpt-5".to_string()];
+        manager.create_terminal_session(request).await.unwrap();
+        let launches = launcher.launches();
+        assert_eq!(
+            launches[0].argv,
+            vec![
+                "codex".to_string(),
+                "--model".to_string(),
+                "gpt-5".to_string()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_terminal_session_rejects_an_unverified_agent() {
+        let (manager, launcher, dir) = terminal_manager();
+        let error = manager
+            .create_terminal_session(terminal_request("opencode", &dir))
+            .await
+            .unwrap_err();
+        assert!(
+            error.code == "terminal_session_agent_unsupported"
+                || error.code == "terminal_session_agent_unverified",
+            "unexpected error code {}",
+            error.code
+        );
+        assert!(launcher.launches().is_empty());
+        // Nothing was persisted for an Agent this release cannot run.
+        let sessions = manager.list_sessions(true).await.unwrap();
+        assert!(sessions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_terminal_session_refuses_arguments_with_control_characters() {
+        let (manager, launcher, dir) = terminal_manager();
+        let mut request = terminal_request("claude", &dir);
+        request.args = vec!["line\nbreak".to_string()];
+        let error = manager.create_terminal_session(request).await.unwrap_err();
+        assert_eq!(error.code, "terminal_session_argument_invalid");
+        assert!(launcher.launches().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_launcher_failure_keeps_the_session_in_error() {
+        /// A host that has no PTY to start the Agent in.
+        struct FailingLauncher;
+        impl crate::session_terminal::SessionTerminalLauncher for FailingLauncher {
+            fn launch(
+                &self,
+                _: &vibex_core::TerminalSessionLaunchSpec,
+            ) -> VibexResult<vibex_core::TerminalSessionHandle> {
+                Err(VibexError::process(
+                    "terminal_unavailable",
+                    "the PTY host is not available",
+                ))
+            }
+            fn kill(&self, _: &vibex_core::TerminalId) -> VibexResult<()> {
+                Ok(())
+            }
+            fn is_running(&self, _: &vibex_core::TerminalId) -> bool {
+                false
+            }
+        }
+
+        let dir = std::env::temp_dir().join(format!(
+            "vibex-terminal-failure-{}",
+            RequestId::new().as_str()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let manager = AgentManager::new(dir.join("vibex.db")).unwrap();
+        let failing: Arc<dyn crate::session_terminal::SessionTerminalLauncher> =
+            Arc::new(FailingLauncher);
+        manager.install_session_terminal_launcher(&failing).unwrap();
+        let error = manager
+            .create_terminal_session(terminal_request("claude", &dir))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "terminal_unavailable");
+        // The row survives as an error so the reader can see what happened and
+        // retry, instead of the session vanishing without a trace.
+        let sessions = manager.list_sessions(true).await.unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].state, AgentSessionState::Error);
+        assert_eq!(
+            sessions[0].transport,
+            vibex_core::SessionTransport::Terminal
+        );
+    }
+
+    /// Deleting a terminal-mode session stops its PTY and drops the link.
+    ///
+    /// The row is the only place that names the terminal, so a deletion that
+    /// forgot to kill it would leave an Agent running with nothing pointing at
+    /// it.
+    #[tokio::test]
+    async fn deleting_a_terminal_session_stops_its_terminal() {
+        let (manager, launcher, dir) = terminal_manager();
+        let session = manager
+            .create_terminal_session(terminal_request("claude", &dir))
+            .await
+            .unwrap();
+        let conn = open_database(&dir.join("vibex.db")).unwrap();
+        let terminal_id = vibex_db::SessionTerminalRepository::get(&conn, &session.id)
+            .unwrap()
+            .expect("the session must record its terminal")
+            .terminal_id;
+        assert!(launcher.is_running(&terminal_id));
+
+        manager.delete_session(&session.id).await.unwrap();
+
+        assert!(
+            !launcher.is_running(&terminal_id),
+            "deleting a terminal session must stop the Agent it started"
+        );
+        let conn = open_database(&dir.join("vibex.db")).unwrap();
+        assert!(
+            vibex_db::SessionTerminalRepository::get(&conn, &session.id)
+                .unwrap()
+                .is_none(),
+            "the link row is deleted with the session"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_terminal_session_refuses_timeline_messages() {
+        let (manager, _, dir) = terminal_manager();
+        let session = manager
+            .create_terminal_session(terminal_request("claude", &dir))
+            .await
+            .unwrap();
+        let error = manager
+            .send_message(SendAgentMessageRequest {
+                session_id: session.id.clone(),
+                message_idempotency_key: "terminal-session-message".to_string(),
+                desired_runtime: vibex_core::SessionRuntimeSelection::provider(
+                    AgentId::parse("claude").unwrap(),
+                    vibex_core::ProviderProfileId::parse("provider_claude").unwrap(),
+                    "claude-opus-5".to_string(),
+                ),
+                text: "hello".to_string(),
+                attachments: Vec::new(),
+                mentions: Vec::new(),
+                reasoning_effort: None,
+                correlation_id: None,
+                delivery: Default::default(),
+                prompt_context: None,
+                provenance: Default::default(),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "session_transport_mismatch");
     }
 }
