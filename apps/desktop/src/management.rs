@@ -255,6 +255,13 @@ const PROVIDER_AUTO_FETCH_DEBOUNCE: Duration = Duration::from_millis(700);
 /// the Search button still ask immediately.
 const MARKET_AUTO_SEARCH_DEBOUNCE: Duration = Duration::from_millis(300);
 const PROVIDER_API_KEY_PLACEHOLDER: &str = "sk-…";
+/// The request-header editor's resting value.
+///
+/// An empty textarea reads as "no JSON at all" until the user works out that
+/// `{}` is what the form wants, and the first save then fails on an EOF parse
+/// error. The editor therefore starts with the empty object already written:
+/// saving it unchanged is valid and declares no header.
+const PROVIDER_HEADERS_EMPTY_OBJECT: &str = "{}";
 const PROVIDER_OPTION_WEBSITE_URL: &str = "ccSwitchWebsiteUrl";
 const PROVIDER_OPTION_CC_SWITCH_DB_PATH: &str = "ccSwitchDbPath";
 /// The mutation id a models.dev catalogue refresh holds while it runs.
@@ -14807,8 +14814,12 @@ impl ManagementCenter {
             .models
             .update(cx, |state, cx| state.set_value(models, window, cx));
         // The header editor speaks the same override shape the record stores,
-        // so a preset's rows can be written before the Provider exists.
-        let headers = preset.header_override().unwrap_or_default();
+        // so a preset's rows can be written before the Provider exists. A
+        // preset without headers leaves the empty object the draft starts on,
+        // which is what saves as "no headers".
+        let headers = preset
+            .header_override()
+            .unwrap_or_else(|| PROVIDER_HEADERS_EMPTY_OBJECT.to_string());
         self.provider_form
             .headers
             .update(cx, |state, cx| state.set_value(headers, window, cx));
@@ -14853,9 +14864,9 @@ impl ManagementCenter {
         }
         self.provider_form
             .rebuild_protocol_fields(&BTreeMap::new(), window, cx);
-        self.provider_form
-            .headers
-            .update(cx, |state, cx| state.set_value("", window, cx));
+        self.provider_form.headers.update(cx, |state, cx| {
+            state.set_value(PROVIDER_HEADERS_EMPTY_OBJECT, window, cx)
+        });
         self.provider_form.headers_open = false;
         cx.notify();
     }
@@ -15401,9 +15412,14 @@ impl ManagementCenter {
             cx.notify();
             None
         };
+        // An empty field means "no headers", not "malformed JSON". Checking it
+        // before parsing matters: `serde_json` reads the empty string as an EOF
+        // error, so a match arm after the parse would never be reached.
+        if headers_text.trim().is_empty() {
+            return Some(Vec::new());
+        }
         let object = match serde_json::from_str::<serde_json::Value>(&headers_text) {
-            Ok(serde_json::Value::Object(headers)) if !headers_text.trim().is_empty() => headers,
-            Ok(_) if headers_text.trim().is_empty() => return Some(Vec::new()),
+            Ok(serde_json::Value::Object(headers)) => headers,
             Ok(_) => {
                 return invalid(
                     self,
@@ -43588,6 +43604,79 @@ mod tests {
                 center.route_group_name.read(cx).value(),
                 "Route group draft"
             );
+        });
+    }
+
+    /// The request-header editor never starts blank.
+    ///
+    /// A blank textarea reads as no JSON at all, and the first save then fails
+    /// on an EOF parse error. The draft therefore starts on `{}`, a preset
+    /// without headers keeps it, and an emptied field still saves as "no
+    /// headers" instead of being reported as malformed.
+    #[gpui::test]
+    fn provider_form_starts_its_headers_on_an_empty_json_object(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let (center, cx) = cx.add_window_view(ManagementCenter::new);
+        let handle = cx.windows().pop().expect("test window");
+
+        let _ = cx.update_window(handle, |_, window, cx| {
+            center.update(cx, |center, cx| {
+                center.open_provider_create_page(None, window, cx);
+            });
+        });
+        center.read_with(cx, |center, cx| {
+            assert_eq!(
+                center.provider_form.headers.read(cx).value().as_ref(),
+                "{}",
+                "a new draft must open on the empty object"
+            );
+        });
+
+        // A preset that declares no header leaves the empty object in place,
+        // and the section stays collapsed because there is nothing to show.
+        let _ = cx.update_window(handle, |_, window, cx| {
+            center.update(cx, |center, cx| {
+                center.apply_provider_create_preset(
+                    vibex_core::PROVIDER_PRESET_DEEPSEEK,
+                    window,
+                    cx,
+                );
+            });
+        });
+        center.read_with(cx, |center, cx| {
+            assert_eq!(center.provider_form.headers.read(cx).value().as_ref(), "{}");
+            assert!(!center.provider_form.headers_open);
+        });
+
+        // Clearing the preset returns to the same resting value.
+        let _ = cx.update_window(handle, |_, window, cx| {
+            center.update(cx, |center, cx| {
+                center.provider_form.headers.update(cx, |state, cx| {
+                    state.set_value("{\"X-Trace\":\"on\"}", window, cx)
+                });
+                center.clear_provider_create_preset(window, cx);
+            });
+        });
+        center.read_with(cx, |center, cx| {
+            assert_eq!(center.provider_form.headers.read(cx).value().as_ref(), "{}");
+        });
+
+        // An emptied field is accepted, not reported as invalid JSON: parsing
+        // an empty string is an EOF error, so the guard has to run first.
+        let _ = cx.update_window(handle, |_, window, cx| {
+            center.update(cx, |center, cx| {
+                center
+                    .provider_form
+                    .headers
+                    .update(cx, |state, cx| state.set_value("", window, cx));
+            });
+        });
+        center.update(cx, |center, cx| {
+            let parsed = center
+                .provider_form_parse_headers(cx)
+                .expect("an empty header field must parse as no headers");
+            assert!(parsed.is_empty());
+            assert!(center.provider_form.endpoint_error.is_none());
         });
     }
 

@@ -138,11 +138,18 @@ impl ProviderDraft {
                 .new(|cx| InputState::new(window, cx).placeholder("http://127.0.0.1:7890")),
             proxy_disabled: false,
             headers: cx.new(|cx| {
-                TextareaState::new(window, cx).placeholder(management_locale_text(
-                    "{\n  \"X-Header\": \"value\"\n}",
-                    "{\n  \"X-Header\": \"值\"\n}",
-                    "{\n  \"X-Header\": \"值\"\n}",
-                ))
+                // The draft opens on the empty object rather than a blank
+                // textarea: `{}` is what the field parses on save, and an
+                // empty field only reads as valid after the user guesses that
+                // shape. A preset or a saved record overwrites it when it has
+                // headers of its own.
+                TextareaState::new(window, cx)
+                    .default_value(PROVIDER_HEADERS_EMPTY_OBJECT)
+                    .placeholder(management_locale_text(
+                        "{\n  \"X-Header\": \"value\"\n}",
+                        "{\n  \"X-Header\": \"值\"\n}",
+                        "{\n  \"X-Header\": \"值\"\n}",
+                    ))
             }),
             headers_open: false,
             catalog_id: cx.new(|cx| {
@@ -201,8 +208,9 @@ impl ProviderDraft {
             state.set_placeholder(PROVIDER_API_KEY_PLACEHOLDER, window, cx);
             state.set_value("", window, cx);
         });
-        self.headers
-            .update(cx, |state, cx| state.set_value("", window, cx));
+        self.headers.update(cx, |state, cx| {
+            state.set_value(PROVIDER_HEADERS_EMPTY_OBJECT, window, cx)
+        });
         self.protocol_open = false;
         self.proxy_disabled = false;
         self.headers_open = false;
