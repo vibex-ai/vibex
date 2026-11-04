@@ -246,6 +246,20 @@ impl TableDelegate for RouteRequestsTableDelegate {
             .into_any_element()
     }
 
+    /// The gutter after the last lane.
+    ///
+    /// The kit's own is a rem-sized box, which would leave the share-out a
+    /// fraction of a lane short or long whenever the root font differs from
+    /// the default. This one is the constant the layout subtracts, so the four
+    /// lanes and the gutter always add up to the table exactly.
+    fn render_last_empty_col(
+        &mut self,
+        _window: &mut Window,
+        _cx: &mut Context<TableState<Self>>,
+    ) -> impl IntoElement {
+        div().w(ROUTE_TRAILING_WIDTH).h_full().flex_shrink_0()
+    }
+
     fn render_td(
         &mut self,
         row_ix: usize,
