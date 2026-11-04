@@ -207,6 +207,25 @@ const DROP_TARGET_ALPHA: f32 = 0.18;
 /// paints those as soft chips, which means darker on a dark theme.
 const LIGHT_SWATCH: f32 = 0.50;
 
+/// How far the unchecked switch track leans from `muted` toward the muted ink.
+///
+/// The track cannot simply be `muted`: a settings module paints its own panel
+/// with that same role in the light appearance, so the switch would sit on a
+/// field of its exact own color and vanish. The track instead takes the plate
+/// one meaningful step toward the readable ink, which both separates it from
+/// every surface it can land on and keeps the surface-colored thumb legible
+/// against it.
+pub const SWITCH_OFF_MIX: f32 = 0.45;
+
+/// The fill an unchecked switch track paints.
+///
+/// One step from the resting plate toward the readable ink. Exposed so a
+/// client's appearance pass test can assert the mapping it receives instead of
+/// re-deriving the ratio, and so both clients stay on one formula.
+pub fn switch_track_off(muted: Hsla, muted_foreground: Hsla) -> Hsla {
+    mix(muted, muted_foreground, SWITCH_OFF_MIX)
+}
+
 /// Fill in every gpui-component color the product palette does not map.
 ///
 /// Call this after the client has mapped its core roles (see [`CORE_TOKENS`]) —
@@ -331,8 +350,13 @@ pub fn apply_component_palette(theme: &mut Theme, definition: &GpuiThemeDefiniti
 
         // Switch. The framework fades the track and keeps the thumb on the
         // surface color, so the thumb stays readable against `primary` when
-        // checked and against `muted` when not.
-        switch = muted;
+        // checked and against the resting plate when not. The resting plate is
+        // not `muted` itself: the settings modules are painted from `muted` in
+        // the light appearance, which would leave an unchecked switch the same
+        // color as the panel behind it. One step toward the muted ink keeps the
+        // track visible on the page, on a card, and on a module alike, while the
+        // surface-colored thumb still reads as a hole punched in it.
+        switch = switch_track_off(muted, muted_foreground);
         switch_thumb = background;
 
         // Buttons. Default and Secondary are the product's neutral plates;
@@ -594,7 +618,10 @@ mod tests {
             apply_component_palette(&mut theme, definition);
             let role = |name: &str| semantic_color(definition, name);
             let expected = [
-                ("switch", role("muted")),
+                (
+                    "switch",
+                    switch_track_off(role("muted"), role("muted-foreground")),
+                ),
                 ("switch_thumb", role("background")),
                 ("tab_bar_segmented", role("secondary")),
                 ("tab_active", role("background")),
@@ -657,6 +684,41 @@ mod tests {
                     definition.id
                 );
             }
+        }
+    }
+
+    /// An unchecked switch must be visible wherever it is placed.
+    ///
+    /// The track used to be `muted` outright, which is exactly what a settings
+    /// module paints its panel with in the light appearance: the switch sat on
+    /// a field of its own color and disappeared. The track now leans toward the
+    /// muted ink, so it clears every surface the product can put it on, and the
+    /// surface-colored thumb still reads against the track.
+    #[test]
+    fn the_unchecked_switch_track_clears_every_surface_it_sits_on() {
+        for definition in THEMES {
+            let mut theme = core_themed(definition);
+            apply_component_palette(&mut theme, definition);
+            for (name, surface) in [
+                ("background", theme.background),
+                ("group_box", theme.group_box),
+                ("muted", theme.muted),
+                ("popover", theme.popover),
+                ("secondary", theme.secondary),
+            ] {
+                let actual = contrast(theme.switch, surface);
+                assert!(
+                    actual >= 1.4,
+                    "{}: the unchecked switch on {name} is {actual:.2}:1",
+                    definition.id
+                );
+            }
+            let thumb = contrast(theme.switch_thumb, theme.switch);
+            assert!(
+                thumb >= 1.5,
+                "{}: the thumb is {thumb:.2}:1 against the unchecked track",
+                definition.id
+            );
         }
     }
 }

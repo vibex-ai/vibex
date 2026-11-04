@@ -740,8 +740,14 @@ mod tests {
                 let theme = Theme::global(cx);
                 for (name, expected, actual) in [
                     (
+                        // The unchecked track is derived, not a role: the light
+                        // module panel is `muted` itself, so a `muted` track
+                        // would vanish into it.
                         "switch",
-                        semantic_color_for(definition, "muted"),
+                        vibex_ui::switch_track_off(
+                            semantic_color_for(definition, "muted"),
+                            semantic_color_for(definition, "muted-foreground"),
+                        ),
                         theme.tokens.switch.color,
                     ),
                     (
