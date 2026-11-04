@@ -51463,6 +51463,14 @@ mod gateway_surface_tests {
         }
         // Picking again replays the request rather than unpinning it.
         assert!(source.contains("stage.replay(cx)"));
+        // A replay is paced by the map's own clock, so the map has to ask for
+        // the frames that carry it: nothing else invalidates the map while a
+        // picked walk plays out.
+        let stage = include_str!("management/provider_workspace/route_stage.rs");
+        assert!(
+            stage.contains("fn pulse_soon(") && stage.contains("PULSE_TICK_MS"),
+            "a replay must schedule its own frames, or it freezes on its first one"
+        );
         // A failed request names why in the record, not only in the message the
         // Agent showed: the code is the one thing a reader can look up.
         assert!(source.contains("gateway_request_error_code(request)"));

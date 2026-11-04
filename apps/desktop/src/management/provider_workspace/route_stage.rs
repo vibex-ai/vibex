@@ -23,6 +23,7 @@
 use std::cell::RefCell;
 use std::f32::consts::PI;
 use std::rc::Rc;
+use std::time::Duration;
 
 use super::*;
 
@@ -187,6 +188,12 @@ pub(crate) struct RouteStage {
     model: StageModel,
     /// When the pinned request's replay began, on the wall clock.
     replay_from_ms: i64,
+    /// The redraw scheduled for a map whose request is only waiting.
+    pulse: Option<Task<()>>,
+    /// Whether the last frame had something slow left to draw. Read by the
+    /// replay test, which cannot wait on a timer that a headless run never
+    /// fires.
+    ambient: bool,
 }
 
 impl RouteStage {
@@ -194,6 +201,8 @@ impl RouteStage {
         Self {
             model: StageModel::default(),
             replay_from_ms: 0,
+            pulse: None,
+            ambient: false,
         }
     }
 
@@ -214,10 +223,40 @@ impl RouteStage {
         }
     }
 
+    /// Whether a drawn frame says the map has slow work left.
+    ///
+    /// Read by the replay test instead of the timer, which a headless run
+    /// never fires.
+    #[cfg(test)]
+    pub(crate) fn has_slow_work(&self) -> bool {
+        self.ambient
+    }
+
     /// Plays the pinned request again from the top.
     pub(crate) fn replay(&mut self, cx: &mut Context<Self>) {
         self.replay_from_ms = vibex_core::unix_timestamp_ms();
         cx.notify();
+    }
+
+    /// Asks for one more frame a little later, for work that needs no full
+    /// frame rate: a dot waiting out its hold, or a wire flowing under it.
+    ///
+    /// Without this the map would draw the frame its replay started on and
+    /// then stop, because nothing else invalidates it: a replayed walk only
+    /// moves when this view asks to be drawn again.
+    fn pulse_soon(&mut self, cx: &mut Context<Self>) {
+        if self.pulse.is_some() {
+            return;
+        }
+        self.pulse = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(PULSE_TICK_MS))
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.pulse = None;
+                cx.notify();
+            });
+        }));
     }
 }
 
@@ -244,6 +283,11 @@ const SHAKE_MS: f64 = 450.0;
 const TAG_MS: f64 = 1_800.0;
 /// The pulse of a dot waiting on a member, and of a busy gateway.
 const PULSE_MS: f64 = 1_600.0;
+
+/// How often a map with only a wait to draw refreshes its pulse. Slow enough
+/// to cost nothing beside the frame rate a travelling dot takes, quick enough
+/// that the breath reads as motion rather than as a stutter.
+const PULSE_TICK_MS: u64 = 66;
 /// One dash and its gap; the pattern travels one period per [`FLOW_MS`].
 const DASH_PERIOD: f32 = 8.0;
 const DASH_ON: f32 = 3.0;
@@ -526,6 +570,10 @@ struct StageLooks {
     busy: bool,
     /// A dot travels, a row shakes or a tag shows: frames are needed.
     moving: bool,
+    /// Something is still going to change, but only slowly: a dot waiting on
+    /// a member, a flowing wire, or a replay whose first leg has not begun.
+    /// A slower tick is enough for these.
+    ambient: bool,
 }
 
 fn stage_looks(
@@ -553,6 +601,7 @@ fn stage_looks(
         dots: Vec::new(),
         busy: false,
         moving: false,
+        ambient: false,
     };
     for flight in &model.flights {
         let Some(hue) = hues.get(flight.agent).copied() else {
@@ -637,6 +686,7 @@ fn stage_looks(
                     }
                 };
             }
+            looks.ambient = true;
         }
         if let Some(DotAt::Moving { leg, .. }) = dot {
             looks.moving = true;
@@ -663,6 +713,15 @@ fn stage_looks(
                 at,
             });
         }
+        // A replay that has not reached its first leg yet, or whose dot is
+        // between legs, still has somewhere to go: keep the clock moving so
+        // the next leg begins on screen instead of waiting for a click.
+        if flight.clock == FlightClock::Replay && dot.is_none() && !landed {
+            looks.ambient = true;
+        }
+    }
+    if looks.busy && !still {
+        looks.ambient = true;
     }
     looks
 }
@@ -1031,9 +1090,17 @@ impl Render for RouteStage {
             .map(|agent| agent_hue(&agent.id, cx))
             .collect::<Vec<_>>();
         let looks = stage_looks(&self.model, &hues, now, self.replay_from_ms as f64, still);
-        // Only a travelling dot needs the next frame.
-        if !still && looks.moving {
-            window.request_animation_frame();
+        self.ambient = looks.ambient;
+        // A travelling dot needs the next frame at frame rate; a map that is
+        // only waiting — or whose request has not left yet — needs a slower
+        // one, and asks for it here because nothing else invalidates the map
+        // while a replay plays out.
+        if !still {
+            if looks.moving {
+                window.request_animation_frame();
+            } else if looks.ambient {
+                self.pulse_soon(cx);
+            }
         }
 
         let geometry: SharedGeometry = Rc::new(RefCell::new(StageGeometry {
@@ -2139,6 +2206,58 @@ mod tests {
         stage.update(cx, |stage, cx| stage.replay(cx));
         draw(cx);
         assert!(cx.debug_bounds("route-stage-hub").is_some());
+    }
+
+    /// A picked request plays itself out.
+    ///
+    /// The replay is paced by this view's own clock, so nothing else will
+    /// invalidate the map while it runs. A frame that starts the replay and
+    /// then asks for nothing would leave the dot frozen at its Agent for good —
+    /// the map would only ever move again when the reader clicked something.
+    #[gpui::test]
+    fn a_replay_keeps_asking_for_frames(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let now = vibex_core::unix_timestamp_ms();
+        let stage = cx.new(|_| RouteStage::new());
+        let mut model = busy_model(now);
+        model.flights.truncate(1);
+        model.flights[0].clock = FlightClock::Replay;
+        stage.update(cx, |stage, cx| stage.set_model(model, cx));
+        let (_, cx) =
+            cx.add_window_view(|window, cx| gpui_component::Root::new(stage.clone(), window, cx));
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        // The replay has just started: the dot is still on the lead-in, so the
+        // map has work left and has asked for a frame of its own.
+        let (has_work, scheduled) = stage.read_with(cx, |stage, _| {
+            (stage.has_slow_work(), stage.pulse.is_some())
+        });
+        assert!(
+            has_work,
+            "a replay that has not drawn its dot yet still has work to draw"
+        );
+        assert!(
+            scheduled,
+            "a replay that still has work to draw must schedule the next frame"
+        );
+
+        // Run the clock out past the whole walk: once the dot is home there is
+        // nothing left to draw, so the ticking stops instead of spinning.
+        stage.update(cx, |stage, cx| {
+            stage.replay_from_ms = vibex_core::unix_timestamp_ms()
+                - (LEAD_MS + OUT_MS + HOLD_MS + HOP_MS + HOLD_MS + HOME_MS + 200.0) as i64;
+            cx.notify();
+        });
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        let ambient = stage.read_with(cx, |stage, _| stage.has_slow_work());
+        assert!(
+            !ambient,
+            "a finished replay has nothing left to animate and must not tick"
+        );
     }
 
     /// The Agent, the gateway and the Provider are three peers on the map, so

@@ -5735,6 +5735,15 @@ ProviderConfigService::{
   window, nothing moves and the map shows where each request stands. Every
   animation frame re-renders the views above the map as well, so the map owns
   no work beyond its own frame.
+- **A picked request's replay carries its own clock.** The map paces a walk
+  itself, so nothing else invalidates it while the replay plays out: a frame
+  that starts a replay and asks for no next one leaves the dot frozen at its
+  Agent until the reader clicks something. `RouteStage::pulse_soon` therefore
+  schedules the slow tick whenever the drawn frame still has work left —
+  `StageLooks::ambient`: a dot waiting out its hold, a flowing wire, a replay
+  whose first leg has not begun, or a request still in flight. A travelling
+  dot still takes `request_animation_frame`; once the dot is home (`landed`)
+  the ticking stops rather than spinning.
 - **A created Provider is verified by one real minimal request, and the check
   cannot undo it.** The save writes the row first and probes it afterwards, so a
   blocked probe — a proxy, a rate limit, a vendor that refuses this client — is
