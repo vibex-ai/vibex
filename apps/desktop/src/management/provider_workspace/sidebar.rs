@@ -199,7 +199,6 @@ impl ManagementCenter {
                     .gap_2()
                     .p_3()
                     .child(self.render_workspace_sidebar_toolbar(cx))
-                    .child(self.render_native_import_report(cx))
                     .child(
                         div()
                             .id("management-provider-section-list")

@@ -992,9 +992,7 @@ impl ManagementCenter {
                 self.render_provider_key_value(
                     &profile.id,
                     &credential.id,
-                    &credential.masked_hint,
-                    &credential.display_name,
-                    credential.credential.secret_reference().is_some(),
+                    ProviderKeyDisplay::from_credential(credential),
                     cx,
                 ),
                 usage,

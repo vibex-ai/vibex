@@ -457,6 +457,12 @@ impl ManagementCenter {
                     .get(&upstream.model_provider_profile_id)
                     .is_some_and(|credential| credential == &key.credential_id);
                 let enabled = key.state != vibex_core::GatewayKeyState::Disabled;
+                let credential = profile.as_ref().and_then(|profile| {
+                    profile
+                        .credentials
+                        .iter()
+                        .find(|credential| credential.id == key.credential_id)
+                });
                 let center = cx.weak_entity();
                 let profile_id = upstream.model_provider_profile_id.clone();
                 let credential_id = key.credential_id.clone();
@@ -623,9 +629,10 @@ impl ManagementCenter {
                     self.render_provider_key_value(
                         &upstream.model_provider_profile_id,
                         &key.credential_id,
-                        &key.masked_hint,
-                        &key.display_name,
-                        true,
+                        // The gateway summary carries no setup state, so the
+                        // Provider record is what says whether this row has a
+                        // Secret or only the placeholder an import left.
+                        ProviderKeyDisplay::from_gateway_key(key, credential),
                         cx,
                     ),
                     Some(
