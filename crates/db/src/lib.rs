@@ -27338,6 +27338,71 @@ mod migration_regression_tests {
         );
     }
 
+    /// A session's terminal is distinguishable from a workspace tab.
+    ///
+    /// The tab list and the restore sweep ask the same question, so one query
+    /// answers it for both: a terminal named by `session_terminals` belongs to a
+    /// session and must not be listed as a tab.
+    #[test]
+    fn a_session_terminal_is_not_a_workspace_tab() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        apply_migrations(&mut conn).unwrap();
+
+        let workspace_root = std::env::temp_dir().join(format!(
+            "vibex-session-terminal-ownership-{}",
+            RequestId::new().as_str()
+        ));
+        let (project, workspace) =
+            WorkspaceRepository::ensure(&conn, &workspace_root, WorkspaceMode::CurrentCheckout)
+                .unwrap();
+        let now = unix_timestamp_ms();
+        let session_id = VibexSessionId::new();
+        SessionRepository::insert(
+            &conn,
+            &AgentSession {
+                id: session_id.clone(),
+                title: "Terminal session".to_string(),
+                project_id: project.id,
+                workspace_id: workspace.id.clone(),
+                workspace_root: workspace.root_path.clone(),
+                workspace_mode: workspace.mode,
+                agent_id: AgentId::parse("claude").unwrap(),
+                state: AgentSessionState::Idle,
+                safety: AgentSessionSafety::workspace_write_ask_on_risk(),
+                created_at_ms: now,
+                updated_at_ms: now,
+                last_message_at_ms: now,
+                archived_at_ms: None,
+                deleted_at_ms: None,
+                tools: Default::default(),
+                transport: vibex_core::SessionTransport::Terminal,
+                terminal: None,
+            },
+        )
+        .unwrap();
+        let workspace_id = workspace.id.clone();
+        let terminal_id = TerminalId::new();
+        let other_terminal = TerminalId::new();
+
+        SessionTerminalRepository::upsert(
+            &conn,
+            &session_id,
+            &terminal_id,
+            &workspace_id,
+            &["claude".to_string()],
+            "/tmp",
+        )
+        .unwrap();
+
+        let ids = SessionTerminalRepository::terminal_ids(&conn).unwrap();
+        assert!(ids.contains(&terminal_id));
+        assert!(!ids.contains(&other_terminal));
+        assert!(SessionTerminalRepository::belongs_to_session(&conn, &terminal_id).unwrap());
+        assert!(!SessionTerminalRepository::belongs_to_session(&conn, &other_terminal).unwrap());
+        std::fs::remove_dir_all(&workspace_root).ok();
+    }
+
     /// Observation writes are skipped when nothing a reader sees has moved, so
     /// a liveness tick cannot keep reordering the sidebar.
     #[test]
@@ -27658,6 +27723,52 @@ impl SessionTerminalRepository {
             "failed to record the session terminal",
         ))?;
         Ok(())
+    }
+
+    /// Every terminal id that belongs to a Logical Session.
+    ///
+    /// Read once per workspace listing rather than per row: the tab list has to
+    /// decide ownership for every terminal it might show.
+    pub fn terminal_ids(conn: &Connection) -> VibexResult<Vec<TerminalId>> {
+        let mut stmt = conn
+            .prepare("SELECT terminal_id FROM session_terminals")
+            .map_err(storage_err(
+                "session_terminal_list_failed",
+                "failed to list session terminals",
+            ))?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(storage_err(
+                "session_terminal_list_failed",
+                "failed to list session terminals",
+            ))?;
+        let mut ids = Vec::new();
+        for row in rows {
+            let raw = row.map_err(storage_err(
+                "session_terminal_decode_failed",
+                "failed to decode a session terminal",
+            ))?;
+            ids.push(parse_id(raw, TerminalId::parse)?);
+        }
+        Ok(ids)
+    }
+
+    /// Whether a terminal belongs to a Logical Session rather than to a
+    /// workspace tab.
+    ///
+    /// A session's terminal is not a tab: the reader reaches it through the
+    /// session, and listing it beside their shells would let them close the
+    /// Agent's process from the wrong surface.
+    pub fn belongs_to_session(conn: &Connection, terminal_id: &TerminalId) -> VibexResult<bool> {
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM session_terminals WHERE terminal_id = ?1)",
+            params![terminal_id.as_str()],
+            |row| row.get::<_, i64>(0).map(|present| present != 0),
+        )
+        .map_err(storage_err(
+            "session_terminal_lookup_failed",
+            "failed to determine whether a terminal belongs to a session",
+        ))
     }
 
     /// Every recorded terminal-mode session, for a runtime restart.

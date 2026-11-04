@@ -4809,8 +4809,15 @@ impl DesktopRuntime {
             .collect::<BTreeMap<_, _>>();
         let mut workspace_root = None;
         let mut visible = Vec::new();
+        let session_terminals = vibex_db::SessionTerminalRepository::terminal_ids(&connection)?;
 
         for session in stored {
+            // A session's terminal belongs to the session page, not to this
+            // list: showing it as a tab would let the reader close the Agent's
+            // process from a surface that does not own it.
+            if session_terminals.contains(&session.id) {
+                continue;
+            }
             if let Some(live_session) = live_by_id.get(&session.id) {
                 TerminalSessionRepository::upsert(&connection, live_session)?;
                 if terminal_session_visible(live_session) {
@@ -4836,6 +4843,7 @@ impl DesktopRuntime {
         }
         for session in live {
             if terminal_session_visible(&session)
+                && !session_terminals.contains(&session.id)
                 && !visible.iter().any(|stored| stored.id == session.id)
             {
                 TerminalSessionRepository::upsert(&connection, &session)?;

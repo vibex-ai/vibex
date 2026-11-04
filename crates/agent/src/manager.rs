@@ -5069,11 +5069,25 @@ impl AgentManager {
         let runtime = session
             .as_ref()
             .and_then(|session| self.runtime_for_close(&conn, session));
+        let terminal_id = session
+            .as_ref()
+            .filter(|session| session.transport.is_terminal())
+            .and_then(|session| {
+                SessionTerminalRepository::get(&conn, &session.id)
+                    .ok()
+                    .flatten()
+                    .map(|record| record.terminal_id)
+            });
         SessionRepository::archive(&conn, session_id)?;
         if let Some(archived) = SessionRepository::get(&conn, session_id)? {
             self.publish_root_session_update(&conn, archived);
         }
         drop(conn);
+        // An archived terminal session has no page to draw its terminal, so
+        // leaving the process running would burn a PTY nobody can reach.
+        if let Some(terminal_id) = terminal_id {
+            self.stop_session_terminals(&[terminal_id]);
+        }
         self.close_provider_session(runtime).await;
         Ok(())
     }
@@ -5088,11 +5102,23 @@ impl AgentManager {
         let runtime = session
             .as_ref()
             .and_then(|session| self.runtime_for_close(&conn, session));
+        let terminal_id = session
+            .as_ref()
+            .filter(|session| session.transport.is_terminal())
+            .and_then(|session| {
+                SessionTerminalRepository::get(&conn, &session.id)
+                    .ok()
+                    .flatten()
+                    .map(|record| record.terminal_id)
+            });
         SessionRepository::archive_if_timeline_unchanged(&conn, session_id, expected_end_sequence)?;
         if let Some(archived) = SessionRepository::get(&conn, session_id)? {
             self.publish_root_session_update(&conn, archived);
         }
         drop(conn);
+        if let Some(terminal_id) = terminal_id {
+            self.stop_session_terminals(&[terminal_id]);
+        }
         self.close_provider_session(runtime).await;
         Ok(())
     }
@@ -12797,6 +12823,38 @@ mod tests {
         assert!(
             !stored.contains("API_KEY") && !stored.contains("TOKEN"),
             "the recorded argv must not carry credential material: {stored}"
+        );
+    }
+
+    /// Archiving a terminal session stops its PTY.
+    ///
+    /// An archived session has no page to draw a terminal, so a process left
+    /// running is one nobody can reach, holding a PTY and its Agent loop.
+    #[tokio::test]
+    async fn archiving_a_terminal_session_stops_its_terminal() {
+        let (manager, launcher, dir) = terminal_manager();
+        let session = manager
+            .create_terminal_session(terminal_request("claude", &dir))
+            .await
+            .unwrap();
+        let watched = launcher.watched();
+        assert_eq!(watched.len(), 1);
+        let terminal_id = watched[0].0.clone();
+        assert!(launcher.is_running(&terminal_id));
+
+        manager.archive_session(&session.id).await.unwrap();
+
+        assert!(
+            !launcher.is_running(&terminal_id),
+            "an archived terminal session must not keep its Agent running"
+        );
+        // The row survives, so unarchiving still finds the session.
+        let conn = open_database(&dir.join("vibex.db")).unwrap();
+        assert!(
+            vibex_db::SessionRepository::get(&conn, &session.id)
+                .unwrap()
+                .is_some(),
+            "archiving must not delete the session"
         );
     }
 
