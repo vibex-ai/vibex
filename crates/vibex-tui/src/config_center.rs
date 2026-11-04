@@ -4018,12 +4018,24 @@ pub fn native_import_rows(
         .items
         .iter()
         .map(|item| {
+            // A CC Switch Key is copied into Vibex during the import, so the
+            // same status means the opposite thing there: information, not a
+            // warning that the reader has work left.
+            let moves_its_secret = item
+                .provider_options
+                .entries
+                .iter()
+                .any(|entry| entry.key == "nativeSource" && entry.value == "cc-switch");
             let (chip, tone, importable) = match item.status {
                 vibex_core::ProviderNativeImportItemStatus::Importable => {
                     (strings.config_state_available(), ConfigTone::Ok, true)
                 }
                 vibex_core::ProviderNativeImportItemStatus::NeedsSecretSetup => {
-                    (strings.config_state_needs_secret(), ConfigTone::Warn, true)
+                    if moves_its_secret {
+                        (strings.config_state_key_migrates(), ConfigTone::Ok, true)
+                    } else {
+                        (strings.config_state_needs_secret(), ConfigTone::Warn, true)
+                    }
                 }
                 vibex_core::ProviderNativeImportItemStatus::Partial => {
                     (strings.config_state_partial(), ConfigTone::Warn, true)
