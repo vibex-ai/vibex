@@ -8,7 +8,7 @@ use gpui_component::{
     Icon, Sizable as _, StyledExt as _,
     button::{Button, ButtonVariants as _},
     empty::Empty,
-    scroll::{ScrollableElement as _, ScrollbarAxis},
+    scroll::ScrollbarAxis,
 };
 use vibex_desktop_runtime::validate_external_open_url;
 
@@ -120,41 +120,144 @@ pub fn pinned_scrollbar<E>(
 where
     E: InteractiveElement + Styled + ParentElement + Element + 'static,
 {
-    pin_to_viewport(scroller, handle, axis).into_any_element()
+    PinnedScrollbarBox::new(scroller, handle, axis).into_any_element()
 }
 
-/// The wrapper [`pinned_scrollbar`] builds, before type erasure.
-fn pin_to_viewport<E>(
-    mut scroller: E,
-    handle: &(impl gpui_base::ScrollbarHandle + Clone),
-    axis: ScrollbarAxis,
-) -> gpui::Stateful<gpui::Div>
+/// The box [`pinned_scrollbar`] wraps a scroller in.
+///
+/// The scroller stays the real scroll area, which is why every builder call
+/// made *after* `.pinned_scrollbar(...)` is forwarded to it rather than to the
+/// outer box. A call site keeps chaining as if the call had not happened — the
+/// padding, the gap, the hover target and the rows all describe the list — so
+/// forwarding is what makes the one-line swap a faithful replacement for the
+/// original chain.
+///
+/// Forwarding the children is not a convenience. Appending them to the outer
+/// box instead puts the new rows *beside* the scroll region rather than inside
+/// it: the region keeps only the children it had at the call, those rows paint
+/// below the clipped viewport, and the tracked handle never grows, so the list
+/// stops scrolling exactly when it has the most to show. That is the defect
+/// this box exists to prevent.
+pub struct PinnedScrollbarBox<E> {
+    /// The stationary viewport: the scroller's layout slot plus the bar.
+    outer: gpui::Stateful<gpui::Div>,
+    scroller: E,
+    bar: Option<gpui_base::Scrollbar>,
+}
+
+impl<E> PinnedScrollbarBox<E>
 where
     E: InteractiveElement + Styled + ParentElement + Element + 'static,
 {
-    let source = scroller.style().clone();
-    let outer_style = StyleRefinement {
-        size: source.size,
-        min_size: source.min_size,
-        max_size: source.max_size,
-        flex_grow: source.flex_grow,
-        flex_shrink: source.flex_shrink,
-        flex_basis: source.flex_basis,
-        align_self: source.align_self,
-        ..Default::default()
-    };
+    #[track_caller]
+    fn new(
+        mut scroller: E,
+        handle: &(impl gpui_base::ScrollbarHandle + Clone),
+        axis: ScrollbarAxis,
+    ) -> Self {
+        let source = scroller.style().clone();
+        let outer_style = StyleRefinement {
+            size: source.size,
+            min_size: source.min_size,
+            max_size: source.max_size,
+            flex_grow: source.flex_grow,
+            flex_shrink: source.flex_shrink,
+            flex_basis: source.flex_basis,
+            align_self: source.align_self,
+            ..Default::default()
+        };
 
-    // The id makes this a `Stateful<Div>`, which is what keeps the chain
-    // usable after the call: `overflow_*_scrollbar()` returns the same shape.
-    div()
-        .id(gpui::ElementId::Name("pinned-scrollbar".into()))
-        .relative()
-        .flex()
-        .min_h_0()
-        .min_w_0()
-        .refine_style(&outer_style)
-        .child(scroller.flex_1().min_h_0().min_w_0())
-        .scrollbar(handle, axis)
+        // One id per call site, so two pinned regions under the same parent do
+        // not share element state.
+        let site = std::panic::Location::caller();
+        let id = gpui::ElementId::CodeLocation(*site);
+        let outer = div()
+            .id(id.clone())
+            .relative()
+            .flex()
+            .min_h_0()
+            .min_w_0()
+            .refine_style(&outer_style);
+        let bar = gpui_base::Scrollbar::new(handle)
+            .id(id)
+            .axis(axis)
+            .viewport_from_layout();
+        Self {
+            outer,
+            scroller: scroller.flex_1().min_h_0().min_w_0(),
+            bar: Some(bar),
+        }
+    }
+}
+
+/// Style calls after the pin belong to the list, not to its viewport.
+impl<E> Styled for PinnedScrollbarBox<E>
+where
+    E: InteractiveElement + Styled + ParentElement + Element + 'static,
+{
+    fn style(&mut self) -> &mut StyleRefinement {
+        self.scroller.style()
+    }
+}
+
+/// Interactivity after the pin belongs to the list too: a hover or a wheel
+/// handler added by a call site is about the rows.
+impl<E> InteractiveElement for PinnedScrollbarBox<E>
+where
+    E: InteractiveElement + Styled + ParentElement + Element + 'static,
+{
+    fn interactivity(&mut self) -> &mut Interactivity {
+        self.scroller.interactivity()
+    }
+}
+
+impl<E> StatefulInteractiveElement for PinnedScrollbarBox<E> where
+    E: InteractiveElement + Styled + ParentElement + Element + 'static
+{
+}
+
+impl<E> ParentElement for PinnedScrollbarBox<E>
+where
+    E: InteractiveElement + Styled + ParentElement + Element + 'static,
+{
+    fn extend(&mut self, elements: impl IntoIterator<Item = AnyElement>) {
+        self.scroller.extend(elements);
+    }
+}
+
+impl<E> IntoElement for PinnedScrollbarBox<E>
+where
+    E: InteractiveElement + Styled + ParentElement + Element + 'static,
+{
+    type Element = gpui::ViewElement<Self>;
+
+    fn into_element(self) -> Self::Element {
+        gpui::ViewElement::new(self)
+    }
+}
+
+impl<E> RenderOnce for PinnedScrollbarBox<E>
+where
+    E: InteractiveElement + Styled + ParentElement + Element + 'static,
+{
+    fn render(mut self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
+        let scroller = self.scroller;
+        let mut outer = self.outer.child(scroller);
+        if let Some(bar) = self.bar.take() {
+            // The overlay is a sibling placed after the scroller, so it paints
+            // over the rows. `inset_0` pins it to the viewport while
+            // `viewport_from_layout` makes it measure against the same box,
+            // which is what keeps the thumb fixed as the content moves.
+            outer = outer.child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .debug_selector(|| "scrollbar-overlay".to_string())
+                    .child(bar),
+            );
+        }
+        outer
+    }
 }
 
 /// [`pinned_scrollbar`] as a builder method, so a call site swaps one line.
@@ -164,16 +267,17 @@ where
 /// untouched, which is what makes the fix readable in review: the diff shows the
 /// bar moving out of the scroller, not a re-indented block.
 ///
-/// Like the `overflow_*_scrollbar()` builders, this returns the wrapper rather
-/// than a type-erased element, so a chain can keep adding children after it.
+/// The returned [`PinnedScrollbarBox`] forwards `child`/`children` to the
+/// scroller, so a chain can keep adding rows after it and they land in the
+/// region the bar tracks.
 pub trait PinnedScrollbar: InteractiveElement + Styled + ParentElement + Sized {
     /// The same bar [`pinned_scrollbar`] draws, pinned to this element's box.
-    fn pinned_scrollbar<H>(self, handle: &H, axis: ScrollbarAxis) -> gpui::Stateful<gpui::Div>
+    fn pinned_scrollbar<H>(self, handle: &H, axis: ScrollbarAxis) -> PinnedScrollbarBox<Self>
     where
         H: gpui_base::ScrollbarHandle + Clone,
         Self: Element + 'static,
     {
-        pin_to_viewport(self, handle, axis)
+        PinnedScrollbarBox::new(self, handle, axis)
     }
 }
 
@@ -529,7 +633,7 @@ mod tests {
         };
         use gpui_component::v_flex;
 
-        use super::super::pinned_scrollbar;
+        use super::super::{PinnedScrollbar as _, pinned_scrollbar};
 
         /// A content-sized panel whose body scrolls: the shape that used to let
         /// the bar ride up with the rows.
@@ -626,6 +730,98 @@ mod tests {
             assert_eq!(
                 before.origin, after.origin,
                 "the bar must stay on the viewport while the content scrolls"
+            );
+        }
+
+        /// The shape every call site actually uses: the list keeps chaining
+        /// after `.pinned_scrollbar(...)`, so its rows are appended to the
+        /// value the builder returns.
+        struct ChainedProbe {
+            scroll: ScrollHandle,
+        }
+
+        impl Render for ChainedProbe {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                v_flex()
+                    .w(px(240.0))
+                    .max_h(px(160.0))
+                    .min_h_0()
+                    .overflow_hidden()
+                    .p_2()
+                    .child(
+                        v_flex()
+                            .id("chained-probe-scroll")
+                            .debug_selector(|| "chained-probe-scroll".to_string())
+                            .w_full()
+                            .min_h_0()
+                            .track_scroll(&self.scroll)
+                            .overflow_y_scroll()
+                            .pinned_scrollbar(
+                                &self.scroll,
+                                gpui_component::scroll::ScrollbarAxis::Vertical,
+                            )
+                            .children((0..20).map(|ix| {
+                                div().h(px(20.0)).flex_none().when(ix == 19, |row| {
+                                    row.debug_selector(|| "chained-last-row".to_string())
+                                })
+                            })),
+                    )
+            }
+        }
+
+        /// A row appended after the pin belongs to the scroll area.
+        ///
+        /// The builder used to return the wrapper, so those rows landed beside
+        /// the viewport instead of inside it: they painted below the clipping
+        /// box, the tracked handle never grew, and the menu could not scroll.
+        #[gpui::test]
+        fn rows_appended_after_the_pin_scroll_with_the_list(cx: &mut TestAppContext) {
+            cx.update(gpui_component::init);
+            let (_, cx) = cx.add_window_view(|_, _| ChainedProbe {
+                scroll: ScrollHandle::new(),
+            });
+            cx.update(|window, cx| {
+                let _ = window.draw(cx);
+            });
+            cx.run_until_parked();
+
+            let viewport = cx
+                .debug_bounds("chained-probe-scroll")
+                .expect("the list should be laid out");
+            let row_before = cx
+                .debug_bounds("chained-last-row")
+                .expect("the appended row should be laid out")
+                .origin
+                .y;
+            assert!(
+                cx.debug_bounds("scrollbar-overlay").is_some(),
+                "the pinned region should still own its bar"
+            );
+
+            cx.simulate_event(gpui::ScrollWheelEvent {
+                position: gpui::point(px(40.0), px(40.0)),
+                delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.0), px(-120.0))),
+                modifiers: Default::default(),
+                touch_phase: gpui::TouchPhase::Moved,
+            });
+            cx.run_until_parked();
+            cx.update(|window, cx| {
+                let _ = window.draw(cx);
+            });
+
+            let row_after = cx
+                .debug_bounds("chained-last-row")
+                .expect("the appended row should still be laid out")
+                .origin
+                .y;
+            assert!(
+                row_after < row_before,
+                "the appended rows must be inside the scroll area: \
+                 {row_before:?} -> {row_after:?}"
+            );
+            assert!(
+                row_after >= viewport.origin.y,
+                "the last row must not sit above the region that clips it"
             );
         }
     }
