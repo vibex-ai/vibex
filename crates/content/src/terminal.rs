@@ -574,6 +574,75 @@ fn encode_key(
     Some(sequence.into_bytes())
 }
 
+/// `DISAMBIGUATE_ESC_CODES`: report a chord as `CSI u` instead of its legacy
+/// bytes.
+const KITTY_DISAMBIGUATE: u8 = 1;
+/// `REPORT_ALTERNATE_KEYS`: also report the shifted key and the base layout key.
+const KITTY_ALTERNATE_KEYS: u8 = 4;
+/// `REPORT_ALL_KEYS_AS_ESC`: report even plain text keys as escapes.
+const KITTY_ALL_KEYS_AS_ESC: u8 = 8;
+
+/// Encodes a chord under the kitty keyboard protocol.
+///
+/// Returns `None` for a key the protocol does not override, which keeps the
+/// caller on its legacy path. Plain text keys stay text unless the program asked
+/// for every key as an escape: turning `a` into `CSI 97 u` for a program that
+/// only wanted `Shift+Enter` disambiguated would break ordinary typing.
+fn encode_kitty_key(key: TerminalKey, modifiers: TerminalModifiers, flags: u8) -> Option<Vec<u8>> {
+    let modifier = 1
+        + u32::from(modifiers.shift)
+        + u32::from(modifiers.alt) * 2
+        + u32::from(modifiers.control) * 4;
+    let modified = modifier != 1;
+    let (code, shifted_code) = match key {
+        TerminalKey::Enter => (13_u32, None),
+        TerminalKey::Tab => (9, None),
+        TerminalKey::Backspace => (127, None),
+        TerminalKey::Escape => (27, None),
+        TerminalKey::Up => (57352, None),
+        TerminalKey::Down => (57353, None),
+        TerminalKey::Left => (57351, None),
+        TerminalKey::Right => (57350, None),
+        TerminalKey::Home => (57356, None),
+        TerminalKey::End => (57357, None),
+        TerminalKey::PageUp => (57358, None),
+        TerminalKey::PageDown => (57359, None),
+        TerminalKey::Insert => (57348, None),
+        TerminalKey::Delete => (57349, None),
+        TerminalKey::Function(number) => {
+            // F1..F12 are the contiguous range 57364..=57375.
+            if !(1..=12).contains(&number) {
+                return None;
+            }
+            (57363 + u32::from(number), None)
+        }
+        TerminalKey::Text(character) => {
+            if flags & KITTY_ALL_KEYS_AS_ESC == 0 {
+                return None;
+            }
+            // The protocol reports the base-layout key plus, when the program
+            // asked for alternates, the shifted form it produced.
+            let shifted = (modified && flags & KITTY_ALTERNATE_KEYS != 0)
+                .then(|| character.to_uppercase().next())
+                .flatten()
+                .filter(|upper| *upper != character)
+                .map(|upper| upper as u32);
+            (character as u32, shifted)
+        }
+    };
+    let mut sequence = format!("\x1b[{code}");
+    if modified || shifted_code.is_some() {
+        sequence.push(';');
+        sequence.push_str(&modifier.to_string());
+        if let Some(shifted) = shifted_code {
+            sequence.push(':');
+            sequence.push_str(&shifted.to_string());
+        }
+    }
+    sequence.push('u');
+    Some(sequence.into_bytes())
+}
+
 fn csi_tilde(code: u8, modifier: usize) -> String {
     if modifier == 1 {
         format!("\x1b[{code}~")
@@ -919,5 +988,97 @@ mod tests {
         assert_eq!(diagnostics.ingested_bytes, 32 * 1024);
         assert!(resources.resident_bytes < diagnostics.ingested_bytes as usize);
         assert!(resources.is_within_budget());
+    }
+    /// A program that never negotiated the keyboard protocol keeps the legacy
+    /// bytes: `Shift+Enter` is a carriage return, precisely because it never
+    /// asked for anything better.
+    #[test]
+    fn legacy_encoding_is_unchanged_without_negotiation() {
+        let backend = TerminalSurfaceBackend::new(4, 20);
+        assert_eq!(backend.modes().kitty_keyboard_flags, 0);
+        let shift_enter = backend
+            .encode_key(
+                TerminalKey::Enter,
+                TerminalModifiers {
+                    shift: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(shift_enter, b"\r");
+    }
+
+    /// Once the program pushes the disambiguate flag, a modified key is reported
+    /// as `CSI u` — the only shape that can carry "shift".
+    #[test]
+    fn a_negotiated_shift_enter_is_reported_as_csi_u() {
+        let mut backend = TerminalSurfaceBackend::new(4, 20);
+        backend.sync(&snapshot(vec![(1, b"\x1b[>1u")], 2)).unwrap();
+        assert_eq!(backend.modes().kitty_keyboard_flags, 1);
+        let out = backend
+            .encode_key(
+                TerminalKey::Enter,
+                TerminalModifiers {
+                    shift: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(out, b"\x1b[13;2u");
+        // A plain Enter stays a carriage return: the flag disambiguates modified
+        // keys, it does not rewrite the unmodified ones.
+        let plain = backend
+            .encode_key(TerminalKey::Enter, TerminalModifiers::default())
+            .unwrap();
+        assert_eq!(plain, b"\x1b[13u");
+    }
+
+    /// A program that pushes the mode and then pops it returns to legacy bytes,
+    /// so a TUI that temporarily asked cannot corrupt what follows it.
+    #[test]
+    fn popping_the_keyboard_mode_restores_legacy_encoding() {
+        let mut backend = TerminalSurfaceBackend::new(4, 20);
+        backend
+            .sync(&snapshot(vec![(1, b"\x1b[>1u"), (2, b"\x1b[<u")], 3))
+            .unwrap();
+        assert_eq!(backend.modes().kitty_keyboard_flags, 0);
+        let out = backend
+            .encode_key(
+                TerminalKey::Enter,
+                TerminalModifiers {
+                    shift: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(out, b"\r");
+    }
+
+    /// Plain text is never rewritten unless the program asked for every key as
+    /// an escape.
+    #[test]
+    fn text_keys_stay_text_unless_all_keys_were_negotiated() {
+        let mut backend = TerminalSurfaceBackend::new(4, 20);
+        backend.sync(&snapshot(vec![(1, b"\x1b[>1u")], 2)).unwrap();
+        let out = backend
+            .encode_key(TerminalKey::Text('a'), TerminalModifiers::default())
+            .unwrap();
+        assert_eq!(out, b"a");
+    }
+
+    /// The replies the emulator owes the program are surfaced for the transport
+    /// that owns the write side.
+    #[test]
+    fn a_device_query_reply_reaches_the_sync_outcome() {
+        let mut backend = TerminalSurfaceBackend::new(4, 20);
+        let outcome = backend.sync(&snapshot(vec![(1, b"\x1b[c")], 2)).unwrap();
+        assert!(
+            outcome.pty_replies.starts_with(b"\x1b[?"),
+            "a device-attributes query must be answered: {:?}",
+            outcome.pty_replies
+        );
+        // The next sync has nothing left to send.
+        let second = backend.sync(&snapshot(vec![], 2)).unwrap();
+        assert!(second.pty_replies.is_empty());
     }
 }

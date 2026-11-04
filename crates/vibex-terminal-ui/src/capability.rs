@@ -46,6 +46,21 @@ pub const TERM_NAME: &str = "xterm-256color";
 /// whole page to the 256-colour cube.
 pub const COLOR_TERM: &str = "truecolor";
 
+/// Whether this emulator implements the kitty keyboard protocol.
+///
+/// It does, and only for a program that pushes a mode: the encoder reports a
+/// modified key as `CSI u` when — and only when — the program negotiated it, and
+/// every other key keeps its legacy bytes. That is a per-program opt-in, not a
+/// property of `TERM`, which is why [`TERM_NAME`] still names a plain xterm: a
+/// name that promised the protocol would have programs send `CSI u` before
+/// asking whether we parse it.
+///
+/// The distinction matters for a user whose *outer* terminal is something else
+/// entirely. What the CLI sees is this grid, never that terminal, so the answer
+/// must come from this constant rather than from `KITTY_WINDOW_ID` or
+/// `TERM_PROGRAM` — which [`OUTER_TERMINAL_VARIABLES`] already clears.
+pub const KITTY_KEYBOARD_PROTOCOL: bool = true;
+
 /// The variables that describe the *outer* terminal rather than this PTY.
 ///
 /// Each one is a claim about a host this emulator is not: a window id, a
@@ -182,5 +197,34 @@ mod tests {
             child_environment().removed().count(),
             OUTER_TERMINAL_VARIABLES.len()
         );
+    }
+    /// The protocol is advertised as a capability of the grid, not inferred from
+    /// whatever terminal happened to launch the desktop.
+    ///
+    /// A user running Vibex inside iTerm, Windows Terminal, or tmux must get the
+    /// same answer: the CLI talks to this emulator, and it is this emulator that
+    /// either parses `CSI u` or does not.
+    #[test]
+    fn the_keyboard_protocol_is_a_property_of_this_grid() {
+        let supports_keyboard_protocol = KITTY_KEYBOARD_PROTOCOL;
+        assert!(
+            supports_keyboard_protocol,
+            "the encoder produces CSI u, so the capability has to say so"
+        );
+        // And the name a child reads still does not promise it: a program must
+        // negotiate before it is answered in that dialect.
+        assert!(
+            !TERM_NAME.contains("kitty"),
+            "TERM must not promise a protocol that is only opt-in"
+        );
+        // The outer terminal's own claims are cleared, so they cannot answer
+        // this question for a program that reads the environment instead.
+        let removed = child_environment().removed().collect::<Vec<_>>();
+        for outer in ["KITTY_WINDOW_ID", "TERM_PROGRAM", "LC_TERMINAL"] {
+            assert!(
+                removed.contains(&outer),
+                "{outer} would let the outer terminal answer for this grid"
+            );
+        }
     }
 }

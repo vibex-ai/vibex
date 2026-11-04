@@ -79914,7 +79914,7 @@ fn terminal_row_facts(session: &AgentSession) -> Option<vibex_core::TerminalSess
     session
         .transport
         .is_terminal()
-        .then(|| session.terminal.clone())
+        .then(|| session.terminal.as_deref().cloned())
         .flatten()
 }
 

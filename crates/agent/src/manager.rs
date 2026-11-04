@@ -1362,7 +1362,7 @@ impl AgentManager {
             deleted_at_ms: None,
             tools: Default::default(),
             transport: vibex_core::SessionTransport::Terminal,
-            terminal: Some(vibex_core::TerminalSessionFacts::default()),
+            terminal: Some(Box::new(vibex_core::TerminalSessionFacts::default())),
         };
         if request.title.is_some() {
             SessionRepository::lock_title(&conn, &session.id)?;
@@ -3025,7 +3025,7 @@ impl AgentManager {
             && session.transport.is_terminal()
         {
             let session = AgentSession {
-                terminal: Some(record.facts),
+                terminal: Some(Box::new(record.facts)),
                 ..session
             };
             let _ = self.session_events.send(session);

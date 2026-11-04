@@ -135,6 +135,18 @@ pub struct TerminalEmulator {
 impl TerminalEmulator {
     pub fn new(rows: u16, columns: u16) -> Self {
         let size = normalized_size(rows, columns);
+        let replies = PtyReplyQueue::default();
+        // The grid can encode `CSI u`, so it may advertise the protocol.
+        // Alacritty refuses to even remember a pushed keyboard mode while this
+        // is false, which is why enabling it here is what lets an Agent
+        // negotiate `Shift+Enter` at all.
+        //
+        // Advertising it does not force it on any child: a program still has to
+        // push a mode, and one that never asks keeps receiving legacy sequences.
+        let config = Config {
+            kitty_keyboard: true,
+            ..Config::default()
+        };
         Self {
             size,
             term: Term::new(Config::default(), &size, VoidListener),
@@ -596,5 +608,62 @@ mod tests {
         let frame = emulator.frame();
         assert_eq!(frame.history_lines, 10_000);
         assert!(frame.cells.len() <= usize::from(frame.rows) * usize::from(frame.columns));
+    }
+    /// The emulator answers the queries a CLI uses to decide what it may send.
+    ///
+    /// Without these replies an Agent that asks "which terminal are you?" or
+    /// "where is the cursor?" waits for an answer that never comes, and one that
+    /// asks about the keyboard protocol falls back to legacy encoding.
+    #[test]
+    fn the_emulator_answers_device_and_cursor_queries() {
+        let mut emulator = TerminalEmulator::new(4, 20);
+        emulator.advance(b"\x1b[c");
+        let primary = emulator.take_pty_replies();
+        assert!(
+            primary.starts_with(b"\x1b[?"),
+            "primary device attributes should be answered: {primary:?}"
+        );
+        // The queue drains, so a host does not resend the same reply forever.
+        assert!(emulator.take_pty_replies().is_empty());
+
+        emulator.advance(b"\x1b[2;3H\x1b[6n");
+        let cursor = emulator.take_pty_replies();
+        assert_eq!(
+            cursor, b"\x1b[2;3R",
+            "a cursor position report should carry the current cell"
+        );
+    }
+
+    /// A program that pushes a keyboard mode is remembered, and popping it
+    /// returns the emulator to legacy encoding.
+    #[test]
+    fn the_keyboard_protocol_is_negotiated_by_the_program() {
+        let mut emulator = TerminalEmulator::new(4, 20);
+        // Nothing pushed yet: the encoder must keep legacy behaviour.
+        assert_eq!(emulator.modes().kitty_keyboard_flags, 0);
+
+        // Push disambiguate + report-alternate-keys, the combination an Agent
+        // uses to tell Shift+Enter from Enter.
+        emulator.advance(b"\x1b[>5u");
+        assert_eq!(emulator.modes().kitty_keyboard_flags, 5);
+
+        // A query reports the active mode rather than changing it.
+        emulator.advance(b"\x1b[?u");
+        assert_eq!(emulator.take_pty_replies(), b"\x1b[?5u");
+
+        // Popping every pushed mode restores legacy encoding.
+        emulator.advance(b"\x1b[<u");
+        assert_eq!(emulator.modes().kitty_keyboard_flags, 0);
+    }
+
+    /// Advertising the protocol does not change what a program that never asks
+    /// receives.
+    #[test]
+    fn a_program_that_never_negotiates_keeps_legacy_modes() {
+        let emulator = TerminalEmulator::new(4, 20);
+        let modes = emulator.modes();
+        assert_eq!(modes.kitty_keyboard_flags, 0);
+        assert!(!modes.bracketed_paste);
+        assert!(!modes.mouse_reporting);
     }
 }

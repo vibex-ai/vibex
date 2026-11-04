@@ -444,8 +444,12 @@ pub struct AgentSession {
     /// What Vibex can currently observe about a terminal-mode Agent.
     ///
     /// `None` for every ACP session, so their serialized shape does not change.
+    /// Boxed because this DTO travels through the session and poll channels and
+    /// is cloned per client: the facts add four options and three timestamps,
+    /// and paying for them in every ACP session would grow the channels for a
+    /// field those sessions never read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub terminal: Option<crate::terminal::TerminalSessionFacts>,
+    pub terminal: Option<Box<crate::terminal::TerminalSessionFacts>>,
 }
 
 impl AgentSession {
