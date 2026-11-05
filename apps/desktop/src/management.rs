@@ -15,13 +15,12 @@ use std::time::Duration;
 
 use crate::typography::{code_font_weight, ui_rems};
 use gpui::{
-    AccessibleAction, Anchor, AnyElement, App, Bounds, ClickEvent, Context, DragMoveEvent,
-    ElementId, Empty, Entity, EventEmitter, FocusHandle, Focusable as _, FontWeight,
-    HitboxBehavior, Hsla, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, Orientation,
-    PathBuilder, Pixels, Rems, Render, RenderOnce, Role, ScrollAnchor, ScrollDelta, ScrollHandle,
-    ScrollWheelEvent, SharedString, Size as GpuiSize, StatefulInteractiveElement as _,
-    Subscription, Task, Toggled, WeakEntity, Window, canvas, div, point, prelude::*, px, rems,
-    size as gpui_size,
+    AccessibleAction, Anchor, AnyElement, App, Bounds, ClickEvent, Context, DragMoveEvent, Empty,
+    Entity, EventEmitter, FocusHandle, Focusable as _, FontWeight, HitboxBehavior, Hsla,
+    IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, Orientation, PathBuilder, Pixels, Rems,
+    Render, Role, ScrollAnchor, ScrollDelta, ScrollHandle, ScrollWheelEvent, SharedString,
+    Size as GpuiSize, StatefulInteractiveElement as _, Subscription, Task, Toggled, WeakEntity,
+    Window, canvas, div, point, prelude::*, px, rems, size as gpui_size,
 };
 use gpui_component::{
     ActiveTheme as _, ColorName, Disableable as _, ElementExt as _, Icon, IconName,
@@ -2180,6 +2179,65 @@ pub struct ManagementCenter {
 
 impl EventEmitter<ManagementEvent> for ManagementCenter {}
 
+/// Turns a macOS precise wheel into horizontal movement of a tab strip.
+///
+/// `gpui_component::TabBar` locks its strip to one scroll axis and installs a
+/// `vertical_wheel` mask that only understands `ScrollDelta::Lines` — the
+/// notches of a plain, non-precise wheel. Linux reports both wheel axes as
+/// `Lines`, so the mask turns a vertical wheel into sideways movement there.
+/// macOS reports mouse and trackpad wheels as precise `ScrollDelta::Pixels`,
+/// which that mask returns untouched; the strip's own axis-locked scroller then
+/// ignores a vertical wheel and can lock a horizontal swipe to the vertical
+/// axis when the gesture begins. Either way the Config Center's section tabs
+/// will not scroll on macOS.
+///
+/// This canvas covers the strip and consumes precise wheel events in the
+/// capture phase, before the strip's own scroller runs, turning whichever axis
+/// the wheel moved into a clamped horizontal offset. `Lines` events are left
+/// entirely alone so the built-in mask keeps handling Linux wheels and keeps
+/// chaining them to the parent at the strip's edge. At our own edge we also let
+/// the event bubble, so the page still scrolls past the strip.
+fn precise_wheel_scroll(handle: &ScrollHandle) -> impl IntoElement {
+    let handle = handle.clone();
+    canvas(
+        |bounds, window, _| window.insert_hitbox(bounds, HitboxBehavior::Normal).id,
+        move |_, hitbox_id, window, cx| {
+            let view = window.current_view();
+            window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
+                if !phase.capture() || !hitbox_id.should_handle_scroll(window) {
+                    return;
+                }
+                // A plain wheel stays with the TabBar's `vertical_wheel` mask.
+                let ScrollDelta::Pixels(delta) = event.delta else {
+                    return;
+                };
+                // A vertical wheel or trackpad swipe over a horizontal strip
+                // still moves it sideways; a horizontal swipe uses its own axis.
+                let movement = if delta.x.abs() >= delta.y.abs() {
+                    delta.x
+                } else {
+                    delta.y
+                };
+                if movement == px(0.) {
+                    return;
+                }
+                let axis_max = handle.max_offset().x.max(px(0.));
+                let mut offset = handle.offset();
+                let next = (offset.x + movement).clamp(-axis_max, px(0.));
+                if next == offset.x {
+                    return; // At the edge: let the parent scroller take over.
+                }
+                offset.x = next;
+                handle.set_offset(offset);
+                cx.notify(view);
+                cx.stop_propagation();
+            });
+        },
+    )
+    .absolute()
+    .size_full()
+}
+
 impl ManagementCenter {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let copy = management_copy();
@@ -2922,6 +2980,7 @@ impl ManagementCenter {
             backend: None,
             terminal_transport: None,
             navigation: ManagementNavigation::default(),
+            nav_scroll: ScrollHandle::new(),
             snapshot: ProviderCenterSnapshot::default(),
             agent_ordering: AgentOrdering::default(),
             provider_profiles: Vec::new(),
@@ -14798,10 +14857,11 @@ impl ManagementCenter {
             .unwrap_or(0);
         let sections: Vec<ManagementSection> =
             items.iter().map(|(section, _, _)| *section).collect();
-        TabBar::new("management-section-nav")
+        let tabs = TabBar::new("management-section-nav")
             .h(px(42.0))
             .w_full()
             .pill()
+            .track_scroll(&self.nav_scroll)
             .selected_index(selected_index)
             .children(items.into_iter().map(|(_, label, icon)| {
                 // `Tab` renders its `icon` *instead of* its label when both are
@@ -14820,7 +14880,15 @@ impl ManagementCenter {
                 if let Some(section) = sections.get(*index) {
                     this.request_section_switch(*section, window, cx);
                 }
-            }))
+            }));
+        // A macOS precise wheel never reaches the strip through the TabBar's
+        // own `Lines`-only mask, so drive its scroll offset from a capture
+        // listener that covers the bar. Plain wheels keep the built-in path.
+        div()
+            .relative()
+            .w_full()
+            .child(tabs)
+            .child(precise_wheel_scroll(&self.nav_scroll))
             .into_any_element()
     }
 

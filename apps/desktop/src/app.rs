@@ -38027,6 +38027,27 @@ impl VibexWorkbench {
         cx.notify();
     }
 
+    /// Keeps the transport choice honest when the Agent changes.
+    ///
+    /// The switch disables the terminal option for an Agent this release cannot
+    /// run in a terminal, but a disabled control does not undo a choice already
+    /// made: a reader who picked terminal mode for Claude and then switched to an
+    /// Agent without one would submit a terminal creation and be told the Agent
+    /// is unsupported. Falling back to the interface mode is what the reader
+    /// meant — the page no longer offers them a terminal at all.
+    fn reconcile_new_session_transport(&mut self, agent_id: Option<&AgentId>) {
+        if !self.ui_state.session.new_session_transport.is_terminal() {
+            return;
+        }
+        let supported = agent_id
+            .map(|agent_id| vibex_core::terminal_session_support(agent_id).is_supported())
+            .unwrap_or(false);
+        if !supported {
+            self.ui_state.session.new_session_transport = NewSessionTransport::Acp;
+            self.queue_ui_state();
+        }
+    }
+
     fn choose_new_session_runtime(
         &mut self,
         selection: SessionRuntimeSelection,
@@ -38039,6 +38060,7 @@ impl VibexWorkbench {
         // the page was already wearing.
         let previous = self.new_session_agent_id.clone();
         self.new_session_agent_id = Some(selection.agent_id.clone());
+        self.reconcile_new_session_transport(Some(&selection.agent_id));
         self.begin_new_session_logo_swap(previous.as_ref(), &selection.agent_id, cx);
         self.sync_home_arena_agent(cx);
         self.clear_runtime_provider_keyboard_selection();
@@ -38232,6 +38254,7 @@ impl VibexWorkbench {
         });
         self.set_new_session_runtime_selection(selection);
         self.new_session_agent_id = Some(agent_id.clone());
+        self.reconcile_new_session_transport(Some(&agent_id));
         self.begin_new_session_logo_swap(previous.as_ref(), &agent_id, cx);
         self.sync_home_arena_agent(cx);
         self.new_session_error = None;
@@ -38453,9 +38476,18 @@ impl VibexWorkbench {
         // A terminal-mode session has no runtime binding to select, but it does
         // need the workspace it will run in, so the branch happens before any
         // ACP mutation is composed.
+        //
+        // The selection is re-checked rather than trusted: the transport is a
+        // page-level choice and the Agent is chosen beside it, so a state left
+        // over from a previous Agent must not route this submission into a
+        // launch the runtime will refuse.
         if self.ui_state.session.new_session_transport.is_terminal() {
-            self.submit_new_terminal_session(&selection.agent_id, window, cx);
-            return;
+            if vibex_core::terminal_session_support(&selection.agent_id).is_supported() {
+                self.submit_new_terminal_session(&selection.agent_id, window, cx);
+                return;
+            }
+            self.ui_state.session.new_session_transport = NewSessionTransport::Acp;
+            self.queue_ui_state();
         }
         let selected_workspace = self.new_session_workspace.selected_workspace().cloned();
         let origin_workspace = self
@@ -104844,6 +104876,49 @@ mod tests {
             .map(|(body, _)| body)
             .expect("the new-session panel should remain inspectable");
         assert!(panel.contains(".child(transport_switch)"));
+    }
+
+    /// Changing the Agent away from a terminal-capable one drops terminal mode.
+    ///
+    /// The switch disables the option, but a disabled control does not undo a
+    /// choice already made. Left alone, the next submit would route an
+    /// unsupported Agent into a terminal launch and answer "this Agent has no
+    /// verified terminal mode" for a session the reader asked to open in the
+    /// ordinary interface.
+    #[test]
+    fn changing_the_agent_falls_back_out_of_terminal_mode() {
+        let source = include_str!("app.rs");
+        let source = source
+            .split("\nmod tests {")
+            .next()
+            .expect("the module has production code");
+        let reconcile = source
+            .split_once("    fn reconcile_new_session_transport(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn choose_new_session_runtime("))
+            .map(|(body, _)| body)
+            .expect("the transport reconciliation should remain inspectable");
+        assert!(reconcile.contains("terminal_session_support(agent_id).is_supported()"));
+        assert!(reconcile.contains("new_session_transport = NewSessionTransport::Acp"));
+        // Both ways of choosing an Agent reconcile.
+        assert_eq!(
+            source
+                .matches("self.reconcile_new_session_transport(Some(")
+                .count(),
+            2,
+            "every Agent choice has to reconcile the transport"
+        );
+        // And the submit path re-checks rather than trusting the page state.
+        let submit = source
+            .split_once("    fn submit_new_session(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn choose_runtime_selection("))
+            .map(|(body, _)| body)
+            .expect("new-session submission should remain inspectable");
+        assert!(
+            submit.contains(
+                "if vibex_core::terminal_session_support(&selection.agent_id).is_supported()"
+            ),
+            "a stale terminal choice must not reach the terminal launch"
+        );
     }
 
     /// Submitting in terminal mode never composes an ACP create request.
