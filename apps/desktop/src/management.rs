@@ -4170,9 +4170,10 @@ impl ManagementCenter {
                             .and_then(|terminal| terminal.terminal_id.clone())
                     {
                         let transport = transport_for_callback.clone();
-                        std::mem::drop(gpui_tokio::Tokio::spawn(cx, async move {
+                        gpui_tokio::Tokio::spawn(cx, async move {
                             let _ = transport.close_terminal(&terminal_id).await;
-                        }));
+                        })
+                        .detach();
                     }
                     cx.notify();
                     return;
@@ -4443,9 +4444,10 @@ impl ManagementCenter {
                         && let Some(terminal_id) = terminal.terminal_id.clone()
                     {
                         let transport = transport_for_callback.clone();
-                        std::mem::drop(gpui_tokio::Tokio::spawn(cx, async move {
+                        gpui_tokio::Tokio::spawn(cx, async move {
                             let _ = transport.close_terminal(&terminal_id).await;
-                        }));
+                        })
+                        .detach();
                     }
                     cx.notify();
                     return;
@@ -5160,9 +5162,10 @@ impl ManagementCenter {
                 .as_ref()
                 .and_then(|terminal| terminal.terminal_id.clone()),
         ) {
-            std::mem::drop(gpui_tokio::Tokio::spawn(cx, async move {
+            gpui_tokio::Tokio::spawn(cx, async move {
                 let _ = transport.close_terminal(&terminal_id).await;
-            }));
+            })
+            .detach();
         }
         self.agent_auth_terminal = None;
         self.agent_auth_terminal_surface = None;
@@ -35925,6 +35928,12 @@ fn provider_reorder_row_offset(
 /// the next snapshot shows what was actually written. A dropped join (the
 /// runtime shut down mid-request) is reported as a cancelled request rather
 /// than a panic.
+///
+/// The Tokio task has to be *detached*, not dropped: dropping the GPUI task
+/// returned by `Tokio::spawn` aborts the Tokio future it wraps. Dropping it
+/// here cancelled the request immediately, the answer channel closed unsent,
+/// and the caller surfaced `management_request_cancelled` — randomly, because
+/// a write that happened to finish before the abort won the race.
 fn management_off_thread<C, T, F>(cx: &C, request: F) -> Task<vibex_backend::BackendResult<T>>
 where
     C: gpui::AppContext,
@@ -35932,10 +35941,11 @@ where
     F: std::future::Future<Output = vibex_backend::BackendResult<T>> + Send + 'static,
 {
     let (answer_tx, answer_rx) = tokio::sync::oneshot::channel();
-    // The join handle is detached from this view on purpose; see above.
-    std::mem::drop(gpui_tokio::Tokio::spawn(cx, async move {
+    // `detach` runs the request to completion; see above.
+    gpui_tokio::Tokio::spawn(cx, async move {
         let _ = answer_tx.send(request.await);
-    }));
+    })
+    .detach();
     cx.background_spawn(async move {
         match answer_rx.await {
             Ok(outcome) => outcome,
@@ -45060,6 +45070,65 @@ mod tests {
                  task: {found:#?}"
             );
         }
+    }
+
+    /// A Config Center request must survive a caller that walks away.
+    ///
+    /// `gpui_tokio::Tokio::spawn` wraps the Tokio join handle in a GPUI task
+    /// that aborts the Tokio future when it is dropped. Dropping that task to
+    /// "fire and forget" therefore cancels the request itself: the answer
+    /// channel closes unsent and the caller reads the closed channel as
+    /// `management_request_cancelled`. Whether it happened at all depended on
+    /// the write winning the race against the abort, which is exactly why
+    /// repeating the same action sometimes worked.
+    ///
+    /// `detach` is the only correct way to drop the handle, so every request
+    /// started off-thread — the bridge and the terminal cleanups — has to
+    /// detach rather than drop.
+    #[test]
+    fn off_thread_requests_are_detached_not_aborted() {
+        for (name, source) in [
+            ("management.rs", include_str!("management.rs")),
+            (
+                "provider_workspace/provider.rs",
+                include_str!("management/provider_workspace/provider.rs"),
+            ),
+            (
+                "provider_workspace/route_group.rs",
+                include_str!("management/provider_workspace/route_group.rs"),
+            ),
+            (
+                "provider_workspace/batch.rs",
+                include_str!("management/provider_workspace/batch.rs"),
+            ),
+            (
+                "provider_workspace/routes.rs",
+                include_str!("management/provider_workspace/routes.rs"),
+            ),
+        ] {
+            let production = source
+                .split("\n#[cfg(test)]\nmod tests {")
+                .next()
+                .unwrap_or(source);
+            assert!(
+                !production.contains("mem::drop(gpui_tokio::Tokio::spawn")
+                    && !production.contains("drop(Tokio::spawn"),
+                "{name}: detach a Tokio task instead of dropping it, or the \
+                 request it carries is aborted before it answers"
+            );
+        }
+
+        let source = include_str!("management.rs");
+        let bridge = source
+            .split_once("fn management_off_thread<")
+            .and_then(|(_, tail)| tail.split_once("\n/// Finds Config Center requests"))
+            .map(|(body, _)| body)
+            .expect("the off-thread bridge should remain inspectable");
+        assert!(
+            bridge.contains(".detach();"),
+            "management_off_thread must detach the Tokio task so a dropped \
+             caller cannot cancel the write"
+        );
     }
 
     /// The guard above is only worth its keep if it sees a real violation.
