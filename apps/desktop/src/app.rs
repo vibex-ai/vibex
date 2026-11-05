@@ -71553,6 +71553,19 @@ impl VibexWorkbench {
                     Ok(session) => {
                         this.agent_action_pending = false;
                         this.session_terminal_error = None;
+                        // The restart replaced the PTY, so the surface bound to
+                        // the old terminal id can only ever show the dead grid it
+                        // was killed in. Dropping it makes the page build one for
+                        // the new terminal, which is what re-attaches the poll
+                        // loop; without this the content stayed frozen until a
+                        // resize forced a fresh snapshot.
+                        let key = session.id.as_str().to_string();
+                        if let Some(surface) = this.session_terminal_surfaces.remove(&key) {
+                            if this.active_session_terminal_id.as_deref() == Some(key.as_str()) {
+                                this.active_session_terminal_id = None;
+                            }
+                            surface.update(cx, |surface, cx| surface.set_active(false, cx));
+                        }
                         this.upsert_session_snapshot(session);
                     }
                     Err(error) => {
@@ -105281,6 +105294,32 @@ mod tests {
             ),
             "a stale terminal choice must not reach the terminal launch"
         );
+    }
+
+
+    /// A restart drops the surface bound to the old terminal.
+    ///
+    /// The restart replaces the PTY, so the surface that was attached to the
+    /// previous terminal id can only show the dead grid it was killed in. Keeping
+    /// it left the content frozen until a resize forced a fresh snapshot; dropping
+    /// it makes the page build one for the new terminal and re-attach polling.
+    #[test]
+    fn a_restart_drops_the_surface_bound_to_the_old_terminal() {
+        let source = include_str!("app.rs");
+        let source = source
+            .split("\nmod tests {")
+            .next()
+            .expect("the module has production code");
+        let restart = source
+            .split_once("    fn restart_terminal_session(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn sync_session_terminal_surface_activity("))
+            .map(|(body, _)| body)
+            .expect("the restart handler should remain inspectable");
+        assert!(
+            restart.contains("this.session_terminal_surfaces.remove(&key)"),
+            "the old surface has to go, or it keeps showing the dead grid"
+        );
+        assert!(restart.contains("this.active_session_terminal_id = None"));
     }
 
     /// A snapshot without terminal facts does not erase a known link.
