@@ -38432,12 +38432,26 @@ impl VibexWorkbench {
         // The CLI is the only thing that can act on the model the page chose:
         // Vibex is not in the conversation, so the choice has to ride the command
         // line or it is silently dropped and the Agent starts on its own default.
-        let args = vibex_core::native_cli_model_arguments(
+        let mut args = vibex_core::native_cli_model_arguments(
             agent_id,
             self.new_session_runtime_selection
                 .as_ref()
                 .and_then(|selection| selection.model.model_id()),
         );
+        // The model is not the only choice the page makes: the effort and the
+        // conversation mode are just as visible to the reader, and a CLI started
+        // without them silently ignores the page. Each is only passed when the
+        // Agent has a flag for it, so an unsupported option is skipped rather
+        // than turned into an argument the CLI would reject.
+        args.extend(vibex_core::native_cli_option_arguments(
+            agent_id,
+            self.new_session_runtime_selection
+                .as_ref()
+                .and_then(|selection| selection.reasoning_effort.as_deref()),
+            self.new_session_runtime_selection
+                .as_ref()
+                .and_then(|selection| selection.mode_id.as_deref()),
+        ));
         // The reader's own words name the session, the same way they name an
         // ACP session: the row is what they will scan for later, and a fixed
         // "<agent> terminal" makes every terminal session look identical.
@@ -71269,6 +71283,17 @@ impl VibexWorkbench {
             return empty_center_content();
         };
         let strings = self.strings();
+        // A session whose Agent ended is answered before the surface is
+        // considered. The link survives a quit on purpose — that is what lets
+        // the page offer a restart — so checking the link first kept drawing the
+        // dead grid, and the "Agent has exited" state never reached the reader.
+        if matches!(
+            session.state,
+            vibex_core::AgentSessionState::Closed
+                | vibex_core::AgentSessionState::Error
+        ) {
+            return self.render_session_terminal_placeholder(&session, cx);
+        }
         let terminal_id = session
             .terminal
             .as_ref()
@@ -105279,6 +105304,33 @@ mod tests {
             source.contains(".map(|session| this.retain_known_terminal_link(session))"),
             "the authoritative list must keep a known link"
         );
+    }
+
+
+    /// A session whose Agent ended shows its end, not the dead grid.
+    ///
+    /// The link survives a quit on purpose — it is what lets the page offer a
+    /// restart — so answering from the link first kept drawing the exited
+    /// terminal, and the reader never saw that the Agent was gone.
+    #[test]
+    fn an_ended_terminal_session_is_answered_before_its_surface() {
+        let source = include_str!("app.rs");
+        let page = source
+            .split_once("    fn render_session_terminal_page(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// The one line above the grid."))
+            .map(|(body, _)| body)
+            .expect("the terminal page should remain inspectable");
+        let ended = page
+            .find("vibex_core::AgentSessionState::Closed")
+            .expect("the page must recognize an ended session");
+        let link = page
+            .find("let terminal_id = session")
+            .expect("the page still reads the link");
+        assert!(
+            ended < link,
+            "an ended session must be answered before the terminal link is consulted"
+        );
+        assert!(page.contains("render_session_terminal_placeholder(&session, cx)"));
     }
 
     /// The transport lives on the workspace row, not inside the prompt box.
