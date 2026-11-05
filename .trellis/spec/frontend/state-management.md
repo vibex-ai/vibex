@@ -2657,6 +2657,13 @@ RuntimeMenuPlacement { anchor, height, trigger_offset }
   provisional configured-model catalog, and later capability enrichment may make
   the preference valid again. Only an explicit user choice or a confirmed
   in-session switch replaces it.
+- A catalog option publishes an empty Effort list, an empty Mode list, or no
+  feature for a dimension the selection carries -> that dimension is *unknown*
+  for this snapshot, not a rejection. Keep the remembered value; only a
+  dimension the option actually populates may invalidate it. Treating the
+  provisional catalog's silence as removal dropped the chosen Effort on the
+  first frame, replaced the draft with the bare option, and created the session
+  with no depth.
 - Persisted runtime preference key does not match `selection.agent_id`, has an
   empty explicit Model, or exceeds bounded key/value/count limits -> drop that
   preference during `DesktopUiStateV1::normalize`; `AgentDefault` is valid and

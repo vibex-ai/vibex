@@ -77037,6 +77037,17 @@ fn runtime_selection_cancellation_is_pending(
     selected_session_id.is_some_and(|session_id| pending_session_ids.contains(session_id.as_str()))
 }
 
+/// Whether the catalogue still describes every dimension of `selection`.
+///
+/// A dimension the catalogue publishes nothing about is unknown, not a
+/// rejection: startup first publishes a provisional configured-model catalogue
+/// whose evidence has not reached it yet, so Effort, Mode and feature values
+/// appear only once a probe answers. Reading that silence as "this value was
+/// removed" discarded a remembered Effort on the first frame and replaced the
+/// draft with the bare catalogue option — the new session was then created with
+/// no depth at all, even though the reader had just chosen one. Only a
+/// dimension the catalogue actually populates can disprove a value; see
+/// `.trellis/spec/frontend/state-management.md`.
 fn catalog_has_runtime_selection(
     catalog: &SessionRuntimeOptionCatalog,
     selection: &SessionRuntimeSelection,
@@ -77047,24 +77058,27 @@ fn catalog_has_runtime_selection(
             && option.selection.auth_source == selection.auth_source
             && option.selection.model == selection.model
             && selection.reasoning_effort.as_ref().is_none_or(|value| {
-                option
-                    .reasoning_efforts
-                    .iter()
-                    .any(|candidate| &candidate.value == value)
+                option.reasoning_efforts.is_empty()
+                    || option
+                        .reasoning_efforts
+                        .iter()
+                        .any(|candidate| &candidate.value == value)
             })
             && selection.mode_id.as_ref().is_none_or(|value| {
-                option
-                    .modes
-                    .iter()
-                    .any(|candidate| &candidate.value == value)
+                option.modes.is_empty()
+                    || option
+                        .modes
+                        .iter()
+                        .any(|candidate| &candidate.value == value)
             })
-            && selection.config_values.iter().all(|(key, value)| {
-                option
-                    .features
-                    .iter()
-                    .find(|feature| &feature.id == key)
-                    .is_some_and(|feature| feature.accepts_value(value))
-            })
+            && (option.features.is_empty()
+                || selection.config_values.iter().all(|(key, value)| {
+                    option
+                        .features
+                        .iter()
+                        .find(|feature| &feature.id == key)
+                        .is_some_and(|feature| feature.accepts_value(value))
+                }))
     })
 }
 
@@ -103229,7 +103243,14 @@ mod tests {
             Some(&remembered_selection),
         )
         .unwrap();
-        assert_eq!(provisional.reasoning_effort, None);
+        // A catalogue that publishes no Effort values yet cannot disprove the
+        // remembered one, so the draft keeps it instead of dropping to a bare
+        // option the picker renders as "no depth chosen".
+        assert_eq!(
+            provisional.reasoning_effort.as_deref(),
+            Some("high"),
+            "a provisional catalogue must not erase a remembered Effort"
+        );
 
         let preferred = new_session_runtime_preference_for_agent(
             &agent_id,
@@ -103557,6 +103578,41 @@ mod tests {
             .config_values
             .insert("removed_feature".into(), "true".into());
         assert!(!catalog_has_runtime_selection(&catalog, &selection));
+    }
+
+    /// A catalogue that has not been probed yet publishes no Effort values, no
+    /// Mode and no features. A remembered selection keeps all three rather than
+    /// being replaced by the bare catalogue option — that replacement is what
+    /// created every new session without the depth the reader had just chosen.
+    #[test]
+    fn provisional_catalog_accepts_a_selection_it_cannot_disprove() {
+        let mut option = new_session_runtime_option("deepseek-harness", "DeepSeek Harness");
+        option.reasoning_efforts.clear();
+        option.modes.clear();
+        option.features.clear();
+        let catalog = SessionRuntimeOptionCatalog {
+            revision: 1,
+            agents: Vec::new(),
+            auth_sources: Vec::new(),
+            options: vec![option],
+        };
+
+        let mut selection = catalog.options[0].selection.clone();
+        selection.reasoning_effort = Some("max".into());
+        selection.mode_id = Some("danger-full-access".into());
+        selection
+            .config_values
+            .insert("agent".into(), "standard".into());
+        assert!(catalog_has_runtime_selection(&catalog, &selection));
+
+        // The same value the provisional catalog could not judge is rejected
+        // once a probe publishes a level set that does not contain it.
+        let mut enriched = catalog.clone();
+        enriched.options[0].reasoning_efforts = vec![SessionConfigValue {
+            value: "off".into(),
+            label: Some("Off".into()),
+        }];
+        assert!(!catalog_has_runtime_selection(&enriched, &selection));
     }
 
     #[test]
