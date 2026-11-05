@@ -57956,49 +57956,36 @@ impl VibexWorkbench {
                                             .gap_2()
                                             .p_4()
                                             .pb_2()
+                                            // The mark is a sibling of the input, laid
+                                            // out by the same row: both start at the
+                                            // top, so the mark sits on the first text
+                                            // line without any absolute maths. The row
+                                            // already has a minimum height, so a
+                                            // one-line mark cannot change its size.
+                                            .when(terminal_transport, |this| {
+                                                // No fixed height: the mark is a
+                                                // single line of text, and the row
+                                                // already aligns every child to its
+                                                // top, so its own line box is what
+                                                // puts it level with the first line
+                                                // of the prompt.
+                                                this.child(
+                                                    div()
+                                                        .flex_none()
+                                                        .text_size(px(14.0))
+                                                        .line_height(px(21.0))
+                                                        .font_weight(gpui::FontWeight::BOLD)
+                                                        .font_family(prompt_font.clone())
+                                                        .text_color(cx.theme().foreground)
+                                                        .child("❯"),
+                                                )
+                                            })
                                             .child(
                                                 div()
                                                     .relative()
                                                     .flex_1()
                                                     .min_w_0()
                                                     .h_full()
-                                                    // Only terminal mode insets the
-                                                    // text, for the mark. The row's
-                                                    // height and the send button do not
-                                                    // depend on it, so the switch moves
-                                                    // the placeholder a little and
-                                                    // nothing else.
-                                                    .when(terminal_transport, |this| {
-                                                        this.pl(px(18.0))
-                                                    })
-                                                    // Painted at the left of the
-                                                    // reserved inset, centred on the
-                                                    // first line rather than the whole
-                                                    // box, so it sits level with the
-                                                    // placeholder instead of floating
-                                                    // at the top or the middle of a
-                                                    // tall prompt.
-                                                    .when(terminal_transport, |this| {
-                                                        this.child(
-                                                            div()
-                                                                .absolute()
-                                                                .top_0()
-                                                                .left_0()
-                                                                .h(px(22.0))
-                                                                .flex()
-                                                                .items_center()
-                                                                .text_size(px(14.0))
-                                                                .line_height(px(22.0))
-                                                                .font_weight(gpui::FontWeight::BOLD)
-                                                                .font_family(prompt_font.clone())
-                                                                // Brighter than the
-                                                                // accent: the mark
-                                                                // has to read as an
-                                                                // affordance.
-                                                                .text_color(cx.theme().foreground)
-                                                                .child("❯"),
-                                                        )
-                                                    })
                                                     .when(
                                                         self.new_session_expanded,
                                                         |this| this.self_stretch(),
@@ -105386,13 +105373,12 @@ mod tests {
         assert!(!panel.contains("bg(terminal_surface_color)"));
         assert!(!panel.contains(".when(!terminal_transport, |this| {"));
         assert!(!panel.contains("new-session-terminal-title"));
-        // The mark is painted over the first line, centred on it, and claims no
-        // layout space; only the text is inset, so the row and the send button
-        // do not move.
+        // The mark is a sibling of the input in the same row, so the row's own
+        // top alignment puts it on the first text line — no absolute maths, and
+        // no layout of its own to shift anything.
         assert!(panel.contains(".child(\"❯\")"));
-        assert!(panel.contains(".absolute()"));
-        assert!(panel.contains(".left_0()"));
-        assert!(panel.contains("this.pl(px(18.0))"));
+        assert!(!panel.contains("this.pl(px(18.0))"));
+        assert!(panel.contains("// The mark is a sibling of the input"));
         // The silhouette is the page's in both modes.
         assert!(panel.contains(".rounded(px(20.0))"));
         assert!(panel.contains("bg(card_color)"));
