@@ -57962,32 +57962,39 @@ impl VibexWorkbench {
                                                     .flex_1()
                                                     .min_w_0()
                                                     .h_full()
+                                                    // Only terminal mode insets the
+                                                    // text, for the mark. The row's
+                                                    // height and the send button do not
+                                                    // depend on it, so the switch moves
+                                                    // the placeholder a little and
+                                                    // nothing else.
                                                     .when(terminal_transport, |this| {
-                                                        this.font_family(
-                                                            prompt_font.clone(),
-                                                        )
+                                                        this.pl(px(18.0))
                                                     })
-                                                    // The mark is painted over the
-                                                    // first line rather than laid
-                                                    // out beside it: a flex child
-                                                    // would claim width and height,
-                                                    // and switching modes would move
-                                                    // the input and the send button.
+                                                    // Painted at the left of the
+                                                    // reserved inset, centred on the
+                                                    // first line rather than the whole
+                                                    // box, so it sits level with the
+                                                    // placeholder instead of floating
+                                                    // at the top or the middle of a
+                                                    // tall prompt.
                                                     .when(terminal_transport, |this| {
                                                         this.child(
                                                             div()
                                                                 .absolute()
                                                                 .top_0()
-                                                                .left(px(-14.0))
+                                                                .left_0()
+                                                                .h(px(22.0))
+                                                                .flex()
+                                                                .items_center()
                                                                 .text_size(px(14.0))
                                                                 .line_height(px(22.0))
                                                                 .font_weight(gpui::FontWeight::BOLD)
                                                                 .font_family(prompt_font.clone())
                                                                 // Brighter than the
-                                                                // accent: the mark has
-                                                                // to read as an
-                                                                // affordance at a
-                                                                // glance.
+                                                                // accent: the mark
+                                                                // has to read as an
+                                                                // affordance.
                                                                 .text_color(cx.theme().foreground)
                                                                 .child("❯"),
                                                         )
@@ -105379,10 +105386,13 @@ mod tests {
         assert!(!panel.contains("bg(terminal_surface_color)"));
         assert!(!panel.contains(".when(!terminal_transport, |this| {"));
         assert!(!panel.contains("new-session-terminal-title"));
-        // The mark is painted over the first line, so it claims no layout space.
+        // The mark is painted over the first line, centred on it, and claims no
+        // layout space; only the text is inset, so the row and the send button
+        // do not move.
         assert!(panel.contains(".child(\"❯\")"));
         assert!(panel.contains(".absolute()"));
-        assert!(panel.contains(".left(px(-14.0))"));
+        assert!(panel.contains(".left_0()"));
+        assert!(panel.contains("this.pl(px(18.0))"));
         // The silhouette is the page's in both modes.
         assert!(panel.contains(".rounded(px(20.0))"));
         assert!(panel.contains("bg(card_color)"));
