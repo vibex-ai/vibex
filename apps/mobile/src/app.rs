@@ -1903,6 +1903,13 @@ pub struct MobileApp {
     /// it. The page has already been replaced by that session's conversation, so
     /// this is what a failure has to take back.
     pending_new_session: Option<PendingNewSessionCreation>,
+    /// A terminal-mode session whose terminal id has not arrived yet.
+    ///
+    /// The session list is fetched asynchronously, so opening a session can
+    /// race the snapshot that names its PTY. Remembering the intent lets the
+    /// refresh that follows complete it, instead of the reader having to tap
+    /// the session a second time.
+    pending_session_terminal: Option<VibexSessionId>,
     /// Sessions whose first prompt is on the wire. A message written while one
     /// of these runs belongs in the desktop's queue, exactly as it would once
     /// the session's own live state says it is running.
@@ -4062,6 +4069,7 @@ impl MobileApp {
             fork_session_busy: false,
             new_session_busy: false,
             pending_new_session: None,
+            pending_session_terminal: None,
             first_prompts_in_flight: BTreeSet::new(),
             new_session_open: false,
             new_session_project_id: None,
@@ -6374,6 +6382,7 @@ impl MobileApp {
                     this.fail(error);
                 }
                 this.sync_sidebar_state();
+                this.retry_pending_session_terminal(cx);
                 this.refresh_sidebar_organization(cx);
                 if selected.is_none()
                     && let Some(session_id) = first
@@ -8699,17 +8708,53 @@ impl MobileApp {
             .find(|session| &session.id == session_id)
             .cloned()
         else {
+            // The list has not answered yet: try again when it does.
+            self.pending_session_terminal = Some(session_id.clone());
             return;
         };
-        if !session.is_terminal() || session.terminal.is_none() {
+        if !session.is_terminal() {
+            self.pending_session_terminal = None;
             return;
         }
+        if session
+            .terminal
+            .as_deref()
+            .and_then(|facts| facts.terminal_id.as_ref())
+            .is_none()
+        {
+            // A terminal session the runtime has not linked to a PTY yet — the
+            // Agent is still starting. Retrying on the next refresh turns that
+            // into one tap rather than a reader who has to reopen the session.
+            self.pending_session_terminal = Some(session_id.clone());
+            return;
+        }
+        self.pending_session_terminal = None;
         let Some(workbench) = self.workbench.as_ref() else {
             return;
         };
         workbench.update(cx, |workbench, cx| {
             workbench.open_session_terminal(&session, cx);
         });
+    }
+
+    /// Completes an attach the session list was not ready for.
+    ///
+    /// Runs after every refresh, and only for the session the reader actually
+    /// opened: a retry that ran for a session they have since left would put a
+    /// terminal on screen they did not ask for.
+    fn retry_pending_session_terminal(&mut self, cx: &mut Context<Self>) {
+        let Some(session_id) = self.pending_session_terminal.clone() else {
+            return;
+        };
+        let selected = self
+            .controller
+            .as_ref()
+            .and_then(|controller| controller.state.selected_session_id.clone());
+        if selected.as_ref() != Some(&session_id) {
+            self.pending_session_terminal = None;
+            return;
+        }
+        self.open_selected_session_terminal(&session_id, cx);
     }
 
     /// The persisted window of a session about to be opened, if this phone has
@@ -45599,5 +45644,57 @@ fn agent_icon_path(",
         // A character outside the BMP is two UTF-16 units, the unit the wire
         // writes, so the picture moves by the width the reader sees.
         assert_eq!(shifted_picture_offset("a", "\u{1f642}a", 1), 3);
+    }
+    /// A session whose terminal id has not arrived yet is retried once the list
+    /// settles, rather than silently never opening.
+    ///
+    /// The session list is fetched asynchronously, so opening a terminal session
+    /// can race the snapshot that names its PTY. Without the retry the reader
+    /// would have to tap the session a second time to get the terminal.
+    #[test]
+    fn a_terminal_session_attach_is_retried_after_the_list_settles() {
+        let source = include_str!("app.rs");
+        let source = source
+            .split("\nmod tests {")
+            .next()
+            .expect("the module has production code");
+
+        // The pending intent is recorded, not dropped.
+        let helper = source
+            .split_once("    fn open_selected_session_terminal(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn retry_pending_session_terminal("))
+            .map(|(body, _)| body)
+            .expect("the attach helper should remain inspectable");
+        assert!(
+            helper.contains("self.pending_session_terminal = Some(session_id.clone());"),
+            "a missing session snapshot must be remembered, not swallowed"
+        );
+        assert!(
+            helper.contains("if !session.is_terminal()"),
+            "a non-terminal session clears the intent rather than retrying forever"
+        );
+
+        // The retry runs after a refresh applies, and only for the open session.
+        let retry = source
+            .split_once("    fn retry_pending_session_terminal(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// The persisted window"))
+            .map(|(body, _)| body)
+            .expect("the retry should remain inspectable");
+        assert!(retry.contains("self.pending_session_terminal = None;"));
+        assert!(
+            retry.contains("if selected.as_ref() != Some(&session_id)"),
+            "a retry must not attach a terminal for a session the reader left"
+        );
+
+        // And the refresh arms it.
+        let refresh = source
+            .split_once("    fn refresh_sessions(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// Pulls the desktop's agent snapshots"))
+            .map(|(body, _)| body)
+            .expect("the session refresh should remain inspectable");
+        assert!(
+            refresh.contains("this.retry_pending_session_terminal(cx);"),
+            "the refresh that answers the list is what completes the attach"
+        );
     }
 }
