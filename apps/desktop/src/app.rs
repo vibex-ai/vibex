@@ -56657,6 +56657,26 @@ impl VibexWorkbench {
         } else {
             theme::semantic_color("muted", false)
         };
+        // The line a terminal window shows above its grid: who and where. It is
+        // drawn only in terminal mode, so the interface mode keeps its clean
+        // prompt, and it answers the question a reader has when a CLI starts —
+        // "which checkout is this Agent pointed at".
+        let terminal_title_user = std::env::var("USER")
+            .or_else(|_| std::env::var("USERNAME"))
+            .unwrap_or_else(|_| "user".to_string());
+        let terminal_title_path = self
+            .new_session_workspace
+            .selected_workspace()
+            .map(|workspace| workspace.root_path.clone())
+            .or_else(|| self.new_session_workspace.origin_workspace_id.as_ref().and_then(|_| {
+                self.new_session_workspace.project_root.clone().into()
+            }))
+            .unwrap_or_else(|| self.new_session_workspace.project_root.clone());
+        let terminal_title_line = format!(
+            "{} at {}",
+            terminal_title_user,
+            terminal_title_path
+        );
         // The reader's configured code face, which is the one a terminal would
         // use: the prompt should not invent a second monospace.
         let prompt_font = self
@@ -57864,32 +57884,23 @@ impl VibexWorkbench {
                                         this.flex_1().min_h(px(240.0))
                                     })
                                     // The prompt box wears the transport it
-                                    // will create. A terminal session types a
-                                    // command line, not a message, so the box
-                                    // squares its corners, drops to the code
-                                    // face, and takes the terminal's own
-                                    // surface — the same shift the page makes
-                                    // when the session opens.
+                                    // will create, and keeps one silhouette
+                                    // while doing it: the corner radius is the
+                                    // page's, not the mode's, so switching
+                                    // modes changes what the box *is* without
+                                    // making the layout jump.
+                                    .rounded(px(20.0))
                                     .when(terminal_transport, |this| {
                                         // A terminal window, not a message box:
-                                        // square, the terminal's own surface,
-                                        // one accent edge in the reader's
-                                        // preferred terminal colour, and a
-                                        // hairline elsewhere so the edges of
-                                        // the pane are still legible.
-                                        // The accent lives on the border: this
-                                        // build has no per-side border colour,
-                                        // and a full accent edge reads as "this
-                                        // box is the active mode" better than a
-                                        // hairline that disappears on a light
-                                        // theme anyway.
-                                        this.rounded(px(4.0))
-                                            .border_color(cx.theme().accent.opacity(0.62))
+                                        // the terminal's own surface, a quieter
+                                        // border so the pane edge does not
+                                        // compete with the prompt, and the
+                                        // shape kept from the interface mode.
+                                        this.border_color(cx.theme().border.opacity(0.45))
                                             .bg(terminal_surface_color)
                                     })
                                     .when(!terminal_transport, |this| {
-                                        this.rounded(px(20.0))
-                                            .border_color(cx.theme().border.opacity(0.72))
+                                        this.border_color(cx.theme().border.opacity(0.72))
                                             .bg(card_color)
                                     })
                                     .border_1()
@@ -57908,6 +57919,33 @@ impl VibexWorkbench {
                                     .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
                                         this.add_composer_paths(paths, window, cx)
                                     }))
+                                    .when(terminal_transport, |this| {
+                                        // The strip a terminal window puts above
+                                        // its grid: the login and the checkout.
+                                        // It is chrome the CLI itself cannot
+                                        // show, and it is what tells the reader
+                                        // which directory this Agent owns
+                                        // before it asks.
+                                        this.child(
+                                            h_flex()
+                                                .id("new-session-terminal-title")
+                                                .w_full()
+                                                .flex_none()
+                                                .items_center()
+                                                .gap_2()
+                                                .px_4()
+                                                .pt_2()
+                                                .pb_1()
+                                                .font_family(prompt_font.clone())
+                                                .text_size(px(11.0))
+                                                .text_color(cx.theme().muted_foreground)
+                                                .child(
+                                                    Icon::new(IconName::SquareTerminal)
+                                                        .size(px(11.0)),
+                                                )
+                                                .child(div().truncate().child(terminal_title_line.clone())),
+                                        )
+                                    })
                                     .child(
                                         h_flex()
                                             .min_h(px(112.0))
@@ -57918,23 +57956,31 @@ impl VibexWorkbench {
                                             .p_4()
                                             .pb_2()
                                             .when(terminal_transport, |this| {
+                                                // The title strip above already
+                                                // supplies the gap, so the prompt
+                                                // starts where the strip ends
+                                                // instead of doubling it.
+                                                this.pt(px(2.0))
+                                            })
+                                            .when(terminal_transport, |this| {
                                                 // A prompt marker, the way a
                                                 // shell draws one, so the box
                                                 // reads as a command line even
                                                 // before the reader types.
                                                 this.child(
+                                                    // The prompt, drawn the way a
+                                                    // shell draws one: a heavy
+                                                    // chevron in the accent, in
+                                                    // the code face, on its own
+                                                    // baseline so it sits level
+                                                    // with the first line of
+                                                    // input instead of floating
+                                                    // above it.
                                                     div()
                                                         .flex_none()
-                                                        // Sized and coloured
-                                                        // like a shell prompt:
-                                                        // a bare glyph in the
-                                                        // code face rendered
-                                                        // thin and nearly
-                                                        // invisible against
-                                                        // the terminal surface.
-                                                        .text_size(px(14.0))
-                                                        .line_height(px(20.0))
-                                                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                                                        .text_size(px(15.0))
+                                                        .line_height(px(22.0))
+                                                        .font_weight(gpui::FontWeight::BOLD)
                                                         .font_family(prompt_font.clone())
                                                         .text_color(cx.theme().accent)
                                                         .child("❯"),
@@ -105273,8 +105319,9 @@ mod tests {
     /// Choosing terminal mode restyles the prompt box as a command line.
     ///
     /// The reader has to be able to tell which interface they are creating
-    /// before they create it, so the box itself says: square border, terminal
-    /// surface, code face, and a prompt marker.
+    /// before they create it, so the box itself says: terminal surface, a title
+    /// strip naming the checkout, the code face, and a prompt marker — while
+    /// keeping the page's own silhouette so the layout does not jump.
     #[test]
     fn terminal_mode_restyles_the_prompt_box() {
         let source = include_str!("app.rs");
@@ -105291,12 +105338,16 @@ mod tests {
             "let terminal_transport = self.ui_state.session.new_session_transport.is_terminal();"
         ));
         assert!(panel.contains(".when(terminal_transport, |this| {"));
-        // Terminal mode squares the corners and takes the terminal surface.
-        assert!(panel.contains("this.rounded(px(4.0))"));
+        // Terminal mode takes the terminal surface and its title strip.
         assert!(panel.contains("bg(terminal_surface_color)"));
-        // The interface mode keeps the conversational card.
+        assert!(panel.contains("new-session-terminal-title"));
+        assert!(panel.contains("terminal_title_line.clone()"));
+        // The silhouette is the page's in both modes: switching changes what the
+        // box is, not how much room it takes.
+        assert!(panel.contains(".rounded(px(20.0))"));
+        // The interface mode keeps the conversational card surface.
         assert!(panel.contains(".when(!terminal_transport, |this| {"));
-        assert!(panel.contains("this.rounded(px(20.0))"));
+        assert!(panel.contains("bg(card_color)"));
         // The prompt marker and the code face.
         assert!(panel.contains(".child(\"❯\")"));
         assert!(panel.contains("prompt_font.clone()"));
