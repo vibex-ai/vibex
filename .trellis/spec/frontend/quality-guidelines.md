@@ -1457,6 +1457,31 @@ gpui_base::text::TextViewState::set_range_highlights(highlights, cx) -> Result<(
   `reveal_range`, and clears its highlights when it closes. Its hits are the
   workbench's own state (`MarkdownFindState`), not the conversation's: the
   session's find bar searches messages, never the file on screen.
+- The source editor's find bar is the workbench's too (`EditorFindState`), never
+  the kit's built-in panel. On the published pair (`gpui-base 0.8.0` +
+  `gpui-component 0.8.0`) every query change records
+  `search_session.anchor_offset`, and the panel's echo guard compares that
+  anchor: each keystroke looks like a fresh session, the panel re-runs
+  `show_with_focus` → `select_all`, and the next character replaces the previous
+  one. Upstream fixes exactly this on `main`, but vendoring or patching the crate
+  is prohibited ([`rust-dependency-sources.md`](../backend/rust-dependency-sources.md)),
+  so the workbench owns the bar. Keep all of these in step:
+  - `ensure_editor_binding` sets `.searchable(false)`. That is what stops the kit
+    mounting its panel; `set_search_query`, `next_search_match` and
+    `replace_current_search_match` still drive the engine through its documented
+    custom-search path.
+  - With no panel, the editor's `Search` action propagates to the workbench root
+    (`Render for CodeWorkbench`) and to `PreviewWindowHost`; both call
+    `open_root_editor_find`, which resolves the file through
+    `focused_editor_ungated` — the focused editor *is* the evidence the action
+    came from it, and the `preview_visible` gate in `focused_editor` would break
+    the detached window. `open_focused_editor_find` keeps the gated path for the
+    app's `OpenConversationFind` hand-off.
+  - The bar writes the query into the session only when it changed
+    (`EditorFindState::synced_query`); a repaint must not re-anchor the search.
+  - `typing_a_query_into_the_file_find_bar_keeps_every_character` types a whole
+    query with `simulate_input` and asserts both the field and the session hold
+    it. It is the regression test for the one-character bug.
 - Links arrive exactly as the document wrote them. `http`/`https` opens through
   `validate_external_open_url`; a fragment stays in place; anything else resolves
   as a workspace path relative to the document's directory (`base_path_for_file`

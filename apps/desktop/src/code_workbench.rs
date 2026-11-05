@@ -40,8 +40,8 @@ use gpui_component::{
     h_flex,
     input::{
         Editor, EditorState, Input, InputEvent, InputGroup, InputGroupAddon,
-        InputGroupAddonAlignment, InputGroupButton, InputGroupInput, InputState, Position,
-        TextDecoration, TextDecorationCollection, Textarea, TextareaState,
+        InputGroupAddonAlignment, InputGroupButton, InputGroupInput, InputState, Position, Replace,
+        Search, TextDecoration, TextDecorationCollection, Textarea, TextareaState,
     },
     menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem},
     notification::NotificationType,
@@ -514,6 +514,51 @@ struct MarkdownFindState {
     reveal: bool,
 }
 
+/// The find bar of one open source file.
+///
+/// The bar is the workbench's own, the way the Markdown preview's and the
+/// browser's are, and for the same reason: the file has to keep answering the
+/// find chord with a working field while it holds the keyboard. The kit's
+/// built-in panel cannot carry that here — `gpui-base 0.8.0` records a new
+/// search anchor on every query change, and `gpui-component 0.8.0` reads that
+/// anchor as a fresh search, so the panel re-selects its field after each
+/// keystroke and every character after the first replaces the previous one.
+/// Upstream fixes that on `main`, but copying or patching the crate is
+/// prohibited (see `.trellis/spec/backend/rust-dependency-sources.md`), so the
+/// bar lives here and drives the engine's public search API instead of the
+/// kit's panel.
+struct EditorFindState {
+    /// The file the bar searches, workspace-relative.
+    path: String,
+    /// The editor whose search session the bar drives. The state owns the
+    /// matches, so closing the bar keeps the query for the next open, exactly
+    /// as the kit's session did.
+    input: Entity<EditorState>,
+    /// What the reader typed into [`Self::query_input`].
+    query_input: Entity<InputState>,
+    /// What the reader typed into [`Self::replace_input`]; empty until the
+    /// replace row is opened.
+    replace_input: Entity<InputState>,
+    /// Whether the replace row is on screen.
+    replace_open: bool,
+    /// The field's typing and Enter, routed to the bar for as long as it lives.
+    _query_events: Subscription,
+    /// The replace field's Enter, routed the same way.
+    _replace_events: Subscription,
+    /// The query the editor's search session was last set from. A frame that
+    /// did not change it must not push it again, or the session's anchor would
+    /// move on every repaint.
+    synced_query: String,
+}
+
+impl EditorFindState {
+    /// The bar's query as the editor should search it. A file is searched
+    /// literally: trimming would stop a reader from matching a leading space.
+    fn query(&self, cx: &App) -> String {
+        self.query_input.read(cx).value().to_string()
+    }
+}
+
 /// The find bar's query, without the whitespace a reader leaves around it.
 ///
 /// A document is searched literally: the conversation's find collapses runs of
@@ -535,6 +580,43 @@ fn subscribe_markdown_find_input(
         }
         InputEvent::Focus | InputEvent::Blur => {}
     })
+}
+
+/// Route the editor find bar's fields to the workbench for as long as they live.
+///
+/// Typing re-searches the file; Enter and Shift+Enter step through the hits;
+/// the replace row's Enter replaces and steps. The fields are retained with the
+/// bar, so the same subscriptions serve every open.
+fn subscribe_editor_find_inputs(
+    cx: &mut Context<CodeWorkbench>,
+    window: &Window,
+    find_path: &str,
+    query_input: &Entity<InputState>,
+    replace_input: &Entity<InputState>,
+) -> (Subscription, Subscription) {
+    let query_path = find_path.to_string();
+    let query_events = cx.subscribe_in(
+        query_input,
+        window,
+        move |this, _, event: &InputEvent, _window, cx| match event {
+            InputEvent::Change => this.apply_editor_find_query(&query_path, cx),
+            InputEvent::PressEnter { shift, .. } => {
+                this.step_editor_find(&query_path, if *shift { -1 } else { 1 }, cx)
+            }
+            InputEvent::Focus | InputEvent::Blur => {}
+        },
+    );
+    let replace_path = find_path.to_string();
+    let replace_events = cx.subscribe_in(
+        replace_input,
+        window,
+        move |this, _, event: &InputEvent, window, cx| {
+            if let InputEvent::PressEnter { shift, .. } = event {
+                this.replace_editor_find_match(&replace_path, !*shift, window, cx);
+            }
+        },
+    );
+    (query_events, replace_events)
 }
 
 /// Observe one preview's parses for the height of a find session.
@@ -1533,6 +1615,16 @@ pub struct CodeWorkbench {
     markdown_find_input: Entity<InputState>,
     /// The find bar of the rendered Markdown preview, once one has been opened.
     markdown_find: Option<MarkdownFindState>,
+    /// The find bar of the open source file, once one has been opened.
+    ///
+    /// The bar is keyed to the file it searches: the workbench holds one at a
+    /// time, and reopening it on another file moves it there.
+    editor_find: Option<EditorFindState>,
+    /// The editor find bar's query and replace fields. Retained with the
+    /// workbench rather than the bar so a closed bar keeps the reader's query
+    /// for the next open.
+    editor_find_query_input: Entity<InputState>,
+    editor_find_replace_input: Entity<InputState>,
     preview_revealed_tab_ids: BTreeMap<String, String>,
     pending_file_search_reveal: Option<FileSearchReveal>,
     pending_file_search_directory_reveal: Option<String>,
@@ -1653,6 +1745,19 @@ impl CodeWorkbench {
                 ))
                 .submit_on_enter(true)
         });
+        // The editor's find bar keeps its fields for the workbench's lifetime:
+        // a closed bar resumes the query the reader last typed, and the fields
+        // are never re-created under a subscription.
+        let editor_find_query_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(locale::text("Find in file", "在文件中查找", "在檔案中尋找"))
+                .submit_on_enter(true)
+        });
+        let editor_find_replace_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(locale::text("Replace with", "替换为", "取代為"))
+                .submit_on_enter(true)
+        });
         let mut this = Self {
             parent,
             backend: None,
@@ -1743,6 +1848,9 @@ impl CodeWorkbench {
             markdown_previews: BTreeMap::new(),
             markdown_find_input,
             markdown_find: None,
+            editor_find: None,
+            editor_find_query_input,
+            editor_find_replace_input,
             preview_revealed_tab_ids: BTreeMap::new(),
             pending_file_search_reveal: None,
             pending_file_search_directory_reveal: None,
@@ -2214,6 +2322,16 @@ impl CodeWorkbench {
         if self.preview_detached || !self.preview_visible {
             return None;
         }
+        self.focused_editor_ungated(window, cx)
+    }
+
+    /// The editor that holds the keyboard, whichever host draws the panel.
+    ///
+    /// This is the evidence an editor's own find action carries: the action
+    /// only travels up from the editor that had the keyboard when the chord was
+    /// pressed, so it needs no panel-visibility check — and the detached
+    /// window's host could never satisfy one.
+    fn focused_editor_ungated(&self, window: &Window, cx: &App) -> Option<Entity<EditorState>> {
         self.editor_bindings
             .iter()
             // A Markdown tab showing its rendered document has no editor on
@@ -2225,18 +2343,245 @@ impl CodeWorkbench {
             .map(|(_, binding)| binding.input.clone())
     }
 
-    /// Opens the focused editor's own find panel. Returns whether one took the
+    /// Opens the focused editor's own find bar. Returns whether one took the
     /// request; `false` leaves the chord to whoever asked.
+    ///
+    /// The bar is the workbench's, not the kit's built-in panel: the panel
+    /// re-selects its field after every keystroke on the published engine, so a
+    /// reader could only ever type one character (see [`EditorFindState`]).
     pub(crate) fn open_focused_editor_find(
         &mut self,
-        window: &Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
         let Some(input) = self.focused_editor(window, cx) else {
             return false;
         };
-        input.update(cx, |input, cx| input.open_search(false, cx));
+        let Some(path) = self
+            .editor_bindings
+            .iter()
+            .find(|(_, binding)| binding.input.entity_id() == input.entity_id())
+            .map(|(path, _)| path.clone())
+        else {
+            return false;
+        };
+        self.open_editor_find(path, false, window, cx);
         true
+    }
+
+    /// Opens the find bar for the file whose source editor sent the chord.
+    ///
+    /// The editor is deliberately not `searchable`, so its own `Search` action
+    /// travels up to the workbench root instead of mounting the kit's panel.
+    /// The action only arrives from the editor that had the keyboard, in either
+    /// host, so this reads the focused binding directly: a root with no editor
+    /// in front of it does nothing rather than opening a bar over another tab.
+    pub(crate) fn open_root_editor_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(input) = self.focused_editor_ungated(window, cx) else {
+            return;
+        };
+        let Some(path) = self
+            .editor_bindings
+            .iter()
+            .find(|(_, binding)| binding.input.entity_id() == input.entity_id())
+            .map(|(path, _)| path.clone())
+        else {
+            return;
+        };
+        self.open_editor_find(path, false, window, cx);
+    }
+
+    /// Opens the file's find bar, or moves the open one onto it.
+    ///
+    /// The field is seeded from the editor's selection, the way every editor's
+    /// find is: a reader who selects a word and hits the chord expects to search
+    /// that word. A reopen with no selection keeps the query already typed.
+    pub(crate) fn open_editor_find(
+        &mut self,
+        path: String,
+        replace: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(input) = self
+            .editor_bindings
+            .get(&path)
+            .map(|binding| binding.input.clone())
+        else {
+            return;
+        };
+        let selected = input.read(cx).selected_text().to_string();
+        // A multi-line selection is not a query; every editor drops it rather
+        // than searching half a block.
+        let selected = if selected.contains(['\n', '\r']) {
+            String::new()
+        } else {
+            selected
+        };
+        let same_file = self
+            .editor_find
+            .as_ref()
+            .is_some_and(|find| find.path == path && find.input.entity_id() == input.entity_id());
+        if !same_file && let Some(previous) = self.editor_find.take() {
+            // The bar is moving to another file, so the hits it painted belong
+            // to a document nobody is searching any more.
+            previous
+                .input
+                .update(cx, |input, cx| input.close_search(cx));
+        }
+        let (query_input, replace_input) = match &self.editor_find {
+            Some(find) => (find.query_input.clone(), find.replace_input.clone()),
+            None => (
+                self.editor_find_query_input.clone(),
+                self.editor_find_replace_input.clone(),
+            ),
+        };
+        if !same_file {
+            let (query_events, replace_events) =
+                subscribe_editor_find_inputs(cx, window, &path, &query_input, &replace_input);
+            self.editor_find = Some(EditorFindState {
+                path: path.clone(),
+                input: input.clone(),
+                query_input: query_input.clone(),
+                replace_input: replace_input.clone(),
+                replace_open: replace,
+                _query_events: query_events,
+                _replace_events: replace_events,
+                synced_query: String::new(),
+            });
+        }
+        if replace && let Some(find) = self.editor_find.as_mut() {
+            find.replace_open = true;
+        }
+        // A different document searches from scratch. Reopening over the same
+        // file keeps what the reader already typed, unless the new selection is
+        // itself the query they expect to search.
+        if !same_file {
+            query_input.update(cx, |field, cx| {
+                field.set_value(selected.clone(), window, cx);
+            });
+        } else if !selected.is_empty() {
+            query_input.update(cx, |field, cx| {
+                field.set_value(selected.clone(), window, cx);
+            });
+        }
+        self.apply_editor_find_query(&path, cx);
+        // The bar's field takes the keyboard with the whole query selected, so
+        // the next character replaces it rather than landing in the middle.
+        window.focus(&query_input.read(cx).focus_handle(cx), cx);
+        query_input.update(cx, |field, cx| field.select_all(window, cx));
+        cx.notify();
+    }
+
+    /// Whether the editor find bar owns the keyboard.
+    ///
+    /// The bar is the topmost dismissible layer over the file: Escape closes it
+    /// and a second chord belongs to it rather than to the conversation.
+    fn editor_find_owns_keyboard(&self, window: &Window, cx: &App) -> bool {
+        let Some(find) = self.editor_find.as_ref() else {
+            return false;
+        };
+        find.query_input
+            .read(cx)
+            .focus_handle(cx)
+            .is_focused(window)
+            || find
+                .replace_input
+                .read(cx)
+                .focus_handle(cx)
+                .is_focused(window)
+    }
+
+    /// Closes the editor find bar and takes its highlights off the file.
+    ///
+    /// The keyboard goes back to the editor, which is where the reader was
+    /// before they searched it.
+    pub(crate) fn close_editor_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(find) = self.editor_find.take() else {
+            return;
+        };
+        find.input.update(cx, |input, cx| input.close_search(cx));
+        let focus = find.input.read(cx).focus_handle(cx);
+        focus.focus(window, cx);
+        cx.notify();
+    }
+
+    /// Pushes the field's query into the file's search session.
+    ///
+    /// The session keeps the matches and the current hit, so the bar only reads
+    /// them; the query is written when it actually changed, because every write
+    /// re-anchors the session to the viewport.
+    fn apply_editor_find_query(&mut self, path: &str, cx: &mut Context<Self>) {
+        let Some(find) = self.editor_find.as_mut().filter(|find| find.path == path) else {
+            return;
+        };
+        let query = find.query(cx);
+        if query == find.synced_query {
+            return;
+        }
+        find.synced_query = query.clone();
+        let input = find.input.clone();
+        input.update(cx, |input, cx| {
+            if query.is_empty() {
+                input.close_search(cx);
+            } else {
+                // The session's own default is a case-insensitive search; the
+                // file's find keeps that. A closed search is reopened first so
+                // the highlights come back after an empty query cleared them.
+                if !input.search_session().is_active() {
+                    input.open_search(false, cx);
+                }
+                input.set_search_query(query, true, cx);
+            }
+        });
+        cx.notify();
+    }
+
+    /// Steps to the next or previous hit and scrolls it into view.
+    fn step_editor_find(&mut self, path: &str, delta: isize, cx: &mut Context<Self>) {
+        let Some(find) = self.editor_find.as_mut().filter(|find| find.path == path) else {
+            return;
+        };
+        let input = find.input.clone();
+        input.update(cx, |input, cx| {
+            if delta < 0 {
+                input.previous_search_match(cx);
+            } else {
+                input.next_search_match(cx);
+            }
+        });
+        cx.notify();
+    }
+
+    /// Replaces the current hit with the row's text and steps to the next one.
+    ///
+    /// [`forward`] is Enter and Shift+Enter walks backwards, matching the
+    /// search field's own direction.
+    fn replace_editor_find_match(
+        &mut self,
+        path: &str,
+        forward: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(find) = self.editor_find.as_mut().filter(|find| find.path == path) else {
+            return;
+        };
+        let replacement = find.replace_input.read(cx).value().to_string();
+        let input = find.input.clone();
+        input.update(cx, |input, cx| {
+            // The engine refuses when the file is not editable, which is the
+            // same answer the editor's own typing gets.
+            if !input.replace_current_search_match(&replacement, window, cx) {
+                return;
+            }
+            if forward {
+                input.next_search_match(cx);
+            } else {
+                input.previous_search_match(cx);
+            }
+        });
+        cx.notify();
     }
 
     /// The Agent that owns a browser session, for the tab strip's mark.
@@ -2766,6 +3111,9 @@ impl CodeWorkbench {
         self.preview_tab_scrolls.clear();
         self.markdown_previews.clear();
         self.markdown_find = None;
+        // The bar goes with the workspace's editors, and the search session
+        // lives on those editors, so nothing else has to be closed here.
+        self.editor_find = None;
     }
 
     /// Apply a file rename or delete to the parked layouts of the current
@@ -6316,14 +6664,16 @@ impl CodeWorkbench {
         let input = cx.new(|cx| {
             EditorState::new(window, cx)
                 .language(language)
-                // The file's own find is part of the contract: the workbench
-                // hands the find chord to the focused editor instead of opening
-                // the conversation's, and `open_search` is a no-op on an editor
-                // that is not searchable. A read-only file still searches —
-                // `replaceable` below decides whether the panel may rewrite
-                // matches, and the state reports itself unreplaceable while the
-                // editor is not editable.
-                .searchable(true)
+                // The file's find is the workbench's own bar, not the kit's
+                // built-in panel: on the published engine that panel re-selects
+                // its field after every keystroke, so a reader can only ever
+                // type one character (see [`EditorFindState`]). `searchable` is
+                // what mounts that panel, so it stays off and the editor's
+                // `Search` action propagates to the workbench root, which opens
+                // the bar instead. `replaceable` stays on: the bar asks the
+                // engine to rewrite matches, and the state reports itself
+                // unreplaceable while the file is read-only.
+                .searchable(false)
                 .replaceable(true)
                 .soft_wrap(self.editor_soft_wrap)
                 .show_whitespaces(self.editor_show_whitespaces)
@@ -7282,6 +7632,15 @@ impl CodeWorkbench {
                     // The bar belongs to the tab, so it goes away with it.
                     self.markdown_find = None;
                 }
+                if self
+                    .editor_find
+                    .as_ref()
+                    .is_some_and(|find| find.path == path)
+                {
+                    // The editor is gone, and the search session lives on it,
+                    // so dropping the bar closes the search with the buffer.
+                    self.editor_find = None;
+                }
                 self.file_tasks.remove(path);
                 self.file_tasks.remove(&format!("markdown:{path}"));
                 self.file_tasks.remove(&format!("markdown-scan:{path}"));
@@ -8019,6 +8378,9 @@ impl CodeWorkbench {
             .map(|(path, preview)| (replace_path_prefix(&path, source, destination), preview))
             .collect();
         if let Some(find) = self.markdown_find.as_mut() {
+            find.path = replace_path_prefix(&find.path, source, destination);
+        }
+        if let Some(find) = self.editor_find.as_mut() {
             find.path = replace_path_prefix(&find.path, source, destination);
         }
         self.lifecycles = std::mem::take(&mut self.lifecycles)
@@ -10848,6 +11210,127 @@ impl CodeWorkbench {
         self.refresh_markdown_find(&path, &state, cx);
     }
 
+    /// The find bar of one open source file, drawn under the editor's header.
+    ///
+    /// The bar is the panel's own, like the Markdown preview's and the
+    /// browser's. The editor keeps the hits in its search session while the
+    /// count and the steps live here, so the number on screen is the number of
+    /// highlighted matches rather than a second count that could disagree.
+    fn render_editor_find_bar(&self, path: &str, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let find = self.editor_find.as_ref().filter(|find| find.path == path)?;
+        let session = find.input.read(cx).search_session();
+        let counter = if session.query.is_empty() {
+            String::new()
+        } else if session.matcher.is_empty() {
+            locale::text("No matches", "无匹配", "無相符").to_string()
+        } else {
+            format!(
+                "{} / {}",
+                session.matcher.current_match_index() + 1,
+                session.matcher.len()
+            )
+        };
+        let has_matches = !session.matcher.is_empty();
+        let step_path = find.path.clone();
+        let step_back_path = find.path.clone();
+        let replace_path = find.path.clone();
+        let replace_open = find.replace_open;
+        let bar = h_flex()
+            .id("editor-find")
+            .debug_selector(|| "editor-find".to_string())
+            .flex_none()
+            .w_full()
+            .px_2()
+            .py_1()
+            .gap_2()
+            .items_center()
+            .border_b_1()
+            .border_color(cx.theme().border)
+            .bg(cx.theme().muted)
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .child(Input::new(&find.query_input).small()),
+            )
+            .child(
+                Button::new("editor-find-replace-toggle")
+                    .icon(Icon::new(IconName::Replace))
+                    .ghost()
+                    .xsmall()
+                    .selected(replace_open)
+                    .tooltip(locale::text("Replace", "替换", "取代"))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if let Some(find) = this.editor_find.as_mut() {
+                            find.replace_open = !find.replace_open;
+                        }
+                        cx.notify();
+                    })),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(counter),
+            )
+            .child(
+                Button::new("editor-find-previous")
+                    .icon(Icon::new(IconName::ArrowUp))
+                    .ghost()
+                    .xsmall()
+                    .disabled(!has_matches)
+                    .tooltip(locale::text("Previous match", "上一个匹配", "上一個相符"))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.step_editor_find(&step_back_path, -1, cx)
+                    })),
+            )
+            .child(
+                Button::new("editor-find-next")
+                    .icon(Icon::new(IconName::ArrowDown))
+                    .ghost()
+                    .xsmall()
+                    .disabled(!has_matches)
+                    .tooltip(locale::text("Next match", "下一个匹配", "下一個相符"))
+                    .on_click(
+                        cx.listener(move |this, _, _, cx| this.step_editor_find(&step_path, 1, cx)),
+                    ),
+            )
+            .child(
+                Button::new("editor-find-close")
+                    .icon(Icon::new(IconName::Close))
+                    .ghost()
+                    .xsmall()
+                    .tooltip(locale::text("Close find", "关闭查找", "關閉尋找"))
+                    .on_click(
+                        cx.listener(move |this, _, window, cx| this.close_editor_find(window, cx)),
+                    ),
+            )
+            .when(replace_open, |this| {
+                this.child(
+                    h_flex()
+                        .flex_none()
+                        .gap_1()
+                        .child(
+                            div()
+                                .w(px(180.0))
+                                .min_w_0()
+                                .child(Input::new(&find.replace_input).small()),
+                        )
+                        .child(
+                            Button::new("editor-find-replace-one")
+                                .small()
+                                .label(locale::text("Replace", "替换", "取代"))
+                                .disabled(!has_matches)
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.replace_editor_find_match(&replace_path, true, window, cx)
+                                })),
+                        ),
+                )
+            });
+        Some(bar.into_any_element())
+    }
+
     /// The find bar of one rendered Markdown preview, drawn under the header.
     ///
     /// The bar is the panel's own, like the browser's: the document keeps its
@@ -11348,6 +11831,9 @@ impl CodeWorkbench {
                                 }),
                         ),
                 )
+                .when_some(self.render_editor_find_bar(&path, cx), |this, bar| {
+                    this.child(bar)
+                })
                 .child(
                     div()
                         .flex_1()
@@ -12250,6 +12736,17 @@ impl Render for CodeWorkbench {
             .size_full()
             .min_w_0()
             .bg(cx.theme().background)
+            // A source editor is deliberately not `searchable`, so its find
+            // action travels up to here and the workbench's own bar answers it.
+            // The action still names the editor it came from: the focused
+            // editor is re-read so a stale root never opens a bar over a file
+            // that has since lost the keyboard.
+            .on_action(cx.listener(|this, _: &Search, window, cx| {
+                this.open_root_editor_find(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &Replace, window, cx| {
+                this.open_root_editor_find(window, cx);
+            }))
             .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 // The find bar is the topmost dismissible layer over the
                 // document; a dialog that took the keyboard keeps its Escape.
@@ -12257,6 +12754,11 @@ impl Render for CodeWorkbench {
                     && this.markdown_find_owns_keyboard(window, cx)
                 {
                     this.close_markdown_find(window, cx);
+                    cx.stop_propagation();
+                    return;
+                }
+                if event.keystroke.key == "escape" && this.editor_find_owns_keyboard(window, cx) {
+                    this.close_editor_find(window, cx);
                     cx.stop_propagation();
                     return;
                 }
@@ -12562,6 +13064,19 @@ impl Render for PreviewWindowHost {
             .on_action(cx.listener(|this, _: &GoToLineInEditor, window, cx| {
                 this.workbench
                     .update(cx, |workbench, cx| workbench.begin_goto_line(window, cx));
+            }))
+            // The workbench column carries these too, but this window hosts the
+            // same workbench alone: an editor's find chord has to reach a bar
+            // here as well, or find would only work in the docked panel.
+            .on_action(cx.listener(|this, _: &Search, window, cx| {
+                this.workbench.update(cx, |workbench, cx| {
+                    workbench.open_root_editor_find(window, cx)
+                });
+            }))
+            .on_action(cx.listener(|this, _: &Replace, window, cx| {
+                this.workbench.update(cx, |workbench, cx| {
+                    workbench.open_root_editor_find(window, cx)
+                });
             }))
             .child(self.workbench.clone())
     }
@@ -22885,12 +23400,171 @@ mod tests {
         cx.simulate_keystrokes("ctrl-f");
         cx.run_until_parked();
 
-        input.read_with(cx, |input, _| {
+        workbench.read_with(cx, |this, _| {
             assert!(
-                input.search_session().open,
+                this.editor_find
+                    .as_ref()
+                    .is_some_and(|find| find.path == "README.md"),
                 "the editor must open its own find, not hand the chord to the workbench"
             );
         });
+    }
+
+    /// Typing a whole query into the file's find bar keeps every character.
+    ///
+    /// The kit's built-in panel re-selects its field after each keystroke on the
+    /// published engine (`gpui-base 0.8.0` re-anchors the search on every query
+    /// change, which the panel reads as a new session), so a reader could only
+    /// ever type one character — the second replaced the first. The workbench
+    /// hosts the bar itself and drives the editor's search session directly, so
+    /// each character has to append to the query and the search has to describe
+    /// that whole query.
+    #[gpui::test]
+    fn typing_a_query_into_the_file_find_bar_keeps_every_character(cx: &mut gpui::TestAppContext) {
+        let (workbench, input, cx) = fixture_editor_input(cx);
+        workbench.update(cx, |this, cx| {
+            this.toggle_markdown_source("README.md".to_string(), cx);
+            this.set_preview_visible(true, cx);
+        });
+        draw_window(cx);
+        cx.update(|window, cx| {
+            input.update(cx, |input, cx| input.focus(window, cx));
+        });
+        draw_window(cx);
+
+        assert!(cx.update(|window, cx| {
+            workbench.update(cx, |this, cx| this.open_focused_editor_find(window, cx))
+        }));
+        draw_window(cx);
+
+        // The field takes the keyboard, so the keystrokes land in the query
+        // rather than in the file behind it.
+        cx.simulate_input("Vibex");
+        cx.run_until_parked();
+        draw_window(cx);
+
+        let query = workbench.read_with(cx, |this, cx| {
+            this.editor_find
+                .as_ref()
+                .expect("the bar stays open while typing")
+                .query(cx)
+        });
+        assert_eq!(
+            query, "Vibex",
+            "every character of the query has to survive, not just the first"
+        );
+        workbench.read_with(cx, |this, cx| {
+            let find = this.editor_find.as_ref().expect("the bar is open");
+            let session = find.input.read(cx).search_session();
+            assert!(
+                !session.matcher.is_empty(),
+                "the whole query reaches the editor's search session"
+            );
+            assert_eq!(
+                session.query, "Vibex",
+                "the session searches what the reader typed"
+            );
+            assert!(
+                session.matcher.len() >= 2,
+                "the fixture repeats the term, so stepping has somewhere to go"
+            );
+        });
+
+        // Enter walks the hits, and the bar's count follows the session rather
+        // than a second tally that could drift.
+        let first = workbench.read_with(cx, |this, cx| {
+            this.editor_find
+                .as_ref()
+                .expect("the bar is open")
+                .input
+                .read(cx)
+                .search_session()
+                .matcher
+                .current_match_index()
+        });
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        let second = workbench.read_with(cx, |this, cx| {
+            this.editor_find
+                .as_ref()
+                .expect("the bar is open")
+                .input
+                .read(cx)
+                .search_session()
+                .matcher
+                .current_match_index()
+        });
+        assert_ne!(
+            first, second,
+            "Enter steps to another hit when the query has one"
+        );
+
+        // Escape closes the bar, returns the keyboard to the file and takes the
+        // search session down with it.
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        workbench.read_with(cx, |this, cx| {
+            assert!(
+                this.editor_find.is_none(),
+                "escape closes the bar the bar owns"
+            );
+            assert!(
+                !this.editor_bindings["README.md"]
+                    .input
+                    .read(cx)
+                    .search_session()
+                    .is_active(),
+                "the file stops highlighting once the bar closes"
+            );
+        });
+    }
+
+    /// The replace row rewrites the current hit.
+    ///
+    /// The workbench owns this bar, so replace has to work through the engine's
+    /// own replace call: it edits the buffer rather than the field, and it
+    /// leaves the search on the following hit.
+    #[gpui::test]
+    fn the_file_find_bar_replaces_the_current_hit(cx: &mut gpui::TestAppContext) {
+        let (workbench, input, cx) = fixture_editor_input(cx);
+        workbench.update(cx, |this, cx| {
+            this.toggle_markdown_source("README.md".to_string(), cx);
+            this.set_preview_visible(true, cx);
+        });
+        draw_window(cx);
+        cx.update(|window, cx| {
+            input.update(cx, |input, cx| input.focus(window, cx));
+        });
+        draw_window(cx);
+
+        assert!(cx.update(|window, cx| {
+            workbench.update(cx, |this, cx| this.open_focused_editor_find(window, cx))
+        }));
+        draw_window(cx);
+        cx.simulate_input("Vibex");
+        cx.run_until_parked();
+        draw_window(cx);
+
+        let before = input.read_with(cx, |input, _| input.text().to_string());
+        cx.update(|window, cx| {
+            workbench.update(cx, |this, cx| {
+                let find = this.editor_find.as_mut().expect("the bar is open");
+                find.replace_open = true;
+                find.replace_input
+                    .update(cx, |field, cx| field.set_value("Replaced", window, cx));
+                this.replace_editor_find_match("README.md", true, window, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        let after = input.read_with(cx, |input, _| input.text().to_string());
+        let occurrences = |text: &str| text.split("Vibex").count() - 1;
+        assert_eq!(
+            occurrences(&before) - occurrences(&after),
+            1,
+            "replacing rewrites exactly one occurrence in the file's buffer"
+        );
+        assert!(after.contains("Replaced"), "the replacement text lands");
     }
 
     /// The workbench's find chord reaches the focused editor and nobody else.
@@ -22918,8 +23592,12 @@ mod tests {
             workbench.update(cx, |this, cx| this.open_focused_editor_find(window, cx))
         });
         assert!(delegated, "a focused editor takes the find chord");
-        input.read_with(cx, |input, _| {
-            assert!(input.search_session().open, "the file's find opens");
+        workbench.read_with(cx, |this, _| {
+            let find = this
+                .editor_find
+                .as_ref()
+                .expect("the file's find bar is the workbench's");
+            assert_eq!(find.path, "README.md", "the bar belongs to that file");
         });
 
         // A panel the user closed keeps the focus handle until something else
