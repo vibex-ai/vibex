@@ -1401,12 +1401,22 @@ impl AgentManager {
             &spec.workspace_root,
             request.provider_profile_id.as_ref(),
         )?;
-        let created = SessionRepository::get(&conn, &session.id)?.ok_or_else(|| {
-            VibexError::storage(
-                "terminal_session_missing_after_create",
-                "the terminal session could not be reloaded",
-            )
-        })?;
+        // Hydrated on the way out: this snapshot is what the caller puts on
+        // screen, and a terminal session without its facts has no terminal id —
+        // the page would then report a terminal that is not running for an Agent
+        // that just started perfectly well.
+        let created = self
+            .client_session_snapshot(&conn, &session.id)?
+            .ok_or_else(|| {
+                VibexError::storage(
+                    "terminal_session_missing_after_create",
+                    "the terminal session could not be reloaded",
+                )
+            })?;
+        debug_assert!(
+            created.terminal.is_some(),
+            "a created terminal session must carry the link it just wrote"
+        );
         // Observation starts only after the link row is committed: the observer
         // attributes bytes to a session, and a session whose row does not exist
         // yet has nothing to attribute them to.
@@ -2026,14 +2036,32 @@ impl AgentManager {
         Ok(sessions)
     }
 
+    /// Reads a session for a caller that may put it on screen, hydrating the
+    /// terminal link.
+    ///
+    /// Every snapshot that leaves this crate for a client goes through here or
+    /// through [`Self::list_sessions`]. The plain [`SessionRepository::get`] is
+    /// for internal decisions that never look at `terminal`, and using it for a
+    /// client answer is how a terminal session ends up with no terminal id —
+    /// a failure that surfaces as "the terminal is not running" for an Agent
+    /// that is running.
+    fn client_session_snapshot(
+        &self,
+        conn: &DbConnection,
+        session_id: &VibexSessionId,
+    ) -> VibexResult<Option<AgentSession>> {
+        SessionTerminalRepository::get_with_terminal(conn, session_id)
+    }
+
     pub async fn get_session(&self, session_id: &VibexSessionId) -> VibexResult<AgentSession> {
         let conn = self.open_migrated()?;
         // Hydrated because this is the read a session page performs: a terminal
         // session without its facts has no terminal id, and the page would draw
         // "the terminal is not running" for an Agent that is running.
-        SessionTerminalRepository::get_with_terminal(&conn, session_id)?.ok_or_else(|| {
-            VibexError::validation("session_not_found", "Agent session was not found")
-        })
+        self.client_session_snapshot(&conn, session_id)?
+            .ok_or_else(|| {
+                VibexError::validation("session_not_found", "Agent session was not found")
+            })
     }
 
     /// Creates a child session and immediately queues its first turn. The
@@ -12880,6 +12908,26 @@ mod tests {
     /// The plain repository read leaves `terminal` empty because most reads
     /// never look at it; a client rendering the Agent's terminal has to be able
     /// to find the PTY, and the id lives only in the link table.
+
+    /// The snapshot returned by creation carries the terminal it just linked.
+    ///
+    /// The caller puts this value straight on screen, so a missing `terminal`
+    /// here is not a cache miss — it is the page reporting that the Agent's
+    /// terminal is not running one line after starting it.
+    #[tokio::test]
+    async fn a_created_terminal_session_returns_its_own_link() {
+        let (manager, launcher, dir) = terminal_manager();
+        let created = manager
+            .create_terminal_session(terminal_request("claude", &dir))
+            .await
+            .unwrap();
+        let expected = launcher.watched()[0].0.clone();
+        let facts = created
+            .terminal
+            .as_deref()
+            .expect("creation must return the link it wrote");
+        assert_eq!(facts.terminal_id.as_ref(), Some(&expected));
+    }
 
     /// Opening a terminal session returns its terminal id.
     ///
