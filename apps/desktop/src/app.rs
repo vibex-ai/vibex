@@ -38438,12 +38438,16 @@ impl VibexWorkbench {
                 .as_ref()
                 .and_then(|selection| selection.model.model_id()),
         );
+        // The reader's own words name the session, the same way they name an
+        // ACP session: the row is what they will scan for later, and a fixed
+        // "<agent> terminal" makes every terminal session look identical.
+        let (draft_text, _) = self.new_session_draft_payload(cx);
         let request = vibex_core::CreateTerminalSessionRequest {
             session_id: None,
             agent_id: agent_id.clone(),
             workspace_root,
             workspace_mode,
-            title: None,
+            title: Some(draft_text),
             safety: None,
             args,
             provider_profile_id,

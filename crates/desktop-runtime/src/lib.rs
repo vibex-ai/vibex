@@ -3781,19 +3781,38 @@ impl DesktopRuntime {
                     continue;
                 }
                 for update in updates {
-                    if let Ok(session_id) = vibex_core::VibexSessionId::parse(update.session_id)
-                        && let Err(error) = runtime.agent.manager().record_terminal_observation(
+                    if let Ok(session_id) = vibex_core::VibexSessionId::parse(update.session_id) {
+                        // The CLI said its session is over. The process may still
+                        // be there waiting for a second interrupt, so this is the
+                        // only witness — a liveness check would keep the session
+                        // open forever behind a prompt nobody can answer.
+                        if update.exited {
+                            runtime.unwatch_session_terminal(&update.terminal_id);
+                            if let Err(error) = runtime
+                                .agent
+                                .manager()
+                                .mark_session_terminal_ended(&session_id)
+                            {
+                                tracing::warn!(
+                                    target: "vibex_desktop",
+                                    error_code = %error.code,
+                                    "terminal session retirement failed"
+                                );
+                            }
+                            continue;
+                        }
+                        if let Err(error) = runtime.agent.manager().record_terminal_observation(
                             &session_id,
                             update.activity,
                             update.source,
                             update.observed_at_ms,
-                        )
-                    {
-                        tracing::warn!(
-                            target: "vibex_desktop",
-                            error_code = %error.code,
-                            "terminal observation write failed"
-                        );
+                        ) {
+                            tracing::warn!(
+                                target: "vibex_desktop",
+                                error_code = %error.code,
+                                "terminal observation write failed"
+                            );
+                        }
                     }
                 }
             }

@@ -1364,10 +1364,13 @@ impl AgentManager {
             transport: vibex_core::SessionTransport::Terminal,
             terminal: Some(Box::new(vibex_core::TerminalSessionFacts::default())),
         };
+        SessionRepository::insert(&conn, &session)?;
+        // Locked after the row exists: `lock_title` answers `session_not_found`
+        // when it updates nothing, so locking first made every titled terminal
+        // session fail to create.
         if request.title.is_some() {
             SessionRepository::lock_title(&conn, &session.id)?;
         }
-        SessionRepository::insert(&conn, &session)?;
         let spec = vibex_core::TerminalSessionLaunchSpec {
             workspace_id: workspace.id,
             workspace_root: workspace.root_path,
@@ -13253,6 +13256,31 @@ mod tests {
             before,
             "a second press must not start a second Agent"
         );
+    }
+
+
+    /// A terminal session is named after what the reader typed.
+    ///
+    /// The row is what they scan for later, and a fixed "<agent> terminal" makes
+    /// every terminal session look identical — the same reason an ACP session is
+    /// named from its first message.
+    #[tokio::test]
+    async fn a_terminal_session_is_named_after_the_draft() {
+        let (manager, _, dir) = terminal_manager();
+        let mut request = terminal_request("claude", &dir);
+        request.title = Some("  fix the   flaky test  ".to_string());
+        let created = manager.create_terminal_session(request).await.unwrap();
+        assert_eq!(created.title, "fix the flaky test");
+    }
+
+    /// An empty draft still gets a title, so the row is never blank.
+    #[tokio::test]
+    async fn an_unnamed_terminal_session_falls_back_to_its_agent() {
+        let (manager, _, dir) = terminal_manager();
+        let mut request = terminal_request("claude", &dir);
+        request.title = Some("   ".to_string());
+        let created = manager.create_terminal_session(request).await.unwrap();
+        assert_eq!(created.title, "claude terminal");
     }
 
     /// A restart rebuilds a terminal session's PTY from its recorded argv.

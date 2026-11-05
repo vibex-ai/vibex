@@ -43,6 +43,14 @@ pub enum ScreenReading {
     Idle,
     Working,
     Waiting,
+    /// The Agent's CLI has ended its session but the process is still there.
+    ///
+    /// A terminal Agent does not die on the first interrupt: Claude asks for a
+    /// second one, Codex disconnects the task and leaves a shell-like prompt.
+    /// Both keep the process alive, so a liveness check on the process alone
+    /// never sees the session end — the screen is the only place the CLI says
+    /// so.
+    Exited,
     /// The screen shows no live chrome either way.
     Unknown,
 }
@@ -53,8 +61,15 @@ impl ScreenReading {
             Self::Idle => TerminalActivity::Idle,
             Self::Working => TerminalActivity::Working,
             Self::Waiting => TerminalActivity::Waiting,
-            Self::Unknown => TerminalActivity::Unknown,
+            // A session whose CLI ended is not "doing" anything: it reports no
+            // activity, and the caller closes the session from the reading.
+            Self::Exited | Self::Unknown => TerminalActivity::Unknown,
         }
+    }
+
+    /// Whether the screen says the Agent's session is over.
+    pub fn is_exit(self) -> bool {
+        self == Self::Exited
     }
 }
 
@@ -93,6 +108,26 @@ impl ScreenProfile {
             ScreenProfile {
                 agent: AgentId::parse("claude").expect("literal agent id"),
                 rules: vec![
+                    // The CLI stays alive after one interrupt and asks for a
+                    // second, so this is the only place the session's end is
+                    // visible. It outranks every other rule: an exit prompt is
+                    // not an idle prompt, and acting on the wrong one leaves the
+                    // reader typing into a session that is over.
+                    ScreenRule {
+                        reading: ScreenReading::Exited,
+                        contains: &[],
+                        any: &[
+                            "press ctrl-c again to exit",
+                            "press ctrl+c again to exit",
+                        ],
+                        without: &[],
+                    },
+                    ScreenRule {
+                        reading: ScreenReading::Exited,
+                        contains: &[],
+                        any: &["resume this session with:"],
+                        without: &[],
+                    },
                     // A permission or selection dialog. The cancel footer is what
                     // distinguishes it from prose that happens to mention a
                     // choice.
@@ -139,6 +174,15 @@ impl ScreenProfile {
             ScreenProfile {
                 agent: AgentId::parse("codex").expect("literal agent id"),
                 rules: vec![
+                    // Codex answers an interrupt by ending the task and leaving
+                    // a prompt that looks like a shell; the process survives, so
+                    // only the message distinguishes "done" from "idle".
+                    ScreenRule {
+                        reading: ScreenReading::Exited,
+                        contains: &[],
+                        any: &["disconnected from this task", "stop the current turn:"],
+                        without: &[],
+                    },
                     ScreenRule {
                         reading: ScreenReading::Waiting,
                         contains: &[],
@@ -227,6 +271,9 @@ pub struct ObservationUpdate {
     pub activity: TerminalActivity,
     pub source: TerminalActivitySource,
     pub observed_at_ms: i64,
+    /// The Agent's CLI said its session is over, while the process may still be
+    /// alive waiting for a second interrupt.
+    pub exited: bool,
 }
 
 /// One watched terminal: its emulator, its rules, and its damping.
@@ -240,6 +287,8 @@ pub struct WatchedTerminal {
     damping: Damping,
     /// The last activity this watch published, so a steady screen writes nothing.
     published: Option<(TerminalActivity, TerminalActivitySource)>,
+    /// Set once the screen has said the session is over.
+    published_exit: bool,
 }
 
 impl WatchedTerminal {
@@ -282,6 +331,7 @@ impl WatchedTerminal {
             rules,
             damping: Damping::default(),
             published: None,
+            published_exit: false,
         }
     }
 
@@ -310,6 +360,22 @@ impl WatchedTerminal {
     /// clock the store writes, and so tests need no wall clock.
     pub fn scan(&mut self, now_ms: i64) -> Option<ObservationUpdate> {
         let reading = self.rules.read(&self.bottom_screen());
+        if reading.is_exit() {
+            // Publish once. The session is then closed by the caller, and a
+            // closed session produces no further readings.
+            if self.published_exit {
+                return None;
+            }
+            self.published_exit = true;
+            return Some(ObservationUpdate {
+                terminal_id: TerminalId::new(),
+                session_id: self.session_id.clone(),
+                activity: TerminalActivity::Unknown,
+                source: TerminalActivitySource::Screen,
+                observed_at_ms: now_ms,
+                exited: true,
+            });
+        }
         let activity = self.damping.accept(reading)?;
         let source = match activity {
             TerminalActivity::Idle | TerminalActivity::Working | TerminalActivity::Waiting => {
@@ -327,6 +393,7 @@ impl WatchedTerminal {
             activity,
             source,
             observed_at_ms: now_ms,
+            exited: false,
         })
     }
 
@@ -424,6 +491,69 @@ mod tests {
             .into_iter()
             .find(|profile| profile.agent().as_str() == "claude")
             .expect("claude has a bundle")
+    }
+
+
+    /// The screen says when the CLI ended its session, even though the process
+    /// is still alive.
+    ///
+    /// A terminal Agent does not die on the first interrupt: Claude asks for a
+    /// second one, Codex disconnects the task and leaves a shell-like prompt.
+    /// A liveness check alone therefore never sees the end, which is what left
+    /// the session stuck behind an exit prompt.
+    #[test]
+    fn an_exit_prompt_reads_as_an_ended_session() {
+        for (agent, screen) in [
+            (
+                "claude",
+                "\n\nPress Ctrl-C again to exit\n\nResume this session with:\nclaude --resume abc",
+            ),
+            (
+                "codex",
+                "^C^CDisconnected from this task. Any running work continues.\n\
+                 To reconnect, run:\n  codex resume abc\nStop the current turn: run codex agents",
+            ),
+        ] {
+            let mut watched = WatchedTerminal::new(
+                "session-1",
+                AgentId::parse(agent).unwrap(),
+                10,
+                80,
+                &ScreenProfile::bundled(),
+            );
+            watched.advance(b"\x1b[2J\x1b[H");
+            watched.advance(screen.as_bytes());
+            assert_eq!(
+                watched.current_reading(),
+                ScreenReading::Exited,
+                "{agent} exit prompt must read as an ended session"
+            );
+        }
+    }
+
+    /// An exit reading is published once, and closes the session rather than
+    /// reporting an activity.
+    #[test]
+    fn an_exit_reading_is_published_once() {
+        let mut observations = TerminalObservations::new();
+        let terminal_id = TerminalId::new();
+        observations.watch(
+            terminal_id.clone(),
+            "session-1",
+            AgentId::parse("claude").unwrap(),
+            6,
+            60,
+        );
+        observations
+            .watched_mut(&terminal_id)
+            .unwrap()
+            .advance(b"\x1b[2J\x1b[HPress Ctrl-C again to exit");
+        let updates = observations.scan_all(1_000);
+        assert_eq!(updates.len(), 1);
+        assert!(updates[0].exited);
+        assert_eq!(updates[0].activity, TerminalActivity::Unknown);
+        // A settled exit screen is not re-published on every sweep.
+        assert!(observations.scan_all(1_100).is_empty());
     }
 
     /// The live idle footer is what makes an idle claim safe; its absence is
