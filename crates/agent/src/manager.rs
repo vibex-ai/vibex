@@ -2028,7 +2028,10 @@ impl AgentManager {
 
     pub async fn get_session(&self, session_id: &VibexSessionId) -> VibexResult<AgentSession> {
         let conn = self.open_migrated()?;
-        SessionRepository::get(&conn, session_id)?.ok_or_else(|| {
+        // Hydrated because this is the read a session page performs: a terminal
+        // session without its facts has no terminal id, and the page would draw
+        // "the terminal is not running" for an Agent that is running.
+        SessionTerminalRepository::get_with_terminal(&conn, session_id)?.ok_or_else(|| {
             VibexError::validation("session_not_found", "Agent session was not found")
         })
     }
@@ -12877,6 +12880,30 @@ mod tests {
     /// The plain repository read leaves `terminal` empty because most reads
     /// never look at it; a client rendering the Agent's terminal has to be able
     /// to find the PTY, and the id lives only in the link table.
+
+    /// Opening a terminal session returns its terminal id.
+    ///
+    /// This is the read a session page performs. Without the link hydrated the
+    /// page has no terminal to attach and draws "the terminal is not running"
+    /// for an Agent that is running perfectly well.
+    #[tokio::test]
+    async fn opening_a_terminal_session_returns_its_terminal() {
+        let (manager, launcher, dir) = terminal_manager();
+        let created = manager
+            .create_terminal_session(terminal_request("claude", &dir))
+            .await
+            .unwrap();
+        let expected = launcher.watched()[0].0.clone();
+
+        let opened = manager.get_session(&created.id).await.unwrap();
+        let facts = opened
+            .terminal
+            .as_deref()
+            .expect("opening a session must hydrate its terminal");
+        assert_eq!(facts.terminal_id.as_ref(), Some(&expected));
+        assert_eq!(facts.activity, vibex_core::TerminalActivity::Unknown);
+    }
+
     #[tokio::test]
     async fn a_session_list_names_the_terminal_a_remote_client_must_attach_to() {
         let (manager, launcher, dir) = terminal_manager();
