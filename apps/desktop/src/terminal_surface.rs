@@ -10,12 +10,13 @@ use std::{
 use crate::theme;
 use crate::typography::code_font_weight;
 use gpui::{
-    AnyElement, App, BackgroundExecutor, BorderStyle, Bounds, ClipboardItem, Context,
-    ElementInputHandler, Entity, EntityInputHandler, FocusHandle, FontStyle, FontWeight, Hsla,
-    IntoElement, KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, Pixels, Point, Render, ScrollDelta, ScrollWheelEvent, ShapedLine, Subscription,
-    Task, TextRun, UTF16Selection, WeakEntity, Window, actions, canvas, div, fill, outline, point,
-    prelude::*, px, rgb, size,
+    AnyElement, App, BackgroundExecutor, BorderStyle, Bounds, ClipboardItem, ContentMask, Context,
+    ElementInputHandler, Entity, EntityInputHandler, FocusHandle, Font, FontFallbacks,
+    FontFeatures, FontStyle, FontWeight, Hsla, IntoElement, KeyBinding, KeyDownEvent, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, ScrollDelta,
+    ScrollWheelEvent, ShapedLine, Subscription, Task, TextAlign, TextRun, UTF16Selection,
+    WeakEntity, Window, actions, canvas, div, fill, font, outline, point, prelude::*, px, rgb,
+    size,
 };
 use gpui_component::{
     ActiveTheme as _, Disableable as _, ElementExt as _, Icon, IconName, Selectable as _,
@@ -48,13 +49,34 @@ use crate::terminal_transport::{
     TerminalTransportResult,
 };
 
-const TERMINAL_BASE_FONT_SIZE: f32 = 13.0;
-const TERMINAL_BASE_CELL_WIDTH: f32 = 8.0;
-const TERMINAL_BASE_CELL_HEIGHT: f32 = 18.0;
+/// The code font's line box, as a multiple of the font size.
+///
+/// The cell is as tall as the font's own line box plus a little breathing room,
+/// not a constant from a 13px design: the terminal cell and the fontSize the
+/// shaper is given have to agree, or the glyphs drift inside their cells at
+/// every zoom level.
+const TERMINAL_LINE_HEIGHT_RATIO: f32 = 1.38;
 const TERMINAL_MIN_FONT_SIZE: f32 = 10.0;
 const TERMINAL_MAX_FONT_SIZE: f32 = 24.0;
 const TERMINAL_HORIZONTAL_PADDING: f32 = 12.0;
 const TERMINAL_VERTICAL_PADDING: f32 = 12.0;
+/// Minimum perceptual distance between ink and the cell it sits on. Below this
+/// a program's colour is washed out to the cell's opposite until it clears.
+const TERMINAL_MINIMUM_CONTRAST: f32 = 0.35;
+/// How far a dim cell's ink is pushed toward the cell background.
+const TERMINAL_DIM_OPACITY: f32 = 0.68;
+/// Extra ink a selected cell's background takes from the default foreground.
+const TERMINAL_SELECTION_OPACITY: f32 = 0.28;
+// Cells are divided into 8 columns and 24 lines, the least common multiple of
+// the 8-way splits of the eighth blocks and the 3-way splits of the sextants.
+/// How many shaped rows the grid keeps between frames.
+///
+/// Enough for several screens of scrollback at a typical window height, small
+/// enough that a long-running terminal cannot pin every row it ever showed.
+const GLYPH_CACHE_LIMIT: usize = 4_096;
+const TERMINAL_SUBCELL_COLUMNS: f32 = 8.0;
+const TERMINAL_SUBCELL_LINES: f32 = 24.0;
+
 // Tauri preview terminals use `p-2`, while the Composer surface has another
 // compact wrapper around its grid. Keep those insets distinct so a preview
 // terminal does not gain standalone chrome or lose the expected content edge.
@@ -209,6 +231,25 @@ pub struct TerminalSurface {
     active_hyperlink: Option<String>,
     focus: FocusHandle,
     cell_metrics: TerminalCellMetrics,
+    /// Fractional scroll not yet spent as a whole line.
+    ///
+    /// A trackpad reports many sub-row deltas per gesture. Rounding each one
+    /// independently turned a single flick into dozens of three-line jumps and
+    /// could also step backwards; the remainder is carried instead.
+    scroll_remainder: f32,
+    /// Shaped rows keyed by the text and style they were shaped from.
+    ///
+    /// A terminal repaints on every output poll and every cursor blink, but a
+    /// row that did not change must not be shaped again: the layout costs more
+    /// than the paint, and a screen of prose is the same handful of strings
+    /// frame after frame.
+    glyph_cache: std::cell::RefCell<std::collections::HashMap<u64, ShapedLine>>,
+    /// Bumped by every local scroll.
+    ///
+    /// A poll that started before the scroll carries the older viewport; without
+    /// this floor it would paint the pre-scroll rows back over the ones the
+    /// reader just moved to, which is what made the content look duplicated.
+    scroll_generation: u64,
     resize: TerminalResizeCoordinator,
     resize_task: Option<Task<()>>,
     /// Content-box bounds of the grid container from the last prepaint — the
@@ -484,7 +525,7 @@ impl TerminalSurface {
                 cx.notify();
             }
         });
-        let cell_metrics = terminal_cell_metrics(f32::from(cx.theme().mono_font_size), mode);
+        let cell_metrics = measured_terminal_cell_metrics(cx.text_system().as_ref(), cx, mode);
         let resize = TerminalResizeCoordinator::new(cell_metrics);
         let owned_terminal_ids = if owns_initial_sessions {
             tabs.iter()
@@ -526,6 +567,9 @@ impl TerminalSurface {
             active_hyperlink: None,
             focus,
             cell_metrics,
+            scroll_remainder: 0.0,
+            glyph_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
+            scroll_generation: 0,
             resize,
             resize_task: None,
             grid_bounds: None,
@@ -687,11 +731,12 @@ impl TerminalSurface {
             background.timer(TERMINAL_ACTIVE_POLL_INTERVAL).await;
             loop {
                 let Ok(work) = entity.update(cx, |this, _| {
-                    this.foreground_active.then(|| this.poll_work())
+                    this.foreground_active
+                        .then(|| (this.poll_work(), this.scroll_generation))
                 }) else {
                     break;
                 };
-                let Some(work) = work else {
+                let Some((work, scroll_generation)) = work else {
                     break;
                 };
                 if work.is_empty() {
@@ -710,6 +755,14 @@ impl TerminalSurface {
                 let Ok(interval) = entity.update(cx, |this, cx| {
                     if !this.foreground_active {
                         return None;
+                    }
+                    // The reader scrolled while this poll was in flight, so the
+                    // frames it carries describe a viewport that is no longer on
+                    // screen. Applying them would scroll the terminal back and
+                    // then forward again, which is what made rows appear twice.
+                    // Drop them and ask for the current viewport instead.
+                    if this.scroll_generation != scroll_generation {
+                        return Some(Duration::ZERO);
                     }
                     let changed = this.apply_poll_results(results, cx);
                     if changed {
@@ -871,7 +924,7 @@ impl TerminalSurface {
         if !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0 {
             return;
         }
-        let cell_metrics = terminal_cell_metrics(f32::from(cx.theme().mono_font_size), self.mode);
+        let cell_metrics = measured_terminal_cell_metrics(cx.text_system().as_ref(), cx, self.mode);
         if self.cell_metrics != cell_metrics {
             self.cell_metrics = cell_metrics;
             self.resize = TerminalResizeCoordinator::new(cell_metrics);
@@ -1523,12 +1576,8 @@ impl TerminalSurface {
     }
 
     fn on_scroll(&mut self, event: &ScrollWheelEvent, _: &mut Window, cx: &mut Context<Self>) {
-        let cell_metrics = terminal_cell_metrics(f32::from(cx.theme().mono_font_size), self.mode);
-        let y = match event.delta {
-            ScrollDelta::Lines(point) => point.y,
-            ScrollDelta::Pixels(point) => f32::from(point.y) / cell_metrics.cell_height,
-        };
-        if y == 0.0 {
+        let lines = self.scroll_delta_lines(event);
+        if lines == 0.0 {
             return;
         }
         let modes = self
@@ -1536,7 +1585,7 @@ impl TerminalSurface {
             .and_then(|index| self.tabs.get(index))
             .map(|tab| tab.frame.modes());
         if modes.is_some_and(|modes| modes.mouse_reporting) && !event.modifiers.shift {
-            let kind = if y > 0.0 {
+            let kind = if lines > 0.0 {
                 TerminalMouseKind::WheelUp
             } else {
                 TerminalMouseKind::WheelDown
@@ -1550,17 +1599,47 @@ impl TerminalSurface {
             );
             return;
         }
+        // Whole lines only: the terminal's display offset is integral, so a
+        // fractional remainder is carried into the next event rather than
+        // rounded away or multiplied into a fixed jump.
+        let whole_lines = self.accumulate_scroll_lines(lines);
+        if whole_lines == 0 {
+            return;
+        }
         let Some((terminal_id, backend)) = self.active_runtime() else {
             return;
         };
         let frame = backend.lock().ok().map(|mut backend| {
-            backend.scroll(if y > 0.0 { 3 } else { -3 });
+            backend.scroll(whole_lines);
             backend.frame()
         });
         if let Some(frame) = frame {
+            // A local scroll is newer than anything a poll in flight can carry,
+            // so the cache is forced through a full repaint and the next poll
+            // result is checked against this floor before it is applied.
             self.apply_local_frame(&terminal_id, frame);
+            self.scroll_generation = self.scroll_generation.wrapping_add(1);
             cx.notify();
         }
+    }
+
+    /// The scroll delta of one wheel event, in terminal lines.
+    ///
+    /// A line-granularity event already says how many lines it means; a pixel
+    /// event is divided by the measured cell height so a trackpad's sub-row
+    /// deltas add up to the number of rows actually travelled.
+    fn scroll_delta_lines(&self, event: &ScrollWheelEvent) -> f32 {
+        match event.delta {
+            ScrollDelta::Lines(point) => point.y,
+            ScrollDelta::Pixels(point) => {
+                f32::from(point.y) / self.cell_metrics.cell_height.max(1.0)
+            }
+        }
+    }
+
+    /// Turn a fractional line delta into the whole lines to scroll now.
+    fn accumulate_scroll_lines(&mut self, lines: f32) -> i32 {
+        accumulate_scroll_lines(&mut self.scroll_remainder, lines)
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -1855,13 +1934,11 @@ impl TerminalSurface {
         let prepaint_entity = cx.entity();
         let paint_entity = cx.entity();
         let input_focus = self.focus.clone();
-        let rows = tab.frame.rows();
-        let columns = tab.frame.columns();
         let cursor = tab.frame.cursor();
         let marked_text = self.marked_text.clone();
         let horizontal_padding = self.horizontal_padding();
         let vertical_padding = self.vertical_padding();
-        let cell_metrics = terminal_cell_metrics(f32::from(cx.theme().mono_font_size), self.mode);
+        let cell_metrics = measured_terminal_cell_metrics(cx.text_system().as_ref(), cx, self.mode);
         v_flex()
             .id("terminal-grid")
             .flex_1()
@@ -1910,16 +1987,23 @@ impl TerminalSurface {
             // becoming a div, three mouse listeners and a text node each. Rebuilding
             // thousands of elements per frame was what dropped the workbench frame
             // rate whenever a terminal was on screen.
+            //
+            // The canvas fills the pane rather than being pinned to the current
+            // row and column count. Pinning it meant the painted grid kept its
+            // old size for as long as the resize round trip took, so dragging a
+            // window left the terminal behind; filling the pane lets the grid
+            // follow the pointer and lets prepaint derive the new size from the
+            // box that is on screen right now.
             .child(
                 canvas(
-                    move |_, window, cx| shape_terminal_grid(&prepaint_entity, window, cx),
+                    move |_, window, cx| {
+                        shape_terminal_grid(&prepaint_entity, cell_metrics, window, cx)
+                    },
                     move |bounds, layout, window, cx| {
                         paint_terminal_grid(bounds, &layout, &paint_entity, window, cx)
                     },
                 )
-                .w(px(f32::from(columns) * cell_metrics.cell_width))
-                .h(px(f32::from(rows) * cell_metrics.cell_height))
-                .flex_none(),
+                .size_full(),
             )
             .when_some(cursor.zip(marked_text), |grid, (cursor, marked_text)| {
                 grid.child(
@@ -2000,17 +2084,149 @@ impl TerminalSurface {
     }
 }
 
-/// One shaped terminal row, prepared during prepaint and painted once.
-struct TerminalRowLayout {
+/// A run of adjacent cells that share one style, shaped as a single line.
+///
+/// The shaper lays out a whole run at once, so ligatures, combining marks and
+/// zero-width emoji sequences keep the relative positions the font gave them.
+/// Splitting a row into runs only where the style actually changes is what keeps
+/// the shaped text small: a screen of prose is a handful of runs, not 80 cells.
+#[derive(Clone)]
+struct TerminalTextRun {
     line: ShapedLine,
-    /// Byte offset of every column's text inside `line.text`, plus a sentinel.
-    column_offsets: Vec<usize>,
+    /// Byte offset of the run's first column inside `line.text`.
+    column: u16,
+    /// Columns the run occupies; wide cells count twice.
+    columns: u16,
 }
 
-/// The shaped rows handed from the grid's prepaint pass to its paint pass.
-#[derive(Default)]
+/// Everything the grid's paint pass needs from its prepaint pass.
 struct TerminalGridLayout {
-    rows: Vec<Option<TerminalRowLayout>>,
+    rows: Vec<Vec<TerminalTextRun>>,
+    /// Filled subcell rectangles for the cells that are painted as geometry
+    /// rather than shaped as text.
+    rects: Vec<TerminalRect>,
+    /// Cell geometry measured from the actual font, not from a design constant.
+    metrics: TerminalCellMetrics,
+}
+
+impl TerminalGridLayout {
+    fn empty(metrics: TerminalCellMetrics) -> Self {
+        Self {
+            rows: Vec::new(),
+            rects: Vec::new(),
+            metrics,
+        }
+    }
+}
+
+/// A run of adjacent cells painted as the same filled subcell rectangle.
+struct TerminalRect {
+    row: u16,
+    column: u16,
+    /// How many adjacent cells this run covers.
+    columns: u16,
+    /// The filled area in subcell units, within a cell.
+    fill: TerminalSubcellFill,
+    color: Hsla,
+    /// `1.0` for a solid block; the shade ramp uses a fraction of the cell.
+    opacity: f32,
+}
+
+/// A filled area inside one cell, in subcell units: `(x, y, columns, lines)`.
+type TerminalSubcellFill = (u16, u16, u16, u16);
+
+/// The rectangles a painted character fills, and the ink fraction they carry.
+struct TerminalCellGeometry {
+    fills: Vec<TerminalSubcellFill>,
+    opacity: f32,
+}
+
+/// Geometry for a cell that must be painted rather than shaped.
+///
+/// Returns the subcell rectangles the character fills and the fraction of the
+/// ink they carry. A solid block is one rectangle at full opacity; the shade
+/// ramp is one cell-covering rectangle at reduced opacity, which keeps a shaded
+/// region seamless instead of showing the gaps a stipple font leaves between
+/// cells. Quadrants and sextants return one rectangle per filled subcell.
+///
+/// An empty result means the character is ordinary text.
+fn cell_geometry(cell: Option<&TerminalCellSnapshot>) -> Option<TerminalCellGeometry> {
+    let ch = cell?.text.chars().next()?;
+    if let Some(opacity) = shade_char_opacity(ch) {
+        return Some(TerminalCellGeometry {
+            fills: vec![(0, 0, 8, 24)],
+            opacity,
+        });
+    }
+    if let Some(fill) = block_char_to_rect(ch) {
+        return Some(TerminalCellGeometry {
+            fills: vec![fill],
+            opacity: 1.0,
+        });
+    }
+    if let Some(bits) = quadrant_char_to_filled_bits(ch) {
+        // Each filled quadrant of the 2x2 split is half the cell wide and half
+        // the cell tall; empty quadrants contribute nothing.
+        let quadrants = [(0u16, 0u16), (4, 0), (0, 12), (4, 12)];
+        let fills = quadrants
+            .into_iter()
+            .enumerate()
+            .filter(|(index, _)| bits & (1 << index) != 0)
+            .map(|(_, (x, y))| (x, y, 4, 12))
+            .collect();
+        return Some(TerminalCellGeometry {
+            fills,
+            opacity: 1.0,
+        });
+    }
+    if let Some(bits) = sextant_char_to_filled_bits(ch) {
+        // A sextant splits the cell into three rows of two; each filled subcell
+        // is half the cell wide and a third of it tall.
+        let sextants = [(0u16, 0u16), (4, 0), (0, 8), (4, 8), (0, 16), (4, 16)];
+        let fills = sextants
+            .into_iter()
+            .enumerate()
+            .filter(|(index, _)| bits & (1 << index) != 0)
+            .map(|(_, (x, y))| (x, y, 4, 8))
+            .collect();
+        return Some(TerminalCellGeometry {
+            fills,
+            opacity: 1.0,
+        });
+    }
+    None
+}
+
+/// The parts of a terminal cell that decide how it is painted.
+#[derive(Clone, Copy, PartialEq)]
+struct TerminalCellStyle {
+    foreground: Hsla,
+    bold: bool,
+    italic: bool,
+    underline: bool,
+    strikeout: bool,
+}
+
+impl TerminalCellStyle {
+    fn font(&self, base: &Font) -> Font {
+        let mut font = base.clone();
+        if self.bold {
+            font.weight = FontWeight::BOLD;
+        }
+        if self.italic {
+            font.style = FontStyle::Italic;
+        }
+        font
+    }
+}
+
+/// Whether the cell has no ink worth shaping: blank, a wide-cell spacer, a
+/// hidden cell, or a code point a shaped line may not hold.
+fn cell_is_blank(cell: &TerminalCellSnapshot) -> bool {
+    cell.wide_spacer
+        || cell.hidden
+        || cell.text.trim_end().is_empty()
+        || cell.text.chars().all(|ch| ch.is_control())
 }
 
 /// Resolve the foreground and background of one cell, including the cursor and
@@ -2037,11 +2253,20 @@ fn terminal_cell_colors(
             default_background,
             default_background,
         );
+        // A program that picked its own true colour or its own 256-colour entry
+        // chose that ink deliberately; only the theme's own ANSI slots and the
+        // two default sentinels are adjusted for legibility.
+        if !cell.inverse
+            && is_theme_chosen_color(cell.foreground)
+            && !cell.text.chars().all(is_decorative_character)
+        {
+            foreground = ensure_minimum_contrast(foreground, background);
+        }
         if cell.dim {
-            foreground = foreground.opacity(0.68);
+            foreground = foreground.opacity(TERMINAL_DIM_OPACITY);
         }
         if cell.selected {
-            background = default_foreground.opacity(0.28);
+            background = default_foreground.opacity(TERMINAL_SELECTION_OPACITY);
         }
     }
     if cursor.is_some_and(|cursor| {
@@ -2055,105 +2280,503 @@ fn terminal_cell_colors(
     (foreground, background)
 }
 
+/// Whether a colour came from the theme rather than from the program.
+fn is_theme_chosen_color(color: TerminalCellColor) -> bool {
+    match color {
+        TerminalCellColor::Named { .. } => true,
+        TerminalCellColor::Indexed { index } => index < 16,
+        TerminalCellColor::Rgb { .. } => false,
+    }
+}
+
+/// Lift `foreground` toward the cell's opposite until it clears the minimum
+/// contrast against `background`.
+///
+/// Terminal programs assume the palette their theme defines. A light-on-light
+/// pair from a mismatched theme is unreadable, so the ink is walked toward the
+/// background's opposite — never the background, which would erase the glyph.
+fn ensure_minimum_contrast(foreground: Hsla, background: Hsla) -> Hsla {
+    if contrast_ratio(foreground, background) >= TERMINAL_MINIMUM_CONTRAST {
+        return foreground;
+    }
+    let toward_white = relative_luminance(background) < 0.5;
+    let mut best = foreground;
+    let mut best_ratio = contrast_ratio(foreground, background);
+    for step in 1..=10 {
+        let amount = step as f32 / 10.0;
+        let candidate = if toward_white {
+            foreground.blend(Hsla::white().opacity(amount))
+        } else {
+            foreground.blend(Hsla::black().opacity(amount))
+        };
+        let ratio = contrast_ratio(candidate, background);
+        if ratio > best_ratio {
+            best = candidate;
+            best_ratio = ratio;
+        }
+        if ratio >= TERMINAL_MINIMUM_CONTRAST {
+            return candidate;
+        }
+    }
+    best
+}
+
+/// Perceived brightness of a colour, 0.0 (black) to 1.0 (white).
+///
+/// The coefficients are the usual perceptual weights, so a saturated blue reads
+/// as dark and a saturated yellow as light — which is what decides whether ink
+/// is lifted toward white or toward black.
+fn relative_luminance(color: Hsla) -> f32 {
+    let rgb = color.to_rgb();
+    0.2126 * rgb.r + 0.7152 * rgb.g + 0.0722 * rgb.b
+}
+
+/// Perceived distance between two colours, 0.0 to 1.0.
+fn contrast_ratio(foreground: Hsla, background: Hsla) -> f32 {
+    (relative_luminance(foreground) - relative_luminance(background)).abs()
+}
+
+/// The subcell rectangle a block, quadrant or sextant character fills, in
+/// `(column, line, columns, lines)` units of the cell grid.
+///
+/// These characters are drawn as rectangles instead of being shaped: their whole
+/// point is to cover their cell edge to edge, and a stipple or a half block from
+/// a vector font never does that consistently across fonts. `None` means the
+/// character is ordinary text.
+fn block_char_to_rect(ch: char) -> Option<TerminalSubcellFill> {
+    let codepoint = ch as u32;
+    Some(match codepoint {
+        // ▀ upper half
+        0x2580 => (0, 0, 8, 12),
+        // ▁▂▃▄▅▆▇█ lower blocks of 1..=8 eighths
+        0x2581..=0x2588 => {
+            let eighths = (codepoint - 0x2580) as u16;
+            (0, 24 - eighths * 3, 8, eighths * 3)
+        }
+        // ▉▊▋▌▍▎▏ left blocks of 7..=1 eighths
+        0x2589..=0x258F => (0, 0, (0x2590 - codepoint) as u16, 24),
+        // ▐ right half
+        0x2590 => (4, 0, 4, 24),
+        // ▔ upper eighth
+        0x2594 => (0, 0, 8, 3),
+        // ▕ right eighth
+        0x2595 => (7, 0, 1, 24),
+        _ => return None,
+    })
+}
+
+/// The filled quadrants of a quadrant character, bit `row * 2 + column`.
+fn quadrant_char_to_filled_bits(ch: char) -> Option<u8> {
+    Some(match ch {
+        '▘' => 0b0001,
+        '▝' => 0b0010,
+        '▖' => 0b0100,
+        '▗' => 0b1000,
+        '▚' => 0b1001,
+        '▞' => 0b0110,
+        '▛' => 0b0111,
+        '▜' => 0b1011,
+        '▙' => 0b1101,
+        '▟' => 0b1110,
+        _ => return None,
+    })
+}
+
+/// The filled subcells of a sextant character, bit `row * 2 + column`.
+///
+/// U+1FB00..=U+1FB3B enumerate the 2x3 combinations that have no Block Elements
+/// character of their own, so the four that do exist are skipped here.
+fn sextant_char_to_filled_bits(ch: char) -> Option<u8> {
+    let offset = (ch as u32).checked_sub(0x1FB00)?;
+    if offset > 0x3B {
+        return None;
+    }
+    Some((offset + 1 + u32::from(offset >= 20) + u32::from(offset >= 40)) as u8)
+}
+
+/// The fill a shade character stands in for, as a fraction of the cell.
+///
+/// Fonts draw `░▒▓` as stipple patterns that leave gaps between cells; painting
+/// the shade as a translucent fill keeps a shaded region seamless.
+fn shade_char_opacity(ch: char) -> Option<f32> {
+    match ch {
+        '░' => Some(0.25),
+        '▒' => Some(0.5),
+        '▓' => Some(0.75),
+        _ => None,
+    }
+}
+
+/// Whether a character is a box, block or geometric connector whose colour has
+/// to match its neighbours exactly to keep a border continuous.
+fn is_decorative_character(ch: char) -> bool {
+    matches!(
+        ch as u32,
+        0x2500..=0x257F   // Box Drawing
+            | 0x2580..=0x259F // Block Elements
+            | 0x25A0..=0x25FF // Geometric Shapes
+            | 0x1FB00..=0x1FB3B // Legacy Computing sextants
+            | 0xE0B0..=0xE0D7 // Powerline separators
+    )
+}
+
+/// The grid's metrics for the current theme and window scale.
+fn measured_terminal_cell_metrics(
+    text_system: &gpui::TextSystem,
+    cx: &App,
+    mode: TerminalSurfaceMode,
+) -> TerminalCellMetrics {
+    terminal_cell_metrics(
+        text_system,
+        &terminal_font(cx),
+        f32::from(cx.theme().mono_font_size),
+        mode,
+    )
+}
+
+/// The metrics of the code font, measured from the font itself.
+///
+/// The cell width is the advance of `m`, so every column is exactly one glyph
+/// wide for the font actually in use. A fixed width from a 13px design would
+/// leave the columns and the glyphs in two different coordinate systems.
+fn terminal_cell_metrics(
+    text_system: &gpui::TextSystem,
+    base: &Font,
+    font_size: f32,
+    mode: TerminalSurfaceMode,
+) -> TerminalCellMetrics {
+    let font_size = if font_size.is_finite() {
+        font_size.clamp(TERMINAL_MIN_FONT_SIZE, TERMINAL_MAX_FONT_SIZE)
+    } else {
+        TERMINAL_MIN_FONT_SIZE
+    };
+    let font_pixels = px(font_size);
+    let font_id = text_system.resolve_font(base);
+    let cell_width = text_system
+        .advance(font_id, font_pixels, 'm')
+        .map(|advance| f32::from(advance.width))
+        .unwrap_or(font_size * 0.6)
+        .max(1.0);
+    TerminalCellMetrics {
+        cell_width,
+        cell_height: font_size * TERMINAL_LINE_HEIGHT_RATIO,
+        horizontal_padding: mode.horizontal_padding(),
+        vertical_padding: mode.vertical_padding(),
+    }
+}
+
+/// The font the grid is shaped and measured with: the theme's code family, the
+/// same weight the theme asks for, ligatures off, and the platform's fallbacks
+/// so a missing glyph lands in a font the grid can still measure.
+fn terminal_font(cx: &App) -> Font {
+    let mut font = font(cx.theme().mono_font_family.clone());
+    font.weight = code_font_weight(cx);
+    font.features = FontFeatures::disable_ligatures();
+    font.fallbacks = Some(FontFallbacks::from_fonts(
+        crate::platform::platform_font_fallbacks()
+            .iter()
+            .filter(|name| *name != &cx.theme().mono_font_family.as_ref())
+            .map(|name| (*name).to_string())
+            .collect(),
+    ));
+    font
+}
+
+/// A run of cells with one style, being accumulated during prepaint.
+struct PendingRun {
+    style: TerminalCellStyle,
+    start_column: u16,
+    end_column: u16,
+    text: String,
+    /// Whether every cell in the run is one column wide.
+    ///
+    /// Only a narrow run may have its glyphs forced onto a fixed pitch. A wide
+    /// glyph already covers two cells, and forcing it to one would overlap it
+    /// with its neighbour, so a run holding one keeps the font's own advance.
+    all_narrow: bool,
+}
+
+impl PendingRun {
+    fn new(style: TerminalCellStyle, column: u16) -> Self {
+        Self {
+            style,
+            start_column: column,
+            end_column: column,
+            text: String::new(),
+            all_narrow: true,
+        }
+    }
+
+    fn push_cell(&mut self, column: u16, text: &str, wide: bool) {
+        self.text.extend(text.chars().filter(|ch| !ch.is_control()));
+        self.end_column = column;
+        self.all_narrow &= !wide;
+    }
+
+    fn columns(&self) -> u16 {
+        self.end_column.saturating_sub(self.start_column) + 1
+    }
+}
+
 /// Shape every row of the grid once per frame.
 ///
-/// Each column's text is appended to the row and its byte offset recorded, so a
-/// shaped glyph can be mapped back to the cell it belongs to. Glyphs are painted
-/// at their cell's origin, which keeps the columns aligned to the terminal grid
-/// even when the mono font's advance differs from the cell width.
+/// Each row is cut into runs of adjacent cells that share a style, and each run
+/// is shaped as one line with the cell width forced, so the shaper's own advance
+/// cannot drift the columns away from the grid. Blank cells start no run, which
+/// keeps a screen of prose down to a handful of shaped lines instead of one per
+/// cell.
 fn shape_terminal_grid(
     entity: &Entity<TerminalSurface>,
+    metrics: TerminalCellMetrics,
     window: &mut Window,
     cx: &mut App,
 ) -> TerminalGridLayout {
+    let font_size = f32::from(cx.theme().mono_font_size);
+    let base_font = terminal_font(cx);
     let surface = entity.read(cx);
     let Some(tab) = surface.active_tab.and_then(|index| surface.tabs.get(index)) else {
-        return TerminalGridLayout::default();
+        return TerminalGridLayout::empty(metrics);
     };
     let frame = &tab.frame;
     let rows = frame.rows();
     let columns = frame.columns();
-    let text_style = window.text_style();
-    let font_size = text_style.font_size.to_pixels(window.rem_size());
-    let base_font = text_style.font();
     let default_foreground = cx.theme().foreground;
     let default_background = cx.theme().background;
-    let mut layout = TerminalGridLayout {
-        rows: Vec::with_capacity(usize::from(rows)),
-    };
+    let cursor = frame
+        .cursor()
+        .filter(|_| surface.marked_text.is_none() && surface.cursor_visible);
+    let mut layout = TerminalGridLayout::empty(metrics);
+
+    let mut rest: Vec<TerminalRect> = Vec::new();
+    // The cache lives on the surface, behind a cell so the prepaint pass — which
+    // only has a shared read of the entity — can still reuse what it shaped last
+    // frame.
+    let mut glyph_cache = surface.glyph_cache.borrow_mut();
     for row in 0..rows {
-        let mut text = String::new();
-        let mut column_offsets = Vec::with_capacity(usize::from(columns) + 1);
-        let mut runs: Vec<TextRun> = Vec::new();
-        let mut run_style = (false, false);
+        let mut runs = Vec::new();
+        let mut pending: Option<PendingRun> = None;
         for column in 0..columns {
-            column_offsets.push(text.len());
-            let Some(cell) = frame.cell(TerminalGridPoint { row, column }) else {
+            let point = TerminalGridPoint { row, column };
+            let cell = frame.cell(point);
+            // A blank cell carries no ink. It also ends the current run, because
+            // a run's shaped text must hold adjacent columns only.
+            let style = cell.filter(|cell| !cell_is_blank(cell)).map(|cell| {
+                let (foreground, _) = terminal_cell_colors(
+                    Some(cell),
+                    cursor,
+                    point,
+                    default_foreground,
+                    default_background,
+                );
+                TerminalCellStyle {
+                    foreground,
+                    bold: cell.bold,
+                    italic: cell.italic,
+                    underline: cell.underline || cell.hyperlink.is_some(),
+                    strikeout: cell.strikeout,
+                }
+            });
+            let text = cell.map(|cell| cell.text.as_str()).unwrap_or_default();
+            let wide = cell.is_some_and(|cell| cell.wide || cell.wide_spacer);
+            // Boxes, blocks, quadrants, sextants and the shade ramp are drawn as
+            // rectangles rather than shaped: their whole point is to cover their
+            // cell edge to edge, and a glyph from a vector font never does that
+            // the same way twice. Recording them as geometry is what keeps a
+            // border continuous and a logo made of half blocks legible.
+            if let Some(geometry) = cell_geometry(cell) {
+                let opacity = geometry.opacity;
+                if let Some(run) = pending.take() {
+                    flush_pending_run(
+                        &mut runs,
+                        run,
+                        &base_font,
+                        font_size,
+                        metrics,
+                        &mut glyph_cache,
+                        window,
+                    );
+                }
+                let foreground = style.map(|style| style.foreground).unwrap_or_default();
+                for fill in geometry.fills {
+                    // Adjacent subcells of the same colour merge, so a line of
+                    // full blocks is one quad rather than one per cell.
+                    if let Some(last) = rest.last_mut()
+                        && last.row == row
+                        && last.fill == fill
+                        && last.color == foreground
+                        && last.opacity == opacity
+                        && last.column + 1 == column
+                    {
+                        last.columns = last.columns.saturating_add(1);
+                        continue;
+                    }
+                    rest.push(TerminalRect {
+                        row,
+                        column,
+                        columns: 1,
+                        fill,
+                        color: foreground,
+                        opacity,
+                    });
+                }
                 continue;
-            };
-            // Blank and spacer cells carry no ink; skipping them keeps the shaped
-            // text small and the paint loop free of invisible glyphs.
-            if cell.wide_spacer || cell.hidden || cell.text.trim_end().is_empty() {
-                continue;
             }
-            // A shaped line may not contain newlines, so control characters a
-            // cell should never hold are dropped rather than handed to the shaper.
-            let start = text.len();
-            text.extend(cell.text.chars().filter(|ch| !ch.is_control()));
-            let len = text.len() - start;
-            if len == 0 {
-                continue;
+            match (style, pending.as_mut()) {
+                (Some(style), Some(run)) if run.style == style => {
+                    run.push_cell(column, text, wide);
+                }
+                (Some(style), _) => {
+                    if let Some(run) = pending.take() {
+                        flush_pending_run(
+                            &mut runs,
+                            run,
+                            &base_font,
+                            font_size,
+                            metrics,
+                            &mut glyph_cache,
+                            window,
+                        );
+                    }
+                    let mut run = PendingRun::new(style, column);
+                    run.push_cell(column, text, wide);
+                    pending = Some(run);
+                }
+                (None, Some(_)) => {
+                    if let Some(run) = pending.take() {
+                        flush_pending_run(
+                            &mut runs,
+                            run,
+                            &base_font,
+                            font_size,
+                            metrics,
+                            &mut glyph_cache,
+                            window,
+                        );
+                    }
+                }
+                (None, None) => {}
             }
-            let bold = cell.bold;
-            let italic = cell.italic;
-            let mut font = base_font.clone();
-            if bold {
-                font.weight = FontWeight::BOLD;
-            }
-            if italic {
-                font.style = FontStyle::Italic;
-            }
-            let color = terminal_color(
-                cell.foreground,
-                default_foreground,
-                default_background,
-                default_foreground,
+        }
+        if let Some(run) = pending.take() {
+            flush_pending_run(
+                &mut runs,
+                run,
+                &base_font,
+                font_size,
+                metrics,
+                &mut glyph_cache,
+                window,
             );
-            if runs.is_empty() || run_style != (bold, italic) {
-                runs.push(TextRun {
-                    len,
-                    font,
-                    color,
-                    background_color: None,
-                    underline: None,
-                    strikethrough: None,
-                });
-                run_style = (bold, italic);
-            } else if let Some(run) = runs.last_mut() {
-                run.len += len;
-            }
         }
-        column_offsets.push(text.len());
-        if text.is_empty() {
-            layout.rows.push(None);
-            continue;
-        }
-        let line = window
-            .text_system()
-            .shape_line(text.into(), font_size, &runs, None);
-        layout.rows.push(Some(TerminalRowLayout {
-            line,
-            column_offsets,
-        }));
+        layout.rows.push(runs);
     }
+
+    layout.rects = rest;
     layout
 }
 
-/// The column a shaped glyph belongs to, given the row's per-column byte offsets.
-fn column_for_offset(column_offsets: &[usize], offset: usize) -> usize {
-    column_offsets
-        .partition_point(|start| *start <= offset)
-        .saturating_sub(1)
+/// Shape one accumulated run and record the columns it covers.
+fn flush_pending_run(
+    runs: &mut Vec<TerminalTextRun>,
+    run: PendingRun,
+    base_font: &Font,
+    font_size: f32,
+    metrics: TerminalCellMetrics,
+    cache: &mut std::collections::HashMap<u64, ShapedLine>,
+    window: &mut Window,
+) {
+    if run.text.is_empty() {
+        return;
+    }
+    let text_run = TextRun {
+        len: run.text.len(),
+        font: run.style.font(base_font),
+        color: run.style.foreground,
+        background_color: None,
+        underline: run.style.underline.then(|| gpui::UnderlineStyle {
+            thickness: px(1.0),
+            color: Some(run.style.foreground),
+            wavy: false,
+        }),
+        strikethrough: run.style.strikeout.then(|| gpui::StrikethroughStyle {
+            thickness: px(1.0),
+            color: Some(run.style.foreground),
+        }),
+    };
+    let columns = run.columns();
+    // A narrow run is forced onto the cell pitch, which is what keeps a font
+    // whose advance differs from the measured cell from drifting. A run holding
+    // a wide glyph keeps the font's own advances: the wide glyph already spans
+    // two cells, and forcing every glyph to one cell would overlap it with the
+    // text after it.
+    let force_width = run.all_narrow.then_some(metrics.cell_width);
+    let line = shape_cached_line(cache, &text_run, run.text, font_size, force_width, window);
+    runs.push(TerminalTextRun {
+        line,
+        column: run.start_column,
+        columns,
+    });
+}
+
+/// Spend a fractional line delta as whole lines, carrying the remainder.
+///
+/// A trackpad reports many sub-row deltas per gesture. Rounding each event on
+/// its own threw away slow gestures entirely and turned fast ones into a burst
+/// of fixed jumps; carrying the remainder makes the movement add up to the
+/// distance the fingers actually travelled.
+fn accumulate_scroll_lines(remainder: &mut f32, lines: f32) -> i32 {
+    if !lines.is_finite() {
+        return 0;
+    }
+    *remainder += lines;
+    let whole = remainder.trunc();
+    if whole == 0.0 {
+        return 0;
+    }
+    *remainder -= whole;
+    whole as i32
+}
+
+/// Shape one run, reusing the previous result when nothing about it changed.
+///
+/// A terminal repaints on every output poll and every cursor blink, but a row
+/// that did not change must not be shaped again: the layout costs more than the
+/// paint. A row's text and style are what decide its layout, so the key covers
+/// both — the same bytes in a different colour or weight must reshape.
+fn shape_cached_line(
+    cache: &mut std::collections::HashMap<u64, ShapedLine>,
+    text_run: &TextRun,
+    text: String,
+    font_size: f32,
+    force_width: Option<f32>,
+    window: &mut Window,
+) -> ShapedLine {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    std::hash::Hash::hash(&text, &mut hasher);
+    std::hash::Hash::hash(&text_run.font, &mut hasher);
+    std::hash::Hash::hash(&text_run.color, &mut hasher);
+    std::hash::Hash::hash(&text_run.underline, &mut hasher);
+    std::hash::Hash::hash(&text_run.strikethrough, &mut hasher);
+    std::hash::Hash::hash(&font_size.to_bits(), &mut hasher);
+    std::hash::Hash::hash(&force_width.map(f32::to_bits), &mut hasher);
+    let key = std::hash::Hasher::finish(&hasher);
+    if let Some(line) = cache.get(&key) {
+        return line.clone();
+    }
+    let line = window.text_system().shape_line(
+        text.into(),
+        px(font_size),
+        std::slice::from_ref(text_run),
+        force_width.map(px),
+    );
+    // Rows that leave the screen would otherwise pin their shaped lines
+    // forever; a few screens' worth covers scrolling without letting the cache
+    // grow without bound.
+    if cache.len() > GLYPH_CACHE_LIMIT {
+        cache.clear();
+    }
+    cache.insert(key, line.clone());
+    line
 }
 
 fn cell_bounds(
@@ -2171,6 +2794,10 @@ fn cell_bounds(
 }
 
 /// Paint every cell of the grid: backgrounds, glyphs, decorations and the cursor.
+///
+/// The whole pass runs inside the grid's own content mask, so a grid that is
+/// momentarily larger than the pane it sits in — during a resize, or while an
+/// old frame is still on screen — can never draw over the chrome around it.
 fn paint_terminal_grid(
     bounds: Bounds<Pixels>,
     layout: &TerminalGridLayout,
@@ -2178,26 +2805,167 @@ fn paint_terminal_grid(
     window: &mut Window,
     cx: &mut App,
 ) {
-    let surface = entity.read(cx);
-    let Some(tab) = surface.active_tab.and_then(|index| surface.tabs.get(index)) else {
+    window.with_content_mask(Some(ContentMask { bounds }), |window| {
+        paint_terminal_grid_masked(bounds, layout, entity, window, cx)
+    });
+}
+
+fn paint_terminal_grid_masked(
+    bounds: Bounds<Pixels>,
+    layout: &TerminalGridLayout,
+    entity: &Entity<TerminalSurface>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let metrics = layout.metrics;
+    let default_foreground = cx.theme().foreground;
+    let default_background = cx.theme().background;
+    let cursor = paint_terminal_backgrounds(
+        bounds,
+        layout,
+        entity,
+        default_foreground,
+        default_background,
+        window,
+        cx,
+    );
+
+    // Block, quadrant and sextant characters are filled rectangles, not glyphs:
+    // painting them here keeps a border continuous and a half-block logo legible
+    // whatever the font draws for those code points.
+    paint_terminal_rects(bounds, layout, window);
+
+    // Text next, one shaped run at a time. The shaper laid each run out from its
+    // first column with the cell width forced, so painting it at that column is
+    // enough: every following glyph lands on its own column already. This is
+    // outside the entity borrow above, because painting a shaped line needs
+    // `&mut App`.
+    for (row, runs) in layout.rows.iter().enumerate() {
+        let row_top = bounds.origin.y + px(row as f32 * metrics.cell_height);
+        for text_run in runs {
+            let origin = point(
+                bounds.origin.x + px(f32::from(text_run.column) * metrics.cell_width),
+                row_top,
+            );
+            let _ = text_run.line.paint(
+                origin,
+                px(metrics.cell_height),
+                TextAlign::Left,
+                Some(px(f32::from(text_run.columns) * metrics.cell_width)),
+                window,
+                cx,
+            );
+        }
+    }
+
+    let Some(cursor) = cursor else {
         return;
     };
+    let cursor_bounds = cell_bounds(
+        bounds.origin,
+        TerminalGridPoint {
+            row: cursor.row,
+            column: cursor.column,
+        },
+        metrics,
+    );
+    match cursor.shape {
+        // A block cursor is painted by inverting the cell it sits on, which the
+        // background pass already did.
+        TerminalCursorShape::Block | TerminalCursorShape::Hidden => {}
+        TerminalCursorShape::Beam => {
+            window.paint_quad(fill(
+                Bounds::new(
+                    cursor_bounds.origin,
+                    size(px(1.0), cursor_bounds.size.height),
+                ),
+                default_foreground,
+            ));
+        }
+        TerminalCursorShape::Underline => {
+            window.paint_quad(fill(
+                Bounds::new(
+                    point(
+                        cursor_bounds.origin.x,
+                        cursor_bounds.origin.y + cursor_bounds.size.height - px(1.0),
+                    ),
+                    size(cursor_bounds.size.width, px(1.0)),
+                ),
+                default_foreground,
+            ));
+        }
+        TerminalCursorShape::HollowBlock => {
+            window.paint_quad(outline(
+                cursor_bounds,
+                default_foreground,
+                BorderStyle::default(),
+            ));
+        }
+    }
+}
+
+/// Paint the block, quadrant and sextant rectangles recorded during prepaint.
+///
+/// The subcell grid is 8 columns by 24 lines, the least common multiple of the
+/// eighth-block splits and the sextant splits, so every rectangle lands on a
+/// whole subcell without accumulating rounding error across a row.
+fn paint_terminal_rects(bounds: Bounds<Pixels>, layout: &TerminalGridLayout, window: &mut Window) {
+    let metrics = layout.metrics;
+    let subcell_width = metrics.cell_width / TERMINAL_SUBCELL_COLUMNS;
+    let subcell_height = metrics.cell_height / TERMINAL_SUBCELL_LINES;
+    for rect in &layout.rects {
+        let (x, y, columns, lines) = rect.fill;
+        let origin = point(
+            bounds.origin.x
+                + px(f32::from(rect.column) * metrics.cell_width)
+                + px(f32::from(x) * subcell_width),
+            bounds.origin.y
+                + px(f32::from(rect.row) * metrics.cell_height)
+                + px(f32::from(y) * subcell_height),
+        );
+        let size = size(
+            px((f32::from(columns)
+                + f32::from(rect.columns.saturating_sub(1)) * TERMINAL_SUBCELL_COLUMNS)
+                * subcell_width),
+            px(f32::from(lines) * subcell_height),
+        );
+        if size.width <= px(0.0) || size.height <= px(0.0) {
+            continue;
+        }
+        window.paint_quad(fill(
+            Bounds::new(origin, size),
+            rect.color.opacity(rect.opacity),
+        ));
+    }
+}
+
+/// Paint every cell's background and return the cursor the text pass still owes.
+///
+/// Adjacent cells sharing a background are painted as one quad: a full-screen
+/// TUI in colour used to emit thousands of quads per frame, one per cell, and a
+/// run of the same colour is the common shape. Cells on the default background
+/// need no quad at all — the grid's own fill is that colour already.
+fn paint_terminal_backgrounds(
+    bounds: Bounds<Pixels>,
+    layout: &TerminalGridLayout,
+    entity: &Entity<TerminalSurface>,
+    default_foreground: Hsla,
+    default_background: Hsla,
+    window: &mut Window,
+    cx: &mut App,
+) -> Option<TerminalCursorSnapshot> {
+    let metrics = layout.metrics;
+    let surface = entity.read(cx);
+    let tab = surface
+        .active_tab
+        .and_then(|index| surface.tabs.get(index))?;
     let frame = &tab.frame;
     let rows = frame.rows();
     let columns = frame.columns();
-    let metrics = terminal_cell_metrics(f32::from(cx.theme().mono_font_size), surface.mode);
-    let default_foreground = cx.theme().foreground;
-    let default_background = cx.theme().background;
     let cursor = frame
         .cursor()
         .filter(|_| surface.marked_text.is_none() && surface.cursor_visible);
-    let content_mask = window.content_mask();
-
     for row in 0..rows {
-        // Backgrounds first, so glyphs and decorations land on top of them.
-        // Adjacent cells sharing a background are painted as one quad: a
-        // full-screen TUI in colour used to emit thousands of quads per frame,
-        // one per cell, and a run of the same colour is the common shape.
         let mut run_start: Option<(u16, Hsla)> = None;
         for column in 0..=columns {
             let background = (column < columns).then(|| {
@@ -2234,205 +3002,8 @@ fn paint_terminal_grid(
                 (None, _) => {}
             }
         }
-
-        let Some(row_layout) = layout.rows.get(usize::from(row)).and_then(Option::as_ref) else {
-            continue;
-        };
-        let row_top = bounds.origin.y + px(f32::from(row) * metrics.cell_height);
-        let ascent = row_layout.line.ascent;
-        let descent = row_layout.line.descent;
-        let baseline = row_top
-            + px((metrics.cell_height - f32::from(ascent) - f32::from(descent)) / 2.0)
-            + ascent;
-
-        // Glyphs are painted one by one at their cell's origin. The shaped
-        // positions only contribute the offset inside the cell, which keeps
-        // combining marks and ligatures intact without letting the font's
-        // advance drift the columns away from the terminal grid.
-        let mut column = 0usize;
-        let mut column_base_x = px(0.0);
-        for run in &row_layout.line.runs {
-            for glyph in &run.glyphs {
-                let glyph_column = column_for_offset(&row_layout.column_offsets, glyph.index);
-                if glyph_column != column {
-                    column = glyph_column;
-                    column_base_x = glyph.position.x;
-                }
-                let Some(column) = u16::try_from(column).ok() else {
-                    continue;
-                };
-                let cell_point = TerminalGridPoint { row, column };
-                let (foreground, _) = terminal_cell_colors(
-                    frame.cell(cell_point),
-                    cursor,
-                    cell_point,
-                    default_foreground,
-                    default_background,
-                );
-                let origin = point(
-                    bounds.origin.x
-                        + px(f32::from(column) * metrics.cell_width)
-                        + (glyph.position.x - column_base_x),
-                    baseline + glyph.position.y,
-                );
-                let glyph_bounds = Bounds::new(
-                    origin,
-                    size(px(metrics.cell_width), px(metrics.cell_height)),
-                );
-                if !glyph_bounds.intersects(&content_mask.bounds) {
-                    continue;
-                }
-                if glyph.is_emoji {
-                    let _ = window.paint_emoji(
-                        origin,
-                        run.font_id,
-                        glyph.id,
-                        row_layout.line.font_size,
-                    );
-                } else {
-                    let _ = window.paint_glyph(
-                        origin,
-                        run.font_id,
-                        glyph.id,
-                        row_layout.line.font_size,
-                        foreground,
-                    );
-                }
-            }
-        }
-
-        // Underlines and strikethroughs belong to cells, not to glyphs, so they
-        // are drawn from the frame and merged across neighbouring columns.
-        let underline_y = baseline + px(f32::from(descent) * 0.618);
-        let strikeout_y = row_top + (px(f32::from(ascent) * 0.5) + (baseline - row_top)) * 0.5;
-        let mut underline_start: Option<u16> = None;
-        let mut strikeout_start: Option<u16> = None;
-        for column in 0..=columns {
-            let cell = (column < columns)
-                .then(|| frame.cell(TerminalGridPoint { row, column }))
-                .flatten();
-            let underlined = cell.is_some_and(|cell| cell.underline || cell.hyperlink.is_some());
-            let strikeout = cell.is_some_and(|cell| cell.strikeout);
-            if underlined != underline_start.is_some() {
-                if let Some(start) = underline_start.take() {
-                    paint_cell_decoration(
-                        frame,
-                        bounds,
-                        row,
-                        start,
-                        column,
-                        underline_y,
-                        metrics,
-                        default_foreground,
-                        window,
-                    );
-                } else {
-                    underline_start = Some(column);
-                }
-            }
-            if strikeout != strikeout_start.is_some() {
-                if let Some(start) = strikeout_start.take() {
-                    paint_cell_decoration(
-                        frame,
-                        bounds,
-                        row,
-                        start,
-                        column,
-                        strikeout_y,
-                        metrics,
-                        default_foreground,
-                        window,
-                    );
-                } else {
-                    strikeout_start = Some(column);
-                }
-            }
-        }
     }
-
-    let Some(cursor) = cursor else {
-        return;
-    };
-    let cursor_bounds = cell_bounds(
-        bounds.origin,
-        TerminalGridPoint {
-            row: cursor.row,
-            column: cursor.column,
-        },
-        metrics,
-    );
-    match cursor.shape {
-        // A block cursor is painted by inverting the cell it sits on.
-        TerminalCursorShape::Block | TerminalCursorShape::Hidden => {}
-        TerminalCursorShape::Beam => {
-            window.paint_quad(fill(
-                Bounds::new(
-                    cursor_bounds.origin,
-                    size(px(1.0), cursor_bounds.size.height),
-                ),
-                default_foreground,
-            ));
-        }
-        TerminalCursorShape::Underline => {
-            window.paint_quad(fill(
-                Bounds::new(
-                    point(
-                        cursor_bounds.origin.x,
-                        cursor_bounds.origin.y + cursor_bounds.size.height - px(1.0),
-                    ),
-                    size(cursor_bounds.size.width, px(1.0)),
-                ),
-                default_foreground,
-            ));
-        }
-        TerminalCursorShape::HollowBlock => {
-            window.paint_quad(outline(
-                cursor_bounds,
-                default_foreground,
-                BorderStyle::default(),
-            ));
-        }
-    }
-}
-
-/// Paint one horizontal cell decoration across `start..end`, coloured by the
-/// foreground of the run's first cell.
-#[allow(clippy::too_many_arguments)]
-fn paint_cell_decoration(
-    frame: &TerminalFrameCache,
-    bounds: Bounds<Pixels>,
-    row: u16,
-    start: u16,
-    end: u16,
-    y: Pixels,
-    metrics: TerminalCellMetrics,
-    default_foreground: Hsla,
-    window: &mut Window,
-) {
-    if end <= start {
-        return;
-    }
-    let color = frame
-        .cell(TerminalGridPoint { row, column: start })
-        .map(|cell| {
-            terminal_color(
-                cell.foreground,
-                default_foreground,
-                default_foreground,
-                default_foreground,
-            )
-        })
-        .unwrap_or(default_foreground);
-    window.paint_quad(fill(
-        Bounds::new(
-            point(
-                bounds.origin.x + px(f32::from(start) * metrics.cell_width),
-                y,
-            ),
-            size(px(f32::from(end - start) * metrics.cell_width), px(1.0)),
-        ),
-        color,
-    ));
+    cursor
 }
 
 impl EntityInputHandler for TerminalSurface {
@@ -2505,7 +3076,7 @@ impl EntityInputHandler for TerminalSurface {
         range_utf16: Range<usize>,
         element_bounds: Bounds<Pixels>,
         _: &mut Window,
-        cx: &mut Context<Self>,
+        _: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
         let cursor = self
             .active_tab
@@ -2514,7 +3085,9 @@ impl EntityInputHandler for TerminalSurface {
             .cursor()?;
         let start = range_utf16.start as f32;
         let width = range_utf16.end.saturating_sub(range_utf16.start).max(1) as f32;
-        let cell_metrics = terminal_cell_metrics(f32::from(cx.theme().mono_font_size), self.mode);
+        // The grid's own metrics, so the IME candidate window lands on the cell
+        // the cursor is actually painted in rather than on a design constant.
+        let cell_metrics = self.cell_metrics;
         Some(Bounds::new(
             point(
                 element_bounds.left()
@@ -2640,21 +3213,6 @@ async fn run_poll_work(work: TerminalPollWork) -> TerminalPollResult {
         session: Some(session),
         result,
         pty_replies,
-    }
-}
-
-fn terminal_cell_metrics(code_font_size: f32, mode: TerminalSurfaceMode) -> TerminalCellMetrics {
-    let code_font_size = if code_font_size.is_finite() {
-        code_font_size.clamp(TERMINAL_MIN_FONT_SIZE, TERMINAL_MAX_FONT_SIZE)
-    } else {
-        TERMINAL_BASE_FONT_SIZE
-    };
-    let scale = code_font_size / TERMINAL_BASE_FONT_SIZE;
-    TerminalCellMetrics {
-        cell_width: TERMINAL_BASE_CELL_WIDTH * scale,
-        cell_height: TERMINAL_BASE_CELL_HEIGHT * scale,
-        horizontal_padding: mode.horizontal_padding(),
-        vertical_padding: mode.vertical_padding(),
     }
 }
 
@@ -2824,35 +3382,106 @@ mod tests {
         (surface, cx)
     }
 
+    /// A run of narrow cells is forced onto the cell pitch; a run holding a wide
+    /// glyph is not, because a wide glyph already spans two cells and forcing
+    /// every glyph to one cell would overlap it with the text after it.
     #[gpui::test]
-    fn grid_shapes_glyphs_against_their_own_columns(cx: &mut TestAppContext) {
-        let (surface, mut cx) = styled_terminal_surface(cx);
-        let layout = cx.update(|window, cx| shape_terminal_grid(&surface, window, cx));
-        let row = layout.rows[0]
-            .as_ref()
-            .expect("the first row should shape a line");
-        assert_eq!(row.line.text.as_ref(), "underlinedplainred");
-
-        let mut columns = row
-            .line
-            .runs
-            .iter()
-            .flat_map(|run| run.glyphs.iter())
-            .map(|glyph| column_for_offset(&row.column_offsets, glyph.index))
-            .collect::<Vec<_>>();
-        columns.sort_unstable();
-        columns.dedup();
-        let mut expected = (0..=9).chain(11..=15).chain(17..=19).collect::<Vec<_>>();
-        expected.sort_unstable();
-        assert_eq!(
-            columns, expected,
-            "blank cells stay out of the shaped text without shifting any column"
+    fn only_narrow_runs_are_forced_onto_the_cell_pitch(cx: &mut TestAppContext) {
+        let mut narrow = PendingRun::new(
+            TerminalCellStyle {
+                foreground: rgb(0xffffff).into(),
+                bold: false,
+                italic: false,
+                underline: false,
+                strikeout: false,
+            },
+            0,
         );
-        assert!(layout.rows[1..].iter().all(Option::is_none));
+        narrow.push_cell(0, "a", false);
+        narrow.push_cell(1, "b", false);
+        assert!(narrow.all_narrow);
+        assert_eq!(narrow.columns(), 2);
+
+        narrow.push_cell(2, "中", true);
+        assert!(
+            !narrow.all_narrow,
+            "a wide cell must disarm the fixed pitch for the whole run"
+        );
+        assert_eq!(narrow.columns(), 3);
     }
 
     #[gpui::test]
-    fn grid_paints_cells_decorations_and_cursor_at_cell_geometry(cx: &mut TestAppContext) {
+    fn grid_shapes_runs_that_start_at_their_own_columns(cx: &mut TestAppContext) {
+        let (surface, mut cx) = styled_terminal_surface(cx);
+        let layout = cx.update(|window, cx| {
+            let metrics = measured_terminal_cell_metrics(
+                cx.text_system().as_ref(),
+                cx,
+                TerminalSurfaceMode::Standalone,
+            );
+            shape_terminal_grid(&surface, metrics, window, cx)
+        });
+        let row = &layout.rows[0];
+        // Three styles on one line: underlined, plain, then red-on-ANSI-red.
+        // Blank cells between them start no run, so the line becomes three runs
+        // and each one begins at the column its first glyph belongs to.
+        assert_eq!(
+            row.len(),
+            3,
+            "one run per style change: {:?}",
+            row.iter()
+                .map(|run| (run.column, run.columns, run.line.text.to_string()))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(row[0].column, 0);
+        assert_eq!(row[0].line.text.as_ref(), "underlined");
+        assert_eq!(row[1].column, 11);
+        assert_eq!(row[1].line.text.as_ref(), "plain");
+        assert_eq!(row[2].column, 17);
+        assert_eq!(row[2].line.text.as_ref(), "red");
+        assert!(layout.rows[1..].iter().all(Vec::is_empty));
+    }
+
+    /// A run is shaped with the cell width forced, so a font whose advance does
+    /// not match the cell cannot drift the later columns away from the grid.
+    #[gpui::test]
+    fn shaped_runs_keep_the_measured_cell_width(cx: &mut TestAppContext) {
+        let (surface, mut cx) = styled_terminal_surface(cx);
+        let (layout, cell_width) = cx.update(|window, cx| {
+            let metrics = measured_terminal_cell_metrics(
+                cx.text_system().as_ref(),
+                cx,
+                TerminalSurfaceMode::Standalone,
+            );
+            let layout = shape_terminal_grid(&surface, metrics, window, cx);
+            let width = layout.metrics.cell_width;
+            (layout, width)
+        });
+        assert!(cell_width > 0.0);
+        let run = &layout.rows[0][2];
+        assert_eq!(run.columns, 3, "three cells in the run");
+        // The shaped advances are the cell width, whatever the font's own
+        // advance is: this is what force_width buys.
+        let mut seen = Vec::new();
+        for glyph in run.line.runs.iter().flat_map(|run| run.glyphs.iter()) {
+            seen.push(f32::from(glyph.position.x));
+        }
+        seen.sort_by(f32::total_cmp);
+        for (index, x) in seen.iter().enumerate() {
+            let expected = index as f32 * cell_width;
+            assert!(
+                (x - expected).abs() < 0.51,
+                "glyph {index} sits at {x}, expected about {expected}"
+            );
+        }
+        assert_eq!(
+            layout.metrics.cell_height,
+            f32::from(cx.update(|_, cx| cx.theme().mono_font_size)) * TERMINAL_LINE_HEIGHT_RATIO
+        );
+    }
+
+    #[gpui::test]
+    fn grid_paints_backgrounds_at_cell_geometry(cx: &mut TestAppContext) {
         let (surface, mut cx) = styled_terminal_surface(cx);
         let (grid_origin, metrics, foreground, background) =
             surface.read_with(&cx, |surface, cx| {
@@ -2867,6 +3496,10 @@ mod tests {
         let origin = point(f32::from(grid_origin.x), f32::from(grid_origin.y));
         let cell_width = metrics.cell_width;
         let cell_height = metrics.cell_height;
+        // Painted quads snap to the device pixel grid, so a quad edge can land
+        // up to one device pixel away from its exact logical position.
+        let snap = 1.0 / scale.max(1.0);
+        let near = |a: f32, b: f32| (a - b).abs() <= snap + 0.01;
         let quads = cx.update(|window, _| window.painted_quads());
 
         let solid = |color: Hsla| {
@@ -2890,38 +3523,40 @@ mod tests {
         assert_eq!(red.len(), 1, "one quad for a run of red cells: {red:?}");
         let (x, y, width, height) = red[0];
         assert!(
-            (width - 3.0 * cell_width).abs() < 0.01,
-            "run width: {width}"
+            near(width, 3.0 * cell_width),
+            "run width: {width}, cell width: {cell_width}"
         );
-        assert!((height - cell_height).abs() < 0.01);
-        assert!((y - origin.y).abs() < 0.01, "red cell should sit in row 0");
+        assert!(near(height, cell_height), "run height: {height}");
+        assert!(near(y, origin.y), "red cell should sit in row 0");
         let expected_x = origin.x + 17.0 * cell_width;
         assert!(
-            (x - expected_x).abs() < 0.01,
+            near(x, expected_x),
             "red run should start at column 17: {x} vs {expected_x}"
         );
 
-        // The underline run covers the ten `underlined` cells, and nothing else.
-        let decorations = solid(foreground);
-        let underline = decorations
-            .iter()
-            .find(|(x, _, width, _)| {
-                (*x - origin.x).abs() < 0.01 && (width - 10.0 * cell_width).abs() < 0.01
-            })
-            .unwrap_or_else(|| panic!("underline quad missing: {decorations:?}"));
-        assert!(underline.1 > origin.y && underline.1 < origin.y + cell_height);
-        assert!((underline.3 - 1.0).abs() < 0.01);
+        // A cell on the default background paints no quad: the grid's own fill
+        // stands in for it, which is one fewer quad per frame. The window's own
+        // background is a different quad entirely, so the check looks for a
+        // cell-sized one.
+        let cell_sized_background = solid(background)
+            .into_iter()
+            .filter(|(_, _, _, height)| near(*height, cell_height))
+            .collect::<Vec<_>>();
+        assert!(
+            cell_sized_background.is_empty(),
+            "default-background cells must not paint a quad: {cell_sized_background:?}"
+        );
 
         // The block cursor inverts the cell after the text.
-        let cursor = decorations
-            .iter()
+        let cursor = solid(foreground)
+            .into_iter()
             .find(|(x, y, width, height)| {
-                (width - cell_width).abs() < 0.01
-                    && (height - cell_height).abs() < 0.01
-                    && (y - origin.y).abs() < 0.01
-                    && (*x - (origin.x + 20.0 * cell_width)).abs() < 0.01
+                near(*width, cell_width)
+                    && near(*height, cell_height)
+                    && near(*y, origin.y)
+                    && near(*x, origin.x + 20.0 * cell_width)
             })
-            .unwrap_or_else(|| panic!("block cursor quad missing: {decorations:?}"));
+            .unwrap_or_else(|| panic!("block cursor quad missing"));
         assert!(cursor.2 > 0.0);
         assert_ne!(foreground, background);
     }
@@ -3084,26 +3719,143 @@ mod tests {
         );
     }
 
+    #[gpui::test]
+    fn terminal_cell_metrics_clamp_the_font_and_keep_the_insets(cx: &mut TestAppContext) {
+        let base = font("Test Mono");
+        let metrics = |cx: &mut TestAppContext, size: f32, mode| {
+            let text_system = cx.update(|cx| cx.text_system().clone());
+            terminal_cell_metrics(text_system.as_ref(), &base, size, mode)
+        };
+
+        for (size, mode) in [
+            (13.0, TerminalSurfaceMode::Standalone),
+            (1.0, TerminalSurfaceMode::Preview),
+            (100.0, TerminalSurfaceMode::Composer),
+            (f32::NAN, TerminalSurfaceMode::Session),
+        ] {
+            let measured = metrics(cx, size, mode);
+            // The cell is measured, so it is positive and its height is the
+            // clamped font size times the line box. A NaN font size lands on the
+            // minimum rather than producing a zero-sized grid.
+            assert!(measured.cell_width > 0.0, "width for {size}: {measured:?}");
+            let clamped = if size.is_finite() {
+                size.clamp(TERMINAL_MIN_FONT_SIZE, TERMINAL_MAX_FONT_SIZE)
+            } else {
+                TERMINAL_MIN_FONT_SIZE
+            };
+            assert!(
+                (measured.cell_height - clamped * TERMINAL_LINE_HEIGHT_RATIO).abs() < 0.01,
+                "height for {size}: {measured:?}"
+            );
+            assert_eq!(measured.horizontal_padding, mode.horizontal_padding());
+            assert_eq!(measured.vertical_padding, mode.vertical_padding());
+        }
+
+        // Two sizes scale the cell by their ratio, because both are measured
+        // from the same font.
+        let small = metrics(cx, 11.0, TerminalSurfaceMode::Standalone);
+        let large = metrics(cx, 22.0, TerminalSurfaceMode::Standalone);
+        assert!((large.cell_width / small.cell_width - 2.0).abs() < 0.05);
+        assert!((large.cell_height / small.cell_height - 2.0).abs() < 0.05);
+    }
+
     #[test]
-    fn terminal_cell_metrics_follow_clamped_code_font_size() {
-        let default = terminal_cell_metrics(13.0, TerminalSurfaceMode::Standalone);
-        assert_eq!(default.cell_width, 8.0);
-        assert_eq!(default.cell_height, 18.0);
+    fn scroll_deltas_accumulate_into_whole_lines() {
+        // A trackpad reports sub-row deltas; carrying the remainder is what
+        // turns a slow gesture into an actual scroll instead of rounding every
+        // event to zero, and a fast one into exactly the lines it travelled.
+        let mut remainder = 0.0;
 
-        let minimum = terminal_cell_metrics(1.0, TerminalSurfaceMode::Preview);
-        assert_eq!(minimum.cell_width, 80.0 / 13.0);
-        assert_eq!(minimum.cell_height, 180.0 / 13.0);
-        assert_eq!(minimum.horizontal_padding, PREVIEW_TERMINAL_PADDING);
+        assert_eq!(accumulate_scroll_lines(&mut remainder, 0.4), 0);
+        assert_eq!(accumulate_scroll_lines(&mut remainder, 0.4), 0);
+        assert_eq!(accumulate_scroll_lines(&mut remainder, 0.4), 1);
+        assert!(remainder < 0.25);
 
-        let maximum = terminal_cell_metrics(100.0, TerminalSurfaceMode::Composer);
-        assert_eq!(maximum.cell_width, 192.0 / 13.0);
-        assert_eq!(maximum.cell_height, 432.0 / 13.0);
-        assert_eq!(maximum.vertical_padding, COMPOSER_TERMINAL_PADDING);
+        // Truncation is toward zero, so a reversal spends the remainder it
+        // already had instead of jumping a whole line early.
+        assert_eq!(accumulate_scroll_lines(&mut remainder, -1.0), 0);
+        assert_eq!(accumulate_scroll_lines(&mut remainder, -1.0), -1);
+        assert_eq!(accumulate_scroll_lines(&mut remainder, -0.5), -1);
+        assert_eq!(accumulate_scroll_lines(&mut remainder, f32::NAN), 0);
+        // A gesture that reverses direction spends the remainder it had.
+        let mut remainder = 0.75;
+        assert_eq!(accumulate_scroll_lines(&mut remainder, -0.5), 0);
+        assert!(remainder > 0.0 && remainder < 0.3);
+    }
 
-        assert_eq!(
-            terminal_cell_metrics(f32::NAN, TerminalSurfaceMode::Standalone),
-            default
+    #[test]
+    fn block_and_shade_characters_paint_as_rectangles() {
+        // Half blocks and the shade ramp are geometry, not ink: they have to
+        // cover their cell edge to edge whatever the font draws for them.
+        assert_eq!(block_char_to_rect('▀'), Some((0, 0, 8, 12)));
+        assert_eq!(block_char_to_rect('█'), Some((0, 0, 8, 24)));
+        assert_eq!(block_char_to_rect('▌'), Some((0, 0, 4, 24)));
+        assert_eq!(block_char_to_rect('▐'), Some((4, 0, 4, 24)));
+        assert_eq!(block_char_to_rect('▁'), Some((0, 21, 8, 3)));
+        assert_eq!(block_char_to_rect('a'), None);
+
+        assert_eq!(quadrant_char_to_filled_bits('▛'), Some(0b0111));
+        assert_eq!(quadrant_char_to_filled_bits('▞'), Some(0b0110));
+        assert_eq!(quadrant_char_to_filled_bits('x'), None);
+
+        assert_eq!(sextant_char_to_filled_bits('\u{1FB00}'), Some(1));
+        // The all-filled sextant is `█`, which Block Elements already owns, so
+        // the range stops one short of it.
+        assert_eq!(sextant_char_to_filled_bits('\u{1FB3B}'), Some(0b111110));
+        assert_eq!(sextant_char_to_filled_bits('x'), None);
+
+        assert_eq!(shade_char_opacity('░'), Some(0.25));
+        assert_eq!(shade_char_opacity('▒'), Some(0.5));
+        assert_eq!(shade_char_opacity('▓'), Some(0.75));
+        assert_eq!(shade_char_opacity('█'), None);
+
+        // Connectors keep their exact colour so a border stays continuous.
+        assert!(is_decorative_character('─'));
+        assert!(is_decorative_character('█'));
+        assert!(is_decorative_character('▶'));
+        assert!(is_decorative_character('\u{E0B0}'));
+        assert!(!is_decorative_character('a'));
+    }
+
+    #[test]
+    fn low_contrast_ink_is_lifted_until_it_reads() {
+        let background: Hsla = rgb(0x101014).into();
+        // A theme that hands out a near-background ink is corrected.
+        let washed: Hsla = rgb(0x14141a).into();
+        assert!(contrast_ratio(washed, background) < TERMINAL_MINIMUM_CONTRAST);
+        let lifted = ensure_minimum_contrast(washed, background);
+        assert!(
+            contrast_ratio(lifted, background) >= TERMINAL_MINIMUM_CONTRAST,
+            "lifted ink should clear the floor"
         );
+
+        // Ink that already reads is left exactly as the program chose it.
+        let readable: Hsla = rgb(0xfafafa).into();
+        assert_eq!(ensure_minimum_contrast(readable, background), readable);
+
+        // On a light background the correction walks the other way.
+        let light: Hsla = rgb(0xfdfdfd).into();
+        let faint: Hsla = rgb(0xf4f4f6).into();
+        let darkened = ensure_minimum_contrast(faint, light);
+        assert!(relative_luminance(darkened) < relative_luminance(faint));
+    }
+
+    #[test]
+    fn only_theme_chosen_colours_are_contrast_adjusted() {
+        // ANSI slots 0..=15 come from the theme and may clash with it.
+        assert!(is_theme_chosen_color(TerminalCellColor::Named { index: 1 }));
+        assert!(is_theme_chosen_color(TerminalCellColor::Indexed {
+            index: 9
+        }));
+        // A program's own 256-colour pick and its true colour do not.
+        assert!(!is_theme_chosen_color(TerminalCellColor::Indexed {
+            index: 16
+        }));
+        assert!(!is_theme_chosen_color(TerminalCellColor::Rgb {
+            red: 1,
+            green: 2,
+            blue: 3
+        }));
     }
 
     #[test]
@@ -3253,10 +4005,8 @@ mod tests {
             Vec::<Vec<u8>>::new()
         );
         let marked_bounds = marked_bounds.expect("IME bounds should follow the terminal cursor");
-        assert_eq!(
-            marked_bounds.size.height,
-            px(terminal_cell_metrics(13.0, TerminalSurfaceMode::Standalone).cell_height)
-        );
+        let cell_height = surface.read_with(&cx, |surface, _| surface.cell_metrics.cell_height);
+        assert_eq!(marked_bounds.size.height, px(cell_height));
 
         cx.update(|window, cx| {
             surface.update(cx, |surface, cx| {
