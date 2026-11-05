@@ -56226,7 +56226,11 @@ impl VibexWorkbench {
         let current = self.ui_state.session.new_session_transport;
         let is_dark = cx.theme().is_dark();
         let track = theme::semantic_color("muted", is_dark).opacity(0.55);
-        let selected_bg = theme::semantic_color("background", is_dark);
+        // The raised segment is the card, not the page background: on a dark
+        // theme `background` and the track are nearly the same colour, so the
+        // accent label drawn on it disappeared into its own segment.
+        let selected_bg = theme::semantic_color("card", is_dark);
+        let selected_fg = cx.theme().foreground;
         let unselected = cx.theme().muted_foreground;
         let terminal_accent = theme::semantic_color("accent", is_dark);
         let disabled_label = crate::locale::text(
@@ -57969,14 +57973,15 @@ impl VibexWorkbench {
                                                 .items_center()
                                                 .gap_2()
                                                 .px_4()
-                                                .pt_2()
+                                                .pt_3()
                                                 .pb_1()
                                                 .font_family(prompt_font.clone())
-                                                .text_size(px(11.0))
-                                                .text_color(cx.theme().muted_foreground)
+                                                .text_size(px(12.0))
                                                 .child(
-                                                    Icon::new(IconName::SquareTerminal)
-                                                        .size(px(11.0)),
+                                                    div()
+                                                        .flex_none()
+                                                        .text_color(cx.theme().accent)
+                                                        .child("❯"),
                                                 )
                                                 .child(div().truncate().child(terminal_title_line.clone())),
                                         )
@@ -71368,9 +71373,11 @@ impl VibexWorkbench {
             .get(&key)
             .cloned()
             .map(|surface| {
-                surface
-                    .cached(StyleRefinement::default().size_full())
-                    .into_any_element()
+                // Rendered directly rather than through `cached`: a cached
+                // element keeps the size it was first laid out at, so opening or
+                // collapsing the right rail left the grid measuring the old
+                // width and the PTY never claimed the space back.
+                surface.into_any_element()
             })
             .unwrap_or_else(|| self.render_session_terminal_placeholder(&session, cx));
         v_flex()
@@ -105414,7 +105421,10 @@ mod tests {
         // Terminal mode takes the terminal surface and its title strip.
         assert!(panel.contains("bg(terminal_surface_color)"));
         assert!(panel.contains("new-session-terminal-title"));
+        // The header names the login and the checkout, and nothing else: a clock
+        // or a version there is chrome the reader did not ask for.
         assert!(panel.contains("terminal_title_line.clone()"));
+        assert!(!panel.contains("terminal_title_clock"));
         // The silhouette is the page's in both modes: switching changes what the
         // box is, not how much room it takes.
         assert!(panel.contains(".rounded(px(20.0))"));
