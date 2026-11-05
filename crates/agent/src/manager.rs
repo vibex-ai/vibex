@@ -3079,6 +3079,98 @@ impl AgentManager {
         Ok(())
     }
 
+    /// Starts a terminal session's Agent again, from the argv it recorded.
+    ///
+    /// The reader quit the CLI, or it crashed; the session row and its link
+    /// survived that on purpose, so restarting is the same command in the same
+    /// checkout rather than a new session that happens to look alike. The argv is
+    /// what makes it the same: a resume id or a model flag is not recoverable
+    /// from anything else.
+    ///
+    /// A session whose process is still running is left alone — pressing restart
+    /// twice must not start a second Agent beside the first.
+    pub async fn restart_terminal_session(
+        &self,
+        session_id: &VibexSessionId,
+    ) -> VibexResult<AgentSession> {
+        let launcher = self.session_terminal_launcher().ok_or_else(|| {
+            VibexError::capability(
+                "terminal_session_unsupported",
+                "this runtime cannot start terminal-mode sessions",
+            )
+        })?;
+        let conn = self.open_migrated()?;
+        let session = self.client_session_snapshot(&conn, session_id)?.ok_or_else(|| {
+            VibexError::validation("session_not_found", "Agent session was not found")
+        })?;
+        if !session.transport.is_terminal() {
+            return Err(VibexError::conflict(
+                "session_transport_mismatch",
+                "this session does not run in a terminal",
+            )
+            .with_diagnostic("sessionId", session_id.as_str()));
+        }
+        let record = SessionTerminalRepository::get(&conn, session_id)?.ok_or_else(|| {
+            VibexError::validation(
+                "session_terminal_missing",
+                "the session has no recorded terminal to restart",
+            )
+        })?;
+        if launcher.is_running(&record.terminal_id) {
+            return Ok(session);
+        }
+        // The environment is re-resolved from the Profile rather than kept: the
+        // credentials never touched the database, so this is the only way the
+        // restarted Agent reaches the same provider.
+        let env = match record.provider_profile_id.as_ref() {
+            Some(profile_id) => self.terminal_session_env_overlays(profile_id, &session)?,
+            None => Vec::new(),
+        };
+        let spec = vibex_core::TerminalSessionLaunchSpec {
+            workspace_id: record.workspace_id.clone(),
+            workspace_root: session.workspace_root.clone(),
+            argv: record.argv.clone(),
+            env,
+            title: session.title.clone(),
+            rows: 24,
+            cols: 100,
+        };
+        let handle = match launcher.restore(&spec, &record.terminal_id)? {
+            Some(handle) => handle,
+            None => {
+                return Err(VibexError::capability(
+                    "terminal_session_restart_unsupported",
+                    "this runtime cannot restart the session's terminal",
+                ));
+            }
+        };
+        SessionTerminalRepository::upsert_with_profile(
+            &conn,
+            session_id,
+            &handle.terminal_id,
+            &record.workspace_id,
+            &record.argv,
+            &session.workspace_root,
+            record.provider_profile_id.as_ref(),
+        )?;
+        launcher.watch_session(
+            &handle.terminal_id,
+            session_id.as_str(),
+            &session.agent_id,
+            spec.rows,
+            spec.cols,
+        );
+        SessionRepository::update_state(&conn, session_id, AgentSessionState::Idle)?;
+        let restarted = self.client_session_snapshot(&conn, session_id)?.ok_or_else(|| {
+            VibexError::storage(
+                "terminal_session_missing_after_restart",
+                "the terminal session could not be reloaded",
+            )
+        })?;
+        self.publish_root_session_update(&conn, restarted.clone());
+        Ok(restarted)
+    }
+
     /// Records that a terminal session's Agent process has ended.
     ///
     /// The screen cannot say this: a TUI that stopped repainting reads like one
@@ -13104,6 +13196,62 @@ mod tests {
                 .and_then(|facts| facts.terminal_id.as_ref())
                 .is_some(),
             "retiring must not drop the link"
+        );
+    }
+
+
+    /// A session whose Agent quit can be started again, with the same command.
+    ///
+    /// The row and the link survive a quit on purpose, so restarting is the same
+    /// Agent in the same checkout rather than a lookalike: the argv, the working
+    /// directory and the Provider Profile all come back from the link.
+    #[tokio::test]
+    async fn a_closed_terminal_session_restarts_with_the_same_command() {
+        let (manager, launcher, dir) = terminal_manager();
+        let mut request = terminal_request("claude", &dir);
+        request.args = vec!["--model".to_string(), "claude-opus-4-6".to_string()];
+        let session = manager.create_terminal_session(request).await.unwrap();
+        let first_terminal = launcher.watched()[0].0.clone();
+
+        // The reader quits the CLI.
+        launcher.kill(&first_terminal).unwrap();
+        manager.mark_session_terminal_ended(&session.id).unwrap();
+        assert_eq!(
+            manager.get_session(&session.id).await.unwrap().state,
+            AgentSessionState::Closed
+        );
+
+        let restarted = manager.restart_terminal_session(&session.id).await.unwrap();
+        assert_eq!(restarted.state, AgentSessionState::Idle);
+        // Same command, including the model the page chose.
+        let launches = launcher.launches();
+        assert_eq!(
+            launches.last().expect("the restart launched").argv,
+            vec!["claude", "--model", "claude-opus-4-6"]
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        );
+        // And it is watched again, so the sidebar can report its activity.
+        let watched = launcher.watched();
+        assert_eq!(watched.last().expect("the restart is watched").1, session.id.as_str());
+    }
+
+    /// Restarting a session that is already running starts nothing.
+    #[tokio::test]
+    async fn restarting_a_live_terminal_session_does_not_start_a_second_agent() {
+        let (manager, launcher, dir) = terminal_manager();
+        let session = manager
+            .create_terminal_session(terminal_request("claude", &dir))
+            .await
+            .unwrap();
+        let before = launcher.launches().len();
+        let restarted = manager.restart_terminal_session(&session.id).await.unwrap();
+        assert_eq!(restarted.id, session.id);
+        assert_eq!(
+            launcher.launches().len(),
+            before,
+            "a second press must not start a second Agent"
         );
     }
 

@@ -250,6 +250,24 @@ pub trait AgentBackend: BackendBound {
         })
     }
 
+    /// Starts a terminal session's Agent again after its process ended.
+    ///
+    /// The session row survives a quit on purpose, so this is a restart of the
+    /// same command rather than a new session. A backend with no PTY answers with
+    /// `terminal_session_unsupported`.
+    fn restart_terminal_session(
+        &self,
+        session_id: vibex_core::VibexSessionId,
+    ) -> BackendFuture<'_, AgentSession> {
+        let _ = session_id;
+        Box::pin(async {
+            Err(crate::BackendError::unsupported(
+                "terminal_session_unsupported",
+                "this backend cannot restart terminal-mode sessions",
+            ))
+        })
+    }
+
     fn fetch_timeline(&self, request: FetchTimelineRequest) -> BackendFuture<'_, TimelinePage>;
 
     /// Reads one timeline item back at full payload depth.

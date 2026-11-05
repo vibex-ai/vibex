@@ -9443,6 +9443,10 @@ pub struct VibexWorkbench {
     active_session_terminal_id: Option<String>,
     /// The session page's terminal render boundary, created on first use.
     session_terminal_view: Option<Entity<SessionTerminalView>>,
+    /// The terminal session whose restart is in flight, so its button can say so.
+    terminal_session_restart_pending: Option<String>,
+    /// A failed restart, shown on the page that offered it.
+    session_terminal_error: Option<String>,
     config: Option<DesktopRuntimeConfig>,
     runtime: Option<Arc<DesktopRuntime>>,
     /// The computer-use runtime, kept so the panel can be opened from anywhere
@@ -11416,6 +11420,8 @@ impl VibexWorkbench {
             session_terminal_surfaces: BTreeMap::new(),
             active_session_terminal_id: None,
             session_terminal_view: None,
+            terminal_session_restart_pending: None,
+            session_terminal_error: None,
             config,
             runtime: None,
             computer_runtime: None,
@@ -19885,13 +19891,23 @@ impl VibexWorkbench {
             return;
         };
         // Detached: the answer is fire-and-forget, and the prompt is already off
-        // screen, so there is nothing left for a handle to cancel.
+        // screen, so there is nothing left for a handle to cancel. It still
+        // runs on the Tokio runtime: the write touches SQLite, and polling it
+        // from the foreground executor would stall the frame.
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            backend
+                .management()
+                .answer_model_gateway_failover(prompt_id, answer)
+                .await
+        });
         cx.spawn(
             async move |_entity: WeakEntity<Self>, _cx: &mut gpui::AsyncApp| {
-                let result = backend
-                    .management()
-                    .answer_model_gateway_failover(prompt_id, answer)
-                    .await;
+                let result = runner.await.unwrap_or_else(|_| {
+                    Err(vibex_backend::BackendError::failed(
+                        "gateway_failover_answer_cancelled",
+                        "the runtime stopped before the failover answer was delivered",
+                    ))
+                });
                 // `Ok(false)` means the window closed first, which is a settled
                 // prompt and not something to report.
                 if let Err(error) = result {
@@ -38438,13 +38454,24 @@ impl VibexWorkbench {
         self.new_session_error = None;
         let generation = self.session_generation;
         let entity = cx.weak_entity();
-        self.agent_action_task = Some(cx.spawn(async move |_, cx| {
-            let created = backend
+        // Starting a terminal session launches a PTY and writes the session
+        // row; both are blocking work, so the request runs on the Tokio runtime
+        // and only its answer returns here.
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            backend
                 .agent()
                 .create_terminal_session(MutationRequest::new(request).with_idempotency_key(
                     format!("gpui:new-session:terminal:{}", unix_timestamp_ms()),
                 ))
-                .await;
+                .await
+        });
+        self.agent_action_task = Some(cx.spawn(async move |_, cx| {
+            let created = runner.await.unwrap_or_else(|_| {
+                Err(vibex_backend::BackendError::failed(
+                    "terminal_session_create_cancelled",
+                    "the runtime stopped before the terminal session started",
+                ))
+            });
             let _ = entity.update(cx, |this, cx| {
                 this.agent_action_pending = false;
                 this.agent_action_task = None;
@@ -71339,11 +71366,10 @@ impl VibexWorkbench {
 
     /// What the page shows when the session has no running PTY.
     fn render_session_terminal_placeholder(
-        &self,
+        &mut self,
         session: &AgentSession,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let _ = cx;
         let message = if session.state == vibex_core::AgentSessionState::Error {
             crate::locale::text(
                 "The Agent did not start in this session's terminal.",
@@ -71354,11 +71380,7 @@ impl VibexWorkbench {
             // The Agent's process ended — the reader quit the CLI, or it
             // crashed. Saying so is the whole difference between a session that
             // looks idle and one that is gone.
-            crate::locale::text(
-                "The Agent has exited. Start a new terminal session to continue.",
-                "Agent 已退出。请新建终端会话以继续。",
-                "Agent 已退出。請新建終端會話以繼續。",
-            )
+            crate::locale::text("The Agent has exited.", "Agent 已退出。", "Agent 已退出。")
         } else {
             crate::locale::text(
                 "This session's terminal is not running.",
@@ -71366,14 +71388,97 @@ impl VibexWorkbench {
                 "該會話的終端未執行。",
             )
         };
+        // A quit is recoverable: the session kept its row and the command it
+        // ran, so restarting it is the same Agent in the same checkout rather
+        // than a lookalike. Offering that here is the difference between "this
+        // is over" and "you can pick it back up".
+        let restartable = matches!(
+            session.state,
+            vibex_core::AgentSessionState::Closed
+                | vibex_core::AgentSessionState::Error
+                | vibex_core::AgentSessionState::Idle
+        );
+        let session_id = session.id.clone();
+        let restarting =
+            self.terminal_session_restart_pending.as_deref() == Some(session_id.as_str());
         div()
             .size_full()
             .flex()
+            .flex_col()
             .items_center()
             .justify_center()
+            .gap_3()
             .p_6()
             .child(div().text_sm().child(message))
+            .when_some(self.session_terminal_error.clone(), |this, error| {
+                this.child(div().text_xs().text_color(cx.theme().danger).child(error))
+            })
+            .when(restartable, |this| {
+                this.child(
+                    Button::new("session-terminal-restart")
+                        .small()
+                        .loading(restarting)
+                        .disabled(restarting)
+                        .icon(IconName::Play)
+                        .label(crate::locale::text(
+                            "Restart Agent",
+                            "重新启动 Agent",
+                            "重新啟動 Agent",
+                        ))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.restart_terminal_session(session_id.clone(), cx);
+                        })),
+                )
+            })
             .into_any_element()
+    }
+
+    /// Starts a terminal session's Agent again.
+    ///
+    /// The page shows the placeholder until the restarted snapshot arrives, so
+    /// the button reports its own progress rather than leaving the reader
+    /// pressing it twice.
+    fn restart_terminal_session(&mut self, session_id: VibexSessionId, cx: &mut Context<Self>) {
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        let generation = self.session_generation;
+        self.terminal_session_restart_pending = Some(session_id.as_str().to_string());
+        let entity = cx.weak_entity();
+        let restarted_id = session_id.clone();
+        // A restart replaces the PTY, which is blocking work; keep it off the
+        // frame thread like the initial start.
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            backend.agent().restart_terminal_session(restarted_id).await
+        });
+        self.agent_action_task = Some(cx.spawn(async move |_, cx| {
+            let outcome = runner.await.unwrap_or_else(|_| {
+                Err(vibex_backend::BackendError::failed(
+                    "terminal_session_restart_cancelled",
+                    "the runtime stopped before the terminal session restarted",
+                ))
+            });
+            let _ = entity.update(cx, |this, cx| {
+                if this.session_generation != generation {
+                    return;
+                }
+                this.terminal_session_restart_pending = None;
+                match outcome {
+                    Ok(session) => {
+                        this.agent_action_pending = false;
+                        this.session_terminal_error = None;
+                        this.upsert_session_snapshot(session);
+                    }
+                    Err(error) => {
+                        this.agent_action_pending = false;
+                        this.session_terminal_error =
+                            Some(format!("{}: {}", error.code, error.message));
+                    }
+                }
+                cx.notify();
+            });
+        }));
+        cx.notify();
     }
 
     /// Keeps exactly the visible terminal-mode session polling.
