@@ -759,10 +759,28 @@ impl TerminalSurface {
                     // The reader scrolled while this poll was in flight, so the
                     // frames it carries describe a viewport that is no longer on
                     // screen. Applying them would scroll the terminal back and
-                    // then forward again, which is what made rows appear twice.
-                    // Drop them and ask for the current viewport instead.
-                    if this.scroll_generation != scroll_generation {
-                        return Some(Duration::ZERO);
+                    // then forward again.
+                    //
+                    // The frames cannot simply be dropped, though: polling a
+                    // terminal consumes its damage, so the rows this pass would
+                    // have repainted are never reported again. The next frame
+                    // would then carry only the newer damage, and the rows the
+                    // dropped pass covered would keep their pre-scroll contents
+                    // underneath the scrolled ones — which is exactly the
+                    // duplicated block this guards against. So the result is
+                    // still applied, and the cache is forced through a full
+                    // repaint to pick up everything the dropped viewport owned.
+                    let scrolled = this.scroll_generation != scroll_generation;
+                    if scrolled {
+                        for result in &results {
+                            if let Some(tab) = this
+                                .tabs
+                                .iter_mut()
+                                .find(|tab| tab.session.id == result.terminal_id)
+                            {
+                                tab.frame.force_full_repaint();
+                            }
+                        }
                     }
                     let changed = this.apply_poll_results(results, cx);
                     if changed {
