@@ -27931,6 +27931,31 @@ impl SessionTerminalRepository {
         Ok(records)
     }
 
+    /// Records the Agent's own session id, as printed in its exit notice.
+    ///
+    /// Written separately from the observation facts because it outlives them:
+    /// the id is what a restart resumes from, and the facts it was read beside
+    /// are discarded when the session closes.
+    pub fn record_native_session_id(
+        conn: &Connection,
+        session_id: &VibexSessionId,
+        native_session_id: &str,
+    ) -> VibexResult<()> {
+        conn.execute(
+            "
+            UPDATE session_terminals
+            SET native_session_id = ?2
+            WHERE session_id = ?1
+            ",
+            params![session_id.as_str(), native_session_id],
+        )
+        .map_err(storage_err(
+            "session_terminal_native_id_failed",
+            "failed to record the Agent's session id",
+        ))?;
+        Ok(())
+    }
+
     /// Writes observation facts, and only when a reader would see a change.
     ///
     /// A liveness tick every 250ms must not rewrite this row: `updated_at_ms`

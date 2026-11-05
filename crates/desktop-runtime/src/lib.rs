@@ -3791,7 +3791,10 @@ impl DesktopRuntime {
                             if let Err(error) = runtime
                                 .agent
                                 .manager()
-                                .mark_session_terminal_ended(&session_id)
+                                .mark_session_terminal_ended(
+                                    &session_id,
+                                    update.native_session_id.as_deref(),
+                                )
                             {
                                 tracing::warn!(
                                     target: "vibex_desktop",
@@ -4734,7 +4737,7 @@ impl DesktopRuntime {
             if let Err(error) = self
                 .agent
                 .manager()
-                .mark_session_terminal_ended(&session_id)
+                .mark_session_terminal_ended(&session_id, None)
             {
                 tracing::warn!(
                     target: "vibex_desktop",

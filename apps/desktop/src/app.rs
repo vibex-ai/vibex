@@ -38493,10 +38493,7 @@ impl VibexWorkbench {
         // a newline is a control character and the launch rejects those, so the
         // draft is flattened to one line the same way a session title is. The
         // content survives; only the line breaks do not.
-        let mut first_prompt = draft_text
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ");
+        let mut first_prompt = draft_text.split_whitespace().collect::<Vec<_>>().join(" ");
         // Attachments follow the words as paths. The CLI reads files from the
         // checkout, so a path is the only form a picture can take on a command
         // line — and naming them is what keeps a screenshot the reader pasted
@@ -38512,8 +38509,11 @@ impl VibexWorkbench {
             }
             first_prompt.push_str(&attachment_paths.join(" "));
         }
+        let mut first_prompt_arg: Option<String> = None;
         if !first_prompt.is_empty() {
-            args.push(first_prompt.clone());
+            // Deliberately not `args`: those are replayed on a restart, and the
+            // prompt is this launch's turn only.
+            first_prompt_arg = Some(first_prompt);
         }
         let request = vibex_core::CreateTerminalSessionRequest {
             session_id: None,
@@ -38523,6 +38523,7 @@ impl VibexWorkbench {
             title: Some(draft_text),
             safety: None,
             args,
+            first_prompt: first_prompt_arg,
             provider_profile_id,
             rows: 24,
             cols: 100,
@@ -56346,9 +56347,11 @@ impl VibexWorkbench {
                             // The icon follows the label, not the mode accent:
                             // a dark accent on a raised segment left the
                             // terminal's icon dim beside its own bright text.
-                            .child(Icon::new(icon).size(px(12.0)).text_color(
-                                if selected { selected_fg } else { unselected },
-                            ))
+                            .child(Icon::new(icon).size(px(12.0)).text_color(if selected {
+                                selected_fg
+                            } else {
+                                unselected
+                            }))
                             .child(
                                 div()
                                     .text_size(px(11.0))
@@ -71298,8 +71301,7 @@ impl VibexWorkbench {
         // dead grid, and the "Agent has exited" state never reached the reader.
         if matches!(
             session.state,
-            vibex_core::AgentSessionState::Closed
-                | vibex_core::AgentSessionState::Error
+            vibex_core::AgentSessionState::Closed | vibex_core::AgentSessionState::Error
         ) {
             return self.render_session_terminal_placeholder(&session, cx);
         }
@@ -105296,7 +105298,6 @@ mod tests {
         );
     }
 
-
     /// A restart drops the surface bound to the old terminal.
     ///
     /// The restart replaces the PTY, so the surface that was attached to the
@@ -105312,7 +105313,9 @@ mod tests {
             .expect("the module has production code");
         let restart = source
             .split_once("    fn restart_terminal_session(")
-            .and_then(|(_, tail)| tail.split_once("\n    fn sync_session_terminal_surface_activity("))
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    fn sync_session_terminal_surface_activity(")
+            })
             .map(|(body, _)| body)
             .expect("the restart handler should remain inspectable");
         assert!(
@@ -105355,7 +105358,6 @@ mod tests {
             "the authoritative list must keep a known link"
         );
     }
-
 
     /// A session whose Agent ended shows its end, not the dead grid.
     ///

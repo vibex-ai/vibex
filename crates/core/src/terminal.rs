@@ -293,8 +293,19 @@ pub struct CreateTerminalSessionRequest {
     pub title: Option<String>,
     pub safety: Option<AgentSessionSafety>,
     /// Extra arguments appended after the Agent's native executable.
+    ///
+    /// These are launch flags, not conversation: they are replayed verbatim when
+    /// the session is restarted, so a prompt must not be put here.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub args: Vec<String>,
+    /// The turn the reader already described on the page that created this
+    /// session.
+    ///
+    /// Kept apart from `args` because it belongs to the first launch only: it is
+    /// the CLI's positional prompt, and replaying it on a restart would make the
+    /// Agent answer the same request twice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_prompt: Option<String>,
     /// Provider Profile whose credentials and endpoint the CLI should inherit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_profile_id: Option<ProviderProfileId>,

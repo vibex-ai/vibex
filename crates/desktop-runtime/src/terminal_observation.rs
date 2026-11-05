@@ -274,6 +274,41 @@ pub struct ObservationUpdate {
     /// The Agent's CLI said its session is over, while the process may still be
     /// alive waiting for a second interrupt.
     pub exited: bool,
+    /// The Agent's own session id, when the CLI printed how to resume it.
+    ///
+    /// A terminal Agent keeps its conversation in its own store, so Vibex cannot
+    /// read it — but the exit notice names it, and that is enough for a restart
+    /// to continue the same conversation instead of opening an empty one.
+    pub native_session_id: Option<String>,
+}
+
+/// The session id a CLI printed in its exit notice.
+///
+/// Both supported CLIs print a ready-to-paste resume command on the way out
+/// (`claude --resume <id>`, `codex resume <id>`). Reading that line is the only
+/// way to learn the Agent's own session id, because Vibex is not a party to the
+/// conversation.
+fn resume_session_id(screen: &str) -> Option<String> {
+    for line in screen.lines() {
+        let trimmed = line.trim();
+        let candidate = trimmed
+            .strip_prefix("claude --resume ")
+            .or_else(|| trimmed.strip_prefix("codex resume "))
+            .or_else(|| trimmed.strip_prefix("codex resume --last "));
+        if let Some(rest) = candidate {
+            let id = rest
+                .split_whitespace()
+                .next()
+                .unwrap_or_default()
+                .trim_matches(|character: char| !character.is_ascii_alphanumeric() && character != '-');
+            // A uuid, not a flag: the notice is copied from a screen a reader
+            // also reads, so the check is on shape rather than on position.
+            if id.len() >= 8 && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+                return Some(id.to_string());
+            }
+        }
+    }
+    None
 }
 
 /// One watched terminal: its emulator, its rules, and its damping.
@@ -367,6 +402,10 @@ impl WatchedTerminal {
                 return None;
             }
             self.published_exit = true;
+            // The CLI prints how to continue this conversation. Capturing it is
+            // what lets a restart resume the Agent's own history instead of
+            // starting a second, empty session beside it.
+            let native_session_id = resume_session_id(&self.bottom_screen());
             return Some(ObservationUpdate {
                 terminal_id: TerminalId::new(),
                 session_id: self.session_id.clone(),
@@ -374,6 +413,7 @@ impl WatchedTerminal {
                 source: TerminalActivitySource::Screen,
                 observed_at_ms: now_ms,
                 exited: true,
+                native_session_id,
             });
         }
         let activity = self.damping.accept(reading)?;
@@ -394,6 +434,7 @@ impl WatchedTerminal {
             source,
             observed_at_ms: now_ms,
             exited: false,
+            native_session_id: None,
         })
     }
 
@@ -554,6 +595,30 @@ mod tests {
         assert_eq!(updates[0].activity, TerminalActivity::Unknown);
         // A settled exit screen is not re-published on every sweep.
         assert!(observations.scan_all(1_100).is_empty());
+    }
+
+
+    /// The exit notice's resume command is the only place the Agent's own
+    /// session id appears, so it is what a restart continues from.
+    #[test]
+    fn the_exit_notice_yields_the_agents_session_id() {
+        assert_eq!(
+            resume_session_id("Resume this session with:\nclaude --resume 54689079-d7b6-4dc5-9a38-8a4202f5f2ad"),
+            Some("54689079-d7b6-4dc5-9a38-8a4202f5f2ad".to_string())
+        );
+        assert_eq!(
+            resume_session_id("To reconnect, run:\n  codex resume 01a1aa4d-b3b1-7723-a20b-3e04da40dd97"),
+            Some("01a1aa4d-b3b1-7723-a20b-3e04da40dd97".to_string())
+        );
+    }
+
+    /// A screen that only says the session ended carries no id.
+    #[test]
+    fn an_exit_notice_without_a_resume_command_yields_nothing() {
+        assert_eq!(resume_session_id("Press Ctrl-C again to exit"), None);
+        assert_eq!(resume_session_id(""), None);
+        // A line that names the command but no usable id is not a session.
+        assert_eq!(resume_session_id("claude --resume"), None);
     }
 
     /// The live idle footer is what makes an idle claim safe; its absence is

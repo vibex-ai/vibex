@@ -1327,9 +1327,29 @@ impl AgentManager {
                 "terminal session arguments cannot contain control characters",
             ));
         }
+        // The recorded argv is the launch, not the conversation: it is what a
+        // restart replays, so the first prompt must stay out of it.
         let mut argv = Vec::with_capacity(request.args.len() + 1);
         argv.push(executable.to_string());
         argv.extend(request.args.iter().cloned());
+        // The prompt rides the first launch as the CLI's positional argument.
+        // Both CLIs accept one, and it is the only channel that reaches an Agent
+        // Vibex is not talking to.
+        let mut launch_argv = argv.clone();
+        if let Some(prompt) = request
+            .first_prompt
+            .as_deref()
+            .map(str::trim)
+            .filter(|prompt| !prompt.is_empty())
+        {
+            if prompt.chars().any(char::is_control) {
+                return Err(VibexError::validation(
+                    "terminal_session_prompt_invalid",
+                    "the first prompt must be a single line",
+                ));
+            }
+            launch_argv.push(prompt.to_string());
+        }
 
         let conn = self.open_migrated()?;
         let (project, workspace) =
@@ -1374,7 +1394,7 @@ impl AgentManager {
         let spec = vibex_core::TerminalSessionLaunchSpec {
             workspace_id: workspace.id,
             workspace_root: workspace.root_path,
-            argv,
+            argv: launch_argv,
             env: self.terminal_session_env(&request, &session)?,
             title: session.title.clone(),
             rows: request.rows,
@@ -1400,7 +1420,9 @@ impl AgentManager {
             &session.id,
             &handle.terminal_id,
             &spec.workspace_id,
-            &spec.argv,
+            // The flags, not the launch: a restart replays this, and replaying
+            // the first prompt would make the Agent answer it again.
+            &argv,
             &spec.workspace_root,
             request.provider_profile_id.as_ref(),
         )?;
@@ -3129,10 +3151,24 @@ impl AgentManager {
             Some(profile_id) => self.terminal_session_env_overlays(profile_id, &session)?,
             None => Vec::new(),
         };
+        // The Agent's conversation lives in its own store, and the exit notice
+        // named the id to continue it. Resuming is what makes a restart the same
+        // conversation rather than an empty one beside it; without the id there
+        // is nothing to resume, so the flags are replayed as they were.
+        let mut argv = record.argv.clone();
+        if let Some(native_session_id) = record
+            .facts
+            .native_session_id
+            .as_deref()
+            .filter(|id| !id.trim().is_empty())
+        {
+            argv.push("--resume".to_string());
+            argv.push(native_session_id.to_string());
+        }
         let spec = vibex_core::TerminalSessionLaunchSpec {
             workspace_id: record.workspace_id.clone(),
             workspace_root: session.workspace_root.clone(),
-            argv: record.argv.clone(),
+            argv,
             env,
             title: session.title.clone(),
             rows: 24,
@@ -3184,11 +3220,25 @@ impl AgentManager {
     ///
     /// The row survives. The reader can see which session ended, and the terminal
     /// link stays so a restart can offer the same command again.
-    pub fn mark_session_terminal_ended(&self, session_id: &VibexSessionId) -> VibexResult<()> {
+    pub fn mark_session_terminal_ended(
+        &self,
+        session_id: &VibexSessionId,
+        native_session_id: Option<&str>,
+    ) -> VibexResult<()> {
         let conn = self.open_migrated()?;
         let Some(session) = SessionRepository::get(&conn, session_id)? else {
             return Ok(());
         };
+        // Recorded even when the session was already closed: the id is what a
+        // restart needs to continue the Agent's own conversation, and the exit
+        // notice is the only place it appears.
+        if let Some(native_session_id) = native_session_id.filter(|id| !id.trim().is_empty()) {
+            SessionTerminalRepository::record_native_session_id(
+                &conn,
+                session_id,
+                native_session_id,
+            )?;
+        }
         if !session.transport.is_terminal() || session.state == AgentSessionState::Closed {
             return Ok(());
         }
@@ -12847,6 +12897,7 @@ mod tests {
             title: None,
             safety: None,
             args: Vec::new(),
+            first_prompt: None,
             provider_profile_id: None,
             rows: 24,
             cols: 100,
@@ -13186,7 +13237,7 @@ mod tests {
         let terminal_id = launcher.watched()[0].0.clone();
         launcher.kill(&terminal_id).unwrap();
 
-        manager.mark_session_terminal_ended(&session.id).unwrap();
+        manager.mark_session_terminal_ended(&session.id, None).unwrap();
 
         let retired = manager.get_session(&session.id).await.unwrap();
         assert_eq!(retired.state, AgentSessionState::Closed);
@@ -13218,7 +13269,7 @@ mod tests {
 
         // The reader quits the CLI.
         launcher.kill(&first_terminal).unwrap();
-        manager.mark_session_terminal_ended(&session.id).unwrap();
+        manager.mark_session_terminal_ended(&session.id, None).unwrap();
         assert_eq!(
             manager.get_session(&session.id).await.unwrap().state,
             AgentSessionState::Closed
@@ -13281,6 +13332,87 @@ mod tests {
         request.title = Some("   ".to_string());
         let created = manager.create_terminal_session(request).await.unwrap();
         assert_eq!(created.title, "claude terminal");
+    }
+
+
+    /// A restart replays the launch flags, never the first prompt.
+    ///
+    /// The prompt is the turn the reader already had answered. Keeping it in the
+    /// recorded argv made every restart ask the Agent the same question again,
+    /// which is exactly what a reader pressing "restart" is not asking for.
+    #[tokio::test]
+    async fn a_restart_does_not_repeat_the_first_prompt() {
+        let (manager, launcher, dir) = terminal_manager();
+        let mut request = terminal_request("claude", &dir);
+        request.args = vec!["--model".to_string(), "claude-opus-4-6".to_string()];
+        request.first_prompt = Some("explain the failing test".to_string());
+        let session = manager.create_terminal_session(request).await.unwrap();
+
+        // The first launch carries the prompt.
+        let first = launcher.launches();
+        assert_eq!(
+            first[0].argv,
+            vec!["claude", "--model", "claude-opus-4-6", "explain the failing test"]
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        );
+        // What was recorded is the launch, without the prompt.
+        let conn = open_database(&dir.join("vibex.db")).unwrap();
+        let record = vibex_db::SessionTerminalRepository::get(&conn, &session.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            record.argv,
+            vec!["claude", "--model", "claude-opus-4-6"]
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>(),
+            "the recorded argv is the launch, not the conversation"
+        );
+
+        // A restart replays those flags only.
+        let terminal_id = launcher.watched()[0].0.clone();
+        launcher.kill(&terminal_id).unwrap();
+        manager
+            .mark_session_terminal_ended(&session.id, None)
+            .unwrap();
+        manager.restart_terminal_session(&session.id).await.unwrap();
+        let launches = launcher.launches();
+        assert_eq!(
+            launches.last().expect("the restart launched").argv,
+            vec!["claude", "--model", "claude-opus-4-6"]
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>(),
+            "a restart must not ask the Agent the same question again"
+        );
+    }
+
+    /// A restart continues the Agent's own conversation when its id is known.
+    #[tokio::test]
+    async fn a_restart_resumes_the_agents_session_when_its_id_is_known() {
+        let (manager, launcher, dir) = terminal_manager();
+        let session = manager
+            .create_terminal_session(terminal_request("claude", &dir))
+            .await
+            .unwrap();
+        let terminal_id = launcher.watched()[0].0.clone();
+        launcher.kill(&terminal_id).unwrap();
+        manager
+            .mark_session_terminal_ended(&session.id, Some("54689079-d7b6-4dc5-9a38-8a4202f5f2ad"))
+            .unwrap();
+
+        manager.restart_terminal_session(&session.id).await.unwrap();
+        let launches = launcher.launches();
+        assert_eq!(
+            launches.last().expect("the restart launched").argv,
+            vec!["claude", "--resume", "54689079-d7b6-4dc5-9a38-8a4202f5f2ad"]
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>(),
+            "the restart continues the conversation instead of starting an empty one"
+        );
     }
 
     /// A restart rebuilds a terminal session's PTY from its recorded argv.
