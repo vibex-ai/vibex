@@ -56290,19 +56290,27 @@ impl VibexWorkbench {
                     .h(px(24.0))
                     .px_2()
                     .rounded(px(7.0))
-                    .when(selected, |this| {
-                        this.bg(selected_bg).text_color(active_color).shadow_xs()
-                    })
-                    .when(!selected, |this| this.text_color(unselected))
+                    .when(selected, |this| this.bg(selected_bg).shadow_xs())
                     .when(option_disabled, |this| this.opacity(0.45))
                     .disabled(option_disabled)
                     .tooltip(tooltip)
                     .child(
+                        // Colour is set on the content rather than only on the
+                        // button: a child that inherits from the theme paints over
+                        // whatever the button asked for, which is how the active
+                        // label ended up darker than the segment it sits on.
                         h_flex()
                             .items_center()
                             .gap(px(5.0))
-                            .child(Icon::new(icon).size(px(12.0)))
-                            .child(div().text_size(px(11.0)).child(label)),
+                            .child(Icon::new(icon).size(px(12.0)).text_color(
+                                if selected { active_color } else { unselected },
+                            ))
+                            .child(
+                                div()
+                                    .text_size(px(11.0))
+                                    .text_color(if selected { selected_fg } else { unselected })
+                                    .child(label),
+                            ),
                     )
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if this.ui_state.session.new_session_transport == mode {
@@ -57958,34 +57966,6 @@ impl VibexWorkbench {
                                     .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
                                         this.add_composer_paths(paths, window, cx)
                                     }))
-                                    .when(terminal_transport, |this| {
-                                        // The strip a terminal window puts above
-                                        // its grid: the login and the checkout.
-                                        // It is chrome the CLI itself cannot
-                                        // show, and it is what tells the reader
-                                        // which directory this Agent owns
-                                        // before it asks.
-                                        this.child(
-                                            h_flex()
-                                                .id("new-session-terminal-title")
-                                                .w_full()
-                                                .flex_none()
-                                                .items_center()
-                                                .gap_2()
-                                                .px_4()
-                                                .pt_3()
-                                                .pb_1()
-                                                .font_family(prompt_font.clone())
-                                                .text_size(px(12.0))
-                                                .child(
-                                                    div()
-                                                        .flex_none()
-                                                        .text_color(cx.theme().accent)
-                                                        .child("❯"),
-                                                )
-                                                .child(div().truncate().child(terminal_title_line.clone())),
-                                        )
-                                    })
                                     .child(
                                         h_flex()
                                             .min_h(px(112.0))
@@ -58016,10 +57996,17 @@ impl VibexWorkbench {
                                                     // with the first line of
                                                     // input instead of floating
                                                     // above it.
+                                                    // A terminal's prompt mark,
+                                                    // bright enough to read as
+                                                    // an affordance rather than
+                                                    // a smudge: the accent at
+                                                    // full strength in the code
+                                                    // face, sized to the first
+                                                    // line of input.
                                                     div()
                                                         .flex_none()
-                                                        .text_size(px(15.0))
-                                                        .line_height(px(22.0))
+                                                        .text_size(px(16.0))
+                                                        .line_height(px(24.0))
                                                         .font_weight(gpui::FontWeight::BOLD)
                                                         .font_family(prompt_font.clone())
                                                         .text_color(cx.theme().accent)
@@ -105418,21 +105405,19 @@ mod tests {
             "let terminal_transport = self.ui_state.session.new_session_transport.is_terminal();"
         ));
         assert!(panel.contains(".when(terminal_transport, |this| {"));
-        // Terminal mode takes the terminal surface and its title strip.
+        // Terminal mode takes the terminal surface and a prompt mark. It does
+        // not add a header line: the box is the prompt, and a path strip above
+        // it is chrome the reader never asked for.
         assert!(panel.contains("bg(terminal_surface_color)"));
-        assert!(panel.contains("new-session-terminal-title"));
-        // The header names the login and the checkout, and nothing else: a clock
-        // or a version there is chrome the reader did not ask for.
-        assert!(panel.contains("terminal_title_line.clone()"));
-        assert!(!panel.contains("terminal_title_clock"));
+        assert!(!panel.contains("new-session-terminal-title"));
+        assert!(panel.contains(".child(\"❯\")"));
         // The silhouette is the page's in both modes: switching changes what the
         // box is, not how much room it takes.
         assert!(panel.contains(".rounded(px(20.0))"));
         // The interface mode keeps the conversational card surface.
         assert!(panel.contains(".when(!terminal_transport, |this| {"));
         assert!(panel.contains("bg(card_color)"));
-        // The prompt marker and the code face.
-        assert!(panel.contains(".child(\"❯\")"));
+        // The code face, so the prompt reads as a command line.
         assert!(panel.contains("prompt_font.clone()"));
         // Both modes keep their controls: the box is only restyled.
         assert!(panel.contains("new-session-toggle-expanded"));
