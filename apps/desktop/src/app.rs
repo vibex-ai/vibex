@@ -56536,6 +56536,25 @@ impl VibexWorkbench {
             selection.as_ref().map(|selection| &selection.agent_id),
             cx,
         );
+        // The prompt box reflects the mode it will create in. In terminal mode
+        // it becomes a command line: the code face, a square border, and the
+        // terminal's own surface, so the reader can tell at a glance that the
+        // Agent will own the interface rather than Vibex drawing it.
+        let terminal_transport = self.ui_state.session.new_session_transport.is_terminal();
+        let terminal_surface_color = if is_dark {
+            theme::semantic_color("background", true)
+        } else {
+            theme::semantic_color("muted", false)
+        };
+        // The reader's configured code face, which is the one a terminal would
+        // use: the prompt should not invent a second monospace.
+        let prompt_font = self
+            .ui_state
+            .appearance
+            .code_font
+            .family
+            .clone()
+            .unwrap_or_else(|| crate::platform::default_code_font_family().to_string());
         let runtime_controls_cascade = self.render_new_session_runtime_cascade(
             selection.clone(),
             self.runtime_catalog.clone(),
@@ -57604,7 +57623,13 @@ impl VibexWorkbench {
                             )
                             .child(self.render_new_session_tool_toggles(cx)),
                     )
-                }),
+                })
+                // Pushed to the far end: the transport is a property of the
+                // session this page will create, not another "where does it
+                // run" control, so it sits opposite the workspace row rather
+                // than inside the prompt box.
+                .child(div().flex_1())
+                .child(div().flex_none().child(transport_switch)),
         );
 
         let worktree_form_valid = !worktree_selected
@@ -57727,10 +57752,26 @@ impl VibexWorkbench {
                                     .when(self.new_session_expanded, |this| {
                                         this.flex_1().min_h(px(240.0))
                                     })
-                                    .rounded(px(20.0))
+                                    // The prompt box wears the transport it
+                                    // will create. A terminal session types a
+                                    // command line, not a message, so the box
+                                    // squares its corners, drops to the code
+                                    // face, and takes the terminal's own
+                                    // surface — the same shift the page makes
+                                    // when the session opens.
+                                    .when(terminal_transport, |this| {
+                                        this.rounded(px(6.0))
+                                            .border_color(
+                                                cx.theme().accent.opacity(0.55),
+                                            )
+                                            .bg(terminal_surface_color)
+                                    })
+                                    .when(!terminal_transport, |this| {
+                                        this.rounded(px(20.0))
+                                            .border_color(cx.theme().border.opacity(0.72))
+                                            .bg(card_color)
+                                    })
                                     .border_1()
-                                    .border_color(cx.theme().border.opacity(0.72))
-                                    .bg(card_color)
                                     .shadow_lg()
                                     .on_prepaint(move |bounds, _, cx| {
                                         let _ = surface_geometry_entity.update(cx, |this, cx| {
@@ -57755,12 +57796,31 @@ impl VibexWorkbench {
                                             .gap_2()
                                             .p_4()
                                             .pb_2()
+                                            .when(terminal_transport, |this| {
+                                                // A prompt marker, the way a
+                                                // shell draws one, so the box
+                                                // reads as a command line even
+                                                // before the reader types.
+                                                this.child(
+                                                    div()
+                                                        .flex_none()
+                                                        .pt(px(1.0))
+                                                        .font_family(prompt_font.clone())
+                                                        .text_color(cx.theme().accent)
+                                                        .child("❯"),
+                                                )
+                                            })
                                             .child(
                                                 div()
                                                     .relative()
                                                     .flex_1()
                                                     .min_w_0()
                                                     .h_full()
+                                                    .when(terminal_transport, |this| {
+                                                        this.font_family(
+                                                            prompt_font.clone(),
+                                                        )
+                                                    })
                                                     .when(
                                                         self.new_session_expanded,
                                                         |this| this.self_stretch(),
@@ -58031,7 +58091,6 @@ impl VibexWorkbench {
                                                         )
                                                         .children(runtime_controls_other),
                                                 )
-                                                .child(transport_switch)
                                                 .child(
                                                     h_flex()
                                                         .id("new-session-runtime-controls-cascade")
@@ -104919,6 +104978,80 @@ mod tests {
             ),
             "a stale terminal choice must not reach the terminal launch"
         );
+    }
+
+    /// The transport lives on the workspace row, not inside the prompt box.
+    ///
+    /// It answers "who owns the interface", which is not another "where does
+    /// this run" control, so it sits opposite the workspace menus rather than
+    /// taking a slot beside the model picker.
+    #[test]
+    fn the_transport_switch_sits_on_the_workspace_row() {
+        let source = include_str!("app.rs");
+        let source = source
+            .split("\nmod tests {")
+            .next()
+            .expect("the module has production code");
+        let panel = source
+            .split_once("    fn render_new_session_panel(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn show_turn_preview_rail("))
+            .map(|(body, _)| body)
+            .expect("the new-session panel should remain inspectable");
+        // It is composed into the workspace row, after the tool toggles.
+        let workspace_row = panel
+            .split_once("let workspace_controls = v_flex()")
+            .and_then(|(_, tail)| tail.split_once("\n        let worktree_form_valid"))
+            .map(|(body, _)| body)
+            .expect("the workspace row should remain inspectable");
+        assert!(workspace_row.contains(".child(transport_switch)"));
+        // And it no longer shares a row with the model/reasoning controllers.
+        let runtime_row = panel
+            .split_once("new-session-runtime-controls-cascade")
+            .map(|(_, tail)| tail)
+            .expect("the runtime cascade should still exist");
+        assert!(
+            !runtime_row
+                .split("new-session-submit")
+                .next()
+                .unwrap_or_default()
+                .contains("child(transport_switch)"),
+            "the prompt box must not host the transport switch"
+        );
+    }
+
+    /// Choosing terminal mode restyles the prompt box as a command line.
+    ///
+    /// The reader has to be able to tell which interface they are creating
+    /// before they create it, so the box itself says: square border, terminal
+    /// surface, code face, and a prompt marker.
+    #[test]
+    fn terminal_mode_restyles_the_prompt_box() {
+        let source = include_str!("app.rs");
+        let source = source
+            .split("\nmod tests {")
+            .next()
+            .expect("the module has production code");
+        let panel = source
+            .split_once("    fn render_new_session_panel(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn show_turn_preview_rail("))
+            .map(|(body, _)| body)
+            .expect("the new-session panel should remain inspectable");
+        assert!(panel.contains(
+            "let terminal_transport = self.ui_state.session.new_session_transport.is_terminal();"
+        ));
+        assert!(panel.contains(".when(terminal_transport, |this| {"));
+        // Terminal mode squares the corners and takes the terminal surface.
+        assert!(panel.contains("this.rounded(px(6.0))"));
+        assert!(panel.contains("bg(terminal_surface_color)"));
+        // The interface mode keeps the conversational card.
+        assert!(panel.contains(".when(!terminal_transport, |this| {"));
+        assert!(panel.contains("this.rounded(px(20.0))"));
+        // The prompt marker and the code face.
+        assert!(panel.contains(".child(\"❯\")"));
+        assert!(panel.contains("prompt_font.clone()"));
+        // Both modes keep their controls: the box is only restyled.
+        assert!(panel.contains("new-session-toggle-expanded"));
+        assert!(panel.contains("new-session-submit"));
     }
 
     /// Submitting in terminal mode never composes an ACP create request.
