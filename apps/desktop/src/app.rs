@@ -56291,7 +56291,7 @@ impl VibexWorkbench {
             ),
         ];
         let mut segments = Vec::with_capacity(options.len());
-        for (mode, id, icon, label, option_disabled, tooltip, active_color) in options {
+        for (mode, id, icon, label, option_disabled, tooltip, _active_color) in options {
             let selected = current == mode;
             segments.push(
                 Button::new(id)
@@ -56312,8 +56312,11 @@ impl VibexWorkbench {
                         h_flex()
                             .items_center()
                             .gap(px(5.0))
+                            // The icon follows the label, not the mode accent:
+                            // a dark accent on a raised segment left the
+                            // terminal's icon dim beside its own bright text.
                             .child(Icon::new(icon).size(px(12.0)).text_color(
-                                if selected { active_color } else { unselected },
+                                if selected { selected_fg } else { unselected },
                             ))
                             .child(
                                 div()
@@ -56704,36 +56707,10 @@ impl VibexWorkbench {
             selection.as_ref().map(|selection| &selection.agent_id),
             cx,
         );
-        // The prompt box reflects the mode it will create in. In terminal mode
-        // it becomes a command line: the code face, a square border, and the
-        // terminal's own surface, so the reader can tell at a glance that the
-        // Agent will own the interface rather than Vibex drawing it.
+        // The mode is announced by the prompt mark, not by repainting the box:
+        // changing the surface and padding moved the input line and the send
+        // button every time the reader switched.
         let terminal_transport = self.ui_state.session.new_session_transport.is_terminal();
-        let terminal_surface_color = if is_dark {
-            theme::semantic_color("background", true)
-        } else {
-            theme::semantic_color("muted", false)
-        };
-        // The line a terminal window shows above its grid: who and where. It is
-        // drawn only in terminal mode, so the interface mode keeps its clean
-        // prompt, and it answers the question a reader has when a CLI starts —
-        // "which checkout is this Agent pointed at".
-        let terminal_title_user = std::env::var("USER")
-            .or_else(|_| std::env::var("USERNAME"))
-            .unwrap_or_else(|_| "user".to_string());
-        let terminal_title_path = self
-            .new_session_workspace
-            .selected_workspace()
-            .map(|workspace| workspace.root_path.clone())
-            .or_else(|| self.new_session_workspace.origin_workspace_id.as_ref().and_then(|_| {
-                self.new_session_workspace.project_root.clone().into()
-            }))
-            .unwrap_or_else(|| self.new_session_workspace.project_root.clone());
-        let terminal_title_line = format!(
-            "{} at {}",
-            terminal_title_user,
-            terminal_title_path
-        );
         // The reader's configured code face, which is the one a terminal would
         // use: the prompt should not invent a second monospace.
         let prompt_font = self
@@ -57947,19 +57924,13 @@ impl VibexWorkbench {
                                     // modes changes what the box *is* without
                                     // making the layout jump.
                                     .rounded(px(20.0))
-                                    .when(terminal_transport, |this| {
-                                        // A terminal window, not a message box:
-                                        // the terminal's own surface, a quieter
-                                        // border so the pane edge does not
-                                        // compete with the prompt, and the
-                                        // shape kept from the interface mode.
-                                        this.border_color(cx.theme().border.opacity(0.45))
-                                            .bg(terminal_surface_color)
-                                    })
-                                    .when(!terminal_transport, |this| {
-                                        this.border_color(cx.theme().border.opacity(0.72))
-                                            .bg(card_color)
-                                    })
+                                    // One appearance for both modes. The mode
+                                    // is announced by the prompt mark inside the
+                                    // box, not by repainting it: a box that
+                                    // changes surface, border and padding moved
+                                    // the input line whenever the reader switched.
+                                    .border_color(cx.theme().border.opacity(0.72))
+                                    .bg(card_color)
                                     .border_1()
                                     .shadow_lg()
                                     .on_prepaint(move |bounds, _, cx| {
@@ -57985,44 +57956,6 @@ impl VibexWorkbench {
                                             .gap_2()
                                             .p_4()
                                             .pb_2()
-                                            .when(terminal_transport, |this| {
-                                                // The title strip above already
-                                                // supplies the gap, so the prompt
-                                                // starts where the strip ends
-                                                // instead of doubling it.
-                                                this.pt(px(2.0))
-                                            })
-                                            .when(terminal_transport, |this| {
-                                                // A prompt marker, the way a
-                                                // shell draws one, so the box
-                                                // reads as a command line even
-                                                // before the reader types.
-                                                this.child(
-                                                    // The prompt, drawn the way a
-                                                    // shell draws one: a heavy
-                                                    // chevron in the accent, in
-                                                    // the code face, on its own
-                                                    // baseline so it sits level
-                                                    // with the first line of
-                                                    // input instead of floating
-                                                    // above it.
-                                                    // A terminal's prompt mark,
-                                                    // bright enough to read as
-                                                    // an affordance rather than
-                                                    // a smudge: the accent at
-                                                    // full strength in the code
-                                                    // face, sized to the first
-                                                    // line of input.
-                                                    div()
-                                                        .flex_none()
-                                                        .text_size(px(16.0))
-                                                        .line_height(px(24.0))
-                                                        .font_weight(gpui::FontWeight::BOLD)
-                                                        .font_family(prompt_font.clone())
-                                                        .text_color(cx.theme().accent)
-                                                        .child("❯"),
-                                                )
-                                            })
                                             .child(
                                                 div()
                                                     .relative()
@@ -58032,6 +57965,31 @@ impl VibexWorkbench {
                                                     .when(terminal_transport, |this| {
                                                         this.font_family(
                                                             prompt_font.clone(),
+                                                        )
+                                                    })
+                                                    // The mark is painted over the
+                                                    // first line rather than laid
+                                                    // out beside it: a flex child
+                                                    // would claim width and height,
+                                                    // and switching modes would move
+                                                    // the input and the send button.
+                                                    .when(terminal_transport, |this| {
+                                                        this.child(
+                                                            div()
+                                                                .absolute()
+                                                                .top_0()
+                                                                .left(px(-14.0))
+                                                                .text_size(px(14.0))
+                                                                .line_height(px(22.0))
+                                                                .font_weight(gpui::FontWeight::BOLD)
+                                                                .font_family(prompt_font.clone())
+                                                                // Brighter than the
+                                                                // accent: the mark has
+                                                                // to read as an
+                                                                // affordance at a
+                                                                // glance.
+                                                                .text_color(cx.theme().foreground)
+                                                                .child("❯"),
                                                         )
                                                     })
                                                     .when(
@@ -105415,17 +105373,18 @@ mod tests {
             "let terminal_transport = self.ui_state.session.new_session_transport.is_terminal();"
         ));
         assert!(panel.contains(".when(terminal_transport, |this| {"));
-        // Terminal mode takes the terminal surface and a prompt mark. It does
-        // not add a header line: the box is the prompt, and a path strip above
-        // it is chrome the reader never asked for.
-        assert!(panel.contains("bg(terminal_surface_color)"));
+        // The box itself does not change between modes: a box that repaints its
+        // surface, border and padding moved the input and the send button every
+        // time the reader switched.
+        assert!(!panel.contains("bg(terminal_surface_color)"));
+        assert!(!panel.contains(".when(!terminal_transport, |this| {"));
         assert!(!panel.contains("new-session-terminal-title"));
+        // The mark is painted over the first line, so it claims no layout space.
         assert!(panel.contains(".child(\"❯\")"));
-        // The silhouette is the page's in both modes: switching changes what the
-        // box is, not how much room it takes.
+        assert!(panel.contains(".absolute()"));
+        assert!(panel.contains(".left(px(-14.0))"));
+        // The silhouette is the page's in both modes.
         assert!(panel.contains(".rounded(px(20.0))"));
-        // The interface mode keeps the conversational card surface.
-        assert!(panel.contains(".when(!terminal_transport, |this| {"));
         assert!(panel.contains("bg(card_color)"));
         // The code face, so the prompt reads as a command line.
         assert!(panel.contains("prompt_font.clone()"));
