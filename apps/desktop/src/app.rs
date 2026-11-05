@@ -18117,7 +18117,14 @@ impl VibexWorkbench {
                                 .into_iter()
                                 .filter(|agent| vibex_core::is_user_visible_agent(&agent.id))
                                 .collect();
-                            this.sessions = sessions;
+                            // Same rule the per-snapshot merge keeps: an
+                            // authoritative list is one read, and a terminal
+                            // session read without its link is not the
+                            // authority withdrawing the PTY.
+                            this.sessions = sessions
+                                .into_iter()
+                                .map(|session| this.retain_known_terminal_link(session))
+                                .collect();
                             // The read is authoritative for whole rows, so a
                             // dispatch whose turn it shows settled is answered
                             // here rather than by the submission that armed it.
@@ -18849,6 +18856,27 @@ impl VibexWorkbench {
             })
     }
 
+    /// Keeps a terminal link the client already knows about.
+    ///
+    /// A snapshot is one row read at one moment, and the terminal facts are
+    /// loaded beside it. A snapshot that arrives without them is not the
+    /// authority saying the link is gone — the link cannot be removed, a session
+    /// is either terminal-mode or not — so replacing a known link with nothing
+    /// only makes the page forget which PTY it was drawing. Retaining it keeps
+    /// the row honest and is a no-op for every ACP session.
+    fn retain_known_terminal_link(&self, mut session: AgentSession) -> AgentSession {
+        if session.terminal.is_some() || !session.is_terminal() {
+            return session;
+        }
+        let known = self
+            .registered_session(session.id.as_str())
+            .and_then(|existing| existing.terminal.clone());
+        if known.is_some() {
+            session.terminal = known;
+        }
+        session
+    }
+
     fn upsert_session_snapshot(&mut self, session: AgentSession) {
         if self.session_hidden_from_sidebar(session.id.as_str())
             || self
@@ -18874,6 +18902,7 @@ impl VibexWorkbench {
             self.queue_ui_state();
             return;
         }
+        let session = self.retain_known_terminal_link(session);
         let session = self.reconcile_pending_new_session_title(session);
         // The snapshot is the authority's own account of the turn a local
         // dispatch asked for, so it is what answers the optimistic flag.
@@ -56099,6 +56128,13 @@ impl VibexWorkbench {
     /// Agent owns the conversation inside it. The second option is disabled for
     /// an Agent this release has not verified, so the panel cannot advertise a
     /// mode that would fail on submit.
+    /// The interface choice, as a segmented pill.
+    ///
+    /// Two modes of one control, so they read as a choice rather than as two
+    /// unrelated buttons: one track, one raised segment for the active mode, and
+    /// an icon pair that says "Vibex draws it" against "the Agent draws it".
+    /// Both segments keep their tooltip, and an Agent this release cannot run in
+    /// a terminal disables only the terminal half.
     fn render_new_session_transport_switch(
         &self,
         agent_id: Option<&AgentId>,
@@ -56108,62 +56144,75 @@ impl VibexWorkbench {
             .map(|agent_id| vibex_core::terminal_session_support(agent_id).is_supported())
             .unwrap_or(false);
         let current = self.ui_state.session.new_session_transport;
-        let disabled_label = if supported {
-            String::new()
-        } else {
-            crate::locale::text(
-                "This Agent has no verified terminal mode",
-                "该 Agent 尚未验证终端模式",
-                "該 Agent 尚未驗證終端模式",
-            )
-            .to_string()
-        };
+        let is_dark = cx.theme().is_dark();
+        let track = theme::semantic_color("muted", is_dark).opacity(0.55);
+        let selected_bg = theme::semantic_color("background", is_dark);
+        let unselected = cx.theme().muted_foreground;
+        let terminal_accent = theme::semantic_color("accent", is_dark);
+        let disabled_label = crate::locale::text(
+            "This Agent has no verified terminal mode",
+            "该 Agent 尚未验证终端模式",
+            "該 Agent 尚未驗證終端模式",
+        )
+        .to_string();
         let options = [
             (
                 NewSessionTransport::Acp,
                 "new-session-transport-acp",
+                IconName::LayoutDashboard,
                 crate::locale::text("Vibex interface", "Vibex 界面", "Vibex 介面"),
                 false,
-            ),
-            (
-                NewSessionTransport::Terminal,
-                "new-session-transport-terminal",
-                crate::locale::text("Native terminal", "原生终端", "原生終端"),
-                !supported,
-            ),
-        ];
-        let mut row = h_flex()
-            .id("new-session-transport")
-            .flex_none()
-            .items_center()
-            .gap_1();
-        for (mode, id, label, option_disabled) in options {
-            let selected = current == mode;
-            let tooltip = if option_disabled {
-                disabled_label.clone()
-            } else if mode.is_terminal() {
-                crate::locale::text(
-                    "The Agent runs its own interface in a terminal. Approvals and file changes happen there.",
-                    "Agent 在终端里运行自己的界面，审批和文件改动都在终端内完成。",
-                    "Agent 在終端裡執行自己的介面，審批和檔案改動都在終端內完成。",
-                )
-                .to_string()
-            } else {
                 crate::locale::text(
                     "Vibex draws the conversation, approvals, and file changes.",
                     "由 Vibex 绘制对话、审批和文件改动。",
                     "由 Vibex 繪製對話、審批和檔案改動。",
                 )
-                .to_string()
-            };
-            row = row.child(
+                .to_string(),
+                cx.theme().foreground,
+            ),
+            (
+                NewSessionTransport::Terminal,
+                "new-session-transport-terminal",
+                IconName::SquareTerminal,
+                crate::locale::text("Native terminal", "原生终端", "原生終端"),
+                !supported,
+                if supported {
+                    crate::locale::text(
+                        "The Agent runs its own interface in a terminal. Approvals and file changes happen there.",
+                        "Agent 在终端里运行自己的界面，审批和文件改动都在终端内完成。",
+                        "Agent 在終端裡執行自己的介面，審批和檔案改動都在終端內完成。",
+                    )
+                    .to_string()
+                } else {
+                    disabled_label.clone()
+                },
+                terminal_accent,
+            ),
+        ];
+        let mut segments = Vec::with_capacity(options.len());
+        for (mode, id, icon, label, option_disabled, tooltip, active_color) in options {
+            let selected = current == mode;
+            segments.push(
                 Button::new(id)
                     .xsmall()
                     .ghost()
-                    .selected(selected)
+                    .h(px(24.0))
+                    .px_2()
+                    .rounded(px(7.0))
+                    .when(selected, |this| {
+                        this.bg(selected_bg).text_color(active_color).shadow_xs()
+                    })
+                    .when(!selected, |this| this.text_color(unselected))
+                    .when(option_disabled, |this| this.opacity(0.45))
                     .disabled(option_disabled)
                     .tooltip(tooltip)
-                    .label(label)
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap(px(5.0))
+                            .child(Icon::new(icon).size(px(12.0)))
+                            .child(div().text_size(px(11.0)).child(label)),
+                    )
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if this.ui_state.session.new_session_transport == mode {
                             return;
@@ -56171,10 +56220,20 @@ impl VibexWorkbench {
                         this.ui_state.session.new_session_transport = mode;
                         this.queue_ui_state();
                         cx.notify();
-                    })),
+                    }))
+                    .into_any_element(),
             );
         }
-        row.into_any_element()
+        h_flex()
+            .id("new-session-transport")
+            .flex_none()
+            .items_center()
+            .gap(px(2.0))
+            .p(px(2.0))
+            .rounded(px(9.0))
+            .bg(track)
+            .children(segments)
+            .into_any_element()
     }
 
     fn render_new_session_runtime_cascade(
@@ -57760,10 +57819,20 @@ impl VibexWorkbench {
                                     // surface — the same shift the page makes
                                     // when the session opens.
                                     .when(terminal_transport, |this| {
-                                        this.rounded(px(6.0))
-                                            .border_color(
-                                                cx.theme().accent.opacity(0.55),
-                                            )
+                                        // A terminal window, not a message box:
+                                        // square, the terminal's own surface,
+                                        // one accent edge in the reader's
+                                        // preferred terminal colour, and a
+                                        // hairline elsewhere so the edges of
+                                        // the pane are still legible.
+                                        // The accent lives on the border: this
+                                        // build has no per-side border colour,
+                                        // and a full accent edge reads as "this
+                                        // box is the active mode" better than a
+                                        // hairline that disappears on a light
+                                        // theme anyway.
+                                        this.rounded(px(4.0))
+                                            .border_color(cx.theme().accent.opacity(0.62))
                                             .bg(terminal_surface_color)
                                     })
                                     .when(!terminal_transport, |this| {
@@ -57804,7 +57873,16 @@ impl VibexWorkbench {
                                                 this.child(
                                                     div()
                                                         .flex_none()
-                                                        .pt(px(1.0))
+                                                        // Sized and coloured
+                                                        // like a shell prompt:
+                                                        // a bare glyph in the
+                                                        // code face rendered
+                                                        // thin and nearly
+                                                        // invisible against
+                                                        // the terminal surface.
+                                                        .text_size(px(14.0))
+                                                        .line_height(px(20.0))
+                                                        .font_weight(gpui::FontWeight::SEMIBOLD)
                                                         .font_family(prompt_font.clone())
                                                         .text_color(cx.theme().accent)
                                                         .child("❯"),
@@ -104980,6 +105058,40 @@ mod tests {
         );
     }
 
+    /// A snapshot without terminal facts does not erase a known link.
+    ///
+    /// The link cannot be withdrawn — a session is terminal-mode or it is not —
+    /// so a snapshot that arrives without it is a read that did not join the
+    /// table, not the authority saying the PTY is gone. Replacing a known link
+    /// with nothing is what made the terminal appear and vanish one frame after
+    /// creation.
+    #[test]
+    fn a_snapshot_without_terminal_facts_keeps_the_known_link() {
+        let source = include_str!("app.rs");
+        let source = source
+            .split("\nmod tests {")
+            .next()
+            .expect("the module has production code");
+        let retain = source
+            .split_once("    fn retain_known_terminal_link(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn upsert_session_snapshot("))
+            .map(|(body, _)| body)
+            .expect("the retention rule should remain inspectable");
+        assert!(retain.contains("if session.terminal.is_some() || !session.is_terminal()"));
+        assert!(retain.contains("session.terminal = known;"));
+
+        // Both row sources keep it: the live snapshot and the list read, which
+        // replaces every row at once.
+        assert!(
+            source.contains("let session = self.retain_known_terminal_link(session);"),
+            "the live snapshot path must keep a known link"
+        );
+        assert!(
+            source.contains(".map(|session| this.retain_known_terminal_link(session))"),
+            "the authoritative list must keep a known link"
+        );
+    }
+
     /// The transport lives on the workspace row, not inside the prompt box.
     ///
     /// It answers "who owns the interface", which is not another "where does
@@ -105041,7 +105153,7 @@ mod tests {
         ));
         assert!(panel.contains(".when(terminal_transport, |this| {"));
         // Terminal mode squares the corners and takes the terminal surface.
-        assert!(panel.contains("this.rounded(px(6.0))"));
+        assert!(panel.contains("this.rounded(px(4.0))"));
         assert!(panel.contains("bg(terminal_surface_color)"));
         // The interface mode keeps the conversational card.
         assert!(panel.contains(".when(!terminal_transport, |this| {"));
