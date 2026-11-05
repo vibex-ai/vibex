@@ -58012,7 +58012,7 @@ impl VibexWorkbench {
                                                     // reads high without the nudge.
                                                     div()
                                                         .flex_none()
-                                                        .pt(px(3.0))
+                                                        .pt(px(6.0))
                                                         .text_size(px(14.0))
                                                         .line_height(px(21.0))
                                                         .font_weight(gpui::FontWeight::BOLD)

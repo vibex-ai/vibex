@@ -3151,19 +3151,32 @@ impl AgentManager {
             Some(profile_id) => self.terminal_session_env_overlays(profile_id, &session)?,
             None => Vec::new(),
         };
-        // The Agent's conversation lives in its own store, and the exit notice
-        // named the id to continue it. Resuming is what makes a restart the same
-        // conversation rather than an empty one beside it; without the id there
-        // is nothing to resume, so the flags are replayed as they were.
+        // The Agent's conversation lives in its own store, and a restart has to
+        // continue it rather than start a second one beside it. The exit notice
+        // names the exact session when it printed one; failing that, both CLIs
+        // can continue the most recent conversation in this directory, which is
+        // this session unless the reader ran another one there since.
         let mut argv = record.argv.clone();
-        if let Some(native_session_id) = record
+        match record
             .facts
             .native_session_id
             .as_deref()
             .filter(|id| !id.trim().is_empty())
         {
-            argv.push("--resume".to_string());
-            argv.push(native_session_id.to_string());
+            Some(native_session_id) => {
+                argv.push("--resume".to_string());
+                argv.push(native_session_id.to_string());
+            }
+            None => match session.agent_id.as_str() {
+                // `--continue` needs no id, which is what makes a restart keep
+                // its history even when the CLI exited without printing one.
+                "claude" => argv.push("--continue".to_string()),
+                "codex" => {
+                    argv.push("resume".to_string());
+                    argv.push("--last".to_string());
+                }
+                _ => {}
+            },
         }
         let spec = vibex_core::TerminalSessionLaunchSpec {
             workspace_id: record.workspace_id.clone(),
@@ -13277,11 +13290,12 @@ mod tests {
 
         let restarted = manager.restart_terminal_session(&session.id).await.unwrap();
         assert_eq!(restarted.state, AgentSessionState::Idle);
-        // Same command, including the model the page chose.
+        // Same command, including the model the page chose, plus the resume flag
+        // that keeps the conversation.
         let launches = launcher.launches();
         assert_eq!(
             launches.last().expect("the restart launched").argv,
-            vec!["claude", "--model", "claude-opus-4-6"]
+            vec!["claude", "--model", "claude-opus-4-6", "--continue"]
                 .into_iter()
                 .map(str::to_string)
                 .collect::<Vec<_>>()
@@ -13379,13 +13393,14 @@ mod tests {
             .unwrap();
         manager.restart_terminal_session(&session.id).await.unwrap();
         let launches = launcher.launches();
+        let argv = launches.last().expect("the restart launched").argv.clone();
         assert_eq!(
-            launches.last().expect("the restart launched").argv,
-            vec!["claude", "--model", "claude-opus-4-6"]
+            argv,
+            vec!["claude", "--model", "claude-opus-4-6", "--continue"]
                 .into_iter()
                 .map(str::to_string)
                 .collect::<Vec<_>>(),
-            "a restart must not ask the Agent the same question again"
+            "a restart replays the flags and continues the conversation, without repeating the prompt"
         );
     }
 
@@ -13412,6 +13427,62 @@ mod tests {
                 .map(str::to_string)
                 .collect::<Vec<_>>(),
             "the restart continues the conversation instead of starting an empty one"
+        );
+    }
+
+
+    /// A restart with no recorded id still continues the conversation.
+    ///
+    /// The exit notice is the only place the Agent's own session id appears, and
+    /// a CLI that exited without printing one used to leave the restart with
+    /// nothing to resume: it started a second, empty conversation beside the
+    /// first and the reader lost their history.
+    #[tokio::test]
+    async fn a_restart_without_a_recorded_id_continues_the_last_conversation() {
+        let (manager, launcher, dir) = terminal_manager();
+        let session = manager
+            .create_terminal_session(terminal_request("claude", &dir))
+            .await
+            .unwrap();
+        let terminal_id = launcher.watched()[0].0.clone();
+        launcher.kill(&terminal_id).unwrap();
+        manager
+            .mark_session_terminal_ended(&session.id, None)
+            .unwrap();
+
+        manager.restart_terminal_session(&session.id).await.unwrap();
+        let launches = launcher.launches();
+        assert_eq!(
+            launches.last().expect("the restart launched").argv,
+            vec!["claude", "--continue"]
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>(),
+            "without an id the CLI is asked to continue its latest conversation"
+        );
+    }
+
+    /// A recorded id wins over the directory-wide fallback.
+    #[tokio::test]
+    async fn a_recorded_id_is_preferred_over_continue() {
+        let (manager, launcher, dir) = terminal_manager();
+        let session = manager
+            .create_terminal_session(terminal_request("claude", &dir))
+            .await
+            .unwrap();
+        let terminal_id = launcher.watched()[0].0.clone();
+        launcher.kill(&terminal_id).unwrap();
+        manager
+            .mark_session_terminal_ended(&session.id, Some("54689079-d7b6-4dc5-9a38-8a4202f5f2ad"))
+            .unwrap();
+
+        manager.restart_terminal_session(&session.id).await.unwrap();
+        let launches = launcher.launches();
+        let argv = launches.last().expect("the restart launched").argv.clone();
+        assert!(argv.contains(&"--resume".to_string()));
+        assert!(
+            !argv.contains(&"--continue".to_string()),
+            "an exact id must not be widened to the whole directory"
         );
     }
 
