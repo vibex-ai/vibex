@@ -3797,15 +3797,18 @@ impl ManagementCenter {
         self.mutation = Some(ManagementMutation::Gateway);
         let this = cx.entity();
         self.mutation_task = Some(cx.spawn(async move |_, cx| {
-            let outcome = backend
-                .management()
-                .set_agent_default_model_route(vibex_backend::MutationRequest::new(
-                    vibex_core::AgentModelRouteDefaultRequest {
-                        agent_id,
-                        model_route_id: route_id,
-                    },
-                ))
-                .await;
+            let outcome = management_off_thread(cx, async move {
+                backend
+                    .management()
+                    .set_agent_default_model_route(vibex_backend::MutationRequest::new(
+                        vibex_core::AgentModelRouteDefaultRequest {
+                            agent_id,
+                            model_route_id: route_id,
+                        },
+                    ))
+                    .await
+            })
+            .await;
             this.update(cx, |this, cx| {
                 this.mutation = None;
                 match outcome {
@@ -5207,7 +5210,16 @@ impl ManagementCenter {
         self.agent_auth_terminal_surface_task = Some(cx.spawn(async move |_, cx| {
             // The session belongs to whichever runtime owns the PTY, so the
             // attach reads it through the transport before building the view.
-            let session = match transport.poll_terminal(&terminal_id, i64::MAX).await {
+            let poll_transport = transport.clone();
+            let poll_terminal_id = terminal_id.clone();
+            let session = match management_off_thread(cx, async move {
+                poll_transport
+                    .poll_terminal(&poll_terminal_id, i64::MAX)
+                    .await
+                    .map_err(|error| vibex_backend::BackendError::failed(error.code, error.message))
+            })
+            .await
+            {
                 Ok(snapshot) => snapshot.session,
                 Err(_) => {
                     let _ = entity.update(cx, |this, _| {
@@ -6561,15 +6573,18 @@ impl ManagementCenter {
         };
         let entity = cx.weak_entity();
         self.profile_secret_task = Some(cx.spawn_in(window, async move |_, cx| {
-            let outcome = backend
-                .management()
-                .get_agent_model_provider_profile_secret_value(
-                    vibex_core::AgentModelProviderProfileSecretValueRequest {
-                        agent_id,
-                        provider_profile_id,
-                    },
-                )
-                .await;
+            let outcome = management_off_thread(cx, async move {
+                backend
+                    .management()
+                    .get_agent_model_provider_profile_secret_value(
+                        vibex_core::AgentModelProviderProfileSecretValueRequest {
+                            agent_id,
+                            provider_profile_id,
+                        },
+                    )
+                    .await
+            })
+            .await;
             let _ = entity.update_in(cx, |this, window, cx| {
                 if this.editing_profile_id.as_deref() != Some(profile_id.as_str())
                     || !this.profile_api_key.read(cx).value().is_empty()
@@ -7661,14 +7676,17 @@ impl ManagementCenter {
         self.provider_preset_models_task = None;
         let entity = cx.weak_entity();
         self.provider_preset_models_task = Some(cx.spawn_in(window, async move |_, cx| {
-            let models = backend
-                .management()
-                .catalog_offered_models(vibex_core::CatalogOfferedModelsRequest {
-                    provider_id,
-                    only,
-                })
-                .await
-                .unwrap_or_default();
+            let models = management_off_thread(cx, async move {
+                backend
+                    .management()
+                    .catalog_offered_models(vibex_core::CatalogOfferedModelsRequest {
+                        provider_id,
+                        only,
+                    })
+                    .await
+            })
+            .await
+            .unwrap_or_default();
             let _ = entity.update_in(cx, |this, window, cx| {
                 // A later preset replaced this one, so this answer describes a
                 // draft that is no longer on screen.
@@ -7800,15 +7818,18 @@ impl ManagementCenter {
         let entity = cx.weak_entity();
         let requested_model = model_id.clone();
         self.model_capability_task = Some(cx.spawn_in(window, async move |_, cx| {
-            let suggestion = backend
-                .management()
-                .model_capability_suggestion(vibex_core::ModelCapabilitySuggestionRequest {
-                    provider_id,
-                    model_id,
-                })
-                .await
-                .ok()
-                .flatten();
+            let suggestion = management_off_thread(cx, async move {
+                backend
+                    .management()
+                    .model_capability_suggestion(vibex_core::ModelCapabilitySuggestionRequest {
+                        provider_id,
+                        model_id,
+                    })
+                    .await
+            })
+            .await
+            .ok()
+            .flatten();
             let _ = entity.update_in(cx, |this, window, cx| {
                 // A late answer must not describe a Model the pane has already
                 // left, so the selection is the guard rather than a generation
@@ -7952,10 +7973,13 @@ impl ManagementCenter {
         }
         let entity = cx.weak_entity();
         self.model_canonical_task = Some(cx.spawn(async move |_, cx| {
-            let Ok(models) = backend
-                .management()
-                .model_canonical_ids(vibex_core::ModelCanonicalIdsRequest { models })
-                .await
+            let Ok(models) = management_off_thread(cx, async move {
+                backend
+                    .management()
+                    .model_canonical_ids(vibex_core::ModelCanonicalIdsRequest { models })
+                    .await
+            })
+            .await
             else {
                 return;
             };
@@ -8234,12 +8258,14 @@ impl ManagementCenter {
         self.error = None;
         let this = cx.entity();
         self.mutation_task = Some(cx.spawn_in(window, async move |_, cx| {
-            let outcome = async {
+            // Creating a Provider writes SQLite and the OS keychain. Both block
+            // the thread that polls them, so the whole sequence runs on the
+            // Tokio runtime and only its answer returns to this GPUI task.
+            let runner = management_off_thread(cx, async move {
                 let mut profile = backend
                     .management()
                     .create_model_provider_profile(vibex_backend::MutationRequest::new(request))
-                    .await
-                    .map_err(crate::app::remote_error_into_vibex)?;
+                    .await?;
                 // The catalogue id is advisory metadata and has no field on the
                 // create request. Write it before the Key so a failure leaves
                 // the Provider editable rather than half-created.
@@ -8254,8 +8280,7 @@ impl ManagementCenter {
                                 expected_revision,
                             },
                         ))
-                        .await
-                        .map_err(crate::app::remote_error_into_vibex)?;
+                        .await?;
                 }
                 // The Key is written through the v2 credential API rather than
                 // carried on the create request, because that is the path that
@@ -8271,8 +8296,7 @@ impl ManagementCenter {
                                 value: api_key,
                             },
                         ))
-                        .await
-                        .map_err(crate::app::remote_error_into_vibex)?;
+                        .await?;
                 }
                 // A shared record has no legacy identity of its own. The bind
                 // path materialises the per-Agent launch row from the shared
@@ -8290,15 +8314,14 @@ impl ManagementCenter {
                                     make_default,
                                 },
                             ))
-                            .await
-                            .map_err(crate::app::remote_error_into_vibex)?;
+                            .await?;
                         Some((bound.id.clone(), agent_id.clone()))
                     }
                     None => None,
                 };
-                Ok::<_, VibexError>((profile, verification))
-            }
-            .await;
+                Ok::<_, vibex_backend::BackendError>((profile, verification))
+            });
+            let outcome = runner.await.map_err(crate::app::remote_error_into_vibex);
             let _ = this.update_in(cx, |this, window, cx| {
                 this.mutation = None;
                 match outcome {
@@ -8692,15 +8715,18 @@ impl ManagementCenter {
         self.mutation = Some(ManagementMutation::ProviderProbe(profile_id.clone()));
         let entity = cx.weak_entity();
         self.mutation_task = Some(cx.spawn(async move |_, cx| {
-            let outcome = backend
-                .management()
-                .test_agent_model_provider_profile(
-                    vibex_core::AgentModelProviderProfileTestRequest {
-                        agent_id,
-                        provider_profile_id,
-                    },
-                )
-                .await;
+            let outcome = management_off_thread(cx, async move {
+                backend
+                    .management()
+                    .test_agent_model_provider_profile(
+                        vibex_core::AgentModelProviderProfileTestRequest {
+                            agent_id,
+                            provider_profile_id,
+                        },
+                    )
+                    .await
+            })
+            .await;
             let _ = entity.update(cx, |this, cx| {
                 this.mutation = None;
                 match outcome {
@@ -14426,15 +14452,20 @@ impl ManagementCenter {
             let mut missing_secret_count = 0usize;
             let mut failures = Vec::new();
             for import_item_id in picked {
-                let result = backend
-                    .management()
-                    .create_profile_from_import(MutationRequest::new(
-                        vibex_core::ProviderNativeImportCreateRequest {
-                            preview_request: preview_request.clone(),
-                            import_item_id,
-                        },
-                    ))
-                    .await;
+                let backend = backend.clone();
+                let preview_request = preview_request.clone();
+                let result = management_off_thread(cx, async move {
+                    backend
+                        .management()
+                        .create_profile_from_import(MutationRequest::new(
+                            vibex_core::ProviderNativeImportCreateRequest {
+                                preview_request: preview_request.clone(),
+                                import_item_id,
+                            },
+                        ))
+                        .await
+                })
+                .await;
                 match result {
                     Ok(result) => {
                         if result.diagnostics.iter().any(|diagnostic| {
@@ -15544,27 +15575,40 @@ impl ManagementCenter {
         self.mutation = Some(ManagementMutation::ProfileCreate);
         let this = cx.entity();
         self.mutation_task = Some(cx.spawn(async move |_, cx| {
-            let created = backend
-                .management()
-                .create_model_provider_profile(vibex_backend::MutationRequest::new(request))
-                .await;
+            // The write touches SQLite and the OS keychain, so it runs on the
+            // Tokio runtime instead of blocking the frame that polls it.
+            let create_backend = backend.clone();
+            let created = management_off_thread(cx, async move {
+                let backend = create_backend;
+                backend
+                    .management()
+                    .create_model_provider_profile(vibex_backend::MutationRequest::new(request))
+                    .await
+            })
+            .await;
             let outcome = match created {
                 // The Key goes through the v2 credential API rather than the
                 // create request, because that is the path that also stores the
                 // Secret and advances the revision the bindings read. A failure
                 // here leaves an editable Provider rather than a half-created
                 // one the user has to clean up.
-                Ok(profile) if !api_key.is_empty() => backend
-                    .management()
-                    .add_model_provider_credential(vibex_backend::MutationRequest::new(
-                        vibex_core::AddModelProviderCredentialRequest {
-                            model_provider_profile_id: profile.id.clone(),
-                            display_name: None,
-                            value: api_key,
-                        },
-                    ))
+                Ok(profile) if !api_key.is_empty() => {
+                    let backend = backend.clone();
+                    management_off_thread(cx, async move {
+                        backend
+                            .management()
+                            .add_model_provider_credential(vibex_backend::MutationRequest::new(
+                                vibex_core::AddModelProviderCredentialRequest {
+                                    model_provider_profile_id: profile.id.clone(),
+                                    display_name: None,
+                                    value: api_key,
+                                },
+                            ))
+                            .await
+                            .map(|_| profile)
+                    })
                     .await
-                    .map(|_| profile),
+                }
                 other => other,
             };
             this.update(cx, |this, cx| {
@@ -15913,16 +15957,19 @@ impl ManagementCenter {
         self.mutation = Some(ManagementMutation::Gateway);
         let this = cx.entity();
         self.mutation_task = Some(cx.spawn(async move |_, cx| {
-            let outcome = backend
-                .management()
-                .bind_agent_model_route(vibex_backend::MutationRequest::new(
-                    vibex_core::AgentModelRouteBindRequest {
-                        agent_id,
-                        model_route_id: route_id,
-                        make_default: !has_default_before_bind,
-                    },
-                ))
-                .await;
+            let outcome = management_off_thread(cx, async move {
+                backend
+                    .management()
+                    .bind_agent_model_route(vibex_backend::MutationRequest::new(
+                        vibex_core::AgentModelRouteBindRequest {
+                            agent_id,
+                            model_route_id: route_id,
+                            make_default: !has_default_before_bind,
+                        },
+                    ))
+                    .await
+            })
+            .await;
             this.update(cx, |this, cx| {
                 this.mutation = None;
                 match outcome {
@@ -16028,13 +16075,15 @@ impl ManagementCenter {
         cx.notify();
 
         let this = cx.entity();
+        let deleted_id = provider_id.clone();
         self.mutation_task = Some(cx.spawn(async move |_, cx| {
-            let outcome = backend
-                .management()
-                .delete_model_provider_profile(vibex_backend::MutationRequest::new(
-                    provider_id.clone(),
-                ))
-                .await;
+            let outcome = management_off_thread(cx, async move {
+                backend
+                    .management()
+                    .delete_model_provider_profile(vibex_backend::MutationRequest::new(provider_id))
+                    .await
+            })
+            .await;
             this.update(cx, |this, cx| {
                 this.mutation = None;
                 match outcome {
@@ -16044,7 +16093,7 @@ impl ManagementCenter {
                         this.refresh(cx);
                     }
                     Err(error) => {
-                        this.pending_provider_deletes.remove(provider_id.as_str());
+                        this.pending_provider_deletes.remove(deleted_id.as_str());
                         if let Some(provider) = removed_provider {
                             this.providers.push(provider);
                         }
@@ -16184,29 +16233,34 @@ impl ManagementCenter {
         self.error = None;
         let this = cx.entity();
         self.mutation_task = Some(cx.spawn(async move |_, cx| {
-            let outcome = match source {
-                UnbindModelSource::Provider(provider_profile_id) => backend
-                    .management()
-                    .delete_agent_model_provider_profile(vibex_backend::MutationRequest::new(
-                        vibex_core::AgentModelProviderProfileDeleteRequest {
-                            agent_id: agent_id.clone(),
-                            provider_profile_id,
-                        },
-                    ))
-                    .await
-                    .map(|_| true),
-                UnbindModelSource::Route(model_route_id) => {
-                    backend
+            // Unbinding writes the binding table, so it runs off the frame
+            // thread like every other Config Center mutation.
+            let outcome = management_off_thread(cx, async move {
+                match source {
+                    UnbindModelSource::Provider(provider_profile_id) => backend
                         .management()
-                        .unbind_agent_model_route(vibex_backend::MutationRequest::new(
-                            vibex_core::AgentModelRouteUnbindRequest {
+                        .delete_agent_model_provider_profile(vibex_backend::MutationRequest::new(
+                            vibex_core::AgentModelProviderProfileDeleteRequest {
                                 agent_id: agent_id.clone(),
-                                model_route_id,
+                                provider_profile_id,
                             },
                         ))
                         .await
+                        .map(|_| true),
+                    UnbindModelSource::Route(model_route_id) => {
+                        backend
+                            .management()
+                            .unbind_agent_model_route(vibex_backend::MutationRequest::new(
+                                vibex_core::AgentModelRouteUnbindRequest {
+                                    agent_id: agent_id.clone(),
+                                    model_route_id,
+                                },
+                            ))
+                            .await
+                    }
                 }
-            };
+            })
+            .await;
             this.update(cx, |this, cx| {
                 this.mutation = None;
                 match outcome {
@@ -16249,16 +16303,19 @@ impl ManagementCenter {
         self.error = None;
         let this = cx.entity();
         self.mutation_task = Some(cx.spawn(async move |_, cx| {
-            let outcome = backend
-                .management()
-                .set_agent_model_source_default(vibex_backend::MutationRequest::new(
-                    vibex_core::SetAgentModelSourceDefaultRequest {
-                        scope,
-                        agent_id,
-                        source,
-                    },
-                ))
-                .await;
+            let outcome = management_off_thread(cx, async move {
+                backend
+                    .management()
+                    .set_agent_model_source_default(vibex_backend::MutationRequest::new(
+                        vibex_core::SetAgentModelSourceDefaultRequest {
+                            scope,
+                            agent_id,
+                            source,
+                        },
+                    ))
+                    .await
+            })
+            .await;
             this.update(cx, |this, cx| {
                 this.mutation = None;
                 match outcome {
@@ -16304,12 +16361,15 @@ impl ManagementCenter {
         self.error = None;
         let this = cx.entity();
         self.mutation_task = Some(cx.spawn(async move |_, cx| {
-            let outcome = backend
+            let outcome = management_off_thread(cx, async move {
+                backend
                 .management()
                 .clear_agent_model_source_default(vibex_backend::MutationRequest::new(
                     vibex_core::ClearAgentModelSourceDefaultRequest { scope, agent_id },
                 ))
-                .await;
+                .await
+            })
+            .await;
             this.update(cx, |this, cx| {
                 this.mutation = None;
                 match outcome {
@@ -16384,17 +16444,20 @@ impl ManagementCenter {
         self.error = None;
         let this = cx.entity();
         self.mutation_task = Some(cx.spawn(async move |_, cx| {
-            let outcome = backend
-                .management()
-                .bind_agent_model_provider(vibex_backend::MutationRequest::new(
-                    vibex_core::AgentModelProviderBindRequest {
-                        provider_profile_id: profile_id,
-                        model_provider_profile_id: shared_id,
-                        agent_id: agent_id.clone(),
-                        make_default: !has_default_before_bind,
-                    },
-                ))
-                .await;
+            let outcome = management_off_thread(cx, async move {
+                backend
+                    .management()
+                    .bind_agent_model_provider(vibex_backend::MutationRequest::new(
+                        vibex_core::AgentModelProviderBindRequest {
+                            provider_profile_id: profile_id,
+                            model_provider_profile_id: shared_id,
+                            agent_id: agent_id.clone(),
+                            make_default: !has_default_before_bind,
+                        },
+                    ))
+                    .await
+            })
+            .await;
             this.update(cx, |this, cx| {
                 this.mutation = None;
                 match outcome {
@@ -17186,12 +17249,15 @@ impl ManagementCenter {
         self.notice = None;
         let this = cx.entity();
         self.mutation_task = Some(cx.spawn(async move |_, cx| {
-            let outcome = backend
-                .management()
-                .test_model_provider_profile(vibex_core::ModelProviderTestRequest {
-                    model_provider_profile_id: profile_id,
-                })
-                .await;
+            let outcome = management_off_thread(cx, async move {
+                backend
+                    .management()
+                    .test_model_provider_profile(vibex_core::ModelProviderTestRequest {
+                        model_provider_profile_id: profile_id,
+                    })
+                    .await
+            })
+            .await;
             this.update(cx, |this, cx| {
                 this.mutation = None;
                 match outcome {
@@ -17235,13 +17301,16 @@ impl ManagementCenter {
         self.notice = None;
         let this = cx.entity();
         self.mutation_task = Some(cx.spawn(async move |_, cx| {
-            let outcome = backend
-                .management()
-                .test_model_provider_credential(vibex_core::ModelProviderKeyTestRequest {
-                    model_provider_profile_id: profile_id,
-                    credential_id,
-                })
-                .await;
+            let outcome = management_off_thread(cx, async move {
+                backend
+                    .management()
+                    .test_model_provider_credential(vibex_core::ModelProviderKeyTestRequest {
+                        model_provider_profile_id: profile_id,
+                        credential_id,
+                    })
+                    .await
+            })
+            .await;
             this.update(cx, |this, cx| {
                 this.mutation = None;
                 match outcome {
@@ -17291,13 +17360,16 @@ impl ManagementCenter {
         self.notice = None;
         let this = cx.entity();
         self.mutation_task = Some(cx.spawn(async move |_, cx| {
-            let outcome = backend
-                .management()
-                .test_model_provider_proxy(vibex_core::ModelProviderProxyTestRequest {
-                    model_provider_profile_id: profile_id,
-                    credential_id,
-                })
-                .await;
+            let outcome = management_off_thread(cx, async move {
+                backend
+                    .management()
+                    .test_model_provider_proxy(vibex_core::ModelProviderProxyTestRequest {
+                        model_provider_profile_id: profile_id,
+                        credential_id,
+                    })
+                    .await
+            })
+            .await;
             this.update(cx, |this, cx| {
                 this.mutation = None;
                 match outcome {
@@ -17340,12 +17412,17 @@ impl ManagementCenter {
         self.notice = None;
         let this = cx.entity();
         self.mutation_task = Some(cx.spawn(async move |_, cx| {
-            let outcome = backend
-                .management()
-                .fetch_model_provider_profile_models(vibex_core::ModelProviderFetchModelsRequest {
-                    model_provider_profile_id: profile_id,
-                })
-                .await;
+            let outcome = management_off_thread(cx, async move {
+                backend
+                    .management()
+                    .fetch_model_provider_profile_models(
+                        vibex_core::ModelProviderFetchModelsRequest {
+                            model_provider_profile_id: profile_id,
+                        },
+                    )
+                    .await
+            })
+            .await;
             this.update(cx, |this, cx| {
                 this.mutation = None;
                 match outcome {
@@ -17976,15 +18053,18 @@ impl ManagementCenter {
         let entity = cx.weak_entity();
         let requested_model = model_id.clone();
         self.provider_model_capability_task = Some(cx.spawn_in(window, async move |_, cx| {
-            let suggestion = backend
-                .management()
-                .model_capability_suggestion(vibex_core::ModelCapabilitySuggestionRequest {
-                    provider_id,
-                    model_id,
-                })
-                .await
-                .ok()
-                .flatten();
+            let suggestion = management_off_thread(cx, async move {
+                backend
+                    .management()
+                    .model_capability_suggestion(vibex_core::ModelCapabilitySuggestionRequest {
+                        provider_id,
+                        model_id,
+                    })
+                    .await
+            })
+            .await
+            .ok()
+            .flatten();
             let _ = entity.update_in(cx, |this, window, cx| {
                 if this.provider_model_edit_id.as_deref() != Some(requested_model.as_str()) {
                     return;
@@ -18706,15 +18786,18 @@ impl ManagementCenter {
         self.error = None;
         let entity = cx.weak_entity();
         self.provider_key_reveal_task = Some(cx.spawn(async move |_, cx| {
-            let outcome = backend
-                .management()
-                .get_model_provider_credential_secret(
-                    vibex_core::ModelProviderCredentialSecretRequest {
-                        model_provider_profile_id: profile_id,
-                        credential_id,
-                    },
-                )
-                .await;
+            let outcome = management_off_thread(cx, async move {
+                backend
+                    .management()
+                    .get_model_provider_credential_secret(
+                        vibex_core::ModelProviderCredentialSecretRequest {
+                            model_provider_profile_id: profile_id,
+                            credential_id,
+                        },
+                    )
+                    .await
+            })
+            .await;
             let _ = entity.update(cx, |this, cx| {
                 // A snapshot or a second eye click may have moved on while the
                 // read was in flight; a late value must not appear under a Key
@@ -18793,10 +18876,13 @@ impl ManagementCenter {
         self.error = None;
         let this = cx.entity();
         self.mutation_task = Some(cx.spawn(async move |_, cx| {
-            let outcome = backend
-                .management()
-                .update_model_gateway_settings(vibex_backend::MutationRequest::new(request))
-                .await;
+            let outcome = management_off_thread(cx, async move {
+                backend
+                    .management()
+                    .update_model_gateway_settings(vibex_backend::MutationRequest::new(request))
+                    .await
+            })
+            .await;
             this.update(cx, |this, cx| {
                 this.mutation = None;
                 match outcome {
@@ -18862,10 +18948,13 @@ impl ManagementCenter {
         self.error = None;
         let this = cx.entity();
         self.mutation_task = Some(cx.spawn(async move |_, cx| {
-            let outcome = backend
-                .management()
-                .set_model_gateway_enabled(enabled)
-                .await;
+            let outcome = management_off_thread(cx, async move {
+                backend
+                    .management()
+                    .set_model_gateway_enabled(enabled)
+                    .await
+            })
+            .await;
             this.update(cx, |this, cx| {
                 this.mutation = None;
                 match outcome {
@@ -18894,7 +18983,10 @@ impl ManagementCenter {
         };
         let this = cx.entity();
         cx.spawn(async move |_, cx| {
-            let outcome = backend.management().model_gateway_snapshot().await;
+            let outcome = management_off_thread(cx, async move {
+                backend.management().model_gateway_snapshot().await
+            })
+            .await;
             this.update(cx, |this, cx| {
                 if let Ok(snapshot) = outcome {
                     this.gateway = snapshot;
@@ -19119,15 +19211,18 @@ impl ManagementCenter {
         self.error = None;
         let this = cx.entity();
         self.mutation_task = Some(cx.spawn(async move |_, cx| {
-            let outcome = backend
-                .management()
-                .update_model_provider_profile(vibex_backend::MutationRequest::new(
-                    vibex_core::ModelProviderProfileUpdateRequest {
-                        profile,
-                        expected_revision,
-                    },
-                ))
-                .await;
+            let outcome = management_off_thread(cx, async move {
+                backend
+                    .management()
+                    .update_model_provider_profile(vibex_backend::MutationRequest::new(
+                        vibex_core::ModelProviderProfileUpdateRequest {
+                            profile,
+                            expected_revision,
+                        },
+                    ))
+                    .await
+            })
+            .await;
             this.update(cx, |this, cx| {
                 this.mutation = None;
                 match outcome {
@@ -19514,7 +19609,10 @@ impl ManagementCenter {
         self.mutation = Some(ManagementMutation::Gateway);
         let this = cx.entity();
         self.mutation_task = Some(cx.spawn(async move |_, cx| {
-            let outcome = backend.management().clear_model_gateway_requests().await;
+            let outcome = management_off_thread(cx, async move {
+                backend.management().clear_model_gateway_requests().await
+            })
+            .await;
             this.update(cx, |this, cx| {
                 this.mutation = None;
                 match outcome {
@@ -19572,16 +19670,19 @@ impl ManagementCenter {
         self.mutation = Some(ManagementMutation::Gateway);
         let this = cx.entity();
         self.mutation_task = Some(cx.spawn(async move |_, cx| {
-            let outcome = backend
-                .management()
-                .add_model_provider_credential(vibex_backend::MutationRequest::new(
-                    vibex_core::AddModelProviderCredentialRequest {
-                        model_provider_profile_id: profile.clone(),
-                        display_name: None,
-                        value,
-                    },
-                ))
-                .await;
+            let outcome = management_off_thread(cx, async move {
+                backend
+                    .management()
+                    .add_model_provider_credential(vibex_backend::MutationRequest::new(
+                        vibex_core::AddModelProviderCredentialRequest {
+                            model_provider_profile_id: profile.clone(),
+                            display_name: None,
+                            value,
+                        },
+                    ))
+                    .await
+            })
+            .await;
             this.update(cx, |this, cx| {
                 this.mutation = None;
                 match outcome {
@@ -19775,13 +19876,16 @@ impl ManagementCenter {
         let credential_id = credential.id.clone();
         let this = cx.entity();
         self.mutation_task = Some(cx.spawn(async move |_, cx| {
-            let outcome = backend
-                .management()
-                .probe_model_provider_endpoints(vibex_core::ModelProviderEndpointProbeRequest {
-                    model_provider_profile_id: profile_id,
-                    credential_id,
-                })
-                .await;
+            let outcome = management_off_thread(cx, async move {
+                backend
+                    .management()
+                    .probe_model_provider_endpoints(vibex_core::ModelProviderEndpointProbeRequest {
+                        model_provider_profile_id: profile_id,
+                        credential_id,
+                    })
+                    .await
+            })
+            .await;
             this.update(cx, |this, cx| {
                 this.mutation = None;
                 match outcome {
@@ -20339,16 +20443,21 @@ impl ManagementCenter {
             let mut added = 0usize;
             let mut failure = None;
             for value in values {
-                let outcome = backend
-                    .management()
-                    .add_model_provider_credential(vibex_backend::MutationRequest::new(
-                        vibex_core::AddModelProviderCredentialRequest {
-                            model_provider_profile_id: profile.clone(),
-                            display_name: None,
-                            value,
-                        },
-                    ))
-                    .await;
+                let backend = backend.clone();
+                let profile = profile.clone();
+                let outcome = management_off_thread(cx, async move {
+                    backend
+                        .management()
+                        .add_model_provider_credential(vibex_backend::MutationRequest::new(
+                            vibex_core::AddModelProviderCredentialRequest {
+                                model_provider_profile_id: profile,
+                                display_name: None,
+                                value,
+                            },
+                        ))
+                        .await
+                })
+                .await;
                 match outcome {
                     Ok(_) => added += 1,
                     Err(error) => {
@@ -20555,15 +20664,18 @@ impl ManagementCenter {
         self.error = None;
         let this = cx.entity();
         self.mutation_task = Some(cx.spawn(async move |_, cx| {
-            let outcome = backend
-                .management()
-                .remove_model_provider_credential(vibex_backend::MutationRequest::new(
-                    vibex_core::RemoveModelProviderCredentialRequest {
-                        model_provider_profile_id: profile,
-                        credential_id: credential,
-                    },
-                ))
-                .await;
+            let outcome = management_off_thread(cx, async move {
+                backend
+                    .management()
+                    .remove_model_provider_credential(vibex_backend::MutationRequest::new(
+                        vibex_core::RemoveModelProviderCredentialRequest {
+                            model_provider_profile_id: profile,
+                            credential_id: credential,
+                        },
+                    ))
+                    .await
+            })
+            .await;
             this.update(cx, |this, cx| {
                 this.mutation = None;
                 match outcome {
@@ -20609,18 +20721,21 @@ impl ManagementCenter {
         self.gateway_key_replace_error = None;
         let this = cx.entity();
         self.mutation_task = Some(cx.spawn(async move |_, cx| {
-            let outcome = backend
-                .management()
-                .mutate_provider_credential_secret(vibex_backend::MutationRequest::new(
-                    vibex_core::ProviderCredentialSecretMutationRequest {
-                        model_provider_profile_id: profile,
-                        credential_id: credential,
-                        touched: true,
-                        clear: false,
-                        value: Some(value),
-                    },
-                ))
-                .await;
+            let outcome = management_off_thread(cx, async move {
+                backend
+                    .management()
+                    .mutate_provider_credential_secret(vibex_backend::MutationRequest::new(
+                        vibex_core::ProviderCredentialSecretMutationRequest {
+                            model_provider_profile_id: profile,
+                            credential_id: credential,
+                            touched: true,
+                            clear: false,
+                            value: Some(value),
+                        },
+                    ))
+                    .await
+            })
+            .await;
             this.update(cx, |this, cx| {
                 this.mutation = None;
                 match outcome {
@@ -28717,39 +28832,63 @@ impl ManagementCenter {
         self.mutation = Some(ManagementMutation::Gateway);
         let this = cx.entity();
         self.mutation_task = Some(cx.spawn_in(window, async move |_, cx| {
-            let saved = match editing {
-                Some(_) => {
-                    backend
+            // A route group save writes the group and, when the draft came from
+            // an Agent, its binding; both are database writes, so the sequence
+            // runs on the Tokio runtime rather than on the frame thread.
+            let runner = management_off_thread(cx, async move {
+                let saved = match editing {
+                    Some(_) => {
+                        backend
+                            .management()
+                            .update_model_route(vibex_backend::MutationRequest::new(
+                                vibex_core::ModelRouteUpdateRequest {
+                                    route: route.clone(),
+                                    expected_revision,
+                                },
+                            ))
+                            .await
+                    }
+                    None => {
+                        backend
+                            .management()
+                            .create_model_route(vibex_backend::MutationRequest::new(route.clone()))
+                            .await
+                    }
+                };
+                let outcome = match (&saved, bind_agent) {
+                    (Ok(saved), Some(agent_id)) => backend
                         .management()
-                        .update_model_route(vibex_backend::MutationRequest::new(
-                            vibex_core::ModelRouteUpdateRequest {
-                                route: route.clone(),
-                                expected_revision,
+                        .bind_agent_model_route(vibex_backend::MutationRequest::new(
+                            vibex_core::AgentModelRouteBindRequest {
+                                agent_id,
+                                model_route_id: saved.id.clone(),
+                                make_default: bind_should_default,
                             },
                         ))
                         .await
-                }
-                None => {
-                    backend
-                        .management()
-                        .create_model_route(vibex_backend::MutationRequest::new(route.clone()))
-                        .await
-                }
-            };
-            let outcome = match (&saved, bind_agent) {
-                (Ok(saved), Some(agent_id)) => backend
-                    .management()
-                    .bind_agent_model_route(vibex_backend::MutationRequest::new(
-                        vibex_core::AgentModelRouteBindRequest {
-                            agent_id,
-                            model_route_id: saved.id.clone(),
-                            make_default: bind_should_default,
-                        },
-                    ))
-                    .await
-                    .map(|_| ()),
-                (Ok(_), None) => Ok(()),
-                (Err(error), _) => Err(error.clone()),
+                        .map(|_| ()),
+                    (Ok(_), None) => Ok(()),
+                    (Err(error), _) => Err(error.clone()),
+                };
+                Ok::<_, vibex_backend::BackendError>((saved, outcome))
+            });
+            let Ok((saved, outcome)) = runner.await else {
+                let _ = this.update_in(cx, |this, window, cx| {
+                    this.mutation = None;
+                    this.error = Some(
+                        management_error_text(
+                            "Route group save did not run",
+                            "路由组保存未能执行",
+                            "路由組儲存未能執行",
+                        )
+                        .to_string(),
+                    );
+                    if window.has_active_dialog(cx) {
+                        window.close_dialog(cx);
+                    }
+                    cx.notify();
+                });
+                return;
             };
             let _ = this.update_in(cx, |this, window, cx| {
                 this.mutation = None;
@@ -28832,10 +28971,13 @@ impl ManagementCenter {
         self.mutation = Some(ManagementMutation::Gateway);
         let this = cx.entity();
         self.mutation_task = Some(cx.spawn(async move |_, cx| {
-            let result = backend
-                .management()
-                .create_model_route(MutationRequest::new(route.clone()))
-                .await;
+            let result = management_off_thread(cx, async move {
+                backend
+                    .management()
+                    .create_model_route(MutationRequest::new(route.clone()))
+                    .await
+            })
+            .await;
             this.update(cx, |this, cx| {
                 this.mutation = None;
                 match result {
@@ -29341,10 +29483,13 @@ impl ManagementCenter {
         self.mutation = Some(ManagementMutation::Gateway);
         let this = cx.entity();
         self.mutation_task = Some(cx.spawn(async move |_, cx| {
-            let outcome = backend
-                .management()
-                .create_model_route(vibex_backend::MutationRequest::new(cloned))
-                .await;
+            let outcome = management_off_thread(cx, async move {
+                backend
+                    .management()
+                    .create_model_route(vibex_backend::MutationRequest::new(cloned))
+                    .await
+            })
+            .await;
             this.update(cx, |this, cx| {
                 this.mutation = None;
                 match outcome {
@@ -29436,14 +29581,17 @@ impl ManagementCenter {
                         this.mutation = Some(ManagementMutation::Gateway);
                         let this_entity = cx.entity();
                         this.mutation_task = Some(cx.spawn(async move |_, cx| {
-                            let outcome = backend
+                            let outcome = management_off_thread(cx, async move {
+                                backend
                                 .management()
                                 .delete_model_route(vibex_backend::MutationRequest::new(
                                     vibex_core::ModelRouteDeleteRequest {
                                         model_route_id: route_id,
                                     },
                                 ))
-                                .await;
+                                .await
+                            })
+                            .await;
                             this_entity.update(cx, |this, cx| {
                                 this.mutation = None;
                                 match outcome {
@@ -29492,15 +29640,18 @@ impl ManagementCenter {
         self.mutation = Some(ManagementMutation::Gateway);
         let this = cx.entity();
         self.mutation_task = Some(cx.spawn(async move |_, cx| {
-            let outcome = backend
-                .management()
-                .unbind_agent_model_route(vibex_backend::MutationRequest::new(
-                    vibex_core::AgentModelRouteUnbindRequest {
-                        agent_id,
-                        model_route_id: route_id,
-                    },
-                ))
-                .await;
+            let outcome = management_off_thread(cx, async move {
+                backend
+                    .management()
+                    .unbind_agent_model_route(vibex_backend::MutationRequest::new(
+                        vibex_core::AgentModelRouteUnbindRequest {
+                            agent_id,
+                            model_route_id: route_id,
+                        },
+                    ))
+                    .await
+            })
+            .await;
             this.update(cx, |this, cx| {
                 this.mutation = None;
                 match outcome {
@@ -35752,6 +35903,169 @@ fn provider_reorder_row_offset(
     let preview_index = preview_ids.iter().position(|id| id == profile_id)?;
     let offset = isize::try_from(original_index).ok()? - isize::try_from(preview_index).ok()?;
     (offset != 0).then_some(offset)
+}
+
+/// Runs one Config Center request on the Tokio runtime.
+///
+/// Every `NativeBackend` management method does its database and keychain work
+/// synchronously inside the future it returns, and the Provider probes call
+/// `reqwest::blocking`. Polling one of those futures from a GPUI foreground
+/// task therefore stops the render loop for the length of the write — which is
+/// what froze the Config Center while a Provider was created and only showed
+/// the toast once the write had finished.
+///
+/// Handing the request to `gpui_tokio::Tokio::spawn` moves the block off the UI
+/// thread; the caller still awaits the returned task from its own GPUI task, so
+/// only the answer crosses back.
+///
+/// The request is *not* tied to the caller: closing the page, switching
+/// sections, or dropping the view must not abort a write halfway through the
+/// Provider/Key pair. A detached task forwards the answer through a channel, so
+/// a dropped caller loses the notification while the write still finishes, and
+/// the next snapshot shows what was actually written. A dropped join (the
+/// runtime shut down mid-request) is reported as a cancelled request rather
+/// than a panic.
+fn management_off_thread<C, T, F>(cx: &C, request: F) -> Task<vibex_backend::BackendResult<T>>
+where
+    C: gpui::AppContext,
+    T: Send + 'static,
+    F: std::future::Future<Output = vibex_backend::BackendResult<T>> + Send + 'static,
+{
+    let (answer_tx, answer_rx) = tokio::sync::oneshot::channel();
+    // The join handle is detached from this view on purpose; see above.
+    std::mem::drop(gpui_tokio::Tokio::spawn(cx, async move {
+        let _ = answer_tx.send(request.await);
+    }));
+    cx.background_spawn(async move {
+        match answer_rx.await {
+            Ok(outcome) => outcome,
+            Err(_) => Err(vibex_backend::BackendError::failed(
+                "management_request_cancelled",
+                "the runtime stopped before the Config Center request answered",
+            )),
+        }
+    })
+}
+
+/// Finds Config Center requests a GPUI foreground task polls itself.
+///
+/// This backs `config_center_requests_never_block_the_frame`. It walks every
+/// `cx.spawn` body and reports an awaited statement that names the backend,
+/// unless that statement is inside `gpui_tokio::Tokio::spawn` or
+/// `management_off_thread` — the two entry points that keep a blocking request
+/// off the frame thread. Test modules are skipped because they quote the very
+/// shapes this scan looks for.
+#[cfg(test)]
+fn backend_awaited_by_foreground_tasks(source: &str) -> Vec<String> {
+    use std::ops::Range;
+
+    /// The line range of each brace-delimited block opened by `marker`.
+    fn blocks(lines: &[&str], marker: &str) -> Vec<Range<usize>> {
+        let mut found = Vec::new();
+        for (line_index, line) in lines.iter().enumerate() {
+            let Some(offset) = line.find(marker) else {
+                continue;
+            };
+            let mut depth = 0usize;
+            let mut started = false;
+            let mut index = line_index;
+            'scan: while index < lines.len() {
+                let text = if index == line_index {
+                    &lines[index][offset..]
+                } else {
+                    lines[index]
+                };
+                for character in text.chars() {
+                    match character {
+                        '{' => {
+                            depth += 1;
+                            started = true;
+                        }
+                        '}' => {
+                            depth = depth.saturating_sub(1);
+                            if started && depth == 0 {
+                                found.push(line_index..index);
+                                break 'scan;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                index += 1;
+            }
+        }
+        found
+    }
+
+    /// The statement that ends on `line`, from its own first line.
+    ///
+    /// A line that ends with `;`, `{` or `}` closed the previous statement, so
+    /// the walk stops there. That keeps a bridge call's own `.await` from
+    /// pulling the `backend` inside its closure into the statement text.
+    fn statement(lines: &[&str], line: usize, floor: usize) -> String {
+        let mut start = line;
+        while start > floor {
+            let previous = lines[start - 1].trim_end();
+            if previous.ends_with(';') || previous.ends_with('{') || previous.ends_with('}') {
+                break;
+            }
+            start -= 1;
+        }
+        lines[start..=line].join("\n")
+    }
+
+    // The helper itself quotes the shapes being looked for, so the scan stops
+    // before it as well as before the test module.
+    let production = source
+        .split("\n#[cfg(test)]\nmod tests {")
+        .next()
+        .unwrap_or(source)
+        .split("\n#[cfg(test)]\nfn backend_awaited_by_foreground_tasks")
+        .next()
+        .unwrap_or(source);
+    let lines: Vec<&str> = production.lines().collect();
+    // A bridge call is `bridge(cx, async move { .. })` followed by its own
+    // `.await`; the block range ends at the closing brace, so the tail lines
+    // are included here or the bridge's own await would look like a direct one.
+    let mut off_thread = blocks(&lines, "gpui_tokio::Tokio::spawn")
+        .into_iter()
+        .chain(blocks(&lines, "management_off_thread("))
+        .collect::<Vec<_>>();
+    for range in &mut off_thread {
+        let mut end = range.end;
+        while end + 1 < lines.len() {
+            let next = lines[end + 1].trim_start();
+            if next.starts_with(".await") || next.is_empty() {
+                end += 1;
+            } else {
+                break;
+            }
+        }
+        range.end = end;
+    }
+
+    let mut found = Vec::new();
+    for body in blocks(&lines, "cx.spawn") {
+        for index in body.clone() {
+            if !lines[index].contains(".await") {
+                continue;
+            }
+            if off_thread
+                .iter()
+                .any(|range| range.start <= index && index <= range.end)
+            {
+                continue;
+            }
+            let text = statement(&lines, index, body.start);
+            if text.contains("management_off_thread") || text.contains("gpui_tokio::Tokio::spawn") {
+                continue;
+            }
+            if text.contains("backend") && text.contains(".await") {
+                found.push(format!("line {}: {}", index + 1, lines[index].trim()));
+            }
+        }
+    }
+    found
 }
 
 fn management_provider_default_scope(
@@ -44702,6 +45016,71 @@ mod tests {
             market.contains("self.mcp_market_icons.get(&entry.id)"),
             "the grid should hand the card the picture it already loaded"
         );
+    }
+
+    /// Config Center requests must not be polled by a GPUI foreground task.
+    ///
+    /// Every `NativeBackend` management method runs its SQLite, keychain and
+    /// `reqwest::blocking` probe work inside the future it returns, so polling
+    /// one from the frame thread freezes the window for the whole write. That
+    /// is what made "Create Provider" hang the Config Center and then show the
+    /// toast late. Each such request now goes through `management_off_thread`,
+    /// which starts it on Tokio and hands only the answer back.
+    ///
+    /// The scan is deliberately statement-level: `cx.spawn` bodies are walked
+    /// for an awaited statement that names the backend outside a Tokio spawn
+    /// or the bridge. That is exactly the shape the bug had, and a new writer
+    /// has to use the same entry point.
+    #[test]
+    fn config_center_requests_never_block_the_frame() {
+        for (name, source) in [
+            ("management.rs", include_str!("management.rs")),
+            (
+                "provider_workspace/provider.rs",
+                include_str!("management/provider_workspace/provider.rs"),
+            ),
+            (
+                "provider_workspace/route_group.rs",
+                include_str!("management/provider_workspace/route_group.rs"),
+            ),
+            (
+                "provider_workspace/batch.rs",
+                include_str!("management/provider_workspace/batch.rs"),
+            ),
+            (
+                "provider_workspace/routes.rs",
+                include_str!("management/provider_workspace/routes.rs"),
+            ),
+        ] {
+            let found = backend_awaited_by_foreground_tasks(source);
+            assert!(
+                found.is_empty(),
+                "{name}: run these Config Center requests through \
+                 `management_off_thread` instead of polling them in the GPUI \
+                 task: {found:#?}"
+            );
+        }
+    }
+
+    /// The guard above is only worth its keep if it sees a real violation.
+    #[test]
+    fn the_frame_block_guard_recognizes_a_violation() {
+        let sample = r#"
+fn save(cx: &mut Context<Self>) {
+    let this = cx.entity();
+    self.mutation_task = Some(cx.spawn(async move |_, cx| {
+        let outcome = backend
+            .management()
+            .create_model_provider_profile(MutationRequest::new(request))
+            .await;
+        this.update(cx, |this, cx| {
+            this.mutation = None;
+            cx.notify();
+        });
+    }));
+}
+"#;
+        assert_eq!(backend_awaited_by_foreground_tasks(sample).len(), 1);
     }
 
     /// Market pictures are read on a blocking worker inside the runtime, so the

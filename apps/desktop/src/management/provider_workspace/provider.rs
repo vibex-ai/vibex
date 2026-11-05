@@ -642,41 +642,52 @@ impl ManagementCenter {
         self.error = None;
         let this = cx.entity();
         self.mutation_task = Some(cx.spawn(async move |_, cx| {
-            let mut applied = 0usize;
-            let mut failure = None;
-            for (agent_id, legacy, make_default) in requests {
-                let outcome = if enabled {
-                    backend
-                        .management()
-                        .bind_agent_model_provider(vibex_backend::MutationRequest::new(
-                            vibex_core::AgentModelProviderBindRequest {
-                                provider_profile_id: legacy,
-                                model_provider_profile_id: Some(profile_id.clone()),
-                                agent_id,
-                                make_default,
-                            },
-                        ))
-                        .await
-                        .map(|_| ())
-                } else {
-                    backend
-                        .management()
-                        .delete_agent_model_provider_profile(vibex_backend::MutationRequest::new(
-                            vibex_core::AgentModelProviderProfileDeleteRequest {
-                                agent_id,
-                                provider_profile_id: legacy,
-                            },
-                        ))
-                        .await
-                };
-                match outcome {
-                    Ok(()) => applied += 1,
-                    Err(error) => {
-                        failure = Some(error);
-                        break;
+            // Every binding in the list is a row write. The loop runs on the
+            // Tokio runtime, so a multi-Agent change keeps the page painting.
+            let outcome = management_off_thread(cx, async move {
+                let mut applied = 0usize;
+                let mut failure = None;
+                for (agent_id, legacy, make_default) in requests {
+                    let outcome = if enabled {
+                        backend
+                            .management()
+                            .bind_agent_model_provider(vibex_backend::MutationRequest::new(
+                                vibex_core::AgentModelProviderBindRequest {
+                                    provider_profile_id: legacy,
+                                    model_provider_profile_id: Some(profile_id.clone()),
+                                    agent_id,
+                                    make_default,
+                                },
+                            ))
+                            .await
+                            .map(|_| ())
+                    } else {
+                        backend
+                            .management()
+                            .delete_agent_model_provider_profile(
+                                vibex_backend::MutationRequest::new(
+                                    vibex_core::AgentModelProviderProfileDeleteRequest {
+                                        agent_id,
+                                        provider_profile_id: legacy,
+                                    },
+                                ),
+                            )
+                            .await
+                    };
+                    match outcome {
+                        Ok(()) => applied += 1,
+                        Err(error) => {
+                            failure = Some(error);
+                            break;
+                        }
                     }
                 }
-            }
+                Ok::<_, vibex_backend::BackendError>((applied, failure))
+            })
+            .await;
+            let Ok((applied, failure)) = outcome else {
+                return;
+            };
             this.update(cx, |this, cx| {
                 this.mutation = None;
                 this.refresh(cx);

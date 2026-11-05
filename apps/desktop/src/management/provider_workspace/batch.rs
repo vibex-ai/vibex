@@ -317,47 +317,60 @@ impl ManagementCenter {
             match action {
                 WorkspaceBatchAction::Enable | WorkspaceBatchAction::Disable => {
                     let enabled = action == WorkspaceBatchAction::Enable;
-                    for mut profile in providers {
-                        profile.status = if enabled {
-                            vibex_core::ModelProviderProfileStatus::Enabled
-                        } else {
-                            vibex_core::ModelProviderProfileStatus::Disabled
-                        };
-                        let expected_revision = profile.revision;
-                        match backend
-                            .management()
-                            .update_model_provider_profile(MutationRequest::new(
-                                vibex_core::ModelProviderProfileUpdateRequest {
-                                    profile,
-                                    expected_revision,
-                                },
-                            ))
-                            .await
-                        {
-                            Ok(_) => changed += 1,
-                            Err(error) => failures.push((error.code, error.message)),
+                    // Every record in the batch is a database write. The whole
+                    // walk runs on the Tokio runtime so a long selection cannot
+                    // hold the frame loop while it is applied.
+                    let enabled_count = management_off_thread(cx, async move {
+                        let mut changed = 0usize;
+                        let mut failures = Vec::new();
+                        for mut profile in providers {
+                            profile.status = if enabled {
+                                vibex_core::ModelProviderProfileStatus::Enabled
+                            } else {
+                                vibex_core::ModelProviderProfileStatus::Disabled
+                            };
+                            let expected_revision = profile.revision;
+                            match backend
+                                .management()
+                                .update_model_provider_profile(MutationRequest::new(
+                                    vibex_core::ModelProviderProfileUpdateRequest {
+                                        profile,
+                                        expected_revision,
+                                    },
+                                ))
+                                .await
+                            {
+                                Ok(_) => changed += 1,
+                                Err(error) => failures.push((error.code, error.message)),
+                            }
                         }
-                    }
-                    for mut route in routes {
-                        route.status = if enabled {
-                            vibex_core::RouteStatus::Enabled
-                        } else {
-                            vibex_core::RouteStatus::Disabled
-                        };
-                        let expected_revision = route.revision;
-                        match backend
-                            .management()
-                            .update_model_route(MutationRequest::new(
-                                vibex_core::ModelRouteUpdateRequest {
-                                    route,
-                                    expected_revision,
-                                },
-                            ))
-                            .await
-                        {
-                            Ok(_) => changed += 1,
-                            Err(error) => failures.push((error.code, error.message)),
+                        for mut route in routes {
+                            route.status = if enabled {
+                                vibex_core::RouteStatus::Enabled
+                            } else {
+                                vibex_core::RouteStatus::Disabled
+                            };
+                            let expected_revision = route.revision;
+                            match backend
+                                .management()
+                                .update_model_route(MutationRequest::new(
+                                    vibex_core::ModelRouteUpdateRequest {
+                                        route,
+                                        expected_revision,
+                                    },
+                                ))
+                                .await
+                            {
+                                Ok(_) => changed += 1,
+                                Err(error) => failures.push((error.code, error.message)),
+                            }
                         }
+                        Ok::<_, vibex_backend::BackendError>((changed, failures))
+                    })
+                    .await;
+                    if let Ok((count, errors)) = enabled_count {
+                        changed = count;
+                        failures = errors;
                     }
                     this.update(cx, |this, cx| {
                         this.mutation = None;
@@ -395,29 +408,41 @@ impl ManagementCenter {
                     });
                 }
                 WorkspaceBatchAction::Delete => {
-                    for route in routes {
-                        match backend
-                            .management()
-                            .delete_model_route(MutationRequest::new(
-                                vibex_core::ModelRouteDeleteRequest {
-                                    model_route_id: route.id,
-                                },
-                            ))
-                            .await
-                        {
-                            Ok(_) => changed += 1,
-                            Err(error) => failures.push((error.code, error.message)),
+                    // Deleting a selection is a burst of database writes; keep
+                    // it on the runtime so the page keeps painting the progress.
+                    let deleted = management_off_thread(cx, async move {
+                        let mut changed = 0usize;
+                        let mut failures = Vec::new();
+                        for route in routes {
+                            match backend
+                                .management()
+                                .delete_model_route(MutationRequest::new(
+                                    vibex_core::ModelRouteDeleteRequest {
+                                        model_route_id: route.id,
+                                    },
+                                ))
+                                .await
+                            {
+                                Ok(_) => changed += 1,
+                                Err(error) => failures.push((error.code, error.message)),
+                            }
                         }
-                    }
-                    for profile in providers {
-                        match backend
-                            .management()
-                            .delete_model_provider_profile(MutationRequest::new(profile.id))
-                            .await
-                        {
-                            Ok(()) => changed += 1,
-                            Err(error) => failures.push((error.code, error.message)),
+                        for profile in providers {
+                            match backend
+                                .management()
+                                .delete_model_provider_profile(MutationRequest::new(profile.id))
+                                .await
+                            {
+                                Ok(()) => changed += 1,
+                                Err(error) => failures.push((error.code, error.message)),
+                            }
                         }
+                        Ok::<_, vibex_backend::BackendError>((changed, failures))
+                    })
+                    .await;
+                    if let Ok((count, errors)) = deleted {
+                        changed = count;
+                        failures = errors;
                     }
                     this.update(cx, |this, cx| {
                         this.mutation = None;

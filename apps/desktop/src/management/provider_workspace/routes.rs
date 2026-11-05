@@ -288,7 +288,10 @@ impl ManagementCenter {
         self.gateway_requests_loading = true;
         let this = cx.entity();
         self.gateway_request_load_task = Some(cx.spawn(async move |_, cx| {
-            let outcome = backend.management().model_gateway_requests(query).await;
+            let outcome = management_off_thread(cx, async move {
+                backend.management().model_gateway_requests(query).await
+            })
+            .await;
             this.update(cx, |this, cx| {
                 this.gateway_request_load_task = None;
                 if generation != this.gateway_requests_generation {

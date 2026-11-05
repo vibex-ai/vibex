@@ -287,15 +287,18 @@ impl ManagementCenter {
         self.mutation = Some(ManagementMutation::Gateway);
         let this = cx.entity();
         self.mutation_task = Some(cx.spawn(async move |_, cx| {
-            let outcome = backend
-                .management()
-                .update_model_route(vibex_backend::MutationRequest::new(
-                    vibex_core::ModelRouteUpdateRequest {
-                        route,
-                        expected_revision,
-                    },
-                ))
-                .await;
+            let outcome = management_off_thread(cx, async move {
+                backend
+                    .management()
+                    .update_model_route(vibex_backend::MutationRequest::new(
+                        vibex_core::ModelRouteUpdateRequest {
+                            route,
+                            expected_revision,
+                        },
+                    ))
+                    .await
+            })
+            .await;
             this.update(cx, |this, cx| {
                 this.mutation = None;
                 match outcome {
@@ -386,41 +389,51 @@ impl ManagementCenter {
         self.error = None;
         let this = cx.entity();
         self.mutation_task = Some(cx.spawn(async move |_, cx| {
-            let mut applied = 0usize;
-            let mut failure = None;
-            for (agent_id, make_default) in requests {
-                let outcome = if enabled {
-                    backend
-                        .management()
-                        .bind_agent_model_route(vibex_backend::MutationRequest::new(
-                            vibex_core::AgentModelRouteBindRequest {
-                                agent_id,
-                                model_route_id: route_id.clone(),
-                                make_default,
-                            },
-                        ))
-                        .await
-                        .map(|_| ())
-                } else {
-                    backend
-                        .management()
-                        .unbind_agent_model_route(vibex_backend::MutationRequest::new(
-                            vibex_core::AgentModelRouteUnbindRequest {
-                                agent_id,
-                                model_route_id: route_id.clone(),
-                            },
-                        ))
-                        .await
-                        .map(|_| ())
-                };
-                match outcome {
-                    Ok(()) => applied += 1,
-                    Err(error) => {
-                        failure = Some(error);
-                        break;
+            // The whole list is applied off the frame thread: each row is a
+            // database write, and a group bound to many Agents must not stall
+            // the page while the loop runs.
+            let outcome = management_off_thread(cx, async move {
+                let mut applied = 0usize;
+                let mut failure = None;
+                for (agent_id, make_default) in requests {
+                    let outcome = if enabled {
+                        backend
+                            .management()
+                            .bind_agent_model_route(vibex_backend::MutationRequest::new(
+                                vibex_core::AgentModelRouteBindRequest {
+                                    agent_id,
+                                    model_route_id: route_id.clone(),
+                                    make_default,
+                                },
+                            ))
+                            .await
+                            .map(|_| ())
+                    } else {
+                        backend
+                            .management()
+                            .unbind_agent_model_route(vibex_backend::MutationRequest::new(
+                                vibex_core::AgentModelRouteUnbindRequest {
+                                    agent_id,
+                                    model_route_id: route_id.clone(),
+                                },
+                            ))
+                            .await
+                            .map(|_| ())
+                    };
+                    match outcome {
+                        Ok(()) => applied += 1,
+                        Err(error) => {
+                            failure = Some(error);
+                            break;
+                        }
                     }
                 }
-            }
+                Ok::<_, vibex_backend::BackendError>((applied, failure))
+            })
+            .await;
+            let Ok((applied, failure)) = outcome else {
+                return;
+            };
             this.update(cx, |this, cx| {
                 this.mutation = None;
                 this.refresh(cx);
