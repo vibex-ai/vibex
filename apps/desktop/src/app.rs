@@ -38483,7 +38483,38 @@ impl VibexWorkbench {
         // The reader's own words name the session, the same way they name an
         // ACP session: the row is what they will scan for later, and a fixed
         // "<agent> terminal" makes every terminal session look identical.
-        let (draft_text, _) = self.new_session_draft_payload(cx);
+        let (draft_text, draft_attachments) = self.new_session_draft_payload(cx);
+        // The draft is also the Agent's first turn. Both CLIs take a prompt as
+        // their positional argument, so passing it here is what saves the reader
+        // from typing the same sentence twice — once on the page that creates
+        // the session and again in the CLI it opens. It goes last, after the
+        // flags, because that is where both parsers expect a positional.
+        // A prompt is one argument even when the reader wrote several lines:
+        // a newline is a control character and the launch rejects those, so the
+        // draft is flattened to one line the same way a session title is. The
+        // content survives; only the line breaks do not.
+        let mut first_prompt = draft_text
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        // Attachments follow the words as paths. The CLI reads files from the
+        // checkout, so a path is the only form a picture can take on a command
+        // line — and naming them is what keeps a screenshot the reader pasted
+        // from becoming a prompt about a picture the Agent cannot see.
+        let attachment_paths = draft_attachments
+            .iter()
+            .filter_map(|attachment| attachment.uri.as_deref())
+            .filter_map(attachment_local_path)
+            .collect::<Vec<_>>();
+        if !attachment_paths.is_empty() {
+            if !first_prompt.is_empty() {
+                first_prompt.push(' ');
+            }
+            first_prompt.push_str(&attachment_paths.join(" "));
+        }
+        if !first_prompt.is_empty() {
+            args.push(first_prompt.clone());
+        }
         let request = vibex_core::CreateTerminalSessionRequest {
             session_id: None,
             agent_id: agent_id.clone(),
