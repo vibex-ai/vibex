@@ -58001,8 +58001,15 @@ impl VibexWorkbench {
                                                 // puts it level with the first line
                                                 // of the prompt.
                                                 this.child(
+                                                    // Pushed down to sit on the
+                                                    // placeholder's line rather
+                                                    // than the row's top edge: the
+                                                    // glyph's own box is shorter
+                                                    // than the text line, so it
+                                                    // reads high without the nudge.
                                                     div()
                                                         .flex_none()
+                                                        .pt(px(3.0))
                                                         .text_size(px(14.0))
                                                         .line_height(px(21.0))
                                                         .font_weight(gpui::FontWeight::BOLD)
