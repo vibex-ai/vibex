@@ -27753,6 +27753,26 @@ impl SessionTerminalRepository {
         Ok(ids)
     }
 
+    /// The terminal behind a Logical Session, as the snapshot a terminal client
+    /// attaches to.
+    ///
+    /// A session's PTY is not listed among the workspace's tabs, so a client that
+    /// received a session snapshot naming its terminal cannot find it in
+    /// `TerminalSessionRepository::list`. It asks here instead, and gets the
+    /// same shape a tab would have given it.
+    pub fn list_session_terminals(
+        conn: &Connection,
+        workspace_id: &WorkspaceId,
+    ) -> VibexResult<Vec<TerminalSession>> {
+        let ids = Self::terminal_ids(conn)?;
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut terminals = TerminalSessionRepository::list(conn, workspace_id)?;
+        terminals.retain(|session| ids.contains(&session.id));
+        Ok(terminals)
+    }
+
     /// Whether a terminal belongs to a Logical Session rather than to a
     /// workspace tab.
     ///
@@ -27769,6 +27789,48 @@ impl SessionTerminalRepository {
             "session_terminal_lookup_failed",
             "failed to determine whether a terminal belongs to a session",
         ))
+    }
+
+    /// Reads a session together with the observation a terminal-mode Agent has
+    /// published, if any.
+    ///
+    /// The plain [`SessionRepository::get`] leaves `terminal` empty on purpose:
+    /// most reads never look at it, and hydrating them would join the link table
+    /// for every list. A client that has to *reach* the PTY — notably a remote
+    /// client rendering the Agent's terminal — needs the id, so it asks here.
+    pub fn get_with_terminal(
+        conn: &Connection,
+        session_id: &VibexSessionId,
+    ) -> VibexResult<Option<AgentSession>> {
+        let Some(mut session) = SessionRepository::get(conn, session_id)? else {
+            return Ok(None);
+        };
+        if session.transport.is_terminal()
+            && let Some(record) = SessionTerminalRepository::get(conn, session_id)?
+        {
+            session.terminal = Some(Box::new(record.facts));
+        }
+        Ok(Some(session))
+    }
+
+    /// Hydrates a page of sessions in one query, for a list a client renders
+    /// with terminal awareness.
+    pub fn hydrate_terminals(conn: &Connection, sessions: &mut [AgentSession]) -> VibexResult<()> {
+        if sessions
+            .iter()
+            .all(|session| !session.transport.is_terminal())
+        {
+            return Ok(());
+        }
+        for session in sessions.iter_mut() {
+            if !session.transport.is_terminal() {
+                continue;
+            }
+            if let Some(record) = SessionTerminalRepository::get(conn, &session.id)? {
+                session.terminal = Some(Box::new(record.facts));
+            }
+        }
+        Ok(())
     }
 
     /// Every recorded terminal-mode session, for a runtime restart.

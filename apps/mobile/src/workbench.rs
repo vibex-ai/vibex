@@ -34,6 +34,7 @@ use vibex_terminal_ui::{
     TerminalCellColor, TerminalCellSnapshot, TerminalCursorShape, TerminalGridPoint,
     TerminalSearchMatch,
 };
+use vibex_ui::terminal::{TERMINAL_DEFAULT_COLS, TERMINAL_DEFAULT_ROWS};
 use vibex_ui::{
     AsyncPhase, FileWorkflowController, GitWorkflowController, ShellKind, TerminalInput,
     TerminalKey, TerminalKeyModifiers, TerminalWorkflowCapabilities, TerminalWorkflowController,
@@ -3117,6 +3118,62 @@ impl MobileWorkbench {
             });
         });
         self.tasks.push(task);
+        cx.notify();
+    }
+
+    /// Opens the Agent's own terminal for a terminal-mode session.
+    ///
+    /// The session's PTY is not a workspace tab, so it never appears in the
+    /// terminal list and the reader cannot reach it by browsing. Selecting the
+    /// session is the gesture that opens it: the snapshot already names the
+    /// terminal, so the rail attaches directly rather than listing.
+    pub fn open_session_terminal(
+        &mut self,
+        session: &vibex_core::AgentSession,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(facts) = session.terminal.as_deref() else {
+            return;
+        };
+        let Some(terminal_id) = facts.terminal_id.clone() else {
+            return;
+        };
+        if self
+            .terminal
+            .state
+            .active_session
+            .as_ref()
+            .is_some_and(|active| active.id == terminal_id)
+        {
+            return;
+        }
+        // The snapshot carries the identity the grid needs, and the terminal's
+        // own metadata is answered by `terminal_snapshot` on attach.
+        let now = vibex_core::unix_timestamp_ms();
+        let terminal = vibex_core::TerminalSession {
+            id: terminal_id.clone(),
+            workspace_id: session.workspace_id.clone(),
+            title: session.title.clone(),
+            shell: session.agent_id.as_str().to_string(),
+            cwd: session.workspace_root.clone(),
+            rows: TERMINAL_DEFAULT_ROWS,
+            cols: TERMINAL_DEFAULT_COLS,
+            status: vibex_core::TerminalStatus::Running,
+            created_at_ms: now,
+            updated_at_ms: now,
+            closed_at_ms: None,
+        };
+        self.stop_terminal_poll();
+        match self.terminal.attach_session_terminal(terminal) {
+            Ok(()) => {
+                self.terminal_fit_error = None;
+                self.terminal_render_sequence = 0;
+                self.terminal_fit_size = None;
+                self.terminal_last_selected = Some(terminal_id.clone());
+                self.start_terminal_poll(terminal_id, cx);
+            }
+            Err(error) => self.fail(error),
+        }
         cx.notify();
     }
 

@@ -7783,8 +7783,16 @@ fn terminal_list_for_workspace(
         .collect();
     let mut root = None;
     let mut visible = Vec::new();
+    // A terminal-mode session's PTY belongs to that session, not to this list;
+    // it is reachable over the session's own id instead. Listing it here would
+    // put an Agent's terminal in a remote client's tab strip, where closing it
+    // kills a process the tab does not own.
+    let session_terminals = vibex_db::SessionTerminalRepository::terminal_ids(&conn)?;
 
     for session in stored {
+        if session_terminals.contains(&session.id) {
+            continue;
+        }
         if let Some(live_session) = live_by_id.get(&session.id) {
             TerminalSessionRepository::upsert(&conn, live_session)?;
             if terminal_session_visible(live_session) {
@@ -7804,6 +7812,7 @@ fn terminal_list_for_workspace(
     }
     for session in live {
         if terminal_session_visible(&session)
+            && !session_terminals.contains(&session.id)
             && !visible.iter().any(|stored| stored.id == session.id)
         {
             TerminalSessionRepository::upsert(&conn, &session)?;

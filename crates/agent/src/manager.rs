@@ -2001,7 +2001,11 @@ impl AgentManager {
     /// Returns the complete runtime registry, including owned child sessions.
     pub async fn list_sessions(&self, include_archived: bool) -> VibexResult<Vec<AgentSession>> {
         let conn = self.open_migrated()?;
-        SessionRepository::list(&conn, include_archived)
+        let mut sessions = SessionRepository::list(&conn, include_archived)?;
+        // A client that receives these rows has to be able to reach a terminal
+        // session's PTY, and the terminal id only lives in the link table.
+        SessionTerminalRepository::hydrate_terminals(&conn, &mut sessions)?;
+        Ok(sessions)
     }
 
     /// Returns the top-level conversations used by client session lists.
@@ -2010,7 +2014,9 @@ impl AgentManager {
         include_archived: bool,
     ) -> VibexResult<Vec<AgentSession>> {
         let conn = self.open_migrated()?;
-        SessionRepository::list_root_sessions(&conn, include_archived)
+        let mut sessions = SessionRepository::list_root_sessions(&conn, include_archived)?;
+        SessionTerminalRepository::hydrate_terminals(&conn, &mut sessions)?;
+        Ok(sessions)
     }
 
     pub async fn get_session(&self, session_id: &VibexSessionId) -> VibexResult<AgentSession> {
@@ -12856,6 +12862,44 @@ mod tests {
                 .is_some(),
             "archiving must not delete the session"
         );
+    }
+
+    /// A session list carries the terminal id a remote client needs to reach the
+    /// Agent's PTY.
+    ///
+    /// The plain repository read leaves `terminal` empty because most reads
+    /// never look at it; a client rendering the Agent's terminal has to be able
+    /// to find the PTY, and the id lives only in the link table.
+    #[tokio::test]
+    async fn a_session_list_names_the_terminal_a_remote_client_must_attach_to() {
+        let (manager, launcher, dir) = terminal_manager();
+        let session = manager
+            .create_terminal_session(terminal_request("claude", &dir))
+            .await
+            .unwrap();
+        let expected = launcher.watched()[0].0.clone();
+
+        let listed = manager.list_sessions(false).await.unwrap();
+        let listed = listed
+            .into_iter()
+            .find(|candidate| candidate.id == session.id)
+            .expect("the created session is listed");
+        let facts = listed
+            .terminal
+            .as_deref()
+            .expect("a terminal session's snapshot must name its terminal");
+        assert_eq!(facts.terminal_id.as_ref(), Some(&expected));
+        // The activity travels with it, so a client that has not attached yet
+        // can still draw the row correctly.
+        assert_eq!(facts.activity, vibex_core::TerminalActivity::Unknown);
+
+        // The plain read is unchanged: a caller that never reaches the PTY does
+        // not pay a join.
+        let conn = open_database(&dir.join("vibex.db")).unwrap();
+        let plain = vibex_db::SessionRepository::get(&conn, &session.id)
+            .unwrap()
+            .expect("the row exists");
+        assert!(plain.terminal.is_none());
     }
 
     /// A restart rebuilds a terminal session's PTY from its recorded argv.

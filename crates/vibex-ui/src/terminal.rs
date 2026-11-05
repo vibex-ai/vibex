@@ -977,6 +977,27 @@ impl TerminalWorkflowController {
         Ok(())
     }
 
+    /// Attaches to a terminal that belongs to a Logical Session.
+    ///
+    /// A session's PTY is deliberately absent from the workspace's terminal
+    /// list — it is not a tab — so [`Self::attach`] would reject it for not
+    /// being in `state.sessions`. The session snapshot names the terminal, so
+    /// this seeds the list with that one session and then attaches through the
+    /// ordinary path: the tab strip shows the Agent's terminal, and closing it
+    /// means what it means anywhere else.
+    pub fn attach_session_terminal(&mut self, session: TerminalSession) -> BackendResult<()> {
+        let terminal_id = session.id.clone();
+        if !self
+            .state
+            .sessions
+            .iter()
+            .any(|existing| existing.id == terminal_id)
+        {
+            self.state.sessions.push(session);
+        }
+        self.attach(terminal_id)
+    }
+
     pub fn begin_poll(&mut self) -> Option<TerminalPollTask> {
         let subscription = self.subscription.take()?;
         Some(TerminalPollTask {
@@ -1577,6 +1598,45 @@ mod tests {
                 Ok(session)
             })
         }
+    }
+
+    /// A session's terminal attaches even though it is not a workspace tab.
+    ///
+    /// The tab path refuses a terminal it cannot find in `state.sessions`, which
+    /// is exactly the case for a session's PTY: it is reached through the
+    /// session, never through the workspace's terminal list. Seeding the list
+    /// first is what makes the Agent's terminal a tab once it is open.
+    #[test]
+    fn a_session_terminal_attaches_without_being_a_workspace_tab() {
+        let backend = Arc::new(MockTerminalBackend::new(TerminalStatus::Running));
+        let capabilities = TerminalWorkflowCapabilities::from_backend(
+            &BackendCapabilitySnapshot::desktop_native_v1(),
+        );
+        let mut controller = TerminalWorkflowController::new(backend.clone(), capabilities);
+        let terminal_id = backend.session.id.clone();
+        assert!(
+            controller.attach(terminal_id.clone()).is_err(),
+            "the tab path must refuse a terminal that is not in the list"
+        );
+        controller
+            .attach_session_terminal(backend.session.clone())
+            .expect("the session path seeds the list first");
+        assert_eq!(
+            controller
+                .state
+                .active_session
+                .as_ref()
+                .map(|active| active.id.clone()),
+            Some(terminal_id.clone())
+        );
+        assert!(
+            controller
+                .state
+                .sessions
+                .iter()
+                .any(|session| session.id == terminal_id),
+            "an attached session terminal joins the strip"
+        );
     }
 
     fn controller_with_backend(backend: Arc<MockTerminalBackend>) -> TerminalWorkflowController {

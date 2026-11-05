@@ -8586,6 +8586,11 @@ impl MobileApp {
         self.reset_drawers();
         self.timeline_list.set_follow_mode(FollowMode::Tail);
         self.token_usage = None;
+        // A terminal-mode session's conversation lives in its PTY, so opening
+        // it is what attaches the rail to that terminal. The snapshot already
+        // names the id; a session without one has nothing to attach yet, and
+        // the next refresh tries again.
+        self.open_selected_session_terminal(&session_id, cx);
         // The command catalogue belongs to the Agent behind this session, so it
         // goes with the session. The armed command never survives a switch
         // either: it names a command the new Agent may not have. The next frame
@@ -8674,6 +8679,37 @@ impl MobileApp {
         });
         self.tasks.push(task);
         cx.notify();
+    }
+
+    /// Attaches the rail to a terminal session's Agent, when the session is
+    /// one.
+    ///
+    /// The PTY belongs to the session rather than to a workspace tab, so the
+    /// rail cannot find it by listing. Reading the snapshot the list already
+    /// carries is what keeps this to one lookup, and a session whose first
+    /// observation has not arrived simply waits for the next refresh.
+    fn open_selected_session_terminal(
+        &mut self,
+        session_id: &VibexSessionId,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(session) = self
+            .sessions()
+            .iter()
+            .find(|session| &session.id == session_id)
+            .cloned()
+        else {
+            return;
+        };
+        if !session.is_terminal() || session.terminal.is_none() {
+            return;
+        }
+        let Some(workbench) = self.workbench.as_ref() else {
+            return;
+        };
+        workbench.update(cx, |workbench, cx| {
+            workbench.open_session_terminal(&session, cx);
+        });
     }
 
     /// The persisted window of a session about to be opened, if this phone has
