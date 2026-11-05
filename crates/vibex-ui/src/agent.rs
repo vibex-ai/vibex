@@ -13,8 +13,8 @@ use vibex_core::{
     ElicitationRequestStatus, ElicitationResolution, ElicitationResolutionAction,
     FetchTimelineRequest, PermissionRequestStatus, RenameAgentSessionRequest,
     ResolveElicitationRequest, ResolvePermissionRequest, SendAgentMessageRequest,
-    SessionRuntimeOptionCatalog, TerminalActivity, TimelineItem, TimelineItemId, TimelineLiveEvent,
-    TimelinePage, TimelinePayload, TimelinePayloadDepth, VibexError, VibexResult, VibexSessionId,
+    SessionRuntimeOptionCatalog, TimelineItem, TimelineItemId, TimelineLiveEvent, TimelinePage,
+    TimelinePayload, TimelinePayloadDepth, VibexError, VibexResult, VibexSessionId,
 };
 use vibex_desktop_model::{
     AgentSidebarRow, ReasoningDisplayMode, SidebarState, TimelineConversationTurn, TimelineModel,
@@ -26,24 +26,18 @@ use crate::{
     ShellKind, WorkflowViewGeneration,
 };
 
-/// The state a layout should show for a session, when it is not a terminal.
+/// The state a layout should show for a session.
 ///
 /// A terminal-mode session's persisted state answers "is this session open",
 /// while the Agent inside its PTY answers the question every list actually asks:
-/// is it working, is it parked on the reader, has it settled. Both projections
-/// below fold the observation into the lifecycle enum so a layout that already
-/// switches on `AgentSessionState` keeps working, and `Unknown` stays `Idle`
-/// rather than inventing a state the reader would act on.
+/// is it working, is it parked on the reader, has it settled. The projection
+/// itself lives on [`AgentSession::display_state`] so every surface — the
+/// desktop drawer, the phone list, the TUI, and the workspace aggregates built
+/// in `vibex-desktop-model` — folds the observation in the same way, and
+/// `Unknown` keeps the lifecycle state rather than inventing a state the reader
+/// would act on.
 pub fn display_state(session: &AgentSession) -> AgentSessionState {
-    match session.terminal_activity() {
-        Some(TerminalActivity::Working) => AgentSessionState::Running,
-        Some(TerminalActivity::Waiting) => AgentSessionState::NeedsInput,
-        Some(TerminalActivity::Idle) => AgentSessionState::Idle,
-        // No observation yet, or one that has aged out: the lifecycle state is
-        // still true, it just is not interesting. A session that failed to
-        // launch keeps reporting `Error`, because that is not an observation.
-        Some(TerminalActivity::Unknown) | None => session.state,
-    }
+    session.display_state()
 }
 
 /// Whether the reader is looking at a session whose interface is a terminal.
@@ -4171,5 +4165,27 @@ mod terminal_session_display_tests {
             None
         )));
         assert!(!is_terminal_session(&session(SessionTransport::Acp, None)));
+    }
+
+    /// Every surface resolves the same answer from the same place.
+    ///
+    /// The desktop drawer, the phone list, the TUI and the workspace aggregates
+    /// all fold a terminal observation in, so the projection has to live on the
+    /// session both of them hold rather than in each layout. A copy here that
+    /// drifted from the core one is how the sidebar and the workspace card
+    /// ended up disagreeing about one session.
+    #[test]
+    fn the_shared_projection_is_the_sessions_own() {
+        for activity in [
+            TerminalActivity::Working,
+            TerminalActivity::Waiting,
+            TerminalActivity::Idle,
+            TerminalActivity::Unknown,
+        ] {
+            let terminal = session(SessionTransport::Terminal, Some(activity));
+            assert_eq!(display_state(&terminal), terminal.display_state());
+        }
+        let acp = session(SessionTransport::Acp, None);
+        assert_eq!(display_state(&acp), acp.display_state());
     }
 }

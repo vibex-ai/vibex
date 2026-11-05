@@ -142,7 +142,12 @@ pub fn project_sidebar_rows(
                 pinned: state.pinned_ids.contains(session.id.as_str()),
                 selected: state.selected_ids.contains(session.id.as_str()),
                 collapsed: false,
-                state: Some(session.state),
+                // The row reports what the session's Agent is doing, which for
+                // a terminal session is its observation rather than whether its
+                // session row is open. Emitting the lifecycle state here left
+                // every terminal row in the phone and TUI lists reading idle
+                // while the CLI inside it worked or waited.
+                state: Some(session.display_state()),
                 parent_id: None,
                 delegated: false,
                 child_count: 0,

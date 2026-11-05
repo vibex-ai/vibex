@@ -8982,12 +8982,15 @@ impl MobileApp {
                 // A terminal session's own state only says the row is open; the
                 // Agent's activity is what the tab exists to report, and the
                 // shared projection folds it in so the phone and the desktop
-                // answer the same question.
+                // answer the same question. Resolving it first also lets the
+                // parked-request check see a terminal Agent that is waiting
+                // rather than only its open row.
+                let session_state = vibex_ui::agent::display_state(session);
                 let display_state =
-                    if self.session_awaits_user_input(member_id.as_str(), session.state) {
+                    if self.session_awaits_user_input(member_id.as_str(), session_state) {
                         AgentSessionState::NeedsInput
                     } else {
-                        vibex_ui::agent::display_state(session)
+                        session_state
                     };
                 Some(MobileSessionGroupTab {
                     session_id: session.id.clone(),
@@ -26138,15 +26141,22 @@ impl MobileApp {
         if session.is_none() && !row.delegated_child {
             return div().into_any_element();
         }
-        // The row prefers the tree's snapshot, but a terminal session's own
-        // state is only "is it open": once an observation exists it is what the
-        // row reports.
-        let session_state = session
-            .filter(|session| session.terminal.is_some())
-            .map(vibex_ui::agent::display_state)
-            .or(row.state)
-            .or_else(|| session.map(|session| session.state))
-            .unwrap_or(AgentSessionState::Idle);
+        // The row prefers the tree's snapshot for ordinary sessions, but a
+        // terminal session's own state only says "is it open": the observation
+        // of the Agent inside its PTY is what the row reports. The shared
+        // projection answers both, so a terminal row takes it whenever the
+        // synced snapshot is at hand — including before an observation lands,
+        // where it correctly keeps the lifecycle state — instead of waiting for
+        // terminal facts to appear before it stops looking idle.
+        let session_state = match session {
+            Some(session) if vibex_ui::agent::is_terminal_session(session) => {
+                session.display_state()
+            }
+            _ => row
+                .state
+                .or_else(|| session.map(|session| session.state))
+                .unwrap_or(AgentSessionState::Idle),
+        };
         // A request can open while the turn is still `Running`, so waiting is
         // answered from the live index as well as from the persisted state; the
         // row then says the same thing the timeline card does.

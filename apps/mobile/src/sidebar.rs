@@ -228,15 +228,20 @@ fn workspace_status(
     view: &SidebarOrganizationView,
     lifecycle: Option<WorktreeLifecycleDisplayState>,
 ) -> (Option<AgentSessionState>, bool) {
-    let running =
-        sessions.iter().any(|session| session_working(session)) || lifecycle_running(lifecycle);
+    // A terminal session's lifecycle state only says its row is open, so the
+    // aggregate asks the shared projection — the same answer the member rows
+    // paint — before it decides what the Worktree is doing.
+    let running = sessions
+        .iter()
+        .any(|session| session_working(session.display_state()))
+        || lifecycle_running(lifecycle);
     let error = sessions
         .iter()
-        .any(|session| session.state == AgentSessionState::Error)
+        .any(|session| session.display_state() == AgentSessionState::Error)
         || lifecycle_error(lifecycle);
     let needs_input = sessions
         .iter()
-        .any(|session| session.state == AgentSessionState::NeedsInput);
+        .any(|session| session.display_state() == AgentSessionState::NeedsInput);
     let unread = sessions
         .iter()
         .any(|session| view.unread_session_ids.contains(session.id.as_str()));
@@ -986,10 +991,12 @@ fn push_group_rows(
 ///
 /// The desktop's per-workspace summary counts a session that is starting up as
 /// running along with one that is running, and both draw the same pulse in the
-/// list, so a count of what is busy has to include both.
-fn session_working(session: &AgentSession) -> bool {
+/// list, so a count of what is busy has to include both. The caller passes the
+/// state it resolved (the shared [`vibex_core::AgentSession::display_state`]
+/// for a terminal session), so the aggregate and the row cannot disagree.
+fn session_working(state: AgentSessionState) -> bool {
     matches!(
-        session.state,
+        state,
         AgentSessionState::Running | AgentSessionState::Initializing
     )
 }
@@ -1069,7 +1076,9 @@ fn session_row(
         selected: input
             .selected_session_id
             .is_some_and(|selected| selected.as_str() == session_id),
-        state: Some(session.state),
+        // The tree row reports what its Agent is doing; for a terminal session
+        // that is the PTY observation, not whether the session row is open.
+        state: Some(session.display_state()),
         session_id: Some(session.id.clone()),
         unread: input.view.unread_session_ids.contains(session_id.as_str()),
         auto_continue: input

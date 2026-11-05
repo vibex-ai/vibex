@@ -469,6 +469,27 @@ impl AgentSession {
             .filter(|_| self.is_terminal())
             .map(|facts| facts.activity)
     }
+
+    /// The state a list should show for this session.
+    ///
+    /// A terminal session's persisted state only answers "is this session
+    /// open"; the observation of the Agent inside its PTY answers the question
+    /// a list actually asks — is it working, is it parked on the reader, has it
+    /// settled. Every surface folds that observation in here rather than each
+    /// answering it, so a sidebar row, a workspace aggregate, a tab and a phone
+    /// list cannot disagree about the same session.
+    ///
+    /// `Unknown` keeps the lifecycle state instead of inventing `Idle`: an
+    /// unobserved session is not a resting one. A failed launch keeps `Error`
+    /// for the same reason — that is not an observation.
+    pub fn display_state(&self) -> AgentSessionState {
+        match self.terminal_activity() {
+            Some(crate::terminal::TerminalActivity::Working) => AgentSessionState::Running,
+            Some(crate::terminal::TerminalActivity::Waiting) => AgentSessionState::NeedsInput,
+            Some(crate::terminal::TerminalActivity::Idle) => AgentSessionState::Idle,
+            Some(crate::terminal::TerminalActivity::Unknown) | None => self.state,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

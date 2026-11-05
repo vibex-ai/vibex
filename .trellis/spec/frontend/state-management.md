@@ -4389,6 +4389,11 @@ fn VibexWorkbench::set_sidebar_session_filter(
   (`sidebar_session_display_state` plus `session_awaits_user_input`), so a row
   is never hidden for a reason it does not also show. `Initializing` counts as
   running, `NeedsInput` as waiting for the reader.
+- That `display_state` starts from `AgentSession::display_state`, the one shared
+  projection, never from `session.state` directly. A terminal-mode session's
+  persisted state only answers "is this session open"; its Agent's observed
+  activity is what every list reports. Reading the lifecycle state here put a
+  working terminal Agent in the `All` bucket and out of `Running`.
 - A project — and, in the detailed hierarchy, a worktree — with no visible row
   leaves the column. Its `agent_summary` stays authoritative wherever the card
   still paints, exactly as it does for a search that narrows rows.
@@ -4447,4 +4452,101 @@ self.sidebar_state.selected_ids = self.sessions.iter().map(id).collect();
 let groups = self.sidebar_filtered_groups();
 let visible = groups.iter().flat_map(|group| &group.compact_sessions);
 self.sidebar_state.selected_ids.retain(|id| visible.any(|session| session.id == id));
+```
+
+## Scenario: Terminal Session Display State
+
+### 1. Scope / Trigger
+
+- Trigger: any surface that reports a session's state — a sidebar row, a session
+  group tab, a workspace card or project badge, a phone row, a TUI row — and any
+  change to how a terminal-mode session's Agent activity is observed.
+
+### 2. Signatures
+
+```rust
+impl AgentSession {
+    pub fn is_terminal(&self) -> bool;
+    pub fn terminal_activity(&self) -> Option<TerminalActivity>;
+    pub fn display_state(&self) -> AgentSessionState;
+}
+```
+
+### 3. Contracts
+
+- `display_state` is the one projection. Every list resolves a session through
+  it; no layout re-derives the answer from `session.state`.
+- A terminal-mode session's persisted `state` only answers "is this session
+  open". What the row exists to report — working, parked on the reader, settled
+  — is the observation in `session.terminal`.
+- `Unknown` and a missing observation keep the lifecycle state. `Unknown` is a
+  real answer, not "idle": claiming idle while the CLI waits on an approval
+  prompt is a claim the reader would act on. A failed launch keeps `Error`,
+  which is also not an observation.
+- The projection lives on `AgentSession` in `vibex-core`, and `vibex-ui`'s
+  `display_state` delegates to it, so the shared UI contracts, the workspace
+  aggregates in `vibex-desktop-model`, and the clients cannot drift apart.
+- Aggregates count what their rows report. A workspace card, a project badge, a
+  collapsed group and a Tab order all take `display_state`, never the raw
+  lifecycle state.
+- The observation is sidebar shape: `session_snapshot_sidebar_changed` compares
+  `display_state`, so a terminal Agent that starts or stops working invalidates
+  the cached sidebar projection. Freshness-only ticks (`observed_at_ms`) are not
+  shape and must not rebuild it.
+
+### 4. Validation & Error Matrix
+
+| Condition | Required result |
+| --- | --- |
+| ACP session, any state | `display_state == session.state` |
+| Terminal session, activity `Working` | `Running` (row pulse, aggregate running) |
+| Terminal session, activity `Waiting` | `NeedsInput` (attention glyph, aggregate waiting) |
+| Terminal session, activity `Idle` | `Idle` |
+| Terminal session, activity `Unknown` | `session.state` |
+| Terminal session with `terminal: None` | `session.state` |
+| Terminal Agent starts or stops working | `session_snapshot_sidebar_changed` is true |
+| Observation timestamp only advances | `session_snapshot_sidebar_changed` is false |
+
+### 5. Good/Base/Bad Cases
+
+- Good: a native-terminal Claude session whose CLI blocks on an approval prompt
+  paints the attention glyph in the drawer, counts as waiting on its workspace
+  card, and matches the "Waiting for you" filter.
+- Base: an ACP session is unaffected — the projection returns its lifecycle
+  state, so no existing layout changes behavior.
+- Bad: reading `session.state` in a row or an aggregate (the terminal row then
+  reads idle forever), keeping a second terminal-only mark builder beside the
+  shared gate, or treating `Unknown` as `Idle`.
+
+### 6. Tests Required
+
+- `vibex-ui` asserts its `display_state` equals `AgentSession::display_state`
+  for every activity, and that an ACP session keeps its lifecycle state.
+- `vibex-desktop-model` asserts a terminal `Working`/`Waiting` session counts in
+  `WorkspaceAgentSummary`, and that `project_sidebar_rows` emits the projection.
+- `vibex-desktop` asserts a changed observation makes
+  `session_snapshot_sidebar_changed` true while a freshness-only tick does not.
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```rust
+// The terminal row and the aggregate both read the open row, not the Agent.
+let state = session.state;
+match session.state {
+    AgentSessionState::Running => summary.running += 1,
+    _ => {}
+}
+```
+
+#### Correct
+
+```rust
+let state = session.display_state();
+match state {
+    AgentSessionState::Running | AgentSessionState::Initializing => summary.running += 1,
+    AgentSessionState::NeedsInput => summary.needs_input += 1,
+    _ => {}
+}
 ```

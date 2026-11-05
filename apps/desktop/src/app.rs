@@ -4556,6 +4556,12 @@ fn authoritative_loaded_turn_status(items: &[TimelineItem]) -> Option<bool> {
 /// changes for every streamed item, but it does not change the sidebar shape.
 /// Keep the comparison focused on fields that can affect the sidebar so a
 /// hidden workbench does not repaint for every reasoning chunk.
+///
+/// A terminal session's observation is a sidebar-shape field: its activity is
+/// what the row's mark and the workspace aggregate report, and the sidebar draws
+/// from a cached projection. Comparing only the lifecycle state meant the cache
+/// kept the reading the row was first built with, so a native terminal never
+/// stopped looking idle however the Agent inside it moved.
 fn session_snapshot_sidebar_changed(previous: Option<&AgentSession>, next: &AgentSession) -> bool {
     let Some(previous) = previous else {
         return true;
@@ -4568,6 +4574,7 @@ fn session_snapshot_sidebar_changed(previous: Option<&AgentSession>, next: &Agen
         || previous.workspace_mode != next.workspace_mode
         || previous.agent_id != next.agent_id
         || previous.state != next.state
+        || previous.display_state() != next.display_state()
         || previous.created_at_ms != next.created_at_ms
         || previous.archived_at_ms != next.archived_at_ms
         || previous.deleted_at_ms != next.deleted_at_ms
@@ -8632,11 +8639,6 @@ struct SidebarSessionStatusColumn {
     /// The hover group whose action cluster paints over this column, for the
     /// rows that own one.
     hover_group: Option<SharedString>,
-    /// What a terminal-mode Agent is doing, when the row is one.
-    ///
-    /// A terminal session's lifecycle state only says whether the session is
-    /// open; this is the fact the row exists to report.
-    terminal: Option<vibex_core::TerminalSessionFacts>,
 }
 
 #[derive(Clone)]
@@ -20221,12 +20223,16 @@ impl VibexWorkbench {
             .iter()
             .filter_map(|group| {
                 let keep = |session: &AgentSession| {
+                    // The filter and the row must agree about a terminal
+                    // session, so both take the shared projection: filtering by
+                    // the lifecycle state put a working terminal Agent in the
+                    // "all" bucket and out of the "running" one.
                     let state = sidebar_session_display_state(
-                        session.state,
+                        session.display_state(),
                         turn_pending.contains(session.id.as_str()),
                     );
                     let state = if session_awaits_user_input(
-                        session.state,
+                        session.display_state(),
                         pending_user_request_ids,
                         session.id.as_str(),
                     ) {
@@ -21628,7 +21634,6 @@ impl VibexWorkbench {
                     has_unread_completion: false,
                     pinned: self.sidebar_state.pinned_ids.contains(&session_id),
                     hover_group: None,
-                    terminal: terminal_row_facts(session),
                 },
                 cx,
             )
@@ -49222,8 +49227,12 @@ impl VibexWorkbench {
             let Some(session) = self.registered_session(member_id) else {
                 continue;
             };
+            // The aggregate counts what the member rows report, which for a
+            // terminal session is its Agent's observed activity rather than the
+            // fact that its session row is open.
+            let state = session.display_state();
             summary.total += 1;
-            match session.state {
+            match state {
                 AgentSessionState::Running | AgentSessionState::Initializing => {
                     summary.running += 1;
                 }
@@ -49232,7 +49241,7 @@ impl VibexWorkbench {
                 _ => {}
             }
             awaiting_user |= session_awaits_user_input(
-                session.state,
+                state,
                 &self.pending_user_request_ids,
                 member_id.as_str(),
             );
@@ -52770,7 +52779,7 @@ impl VibexWorkbench {
         let awaiting_user = self.sessions.iter().any(|session| {
             session.deleted_at_ms.is_none()
                 && session_awaits_user_input(
-                    session.state,
+                    session.display_state(),
                     &self.pending_user_request_ids,
                     session.id.as_str(),
                 )
@@ -53160,14 +53169,17 @@ impl VibexWorkbench {
     /// Once the session settles, fails, or closes, the persisted state wins and
     /// the row stops asking about a request that has no surface left.
     fn sidebar_session_row_state(&self, session: &AgentSession) -> AgentSessionState {
-        if session_awaits_user_input(
-            session.state,
-            &self.pending_user_request_ids,
-            session.id.as_str(),
-        ) {
+        // The shared projection answers for both transports: an ACP session
+        // reports its lifecycle, a terminal session reports what its Agent was
+        // last observed doing. Reading `session.state` here was what left every
+        // native-terminal row looking idle: its persisted state only ever says
+        // whether the session is open, so the working pulse and the attention
+        // glyph never had a state to come from.
+        let state = session.display_state();
+        if session_awaits_user_input(state, &self.pending_user_request_ids, session.id.as_str()) {
             AgentSessionState::NeedsInput
         } else {
-            sidebar_session_display_state(session.state, self.session_turn_pending(&session.id))
+            sidebar_session_display_state(state, self.session_turn_pending(&session.id))
         }
     }
 
@@ -53213,7 +53225,6 @@ impl VibexWorkbench {
             has_unread_completion,
             pinned,
             hover_group,
-            terminal,
         } = status;
         let strings = self.strings();
         // The attention glyph answers the user, so it outranks the optimistic
@@ -53239,12 +53250,13 @@ impl VibexWorkbench {
         // the clock, and its countdown stands where the state's mark would.
         let status_mark = if let Some(at_ms) = scheduled_at_ms {
             Some(self.render_scheduled_session_indicator(session_id.as_str(), at_ms, cx))
-        } else if let Some(facts) = terminal.as_ref() {
-            // A terminal session's row reports what the Agent inside the PTY is
-            // doing, not the session's own lifecycle: the row exists to answer
-            // "can I leave it alone".
-            sidebar_terminal_activity_mark(prefix, session_id.as_str(), facts, cx)
         } else {
+            // One gate answers for both transports. A terminal session's state
+            // is already its Agent's observed activity — [`AgentSession::display_state`]
+            // folded it in before the row was built — so the working pulse, the
+            // attention glyph and the settled row all come from here. `Unknown`
+            // keeps the lifecycle state, which is the honest answer for a
+            // terminal whose observation has not landed.
             sidebar_session_state_mark(
                 prefix,
                 session_id.as_str(),
@@ -53709,7 +53721,6 @@ impl VibexWorkbench {
                 has_unread_completion,
                 pinned,
                 hover_group: Some(hover_group.clone()),
-                terminal: terminal_row_facts(session),
             },
             cx,
         );
@@ -80341,55 +80352,6 @@ fn session_status_mark_for(
     }
 }
 
-/// The observation facts a sidebar row paints, when the session is a terminal.
-///
-/// An ACP session answers the same question through its lifecycle state, so the
-/// two never race: exactly one of them produces a mark.
-fn terminal_row_facts(session: &AgentSession) -> Option<vibex_core::TerminalSessionFacts> {
-    session
-        .transport
-        .is_terminal()
-        .then(|| session.terminal.as_deref().cloned())
-        .flatten()
-}
-
-/// The mark a terminal-mode session's row shows.
-///
-/// A terminal session's persisted state answers "is the session open", while the
-/// Agent's activity answers the question the row exists for: is it working, and
-/// is it parked on me. `Unknown` draws nothing rather than a fake idle dot —
-/// claiming idle while the CLI waits on an approval prompt is a claim the
-/// reader would act on.
-fn sidebar_terminal_activity_mark(
-    prefix: &'static str,
-    session_id: &str,
-    facts: &vibex_core::TerminalSessionFacts,
-    cx: &App,
-) -> Option<AnyElement> {
-    use vibex_core::TerminalActivity;
-    match facts.activity {
-        TerminalActivity::Working => Some(session_status_mark_for(
-            format!("{prefix}-terminal-working-{session_id}"),
-            AgentSessionState::Running,
-            false,
-            cx,
-        )),
-        TerminalActivity::Waiting => Some(sidebar_attention_icon(
-            format!("{prefix}-terminal-waiting-{session_id}"),
-            crate::locale::text(
-                "Terminal is waiting for you",
-                "终端在等你操作",
-                "終端在等你操作",
-            ),
-            cx,
-        )),
-        // Idle and Unknown both draw nothing: the row's time label already says
-        // when something last happened, and a dot for "possibly idle" would be
-        // the same lie in a smaller shape.
-        TerminalActivity::Idle | TerminalActivity::Unknown => None,
-    }
-}
-
 /// Whether a session's state earns a mark at all, and which one.
 ///
 /// [`session_status_mark_for`] answers *every* state with a mark, an idle one
@@ -102019,6 +101981,75 @@ mod tests {
         assert!(event_bridge.contains("timeline_live_event_is_streaming_only(event)"));
     }
 
+    /// A terminal Agent's activity is sidebar shape, not a hidden detail.
+    ///
+    /// The sidebar draws from a cached projection, so a snapshot only reaches
+    /// the rows when the comparison says the shape moved. The observation is
+    /// that shape: it is what the row's mark and the workspace aggregate report.
+    /// Comparing the lifecycle state alone meant a terminal session's cache was
+    /// never invalidated by its own observation, so the drawer kept painting the
+    /// reading the row was first built with and a native terminal never stopped
+    /// looking idle however the CLI inside it moved.
+    #[test]
+    fn a_terminal_sessions_activity_is_sidebar_shape() {
+        let mut session = AgentSession {
+            id: VibexSessionId::new(),
+            title: "Terminal session".into(),
+            project_id: ProjectId::new(),
+            workspace_id: WorkspaceId::new(),
+            workspace_root: "/tmp/vibex-terminal-session".into(),
+            workspace_mode: WorkspaceMode::CurrentCheckout,
+            agent_id: AgentId::parse("claude").unwrap(),
+            state: AgentSessionState::Idle,
+            safety: AgentSessionSafety::workspace_write_ask_on_risk(),
+            created_at_ms: 1,
+            updated_at_ms: 2,
+            last_message_at_ms: 2,
+            archived_at_ms: None,
+            deleted_at_ms: None,
+            tools: Default::default(),
+            transport: vibex_core::SessionTransport::Terminal,
+            terminal: Some(Box::new(vibex_core::TerminalSessionFacts {
+                activity: vibex_core::TerminalActivity::Working,
+                source: vibex_core::TerminalActivitySource::Screen,
+                observed_at_ms: 2,
+                ..Default::default()
+            })),
+        };
+        // The same lifecycle state with a new observation is news to the rows:
+        // the Agent started working without the session row changing.
+        let mut working = session.clone();
+        working.terminal = Some(Box::new(vibex_core::TerminalSessionFacts {
+            activity: vibex_core::TerminalActivity::Waiting,
+            source: vibex_core::TerminalActivitySource::Screen,
+            observed_at_ms: 3,
+            ..Default::default()
+        }));
+        assert!(
+            session_snapshot_sidebar_changed(Some(&session), &working),
+            "an observation moved and the cached projection has to be rebuilt"
+        );
+        // A freshness-only tick is not shape: the cache must not be rebuilt by
+        // every liveness observation.
+        let mut heartbeat = working.clone();
+        if let Some(facts) = heartbeat.terminal.as_mut() {
+            facts.observed_at_ms = 4;
+        }
+        assert!(!session_snapshot_sidebar_changed(
+            Some(&working),
+            &heartbeat
+        ));
+        // The row itself resolves through the same projection, so the state it
+        // paints is the Agent's activity rather than the open row.
+        assert_eq!(session.display_state(), AgentSessionState::Running);
+        session.state = AgentSessionState::Closed;
+        assert_eq!(
+            session.display_state(),
+            AgentSessionState::Running,
+            "a closed row whose Agent is observed working still reports the work"
+        );
+    }
+
     #[test]
     fn background_session_events_do_not_repaint_the_selected_workbench() {
         let source = include_str!("app.rs");
@@ -112449,7 +112480,14 @@ mod tests {
             .map(|(body, _)| body)
             .expect("the shared row projection should remain inspectable");
         assert!(projection.contains(".pending_user_request_ids"));
-        assert!(projection.contains("sidebar_session_display_state(session.state,"));
+        // The row starts from the shared projection, which folds a terminal
+        // session's observation in, so a working or waiting Agent inside a PTY
+        // reaches the row instead of stopping at "the session row is open".
+        assert!(
+            projection.contains("let state = session.display_state();"),
+            "the row must resolve a terminal session's activity, not its lifecycle state"
+        );
+        assert!(projection.contains("sidebar_session_display_state(state,"));
 
         // Both lanes resolve their mark through the same gate.
         let gate = source

@@ -550,7 +550,11 @@ fn push_project_children(
                     pinned: input.view.pinned_session_ids.contains(session.id.as_str()),
                     selected: false,
                     collapsed: input.children.is_collapsed(session.id.as_str()),
-                    state: Some(session.state),
+                    // The row reports what the Agent is doing. A terminal
+                    // session's persisted state only says its row is open, so
+                    // it resolves through the shared projection every other
+                    // surface uses.
+                    state: Some(session.display_state()),
                     delegated: false,
                     child_count,
                     parent_id: parent_folder_id.map(ToString::to_string),
@@ -671,7 +675,7 @@ fn push_child_rows(
             pinned: false,
             selected: false,
             collapsed,
-            state: session.map(|session| session.state),
+            state: session.map(|session| session.display_state()),
             delegated: true,
             child_count,
             // A child's siblings are its own, not its parent's neighbours: the

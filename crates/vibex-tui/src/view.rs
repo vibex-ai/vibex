@@ -2222,7 +2222,11 @@ fn session_status_column(
             icons,
         };
     };
-    let state = session.state;
+    // A terminal session's lifecycle state only says its row is open, so the
+    // column takes the shared projection: the same one the row, the drawer and
+    // the workspace aggregate resolve, which reports the Agent's observed
+    // activity instead.
+    let state = session.display_state();
     let awaiting = state == AgentSessionState::NeedsInput;
     // Only a *running* turn suppresses the hour. A session still starting up
     // keeps the ring — the Agent has been asked and has not answered — and says
@@ -2656,7 +2660,10 @@ fn session_row_lines(
     // workspace is the heading the row already sits under, so a row with nothing
     // to report stays one line rather than repeating its directory.
     if let Some(session) = session {
-        let pending = session.state == vibex_core::AgentSessionState::NeedsInput;
+        // A terminal session's lifecycle only says its row is open; the Agent
+        // parked on the reader is an observation, so the line asks the shared
+        // projection rather than the persisted state.
+        let pending = session.display_state() == vibex_core::AgentSessionState::NeedsInput;
         // What the line says, and whether it is news the reader has to act on: a
         // session blocked on them says so even when this client has not seen it
         // say anything yet.

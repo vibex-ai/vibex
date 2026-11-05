@@ -702,7 +702,13 @@ impl WorkspaceAgentSummary {
             ..Self::default()
         };
         for session in sessions {
-            match session.state {
+            // The aggregate counts what the rows under it report, so a terminal
+            // session is counted by its Agent's observed activity rather than by
+            // the fact that its session row is open. Reading `session.state`
+            // here left every closed-state terminal session in the "nothing to
+            // report" bucket, so the workspace card and the project badge said
+            // nothing while a terminal Agent was working or waiting.
+            match session.display_state() {
                 AgentSessionState::Running | AgentSessionState::Initializing => {
                     summary.running += 1;
                 }
@@ -1510,6 +1516,55 @@ mod tests {
         assert_eq!(projects[0].workspaces[0].sessions.len(), 1);
         assert_eq!(projects[0].workspaces[0].agent_summary.total, 2);
         assert_eq!(projects[0].workspaces[0].agent_summary.running, 1);
+    }
+
+    /// A terminal Agent's work reaches the card it sits under.
+    ///
+    /// The workspace aggregate is what the project badge and the collapsed card
+    /// report, and it counts the rows below it. A terminal session's persisted
+    /// state only says its row is open, so counting that left the card silent
+    /// while the CLI inside the PTY was working or waiting — the drawer and the
+    /// card disagreed about the same session.
+    #[test]
+    fn a_terminal_sessions_activity_counts_in_the_workspace_summary() {
+        let project = project();
+        let checkout = workspace(&project, WorkspaceMode::CurrentCheckout, "/repo");
+        let terminal = |activity| {
+            let mut session = session(&checkout, "Terminal", AgentSessionState::Idle);
+            session.transport = vibex_core::SessionTransport::Terminal;
+            session.terminal = Some(Box::new(vibex_core::TerminalSessionFacts {
+                activity,
+                source: vibex_core::TerminalActivitySource::Screen,
+                observed_at_ms: 1,
+                ..Default::default()
+            }));
+            session
+        };
+        let working = sidebar_project_projections(
+            &[(project.clone(), checkout.clone())],
+            &[terminal(vibex_core::TerminalActivity::Working)],
+            &BTreeMap::new(),
+            &[],
+            &[],
+            0,
+            &BTreeSet::new(),
+            "",
+        );
+        assert_eq!(working[0].workspaces[0].agent_summary.running, 1);
+        assert_eq!(working[0].workspaces[0].agent_summary.needs_input, 0);
+
+        let waiting = sidebar_project_projections(
+            &[(project, checkout.clone())],
+            &[terminal(vibex_core::TerminalActivity::Waiting)],
+            &BTreeMap::new(),
+            &[],
+            &[],
+            0,
+            &BTreeSet::new(),
+            "",
+        );
+        assert_eq!(waiting[0].workspaces[0].agent_summary.needs_input, 1);
+        assert_eq!(waiting[0].workspaces[0].agent_summary.running, 0);
     }
 
     #[test]
