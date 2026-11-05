@@ -2950,7 +2950,7 @@ impl AgentManager {
                     for item in items {
                         let _ = self.publish_timeline_item(item);
                     }
-                    if let Some(loaded) = SessionRepository::get(&conn, &session.id)? {
+                    if let Some(loaded) = self.client_session_snapshot(&conn, &session.id)? {
                         self.publish_root_session_update(&conn, loaded.clone());
                         result.sessions.push(loaded);
                     }
@@ -2996,9 +2996,11 @@ impl AgentManager {
             .initialize_new_session(session_id, desired, None, None)
             .await?;
         let conn = self.open_migrated()?;
-        let session = SessionRepository::get(&conn, session_id)?.ok_or_else(|| {
-            VibexError::validation("session_not_found", "Agent session was not found")
-        })?;
+        let session = self
+            .client_session_snapshot(&conn, session_id)?
+            .ok_or_else(|| {
+                VibexError::validation("session_not_found", "Agent session was not found")
+            })?;
         self.publish_root_session_update(&conn, session.clone());
         Ok(session)
     }
@@ -3330,7 +3332,14 @@ impl AgentManager {
                     sequence: item.sequence,
                     item,
                 });
-                if let Ok(Some(session)) = SessionRepository::get(&conn, &session_id) {
+                // Hydrated: this snapshot replaces the row a client is
+                // already drawing, and every provider event sends one. A plain
+                // read here stripped a terminal session's link on the first
+                // event its Agent produced, which took the terminal off screen
+                // one frame after it appeared.
+                if let Ok(Some(session)) =
+                    SessionTerminalRepository::get_with_terminal(&conn, &session_id)
+                {
                     let _ = session_events.send(session);
                 }
             }
@@ -3988,7 +3997,7 @@ impl AgentManager {
         // snapshot so every client drops the pre-turn state (a failed session's
         // error dot, for example) as soon as the turn exists, instead of waiting
         // for the first provider event to refresh it.
-        if let Some(running) = SessionRepository::get(&conn, &session.id)? {
+        if let Some(running) = self.client_session_snapshot(&conn, &session.id)? {
             self.publish_root_session_update(&conn, running);
         }
 
@@ -4313,7 +4322,7 @@ impl AgentManager {
         // told of the settle only after that scan finishes keeps painting a
         // turn the authority has already ended as running — for a minute or
         // more on a long turn.
-        if let Some(settled) = SessionRepository::get(&conn, &session.id)? {
+        if let Some(settled) = self.client_session_snapshot(&conn, &session.id)? {
             self.publish_root_session_update(&conn, settled);
         }
         // The turn is over, so its streamed rows have served their purpose:
@@ -4999,7 +5008,7 @@ impl AgentManager {
         // the same abandoned requests.
         self.cancel_pending_user_input_requests(&mut conn, &session.id)?;
         SessionRepository::update_state(&conn, &session.id, AgentSessionState::Idle)?;
-        if let Some(settled) = SessionRepository::get(&conn, &session.id)? {
+        if let Some(settled) = self.client_session_snapshot(&conn, &session.id)? {
             self.publish_root_session_update(&conn, settled);
         }
         Ok(())
@@ -5123,7 +5132,7 @@ impl AgentManager {
                     .map(|record| record.terminal_id)
             });
         SessionRepository::archive(&conn, session_id)?;
-        if let Some(archived) = SessionRepository::get(&conn, session_id)? {
+        if let Some(archived) = self.client_session_snapshot(&conn, session_id)? {
             self.publish_root_session_update(&conn, archived);
         }
         drop(conn);
@@ -5156,7 +5165,7 @@ impl AgentManager {
                     .map(|record| record.terminal_id)
             });
         SessionRepository::archive_if_timeline_unchanged(&conn, session_id, expected_end_sequence)?;
-        if let Some(archived) = SessionRepository::get(&conn, session_id)? {
+        if let Some(archived) = self.client_session_snapshot(&conn, session_id)? {
             self.publish_root_session_update(&conn, archived);
         }
         drop(conn);
@@ -6228,12 +6237,29 @@ impl AgentManager {
         let _ = self.session_events.send(session.clone());
     }
 
-    fn publish_root_session_update(&self, _conn: &DbConnection, session: AgentSession) {
+    fn publish_root_session_update(&self, conn: &DbConnection, session: AgentSession) {
         // Child updates refresh open worker views and tree metadata. Client
         // session-list queries keep their authoritative roots-only projection,
         // so a client that cannot place a snapshot answers it by re-reading
         // that list — which is what a creation needs: the row exists now and
         // no other event names it.
+        //
+        // Every snapshot a client receives leaves through here or through
+        // `announce_created_session`, so the terminal link is filled in once,
+        // at the exit, rather than at each of the call sites that could forget
+        // it. A client drawing a terminal session without its facts shows
+        // "the terminal is not running" for an Agent that is running.
+        let session = if session.transport.is_terminal() && session.terminal.is_none() {
+            match SessionTerminalRepository::get(conn, &session.id) {
+                Ok(Some(record)) => AgentSession {
+                    terminal: Some(Box::new(record.facts)),
+                    ..session
+                },
+                _ => session,
+            }
+        } else {
+            session
+        };
         self.announce_created_session(&session);
     }
 
@@ -12908,6 +12934,35 @@ mod tests {
     /// The plain repository read leaves `terminal` empty because most reads
     /// never look at it; a client rendering the Agent's terminal has to be able
     /// to find the PTY, and the id lives only in the link table.
+
+    /// A terminal session keeps its link across the list read that follows
+    /// creation.
+    ///
+    /// The workbench answers creation with the returned snapshot and then
+    /// replaces the whole list from an authoritative read. Both have to carry
+    /// the same terminal, or the terminal appears and is immediately taken away.
+    #[tokio::test]
+    async fn the_list_read_after_creation_keeps_the_terminal() {
+        let (manager, launcher, dir) = terminal_manager();
+        let created = manager
+            .create_terminal_session(terminal_request("claude", &dir))
+            .await
+            .unwrap();
+        let expected = launcher.watched()[0].0.clone();
+
+        let listed = manager.list_root_sessions(false).await.unwrap();
+        let row = listed
+            .into_iter()
+            .find(|session| session.id == created.id)
+            .expect("the new session is in the root list");
+        assert_eq!(
+            row.terminal
+                .as_deref()
+                .and_then(|facts| facts.terminal_id.as_ref()),
+            Some(&expected),
+            "the authoritative list must not strip the terminal the creation returned"
+        );
+    }
 
     /// The snapshot returned by creation carries the terminal it just linked.
     ///

@@ -4773,7 +4773,17 @@ impl DesktopRuntime {
                         24,
                         100,
                     );
-                    restored.push(session);
+                    // The announced snapshot has to carry the link, or the
+                    // client draws a restored session with no terminal.
+                    restored.push(
+                        match vibex_db::SessionTerminalRepository::get_with_terminal(
+                            &connection,
+                            &session.id,
+                        )? {
+                            Some(hydrated) => hydrated,
+                            None => session,
+                        },
+                    );
                 }
                 Ok(None) | Err(_) => {
                     vibex_db::SessionRepository::update_state(

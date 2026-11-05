@@ -71002,8 +71002,20 @@ impl VibexWorkbench {
             .terminal
             .as_ref()
             .and_then(|facts| facts.terminal_id.clone());
-        let (Some(terminal_id), Some(transport)) = (terminal_id, self.terminal_transport(cx))
-        else {
+        let transport = self.terminal_transport(cx);
+        let (Some(terminal_id), Some(transport)) = (terminal_id, transport) else {
+            // The two reasons this page cannot attach look identical on
+            // screen, and they have different causes: a snapshot that arrived
+            // without its link, or a runtime with no terminal transport. Say
+            // which one it was, once, at the moment it happens.
+            tracing::warn!(
+                target: "vibex_desktop",
+                error_code = "session_terminal_page_unattachable",
+                has_terminal = session.terminal.is_some(),
+                has_transport = self.terminal_transport(cx).is_some(),
+                session_id = session.id.as_str(),
+                "a terminal session page has nothing to attach"
+            );
             return self.render_session_terminal_placeholder(&session, cx);
         };
         let key = session.id.as_str().to_string();

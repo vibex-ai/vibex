@@ -15,10 +15,11 @@ use std::time::Duration;
 
 use crate::typography::{code_font_weight, ui_rems};
 use gpui::{
-    AccessibleAction, Anchor, AnyElement, App, Bounds, ClickEvent, Context, DragMoveEvent, Empty,
-    Entity, EventEmitter, FocusHandle, Focusable as _, FontWeight, Hsla, IntoElement, KeyDownEvent,
-    MouseButton, MouseDownEvent, Orientation, PathBuilder, Pixels, Rems, Render, Role,
-    ScrollAnchor, ScrollHandle, SharedString, Size as GpuiSize, StatefulInteractiveElement as _,
+    AccessibleAction, Anchor, AnyElement, App, Bounds, ClickEvent, Context, DragMoveEvent,
+    ElementId, Empty, Entity, EventEmitter, FocusHandle, Focusable as _, FontWeight,
+    HitboxBehavior, Hsla, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, Orientation,
+    PathBuilder, Pixels, Rems, Render, RenderOnce, Role, ScrollAnchor, ScrollDelta, ScrollHandle,
+    ScrollWheelEvent, SharedString, Size as GpuiSize, StatefulInteractiveElement as _,
     Subscription, Task, Toggled, WeakEntity, Window, canvas, div, point, prelude::*, px, rems,
     size as gpui_size,
 };
@@ -1380,6 +1381,11 @@ pub struct ManagementCenter {
     /// terminal is served by whichever runtime owns the PTY.
     terminal_transport: Option<Arc<dyn TerminalTransport>>,
     navigation: ManagementNavigation,
+    /// Scroll offset of the primary section tab strip. A macOS precise wheel
+    /// (`ScrollDelta::Pixels`) does not reach the strip through the TabBar's
+    /// built-in wheel handling, so `precise_wheel_scroll` drives this handle
+    /// directly. See that helper for the platform difference.
+    nav_scroll: ScrollHandle,
     snapshot: ProviderCenterSnapshot,
     agent_ordering: AgentOrdering,
     provider_profiles: Vec<vibex_core::ProviderProfile>,
