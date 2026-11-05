@@ -38105,7 +38105,17 @@ impl VibexWorkbench {
         let supported = agent_id
             .map(|agent_id| vibex_core::terminal_session_support(agent_id).is_supported())
             .unwrap_or(false);
-        if !supported {
+        // Terminal mode also needs a Provider Profile to carry, because the
+        // profile is what becomes the child's environment. An Agent account is a
+        // credential only the ACP adapter holds, so a terminal session under one
+        // would start on the user's own login — a different provider than the
+        // page shows. Falling back keeps the mode the page offers and the mode it
+        // can actually run in agreement.
+        let profile_backed = self
+            .new_session_runtime_selection
+            .as_ref()
+            .is_some_and(|selection| selection.provider_profile_id().is_some());
+        if !supported || !profile_backed {
             self.ui_state.session.new_session_transport = NewSessionTransport::Acp;
             self.queue_ui_state();
         }
