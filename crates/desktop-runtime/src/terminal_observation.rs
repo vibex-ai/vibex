@@ -285,6 +285,10 @@ impl WatchedTerminal {
         }
     }
 
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
     /// Feeds bytes from the PTY.
     ///
     /// The emulator's own scrollback is what makes the bottom buffer correct;
@@ -359,6 +363,18 @@ impl TerminalObservations {
         let watched =
             WatchedTerminal::new(session_id, agent, rows, columns, self.profiles.as_slice());
         self.terminals.insert(terminal_id, watched);
+    }
+
+    /// Every watched terminal with the session it belongs to.
+    ///
+    /// The retirement sweep asks the launcher whether each one is still alive,
+    /// which needs both ids: the launcher speaks in terminal ids, the session
+    /// store in session ids.
+    pub fn watched_terminals(&self) -> Vec<(TerminalId, String)> {
+        self.terminals
+            .iter()
+            .map(|(terminal_id, watched)| (terminal_id.clone(), watched.session_id().to_string()))
+            .collect()
     }
 
     pub fn unwatch(&mut self, terminal_id: &TerminalId) -> Option<WatchedTerminal> {

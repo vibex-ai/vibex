@@ -3771,6 +3771,11 @@ impl DesktopRuntime {
                 let Some(runtime) = weak_runtime.upgrade() else {
                     break;
                 };
+                // A PTY that ended has to be reported as such: the screen stops
+                // changing, so nothing else in this loop will ever notice, and
+                // the sidebar would keep showing a session whose Agent is gone —
+                // with a page that writes into a dead process.
+                runtime.retire_ended_terminal_sessions();
                 let updates = runtime.scan_terminal_observations();
                 if updates.is_empty() {
                     continue;
@@ -4683,7 +4688,45 @@ impl DesktopRuntime {
         observations.scan_all(unix_timestamp_ms())
     }
 
-    /// Rebuilds the PTY of every terminal-mode session recorded on disk.
+    /// Marks sessions whose terminal process has ended.
+    ///
+    /// The observation loop reads a screen, and a screen that stopped changing
+    /// looks exactly like one whose Agent is thinking. Only the process tells the
+    /// two apart, so this asks the launcher — and stops watching a terminal it
+    /// can no longer read.
+    fn retire_ended_terminal_sessions(&self) {
+        let Some(launcher) = self.agent.manager().session_terminal_launcher() else {
+            return;
+        };
+        let watched = {
+            let Ok(observations) = self.terminals.observations.lock() else {
+                return;
+            };
+            observations.watched_terminals()
+        };
+        for (terminal_id, session_id) in watched {
+            if launcher.is_running(&terminal_id) {
+                continue;
+            }
+            self.unwatch_session_terminal(&terminal_id);
+            let Ok(session_id) = vibex_core::VibexSessionId::parse(session_id) else {
+                continue;
+            };
+            if let Err(error) = self
+                .agent
+                .manager()
+                .mark_session_terminal_ended(&session_id)
+            {
+                tracing::warn!(
+                    target: "vibex_desktop",
+                    error_code = %error.code,
+                    "terminal session retirement failed"
+                );
+            }
+        }
+    }
+
+    /// Rebuilds the PTY of every terminal-mode session recorded on disk.    /// Rebuilds the PTY of every terminal-mode session recorded on disk.
     ///
     /// A runtime restart must not silently strand a session that was created in
     /// terminal mode: the row survives, so the page would draw an empty

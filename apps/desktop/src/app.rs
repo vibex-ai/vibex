@@ -38413,6 +38413,15 @@ impl VibexWorkbench {
             .new_session_runtime_selection
             .as_ref()
             .and_then(|selection| selection.provider_profile_id().cloned());
+        // The CLI is the only thing that can act on the model the page chose:
+        // Vibex is not in the conversation, so the choice has to ride the command
+        // line or it is silently dropped and the Agent starts on its own default.
+        let args = vibex_core::native_cli_model_arguments(
+            agent_id,
+            self.new_session_runtime_selection
+                .as_ref()
+                .and_then(|selection| selection.model.model_id()),
+        );
         let request = vibex_core::CreateTerminalSessionRequest {
             session_id: None,
             agent_id: agent_id.clone(),
@@ -38420,7 +38429,7 @@ impl VibexWorkbench {
             workspace_mode,
             title: None,
             safety: None,
-            args: Vec::new(),
+            args,
             provider_profile_id,
             rows: 24,
             cols: 100,
@@ -56143,6 +56152,15 @@ impl VibexWorkbench {
         let supported = agent_id
             .map(|agent_id| vibex_core::terminal_session_support(agent_id).is_supported())
             .unwrap_or(false);
+        // Terminal mode can only carry a Provider Profile: the profile is what
+        // becomes the child's environment. An Agent account is a credential the
+        // ACP adapter holds, and the native CLI has no way to receive it, so it
+        // would start on the user's own login instead — silently answering from
+        // a different provider than the one this page shows.
+        let profile_backed = self
+            .new_session_runtime_selection
+            .as_ref()
+            .is_some_and(|selection| selection.provider_profile_id().is_some());
         let current = self.ui_state.session.new_session_transport;
         let is_dark = cx.theme().is_dark();
         let track = theme::semantic_color("muted", is_dark).opacity(0.55);
@@ -56176,15 +56194,22 @@ impl VibexWorkbench {
                 IconName::SquareTerminal,
                 crate::locale::text("Native terminal", "原生终端", "原生終端"),
                 !supported,
-                if supported {
+                if !supported {
+                    disabled_label.clone()
+                } else if !profile_backed {
+                    crate::locale::text(
+                        "Terminal mode runs the Agent's own CLI, which can only be pointed at a Provider Profile. Choose one on this page, or the Agent will use the CLI's own login.",
+                        "终端模式运行 Agent 自己的 CLI，只能通过供应商配置注入凭据。请在本页选择一个供应商配置，否则 CLI 会使用它自己的登录态。",
+                        "終端模式執行 Agent 自己的 CLI，只能透過供應商設定注入憑證。請在本頁選擇一個供應商設定，否則 CLI 會使用它自己的登入狀態。",
+                    )
+                    .to_string()
+                } else {
                     crate::locale::text(
                         "The Agent runs its own interface in a terminal. Approvals and file changes happen there.",
                         "Agent 在终端里运行自己的界面，审批和文件改动都在终端内完成。",
                         "Agent 在終端裡執行自己的介面，審批和檔案改動都在終端內完成。",
                     )
                     .to_string()
-                } else {
-                    disabled_label.clone()
                 },
                 terminal_accent,
             ),
@@ -71324,6 +71349,15 @@ impl VibexWorkbench {
                 "The Agent did not start in this session's terminal.",
                 "该会话的终端未能启动 Agent。",
                 "該會話的終端未能啟動 Agent。",
+            )
+        } else if session.state == vibex_core::AgentSessionState::Closed {
+            // The Agent's process ended — the reader quit the CLI, or it
+            // crashed. Saying so is the whole difference between a session that
+            // looks idle and one that is gone.
+            crate::locale::text(
+                "The Agent has exited. Start a new terminal session to continue.",
+                "Agent 已退出。请新建终端会话以继续。",
+                "Agent 已退出。請新建終端會話以繼續。",
             )
         } else {
             crate::locale::text(

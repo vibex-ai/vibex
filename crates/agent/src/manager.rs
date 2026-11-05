@@ -3079,6 +3079,37 @@ impl AgentManager {
         Ok(())
     }
 
+    /// Records that a terminal session's Agent process has ended.
+    ///
+    /// The screen cannot say this: a TUI that stopped repainting reads like one
+    /// whose Agent is thinking, and a shell prompt after `Ctrl+C` reads like an
+    /// idle Agent. The process is the only witness, so when the launcher reports
+    /// it gone the session is closed rather than left claiming a state its
+    /// terminal can no longer back.
+    ///
+    /// The row survives. The reader can see which session ended, and the terminal
+    /// link stays so a restart can offer the same command again.
+    pub fn mark_session_terminal_ended(&self, session_id: &VibexSessionId) -> VibexResult<()> {
+        let conn = self.open_migrated()?;
+        let Some(session) = SessionRepository::get(&conn, session_id)? else {
+            return Ok(());
+        };
+        if !session.transport.is_terminal() || session.state == AgentSessionState::Closed {
+            return Ok(());
+        }
+        SessionRepository::update_state(&conn, session_id, AgentSessionState::Closed)?;
+        self.record_terminal_observation(
+            session_id,
+            vibex_core::TerminalActivity::Unknown,
+            vibex_core::TerminalActivitySource::Process,
+            vibex_core::unix_timestamp_ms(),
+        )?;
+        if let Some(closed) = self.client_session_snapshot(&conn, session_id)? {
+            self.publish_root_session_update(&conn, closed);
+        }
+        Ok(())
+    }
+
     /// Refuses a mutation that only an ACP session can serve.
     ///
     /// Terminal sessions keep the same row and the same lifecycle, so a client

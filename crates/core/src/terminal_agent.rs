@@ -66,3 +66,61 @@ mod tests {
         );
     }
 }
+
+/// The arguments that make a native CLI start on a chosen model.
+///
+/// The new-session page picks a model for the *session*, and a terminal session
+/// has no other channel to carry that choice: Vibex is not in the conversation,
+/// so the only way the choice reaches the Agent is the command line. Each Agent
+/// spells it differently, which is why the mapping lives beside the executable
+/// table rather than in the caller.
+///
+/// Returns nothing when the Agent has no flag for it, or when the selection is
+/// the Agent's own default — passing `--model` with a guessed id would start the
+/// CLI on a model the reader did not choose.
+pub fn native_cli_model_arguments(agent_id: &AgentId, model_id: Option<&str>) -> Vec<String> {
+    let Some(model_id) = model_id.filter(|model| !model.trim().is_empty()) else {
+        return Vec::new();
+    };
+    match agent_id.as_str() {
+        "claude" | "codex" => vec!["--model".to_string(), model_id.to_string()],
+        _ => Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod model_argument_tests {
+    use super::*;
+
+    fn agent(id: &str) -> AgentId {
+        AgentId::parse(id).expect("literal agent id")
+    }
+
+    /// The chosen model reaches the CLI, because the CLI is the only thing that
+    /// can act on it in terminal mode.
+    #[test]
+    fn the_chosen_model_becomes_a_flag() {
+        assert_eq!(
+            native_cli_model_arguments(&agent("claude"), Some("claude-opus-4-6")),
+            vec!["--model".to_string(), "claude-opus-4-6".to_string()]
+        );
+        assert_eq!(
+            native_cli_model_arguments(&agent("codex"), Some("gpt-5")),
+            vec!["--model".to_string(), "gpt-5".to_string()]
+        );
+    }
+
+    /// The Agent's own default stays its own: no flag, no guess.
+    #[test]
+    fn an_agent_default_passes_no_flag() {
+        assert!(native_cli_model_arguments(&agent("claude"), None).is_empty());
+        assert!(native_cli_model_arguments(&agent("claude"), Some("   ")).is_empty());
+    }
+
+    /// An Agent without a known flag gets none, rather than an argument its CLI
+    /// would reject.
+    #[test]
+    fn an_unknown_agent_gets_no_flag() {
+        assert!(native_cli_model_arguments(&agent("opencode"), Some("m")).is_empty());
+    }
+}

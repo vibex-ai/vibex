@@ -622,7 +622,7 @@ pub use terminal::{
     TerminalSessionLaunchSpec, TerminalSessionSupport, TerminalShell, TerminalSnapshot,
     TerminalStatus, TerminalSwitchShellRequest, TerminalWriteRequest,
 };
-pub use terminal_agent::{native_cli_executable, terminal_session_support};
+pub use terminal_agent::{native_cli_executable, native_cli_model_arguments, terminal_session_support};
 pub use time::unix_timestamp_ms;
 pub mod team;
 pub use team::*;
