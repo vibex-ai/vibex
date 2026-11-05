@@ -2201,7 +2201,7 @@ fn precise_wheel_scroll(handle: &ScrollHandle) -> impl IntoElement {
     let handle = handle.clone();
     canvas(
         |bounds, window, _| window.insert_hitbox(bounds, HitboxBehavior::Normal).id,
-        move |_, hitbox_id, window, cx| {
+        move |_, hitbox_id, window, _cx| {
             let view = window.current_view();
             window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
                 if !phase.capture() || !hitbox_id.should_handle_scroll(window) {
@@ -2235,6 +2235,11 @@ fn precise_wheel_scroll(handle: &ScrollHandle) -> impl IntoElement {
         },
     )
     .absolute()
+    // An absolute element without insets keeps its static position, which here
+    // is the flow slot after the tabs — below the bar, where the pointer never
+    // is. Pin it to the parent's top-left so it actually covers the strip.
+    .top_0()
+    .left_0()
     .size_full()
 }
 
@@ -45515,6 +45520,105 @@ mod tests {
         assert!(
             !band.iter().any(|quad| quad.background == track),
             "pill tabs paint no segmented track"
+        );
+    }
+
+    /// The section strip in a window, built the way `render_nav` builds it.
+    ///
+    /// The real TabBar's own `vertical_wheel` mask only reads `Lines` deltas,
+    /// so a macOS trackpad's `Pixels` never reaches it. The probe keeps the
+    /// same axis-locked horizontal scroller and puts `precise_wheel_scroll`
+    /// over it, so a simulated precise wheel goes through the helper and
+    /// nothing else.
+    struct NavPreciseWheelProbe {
+        scroll: ScrollHandle,
+    }
+
+    impl Render for NavPreciseWheelProbe {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .relative()
+                .w(px(200.0))
+                .h(px(42.0))
+                .child(
+                    h_flex()
+                        .id("nav-precise-wheel-strip")
+                        .w_full()
+                        .h_full()
+                        .overflow_x_scroll()
+                        .restrict_scroll_to_axis()
+                        .track_scroll(&self.scroll)
+                        .child(div().flex_none().w(px(800.0)).h_full()),
+                )
+                .child(precise_wheel_scroll(&self.scroll))
+        }
+    }
+
+    /// A macOS precise wheel scrolls the Config Center's section strip.
+    ///
+    /// Linux reports a wheel as `Lines`, which the TabBar's mask already turns
+    /// into sideways movement, so the bug was macOS-only: there the same wheel
+    /// arrives as `Pixels`, the mask returns it untouched, and the strip's
+    /// axis-locked scroller drops a vertical swipe. Both a vertical swipe and
+    /// a horizontal one now move the strip, and a `Lines` wheel is left to the
+    /// built-in path instead of being consumed twice.
+    #[gpui::test]
+    fn a_precise_wheel_scrolls_the_section_strip(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let scroll = ScrollHandle::new();
+        let observed = scroll.clone();
+        let (_, cx) = cx.add_window_view(|_, _| NavPreciseWheelProbe { scroll });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        assert!(
+            observed.max_offset().x > px(0.0),
+            "the probe strip has to overflow before a wheel can move it"
+        );
+
+        // Built field by field so the probe does not depend on which scroll
+        // fields this gpui revision carries.
+        let wheel = |delta: ScrollDelta| {
+            let mut event = ScrollWheelEvent::default();
+            event.position = point(px(20.0), px(20.0));
+            event.delta = delta;
+            event.modifiers = Default::default();
+            event.touch_phase = gpui::TouchPhase::Moved;
+            event
+        };
+
+        // macOS sends a vertical trackpad swipe as precise pixels; over a
+        // horizontal strip it has to move the strip sideways.
+        cx.simulate_event(wheel(ScrollDelta::Pixels(point(px(0.0), px(-120.0)))));
+        cx.run_until_parked();
+        assert!(
+            observed.offset().x < px(0.0),
+            "a vertical precise wheel moved the strip: {:?}",
+            observed.offset().x
+        );
+
+        // A horizontal swipe, the gesture a trackpad actually uses here, keeps
+        // its own axis.
+        let after_vertical = observed.offset().x;
+        cx.simulate_event(wheel(ScrollDelta::Pixels(point(px(-80.0), px(0.0)))));
+        cx.run_until_parked();
+        assert!(
+            observed.offset().x < after_vertical,
+            "a horizontal precise wheel moved the strip further: {:?} -> {:?}",
+            after_vertical,
+            observed.offset().x
+        );
+
+        // Linux wheels are `Lines`. The helper must not eat them, or the
+        // TabBar's mask would lose the movement it already handles.
+        let at_edge = observed.offset().x;
+        cx.simulate_event(wheel(ScrollDelta::Lines(point(0.0, -1.0))));
+        cx.run_until_parked();
+        assert_eq!(
+            observed.offset().x,
+            at_edge,
+            "a plain wheel stays with the TabBar's own mask"
         );
     }
 
