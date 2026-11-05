@@ -616,7 +616,11 @@ function validateServerRelease() {
     "--server-artifact",
     "require_artifact_class 'vibex-server-*-linux-x86_64.tar.gz'",
     "require_artifact_class 'vibex-server-*-linux-aarch64.tar.gz'",
-    "name: server-linux-${{ github.sha }}"
+    "name: server-linux-${{ github.sha }}",
+    // The macOS server job has one matrix entry per architecture, so a shared
+    // artifact name makes the two uploads overwrite each other and the
+    // aggregate job fails the release as missing an architecture.
+    "name: server-macos-${{ matrix.arch }}-${{ github.sha }}"
   ]) {
     assert(workflow.includes(required), `publish workflow is missing server release contract ${required}`);
   }

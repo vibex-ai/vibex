@@ -328,7 +328,11 @@ jobs:
       - name: Upload server artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: server-macos-${{ github.sha }}
+          # The matrix has one entry per architecture, so the name has to carry
+          # the architecture: a shared name makes the second job overwrite the
+          # first, and the aggregate job then rejects the release as missing the
+          # architecture that lost the race.
+          name: server-macos-${{ matrix.arch }}-${{ github.sha }}
           path: |
             target/server-artifacts/*.tar.gz
             target/server-artifacts/*.sha256
