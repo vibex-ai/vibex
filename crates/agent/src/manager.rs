@@ -13070,6 +13070,43 @@ mod tests {
         assert!(plain.terminal.is_none());
     }
 
+
+    /// A terminal session whose Agent process ended is retired.
+    ///
+    /// The screen cannot say this. A TUI that stopped repainting reads like an
+    /// Agent that is thinking, and the shell prompt a `Ctrl+C` leaves behind
+    /// reads like an idle Agent — so without asking the process, the sidebar
+    /// keeps advertising a session whose Agent is gone and the page keeps an
+    /// input box pointed at a dead PTY.
+    #[tokio::test]
+    async fn a_terminal_session_is_closed_when_its_process_ends() {
+        let (manager, launcher, dir) = terminal_manager();
+        let session = manager
+            .create_terminal_session(terminal_request("claude", &dir))
+            .await
+            .unwrap();
+        assert_eq!(session.state, AgentSessionState::Idle);
+
+        // The Agent's process ends, the way quitting the CLI ends it.
+        let terminal_id = launcher.watched()[0].0.clone();
+        launcher.kill(&terminal_id).unwrap();
+
+        manager.mark_session_terminal_ended(&session.id).unwrap();
+
+        let retired = manager.get_session(&session.id).await.unwrap();
+        assert_eq!(retired.state, AgentSessionState::Closed);
+        // The row survives, and so does its link: the reader can see which
+        // session ended, and a restart can offer the same command again.
+        assert!(
+            retired
+                .terminal
+                .as_deref()
+                .and_then(|facts| facts.terminal_id.as_ref())
+                .is_some(),
+            "retiring must not drop the link"
+        );
+    }
+
     /// A restart rebuilds a terminal session's PTY from its recorded argv.
     ///
     /// The row survives the restart, so without this the page would draw an
