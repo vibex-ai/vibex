@@ -10976,8 +10976,18 @@ impl CodeWorkbench {
     /// is the representation on screen, and only while its tab is the active one
     /// in a pane — a tab parked under another session, or one the reader
     /// switched away from, keeps its retained view but shows nothing.
+    ///
+    /// The document has to be the one the tab actually draws. `render_file_content`
+    /// picks the editor over the preview for anything that is not a loaded
+    /// Markdown presentation, so a file that is not Markdown — or one still
+    /// loading — has no rendered document to speak of. Without this test every
+    /// active file tab answered yes, and the find hand-off skipped the very
+    /// editor the reader was typing in.
     fn markdown_preview_showing(&self, path: &str) -> bool {
-        !self.markdown_edit_paths.contains(path)
+        matches!(
+            self.presentations.get(path),
+            Some(FilePresentation::Markdown { .. })
+        ) && !self.markdown_edit_paths.contains(path)
             && self.preview_active_tab_is(
                 PreviewTarget::File {
                     path: path.to_string(),
@@ -23406,6 +23416,80 @@ mod tests {
                     .as_ref()
                     .is_some_and(|find| find.path == "README.md"),
                 "the editor must open its own find, not hand the chord to the workbench"
+            );
+        });
+    }
+
+    /// The find chord reaches a plain source file, not only a Markdown source.
+    ///
+    /// `markdown_preview_showing` answers "the rendered document is what the
+    /// reader sees" for the tab in front of them. A source file that is not
+    /// Markdown has no rendered document at all, but the predicate used to
+    /// answer yes for any active file tab, so the focused editor was filtered
+    /// out of the find hand-off and Ctrl+F did nothing in the file the reader
+    /// was editing.
+    #[gpui::test]
+    fn the_find_chord_reaches_a_plain_source_editor(cx: &mut gpui::TestAppContext) {
+        let (workbench, _readme, cx) = fixture_editor_input(cx);
+        let source = "fn main() {\n    println!(\"Vibex\");\n}\n";
+        workbench.update_in(cx, |this, window, cx| {
+            this.set_preview_visible(true, cx);
+            this.editors.insert_read(vibex_core::FileReadResponse {
+                workspace_id: this
+                    .workspace
+                    .as_ref()
+                    .expect("the fixture selects a workspace")
+                    .id
+                    .clone(),
+                path: "src/lib.rs".to_string(),
+                name: "lib.rs".to_string(),
+                preview_kind: vibex_core::FilePreviewKind::Text,
+                content: Some(source.to_string()),
+                size_bytes: source.len() as u64,
+                modified_at_ms: Some(1),
+                language: Some("rust".to_string()),
+                truncated: false,
+                encoding: vibex_core::FileEncoding::Utf8,
+                line_ending: vibex_core::FileLineEnding::Lf,
+                content_revision: "fixture-lib-r1".to_string(),
+            });
+            let editor = this.ensure_editor_binding("src/lib.rs", window, cx);
+            editor.update(cx, |input, cx| {
+                input.set_value(source, window, cx);
+            });
+            let tab = this
+                .preview
+                .open(
+                    PreviewTarget::File {
+                        path: "src/lib.rs".to_string(),
+                    },
+                    None,
+                    1,
+                )
+                .expect("the source tab opens");
+            this.preview.focus(&tab);
+        });
+        draw_window(cx);
+        let editor = workbench.read_with(cx, |this, _| {
+            this.editor_bindings["src/lib.rs"].input.clone()
+        });
+        cx.update(|window, cx| {
+            editor.update(cx, |editor, cx| editor.focus(window, cx));
+        });
+        draw_window(cx);
+
+        #[cfg(target_os = "macos")]
+        cx.simulate_keystrokes("cmd-f");
+        #[cfg(not(target_os = "macos"))]
+        cx.simulate_keystrokes("ctrl-f");
+        cx.run_until_parked();
+
+        workbench.read_with(cx, |this, _| {
+            assert!(
+                this.editor_find
+                    .as_ref()
+                    .is_some_and(|find| find.path == "src/lib.rs"),
+                "Ctrl+F in a plain source file has to open its find bar"
             );
         });
     }

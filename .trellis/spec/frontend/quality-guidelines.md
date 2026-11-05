@@ -1451,7 +1451,14 @@ gpui_base::text::TextViewState::set_range_highlights(highlights, cx) -> Result<(
   tab keeps behind the rendered document — holds the keyboard, and
   `CodeWorkbench::focused_editor` declines for a path whose tab is showing its
   preview, so the hidden editor cannot open a find panel behind a document
-  nobody can see. The bar renders under the preview header, searches the
+  nobody can see. That declination must key on the tab *actually drawing* the
+  rendered document — `markdown_preview_showing` therefore requires a
+  `FilePresentation::Markdown` for the path, the same condition
+  `render_file_content` uses to choose the preview over the editor. Testing only
+  "not editing Markdown" and "tab is active" made every active source file look
+  like a rendered preview, so a plain editor's Ctrl+F was filtered out and did
+  nothing; `the_find_chord_reaches_a_plain_source_editor` pins that case. The
+  bar renders under the preview header, searches the
   rendered text through the shared `session_search_match_ranges`, steps with
   Enter/Shift+Enter and the arrows, reveals the current hit with
   `reveal_range`, and clears its highlights when it closes. Its hits are the
