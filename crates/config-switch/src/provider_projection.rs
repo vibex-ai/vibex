@@ -5592,6 +5592,31 @@ fn hydrate_provider_credential_masks(profiles: &mut [ModelProviderProfile]) {
     }
 }
 
+/// Derives the projection workspace key for a checkout.
+///
+/// The key must be a bounded, non-path identity — the projection directory is
+/// named after it and it is validated on the way in — so the working directory
+/// is hashed into a stable token rather than passed through. Two callers use
+/// this: the ACP launch path and the terminal launch path. Keeping one function
+/// is what makes a session that moved between the two land on the *same*
+/// projection instead of materializing a second one.
+pub fn workspace_projection_key(cwd: &std::path::Path) -> String {
+    let mut hasher = Sha256::new();
+    // The derivation is byte-for-byte the one the ACP launch path has always
+    // used. Matching it is load-bearing: a session that moves between ACP and
+    // terminal mode must land on the *same* overlay directory, and an existing
+    // ACP session must not be moved to a fresh one by this refactor.
+    hash_component(&mut hasher, b"vibex/acp/codex-profile-workspace-home/v1");
+    hash_component(&mut hasher, cwd.to_string_lossy().as_bytes());
+    let digest = hex_digest(hasher.finalize().as_slice());
+    format!("workspace_{}", &digest[..32])
+}
+
+fn hash_component(hasher: &mut Sha256, bytes: &[u8]) {
+    hasher.update((bytes.len() as u64).to_be_bytes());
+    hasher.update(bytes);
+}
+
 fn validate_workspace_key(value: &str) -> VibexResult<()> {
     let value = value.trim();
     if value.is_empty()
@@ -12105,5 +12130,44 @@ mod write_order_tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod workspace_key_tests {
+    use super::*;
+    use std::path::Path;
+
+    /// The projection key is a bounded identity, never a path.
+    ///
+    /// The engine validates it before materializing an overlay, so a caller that
+    /// hands it a checkout path fails the whole launch with
+    /// `agent_projection_workspace_key_invalid`. That is exactly what a terminal
+    /// session did before this was shared with the ACP path.
+    #[test]
+    fn the_workspace_key_is_a_stable_identity_not_a_path() {
+        let key = workspace_projection_key(Path::new("/home/someone/code/a project"));
+        assert!(key.starts_with("workspace_"));
+        assert!(
+            !key.contains('/') && !key.contains(' '),
+            "the key must be a token, not a path: {key}"
+        );
+        assert!(
+            key.chars()
+                .all(|character| character.is_ascii_alphanumeric() || character == '_'),
+            "the engine accepts only alphanumerics, `-`, `_` and `.`: {key}"
+        );
+        assert!(key.len() <= MAX_WORKSPACE_KEY_LEN);
+    }
+
+    /// The same checkout always derives the same key, so a session that switched
+    /// between ACP and terminal mode stays on one projection.
+    #[test]
+    fn the_key_is_stable_for_one_checkout_and_distinct_across_checkouts() {
+        let a = workspace_projection_key(Path::new("/code/vibex"));
+        let b = workspace_projection_key(Path::new("/code/vibex"));
+        let other = workspace_projection_key(Path::new("/code/vibex-other"));
+        assert_eq!(a, b);
+        assert_ne!(a, other);
     }
 }

@@ -156,6 +156,9 @@ struct TerminalPollResult {
     terminal_id: TerminalId,
     session: Option<TerminalSession>,
     result: Result<Option<(TerminalSyncOutcome, TerminalFrameSnapshot)>, String>,
+    /// Bytes the emulator owes the program, carried out of the blocking poll so
+    /// the UI thread can write them back with the transport.
+    pty_replies: Vec<u8>,
 }
 
 fn terminal_poll_interval(idle_poll_count: u16) -> Duration {
@@ -781,6 +784,20 @@ impl TerminalSurface {
         cx: &mut Context<Self>,
     ) -> bool {
         let mut changed = false;
+        // Replies are written before the tab borrow below so the transport call
+        // does not have to borrow `self` immutably while a tab is borrowed
+        // mutably.
+        let replies = results
+            .iter()
+            .filter(|result| !result.pty_replies.is_empty())
+            .map(|result| (result.terminal_id.clone(), result.pty_replies.clone()))
+            .collect::<Vec<_>>();
+        for (terminal_id, bytes) in replies {
+            // The emulator answered a query the program is waiting on; the
+            // transport owns the write side, so the reply leaves through it
+            // rather than being dropped on the floor.
+            self.send_terminal_bytes(terminal_id, bytes, cx);
+        }
         for result in results {
             let Some(tab) = self
                 .tabs
@@ -2596,10 +2613,12 @@ async fn run_poll_work(work: TerminalPollWork) -> TerminalPollResult {
                 terminal_id: work.terminal_id,
                 session: None,
                 result: Err(format!("Terminal snapshot failed: {}", error.message)),
+                pty_replies: Vec::new(),
             };
         }
     };
     let session = snapshot.session.clone();
+    let mut pty_replies = Vec::new();
     let result = work
         .backend
         .lock()
@@ -2609,6 +2628,9 @@ async fn run_poll_work(work: TerminalPollWork) -> TerminalPollResult {
                 .sync(&snapshot)
                 .map_err(|error| format!("Terminal sync failed: {}", error.message))
                 .map(|outcome| {
+                    // Cloned, not moved: the same outcome still has to reach the
+                    // frame gate below.
+                    pty_replies.clone_from(&outcome.pty_replies);
                     (outcome.ingested_chunks > 0 || outcome.rebuilt)
                         .then(|| (outcome, backend.frame()))
                 })
@@ -2617,6 +2639,7 @@ async fn run_poll_work(work: TerminalPollWork) -> TerminalPollResult {
         terminal_id: work.terminal_id,
         session: Some(session),
         result,
+        pty_replies,
     }
 }
 

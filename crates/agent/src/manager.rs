@@ -1467,8 +1467,15 @@ impl AgentManager {
             ));
         }
         let service = ProviderConfigService::new(self.db_path.clone());
+        // The projection key is a stable identity, not a path: the engine
+        // validates it and names the overlay directory after it. Hashing the
+        // checkout is what keeps a terminal session on the same projection the
+        // ACP path would have used for the same workspace.
+        let workspace_key = vibex_config_switch::workspace_projection_key(std::path::Path::new(
+            &session.workspace_root,
+        ));
         let projection = service
-            .resolve_legacy_agent_provider_projection(profile_id, &session.workspace_root)
+            .resolve_legacy_agent_provider_projection(profile_id, &workspace_key)
             .map_err(|error| {
                 error.with_diagnostic("providerProfileId", profile_id.as_str().to_string())
             })?;

@@ -1,5 +1,7 @@
+use std::sync::{Arc, Mutex};
+
 use alacritty_terminal::{
-    event::VoidListener,
+    event::{Event, EventListener},
     grid::{Dimensions, Scroll},
     index::{Column, Point, Side},
     selection::{Selection, SelectionType},
@@ -81,6 +83,14 @@ pub struct TerminalModeSnapshot {
     pub mouse_reporting: bool,
     pub sgr_mouse: bool,
     pub focus_reporting: bool,
+    /// The kitty keyboard protocol flags the program has pushed.
+    ///
+    /// Zero means the program asked for nothing and legacy encoding applies.
+    /// Non-zero tells the encoder it may report a chord as `CSI u` with
+    /// modifiers, which is the only way an Agent can tell `Shift+Enter` from
+    /// `Enter`.
+    #[serde(default)]
+    pub kitty_keyboard_flags: u8,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -125,11 +135,61 @@ impl Dimensions for TerminalGridSize {
     }
 }
 
+/// Collects the replies the emulator owes a program on the other end.
+///
+/// The terminal core answers queries — device attributes, cursor position,
+/// keyboard protocol — by raising an [`Event::PtyWrite`]; the host has to send
+/// that text back into the PTY. A `VoidListener` (what this emulator used) drops
+/// them, so an Agent that asks "do you understand `CSI u`?" gets silence and
+/// falls back to legacy encoding, and one that waits for a device-attributes
+/// reply can stall outright.
+///
+/// The queue is a plain `Mutex<Vec<u8>>`: it is written on whatever thread feeds
+/// the parser and drained by the host between reads, so it never has to be
+/// async or lock-free to keep up.
+#[derive(Clone, Default)]
+pub struct PtyReplyQueue {
+    pending: Arc<Mutex<Vec<u8>>>,
+}
+
+impl PtyReplyQueue {
+    /// Takes the replies accumulated since the last drain.
+    pub fn take(&self) -> Vec<u8> {
+        let mut pending = match self.pending.lock() {
+            Ok(pending) => pending,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        std::mem::take(&mut *pending)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.pending
+            .lock()
+            .map(|pending| pending.is_empty())
+            .unwrap_or(true)
+    }
+}
+
+impl EventListener for PtyReplyQueue {
+    fn send_event(&self, event: Event) {
+        // Only replies travel back to the program. Everything else — title,
+        // bell, clipboard, wakeup — belongs to a UI this crate does not own.
+        if let Event::PtyWrite(text) = event {
+            let mut pending = match self.pending.lock() {
+                Ok(pending) => pending,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            pending.extend_from_slice(text.as_bytes());
+        }
+    }
+}
+
 pub struct TerminalEmulator {
     size: TerminalGridSize,
-    term: Term<VoidListener>,
+    term: Term<PtyReplyQueue>,
     parser: ansi::Processor,
     ingested_bytes: u64,
+    replies: PtyReplyQueue,
 }
 
 impl TerminalEmulator {
@@ -149,9 +209,10 @@ impl TerminalEmulator {
         };
         Self {
             size,
-            term: Term::new(Config::default(), &size, VoidListener),
+            term: Term::new(config, &size, replies.clone()),
             parser: ansi::Processor::new(),
             ingested_bytes: 0,
+            replies,
         }
     }
 
@@ -182,14 +243,15 @@ impl TerminalEmulator {
     }
 
     pub fn modes(&self) -> TerminalModeSnapshot {
-        TerminalModeSnapshot {
-            alternate_screen: self.term.mode().contains(TermMode::ALT_SCREEN),
-            application_cursor: self.term.mode().contains(TermMode::APP_CURSOR),
-            bracketed_paste: self.term.mode().contains(TermMode::BRACKETED_PASTE),
-            mouse_reporting: self.term.mode().intersects(TermMode::MOUSE_MODE),
-            sgr_mouse: self.term.mode().contains(TermMode::SGR_MOUSE),
-            focus_reporting: self.term.mode().contains(TermMode::FOCUS_IN_OUT),
-        }
+        mode_snapshot(*self.term.mode())
+    }
+
+    /// Replies the emulator owes the program, to be written back into the PTY.
+    ///
+    /// A host drains this after every `advance`; an empty queue is the common
+    /// case.
+    pub fn take_pty_replies(&self) -> Vec<u8> {
+        self.replies.take()
     }
 
     pub fn scroll(&mut self, line_delta: i32) {
@@ -460,7 +522,29 @@ fn mode_snapshot(mode: TermMode) -> TerminalModeSnapshot {
         mouse_reporting: mode.intersects(TermMode::MOUSE_MODE),
         sgr_mouse: mode.contains(TermMode::SGR_MOUSE),
         focus_reporting: mode.contains(TermMode::FOCUS_IN_OUT),
+        kitty_keyboard_flags: kitty_keyboard_flags(mode),
     }
+}
+
+/// The five protocol bits an Agent can push, packed the way `CSI u` reports them.
+fn kitty_keyboard_flags(mode: TermMode) -> u8 {
+    let mut flags = 0_u8;
+    if mode.contains(TermMode::DISAMBIGUATE_ESC_CODES) {
+        flags |= 1;
+    }
+    if mode.contains(TermMode::REPORT_EVENT_TYPES) {
+        flags |= 2;
+    }
+    if mode.contains(TermMode::REPORT_ALTERNATE_KEYS) {
+        flags |= 4;
+    }
+    if mode.contains(TermMode::REPORT_ALL_KEYS_AS_ESC) {
+        flags |= 8;
+    }
+    if mode.contains(TermMode::REPORT_ASSOCIATED_TEXT) {
+        flags |= 16;
+    }
+    flags
 }
 
 fn normalize_search_text(value: &str, case_sensitive: bool) -> String {

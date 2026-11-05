@@ -17329,12 +17329,12 @@ fn toml_quoted_string(value: &str) -> String {
     quoted
 }
 
+/// The projection key for a checkout.
+///
+/// Delegates to the shared derivation so an ACP session and a terminal session in
+/// the same workspace resolve to one overlay directory instead of two.
 fn workspace_runtime_key(cwd: &Path) -> String {
-    let mut hasher = Sha256::new();
-    hash_component(&mut hasher, b"vibex/acp/codex-profile-workspace-home/v1");
-    hash_component(&mut hasher, cwd.to_string_lossy().as_bytes());
-    let digest = hex_digest(hasher.finalize().as_slice());
-    format!("workspace_{}", &digest[..32])
+    vibex_config_switch::workspace_projection_key(cwd)
 }
 
 fn opencode_model_provider_id(profile: &ProviderProfile) -> Option<String> {

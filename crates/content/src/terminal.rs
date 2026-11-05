@@ -194,7 +194,7 @@ pub fn new_ui_terminal_manager() -> TerminalManager {
     )
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TerminalSyncOutcome {
     pub ingested_chunks: usize,
@@ -203,6 +203,12 @@ pub struct TerminalSyncOutcome {
     pub gap_detected: bool,
     pub rebuilt: bool,
     pub dropped_chunks: u64,
+    /// Bytes the emulator owes the program, to be written back into the PTY.
+    ///
+    /// A device-attributes, cursor-position or keyboard-protocol query is
+    /// answered by the terminal core; the transport that owns the write side is
+    /// the only one that can deliver it.
+    pub pty_replies: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -334,6 +340,9 @@ impl TerminalSurfaceBackend {
             gap_detected: rebuild,
             rebuilt: rebuild,
             dropped_chunks: snapshot.dropped_chunks,
+            // Drained even when a rebuild replayed every chunk: the program is
+            // waiting on the last answer, not on the ones it already got.
+            pty_replies: self.emulator.take_pty_replies(),
         })
     }
 
@@ -506,6 +515,19 @@ fn encode_key(
     modifiers: TerminalModifiers,
     modes: vibex_terminal::TerminalModeSnapshot,
 ) -> Option<Vec<u8>> {
+    // A program that negotiated the kitty keyboard protocol is asking for the
+    // chord itself, not for the text it would type. `Shift+Enter` has no legacy
+    // encoding at all (it arrives as a plain carriage return), so a terminal
+    // that pretends otherwise is what makes "newline" and "send" the same key.
+    //
+    // Everything below this branch is the legacy fallback, and it is what a
+    // program that never negotiated still receives: the protocol is opt-in per
+    // program, so enabling it here cannot change the bytes an unaware CLI gets.
+    if modes.kitty_keyboard_flags & KITTY_DISAMBIGUATE != 0
+        && let Some(sequence) = encode_kitty_key(key, modifiers, modes.kitty_keyboard_flags)
+    {
+        return Some(sequence);
+    }
     if let TerminalKey::Text(character) = key {
         let mut output = Vec::new();
         if modifiers.alt {

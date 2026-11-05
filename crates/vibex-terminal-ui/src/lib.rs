@@ -13,8 +13,8 @@ mod emulator_wasm;
 mod capability;
 
 pub use capability::{
-    COLOR_TERM, ChildEnvironment, DRAWS_PICTURES, IMAGE_OVERRIDE, OUTER_TERMINAL_VARIABLES,
-    TERM_NAME, child_environment,
+    COLOR_TERM, ChildEnvironment, DRAWS_PICTURES, IMAGE_OVERRIDE, KITTY_KEYBOARD_PROTOCOL,
+    OUTER_TERMINAL_VARIABLES, TERM_NAME, child_environment,
 };
 #[cfg(not(target_family = "wasm"))]
 pub use emulator::*;
