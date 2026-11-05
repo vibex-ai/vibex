@@ -15192,29 +15192,47 @@ impl VibexWorkbench {
         // so the reader lands in the progress they just asked for instead of
         // having to find a one-line entry point first. A terminal attempt hands
         // the result back to the row and closes the dialog.
-        settings_view.update(cx, |settings, cx| {
+        //
+        // The decision and the dialog are two separate updates on purpose: the
+        // opening call has to reach `self` again (it reads the snapshot and the
+        // log view), and doing that from inside `settings.update` re-leases the
+        // same entity and panics with "cannot update
+        // `vibex_desktop::app::FoundationSettings` while it is already being
+        // updated". This is the path an "Add SSH connection" probe takes: the
+        // first provisioning event arrives while the settings dialog is on the
+        // stack.
+        let open_progress = settings_view.update(cx, |settings, cx| {
             settings.connections_progress_target = Some((profile_id.clone(), attempt_id));
-            let dismissed = settings.connections_progress_dismissed.clone();
             if terminal {
                 settings.connections_progress_target = None;
                 settings.connections_progress_open = false;
-                if dismissed.as_ref() == Some(&(profile_id.clone(), attempt_id)) {
+                if settings.connections_progress_dismissed.as_ref()
+                    == Some(&(profile_id.clone(), attempt_id))
+                {
                     settings.connections_progress_dismissed = None;
                 }
-                return;
+                cx.notify();
+                return false;
             }
-            if dismissed == Some((profile_id.clone(), attempt_id)) {
-                return;
+            if settings.connections_progress_dismissed == Some((profile_id.clone(), attempt_id)) {
+                cx.notify();
+                return false;
             }
             if settings.connections_progress_open {
-                return;
+                cx.notify();
+                return false;
             }
             settings.connections_progress_open = true;
-            let settings = cx.weak_entity();
-            let _ = window.update(cx, |_, window, cx| {
-                let _ = settings.update(cx, |settings, cx| {
-                    settings.open_connections_progress_dialog(window, cx);
-                });
+            cx.notify();
+            true
+        });
+        if !open_progress {
+            return;
+        }
+        let settings = settings_view.downgrade();
+        let _ = window.update(cx, |_, window, cx| {
+            let _ = settings.update(cx, |settings, cx| {
+                settings.open_connections_progress_dialog(window, cx);
             });
         });
     }
@@ -46282,7 +46300,6 @@ impl VibexWorkbench {
             cx.notify();
         });
         self.settings_open = true;
-        eprintln!("vibex-foundation: settings-dialog-open");
         let settings = self.settings_view.clone();
         let workbench = cx.weak_entity();
         let viewport = window.viewport_size();
@@ -115593,6 +115610,101 @@ mod tests {
             });
             assert_eq!(active, section, "the section still has to become active");
         }
+    }
+
+    /// A provisioning event that opens the progress dialog must not re-lease
+    /// the settings view.
+    ///
+    /// Adding an SSH connection probes the host and immediately starts
+    /// provisioning, so the first event lands while the settings dialog is
+    /// already on the stack. The sync used to open the progress dialog from
+    /// inside `settings_view.update`, which leases `FoundationSettings` twice
+    /// and aborts the process with "cannot update
+    /// `vibex_desktop::app::FoundationSettings` while it is already being
+    /// updated". The follow-up state is decided and returned from the first
+    /// update, and the dialog opens from a second, later one.
+    #[gpui::test]
+    fn a_provisioning_event_opens_the_progress_dialog_without_releasing_settings(
+        cx: &mut TestAppContext,
+    ) {
+        struct ProvisioningProbe {
+            workbench: Entity<VibexWorkbench>,
+        }
+
+        impl Render for ProvisioningProbe {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                self.workbench.clone()
+            }
+        }
+
+        cx.update(gpui_component::init);
+        // `Root` keeps the view it was built from private, so the test parks
+        // the workbench it needs in a slot the closure fills. The probe itself
+        // only has to be an entity because `Root::new` takes a view, not a
+        // closure.
+        let workbench_slot: std::rc::Rc<RefCell<Option<Entity<VibexWorkbench>>>> =
+            std::rc::Rc::new(RefCell::new(None));
+        let slot = workbench_slot.clone();
+        let (_probe, cx) = cx.add_window_view(|window, cx| {
+            let workbench = cx.new(|cx| {
+                let mut ui_state = DesktopUiStateV1::default();
+                ui_state.appearance.locale = LocaleMode::En;
+                VibexWorkbench::with_initial_state(None, ui_state, None, window, cx)
+            });
+            *slot.borrow_mut() = Some(workbench.clone());
+            let probe = cx.new(|_| ProvisioningProbe {
+                workbench: workbench.clone(),
+            });
+            Root::new(probe, window, cx)
+        });
+        let workbench = workbench_slot
+            .borrow()
+            .clone()
+            .expect("the probe window should hold the workbench");
+
+        workbench.update(cx, |workbench, _| {
+            workbench.ssh_provisioning_snapshot = Some(ProvisioningSnapshot {
+                profile_id: "ssh-dev-home".to_string(),
+                attempt_id: 7,
+                step: ProvisioningStep::CheckingEnvironment,
+                status: ProvisioningStatus::Running,
+                failure: None,
+                detail: None,
+                progress: None,
+                cancel_requested: false,
+                active_runtime_id: None,
+                started_at_ms: 0,
+                updated_at_ms: 0,
+            });
+        });
+        // The panic this guards against is a double lease, so reaching the
+        // assertions at all is most of the test: the sync must return normally
+        // and still leave the dialog claimed.
+        workbench.update(cx, |workbench, cx| {
+            workbench.sync_ssh_provisioning_settings(cx);
+        });
+        let (open, target) = workbench.read_with(cx, |workbench, cx| {
+            let settings = workbench.settings_view.read(cx);
+            (
+                settings.connections_progress_open,
+                settings.connections_progress_target.clone(),
+            )
+        });
+        assert!(
+            open,
+            "the running attempt should ask for its progress dialog"
+        );
+        assert_eq!(target, Some(("ssh-dev-home".to_string(), 7)));
+
+        // The same attempt reports again on every step; it must not stack a
+        // second dialog on top of the one already open.
+        workbench.update(cx, |workbench, cx| {
+            workbench.sync_ssh_provisioning_settings(cx);
+        });
+        let open = workbench.read_with(cx, |workbench, cx| {
+            workbench.settings_view.read(cx).connections_progress_open
+        });
+        assert!(open, "the dialog stays open across a repeat event");
     }
 
     #[test]
