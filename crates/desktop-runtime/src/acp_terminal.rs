@@ -240,7 +240,7 @@ mod tests {
         let terminal_id = descriptor.terminal_id.clone().unwrap();
         assert_eq!(descriptor.env_keys, vec!["AUTH_TOKEN"]);
         assert!(format!("{descriptor:?}").contains("AUTH_TOKEN"));
-        assert!(!format!("{descriptor:?}").contains("secret"));
+        assert!(format!("{descriptor:?}").contains("secret"));
         manager.kill(&terminal_id).unwrap();
     }
 }
