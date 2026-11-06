@@ -276,14 +276,42 @@ fn append_file_reference_commands(
         return Ok(());
     };
 
-    let entries = files.list_tree(&FileTreeRequest {
-        workspace_id: workspace_id.clone(),
-        path: None,
-        max_depth: Some(8),
-        include_hidden: true,
-    })?;
     let query = request.query.as_deref().map(str::trim).unwrap_or("");
-    let query_lower = query.to_lowercase();
+    let directory_query = composer_directory_query(query);
+    // A query that has reached a directory browses that directory itself
+    // rather than searching for it in the workspace-wide listing: that
+    // listing is bounded, and a large sibling subtree can exhaust the bound
+    // before the directory the reader named is ever reached.
+    let scoped_entries = directory_query.and_then(|(directory, _)| {
+        files
+            .list_tree(&FileTreeRequest {
+                workspace_id: workspace_id.clone(),
+                path: Some(directory.to_string()),
+                max_depth: Some(1),
+                include_hidden: true,
+            })
+            .ok()
+    });
+    let scoped = scoped_entries.is_some();
+    let entries = match scoped_entries {
+        Some(entries) => entries,
+        // The named directory does not exist yet — the reader may still be
+        // typing its name. Fall back to the workspace listing so a partial
+        // path keeps narrowing the tree as it did before.
+        None => files.list_tree(&FileTreeRequest {
+            workspace_id,
+            path: None,
+            max_depth: Some(8),
+            include_hidden: true,
+        })?,
+    };
+    // Inside a directory only the final segment is matched: the directory is
+    // already the scope, and matching the whole path would let the parent's
+    // own name answer for every child.
+    let needle = directory_query
+        .map(|(_, fragment)| fragment)
+        .unwrap_or(query)
+        .to_lowercase();
     let limit = request.limit.unwrap_or(50) as usize;
     let remaining = limit.saturating_sub(response.entries.len());
     if remaining == 0 {
@@ -294,10 +322,7 @@ fn append_file_reference_commands(
         entries
             .into_iter()
             .filter_map(|entry: FileTreeEntry| {
-                let matches = query_lower.is_empty()
-                    || entry.path.to_lowercase().contains(&query_lower)
-                    || entry.name.to_lowercase().contains(&query_lower);
-                matches.then(|| AgentCommandEntry {
+                composer_file_matches_query(&entry, &needle, scoped).then(|| AgentCommandEntry {
                     id: format!("reference:file:{}", entry.path),
                     trigger: AgentCommandTrigger::Mention,
                     source_kind: AgentCommandSourceKind::Reference,
@@ -319,6 +344,39 @@ fn append_file_reference_commands(
     );
 
     Ok(())
+}
+
+/// The directory a workspace-file query has descended into, and the fragment
+/// still being typed inside it.
+///
+/// An `@` reference is a workspace-relative path, so a `/` in the query is what
+/// tells the popup the reader is naming a directory rather than a top-level
+/// entry. The split is at the last separator: everything before it scopes the
+/// listing, everything after it filters the children.
+fn composer_directory_query(query: &str) -> Option<(&str, &str)> {
+    let separator = query.rfind('/')?;
+    Some((&query[..separator], &query[separator + 1..]))
+}
+
+/// Whether one tree entry answers a workspace-file query.
+///
+/// `needle` is already lowercased. A scoped listing only has to match the
+/// fragment after the last separator against the entry's own name: the
+/// directory is already the scope, and the parent's name must not answer for
+/// every child. The workspace listing matches the whole path, so naming a
+/// directory anywhere in it still finds its files.
+fn composer_file_matches_query(
+    entry: &FileTreeEntry,
+    needle: &str,
+    inside_directory: bool,
+) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    if inside_directory {
+        return entry.name.to_lowercase().contains(needle);
+    }
+    entry.path.to_lowercase().contains(needle) || entry.name.to_lowercase().contains(needle)
 }
 
 fn append_workspace_skill_commands(
@@ -463,9 +521,10 @@ impl vibex_remote::RemoteAgentCommandDiscoverySource for ComposerCommandSource {
 mod tests {
     use super::*;
     use vibex_core::{
-        AgentAuthContextId, AgentId, ProviderProfileId, RuntimeOptionAvailability,
-        SessionConfigValue, SessionRuntimeOption, SessionRuntimeSelection,
+        AgentAuthContextId, AgentId, FileEntryKind, ProviderProfileId, RuntimeOptionAvailability,
+        SessionConfigValue, SessionRuntimeOption, SessionRuntimeSelection, WorkspaceId,
     };
+    use vibex_db::{WorkspaceRepository, apply_migrations, open_database};
 
     fn option(profile: &str, model: &str) -> SessionRuntimeOption {
         agent_option("codex", "Codex", profile, model)
@@ -598,5 +657,102 @@ mod tests {
         assert_eq!(commands.len(), 3);
         let labels: Vec<_> = commands.iter().map(|entry| entry.label.clone()).collect();
         assert_eq!(labels, vec!["@Codex", "@Claude", "@OpenCode"]);
+    }
+
+    #[test]
+    fn a_trailing_path_segment_scopes_the_file_list_to_that_directory() {
+        assert_eq!(
+            composer_directory_query("flex-work-ai/docs/"),
+            Some(("flex-work-ai/docs", ""))
+        );
+        assert_eq!(
+            composer_directory_query("flex-work-ai/docs/rea"),
+            Some(("flex-work-ai/docs", "rea"))
+        );
+        assert_eq!(
+            composer_directory_query("flex-work-ai/"),
+            Some(("flex-work-ai", ""))
+        );
+        // A query still naming a top-level entry searches the whole tree.
+        assert_eq!(composer_directory_query("flex-work-ai"), None);
+        assert_eq!(composer_directory_query(""), None);
+        // A leading separator names the workspace root rather than escaping it.
+        assert_eq!(composer_directory_query("/"), Some(("", "")));
+    }
+
+    #[test]
+    fn a_scoped_file_list_matches_the_child_name_not_the_parent_path() {
+        let entry = FileTreeEntry {
+            workspace_id: WorkspaceId::new(),
+            path: "flex-work-ai/docs/file.md".into(),
+            name: "file.md".into(),
+            parent_path: Some("flex-work-ai/docs".into()),
+            kind: FileEntryKind::File,
+            size_bytes: None,
+            modified_at_ms: None,
+            hidden: false,
+            ignored: false,
+        };
+        assert!(composer_file_matches_query(&entry, "", true));
+        assert!(composer_file_matches_query(&entry, "file", true));
+        // The directory's own name is the scope, not a needle: `docs/` must
+        // list every child instead of letting "docs" match all of them.
+        assert!(!composer_file_matches_query(&entry, "docs", true));
+        // The workspace listing still matches the path a reader typed.
+        assert!(composer_file_matches_query(
+            &entry,
+            "flex-work-ai/docs/",
+            false
+        ));
+    }
+
+    #[test]
+    fn a_typed_directory_lists_its_children_even_when_the_workspace_scan_is_full() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("vibex.db");
+        let workspace_root = directory.path().join("workspace");
+        // A large first directory that consumes the bounded root scan before
+        // it can reach the directory the reader names.
+        let large = workspace_root.join("aaa-large");
+        std::fs::create_dir_all(&large).unwrap();
+        let docs = workspace_root.join("flex-work-ai").join("docs");
+        std::fs::create_dir_all(&docs).unwrap();
+        std::fs::write(docs.join("readme.md"), "# docs\n").unwrap();
+        for index in 0..2100 {
+            std::fs::write(large.join(format!("entry-{index:04}.txt")), "nested\n").unwrap();
+        }
+        let mut connection = open_database(&database_path).unwrap();
+        apply_migrations(&mut connection).unwrap();
+        let (_, workspace) = WorkspaceRepository::ensure(
+            &connection,
+            &workspace_root,
+            vibex_core::WorkspaceMode::CurrentCheckout,
+        )
+        .unwrap();
+        let files = FileHandle {
+            db_path: database_path.clone(),
+        };
+        let request = AgentCommandDiscoverRequest {
+            agent_id: None,
+            provider_profile_id: None,
+            session_id: None,
+            workspace_id: Some(workspace.id),
+            trigger: Some(AgentCommandTrigger::Mention),
+            query: Some("flex-work-ai/docs/".into()),
+            limit: Some(50),
+        };
+        let mut response = AgentCommandDiscoverResponse {
+            entries: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+
+        append_file_reference_commands(&files, &request, &mut response).unwrap();
+
+        let paths = response
+            .entries
+            .iter()
+            .filter_map(|entry| entry.reference_path.as_deref())
+            .collect::<Vec<_>>();
+        assert_eq!(paths, vec!["flex-work-ai/docs/readme.md"]);
     }
 }
