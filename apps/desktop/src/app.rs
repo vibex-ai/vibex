@@ -336,6 +336,12 @@ struct SettingsOperationNotification;
 /// screen instead of stacking a queue of them.
 struct RuntimeRegistryNotification;
 
+/// Replace-by-id marker for a failed runtime action's hint.
+///
+/// One id for every failure reported by the runtime manager keeps the newest
+/// reason on screen instead of stacking a queue of them.
+struct RuntimeNoteErrorNotification;
+
 /// Replace-by-id marker for the new-session dialog's failure hint.
 ///
 /// One id for every reason the dialog reports keeps the newest one on screen
@@ -3164,6 +3170,37 @@ impl VibexWorkbench {
                     locale::localize_error_message(&error),
                 )
                 .id::<NewSessionErrorNotification>()
+                .autohide(true),
+                cx,
+            );
+        });
+    }
+
+    /// Hands a failed runtime action to the window's hint layer.
+    ///
+    /// The manager's own note line reports progress — connecting, restoring,
+    /// upgrading — and stays inside the panel. A failure is the result of the
+    /// action that raised it, so it rides the same top-centered layer as the
+    /// workbench's other failures instead of sitting under the instance list in
+    /// danger red, where it was only visible while the manager happened to be
+    /// open. `window.defer` keeps the push out of the update that raised it.
+    fn present_runtime_note_error(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(error) = self.runtime_note_error.take() else {
+            return;
+        };
+        // The progress line described the action that just failed. Leaving
+        // "Connecting…" under the instance list after the failure would let a
+        // stale state outlive the result the hint now reports.
+        self.runtime_note = None;
+        window.defer(cx, move |window, cx| {
+            Theme::global_mut(cx).notification.placement = Anchor::TopCenter;
+            hint_layer::push(
+                window,
+                hint_notification(
+                    NotificationType::Error,
+                    locale::localize_ui_message(&error),
+                )
+                .id::<RuntimeNoteErrorNotification>()
                 .autohide(true),
                 cx,
             );
@@ -9480,7 +9517,18 @@ pub struct VibexWorkbench {
     shared_terminal: Option<TerminalWorkflowController>,
     shared_management: Option<ManagementWorkflowController>,
     runtime_status: RuntimeStatus,
+    /// Progress the runtime manager reports in place — connecting, restoring,
+    /// upgrading. It is not a failure channel: failures wait in
+    /// [`Self::runtime_note_error`] for the hint layer instead.
     runtime_note: Option<String>,
+    /// A failed runtime action, waiting for
+    /// [`Self::present_runtime_note_error`] to hand it to the hint layer.
+    ///
+    /// Kept apart from [`Self::runtime_note`] so the manager's note line stays
+    /// a progress line: an error belongs on the window's top-centered hint
+    /// layer, not in a strip under the instance list that only exists while
+    /// the manager is open.
+    runtime_note_error: Option<String>,
     /// A failed write of `remote-runtimes.json`, waiting for
     /// [`Self::present_runtime_registry_error`] to hand it to the hint layer.
     /// Kept apart from [`Self::runtime_note`] because it is a failure rather
@@ -11443,6 +11491,7 @@ impl VibexWorkbench {
             shared_management: None,
             runtime_status: RuntimeStatus::Starting,
             runtime_note: None,
+            runtime_note_error: None,
             runtime_registry_error: None,
             ui_state,
             ui_writer: None,
@@ -12458,6 +12507,7 @@ impl VibexWorkbench {
         };
         self.runtime_status = RuntimeStatus::Starting;
         self.runtime_note = None;
+        self.runtime_note_error = None;
         self.detach_local_runtime(cx);
         let pending_shutdown = self.runtime_shutdown_done.take();
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
@@ -14420,9 +14470,10 @@ impl VibexWorkbench {
                     this.runtime_rename_task = None;
                     match outcome {
                         Ok(Ok(name)) => this.local_runtime_name = Some(name),
-                        Ok(Err(error)) => this.runtime_note = Some(error.message),
+                        Ok(Err(error)) => this.runtime_note_error = Some(error.message),
                         Err(_) => {
-                            this.runtime_note = Some("The runtime rename task failed".to_string());
+                            this.runtime_note_error =
+                                Some("The runtime rename task failed".to_string());
                         }
                     }
                     cx.notify();
@@ -14463,9 +14514,10 @@ impl VibexWorkbench {
                                 }
                             }
                         }
-                        Ok(Err(error)) => this.runtime_note = Some(error.message),
+                        Ok(Err(error)) => this.runtime_note_error = Some(error.message),
                         Err(_) => {
-                            this.runtime_note = Some("The runtime rename task failed".to_string());
+                            this.runtime_note_error =
+                                Some("The runtime rename task failed".to_string());
                         }
                     }
                     cx.notify();
@@ -15748,7 +15800,7 @@ impl VibexWorkbench {
                                             this.runtime_connect_errors
                                                 .insert(active, message.clone());
                                         }
-                                        this.runtime_note = Some(message);
+                                        this.runtime_note_error = Some(message);
                                         cx.notify();
                                         Some(false)
                                     }
@@ -15972,7 +16024,7 @@ impl VibexWorkbench {
         cx: &mut Context<Self>,
     ) {
         let message = format!("{} — {}", error.code, error.message);
-        self.runtime_note = Some(message.clone());
+        self.runtime_note_error = Some(message.clone());
         if let Some(id) = self.runtime_switch_pending.clone() {
             self.runtime_connect_errors.insert(id, message);
         }
@@ -16449,9 +16501,10 @@ impl VibexWorkbench {
             cx,
         ));
 
-        // The switcher is now the only surface a connect or switch result can
-        // report into: pairing moved to settings, so a failed switch would
-        // otherwise leave its reason nowhere to land.
+        // Progress the manager reports in place — connecting, restoring,
+        // upgrading. A failed action never lands here: it is handed to the
+        // window's top hint layer by `present_runtime_note_error`, so the panel
+        // does not paint a danger strip that outlives the action.
         if let Some(note) = self.runtime_note.clone() {
             rows.push(
                 div()
@@ -16459,7 +16512,7 @@ impl VibexWorkbench {
                     .px_2()
                     .pt_2()
                     .text_xs()
-                    .text_color(cx.theme().danger)
+                    .text_color(cx.theme().muted_foreground)
                     .whitespace_normal()
                     .child(note)
                     .into_any_element(),
@@ -17977,13 +18030,13 @@ impl VibexWorkbench {
                             this.load_agent_runtime_catalog(cx);
                         }
                         Ok(Err(error)) => {
-                            this.runtime_note = Some(format!(
+                            this.runtime_note_error = Some(format!(
                                 "Configured runtime catalog unavailable ({}: {})",
                                 error.code, error.message
                             ));
                         }
                         Err(error) => {
-                            this.runtime_note =
+                            this.runtime_note_error =
                                 Some(format!("configured runtime catalog task failed: {error}"));
                         }
                     }
@@ -18429,13 +18482,13 @@ impl VibexWorkbench {
                             }
                         }
                         Ok(Err(error)) => {
-                            this.runtime_note = Some(format!(
+                            this.runtime_note_error = Some(format!(
                                 "Workspace context refresh failed: {}: {}",
                                 error.code, error.message
                             ));
                         }
                         Err(error) => {
-                            this.runtime_note =
+                            this.runtime_note_error =
                                 Some(format!("Workspace context task failed: {error}"));
                         }
                     }
@@ -18479,13 +18532,13 @@ impl VibexWorkbench {
                             }
                         }
                         Ok(Err(error)) => {
-                            this.runtime_note = Some(format!(
+                            this.runtime_note_error = Some(format!(
                                 "Runtime catalog unavailable ({}: {})",
                                 error.code, error.message
                             ));
                         }
                         Err(error) => {
-                            this.runtime_note =
+                            this.runtime_note_error =
                                 Some(format!("Runtime catalog task failed: {error}"));
                         }
                     }
@@ -22868,7 +22921,7 @@ impl VibexWorkbench {
             .find(|(_, workspace)| workspace.id == workspace_id)
             .map(|(_, workspace)| workspace.clone())
         else {
-            self.runtime_note = Some("worktree_target_workspace_not_found".to_string());
+            self.runtime_note_error = Some("worktree_target_workspace_not_found".to_string());
             cx.notify();
             return;
         };
@@ -27551,7 +27604,7 @@ impl VibexWorkbench {
                     let dirty = match outcome {
                         Ok(terminals) => this.sync_terminal_sessions(terminals, cx),
                         Err(error) => {
-                            this.runtime_note =
+                            this.runtime_note_error =
                                 Some(format!("session terminal task failed: {error}"));
                             true
                         }
@@ -39191,7 +39244,7 @@ impl VibexWorkbench {
                         if let Some(error) = initial_message_error
                             && let Some(note) = initial_message_failure_note(&error)
                         {
-                            this.runtime_note = Some(note);
+                            this.runtime_note_error = Some(note);
                         }
                         this.reconcile_sidebar_state();
                         this.publish_sidebar_invalidation();
@@ -39222,7 +39275,7 @@ impl VibexWorkbench {
                     }
                     Ok(Err(error)) => {
                         if created_session_id.is_some() {
-                            this.runtime_note = Some(format!(
+                            this.runtime_note_error = Some(format!(
                                 "Session created; runtime initialization failed: {}",
                                 error
                             ));
@@ -39244,7 +39297,7 @@ impl VibexWorkbench {
                     }
                     Err(error) => {
                         if created_session_id.is_some() {
-                            this.runtime_note = Some(format!(
+                            this.runtime_note_error = Some(format!(
                                 "Session created; runtime initialization failed: {}",
                                 error
                             ));
@@ -92099,6 +92152,7 @@ impl Render for VibexWorkbench {
         self.present_persistence_note(window, cx);
         self.present_settings_operation_notice(window, cx);
         self.present_runtime_registry_error(window, cx);
+        self.present_runtime_note_error(window, cx);
         self.present_new_session_error(window, cx);
         if self.initial_new_session_setup_pending {
             self.initial_new_session_setup_pending = false;
@@ -108731,6 +108785,61 @@ mod tests {
         assert!(!render.contains(".when_some(self.runtime_registry_error.clone()"));
     }
 
+    /// A failed runtime action is a result of the action that triggered it, so
+    /// it is announced by the notification layer instead of by the manager's
+    /// note line under the instance list.
+    #[test]
+    fn runtime_note_failures_use_top_light_notifications_instead_of_a_panel_note() {
+        let source = include_str!("app.rs");
+        let presenter = source
+            .split_once("    fn present_runtime_note_error(")
+            .and_then(|(_, tail)| tail.split_once("\n    }\n}"))
+            .map(|(body, _)| body)
+            .expect("runtime note presenter should remain inspectable");
+        assert!(presenter.contains("self.runtime_note_error.take()"));
+        assert!(
+            presenter.contains("self.runtime_note = None;"),
+            "the failed action's progress line must not outlive its result"
+        );
+        assert!(presenter.contains("hint_notification("));
+        assert!(presenter.contains("NotificationType::Error"));
+        assert!(presenter.contains("locale::localize_ui_message(&error)"));
+        assert!(presenter.contains(".id::<RuntimeNoteErrorNotification>()"));
+        assert!(presenter.contains(".autohide(true)"));
+        assert!(presenter.contains("hint_layer::push("));
+        assert!(presenter.contains("Anchor::TopCenter"));
+
+        let render = source
+            .split_once("impl Render for VibexWorkbench")
+            .and_then(|(_, tail)| tail.split_once("\n}\n\npub fn bind_foundation_keys"))
+            .map(|(body, _)| body)
+            .expect("workbench renderer should remain inspectable");
+        assert!(render.contains("self.present_runtime_note_error(window, cx);"));
+
+        let list = source
+            .split_once("    fn render_runtime_manager_list(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_runtime_row("))
+            .map(|(body, _)| body)
+            .expect("runtime manager list should remain inspectable");
+        assert!(list.contains("self.runtime_note.clone()"));
+        assert!(
+            !list.contains("self.runtime_note_error"),
+            "a failure must not be painted under the instance list"
+        );
+        assert!(
+            !list.contains(".text_color(cx.theme().danger)"),
+            "the manager's note line is progress copy, not an error strip"
+        );
+
+        let connect_failure = source
+            .split_once("    fn finish_runtime_connect_failure(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// Attaches the workbench"))
+            .map(|(body, _)| body)
+            .expect("runtime connect failure handling should remain inspectable");
+        assert!(connect_failure.contains("self.runtime_note_error = Some(message.clone());"));
+        assert!(!connect_failure.contains("self.runtime_note = Some(message"));
+    }
+
     /// A rejected create-session attempt is answered by the notification layer,
     /// above the dialog, instead of by a danger box inside the dialog body.
     #[test]
@@ -109909,7 +110018,11 @@ mod tests {
             .and_then(|(_, tail)| tail.split_once("this.reconcile_sidebar_state();"))
             .map(|(body, _)| body)
             .expect("initial-message failure handling should remain inspectable");
-        assert!(initial_message_failure.contains("this.runtime_note"));
+        assert!(initial_message_failure.contains("this.runtime_note_error"));
+        assert!(
+            !initial_message_failure.contains("this.runtime_note ="),
+            "an initial-turn failure is a result, not manager progress"
+        );
         assert!(
             !initial_message_failure.contains("discard_optimistic_user_message"),
             "a created session must keep the captured user message visible when initialization fails"
