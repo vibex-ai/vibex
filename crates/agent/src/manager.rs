@@ -1420,7 +1420,7 @@ impl AgentManager {
         if request.title.is_some() {
             SessionRepository::lock_title(&conn, &session.id)?;
         }
-        let environment = self.terminal_session_env(&request, &session)?;
+        let mut environment = self.terminal_session_env(&request, &session)?;
         // A terminal session hands the argv straight to the CLI, so the model
         // has to be renamed here rather than at an ACP boundary. Resolved after
         // the environment because projecting the Profile is what materializes
@@ -1429,6 +1429,16 @@ impl AgentManager {
             self.terminal_model_id_projections(request.provider_profile_id.as_ref())?;
         vibex_core::native_cli_project_model_arguments(&mut argv, &projections);
         vibex_core::native_cli_project_model_arguments(&mut launch_argv, &projections);
+        // OpenCode's TUI has no `--model`: it reads the model from the config
+        // document the Provider projection puts in its environment. The
+        // recorded argv keeps the flag so a restart still knows the choice;
+        // only the launch copy moves it into the config.
+        crate::terminal_settings::move_opencode_model_to_config(
+            &mut launch_argv,
+            &mut environment.env,
+            &projections,
+            &session.agent_id,
+        );
         // Claude Code applies the reader's `~/.claude/settings.json` after the
         // process environment, so a Profile's endpoint and credential only win
         // on the command-line settings tier. The projection file is restated
@@ -3252,7 +3262,7 @@ impl AgentManager {
         // restarted Agent reaches the same provider. A Claude session also gets
         // its settings file rewritten, because the projection it names can have
         // changed since the first launch.
-        let environment = match record.provider_profile_id.as_ref() {
+        let mut environment = match record.provider_profile_id.as_ref() {
             Some(profile_id) => self.terminal_session_env_overlays(profile_id, &session)?,
             None => crate::session_terminal::TerminalSessionEnvironment::default(),
         };
@@ -3285,6 +3295,12 @@ impl AgentManager {
                 .as_deref()
                 .filter(|id| !id.trim().is_empty()),
         ));
+        crate::terminal_settings::move_opencode_model_to_config(
+            &mut argv,
+            &mut environment.env,
+            &projections,
+            &session.agent_id,
+        );
         let spec = vibex_core::TerminalSessionLaunchSpec {
             agent_id: session.agent_id.clone(),
             workspace_id: record.workspace_id.clone(),
