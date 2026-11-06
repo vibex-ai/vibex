@@ -8,17 +8,22 @@
 //! authority, so the same assembly serves the native backend and a paired
 //! client instead of each side re-deriving it.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use vibex_config_switch::skills::LocalSkillScanRequest;
 use vibex_core::{
     AgentCommandDiscoverRequest, AgentCommandDiscoverResponse, AgentCommandDiscovery,
     AgentCommandEntry, AgentCommandExecutionBehavior, AgentCommandSelectionBehavior,
-    AgentCommandSourceKind, AgentCommandTrigger, AgentId, FileTreeEntry, FileTreeRequest,
-    ProviderBindingMetadata, ProviderKind, VibexResult, VibexUseRef,
+    AgentCommandSourceKind, AgentCommandTrigger, AgentId, AgentModelSourceRef, FileTreeEntry,
+    FileTreeRequest, ProviderBindingMetadata, ProviderDefaultScopeKind, ProviderKind,
+    ProviderProfileDefaultScope, ProviderProfileId, RuntimeOptionAvailability,
+    SessionRuntimeOption, SessionRuntimeSelection, VibexResult, VibexUseRef, WorkspaceId,
 };
+use vibex_db::{AgentModelSourceDefaultRepository, ProviderProfileRepository, open_database};
+use vibex_desktop_model::runtime_selection_use_count;
 
+use crate::catalog::RuntimeComposerPreferences;
 use crate::runtime_option_ref;
 use crate::vibex_use::VibexUseService;
 use crate::{AgentHandle, FileHandle, ProviderHandle};
@@ -52,7 +57,7 @@ pub async fn discover_composer_commands(
     // its second tab. They are bounded separately, so neither one's size can
     // decide what the other offers.
     let delegation_entries = match vibex_use {
-        Some(vibex_use) => collaborator_reference_commands(vibex_use, &request).await?,
+        Some(vibex_use) => collaborator_reference_commands(vibex_use, files, &request).await?,
         None => Vec::new(),
     };
     append_file_reference_commands(files, &request, &mut response)?;
@@ -86,6 +91,7 @@ fn mention_references_are_offered(request: &AgentCommandDiscoverRequest) -> bool
 /// anything by itself.
 async fn collaborator_reference_commands(
     vibex_use: &Arc<VibexUseService>,
+    files: &FileHandle,
     request: &AgentCommandDiscoverRequest,
 ) -> VibexResult<Vec<AgentCommandEntry>> {
     if !mention_references_are_offered(request) {
@@ -98,8 +104,11 @@ async fn collaborator_reference_commands(
         .map(str::trim)
         .unwrap_or("")
         .to_lowercase();
-    let catalog = vibex_use.runtime_option_catalog().list().await?;
-    let mut entries = runtime_reference_commands(&catalog.options, request);
+    let catalog_service = vibex_use.runtime_option_catalog();
+    let catalog = catalog_service.list().await?;
+    let preferences = catalog_service.composer_preferences();
+    let selection = DelegationSelection::load(files, &catalog, request, preferences);
+    let mut entries = runtime_reference_commands(&catalog.options, request, &selection);
     // An Agent's own configurations usually fill the tab, and the session
     // lookup is a database read of its own: only reach for it when the list
     // still has room.
@@ -143,100 +152,336 @@ async fn collaborator_reference_commands(
     Ok(entries)
 }
 
-/// The Agent references and direct delegation actions of one catalogue.
+/// The evidence behind the one configuration shown for each Agent.
 ///
-/// Each available account/model combination is independently selectable, so the
-/// entry pair it produces is bounded by the request's own limit here rather
-/// than by whatever the caller has already listed.
+/// The delegation tab answers "who can take this work", not "which of this
+/// Agent's configurations can take it": one Agent once. Which configuration
+/// that row carries is decided here, from the Agent's default source, the
+/// models the reader has run in it, and the explicit choice the row's edit
+/// button writes down.
+#[derive(Debug, Default)]
+struct DelegationSelection {
+    default_sources: BTreeMap<AgentId, AgentModelSourceRef>,
+    default_models: BTreeMap<ProviderProfileId, String>,
+    preferences: RuntimeComposerPreferences,
+}
+
+impl DelegationSelection {
+    fn load(
+        files: &FileHandle,
+        catalog: &vibex_core::SessionRuntimeOptionCatalog,
+        request: &AgentCommandDiscoverRequest,
+        preferences: RuntimeComposerPreferences,
+    ) -> Self {
+        let scope = delegation_default_scope(request.workspace_id.as_ref());
+        let mut default_sources = BTreeMap::new();
+        let mut default_models = BTreeMap::new();
+        // A default source only decides between multiple configurations. An
+        // Agent with a single option has nothing to resolve, so the per-Agent
+        // fallback queries are skipped for it. Two models of one Provider still
+        // need the profile's own default model when no usage has accumulated.
+        let mut option_count_by_agent = BTreeMap::<AgentId, usize>::new();
+        for option in &catalog.options {
+            *option_count_by_agent
+                .entry(option.selection.agent_id.clone())
+                .or_default() += 1;
+        }
+        let agents = option_count_by_agent
+            .into_iter()
+            .filter(|(_, count)| *count > 1)
+            .map(|(agent_id, _)| agent_id)
+            .collect::<Vec<_>>();
+        let Ok(connection) = open_database(files.database_path()) else {
+            return Self {
+                default_sources,
+                default_models,
+                preferences,
+            };
+        };
+        for agent_id in agents {
+            if let Ok(default) = AgentModelSourceDefaultRepository::resolve(
+                &connection,
+                scope.clone(),
+                agent_id.clone(),
+            ) && let Some(source) = default.source
+            {
+                default_sources.insert(agent_id, source);
+            }
+        }
+        if let Ok(profiles) = ProviderProfileRepository::list_all(&connection) {
+            for profile in profiles {
+                if let Some(model) = profile
+                    .default_model
+                    .filter(|model| !model.trim().is_empty())
+                {
+                    default_models.insert(profile.id, model);
+                }
+            }
+        }
+        Self {
+            default_sources,
+            default_models,
+            preferences,
+        }
+    }
+}
+
+fn delegation_default_scope(workspace_id: Option<&WorkspaceId>) -> ProviderProfileDefaultScope {
+    match workspace_id {
+        Some(workspace_id) => ProviderProfileDefaultScope {
+            kind: ProviderDefaultScopeKind::Workspace,
+            project_id: None,
+            workspace_id: Some(workspace_id.clone()),
+        },
+        None => ProviderProfileDefaultScope {
+            kind: ProviderDefaultScopeKind::Global,
+            project_id: None,
+            workspace_id: None,
+        },
+    }
+}
+
+/// The Agent references of one catalogue, one per Agent.
+///
+/// Each row carries the configuration that Agent should run as: its explicit
+/// delegation choice if the reader made one, otherwise the commonly used model
+/// of its default source, otherwise the provider/model pair the reader used
+/// last. The old list dealt every configuration, which showed the same Agent
+/// several times and made the reader choose a configuration when all they
+/// wanted was a collaborator.
 fn runtime_reference_commands(
-    options: &[vibex_core::SessionRuntimeOption],
+    options: &[SessionRuntimeOption],
     request: &AgentCommandDiscoverRequest,
+    selection: &DelegationSelection,
 ) -> Vec<AgentCommandEntry> {
     let limit = request.limit.unwrap_or(50) as usize;
-    let mut remaining = limit;
     let query = request
         .query
         .as_deref()
         .map(str::trim)
         .unwrap_or("")
         .to_lowercase();
-    let mut entries: Vec<AgentCommandEntry> = Vec::with_capacity(limit);
-    // Availability is checked before deduplication, so an unavailable default
-    // cannot hide another usable configuration of the same Agent.
-    let mut seen_selections = HashSet::new();
-    // One Agent owns as many configurations as it has accounts, models and
-    // modes, so dealt in catalogue order the first Agent fills the list with
-    // itself. The entries are dealt one configuration per Agent per round
-    // instead: every collaborator reaches the list before any Agent offers a
-    // second configuration, and a query still narrows its way to whichever
-    // configuration the reader named.
-    let mut configurations_by_agent = Vec::<Vec<&vibex_core::SessionRuntimeOption>>::new();
-    let mut agent_slots = HashMap::<AgentId, usize>::new();
+    let mut agent_order = Vec::new();
+    let mut available_by_agent = HashMap::<AgentId, Vec<&SessionRuntimeOption>>::new();
     for option in options {
-        let slot = *agent_slots
-            .entry(option.selection.agent_id.clone())
-            .or_insert_with(|| {
-                configurations_by_agent.push(Vec::new());
-                configurations_by_agent.len() - 1
-            });
-        configurations_by_agent[slot].push(option);
-    }
-    let rounds = configurations_by_agent
-        .iter()
-        .map(Vec::len)
-        .max()
-        .unwrap_or_default();
-    'rounds: for round in 0..rounds {
-        for agent_options in &configurations_by_agent {
-            let Some(option) = agent_options.get(round) else {
-                continue;
-            };
-            if remaining == 0 {
-                break 'rounds;
-            }
-            let agent_id = option.selection.agent_id.clone();
-            if option.availability != vibex_core::RuntimeOptionAvailability::Available {
-                // An Agent that cannot start right now is not offered as if it
-                // could; `vibex_discover` reports why.
-                continue;
-            }
-            let selection_ref = runtime_option_ref(option);
-            if !seen_selections.insert(selection_ref.clone()) {
-                continue;
-            }
-            let entry = AgentCommandEntry {
-                id: format!("reference:agent:{}:{selection_ref}", agent_id.as_str()),
-                trigger: AgentCommandTrigger::Mention,
-                source_kind: AgentCommandSourceKind::Reference,
-                label: format!("@{}", option.agent_label),
-                description: Some(runtime_reference_description(option)),
-                insertion_text: format!("@{} ", option.agent_label),
-                command_name: None,
-                provider_kind: Some(ProviderKind::Acp),
-                prompt_id: None,
-                skill_id: None,
-                reference_path: None,
-                selection_behavior: AgentCommandSelectionBehavior::Insert,
-                execution_behavior: AgentCommandExecutionBehavior::None,
-                destructive: false,
-                metadata: vec![
-                    ProviderBindingMetadata {
-                        key: COMPOSER_AGENT_REFERENCE_KEY.to_string(),
-                        value: agent_id.as_str().to_string(),
-                    },
-                    ProviderBindingMetadata {
-                        key: COMPOSER_SELECTION_REFERENCE_KEY.to_string(),
-                        value: selection_ref.clone(),
-                    },
-                ],
-            };
-            if query.is_empty() || command_entry_matches_query(&entry, &query) {
-                entries.push(entry);
-                remaining -= 1;
-            }
+        if option.availability != RuntimeOptionAvailability::Available {
+            // An Agent that cannot start right now is not offered as if it
+            // could; `vibex_discover` reports why.
+            continue;
         }
+        let agent_id = option.selection.agent_id.clone();
+        let slot = available_by_agent
+            .entry(agent_id.clone())
+            .or_insert_with(|| {
+                agent_order.push(agent_id);
+                Vec::new()
+            });
+        slot.push(option);
+    }
+
+    let mut entries = Vec::with_capacity(limit.min(agent_order.len()));
+    for agent_id in agent_order {
+        if entries.len() >= limit {
+            break;
+        }
+        let Some(available) = available_by_agent.get(&agent_id) else {
+            continue;
+        };
+        // The query narrows against the Agent's whole vocabulary, not only the
+        // configuration the row happens to carry: a reader who typed a model
+        // name still finds the collaborator that can run it.
+        let matches = query.is_empty()
+            || available.iter().any(|option| {
+                option.agent_label.to_lowercase().contains(&query)
+                    || runtime_reference_description(option)
+                        .to_lowercase()
+                        .contains(&query)
+            });
+        if !matches {
+            continue;
+        }
+        let Some(option) = preferred_delegation_option(available, &agent_id, selection) else {
+            continue;
+        };
+        let selection_ref = runtime_option_ref(option);
+        entries.push(AgentCommandEntry {
+            id: format!("reference:agent:{}:{selection_ref}", agent_id.as_str()),
+            trigger: AgentCommandTrigger::Mention,
+            source_kind: AgentCommandSourceKind::Reference,
+            label: format!("@{}", option.agent_label),
+            description: Some(runtime_reference_description(option)),
+            insertion_text: format!("@{} ", option.agent_label),
+            command_name: None,
+            provider_kind: Some(ProviderKind::Acp),
+            prompt_id: None,
+            skill_id: None,
+            reference_path: None,
+            selection_behavior: AgentCommandSelectionBehavior::Insert,
+            execution_behavior: AgentCommandExecutionBehavior::None,
+            destructive: false,
+            metadata: vec![
+                ProviderBindingMetadata {
+                    key: COMPOSER_AGENT_REFERENCE_KEY.to_string(),
+                    value: agent_id.as_str().to_string(),
+                },
+                ProviderBindingMetadata {
+                    key: COMPOSER_SELECTION_REFERENCE_KEY.to_string(),
+                    value: selection_ref,
+                },
+            ],
+        });
     }
     entries
+}
+
+/// Which of one Agent's available configurations the delegation row carries.
+fn preferred_delegation_option<'a>(
+    available: &[&'a SessionRuntimeOption],
+    agent_id: &AgentId,
+    selection: &DelegationSelection,
+) -> Option<&'a SessionRuntimeOption> {
+    let preferences = &selection.preferences;
+    if available.is_empty() {
+        return None;
+    }
+    // An explicit edit is the reader's answer, so it outranks every rule below
+    // even when the Agent has a default source.
+    if let Some(preferred) = preferences.delegation_by_agent.get(agent_id)
+        && let Some(option) = available
+            .iter()
+            .copied()
+            .find(|option| delegation_selection_matches(&option.selection, preferred))
+    {
+        return Some(option);
+    }
+
+    if let Some(source) = selection.default_sources.get(agent_id) {
+        let scoped = available
+            .iter()
+            .copied()
+            .filter(|option| runtime_auth_source_matches(&option.selection.auth_source, source))
+            .collect::<Vec<_>>();
+        if !scoped.is_empty() {
+            // "Commonly used" is the reader's own count, not a provider's
+            // ordering: the model they pick most often inside the default
+            // source is the one the row should carry.
+            if let Some(option) = most_used_delegation_option(&scoped, preferences) {
+                return Some(option);
+            }
+            // No usage yet: the last pair used inside that source, then the
+            // source's own default model, then catalogue order.
+            if let Some(preferred) = preferences.by_agent.get(agent_id)
+                && let Some(option) = scoped
+                    .iter()
+                    .copied()
+                    .find(|option| delegation_selection_matches(&option.selection, preferred))
+            {
+                return Some(option);
+            }
+            if let Some(profile_id) = source.provider_profile_id()
+                && let Some(model) = selection.default_models.get(profile_id)
+                && let Some(option) = scoped
+                    .iter()
+                    .copied()
+                    .find(|option| option.selection.model_id() == Some(model.as_str()))
+            {
+                return Some(option);
+            }
+            return scoped.first().copied();
+        }
+    }
+
+    // No default source: the Agent's own last used provider/model pair, then
+    // the tail of the model recency list, then the last applied selection.
+    if let Some(preferred) = preferences.by_agent.get(agent_id)
+        && let Some(option) = available
+            .iter()
+            .copied()
+            .find(|option| delegation_selection_matches(&option.selection, preferred))
+    {
+        return Some(option);
+    }
+    for preferred in preferences.by_model.iter().rev() {
+        if &preferred.agent_id != agent_id {
+            continue;
+        }
+        if let Some(option) = available
+            .iter()
+            .copied()
+            .find(|option| delegation_selection_matches(&option.selection, preferred))
+        {
+            return Some(option);
+        }
+    }
+    if let Some(preferred) = preferences.default_selection.as_ref()
+        && &preferred.agent_id == agent_id
+        && let Some(option) = available
+            .iter()
+            .copied()
+            .find(|option| delegation_selection_matches(&option.selection, preferred))
+    {
+        return Some(option);
+    }
+    available.first().copied()
+}
+
+/// The option with the highest use count, newest use breaking a tie.
+///
+/// `None` means none of the scoped models has been chosen yet; the caller has
+/// a provider default to fall back to.
+fn most_used_delegation_option<'a>(
+    options: &[&'a SessionRuntimeOption],
+    preferences: &RuntimeComposerPreferences,
+) -> Option<&'a SessionRuntimeOption> {
+    let recency = |selection: &SessionRuntimeSelection| {
+        preferences
+            .by_model
+            .iter()
+            .rposition(|remembered| delegation_selection_matches(remembered, selection))
+            .map(|index| index + 1)
+            .unwrap_or(0)
+    };
+    options
+        .iter()
+        .copied()
+        .map(|option| {
+            (
+                runtime_selection_use_count(&preferences.usage, &option.selection),
+                recency(&option.selection),
+                option,
+            )
+        })
+        .filter(|(count, _, _)| *count > 0)
+        .max_by_key(|(count, recency, _)| (*count, *recency))
+        .map(|(_, _, option)| option)
+}
+
+/// Whether two selections name the same catalogue entry.
+///
+/// Identity is Agent, authentication source and model: the mode and thinking
+/// depth are how that entry runs, and a reader who changed one did not move to
+/// a different provider/model pair.
+fn delegation_selection_matches(
+    left: &SessionRuntimeSelection,
+    right: &SessionRuntimeSelection,
+) -> bool {
+    left.agent_id == right.agent_id
+        && left.auth_source == right.auth_source
+        && left.model == right.model
+}
+
+fn runtime_auth_source_matches(
+    auth_source: &vibex_core::RuntimeAuthSource,
+    source: &AgentModelSourceRef,
+) -> bool {
+    match source {
+        AgentModelSourceRef::Provider(provider_profile_id) => {
+            auth_source.provider_profile_id() == Some(provider_profile_id)
+        }
+        AgentModelSourceRef::RouteGroup(model_route_id) => {
+            auth_source.model_route_id() == Some(model_route_id)
+        }
+    }
 }
 
 fn runtime_reference_description(option: &vibex_core::SessionRuntimeOption) -> String {
@@ -549,12 +794,8 @@ mod tests {
         }
     }
 
-    fn entries(
-        options: &[SessionRuntimeOption],
-        query: &str,
-        limit: u32,
-    ) -> Vec<AgentCommandEntry> {
-        let request = AgentCommandDiscoverRequest {
+    fn request(query: &str, limit: u32) -> AgentCommandDiscoverRequest {
+        AgentCommandDiscoverRequest {
             agent_id: None,
             provider_profile_id: None,
             session_id: None,
@@ -562,8 +803,19 @@ mod tests {
             trigger: Some(AgentCommandTrigger::Mention),
             query: Some(query.into()),
             limit: Some(limit),
-        };
-        runtime_reference_commands(options, &request)
+        }
+    }
+
+    fn entries(
+        options: &[SessionRuntimeOption],
+        query: &str,
+        limit: u32,
+    ) -> Vec<AgentCommandEntry> {
+        runtime_reference_commands(
+            options,
+            &request(query, limit),
+            &DelegationSelection::default(),
+        )
     }
 
     #[test]
@@ -577,7 +829,7 @@ mod tests {
     }
 
     #[test]
-    fn account_model_and_configuration_choices_remain_distinct() {
+    fn one_agent_is_offered_once_across_its_configurations() {
         let provider = option("provider_main", "model-a");
         let mut account = provider.clone();
         account.selection = SessionRuntimeSelection::agent_default(
@@ -601,20 +853,128 @@ mod tests {
             "",
             50,
         );
-        assert_eq!(commands.len(), 4);
+        // Four configurations of one Agent are one collaborator, not four
+        // rows: the list answers "who can take this work".
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].label, "@Codex");
+    }
+
+    #[test]
+    fn a_default_source_contributes_its_most_used_model() {
+        let agent_id = AgentId::parse("codex").unwrap();
+        let other = option("provider_other", "model-other");
+        let unused = option("provider_main", "model-unused");
+        let mut used = option("provider_main", "model-used");
+        used.selection.reasoning_effort = Some("high".into());
+        used.reasoning_efforts = vec![SessionConfigValue {
+            value: "high".into(),
+            label: Some("High reasoning".into()),
+        }];
+        let mut selection = DelegationSelection::default();
+        selection.default_sources.insert(
+            agent_id.clone(),
+            AgentModelSourceRef::provider(ProviderProfileId::parse("provider_main").unwrap()),
+        );
+        selection.preferences.usage.insert(
+            vibex_desktop_model::runtime_selection_usage_key(&used.selection),
+            4,
+        );
+        selection.preferences.usage.insert(
+            vibex_desktop_model::runtime_selection_usage_key(&unused.selection),
+            1,
+        );
+
+        let commands = runtime_reference_commands(
+            &[other, unused, used.clone()],
+            &request("", 50),
+            &selection,
+        );
+        assert_eq!(commands.len(), 1);
         assert_eq!(
-            commands
-                .iter()
-                .map(|entry| &entry.id)
-                .collect::<HashSet<_>>()
-                .len(),
-            4
+            commands[0].description.as_deref(),
+            Some("provider_main · model-used · High reasoning")
         );
-        assert!(
-            commands
-                .iter()
-                .any(|entry| entry.description.as_deref() == Some("Main account · Agent default"))
+    }
+
+    #[test]
+    fn without_usage_the_default_source_uses_its_profile_default_model() {
+        let agent_id = AgentId::parse("codex").unwrap();
+        let profile_id = ProviderProfileId::parse("provider_main").unwrap();
+        let first = option("provider_main", "model-a");
+        let default = option("provider_main", "model-b");
+        let mut selection = DelegationSelection::default();
+        selection
+            .default_sources
+            .insert(agent_id, AgentModelSourceRef::provider(profile_id.clone()));
+        selection
+            .default_models
+            .insert(profile_id, "model-b".to_string());
+
+        let commands = runtime_reference_commands(&[first, default], &request("", 50), &selection);
+        assert_eq!(commands.len(), 1);
+        assert_eq!(
+            commands[0].description.as_deref(),
+            Some("provider_main · model-b")
         );
+    }
+
+    #[test]
+    fn without_a_default_source_the_last_used_pair_is_offered() {
+        let agent_id = AgentId::parse("codex").unwrap();
+        let first = option("provider_a", "model-a");
+        let last = option("provider_b", "model-b");
+        let mut selection = DelegationSelection::default();
+        selection
+            .preferences
+            .by_agent
+            .insert(agent_id, last.selection.clone());
+
+        let commands = runtime_reference_commands(&[first, last], &request("", 50), &selection);
+        assert_eq!(commands.len(), 1);
+        assert_eq!(
+            commands[0].description.as_deref(),
+            Some("provider_b · model-b")
+        );
+    }
+
+    #[test]
+    fn an_explicit_delegation_choice_outranks_the_default_source() {
+        let agent_id = AgentId::parse("codex").unwrap();
+        let default = option("provider_main", "model-default");
+        let chosen = option("provider_other", "model-chosen");
+        let mut selection = DelegationSelection::default();
+        selection.default_sources.insert(
+            agent_id.clone(),
+            AgentModelSourceRef::provider(ProviderProfileId::parse("provider_main").unwrap()),
+        );
+        selection
+            .preferences
+            .delegation_by_agent
+            .insert(agent_id, chosen.selection.clone());
+
+        let commands = runtime_reference_commands(&[default, chosen], &request("", 50), &selection);
+        assert_eq!(commands.len(), 1);
+        assert_eq!(
+            commands[0].description.as_deref(),
+            Some("provider_other · model-chosen")
+        );
+    }
+
+    #[test]
+    fn a_query_matches_any_configuration_of_an_agent_but_offers_one_row() {
+        let selected = option("provider_main", "model-a");
+        let queried = option("provider_main", "model-z");
+        let commands = runtime_reference_commands(
+            &[selected, queried],
+            &request("model-z", 50),
+            &DelegationSelection::default(),
+        );
+        assert_eq!(commands.len(), 1);
+        assert_eq!(
+            commands[0].description.as_deref(),
+            Some("provider_main · model-a")
+        );
+        assert!(entries(&[option("provider_main", "model-a")], "absent", 50).is_empty());
     }
 
     #[test]
@@ -640,7 +1000,7 @@ mod tests {
     }
 
     #[test]
-    fn each_collaborator_is_offered_before_any_agent_offers_a_second_configuration() {
+    fn each_collaborator_occupies_one_row_regardless_of_its_configurations() {
         let commands = entries(
             &[
                 agent_option("codex", "Codex", "provider_main", "model-a"),
@@ -653,7 +1013,8 @@ mod tests {
             "",
             3,
         );
-        // The first round covers every Agent; the second is what the bound cuts.
+        // Two configurations each, still one row per collaborator, in the
+        // catalogue's own Agent order.
         assert_eq!(commands.len(), 3);
         let labels: Vec<_> = commands.iter().map(|entry| entry.label.clone()).collect();
         assert_eq!(labels, vec!["@Codex", "@Claude", "@OpenCode"]);

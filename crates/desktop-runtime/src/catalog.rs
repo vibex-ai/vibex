@@ -12,7 +12,7 @@ use vibex_agent_acp::{
 use vibex_config_switch::ProviderConfigService;
 use vibex_core::{
     AgentId, AgentListRequest, ProviderKind, ProviderProfile, ProviderProfileId,
-    ProviderProfileStatus, SessionRuntimeOptionCatalog, VibexError,
+    ProviderProfileStatus, SessionRuntimeOptionCatalog, SessionRuntimeSelection, VibexError,
 };
 use vibex_db::{
     AgentAuthModelCatalogRepository, AgentConfigRepository, AgentRuntimeOptionSnapshotRecord,
@@ -45,6 +45,20 @@ pub struct RuntimeOptionProbeResult {
     pub probed_agent_ids: Vec<AgentId>,
     pub failed_agent_ids: Vec<AgentId>,
     pub cached_agent_ids: Vec<AgentId>,
+}
+
+/// The runtime choices one Desktop home remembers, as the composer needs them.
+///
+/// See [`RuntimeOptionCatalogService::composer_preferences`].
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RuntimeComposerPreferences {
+    pub default_selection: Option<SessionRuntimeSelection>,
+    pub by_agent: BTreeMap<AgentId, SessionRuntimeSelection>,
+    /// Most recently chosen last.
+    pub by_model: Vec<SessionRuntimeSelection>,
+    pub usage: BTreeMap<String, u64>,
+    /// What the reader picked with the delegation row's edit button.
+    pub delegation_by_agent: BTreeMap<AgentId, SessionRuntimeSelection>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -121,6 +135,37 @@ impl RuntimeOptionCatalogService {
     pub fn with_ui_state_path(mut self, path: PathBuf) -> Self {
         self.ui_state_path = Some(path);
         self
+    }
+
+    /// The runtime choices the Desktop has remembered, as the composer needs
+    /// them.
+    ///
+    /// The delegation list asks the authority for one entry per Agent, so the
+    /// authority has to answer "which configuration of this Agent?" with the
+    /// same evidence the Desktop's own picker uses: the selection last applied
+    /// to each Agent, the model recency order, and how often each Agent +
+    /// source + model triple was chosen. The explicit delegation choice the
+    /// reader made with the row's edit button rides beside them and outranks
+    /// both.
+    ///
+    /// A runtime with no shell behind it — or a state file that is missing or
+    /// unreadable — remembers nothing, which leaves the default-source rule to
+    /// decide.
+    pub fn composer_preferences(&self) -> RuntimeComposerPreferences {
+        let Some(path) = self.ui_state_path.as_ref() else {
+            return RuntimeComposerPreferences::default();
+        };
+        let Ok(load) = UiStateStore::new(path).load_read_only() else {
+            return RuntimeComposerPreferences::default();
+        };
+        let composer = load.state.composer;
+        RuntimeComposerPreferences {
+            default_selection: composer.default_runtime_selection,
+            by_agent: composer.runtime_selections_by_agent,
+            by_model: composer.runtime_selections_by_model,
+            usage: composer.runtime_selection_usage,
+            delegation_by_agent: composer.delegation_runtime_selections_by_agent,
+        }
     }
 
     pub async fn list(&self) -> Result<SessionRuntimeOptionCatalog, VibexError> {

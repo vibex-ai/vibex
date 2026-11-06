@@ -90,7 +90,8 @@ pub use agent_install::{AgentInstallService, AgentNodeRuntimeOptions, AgentUvRun
 pub use auth_catalog::AgentAuthCatalogService;
 pub use catalog::{
     ProviderModelRuntimeOptionKey, ProviderModelRuntimeOptionProbeResult,
-    RuntimeOptionCatalogService, RuntimeOptionProbeResult, RuntimeOptionSnapshotSummary,
+    RuntimeComposerPreferences, RuntimeOptionCatalogService, RuntimeOptionProbeResult,
+    RuntimeOptionSnapshotSummary,
 };
 pub use composer::{
     COMPOSER_AGENT_REFERENCE_KEY, COMPOSER_DELEGATE_NOW_KEY, COMPOSER_SELECTION_REFERENCE_KEY,

@@ -120,38 +120,38 @@ use vibex_core::{
     AgentAuthContextStatus, AgentAuthContextVerifyRequest, AgentAuthMethodEffect,
     AgentAuthMethodKind, AgentAuthenticationOperationId, AgentBuiltinTool,
     AgentCommandDiscoverRequest, AgentCommandEntry, AgentCommandExecuteRequest,
-    AgentCommandExecutionBehavior, AgentCommandSourceKind, AgentCommandTrigger,
-    AgentGoalControlRequest, AgentId, AgentListRequest, AgentMessagePhase, AgentSession,
-    AgentSessionRuntimeSelectionState, AgentSessionSafety, AgentSessionState, AgentSnapshotEntry,
-    AgentTimelineDisplaySettings, AgentTimelineReasoningDisplayMode, AgentTokenUsage,
-    AgentToolPreferences, AttachRuntimeRequest, BrowserCaptureQuality, BrowserDataClearReport,
-    BrowserLoginImportReport, BrowserLoginImportRequest, BrowserProfileSource,
-    CancelAgentSessionRuntimeSwitchRequest, ComputerAvailability, ComputerUnavailableReason,
-    ContinueAgentTurnRequest, CreateAgentSessionRequest, DetachRuntimeRequest, ElicitationField,
-    ElicitationFieldKind, ElicitationRequest, ElicitationResolutionAction, FetchTimelineRequest,
-    FileEntryKind, FileOperationKind, FileOperationPatchFormat, ForkAgentSessionRequest,
-    GetMessageSubmissionRequest, GitProjectEligibilityState, GitProjectIneligibleReason,
-    GitStatusSummary, GitWorktreeAssistanceSessionRequest, GitWorktreeConflictKind,
-    GitWorktreeDiscardRequest, GitWorktreeOperationRecord, GitWorktreeOperationStatus, GoalAction,
-    GoalPhase, GroupPresentationCommand, GroupPresentationReply, MessageAttachment,
-    MessageSubmissionState, MessageSubmissionStatus, OpenWorkspaceRequest, PermissionResolution,
-    PermissionResponseKind, PlanStepStatus, PresentationActivationPolicy, PresentationState,
-    ProjectId, ProjectRecord, PromptId, PromptUsageRecordRequest, ProviderProfileSummary,
-    RcImportPayload, RenameAgentSessionRequest, ReplaceUserMessagePayload, RequestId,
-    ResolvePermissionRequest, RuntimeAuthSource, RuntimeAuthSourceAvailability,
-    RuntimeAuthSourceKind, RuntimeAuthSourceSummary, RuntimeClientId, RuntimeLeaseRole,
-    RuntimeModelSelection, RuntimeSelectionInteraction, SendAgentMessageRequest,
-    SessionRuntimeFeature, SessionRuntimeFeatureKind, SessionRuntimeOption,
-    SessionRuntimeOptionCatalog, SessionRuntimeSelection, SessionRuntimeSelectionStatus,
-    SessionToolChoice, SessionToolSettings, SessionTreeNode, SetDesiredAgentSessionRuntimeRequest,
-    SteerAgentMessageRequest, SteerMessageOutcome, TerminalCreateRequest, TerminalId,
-    TerminalSession, TerminalStatus, TerminalSwitchShellRequest, TimelineItem, TimelineItemId,
-    TimelineLiveEvent, TimelinePage, TimelinePayload, TimelineRedactionState, TimelineSource,
-    TimelineTurnStart, UserMessageDelivery, UserMessagePayload, VIBEX_USE_MAX_MENTIONS,
-    VibexSessionId, VibexUseMention, VibexUsePresentationCapability, VibexUseUnavailableReason,
-    WorkspaceMode, WorkspaceRecord, agent_session_turn_requires_continuation,
-    latest_timeline_turn_ended_normally, managed_worktree_name_slug, normalize_agent_session_title,
-    unix_timestamp_ms,
+    AgentCommandExecutionBehavior, AgentCommandSelectionBehavior, AgentCommandSourceKind,
+    AgentCommandTrigger, AgentGoalControlRequest, AgentId, AgentListRequest, AgentMessagePhase,
+    AgentSession, AgentSessionRuntimeSelectionState, AgentSessionSafety, AgentSessionState,
+    AgentSnapshotEntry, AgentTimelineDisplaySettings, AgentTimelineReasoningDisplayMode,
+    AgentTokenUsage, AgentToolPreferences, AttachRuntimeRequest, BrowserCaptureQuality,
+    BrowserDataClearReport, BrowserLoginImportReport, BrowserLoginImportRequest,
+    BrowserProfileSource, CancelAgentSessionRuntimeSwitchRequest, ComputerAvailability,
+    ComputerUnavailableReason, ContinueAgentTurnRequest, CreateAgentSessionRequest,
+    DetachRuntimeRequest, ElicitationField, ElicitationFieldKind, ElicitationRequest,
+    ElicitationResolutionAction, FetchTimelineRequest, FileEntryKind, FileOperationKind,
+    FileOperationPatchFormat, ForkAgentSessionRequest, GetMessageSubmissionRequest,
+    GitProjectEligibilityState, GitProjectIneligibleReason, GitStatusSummary,
+    GitWorktreeAssistanceSessionRequest, GitWorktreeConflictKind, GitWorktreeDiscardRequest,
+    GitWorktreeOperationRecord, GitWorktreeOperationStatus, GoalAction, GoalPhase,
+    GroupPresentationCommand, GroupPresentationReply, MessageAttachment, MessageSubmissionState,
+    MessageSubmissionStatus, OpenWorkspaceRequest, PermissionResolution, PermissionResponseKind,
+    PlanStepStatus, PresentationActivationPolicy, PresentationState, ProjectId, ProjectRecord,
+    PromptId, PromptUsageRecordRequest, ProviderProfileSummary, RcImportPayload,
+    RenameAgentSessionRequest, ReplaceUserMessagePayload, RequestId, ResolvePermissionRequest,
+    RuntimeAuthSource, RuntimeAuthSourceAvailability, RuntimeAuthSourceKind,
+    RuntimeAuthSourceSummary, RuntimeClientId, RuntimeLeaseRole, RuntimeModelSelection,
+    RuntimeSelectionInteraction, SendAgentMessageRequest, SessionRuntimeFeature,
+    SessionRuntimeFeatureKind, SessionRuntimeOption, SessionRuntimeOptionCatalog,
+    SessionRuntimeSelection, SessionRuntimeSelectionStatus, SessionToolChoice, SessionToolSettings,
+    SessionTreeNode, SetDesiredAgentSessionRuntimeRequest, SteerAgentMessageRequest,
+    SteerMessageOutcome, TerminalCreateRequest, TerminalId, TerminalSession, TerminalStatus,
+    TerminalSwitchShellRequest, TimelineItem, TimelineItemId, TimelineLiveEvent, TimelinePage,
+    TimelinePayload, TimelineRedactionState, TimelineSource, TimelineTurnStart,
+    UserMessageDelivery, UserMessagePayload, VIBEX_USE_MAX_MENTIONS, VibexSessionId,
+    VibexUseMention, VibexUsePresentationCapability, VibexUseUnavailableReason, WorkspaceMode,
+    WorkspaceRecord, agent_session_turn_requires_continuation, latest_timeline_turn_ended_normally,
+    managed_worktree_name_slug, normalize_agent_session_title, unix_timestamp_ms,
 };
 use vibex_desktop_model::{
     AgentOrderEntry, AgentOrdering, AgentPlanProjection, AgentSortStrategy, AppearanceUiState,
@@ -191,11 +191,11 @@ use vibex_desktop_model::{
 };
 use vibex_desktop_runtime::DriverState;
 use vibex_desktop_runtime::{
-    AuthoritativeRefetch, DesktopEvent, DesktopEventStream, DesktopRuntime, DesktopRuntimeConfig,
-    DesktopRuntimeFacade, DesktopRuntimeMode, LocalClientsSnapshot, PREVIEW_APP_ID,
-    ProviderConfigChangePhase, RC_APP_ID, STABLE_DESKTOP_APP_ID, SessionGroupPresentationRequest,
-    SidebarOrganizationRequest, StorageCleanupKind, StorageCleanupReport,
-    validate_external_open_url,
+    AuthoritativeRefetch, COMPOSER_AGENT_REFERENCE_KEY, COMPOSER_SELECTION_REFERENCE_KEY,
+    DesktopEvent, DesktopEventStream, DesktopRuntime, DesktopRuntimeConfig, DesktopRuntimeFacade,
+    DesktopRuntimeMode, LocalClientsSnapshot, PREVIEW_APP_ID, ProviderConfigChangePhase, RC_APP_ID,
+    STABLE_DESKTOP_APP_ID, SessionGroupPresentationRequest, SidebarOrganizationRequest,
+    StorageCleanupKind, StorageCleanupReport, runtime_option_ref, validate_external_open_url,
 };
 use vibex_ui::{
     AgentFileGitController, ElicitationFormDraft, GpuiThemeMode, ManagementWorkflowCapabilities,
@@ -965,6 +965,13 @@ const COMPOSER_SUGGESTION_MENU_TRIGGER_GAP: f32 = 6.0;
 /// Rows one discovery answer may offer. The menu draws a ten-row window and
 /// scrolls the rest, so a long collaborator catalogue stays reachable.
 const COMPOSER_SUGGESTION_MAX_ROWS: usize = 50;
+/// Metadata on a client-built row that chooses one Agent's delegation
+/// configuration.
+///
+/// These rows never travel to the authority: they are the second layer of the
+/// `@` popup, built from the catalogue this client already holds.
+const COMPOSER_DELEGATION_EDIT_AGENT_KEY: &str = "vibexUseDelegationEditAgent";
+const COMPOSER_DELEGATION_EDIT_SELECTION_KEY: &str = "vibexUseDelegationEditSelection";
 const NEW_SESSION_RUNTIME_MENU_MAX_HEIGHT: f32 = 360.0;
 const NEW_SESSION_RUNTIME_MENU_MIN_HEIGHT: f32 = 104.0;
 const RUNTIME_MENU_VIEWPORT_MARGIN: f32 = 12.0;
@@ -1481,6 +1488,176 @@ fn delegation_suggestions(entries: Vec<AgentCommandEntry>) -> Vec<AgentCommandEn
         .into_iter()
         .filter(|entry| !composer_suggestion_is_delegate_now(entry))
         .collect()
+}
+
+/// The Agent id one delegation row names.
+///
+/// A row from the authority carries the reference metadata; a client-built
+/// configuration row names its Agent under the edit key. The id shape is the
+/// last resort so an older paired authority still resolves.
+fn delegation_agent_id(entry: &AgentCommandEntry) -> Option<AgentId> {
+    entry
+        .metadata
+        .iter()
+        .find(|metadata| {
+            metadata.key == COMPOSER_AGENT_REFERENCE_KEY
+                || metadata.key == COMPOSER_DELEGATION_EDIT_AGENT_KEY
+        })
+        .and_then(|metadata| AgentId::parse(&metadata.value).ok())
+        .or_else(|| {
+            entry
+                .id
+                .strip_prefix("reference:agent:")
+                .or_else(|| entry.id.strip_prefix("delegate-now:"))
+                .and_then(|rest| rest.split(':').next())
+                .and_then(|id| AgentId::parse(id).ok())
+        })
+}
+
+/// The runtime option ref one delegation row carries.
+fn delegation_selection_ref(entry: &AgentCommandEntry) -> Option<&str> {
+    entry
+        .metadata
+        .iter()
+        .find(|metadata| {
+            metadata.key == COMPOSER_SELECTION_REFERENCE_KEY
+                || metadata.key == COMPOSER_DELEGATION_EDIT_SELECTION_KEY
+        })
+        .map(|metadata| metadata.value.as_str())
+}
+
+/// One row per available configuration of `agent_id`, for the delegation
+/// panel's edit layer.
+///
+/// The configuration the row already carries leads, then the models the reader
+/// uses most, then catalogue order. Each row is a client-only choice: its
+/// metadata names the Agent and the option to write down, not a mention to
+/// insert.
+fn delegation_runtime_edit_entries(
+    catalog: &SessionRuntimeOptionCatalog,
+    agent_id: &AgentId,
+    selected: Option<&SessionRuntimeSelection>,
+    usage: &BTreeMap<String, u64>,
+) -> Vec<AgentCommandEntry> {
+    let mut options = catalog
+        .options
+        .iter()
+        .filter(|option| {
+            &option.selection.agent_id == agent_id
+                && option.availability == vibex_core::RuntimeOptionAvailability::Available
+        })
+        .collect::<Vec<_>>();
+    options.sort_by_key(|option| {
+        let selected = selected.is_some_and(|selected| {
+            runtime_selection_identity_matches(&option.selection, selected)
+        });
+        let uses = runtime_selection_use_count(usage, &option.selection);
+        (!selected, std::cmp::Reverse(uses))
+    });
+    options
+        .into_iter()
+        .map(|option| AgentCommandEntry {
+            id: format!(
+                "delegation-edit:{}:{}",
+                agent_id.as_str(),
+                runtime_option_ref(option)
+            ),
+            trigger: AgentCommandTrigger::Mention,
+            source_kind: AgentCommandSourceKind::Reference,
+            label: format!("@{}", option.model_label),
+            description: Some(option.auth_source_label.clone()),
+            insertion_text: String::new(),
+            command_name: None,
+            provider_kind: Some(vibex_core::ProviderKind::Acp),
+            prompt_id: None,
+            skill_id: None,
+            reference_path: None,
+            selection_behavior: AgentCommandSelectionBehavior::Insert,
+            execution_behavior: AgentCommandExecutionBehavior::None,
+            destructive: false,
+            metadata: vec![
+                vibex_core::ProviderBindingMetadata {
+                    key: COMPOSER_DELEGATION_EDIT_AGENT_KEY.to_string(),
+                    value: agent_id.as_str().to_string(),
+                },
+                vibex_core::ProviderBindingMetadata {
+                    key: COMPOSER_DELEGATION_EDIT_SELECTION_KEY.to_string(),
+                    value: runtime_option_ref(option),
+                },
+            ],
+        })
+        .collect()
+}
+
+/// The Agent and selection a click on one configuration row chooses.
+fn delegation_edit_target(entry: &AgentCommandEntry) -> Option<(AgentId, String)> {
+    let agent_id = entry
+        .metadata
+        .iter()
+        .find(|metadata| metadata.key == COMPOSER_DELEGATION_EDIT_AGENT_KEY)
+        .and_then(|metadata| AgentId::parse(&metadata.value).ok())?;
+    let selection_ref = entry
+        .metadata
+        .iter()
+        .find(|metadata| metadata.key == COMPOSER_DELEGATION_EDIT_SELECTION_KEY)
+        .map(|metadata| metadata.value.clone())?;
+    Some((agent_id, selection_ref))
+}
+
+/// The description one runtime option shows beside its Agent.
+///
+/// Mirrors the authority's own projection so a row the client re-points reads
+/// the same as the row the next discovery sends.
+fn delegation_runtime_description(option: &SessionRuntimeOption) -> String {
+    let mut parts = vec![
+        option.auth_source_label.as_str(),
+        option.model_label.as_str(),
+    ];
+    for (selected, choices) in [
+        (option.selection.mode_id.as_deref(), &option.modes),
+        (
+            option.selection.reasoning_effort.as_deref(),
+            &option.reasoning_efforts,
+        ),
+    ] {
+        if let Some(selected) = selected {
+            parts.push(
+                choices
+                    .iter()
+                    .find(|choice| choice.value == selected)
+                    .and_then(|choice| choice.label.as_deref())
+                    .unwrap_or(selected),
+            );
+        }
+    }
+    parts.join(" · ")
+}
+
+/// Points one delegation entry at `option`.
+///
+/// Only the reference and the labels move: the row still names the same Agent,
+/// and the send path reads the same two metadata keys it read before.
+fn apply_delegation_selection_to_entry(
+    entry: &mut AgentCommandEntry,
+    agent_id: &AgentId,
+    option: &SessionRuntimeOption,
+) {
+    let selection_ref = runtime_option_ref(option);
+    entry.id = format!("reference:agent:{}:{selection_ref}", agent_id.as_str());
+    entry.label = format!("@{}", option.agent_label);
+    entry.description = Some(delegation_runtime_description(option));
+    entry.metadata.retain(|metadata| {
+        metadata.key != COMPOSER_AGENT_REFERENCE_KEY
+            && metadata.key != COMPOSER_SELECTION_REFERENCE_KEY
+    });
+    entry.metadata.push(vibex_core::ProviderBindingMetadata {
+        key: COMPOSER_AGENT_REFERENCE_KEY.to_string(),
+        value: agent_id.as_str().to_string(),
+    });
+    entry.metadata.push(vibex_core::ProviderBindingMetadata {
+        key: COMPOSER_SELECTION_REFERENCE_KEY.to_string(),
+        value: selection_ref,
+    });
 }
 
 /// One row of the composer's `/` popup, without the app-specific handlers the
@@ -5230,6 +5407,14 @@ pub struct SessionView {
     /// Collaborators and conversations offered by the `@` popup's delegation
     /// tab, fetched beside the workspace files of `suggestions`.
     delegation_suggestions: Vec<AgentCommandEntry>,
+    /// The Agent whose provider/model choice the delegation tab is editing.
+    ///
+    /// While this is set the popup shows that Agent's available
+    /// configurations instead of the collaborator list; choosing one writes
+    /// the row's explicit delegation selection.
+    delegation_edit_agent: Option<AgentId>,
+    /// The rows of the open delegation configuration picker.
+    delegation_edit_entries: Vec<AgentCommandEntry>,
     suggestion_tab: ComposerSuggestionTab,
     suggestion_selection: ComposerSuggestionSelection,
     /// Which half of the selected delegation row owns Enter.
@@ -5373,6 +5558,8 @@ impl SessionView {
             suggestions: Vec::new(),
             phrase_suggestions: Vec::new(),
             delegation_suggestions: Vec::new(),
+            delegation_edit_agent: None,
+            delegation_edit_entries: Vec::new(),
             suggestion_tab: ComposerSuggestionTab::default(),
             suggestion_selection: ComposerSuggestionSelection::default(),
             suggestion_delegation_action: ComposerDelegationAction::default(),
@@ -30378,6 +30565,8 @@ impl VibexWorkbench {
         self.suggestions.clear();
         self.phrase_suggestions.clear();
         self.delegation_suggestions.clear();
+        self.delegation_edit_agent = None;
+        self.delegation_edit_entries.clear();
         self.suggestion_tab = ComposerSuggestionTab::default();
         self.suggestion_selection.dismiss();
         self.suggestion_delegation_action = ComposerDelegationAction::default();
@@ -30548,6 +30737,17 @@ impl VibexWorkbench {
         };
         if self.suggestion_context.as_ref() == Some(&context) {
             return;
+        }
+        // Typing while a delegation configuration picker is open means the
+        // reader moved back to naming a file or collaborator: the picker is a
+        // layer of the old query, not a second mode of the composer.
+        if self
+            .suggestion_context
+            .as_ref()
+            .is_some_and(|current| current.request.query.as_deref() != request.query.as_deref())
+        {
+            self.delegation_edit_agent = None;
+            self.delegation_edit_entries.clear();
         }
         let preserve_rows = self
             .suggestion_context
@@ -30726,6 +30926,13 @@ impl VibexWorkbench {
 
     /// The rows the popup is showing right now.
     fn visible_suggestions(&self) -> &[AgentCommandEntry] {
+        // The delegation tab's second layer: one Agent's configurations, so
+        // the reader can choose the provider/model the row will carry.
+        if self.delegation_edit_agent.is_some()
+            && self.active_suggestion_tab() == ComposerSuggestionTab::Delegation
+        {
+            return &self.delegation_edit_entries;
+        }
         self.active_suggestion_tab().rows(
             &self.suggestions,
             &self.phrase_suggestions,
@@ -30770,6 +30977,8 @@ impl VibexWorkbench {
         if next == self.active_suggestion_tab() {
             return false;
         }
+        self.delegation_edit_agent = None;
+        self.delegation_edit_entries.clear();
         self.suggestion_tab = next;
         self.reseat_suggestion_selection(true);
         cx.notify();
@@ -31033,7 +31242,15 @@ impl VibexWorkbench {
                 cx.stop_propagation();
             }
             ComposerSuggestionAction::Dismiss => {
-                self.clear_suggestions();
+                // Escape leaves the configuration layer first; only the next
+                // press closes the popup the reader came from.
+                if self.delegation_edit_agent.is_some() {
+                    self.delegation_edit_agent = None;
+                    self.delegation_edit_entries.clear();
+                    self.reseat_suggestion_selection(true);
+                } else {
+                    self.clear_suggestions();
+                }
                 cx.stop_propagation();
                 cx.notify();
             }
@@ -31059,6 +31276,106 @@ impl VibexWorkbench {
         }
     }
 
+    /// Opens the delegation tab's configuration layer for one Agent.
+    ///
+    /// The rows are built from the catalogue this client already holds, so the
+    /// picker opens without another round trip. The row the Agent currently
+    /// carries leads; the rest keep the reader's use order.
+    fn open_delegation_runtime_edit(&mut self, agent_id: AgentId, cx: &mut Context<Self>) {
+        let Some(catalog) = self.runtime_catalog.as_deref() else {
+            return;
+        };
+        let selected = self
+            .delegation_suggestions
+            .iter()
+            .find(|entry| delegation_agent_id(entry).as_ref() == Some(&agent_id))
+            .and_then(delegation_selection_ref)
+            .and_then(|reference| {
+                catalog
+                    .options
+                    .iter()
+                    .find(|option| runtime_option_ref(option) == reference)
+            })
+            .map(|option| option.selection.clone());
+        let entries = delegation_runtime_edit_entries(
+            catalog,
+            &agent_id,
+            selected.as_ref(),
+            &self.ui_state.composer.runtime_selection_usage,
+        );
+        if entries.is_empty() {
+            return;
+        }
+        self.delegation_edit_agent = Some(agent_id);
+        self.delegation_edit_entries = entries;
+        self.suggestion_tab = ComposerSuggestionTab::Delegation;
+        self.suggestion_selection.dismiss();
+        self.reseat_suggestion_selection(true);
+        self.suggestion_scroll.scroll_to_item(0);
+        cx.notify();
+    }
+
+    /// Writes down the configuration the reader picked for one Agent and
+    /// re-points its delegation row at it.
+    ///
+    /// The choice lives in the UI state the authority reads, so it outlives the
+    /// popup and a restart, and applies to the next discovery as well as the
+    /// row on screen.
+    fn apply_delegation_edit_choice(
+        &mut self,
+        agent_id: AgentId,
+        selection_ref: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(option) = self
+            .runtime_catalog
+            .as_deref()
+            .and_then(|catalog| {
+                catalog.options.iter().find(|option| {
+                    option.availability == vibex_core::RuntimeOptionAvailability::Available
+                        && runtime_option_ref(option) == selection_ref
+                })
+            })
+            .cloned()
+        else {
+            return;
+        };
+        let selection = option.selection.clone();
+        self.ui_state
+            .composer
+            .delegation_runtime_selections_by_agent
+            .insert(agent_id.clone(), selection.clone());
+        self.ui_state
+            .composer
+            .record_runtime_selection_use(&selection);
+        self.delegation_edit_agent = None;
+        self.delegation_edit_entries.clear();
+        self.queue_ui_state();
+        // The authority picks the row's one configuration from the same file,
+        // so the write must be visible before a later discovery asks again.
+        if let Some(writer) = self.ui_writer.as_mut() {
+            let _ = writer.flush();
+        }
+        if let Some(entry) = self
+            .delegation_suggestions
+            .iter_mut()
+            .find(|entry| delegation_agent_id(entry).as_ref() == Some(&agent_id))
+        {
+            apply_delegation_selection_to_entry(entry, &agent_id, &option);
+        }
+        self.suggestion_tab = ComposerSuggestionTab::Delegation;
+        let edited = self
+            .delegation_suggestions
+            .iter()
+            .position(|entry| delegation_agent_id(entry).as_ref() == Some(&agent_id));
+        self.reseat_suggestion_selection(true);
+        if let Some(index) = edited {
+            self.suggestion_selection.selected_index = Some(index);
+            self.suggestion_scroll.scroll_to_item(index);
+        }
+        cx.notify();
+    }
+
     fn apply_suggestion(
         &mut self,
         target: ComposerTarget,
@@ -31067,6 +31384,13 @@ impl VibexWorkbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // A configuration row in the delegation tab's edit layer is not a
+        // mention: it writes the Agent's explicit delegation choice and leaves
+        // the draft untouched.
+        if let Some((agent_id, selection_ref)) = delegation_edit_target(&entry) {
+            self.apply_delegation_edit_choice(agent_id, selection_ref, cx);
+            return;
+        }
         let Some(input) = self.input_for_composer_target(target) else {
             return;
         };
@@ -62601,6 +62925,47 @@ impl VibexWorkbench {
             .collect()
     }
 
+    /// The pencil that opens one collaborator's configuration picker.
+    ///
+    /// It sits between the provider/model copy and the `Mention | Delegate`
+    /// halves: the copy says which configuration the row carries, and this is
+    /// the way to change it. The click is swallowed before the row's own
+    /// mention action can fire.
+    fn composer_delegation_edit_button(
+        &self,
+        target: ComposerTarget,
+        entry: &AgentCommandEntry,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Some(agent_id) = delegation_agent_id(entry) else {
+            return Empty.into_any_element();
+        };
+        Button::new(format!(
+            "composer-delegation-edit:{}:{}",
+            target.id(),
+            entry.id
+        ))
+        .xsmall()
+        .ghost()
+        .compact()
+        .size(px(24.0))
+        .icon(Icon::default().path("icons/vibex/pencil.svg"))
+        .tooltip(locale::text(
+            "Change provider and model",
+            "修改供应商配置与模型",
+            "修改供應商設定與模型",
+        ))
+        .on_mouse_down(MouseButton::Left, |_, window, cx| {
+            window.prevent_default();
+            cx.stop_propagation();
+        })
+        .on_click(cx.listener(move |this, _, _, cx| {
+            cx.stop_propagation();
+            this.open_delegation_runtime_edit(agent_id.clone(), cx);
+        }))
+        .into_any_element()
+    }
+
     /// The `Mention | Delegate` half of one collaborator row.
     ///
     /// The row itself is the reference; this control owns the direct hand-off.
@@ -69342,18 +69707,37 @@ impl VibexWorkbench {
             .map(|(index, entry)| {
                 let selected = self.suggestion_selection.selected_index == Some(index);
                 let selected_entry = entry.clone();
-                let agent_identity = self.composer_suggestion_agent_identity(&entry);
+                let editing_delegation = self.delegation_edit_agent.is_some();
+                let edit_agent_identity =
+                    self.delegation_edit_agent.as_ref().and_then(|agent_id| {
+                        self.agent_snapshots
+                            .iter()
+                            .find(|agent| &agent.id == agent_id)
+                            .map(agent_brand_identity)
+                    });
+                let agent_identity = if editing_delegation {
+                    edit_agent_identity.clone()
+                } else {
+                    self.composer_suggestion_agent_identity(&entry)
+                };
                 let agent_row = target == ComposerTarget::Session
                     && active_tab == ComposerSuggestionTab::Delegation
+                    && !editing_delegation
                     && composer_suggestion_is_agent(&entry);
                 let trailing = agent_row.then(|| {
-                    self.composer_delegation_action_control(
-                        target,
-                        &entry,
-                        selected,
-                        self.suggestion_delegation_action,
-                        cx,
-                    )
+                    h_flex()
+                        .flex_none()
+                        .items_center()
+                        .gap_1()
+                        .child(self.composer_delegation_edit_button(target, &entry, cx))
+                        .child(self.composer_delegation_action_control(
+                            target,
+                            &entry,
+                            selected,
+                            self.suggestion_delegation_action,
+                            cx,
+                        ))
+                        .into_any_element()
                 });
                 let body_choice = if agent_row && selected {
                     self.suggestion_delegation_action
@@ -69614,6 +69998,8 @@ impl VibexWorkbench {
         if !self.composer_suggestion_tabs_available(target) || self.active_suggestion_tab() == tab {
             return;
         }
+        self.delegation_edit_agent = None;
+        self.delegation_edit_entries.clear();
         self.suggestion_tab = tab;
         self.reseat_suggestion_selection(true);
         cx.notify();
@@ -99756,6 +100142,67 @@ mod tests {
             Some(ComposerDelegationAction::Reference)
         );
         assert_eq!(ComposerDelegationAction::Reference.moved(false), None);
+    }
+
+    #[test]
+    fn delegation_edit_rows_round_trip_the_agent_and_selection() {
+        let option = new_session_runtime_option("codex", "Codex");
+        let agent_id = option.selection.agent_id.clone();
+        let catalog = SessionRuntimeOptionCatalog {
+            revision: 0,
+            agents: Vec::new(),
+            auth_sources: Vec::new(),
+            options: vec![option.clone()],
+        };
+
+        let rows = delegation_runtime_edit_entries(&catalog, &agent_id, None, &BTreeMap::new());
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].label, "@Codex model");
+        assert_eq!(delegation_agent_id(&rows[0]).as_ref(), Some(&agent_id));
+        let (row_agent, selection_ref) =
+            delegation_edit_target(&rows[0]).expect("the row names the choice it writes");
+        assert_eq!(row_agent, agent_id);
+        assert_eq!(selection_ref, runtime_option_ref(&option));
+    }
+
+    #[test]
+    fn a_delegation_choice_rewrites_the_agent_row_in_place() {
+        let option = new_session_runtime_option("codex", "Codex");
+        let agent_id = option.selection.agent_id.clone();
+        let mut entry = command_entry(
+            AgentCommandSourceKind::Reference,
+            AgentCommandTrigger::Mention,
+            None,
+        );
+        entry.id = "reference:agent:codex:stale".into();
+        entry.label = "@Codex".into();
+        entry.metadata = vec![
+            vibex_core::ProviderBindingMetadata {
+                key: COMPOSER_AGENT_REFERENCE_KEY.to_string(),
+                value: agent_id.as_str().to_string(),
+            },
+            vibex_core::ProviderBindingMetadata {
+                key: COMPOSER_SELECTION_REFERENCE_KEY.to_string(),
+                value: "stale".into(),
+            },
+        ];
+
+        apply_delegation_selection_to_entry(&mut entry, &agent_id, &option);
+
+        assert_eq!(
+            entry.id,
+            format!("reference:agent:codex:{}", runtime_option_ref(&option))
+        );
+        assert_eq!(delegation_agent_id(&entry), Some(agent_id));
+        assert_eq!(
+            delegation_selection_ref(&entry),
+            Some(runtime_option_ref(&option).as_str())
+        );
+        assert_eq!(
+            entry.description.as_deref(),
+            Some("Codex profile · Codex model")
+        );
     }
 
     /// A collaborator row is not a generic reference: its left column is the
