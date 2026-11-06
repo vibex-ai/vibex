@@ -10259,6 +10259,18 @@ impl ActiveWorkGate for AcpRuntimeSwitchBridge {
         self.client.set_session_prompt_gate(session_id, closed)
     }
 
+    /// Expires cards whose producer-side deadline has passed.
+    ///
+    /// The browser and computer-use hosts enforce their own TTL while they wait,
+    /// but the durable row and the timeline item stay `Pending` once they give
+    /// up, and this bridge's prompt gate is closed for the whole wait. Running
+    /// the shared sweep here means time keeps moving for a card nobody can
+    /// answer, instead of the switch renewing its lease against a blocker that
+    /// can no longer change.
+    async fn expire_user_input(&self, _session_id: &VibexSessionId) -> VibexResult<bool> {
+        Ok(self.manager.expire_pending_user_input_requests().await? > 0)
+    }
+
     async fn cancel(
         &self,
         session_id: &VibexSessionId,

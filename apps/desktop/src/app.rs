@@ -3211,10 +3211,20 @@ impl VibexWorkbench {
 }
 
 fn runtime_status_banner_is_visible(status: SessionRuntimeSelectionStatus) -> bool {
-    // Runtime preparation is deliberately presentation-transparent. The
+    // Runtime preparation is deliberately presentation-transparent: the
     // composer keeps the desired selection visible while durable submission
-    // waits in the background; only a failed switch needs an actionable row.
-    status == SessionRuntimeSelectionStatus::FailedUsingPrevious
+    // waits in the background.
+    //
+    // A switch waiting for the current work is different. It can outlive the
+    // work (a turn parked on a card, a terminal that never goes idle), and the
+    // only way out of that state is the cancel affordance the banner carries.
+    // Hiding the row left the reader with a session that showed one runtime in
+    // the composer, ran another, and offered nothing to stop the mismatch.
+    matches!(
+        status,
+        SessionRuntimeSelectionStatus::WaitingForCurrentWork
+            | SessionRuntimeSelectionStatus::FailedUsingPrevious
+    )
 }
 
 fn composer_surface_background(is_dark: bool) -> Hsla {
@@ -59731,13 +59741,12 @@ impl VibexWorkbench {
         }) {
             return div().into_any_element();
         }
-        if self.agent_turn_pending
-            && matches!(
-                state.status,
-                SessionRuntimeSelectionStatus::Preparing
-                    | SessionRuntimeSelectionStatus::WaitingForCurrentWork
-            )
-        {
+        // A pending turn hides the transient "preparing" row, which only
+        // lasts until the switch can start. It must not hide the "waiting for
+        // this work" row: that row is the one the reader needs while the turn
+        // is still running, because cancelling the switch is what ends the
+        // mismatch between the desired and the effective runtime.
+        if self.agent_turn_pending && state.status == SessionRuntimeSelectionStatus::Preparing {
             return div().into_any_element();
         }
         // The selected runtime is already visible in the composer selectors;
@@ -109716,18 +109725,43 @@ mod tests {
     }
 
     #[test]
-    fn runtime_preparation_does_not_render_a_status_banner() {
+    fn runtime_preparation_stays_quiet_but_a_waiting_switch_is_cancellable() {
         assert!(!runtime_status_banner_is_visible(
             SessionRuntimeSelectionStatus::Ready
         ));
-        for status in [
-            SessionRuntimeSelectionStatus::WaitingForCurrentWork,
-            SessionRuntimeSelectionStatus::Preparing,
-        ] {
-            assert!(!runtime_status_banner_is_visible(status));
-        }
+        assert!(!runtime_status_banner_is_visible(
+            SessionRuntimeSelectionStatus::Preparing
+        ));
+        // A switch waiting for the current work can outlive the work itself;
+        // the row — and the cancel button it carries — must stay reachable.
+        assert!(runtime_status_banner_is_visible(
+            SessionRuntimeSelectionStatus::WaitingForCurrentWork
+        ));
         assert!(runtime_status_banner_is_visible(
             SessionRuntimeSelectionStatus::FailedUsingPrevious
+        ));
+
+        // A pending turn hides only the transient preparing row. It must not
+        // suppress the waiting row, or the cancel affordance disappears in
+        // exactly the state that needs it.
+        let source = include_str!("app.rs");
+        let controls = source
+            .split_once("    fn render_runtime_controls(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// The pane a session Composer"))
+            .map(|(body, _)| body)
+            .expect("runtime controls should remain inspectable");
+        let pending_guard = controls
+            .find("if self.agent_turn_pending")
+            .expect("a pending turn still gates the busy row");
+        let waiting_visible = controls
+            .find("state.status == SessionRuntimeSelectionStatus::Preparing")
+            .expect("the pending-turn guard must name the transient phase");
+        assert!(
+            pending_guard < waiting_visible,
+            "the guard must be the pending turn around the preparing row only"
+        );
+        assert!(!controls.contains(
+            "SessionRuntimeSelectionStatus::Preparing\n                    | SessionRuntimeSelectionStatus::WaitingForCurrentWork"
         ));
     }
 

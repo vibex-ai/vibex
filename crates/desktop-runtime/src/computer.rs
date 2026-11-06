@@ -50,8 +50,10 @@ use crate::AgentHandle;
 
 /// How long a computer-use approval card stays open before it is denied.
 ///
-/// The runtime has no global pending-permission expiry, so an unanswered card
-/// would otherwise hold an agent tool call for the whole ACP prompt budget.
+/// The deadline is published on the card itself, so the runtime-wide expiry
+/// sweep closes the row at the same moment this wait gives up on it. Without
+/// that, an unanswered card would hold an agent tool call for the whole ACP
+/// prompt budget.
 pub const COMPUTER_APPROVAL_TTL_MS: i64 = vibex_core::COMPUTER_APPROVAL_TTL_MS;
 /// How often the approval wait re-reads the request.
 const COMPUTER_APPROVAL_POLL_MS: u64 = 250;

@@ -3714,6 +3714,12 @@ impl DesktopRuntime {
                 .runtime_lifecycle
                 .start(&tokio::runtime::Handle::current())
         })?;
+        startup_stage("user_input_expiry_start", || {
+            self.agent.manager.start_user_input_expiry(
+                &tokio::runtime::Handle::current(),
+                vibex_agent::DEFAULT_USER_INPUT_EXPIRY_INTERVAL,
+            )
+        })?;
         if let Err(error) = startup_stage("runtime_probe_reconcile", || {
             self.providers.runtime_probe.reconcile_on_startup()
         }) {

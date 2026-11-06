@@ -86,9 +86,9 @@ pub trait BrowserMcpHost: Send + Sync + 'static {
     /// Raises an approval card and waits for the human.
     ///
     /// `error` carries `origin` and `domain` diagnostics describing what the
-    /// Agent is trying to reach. Implementations must apply their own timeout:
-    /// the runtime has no global pending-permission expiry, so an unanswered
-    /// card would otherwise hang for the whole ACP prompt budget.
+    /// Agent is trying to reach. Implementations must apply their own timeout
+    /// and publish it as `expires_at_ms`: an unanswered card otherwise hangs
+    /// for the whole ACP prompt budget.
     async fn request_permission(
         &self,
         session: &BrowserMcpSession,

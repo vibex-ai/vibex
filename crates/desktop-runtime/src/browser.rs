@@ -47,10 +47,10 @@ fn browser_family_label(browser_id: &str) -> String {
 
 /// How long a browser approval card stays open before it is denied.
 ///
-/// The runtime has no global pending-permission expiry — `expires_at_ms` is
-/// always `None` elsewhere and nothing ever writes `Expired` — so an
-/// unanswered browser card would otherwise sit there for the entire two-hour
-/// ACP prompt budget while the Agent waits on a tool call.
+/// The deadline is published on the card itself, so the runtime-wide expiry
+/// sweep closes the row at the same moment this wait gives up on it. Without
+/// that, an unanswered card would sit `Pending` for the entire two-hour ACP
+/// prompt budget while the Agent waited on a tool call.
 pub const BROWSER_APPROVAL_TTL_MS: i64 = 120_000;
 /// How often the approval wait re-reads the request.
 const BROWSER_APPROVAL_POLL_MS: u64 = 250;

@@ -175,9 +175,9 @@ pub const COMPUTER_DISCONNECT_HARD_MS: i64 = 30_000;
 
 /// How long a computer-use approval card stays open before it is denied.
 ///
-/// The runtime has no global pending-permission expiry, so the computer layer
-/// carries its own TTL; an unanswered card would otherwise hold an Agent tool
-/// call for the entire ACP prompt budget.
+/// The deadline is published on the card itself, so the runtime-wide expiry
+/// sweep closes the row when it passes; the computer layer's own wait uses the
+/// same value so the reader stops waiting at the same moment.
 pub const COMPUTER_APPROVAL_TTL_MS: i64 = 120_000;
 
 /// How recently the human must have produced input for a target the Agent is

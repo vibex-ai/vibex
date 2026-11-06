@@ -103,6 +103,15 @@ static LOCAL_HISTORY_IMPORT_GUARD: OnceLock<AsyncMutex<()>> = OnceLock::new();
 pub const PROVIDER_SELECTED_MODEL_METADATA_KEY: &str = "selectedModel";
 pub const PROVIDER_SELECTED_REASONING_EFFORT_METADATA_KEY: &str = "selectedReasoningEffort";
 
+/// How often a runtime that installed the expiry sweep looks for cards whose
+/// deadline has passed.
+///
+/// Producers set deadlines in whole seconds at the shortest (the browser's two
+/// minutes), so a one-second poll is prompt enough to close the card while the
+/// reader is still looking at it without asking SQLite for work in a tight
+/// loop.
+pub const DEFAULT_USER_INPUT_EXPIRY_INTERVAL: Duration = Duration::from_secs(1);
+
 /// Where the sweep over histories written before the timeline folded its
 /// update runs on disk has got to.
 ///
@@ -250,6 +259,15 @@ pub struct AgentManager {
     /// cannot create or restart one — which is the honest answer for a headless
     /// process that owns no PTY.
     session_terminal_launcher: OnceLock<Arc<dyn crate::session_terminal::SessionTerminalLauncher>>,
+    /// The task that expires unanswered user-input requests.
+    ///
+    /// A card with an `expires_at_ms` had no reaper: browser and computer use
+    /// enforce their own deadline in the waiting loop, but the durable row and
+    /// the timeline item stayed `Pending` forever. A switch waiting for that
+    /// card then had nothing to observe, so its lease was renewed indefinitely.
+    /// The installed sweep is what closes that lifecycle; it is optional so a
+    /// headless manager (tests, remote-only processes) keeps working.
+    user_input_expiry_task: StdMutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 /// Releases a session's in-flight turn slot when its turn future ends.
@@ -673,6 +691,7 @@ impl AgentManager {
             session_event_pumps: Arc::new(StdMutex::new(HashSet::new())),
             active_turn_sessions: Arc::new(StdMutex::new(HashSet::new())),
             session_terminal_launcher: OnceLock::new(),
+            user_input_expiry_task: StdMutex::new(None),
         };
         manager.recover_interrupted_sessions(&mut conn)?;
         Ok(manager)
@@ -4841,6 +4860,71 @@ impl AgentManager {
         })
     }
 
+    /// Answers a permission request against the runtime the session is
+    /// actually executing on right now.
+    ///
+    /// `durable_session_execution` is the prompt-admission gate: it refuses
+    /// while a desired selection differs from the committed one, while a
+    /// pending switch exists, or while the status is anything but `Ready`. That
+    /// is the right question before starting a turn, but the wrong one before
+    /// answering a card: the card was raised by the turn running on the
+    /// *current* binding, and a switch that is merely waiting for that turn to
+    /// finish has not moved anything yet. Gating the answer on the target
+    /// selection made every approval fail with `session_runtime_not_ready`, so
+    /// the waiting turn could never end and the switch could never commit — a
+    /// deadlock the reader could not break from any surface.
+    ///
+    /// The committed binding is still checked exactly: same Agent, same auth
+    /// source, `Current` state, the session's activation generation, and a
+    /// native session. Only the desired-selection and pending-switch clauses
+    /// are waived, because neither describes what is running now.
+    fn resolve_user_input_execution(
+        &self,
+        conn: &DbConnection,
+        session: &AgentSession,
+    ) -> VibexResult<(
+        SessionRuntimeSelection,
+        ProviderBinding,
+        ProviderTurnExecutionIdentity,
+        vibex_core::AgentRuntimeRouteKey,
+    )> {
+        let state = AgentSessionRuntimeRepository::get_runtime_state(conn, &session.id)?
+            .ok_or_else(|| {
+                VibexError::conflict(
+                    "session_runtime_state_missing",
+                    "Agent session has no durable runtime state",
+                )
+            })?;
+        let selection = state.effective_runtime_selection.clone().ok_or_else(|| {
+            VibexError::conflict(
+                "session_runtime_selection_missing",
+                "Agent session has no effective ACP runtime selection",
+            )
+        })?;
+        let current_binding_id = state.current_binding_id.as_ref().ok_or_else(|| {
+            VibexError::conflict(
+                "session_runtime_binding_missing",
+                "Agent session has no committed runtime binding",
+            )
+        })?;
+        if state.current_agent_id.as_ref() != Some(&selection.agent_id)
+            || session.agent_id != selection.agent_id
+        {
+            return Err(VibexError::conflict(
+                "session_runtime_not_ready",
+                "Agent session runtime is not ready for online execution",
+            ));
+        }
+        let (binding, identity, route_key) = self.durable_provider_turn_binding(
+            conn,
+            session,
+            &selection,
+            current_binding_id,
+            state.activation_generation,
+        )?;
+        Ok((selection, binding, identity, route_key))
+    }
+
     pub async fn resolve_permission(
         &self,
         request: ResolvePermissionRequest,
@@ -4850,7 +4934,7 @@ impl AgentManager {
             VibexError::validation("session_not_found", "Agent session was not found")
         })?;
         let (selection, binding, _identity, route_key) =
-            self.durable_session_execution(&conn, &session)?;
+            self.resolve_user_input_execution(&conn, &session)?;
         let provider = self.runtime(&route_key)?;
         // The selection's auth source, not its Profile id: a route group
         // launches through a resolved Profile but names none, so asking by
@@ -4896,7 +4980,24 @@ impl AgentManager {
                 "the selected permission response option is not available for this request",
             ));
         }
-        PermissionRepository::resolve(&conn, &request.resolution)?;
+        match PermissionRepository::resolve(&conn, &request.resolution) {
+            Ok(()) => {}
+            // A concurrent answer (another window, the remote client, the
+            // interrupt drain) won the compare-and-set. It already owns the
+            // answer, so this submission is an audit entry, not an error.
+            Err(error) if error.code == "permission_request_not_pending" => {
+                return self.append_timeline_item(
+                    &mut conn,
+                    &session.id,
+                    TimelineSource::User,
+                    TimelinePayload::PermissionResolution(request.resolution),
+                    None,
+                    None,
+                    TimelineRedactionState::None,
+                );
+            }
+            Err(error) => return Err(error),
+        }
         let item = self.append_timeline_item(
             &mut conn,
             &session.id,
@@ -4958,7 +5059,7 @@ impl AgentManager {
             VibexError::validation("session_not_found", "Agent session was not found")
         })?;
         let (selection, binding, execution_identity, route_key) =
-            self.durable_session_execution(&conn, &session)?;
+            self.resolve_user_input_execution(&conn, &session)?;
         let provider = self.runtime(&route_key)?;
         let capabilities = provider
             .capabilities_for_auth_source(Some(&selection.agent_id), &selection.auth_source);
@@ -5098,7 +5199,15 @@ impl AgentManager {
                 note: Some("interrupted".to_string()),
                 resolved_at_ms,
             };
-            PermissionRepository::resolve(conn, &resolution)?;
+            // The permission write is now a pending-only compare-and-set, so
+            // a reader (or the expiry reaper) that answered between the list
+            // and this write already owns the resolution; skip it instead of
+            // clobbering the answer or failing the interrupt over the race.
+            match PermissionRepository::resolve(conn, &resolution) {
+                Ok(()) => {}
+                Err(error) if error.code == "permission_request_not_pending" => continue,
+                Err(error) => return Err(error),
+            }
             self.append_timeline_item(
                 conn,
                 session_id,
@@ -5139,6 +5248,153 @@ impl AgentManager {
         Ok(())
     }
 
+    /// Starts the sweep that expires unanswered user-input requests.
+    ///
+    /// A producer that set `expires_at_ms` (the embedded browser, computer use,
+    /// a remote approval) owns the deadline in its own wait loop, but nothing
+    /// moved the durable row or the timeline item past `Pending` once that loop
+    /// gave up. The stale card then kept every client's approval surface open
+    /// and left a runtime switch waiting on it with nothing to observe. The
+    /// sweep is the runtime-wide lifecycle the producers delegate to.
+    ///
+    /// Idempotent: a second call keeps the task already installed.
+    pub fn start_user_input_expiry(
+        self: &Arc<Self>,
+        runtime: &tokio::runtime::Handle,
+        interval: std::time::Duration,
+    ) -> VibexResult<()> {
+        if interval.is_zero() {
+            return Err(VibexError::validation(
+                "user_input_expiry_interval_invalid",
+                "user input expiry interval must be positive",
+            ));
+        }
+        let mut task = self.user_input_expiry_task.lock().map_err(|_| {
+            VibexError::process(
+                "user_input_expiry_task_lock_poisoned",
+                "user input expiry task is unavailable",
+            )
+        })?;
+        if task.is_some() {
+            return Ok(());
+        }
+        // The sweeper holds a weak handle, so a runtime that drops the manager
+        // takes the task's reason to exist with it.
+        let manager = Arc::downgrade(self);
+        *task = Some(runtime.spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                let Some(manager) = manager.upgrade() else {
+                    break;
+                };
+                let _ = manager.expire_pending_user_input_requests().await;
+            }
+        }));
+        Ok(())
+    }
+
+    /// Expires every unanswered user-input request whose deadline has passed.
+    ///
+    /// Expiry is not a denial: the reader never decided, so the row keeps no
+    /// resolution JSON and the timeline carries a resolution item whose note
+    /// says the card expired. Recording that item is what drops the card from
+    /// every client's pending index; the status change is what lets a switch
+    /// waiting on the card observe that its blocker is gone.
+    ///
+    /// The durable part comes first and the runtime part second. A card that
+    /// was raised by the Agent also owns a native callback, and expiring only
+    /// the row would leave that callback open: the attachment would keep
+    /// reporting `pending_permission`, and the switch waiting on it would go on
+    /// renewing its lease against a blocker that can no longer change. Draining
+    /// through the provider is therefore best effort — a browser or computer
+    /// card has no native callback at all, and its answer is the row itself.
+    pub async fn expire_pending_user_input_requests(&self) -> VibexResult<usize> {
+        let mut conn = self.open_migrated()?;
+        let now_ms = unix_timestamp_ms();
+        let expired = PermissionRepository::list_pending_expired(&conn, now_ms, 256)?;
+        let mut count = 0;
+        let mut drained = Vec::new();
+        for request in expired {
+            if !PermissionRepository::expire(&conn, &request.id, &request.session_id, now_ms)? {
+                // Another writer answered or expired it between the list and
+                // this write; that writer owns the outcome.
+                continue;
+            }
+            count += 1;
+            let resolution = vibex_core::PermissionResolution {
+                request_id: request.id.clone(),
+                session_id: request.session_id.clone(),
+                // `PermissionResponseKind` has no "expired" variant, and the
+                // row itself is already `Expired`; `Deny` is the honest
+                // provider answer for a window that closed unanswered.
+                response: vibex_core::PermissionResponseKind::Deny,
+                responder_device_id: None,
+                provider_resolution_id: None,
+                note: Some("expired".to_string()),
+                resolved_at_ms: now_ms,
+            };
+            self.append_timeline_item(
+                &mut conn,
+                &request.session_id,
+                TimelineSource::System,
+                TimelinePayload::PermissionResolution(resolution.clone()),
+                None,
+                None,
+                TimelineRedactionState::None,
+            )?;
+            self.settle_after_user_input_resolution(&conn, &request.session_id)?;
+            drained.push((request.session_id, resolution));
+        }
+        drop(conn);
+        for (session_id, resolution) in drained {
+            self.drain_expired_permission(&session_id, resolution).await;
+        }
+        Ok(count)
+    }
+
+    /// Best-effort answer for a card whose durable row has already expired.
+    ///
+    /// The attached runtime is asked to answer the native callback the card
+    /// was raised from, so the Agent stops waiting on a decision that can no
+    /// longer arrive. A runtime with no such callback (a browser or computer
+    /// card) simply reports a duplicate answer, which both implementations
+    /// treat as success; a session whose runtime cannot be resolved keeps the
+    /// row-level expiry, which is the authoritative half.
+    async fn drain_expired_permission(
+        &self,
+        session_id: &VibexSessionId,
+        resolution: vibex_core::PermissionResolution,
+    ) {
+        let Ok(conn) = self.open_migrated() else {
+            return;
+        };
+        let Ok(Some(session)) = SessionRepository::get(&conn, session_id) else {
+            return;
+        };
+        let Ok((selection, binding, _identity, route_key)) =
+            self.resolve_user_input_execution(&conn, &session)
+        else {
+            return;
+        };
+        let Ok(provider) = self.runtime(&route_key) else {
+            return;
+        };
+        let capabilities = provider
+            .capabilities_for_auth_source(Some(&selection.agent_id), &selection.auth_source);
+        if !capabilities.permission_requests {
+            return;
+        }
+        let _ = provider
+            .resolve_permission(ProviderPermissionResolution {
+                session_id: session_id.clone(),
+                binding,
+                resolution,
+            })
+            .await;
+    }
+
     pub async fn interrupt(&self, session_id: &VibexSessionId) -> VibexResult<()> {
         let mut conn = self.open_migrated()?;
         let session = SessionRepository::get(&conn, session_id)?.ok_or_else(|| {
@@ -5161,7 +5417,7 @@ impl AgentManager {
         }
         let runtime_state = AgentSessionRuntimeRepository::get_runtime_state(&conn, &session.id)?;
         let (selection, binding, _identity, route_key) = match self
-            .durable_session_execution(&conn, &session)
+            .resolve_user_input_execution(&conn, &session)
         {
             Ok(execution) => execution,
             Err(error)
@@ -9509,6 +9765,260 @@ mod tests {
                     if resolution == &winning_resolution
             )
         }));
+
+        cleanup_db(&db_path);
+        let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    /// A card raised by the running turn is answerable while a switch waits.
+    ///
+    /// The regression behind this test is the deadlock in the issue: a mode
+    /// change made mid-turn parks the switch in `waiting_for_idle`, the turn
+    /// then raises a permission, and answering it went through the prompt
+    /// admission gate — which refuses whenever a desired selection differs from
+    /// the committed one. Every answer produced `session_runtime_not_ready`,
+    /// the turn could never finish, the switch could never commit, and no
+    /// surface could break the loop.
+    ///
+    /// The card belongs to the current binding, so the answer must reach it.
+    /// A stop must reach it too: it is the other way out of "waiting for
+    /// current work", and it was refused for the same reason.
+    #[tokio::test]
+    async fn a_card_and_an_interrupt_reach_the_running_runtime_while_a_switch_waits() {
+        let db_path = temp_db_path("card-during-waiting-switch");
+        let workspace_root = temp_workspace_path("card-during-waiting-switch");
+        fs::create_dir_all(&workspace_root).unwrap();
+        let mut manager = AgentManager::new(&db_path).unwrap();
+        let mut conn = manager.open_migrated().unwrap();
+        ProviderProfileRepository::ensure_local_defaults(&conn).unwrap();
+        let (project, workspace) =
+            WorkspaceRepository::ensure(&conn, &workspace_root, WorkspaceMode::CurrentCheckout)
+                .unwrap();
+        let agent_id = AgentId::parse("card-during-switch-agent").unwrap();
+        let adapter_id = AcpAdapterId::parse("card-during-switch-acp").unwrap();
+        let provider_profile_id =
+            ProviderProfileId::parse(ProviderKind::Acp.local_default_profile_id().to_string())
+                .unwrap();
+        let session = insert_session(
+            &conn,
+            "card during a waiting switch",
+            &project.id,
+            &workspace.id,
+            &workspace.root_path,
+            agent_id.clone(),
+            AgentSessionState::Idle,
+        );
+        let selection = SessionRuntimeSelection::provider(
+            agent_id.clone(),
+            provider_profile_id.clone(),
+            "card-during-switch-model",
+        );
+        let mut runtime_config = SessionRuntimeConfigState {
+            preferred_model: selection.model_id().map(str::to_string),
+            effective_model: selection.model_id().map(str::to_string),
+            ..SessionRuntimeConfigState::default()
+        };
+        runtime_config.mark_generation_if_converged(0);
+        let now = unix_timestamp_ms();
+        let binding = RuntimeBinding {
+            binding_id: RuntimeBindingId::new(),
+            session_id: session.id.clone(),
+            agent_id: agent_id.clone(),
+            transport_kind: TransportKind::Acp,
+            auth_source: selection.auth_source.clone(),
+            auth_source_revision: 1,
+            adapter_id: adapter_id.clone(),
+            adapter_version: "1.0.0".to_string(),
+            adapter_compatibility_identity: "card-during-switch-acp@1".to_string(),
+            native_session_id: Some("native-card-during-switch".to_string()),
+            native_state_home_id: NativeStateHomeId::new(),
+            provider_resume_identity: None,
+            process_spawn_fingerprint: "card-during-switch".to_string(),
+            session_runtime_config_state: runtime_config,
+            capability_snapshot: None,
+            restore_compatibility_key: None,
+            last_context_sequence: 0,
+            last_summary_sequence: 0,
+            context_bridge_version: 0,
+            activation_generation: 0,
+            binding_state: BindingState::Current,
+            created_by_switch_id: None,
+            created_at_ms: now,
+            updated_at_ms: now,
+        };
+        AgentSessionRuntimeRepository::initialize_runtime_selection(
+            &mut conn, &binding, &selection,
+        )
+        .unwrap();
+
+        // The reader asks for another runtime while the turn is still running.
+        // This is exactly the durable shape of the reported session: desired
+        // moved, effective did not, and the switch waits for idle.
+        let target_selection = SessionRuntimeSelection {
+            model: vibex_core::RuntimeModelSelection::explicit("card-during-switch-model-2"),
+            ..selection.clone()
+        };
+        let DesiredRuntimeSwitchEnqueueResult::Enqueued(switch_record) =
+            AgentSessionRuntimeRepository::enqueue_desired_switch(
+                &mut conn,
+                RuntimeSwitchId::new(),
+                &DesiredRuntimeSwitchEnqueueRequest {
+                    session_id: session.id.clone(),
+                    idempotency_key: "card-during-waiting-switch".to_string(),
+                    expected_revision: 0,
+                    expected_selection_revision: 0,
+                    target_binding_id: RuntimeBindingId::new(),
+                    target_adapter_id: adapter_id.clone(),
+                    target_auth_source_revision: 1,
+                    desired: target_selection.clone(),
+                    requested_policy: RuntimeSwitchPolicy::Automatic,
+                    active_work_policy: RuntimeSwitchActiveWorkPolicy::default(),
+                    requested_session_config: RuntimeSwitchCoordinator::encode_requested_config(
+                        &target_selection,
+                        None,
+                    )
+                    .unwrap(),
+                },
+            )
+            .unwrap()
+        else {
+            panic!("a changed desired selection must enqueue a switch");
+        };
+        assert_eq!(
+            RuntimeSwitchRepository::claim_requested(&mut conn, &switch_record.switch_id).unwrap(),
+            RequestedSwitchClaimOutcome::Claimed
+        );
+        RuntimeSwitchRepository::advance_status(
+            &conn,
+            &switch_record.switch_id,
+            RuntimeSwitchStatus::Reserved,
+            RuntimeSwitchStatus::WaitingForIdle,
+        )
+        .unwrap();
+        drop(conn);
+        manager
+            .register_runtime(
+                AgentRuntimeRouteKey {
+                    agent_id: agent_id.clone(),
+                    transport_kind: TransportKind::Acp,
+                    adapter_id,
+                },
+                Arc::new(MidTurnPermissionProvider {
+                    identity: ProviderTurnExecutionIdentity {
+                        binding_id: binding.binding_id.clone(),
+                        activation_generation: binding.activation_generation,
+                        model_id: Some(selection.model_id().unwrap().to_string()),
+                    },
+                    armed: tokio::sync::Notify::new(),
+                    release: tokio::sync::Notify::new(),
+                }),
+            )
+            .unwrap();
+        let manager = Arc::new(manager);
+
+        let permission = PermissionRequest {
+            id: vibex_core::RequestId::new(),
+            session_id: session.id.clone(),
+            project_id: Some(project.id.clone()),
+            workspace_id: Some(workspace.id.clone()),
+            provider_request_id: Some("acp-permission-during-switch".to_string()),
+            risk_category: PermissionRiskCategory::Command,
+            title: "Agent wants to run a command".to_string(),
+            details: Vec::new(),
+            allowed_responses: vec![
+                PermissionResponseKind::Approve,
+                PermissionResponseKind::Deny,
+            ],
+            response_options: Vec::new(),
+            status: PermissionRequestStatus::Pending,
+            requested_at_ms: now,
+            expires_at_ms: None,
+        };
+        manager
+            .record_permission_request(permission.clone())
+            .await
+            .unwrap();
+
+        let resolution = PermissionResolution {
+            request_id: permission.id.clone(),
+            session_id: session.id.clone(),
+            response: PermissionResponseKind::Approve,
+            responder_device_id: None,
+            provider_resolution_id: None,
+            note: None,
+            resolved_at_ms: unix_timestamp_ms(),
+        };
+        manager
+            .resolve_permission(ResolvePermissionRequest {
+                session_id: session.id.clone(),
+                request_id: permission.id.clone(),
+                resolution,
+            })
+            .await
+            .expect("a card raised by the running turn must be answerable during a waiting switch");
+
+        let conn = manager.open_migrated().unwrap();
+        assert_eq!(
+            PermissionRepository::get_request(&conn, &permission.id)
+                .unwrap()
+                .unwrap()
+                .status,
+            PermissionRequestStatus::Approved
+        );
+        assert_eq!(
+            AgentSessionRuntimeRepository::get_runtime_state(&conn, &session.id)
+                .unwrap()
+                .unwrap()
+                .runtime_selection_status,
+            Some(SessionRuntimeSelectionStatus::WaitingForCurrentWork),
+            "answering a card must not disturb the switch that is waiting"
+        );
+        drop(conn);
+
+        // A stop is the other way out. It must reach the same runtime instead
+        // of being refused by the prompt gate.
+        manager
+            .interrupt(&session.id)
+            .await
+            .expect("a stop must reach the runtime that is holding the switch");
+
+        // An expired card answers itself, and the timeline carries the
+        // resolution that drops it from every client's pending index.
+        let expiring = PermissionRequest {
+            id: vibex_core::RequestId::new(),
+            provider_request_id: Some("acp-permission-expiring".to_string()),
+            expires_at_ms: Some(unix_timestamp_ms() + 5),
+            ..permission.clone()
+        };
+        manager
+            .record_permission_request(expiring.clone())
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        assert_eq!(
+            manager.expire_pending_user_input_requests().await.unwrap(),
+            1,
+            "one unanswered card reached its deadline"
+        );
+        let conn = manager.open_migrated().unwrap();
+        assert_eq!(
+            PermissionRepository::get_request(&conn, &expiring.id)
+                .unwrap()
+                .unwrap()
+                .status,
+            PermissionRequestStatus::Expired
+        );
+        let timeline = TimelineRepository::fetch_range(&conn, &session.id, 1, 100).unwrap();
+        assert!(
+            timeline.iter().any(|item| matches!(
+                &item.payload,
+                TimelinePayload::PermissionResolution(resolution)
+                    if resolution.request_id == expiring.id
+                        && resolution.note.as_deref() == Some("expired")
+            )),
+            "an expired card must be recorded as resolved so clients drop it"
+        );
+        drop(conn);
 
         cleanup_db(&db_path);
         let _ = fs::remove_dir_all(workspace_root);

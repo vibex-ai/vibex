@@ -1132,6 +1132,38 @@ PermissionRepository::pending_for_session(VibexSessionId)
   publishes the matching `PermissionResolution` / `ElicitationResolution`
   timeline item before it settles the state. A request the reader answered
   concurrently already has a resolution and is skipped rather than clobbered.
+- Control-plane answers are admitted by the runtime the session is executing
+  on, not by the next prompt's admission gate. `resolve_permission`,
+  `resolve_elicitation`, and `interrupt` require a durable current binding —
+  effective selection present, `current_agent_id` matching the selection,
+  `BindingState::Current`, the session's activation generation — and
+  deliberately ignore the desired selection, `runtime_selection_status`, and
+  `pending_switch_id`. A switch that is only waiting for the running turn has
+  not moved anything yet, so the card it waits behind is still answerable; using
+  the prompt gate here produced `session_runtime_not_ready` for every answer,
+  the turn could never end, and the switch could never commit. `send_message`
+  keeps the strict gate, because a new prompt really does have to run on the
+  target runtime.
+- A pending permission is a compare-and-set, not an absorbing write:
+  `PermissionRepository::resolve` updates only `WHERE status = 'pending'` and
+  returns `permission_request_not_pending` when it loses the race. Callers treat
+  that as "somebody else owns the answer" — the interrupt drain skips the row
+  and a reader's late submission appends an audit resolution item — instead of
+  overwriting the first answer or failing the whole stop.
+- A card can expire, and expiry is not a denial. Producers that wait on a card
+  publish their deadline as `expires_at_ms` (browser and computer use already
+  did). `AgentManager::expire_pending_user_input_requests` sweeps every row past
+  its deadline onto `PermissionRequestStatus::Expired` with
+  `resolution_json = NULL`, appends a System `PermissionResolution` with
+  `response: deny` and note `expired` so every client drops the card, settles
+  the session, and then asks the owning runtime to answer the native callback
+  best-effort. The desktop runtime installs this sweep at startup
+  (`DEFAULT_USER_INPUT_EXPIRY_INTERVAL`, one second); a manager without it keeps
+  working, only without the lifecycle. A runtime switch waiting on
+  `pending_permission` calls the same sweep through
+  `ActiveWorkGate::expire_user_input`, so a card nobody can answer releases the
+  wait instead of renewing the switch lease forever.
+
 - A client-side pending-request index is a live-stream projection and can
   outlive the card it describes, because a drain path can cancel the native
   callback without a resolution item ever reaching a lagged client. A row may

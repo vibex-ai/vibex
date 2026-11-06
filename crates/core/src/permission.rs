@@ -71,6 +71,13 @@ pub struct PermissionRequest {
     pub response_options: Vec<PermissionResponseOption>,
     pub status: PermissionRequestStatus,
     pub requested_at_ms: i64,
+    /// When this card stops accepting an answer, if its producer set one.
+    ///
+    /// The producer that raises a card and blocks on it owns this deadline: the
+    /// embedded browser and computer use publish theirs, and the runtime-wide
+    /// expiry sweep moves a row past it to `expired` without inventing a
+    /// resolution. `None` means the card has no deadline and its producer
+    /// closes it explicitly.
     pub expires_at_ms: Option<i64>,
 }
 

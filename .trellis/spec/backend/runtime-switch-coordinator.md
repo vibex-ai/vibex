@@ -446,6 +446,8 @@ agent://runtime-selection-event
 | Desired/session revision is stale | `desired_selection_revision_conflict` / `runtime_switch_revision_conflict`. |
 | Same idempotency key has another target | `runtime_selection_idempotency_payload_conflict`. |
 | Seamless Wait deadline passes | Stay in `WaitingForCurrentWork` and finish the switch after the work ends; queued messages keep waiting instead of failing. |
+| Switch waits on `pending_permission` | Persist `runtime_selection_status = waiting_for_current_work` on the session row when the switch enters `WaitingForIdle`, then let `ActiveWorkGate::expire_user_input` run each wait tick so a card past its `expires_at_ms` releases the wait. A wait must never be renewable only by the work it is waiting for. |
+| Waiting phase reaches a surface | The status banner is shown for `waiting_for_current_work` (and not suppressed by a pending turn), because its cancel action is the only exit from a switch whose work never goes idle. |
 | Prepared config rebuild CAS conflicts | stop reconciliation; never apply using an unpersisted baseline. |
 | Kill/release/wait host call fails | return the host error and keep `active_terminal=true`. |
 

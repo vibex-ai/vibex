@@ -10066,6 +10066,14 @@ impl PermissionRepository {
             ))
     }
 
+    /// Resolves one request, but only while it is still `Pending`.
+    ///
+    /// The write is a compare-and-set on the status column, the same shape the
+    /// elicitation repository uses. Without it, a second resolution racing the
+    /// first could overwrite an answer the reader had already given: the
+    /// manager's own `status != Pending` read happens before the write, so it
+    /// cannot close that window. A caller that loses the race must treat the
+    /// request as already answered instead of retrying.
     pub fn resolve(conn: &Connection, resolution: &PermissionResolution) -> VibexResult<()> {
         let status = match resolution.response {
             PermissionResponseKind::Approve | PermissionResponseKind::AlwaysAllowForSession => {
@@ -10073,25 +10081,116 @@ impl PermissionRepository {
             }
             PermissionResponseKind::Deny => PermissionRequestStatus::Denied,
         };
-        conn.execute(
-            "
+        let updated = conn
+            .execute(
+                "
             UPDATE permission_requests
             SET status = ?3, resolution_json = ?4, resolved_at_ms = ?5
-            WHERE request_id = ?1 AND session_id = ?2
+            WHERE request_id = ?1 AND session_id = ?2 AND status = ?6
             ",
-            params![
-                resolution.request_id.as_str(),
-                resolution.session_id.as_str(),
-                enum_to_db(&status)?,
-                json_to_db(resolution)?,
-                resolution.resolved_at_ms
-            ],
-        )
-        .map_err(storage_err(
-            "permission_request_resolve_failed",
-            "failed to resolve permission request",
-        ))?;
+                params![
+                    resolution.request_id.as_str(),
+                    resolution.session_id.as_str(),
+                    enum_to_db(&status)?,
+                    json_to_db(resolution)?,
+                    resolution.resolved_at_ms,
+                    enum_to_db(&PermissionRequestStatus::Pending)?,
+                ],
+            )
+            .map_err(storage_err(
+                "permission_request_resolve_failed",
+                "failed to resolve permission request",
+            ))?;
+        if updated != 1 {
+            return Err(VibexError::conflict(
+                "permission_request_not_pending",
+                "permission request is no longer pending",
+            )
+            .with_diagnostic("requestId", resolution.request_id.as_str()));
+        }
         Ok(())
+    }
+
+    /// Expires one unanswered request without inventing an answer.
+    ///
+    /// Expiry is not a denial: the reader never decided, so no resolution JSON
+    /// is recorded. Clearing `Pending` is what unblocks every reader (it is the
+    /// only status a surface may still answer) and lets a runtime switch
+    /// waiting on that card make progress.
+    pub fn expire(
+        conn: &Connection,
+        request_id: &RequestId,
+        session_id: &VibexSessionId,
+        resolved_at_ms: i64,
+    ) -> VibexResult<bool> {
+        let updated = conn
+            .execute(
+                "
+            UPDATE permission_requests
+            SET status = ?3, resolved_at_ms = ?4, resolution_json = NULL
+            WHERE request_id = ?1 AND session_id = ?2 AND status = ?5
+            ",
+                params![
+                    request_id.as_str(),
+                    session_id.as_str(),
+                    enum_to_db(&PermissionRequestStatus::Expired)?,
+                    resolved_at_ms,
+                    enum_to_db(&PermissionRequestStatus::Pending)?,
+                ],
+            )
+            .map_err(storage_err(
+                "permission_request_expire_failed",
+                "failed to expire permission request",
+            ))?;
+        Ok(updated == 1)
+    }
+
+    /// Lists the `Pending` requests of every session whose deadline has passed.
+    ///
+    /// The reaper sweeps across sessions, so it needs one query rather than one
+    /// per session. `limit` keeps a huge backlog from holding the connection for
+    /// an unbounded time.
+    pub fn list_pending_expired(
+        conn: &Connection,
+        now_ms: i64,
+        limit: usize,
+    ) -> VibexResult<Vec<PermissionRequest>> {
+        let pending = enum_to_db(&PermissionRequestStatus::Pending)?;
+        let mut stmt = conn
+            .prepare(
+                "
+                SELECT request_id, session_id, project_id, workspace_id, provider_request_id,
+                    risk_category, title, details_json, allowed_responses_json, status,
+                    requested_at_ms, expires_at_ms, response_options_json
+                FROM permission_requests
+                WHERE status = ?1
+                  AND expires_at_ms IS NOT NULL AND expires_at_ms <= ?2
+                ORDER BY expires_at_ms ASC
+                LIMIT ?3
+                ",
+            )
+            .map_err(storage_err(
+                "permission_request_list_failed",
+                "failed to list permission requests",
+            ))?;
+        let rows = stmt
+            .query_map(
+                params![pending, now_ms, limit as i64],
+                map_permission_request,
+            )
+            .map_err(storage_err(
+                "permission_request_list_failed",
+                "failed to list permission requests",
+            ))?;
+
+        let mut requests = Vec::new();
+        for row in rows {
+            requests.push(row.map_err(storage_err(
+                "permission_request_decode_failed",
+                "failed to decode permission request",
+            ))?);
+        }
+        Ok(requests)
     }
 
     pub fn pending_for_session(
@@ -25152,6 +25251,25 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+        // Resolving is a pending-only compare-and-set: a second answer must not
+        // overwrite the one the reader already gave.
+        assert_eq!(
+            PermissionRepository::resolve(
+                &conn,
+                &PermissionResolution {
+                    request_id: request.id.clone(),
+                    session_id: session.id.clone(),
+                    response: PermissionResponseKind::Deny,
+                    responder_device_id: None,
+                    provider_resolution_id: None,
+                    note: None,
+                    resolved_at_ms: unix_timestamp_ms(),
+                },
+            )
+            .unwrap_err()
+            .code,
+            "permission_request_not_pending"
+        );
 
         let elicitation = ElicitationRequest {
             id: RequestId::new(),
@@ -27236,6 +27354,163 @@ mod tests {
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(path.with_extension("db-wal"));
         let _ = fs::remove_file(path.with_extension("db-shm"));
+    }
+}
+
+#[cfg(test)]
+mod permission_lifecycle_tests {
+    use super::*;
+
+    fn temp_db_path(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "vibex-db-{label}-{}.db",
+            vibex_core::RequestId::new().as_str()
+        ))
+    }
+
+    fn cleanup_db(path: PathBuf) {
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(path.with_extension("db-wal"));
+        let _ = fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    fn seeded_session(conn: &Connection, label: &str) -> VibexSessionId {
+        let workspace_root = std::env::temp_dir().join(format!(
+            "vibex-db-permission-{label}-{}",
+            RequestId::new().as_str()
+        ));
+        let (_project, workspace) =
+            WorkspaceRepository::ensure(conn, &workspace_root, WorkspaceMode::CurrentCheckout)
+                .unwrap();
+        let now = unix_timestamp_ms();
+        let session = AgentSession {
+            id: VibexSessionId::new(),
+            title: format!("permission lifecycle {label}"),
+            project_id: workspace.project_id.clone(),
+            workspace_id: workspace.id.clone(),
+            workspace_root: workspace.root_path.clone(),
+            workspace_mode: workspace.mode,
+            agent_id: AgentId::parse("claude-code").unwrap(),
+            state: AgentSessionState::Idle,
+            safety: AgentSessionSafety::workspace_write_ask_on_risk(),
+            created_at_ms: now,
+            updated_at_ms: now,
+            last_message_at_ms: now,
+            archived_at_ms: None,
+            deleted_at_ms: None,
+            tools: Default::default(),
+            transport: vibex_core::SessionTransport::Acp,
+            terminal: None,
+        };
+        SessionRepository::insert(conn, &session).unwrap();
+        session.id
+    }
+
+    fn request(
+        session_id: &VibexSessionId,
+        requested_at_ms: i64,
+        expires_at_ms: Option<i64>,
+    ) -> PermissionRequest {
+        PermissionRequest {
+            id: RequestId::new(),
+            session_id: session_id.clone(),
+            project_id: None,
+            workspace_id: None,
+            provider_request_id: None,
+            risk_category: vibex_core::PermissionRiskCategory::Command,
+            title: "Run a command".to_string(),
+            details: Vec::new(),
+            allowed_responses: vec![
+                PermissionResponseKind::Approve,
+                PermissionResponseKind::Deny,
+            ],
+            response_options: Vec::new(),
+            status: PermissionRequestStatus::Pending,
+            requested_at_ms,
+            expires_at_ms,
+        }
+    }
+
+    /// A pending-only write is what stops a second answer from overwriting the
+    /// first, and expiry has to be its own terminal status.
+    #[test]
+    fn resolve_is_pending_only_and_expire_clears_the_card_without_an_answer() {
+        let temp = temp_db_path("permission-cas");
+        let mut conn = open_database(&temp).unwrap();
+        apply_migrations(&mut conn).unwrap();
+        let session_id = seeded_session(&conn, "cas");
+
+        let first = request(&session_id, 100, None);
+        PermissionRepository::insert_request(&conn, &first).unwrap();
+        let approved = PermissionResolution {
+            request_id: first.id.clone(),
+            session_id: session_id.clone(),
+            response: PermissionResponseKind::Approve,
+            responder_device_id: None,
+            provider_resolution_id: None,
+            note: None,
+            resolved_at_ms: 200,
+        };
+        PermissionRepository::resolve(&conn, &approved).unwrap();
+        let resolve_again = PermissionResolution {
+            response: PermissionResponseKind::Deny,
+            resolved_at_ms: 300,
+            ..approved.clone()
+        };
+        assert_eq!(
+            PermissionRepository::resolve(&conn, &resolve_again)
+                .unwrap_err()
+                .code,
+            "permission_request_not_pending"
+        );
+        assert_eq!(
+            PermissionRepository::get_request(&conn, &first.id)
+                .unwrap()
+                .unwrap()
+                .status,
+            PermissionRequestStatus::Approved,
+            "the reader's first answer must survive the race"
+        );
+
+        let expiring = request(&session_id, 100, Some(1_000));
+        let not_yet_due = request(&session_id, 100, Some(9_000));
+        let no_deadline = request(&session_id, 100, None);
+        for pending in [&expiring, &not_yet_due, &no_deadline] {
+            PermissionRepository::insert_request(&conn, pending).unwrap();
+        }
+        let due = PermissionRepository::list_pending_expired(&conn, 2_000, 64).unwrap();
+        assert_eq!(
+            due.iter()
+                .map(|request| request.id.clone())
+                .collect::<Vec<_>>(),
+            vec![expiring.id.clone()],
+            "only a card whose own deadline passed is due"
+        );
+        assert!(
+            PermissionRepository::expire(&conn, &expiring.id, &session_id, 2_000).unwrap(),
+            "the first sweep owns the status change"
+        );
+        assert!(
+            !PermissionRepository::expire(&conn, &expiring.id, &session_id, 2_100).unwrap(),
+            "a second sweep must not rewrite a card somebody else already settled"
+        );
+        let expired = PermissionRepository::get_request(&conn, &expiring.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(expired.status, PermissionRequestStatus::Expired);
+        assert_eq!(expired.requested_at_ms, 100);
+
+        let all_due = PermissionRepository::list_pending_expired(&conn, 10_000, 64).unwrap();
+        assert_eq!(
+            all_due
+                .iter()
+                .map(|request| request.id.clone())
+                .collect::<Vec<_>>(),
+            vec![not_yet_due.id.clone()],
+            "the cross-session sweep skips cards a producer left without a deadline"
+        );
+
+        cleanup_db(temp);
     }
 }
 

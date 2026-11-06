@@ -2204,10 +2204,67 @@ impl RuntimeSwitchRepository {
                 now,
             )?;
         }
+        Self::project_active_work_phase(&tx, switch_id, next, now)?;
         tx.commit().map_err(storage_err(
             "runtime_switch_advance_transaction_failed",
             "failed to commit runtime switch advance transaction",
         ))
+    }
+
+    /// Persists the product-level phase that the active-work wait implies.
+    ///
+    /// The session's `runtime_selection_status` column used to stay
+    /// `Preparing` for the whole `Reserved`/`WaitingForIdle` stretch, and only
+    /// the in-memory projection in `RuntimeSelectionService` knew the switch
+    /// was waiting for the current work. Every other reader — startup
+    /// reconciliation, a second process, a debugging query — therefore saw a
+    /// switch that looked like it was already preparing a target. Writing the
+    /// phase here keeps the durable row honest, so a `WaitingForCurrentWork`
+    /// banner and a client-side cancel affordance can be decided from SQLite
+    /// alone.
+    fn project_active_work_phase(
+        tx: &rusqlite::Transaction<'_>,
+        switch_id: &RuntimeSwitchId,
+        next: RuntimeSwitchStatus,
+        now: i64,
+    ) -> VibexResult<()> {
+        let phase = match next {
+            RuntimeSwitchStatus::WaitingForIdle => {
+                Some(SessionRuntimeSelectionStatus::WaitingForCurrentWork)
+            }
+            RuntimeSwitchStatus::Preparing => Some(SessionRuntimeSelectionStatus::Preparing),
+            _ => None,
+        };
+        let Some(phase) = phase else {
+            return Ok(());
+        };
+        let session_id: Option<String> = tx
+            .query_row(
+                "SELECT session_id FROM runtime_switches WHERE switch_id = ?1",
+                params![switch_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(storage_err(
+                "runtime_switch_advance_failed",
+                "failed to load runtime switch session for phase projection",
+            ))?;
+        let Some(session_id) = session_id else {
+            return Ok(());
+        };
+        tx.execute(
+            "UPDATE agent_sessions
+             SET runtime_selection_status = ?2, runtime_selection_error_code = NULL,
+                 updated_at_ms = ?3
+             WHERE session_id = ?1 AND pending_switch_id = ?4
+               AND deleted_at_ms IS NULL",
+            params![session_id, enum_to_db(&phase)?, now, switch_id.as_str(),],
+        )
+        .map_err(storage_err(
+            "runtime_switch_advance_failed",
+            "failed to project the runtime switch active-work phase",
+        ))?;
+        Ok(())
     }
 
     /// Finalizes the stable target binding while a newly reserved switch has
@@ -10154,6 +10211,92 @@ mod tests {
         assert_eq!(
             SwitchOperationJournalRepository::max_sequence(&conn, &reserved.switch_id).unwrap(),
             Some(2)
+        );
+        cleanup_db(temp);
+    }
+
+    /// The durable phase must agree with what the switch is actually doing.
+    ///
+    /// Leaving the column at `Preparing` for the whole wait made every reader
+    /// that is not the in-memory projection — startup reconciliation, another
+    /// process, an operator querying SQLite — believe a target was already being
+    /// prepared while the turn was still running. The row is the only thing a
+    /// client can re-read, so the wait has to be in it.
+    #[test]
+    fn active_work_wait_projects_waiting_phase_into_the_session_row() {
+        let temp = temp_db_path("active-work-phase-projection");
+        let mut conn = open_database(&temp).unwrap();
+        apply_migrations(&mut conn).unwrap();
+        let session_id = seeded_session(&conn, "active-work-phase-projection");
+        seed_runtime_selection(&conn, &session_id, &sample_selection());
+        let mut request = desired_enqueue_request(
+            &session_id,
+            "active-work-phase",
+            0,
+            selection_with_model("claude-opus-4-1"),
+        );
+        request.expected_revision = 0;
+        let enqueued = AgentSessionRuntimeRepository::enqueue_desired_switch(
+            &mut conn,
+            RuntimeSwitchId::new(),
+            &request,
+        )
+        .unwrap();
+        let DesiredRuntimeSwitchEnqueueResult::Enqueued(record) = enqueued else {
+            panic!("a changed desired selection must enqueue a switch");
+        };
+        assert_eq!(record.status, RuntimeSwitchStatus::Requested);
+        assert_eq!(
+            AgentSessionRuntimeRepository::get_runtime_state(&conn, &session_id)
+                .unwrap()
+                .unwrap()
+                .runtime_selection_status,
+            Some(SessionRuntimeSelectionStatus::Preparing)
+        );
+
+        assert_eq!(
+            RuntimeSwitchRepository::claim_requested(&mut conn, &record.switch_id).unwrap(),
+            RequestedSwitchClaimOutcome::Claimed
+        );
+        RuntimeSwitchRepository::advance_status(
+            &conn,
+            &record.switch_id,
+            RuntimeSwitchStatus::Reserved,
+            RuntimeSwitchStatus::WaitingForIdle,
+        )
+        .unwrap();
+        assert_eq!(
+            AgentSessionRuntimeRepository::get_runtime_state(&conn, &session_id)
+                .unwrap()
+                .unwrap()
+                .runtime_selection_status,
+            Some(SessionRuntimeSelectionStatus::WaitingForCurrentWork),
+            "a session waiting for its current turn must say so in SQLite"
+        );
+
+        RuntimeSwitchRepository::advance_status(
+            &conn,
+            &record.switch_id,
+            RuntimeSwitchStatus::WaitingForIdle,
+            RuntimeSwitchStatus::Preparing,
+        )
+        .unwrap();
+        assert_eq!(
+            AgentSessionRuntimeRepository::get_runtime_state(&conn, &session_id)
+                .unwrap()
+                .unwrap()
+                .runtime_selection_status,
+            Some(SessionRuntimeSelectionStatus::Preparing)
+        );
+
+        RuntimeSwitchRepository::cancel(&mut conn, &session_id, &record.switch_id).unwrap();
+        assert_eq!(
+            AgentSessionRuntimeRepository::get_runtime_state(&conn, &session_id)
+                .unwrap()
+                .unwrap()
+                .runtime_selection_status,
+            Some(SessionRuntimeSelectionStatus::Ready),
+            "a cancelled wait leaves the session on its effective runtime"
         );
         cleanup_db(temp);
     }

@@ -477,6 +477,19 @@ pub trait ActiveWorkGate: Send + Sync {
         kind: ActiveWorkKind,
         operation: &JournaledOperation,
     ) -> VibexResult<()>;
+
+    /// Withdraws user-input requests whose own deadline has passed.
+    ///
+    /// `pending_permission` covers more than a permission card (elicitation
+    /// forms and terminal-create approvals count too), and only a producer that
+    /// set a deadline owns an expiry. A switch holding its prompt gate closed
+    /// must still let time do its work on a card nobody can answer: the gate
+    /// stops new prompts, not the request's own lifecycle. Returning `true`
+    /// means at least one request expired, so the caller re-probes instead of
+    /// assuming its snapshot is still current.
+    async fn expire_user_input(&self, _session_id: &VibexSessionId) -> VibexResult<bool> {
+        Ok(false)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1284,6 +1297,25 @@ impl RuntimeSwitchCoordinator {
             self.cancel_active_work(intent, snapshot, owner).await?;
             snapshot = self.inner.active_work.probe(&intent.session_id).await?;
             self.reject_active_work(intent, snapshot)?;
+
+            if snapshot.pending_permission {
+                // The prompt gate is closed, so the only thing that can end a
+                // card-backed wait is the card's own lifecycle: the reader
+                // answers it, or its producer's deadline passes. Letting time
+                // run here is what keeps "waiting for current work" from
+                // becoming "waiting forever" when the card is unreachable —
+                // which is exactly the state a reader could not break while an
+                // approval was refused for the session the switch was leaving.
+                if self
+                    .inner
+                    .active_work
+                    .expire_user_input(&intent.session_id)
+                    .await?
+                {
+                    snapshot = self.inner.active_work.probe(&intent.session_id).await?;
+                    self.reject_active_work(intent, snapshot)?;
+                }
+            }
 
             let mut waiting = false;
             for kind in ACTIVE_WORK_KINDS {
@@ -2855,6 +2887,10 @@ mod tests {
         prompt_gate_events: Vec<bool>,
         cancel_calls: Vec<ActiveWorkKind>,
         cancel_supported: bool,
+        /// Whether the next `expire_user_input` releases the pending card, the
+        /// way a real producer's deadline would.
+        expire_releases_permission: bool,
+        expire_calls: usize,
     }
 
     impl MockActiveWorkGate {
@@ -2882,6 +2918,14 @@ mod tests {
 
         fn cancel_calls(&self) -> Vec<ActiveWorkKind> {
             self.state.lock().unwrap().cancel_calls.clone()
+        }
+
+        fn expire_on_next_probe(&self) {
+            self.state.lock().unwrap().expire_releases_permission = true;
+        }
+
+        fn expire_calls(&self) -> usize {
+            self.state.lock().unwrap().expire_calls
         }
     }
 
@@ -2916,6 +2960,21 @@ mod tests {
             }
             set_snapshot_kind(&mut state.snapshot, kind, false);
             Ok(())
+        }
+
+        async fn expire_user_input(&self, _session_id: &VibexSessionId) -> VibexResult<bool> {
+            let mut state = self.state.lock().unwrap();
+            state.expire_calls += 1;
+            if !state.expire_releases_permission {
+                return Ok(false);
+            }
+            state.expire_releases_permission = false;
+            set_snapshot_kind(
+                &mut state.snapshot,
+                ActiveWorkKind::PendingPermission,
+                false,
+            );
+            Ok(true)
         }
     }
 
@@ -3899,6 +3958,44 @@ mod tests {
             RuntimeSwitchStatus::Committed
         );
         assert_eq!(env.gate.prompt_gate_events().last(), Some(&false));
+    }
+
+    /// A card-backed wait lets the card's own deadline end the blocker.
+    ///
+    /// The reported loop: the switch holds its prompt gate closed, the turn is
+    /// parked on a permission whose answer is refused, and neither side can
+    /// move. A switch must not itself answer a reader's card, but it must let
+    /// time do it — the request's expiry is what turns "waiting for current
+    /// work" back into progress.
+    #[tokio::test]
+    async fn a_waiting_switch_expires_an_unanswerable_permission_instead_of_stalling() {
+        let env = TestEnvironment::new("waiting-expires-permission");
+        env.gate.set_active(ActiveWorkKind::ActiveTurn, true);
+        env.gate.set_active(ActiveWorkKind::PendingPermission, true);
+        let mut request = env.request("waiting-expires-permission");
+        request.active_work_policy.pending_permission = BusyDisposition::Wait { deadline_ms: 500 };
+        request.active_work_policy.active_turn = BusyDisposition::Wait { deadline_ms: 500 };
+        env.gate.expire_on_next_probe();
+
+        // The real chain: expiry ends the card, the blocked turn then finishes.
+        let gate = env.gate.clone();
+        let turn_release = tokio::spawn(async move {
+            for _ in 0..200 {
+                if gate.expire_calls() > 0 {
+                    gate.set_active(ActiveWorkKind::ActiveTurn, false);
+                    return;
+                }
+                sleep(Duration::from_millis(2)).await;
+            }
+        });
+
+        let outcome = env.coordinator.request_switch(request).await.unwrap();
+        turn_release.await.unwrap();
+        assert_eq!(outcome.status, RuntimeSwitchStatus::Committed);
+        assert!(
+            env.gate.expire_calls() > 0,
+            "the waiting phase must offer the request's own expiry a chance to run"
+        );
     }
 
     #[tokio::test]
