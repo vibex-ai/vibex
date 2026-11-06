@@ -183,10 +183,11 @@ use vibex_desktop_model::{
     composer_trigger_at, current_active_goal, current_agent_plan, custom_worktree_path_is_absolute,
     has_managed_child_agent_delegations, is_runtime_model_favorite, move_string_relative,
     move_strings_relative, ordered_agent_ids, parse_unified_diff, runtime_auth_source_use_count,
-    runtime_selection_use_count, sidebar_project_custom_logo_file_is_valid, sidebar_project_items,
-    sidebar_project_items_for_workspace, sidebar_project_projections_with_workspace_order_and_sort,
-    sidebar_root_items, split_share, timeline_agent_message_count_after_sequence,
-    timeline_conversation_turns, timeline_conversation_turns_with_leading_turn_start,
+    runtime_selection_use_count, sidebar_project_custom_logo_file_is_valid,
+    sidebar_project_items_for_workspace_with_sort, sidebar_project_items_with_sort,
+    sidebar_project_projections_with_workspace_order_and_sort, sidebar_root_items, split_share,
+    timeline_agent_message_count_after_sequence, timeline_conversation_turns,
+    timeline_conversation_turns_with_leading_turn_start,
     timeline_conversation_turns_with_reasoning_mode, timeline_row_delegation,
 };
 use vibex_desktop_runtime::DriverState;
@@ -19127,7 +19128,11 @@ impl VibexWorkbench {
             &mut ordered_project_ids,
             valid_project_ids.iter().cloned().collect(),
         );
-        let ordered_session_projects = self.ordered_sidebar_session_projects();
+        // The tree stores placements, not a sort. Aligning them to a field
+        // sort would turn a view choice into a manual arrangement, so
+        // reconciliation always follows the manual band.
+        let ordered_session_projects =
+            self.ordered_sidebar_session_projects_by(SidebarSessionSort::Manual);
         self.ui_state
             .sidebar
             .organization
@@ -20881,6 +20886,18 @@ impl VibexWorkbench {
     }
 
     fn ordered_sidebar_session_projects(&self) -> Vec<(String, String)> {
+        self.ordered_sidebar_session_projects_by(self.ui_state.sidebar.session_sort)
+    }
+
+    /// [`ordered_sidebar_session_projects`] in one explicit order.
+    ///
+    /// Reconciliation aligns the persisted placements and must always use the
+    /// manual band: a field sort is only a view, and letting it rewrite the
+    /// arrangement would lose the drag order the reader returns to.
+    fn ordered_sidebar_session_projects_by(
+        &self,
+        session_sort: SidebarSessionSort,
+    ) -> Vec<(String, String)> {
         let projected = sidebar_project_projections_with_workspace_order_and_sort(
             &self.workspaces,
             &self.sessions,
@@ -20890,7 +20907,7 @@ impl VibexWorkbench {
             self.ui_state.sidebar.session_order_anchored_at_ms,
             &self.ui_state.sidebar.workspace_order,
             &self.sidebar_state.pinned_ids,
-            self.ui_state.sidebar.session_sort,
+            session_sort,
             "",
         );
         let mut projected_scopes = BTreeMap::new();
@@ -22550,12 +22567,13 @@ impl VibexWorkbench {
             .iter()
             .map(|session| session.id.as_str().to_string())
             .collect::<Vec<_>>();
-        sidebar_project_items(
+        sidebar_project_items_with_sort(
             &self.ui_state.sidebar.organization,
             project_id,
             &session_ids,
             &self.sidebar_state.pinned_ids,
             parent_folder_id,
+            self.ui_state.sidebar.session_sort,
         )
     }
 
@@ -22569,7 +22587,7 @@ impl VibexWorkbench {
             .iter()
             .map(|session| session.id.as_str().to_string())
             .collect::<Vec<_>>();
-        sidebar_project_items_for_workspace(
+        sidebar_project_items_for_workspace_with_sort(
             &self.ui_state.sidebar.organization,
             project_id,
             None,
@@ -22579,6 +22597,7 @@ impl VibexWorkbench {
             &self.sidebar_group_ids_for_project(project_id),
             &self.sidebar_state.pinned_ids,
             parent_folder_id,
+            self.ui_state.sidebar.session_sort,
         )
     }
 
@@ -49734,7 +49753,7 @@ impl VibexWorkbench {
             .iter()
             .map(|session| session.id.as_str().to_string())
             .collect::<Vec<_>>();
-        let items = sidebar_project_items_for_workspace(
+        let items = sidebar_project_items_for_workspace_with_sort(
             &self.ui_state.sidebar.organization,
             &project_id,
             Some(&workspace_id),
@@ -49744,6 +49763,7 @@ impl VibexWorkbench {
             &self.sidebar_group_ids_for_workspace(&project_id, &workspace_id),
             &self.sidebar_state.pinned_ids,
             parent_folder_id.as_deref(),
+            self.ui_state.sidebar.session_sort,
         );
         let session_indices = projection
             .sessions
@@ -106232,6 +106252,13 @@ mod tests {
         // The projection receives the mode, so only session bands move.
         assert!(source.contains("sidebar_project_projections_with_workspace_order_and_sort("));
         assert!(source.contains("self.ui_state.sidebar.session_sort,"));
+
+        // Reconciliation persists the manual band, so looking at another sort
+        // never rewrites the arrangement the reader dragged.
+        assert!(
+            source
+                .contains("self.ordered_sidebar_session_projects_by(SidebarSessionSort::Manual);")
+        );
 
         // A drop switches to the manual order it just produced; a field sort
         // would otherwise undo the gesture on the next projection.

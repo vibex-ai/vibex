@@ -17,7 +17,7 @@ use vibex_core::{
 
 use crate::{
     NewSessionLocation, SidebarHierarchyMode, SidebarOrganizationItem, SidebarOrganizationScope,
-    SidebarOrganizationState, SidebarProjectAppearance,
+    SidebarOrganizationState, SidebarProjectAppearance, SidebarSessionSort,
 };
 
 /// The subset of sidebar view state a compact client needs to draw the tree.
@@ -1749,13 +1749,37 @@ pub fn sidebar_project_items(
     pinned_session_ids: &BTreeSet<String>,
     parent_folder_id: Option<&str>,
 ) -> Vec<SidebarOrganizationItem> {
+    sidebar_project_items_with_sort(
+        organization,
+        project_id,
+        session_ids,
+        pinned_session_ids,
+        parent_folder_id,
+        SidebarSessionSort::Manual,
+    )
+}
+
+/// [`sidebar_project_items`] with the reader's session order.
+///
+/// A field sort reorders the session slots that `session_ids` already carries,
+/// while a manual order keeps the persisted placements. Folders and groups stay
+/// where the reader arranged them either way, so switching the sort never
+/// rewrites the organization tree.
+pub fn sidebar_project_items_with_sort(
+    organization: &SidebarOrganizationState,
+    project_id: &str,
+    session_ids: &[String],
+    pinned_session_ids: &BTreeSet<String>,
+    parent_folder_id: Option<&str>,
+    session_sort: SidebarSessionSort,
+) -> Vec<SidebarOrganizationItem> {
     let group_ids = organization
         .groups
         .iter()
         .filter(|(_, group)| group.project_id == project_id)
         .map(|(id, _)| id.clone())
         .collect::<Vec<_>>();
-    sidebar_project_items_for_workspace(
+    sidebar_project_items_for_workspace_with_sort(
         organization,
         project_id,
         None,
@@ -1765,6 +1789,7 @@ pub fn sidebar_project_items(
         &group_ids,
         pinned_session_ids,
         parent_folder_id,
+        session_sort,
     )
 }
 
@@ -1784,6 +1809,34 @@ pub fn sidebar_project_items_for_workspace(
     group_ids: &[String],
     pinned_session_ids: &BTreeSet<String>,
     parent_folder_id: Option<&str>,
+) -> Vec<SidebarOrganizationItem> {
+    sidebar_project_items_for_workspace_with_sort(
+        organization,
+        project_id,
+        workspace_id,
+        include_legacy_project_folders,
+        include_all_workspace_folders,
+        session_ids,
+        group_ids,
+        pinned_session_ids,
+        parent_folder_id,
+        SidebarSessionSort::Manual,
+    )
+}
+
+/// [`sidebar_project_items_for_workspace`] with the reader's session order.
+#[allow(clippy::too_many_arguments)]
+pub fn sidebar_project_items_for_workspace_with_sort(
+    organization: &SidebarOrganizationState,
+    project_id: &str,
+    workspace_id: Option<&str>,
+    include_legacy_project_folders: bool,
+    include_all_workspace_folders: bool,
+    session_ids: &[String],
+    group_ids: &[String],
+    pinned_session_ids: &BTreeSet<String>,
+    parent_folder_id: Option<&str>,
+    session_sort: SidebarSessionSort,
 ) -> Vec<SidebarOrganizationItem> {
     // A session inside a group renders under its group row, so it is not also
     // offered as a sibling here. A caller that lists no groups — a compact
@@ -1834,12 +1887,52 @@ pub fn sidebar_project_items_for_workspace(
             .map(|id| SidebarOrganizationItem::Group(id.clone())),
     );
     let ordered = organization.ordered_children(parent_folder_id, &available);
+    // A field sort is a view over the same tree: sessions keep the slots their
+    // placements gave them, but the sessions filling those slots follow the
+    // reader's order. Rebuilding the placements instead would turn a glance at
+    // another sort into a manual arrangement and lose the drag order the reader
+    // returns to.
+    let ordered = if session_sort == SidebarSessionSort::Manual {
+        ordered
+    } else {
+        sidebar_items_in_session_order(ordered, &session_ids)
+    };
     let (pinned, rest): (Vec<_>, Vec<_>) = ordered.into_iter().partition(|item| match item {
         SidebarOrganizationItem::Session(id) => pinned_session_ids.contains(id),
         SidebarOrganizationItem::Group(id) => organization.group_is_pinned(id),
         _ => false,
     });
     pinned.into_iter().chain(rest).collect()
+}
+
+/// Fills the session slots of `items` with `session_order`.
+///
+/// Folder and group rows keep their places, so a sorted band still reads as the
+/// tree the reader arranged. Sessions missing from `session_order` keep the
+/// order their placements already gave them, after the named ones.
+fn sidebar_items_in_session_order(
+    items: Vec<SidebarOrganizationItem>,
+    session_order: &[String],
+) -> Vec<SidebarOrganizationItem> {
+    let positions = session_order
+        .iter()
+        .enumerate()
+        .map(|(index, id)| (id.as_str(), index))
+        .collect::<BTreeMap<_, _>>();
+    let mut slots = Vec::new();
+    let mut sessions = Vec::new();
+    for (index, item) in items.iter().enumerate() {
+        if let SidebarOrganizationItem::Session(id) = item {
+            slots.push(index);
+            sessions.push(id.clone());
+        }
+    }
+    sessions.sort_by_key(|id| positions.get(id.as_str()).copied().unwrap_or(usize::MAX));
+    let mut items = items;
+    for (slot, session_id) in slots.into_iter().zip(sessions) {
+        items[slot] = SidebarOrganizationItem::Session(session_id);
+    }
+    items
 }
 
 /// Which half of the sidebar view a mutation touched. The Desktop persists the
@@ -2143,6 +2236,63 @@ mod tests {
         assert_eq!(appearance.logo, crate::SidebarProjectLogo::Boxes);
         assert_eq!(appearance.color, crate::SidebarProjectLogoColor::Neutral);
         assert!(appearance.custom_logo_file.is_some());
+    }
+
+    #[test]
+    fn a_field_sort_refills_the_session_slots_without_rewriting_the_tree() {
+        let view = view_with_folder();
+        let session_order = ["session-b".to_string(), "session-a".to_string()];
+        let pinned = BTreeSet::new();
+        let session_ids = |items: &[SidebarOrganizationItem]| {
+            items
+                .iter()
+                .filter_map(|item| match item {
+                    SidebarOrganizationItem::Session(id) => Some(id.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        // The persisted placements are a manual arrangement: a then b. A
+        // manual sort is that arrangement, regardless of the projection order.
+        let manual = sidebar_project_items_with_sort(
+            &view.organization,
+            "project-1",
+            &session_order,
+            &pinned,
+            None,
+            SidebarSessionSort::Manual,
+        );
+        assert_eq!(session_ids(&manual), ["session-a", "session-b"]);
+
+        // A field sort fills those same slots in the projection's order and
+        // leaves the folder row where the reader put it.
+        let sorted = sidebar_project_items_with_sort(
+            &view.organization,
+            "project-1",
+            &session_order,
+            &pinned,
+            None,
+            SidebarSessionSort::Created,
+        );
+        assert_eq!(session_ids(&sorted), ["session-b", "session-a"]);
+        assert_eq!(
+            sorted.first(),
+            Some(&SidebarOrganizationItem::Folder("folder-1".into()))
+        );
+        // A glance at another sort is not a rearrangement: the placements the
+        // reader returns to are unchanged.
+        assert_eq!(
+            view.organization
+                .placements
+                .iter()
+                .filter_map(|placement| match &placement.item {
+                    SidebarOrganizationItem::Session(id) => Some(id.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            ["session-a", "session-b"]
+        );
     }
 
     #[test]
