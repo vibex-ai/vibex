@@ -2853,6 +2853,13 @@ struct TerminalRect {
     color: Hsla,
     /// `1.0` for a solid block; the shade ramp uses a fraction of the cell.
     opacity: f32,
+    /// Whether this rectangle may extend into the next cell when it repeats
+    /// there.
+    ///
+    /// Blocks are edge-to-edge and should merge into one quad. A Braille dot is
+    /// isolated inside its cell, so merging would bridge the gap between two
+    /// neighbouring dots.
+    merge_adjacent: bool,
 }
 
 /// A filled area inside one cell, in subcell units: `(x, y, columns, lines)`.
@@ -2862,6 +2869,8 @@ type TerminalSubcellFill = (u16, u16, u16, u16);
 struct TerminalCellGeometry {
     fills: Vec<TerminalSubcellFill>,
     opacity: f32,
+    /// Whether a repeated fill may be merged into the next cell's rectangle.
+    merge_adjacent: bool,
 }
 
 /// Geometry for a cell that must be painted rather than shaped.
@@ -2870,21 +2879,26 @@ struct TerminalCellGeometry {
 /// ink they carry. A solid block is one rectangle at full opacity; the shade
 /// ramp is one cell-covering rectangle at reduced opacity, which keeps a shaded
 /// region seamless instead of showing the gaps a stipple font leaves between
-/// cells. Quadrants and sextants return one rectangle per filled subcell.
+/// cells. Quadrants and sextants return one rectangle per filled subcell, and
+/// Braille patterns one small rectangle per raised dot.
 ///
-/// An empty result means the character is ordinary text.
+/// An empty result means the character is ordinary text. A Braille blank returns
+/// `Some` with no fills: it is one cell wide but draws nothing, and it must not
+/// fall through to the shaper as ordinary text.
 fn cell_geometry(cell: Option<&TerminalCellSnapshot>) -> Option<TerminalCellGeometry> {
     let ch = cell?.text.chars().next()?;
     if let Some(opacity) = shade_char_opacity(ch) {
         return Some(TerminalCellGeometry {
             fills: vec![(0, 0, 8, 24)],
             opacity,
+            merge_adjacent: true,
         });
     }
     if let Some(fill) = block_char_to_rect(ch) {
         return Some(TerminalCellGeometry {
             fills: vec![fill],
             opacity: 1.0,
+            merge_adjacent: true,
         });
     }
     if let Some(bits) = quadrant_char_to_filled_bits(ch) {
@@ -2900,6 +2914,7 @@ fn cell_geometry(cell: Option<&TerminalCellSnapshot>) -> Option<TerminalCellGeom
         return Some(TerminalCellGeometry {
             fills,
             opacity: 1.0,
+            merge_adjacent: true,
         });
     }
     if let Some(bits) = sextant_char_to_filled_bits(ch) {
@@ -2915,6 +2930,17 @@ fn cell_geometry(cell: Option<&TerminalCellSnapshot>) -> Option<TerminalCellGeom
         return Some(TerminalCellGeometry {
             fills,
             opacity: 1.0,
+            merge_adjacent: true,
+        });
+    }
+    if let Some(bits) = braille_char_to_dots(ch) {
+        return Some(TerminalCellGeometry {
+            fills: braille_dot_fills(bits),
+            opacity: 1.0,
+            // Every dot is separated from its neighbour by a gutter, and the
+            // gutter is part of the pattern; merging adjacent cells would turn
+            // a row of dots into a continuous bar.
+            merge_adjacent: false,
         });
     }
     None
@@ -3117,6 +3143,43 @@ fn sextant_char_to_filled_bits(ch: char) -> Option<u8> {
     Some((offset + 1 + u32::from(offset >= 20) + u32::from(offset >= 40)) as u8)
 }
 
+/// The raised dots of a Braille Pattern character.
+///
+/// U+2800..=U+28FF are not glyphs with outlines but a 2x4 dot matrix whose bit
+/// set is the character itself: bit 0 is dot 1 (top left), bit 3 is dot 4 (top
+/// right), bit 6 is dot 7 (bottom left) and bit 7 is dot 8 (bottom right).
+/// `None` for every other character, which keeps ordinary text out of
+/// [`braille_dot_fills`].
+fn braille_char_to_dots(ch: char) -> Option<u8> {
+    let offset = (ch as u32).checked_sub(0x2800)?;
+    (offset <= 0xFF).then_some(offset as u8)
+}
+
+/// The rectangles of one Braille cell's raised dots, in subcell units.
+///
+/// The 2x4 dots sit on a fixed lattice, so a run of `⣿` reads as a dot matrix
+/// at any font size instead of a solid block. Each dot is 2x3 units, leaving a
+/// gutter of the same size on each side.
+fn braille_dot_fills(bits: u8) -> Vec<TerminalSubcellFill> {
+    const DOTS: [(u16, u16); 8] = [
+        (1, 2),  // dot 1, top left
+        (1, 8),  // dot 2
+        (1, 14), // dot 3
+        (5, 2),  // dot 4, top right
+        (5, 8),  // dot 5
+        (5, 14), // dot 6
+        (1, 20), // dot 7, bottom left
+        (5, 20), // dot 8, bottom right
+    ];
+    const DOT_WIDTH: u16 = 2;
+    const DOT_HEIGHT: u16 = 3;
+    DOTS.into_iter()
+        .enumerate()
+        .filter(|(index, _)| bits & (1u8 << index) != 0)
+        .map(|(_, (x, y))| (x, y, DOT_WIDTH, DOT_HEIGHT))
+        .collect()
+}
+
 /// The fill a shade character stands in for, as a fraction of the cell.
 ///
 /// Fonts draw `░▒▓` as stipple patterns that leave gaps between cells; painting
@@ -3130,14 +3193,16 @@ fn shade_char_opacity(ch: char) -> Option<f32> {
     }
 }
 
-/// Whether a character is a box, block or geometric connector whose colour has
-/// to match its neighbours exactly to keep a border continuous.
+/// Whether a character is a box, block, Braille pattern or geometric connector
+/// whose colour has to match its neighbours exactly to keep a border or a
+/// picture continuous.
 fn is_decorative_character(ch: char) -> bool {
     matches!(
         ch as u32,
         0x2500..=0x257F   // Box Drawing
             | 0x2580..=0x259F // Block Elements
             | 0x25A0..=0x25FF // Geometric Shapes
+            | 0x2800..=0x28FF // Braille Patterns
             | 0x1FB00..=0x1FB3B // Legacy Computing sextants
             | 0xE0B0..=0xE0D7 // Powerline separators
     )
@@ -3506,13 +3571,15 @@ fn shape_terminal_row(
             continue;
         }
 
-        // Blocks, quadrants, sextants and the shade ramp are drawn as
-        // rectangles rather than shaped: their whole point is to cover their
+        // Blocks, quadrants, sextants, Braille dots and the shade ramp are drawn
+        // as rectangles rather than shaped: their whole point is to cover their
         // cell edge to edge, and a glyph from a vector font never does that the
         // same way twice. Recording them as geometry is what keeps a border
-        // continuous and a logo made of half blocks legible.
+        // continuous, a logo made of half blocks legible and a Braille pattern
+        // readable even when no installed font covers it.
         if let Some(geometry) = cell_geometry(cell) {
             let opacity = geometry.opacity;
+            let merge_adjacent = geometry.merge_adjacent;
             flush_pending_run(
                 &mut layout.runs,
                 pending.take(),
@@ -3523,12 +3590,14 @@ fn shape_terminal_row(
                 window,
             );
             for fill in geometry.fills {
-                // Adjacent subcells of the same colour merge, so a line of
-                // full blocks is one quad rather than one per cell.
+                // Adjacent edge-to-edge fills of the same colour merge, so a
+                // line of full blocks is one quad rather than one per cell.
                 if let Some(last) = layout.rects.last_mut()
                     && last.fill == fill
                     && last.color == foreground
                     && last.opacity == opacity
+                    && last.merge_adjacent
+                    && merge_adjacent
                     && last.column + 1 == column
                 {
                     last.columns = last.columns.saturating_add(1);
@@ -3541,6 +3610,7 @@ fn shape_terminal_row(
                     fill,
                     color: foreground,
                     opacity,
+                    merge_adjacent,
                 });
             }
             continue;
@@ -3907,7 +3977,8 @@ fn paint_terminal_grid_masked(
     }
 }
 
-/// Paint the block, quadrant and sextant rectangles recorded during prepaint.
+/// Paint the block, quadrant, sextant and Braille rectangles recorded during
+/// prepaint.
 ///
 /// The subcell grid is 8 columns by 24 lines, the least common multiple of the
 /// eighth-block splits and the sextant splits, so every rectangle lands on a
@@ -4491,6 +4562,28 @@ mod tests {
     use super::*;
     use gpui::{TestAppContext, VisualTestContext};
     use std::{cell::Cell, rc::Rc};
+
+    /// A one-cell snapshot for the pure geometry tests.
+    fn test_cell(text: &str) -> TerminalCellSnapshot {
+        TerminalCellSnapshot {
+            row: 0,
+            column: 0,
+            text: text.to_string(),
+            foreground: TerminalCellColor::Named { index: 7 },
+            background: TerminalCellColor::Named { index: 0 },
+            bold: false,
+            dim: false,
+            italic: false,
+            underline: false,
+            inverse: false,
+            hidden: false,
+            strikeout: false,
+            wide: false,
+            wide_spacer: false,
+            selected: false,
+            hyperlink: None,
+        }
+    }
 
     /// Opens a terminal surface whose frame already holds styled output:
     /// `underlined` is underlined, `red` sits on the ANSI red background and the
@@ -5107,6 +5200,62 @@ mod tests {
         assert!(is_decorative_character('▶'));
         assert!(is_decorative_character('\u{E0B0}'));
         assert!(!is_decorative_character('a'));
+    }
+
+    #[test]
+    fn braille_patterns_paint_as_dot_matrices() {
+        // The code point itself is the dot mask; U+2800 is a blank cell and
+        // must stay geometry so it paints nothing instead of a missing glyph.
+        assert_eq!(braille_char_to_dots('⠀'), Some(0));
+        assert_eq!(braille_char_to_dots('⠁'), Some(0b0000_0001));
+        assert_eq!(braille_char_to_dots('⣿'), Some(0xFF));
+        assert_eq!(braille_char_to_dots('⣴'), Some(('⣴' as u32 - 0x2800) as u8));
+        assert_eq!(braille_char_to_dots('\u{27FF}'), None);
+        assert_eq!(braille_char_to_dots('\u{2900}'), None);
+        assert_eq!(braille_char_to_dots('a'), None);
+
+        assert!(braille_dot_fills(0).is_empty());
+
+        let all = braille_dot_fills(0xFF);
+        assert_eq!(all.len(), 8);
+        for &(column, line, width, height) in &all {
+            assert_eq!((width, height), (2, 3));
+            assert!(column + width <= 8, "dot leaves the cell: {column}");
+            assert!(line + height <= 24, "dot leaves the cell: {line}");
+        }
+        let positions = all
+            .iter()
+            .map(|&(column, line, _, _)| (column, line))
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(positions.len(), 8, "dots must not share a cell slot");
+
+        // Unicode order: dots 1-3 run down the left, 4-6 down the right, then
+        // 7 and 8 along the bottom.
+        assert_eq!(braille_dot_fills(0b0000_0001), vec![(1, 2, 2, 3)]);
+        assert_eq!(braille_dot_fills(0b0000_1000), vec![(5, 2, 2, 3)]);
+        assert_eq!(braille_dot_fills(0b0100_0000), vec![(1, 20, 2, 3)]);
+        assert_eq!(braille_dot_fills(0b1000_0000), vec![(5, 20, 2, 3)]);
+
+        // Braille art is decorative: its ink keeps the program's exact colour
+        // instead of being lifted for contrast.
+        assert!(is_decorative_character('⣿'));
+        assert!(!is_decorative_character('\u{27FF}'));
+
+        // Geometry, not text: the cell returns its dots directly, and a blank
+        // Braille cell stays geometry so it paints nothing.
+        let filled = cell_geometry(Some(&test_cell("⣿"))).expect("braille is geometry");
+        assert_eq!(filled.fills.len(), 8);
+        assert!(!filled.merge_adjacent, "dots must not merge across cells");
+
+        let blank = cell_geometry(Some(&test_cell("⠀"))).expect("blank braille is geometry");
+        assert!(blank.fills.is_empty());
+
+        assert!(
+            cell_geometry(Some(&test_cell("█")))
+                .expect("block is geometry")
+                .merge_adjacent
+        );
+        assert!(cell_geometry(Some(&test_cell("a"))).is_none());
     }
 
     #[test]
