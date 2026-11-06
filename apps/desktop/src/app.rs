@@ -824,6 +824,12 @@ const AGENT_TIMELINE_STREAMING_SHRINK_EPSILON_PX: f32 = 1.0;
 /// How long a completion probe that already ran for a revision is left alone
 /// before the same revision may be probed again.
 const AUTO_CONTINUE_PROBE_RETRY_BACKOFF: Duration = Duration::from_secs(1);
+/// How long a failed runtime catalogue read waits before its one retry.
+///
+/// Startup writes discovery rows and runs option probes beside the first
+/// catalogue read. A short delay lets those settle instead of racing the same
+/// transient failure twice in the same frame.
+const AGENT_CATALOG_RETRY_BACKOFF: Duration = Duration::from_millis(400);
 /// Attempts one revision's completion probe gets before an answer that could
 /// not judge it is accepted as the verdict.
 ///
@@ -10707,6 +10713,18 @@ pub struct VibexWorkbench {
     event_task: Option<Task<()>>,
     agent_overview_task: Option<Task<()>>,
     agent_catalog_task: Option<Task<()>>,
+    /// The one delayed retry of a failed runtime catalogue read.
+    ///
+    /// The read can lose a transient race with the migrations and option probes
+    /// the runtime is running while the window opens. Without a retry the shell
+    /// keeps the provisional catalogue — options with no effort, mode or
+    /// feature — until the process restarts, which the reader sees as every
+    /// Agent having lost its run options.
+    agent_catalog_retry_task: Option<Task<()>>,
+    /// Whether the one retry has already been scheduled for this chain of
+    /// catalogue reads. It clears on success and on a fresh request, so a later
+    /// failure is retried again, but one failed chain cannot loop.
+    agent_catalog_retry_pending: bool,
     runtime_authentication_task: Option<Task<()>>,
     agent_overview_generation: u64,
     agent_catalog_generation: u64,
@@ -12235,6 +12253,8 @@ impl VibexWorkbench {
             event_task: None,
             agent_overview_task: None,
             agent_catalog_task: None,
+            agent_catalog_retry_task: None,
+            agent_catalog_retry_pending: false,
             runtime_authentication_task: None,
             agent_overview_generation: 0,
             agent_catalog_generation: 0,
@@ -18418,10 +18438,16 @@ impl VibexWorkbench {
                                 "Configured runtime catalog unavailable ({}: {})",
                                 error.code, error.message
                             ));
+                            // This read is only the provisional half. A failure
+                            // here must not leave the selectors on a catalogue
+                            // without probe evidence: the runtime catalogue is a
+                            // separate read and that is the one carrying it.
+                            this.load_agent_runtime_catalog(cx);
                         }
                         Err(error) => {
                             this.runtime_note_error =
                                 Some(format!("configured runtime catalog task failed: {error}"));
+                            this.load_agent_runtime_catalog(cx);
                         }
                     }
                     cx.notify();
@@ -18745,9 +18771,17 @@ impl VibexWorkbench {
                                 this.agent_loading = false;
                                 this.finish_startup_loading(cx);
                             }
-                            if this.agent_catalog_generation == catalog_generation {
-                                this.load_agent_runtime_catalog(cx);
-                            }
+                            // The provider read this overview just installed is
+                            // authoritative for the pairs the catalogue is
+                            // built from, and a catalogue read started before it
+                            // may carry the previous configuration. Enrich
+                            // unconditionally: the read is independent of this
+                            // snapshot, and a newer configured catalogue still in
+                            // flight is superseded rather than silently skipped.
+                            // Skipping it was how a provisional catalogue with no
+                            // probe evidence survived when the provider events
+                            // and the overview overlapped.
+                            this.load_agent_runtime_catalog(cx);
                         }
                         Ok(Err(error)) => {
                             if this.sessions.is_empty() && this.timeline.session_id.is_none() {
@@ -18882,7 +18916,18 @@ impl VibexWorkbench {
         ));
     }
 
+    /// Read the authoritative runtime catalogue, superseding any pending retry.
     fn load_agent_runtime_catalog(&mut self, cx: &mut Context<Self>) {
+        // A fresh request is newer than the retry it may find scheduled: the
+        // retry answers the same question, so cancel it and let this read
+        // re-arm the one retry if it fails.
+        self.agent_catalog_retry_pending = false;
+        self.agent_catalog_retry_task = None;
+        self.load_agent_runtime_catalog_inner(cx);
+    }
+
+    /// The shared read used by a fresh request and by its one retry.
+    fn load_agent_runtime_catalog_inner(&mut self, cx: &mut Context<Self>) {
         let Some(backend) = self.backend.clone() else {
             return;
         };
@@ -18901,6 +18946,7 @@ impl VibexWorkbench {
         });
         self.agent_catalog_task = Some(cx.spawn(
             async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let retry_entity = entity.clone();
                 let outcome = runner.await;
                 let _ = entity.update(cx, |this, cx| {
                     if this.agent_catalog_generation != generation {
@@ -18908,6 +18954,8 @@ impl VibexWorkbench {
                     }
                     match outcome {
                         Ok(Ok(catalog)) => {
+                            this.agent_catalog_retry_pending = false;
+                            this.agent_catalog_retry_task = None;
                             this.runtime_catalog = Some(Rc::new(catalog));
                             if this.reconcile_new_session_runtime_selection()
                                 && this.new_session_open
@@ -18920,13 +18968,42 @@ impl VibexWorkbench {
                                 "Runtime catalog unavailable ({}: {})",
                                 error.code, error.message
                             ));
+                            this.schedule_agent_catalog_retry(retry_entity, cx);
                         }
                         Err(error) => {
                             this.runtime_note_error =
                                 Some(format!("Runtime catalog task failed: {error}"));
+                            this.schedule_agent_catalog_retry(retry_entity, cx);
                         }
                     }
                     cx.notify();
+                });
+            },
+        ));
+    }
+
+    /// Retry a failed catalogue read once, after the startup work beside it has
+    /// had a moment to settle.
+    ///
+    /// One retry only, and a fresh request clears the flag first: a transient
+    /// failure heals, while a backend that cannot answer at all cannot keep the
+    /// shell reading in a loop.
+    fn schedule_agent_catalog_retry(
+        &mut self,
+        entity: WeakEntity<Self>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.agent_catalog_retry_pending {
+            return;
+        }
+        self.agent_catalog_retry_pending = true;
+        self.agent_catalog_retry_task = Some(cx.spawn(
+            async move |_, cx: &mut gpui::AsyncApp| {
+                cx.background_executor()
+                    .timer(AGENT_CATALOG_RETRY_BACKOFF)
+                    .await;
+                let _ = entity.update(cx, |this, cx| {
+                    this.load_agent_runtime_catalog_inner(cx);
                 });
             },
         ));
@@ -114040,6 +114117,13 @@ mod tests {
         assert!(configured_catalog.contains("build_runtime_option_catalog_for_agents("));
         assert!(configured_catalog.contains("this.runtime_catalog.is_none()"));
         assert!(configured_catalog.contains("this.load_agent_runtime_catalog(cx);"));
+        assert!(
+            configured_catalog
+                .matches("this.load_agent_runtime_catalog(cx);")
+                .count()
+                >= 3,
+            "both configured-catalog failure branches must still enrich"
+        );
         assert!(!configured_catalog.contains("list_sessions("));
         assert!(!configured_catalog.contains("list_workspaces("));
         assert!(handler.contains("DesktopEvent::ProviderConfigChanged(event)"));
@@ -114047,6 +114131,60 @@ mod tests {
         assert!(handler.contains("self.load_agent_configured_catalog(cx)"));
         assert!(handler.contains("ProviderConfigChangePhase::RuntimeOptionsChanged"));
         assert!(handler.contains("self.load_agent_runtime_catalog(cx)"));
+    }
+
+    /// A provider event and the startup overview used to bump the catalogue
+    /// generation against each other. The overview then skipped its enrichment
+    /// read, and when the overlapping configured read failed the shell kept the
+    /// provisional catalogue — every Agent showing no thinking depth, mode or
+    /// feature until the process restarted.
+    #[test]
+    fn the_overview_never_skips_catalogue_enrichment() {
+        let source = include_str!("app.rs");
+        let overview = source
+            .split_once("    fn load_agent_overview(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn load_agent_runtime_catalog("))
+            .map(|(body, _)| body)
+            .expect("agent overview should remain inspectable");
+        let enrichment = overview
+            .find("this.load_agent_runtime_catalog(cx);")
+            .expect("the overview should enrich the catalogue");
+        let before = &overview[enrichment.saturating_sub(240)..enrichment];
+        assert!(
+            !before.contains("agent_catalog_generation == catalog_generation"),
+            "the overview still guards its enrichment on the shared generation"
+        );
+    }
+
+    /// A failed authoritative read is retried once, and a fresh request clears
+    /// that retry so the failure cannot leave the provisional catalogue in place
+    /// for the rest of the process.
+    #[test]
+    fn a_failed_catalogue_read_is_retried_once() {
+        let source = include_str!("app.rs");
+        let wrapper = source
+            .split_once("    fn load_agent_runtime_catalog(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn load_agent_runtime_catalog_inner("))
+            .map(|(body, _)| body)
+            .expect("the catalogue entry point should remain inspectable");
+        let inner = source
+            .split_once("    fn load_agent_runtime_catalog_inner(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn schedule_agent_catalog_retry("))
+            .map(|(body, _)| body)
+            .expect("the catalogue read should remain inspectable");
+        let retry = source
+            .split_once("    fn schedule_agent_catalog_retry(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn reconcile_new_session_runtime_selection("))
+            .map(|(body, _)| body)
+            .expect("the catalogue retry should remain inspectable");
+
+        assert!(wrapper.contains("self.agent_catalog_retry_pending = false;"));
+        assert!(wrapper.contains("self.load_agent_runtime_catalog_inner(cx);"));
+        assert!(inner.contains("this.schedule_agent_catalog_retry(retry_entity, cx);"));
+        assert!(inner.contains("this.agent_catalog_retry_pending = false;"));
+        assert!(retry.contains("AGENT_CATALOG_RETRY_BACKOFF"));
+        assert!(retry.contains("this.load_agent_runtime_catalog_inner(cx);"));
+        assert!(!retry.contains("load_agent_runtime_catalog(cx);"));
     }
 
     #[test]
