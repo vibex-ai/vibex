@@ -231,12 +231,22 @@ a `SESSION_TERMINAL_FRAME_INSET` gutter in the sidebar tone around
 `SESSION_TERMINAL_WINDOW_RADIUS` corners. `TerminalSurfaceMode::Session` therefore
 paints no background of its own (`paints_surface_background` is false): an opaque
 grid fill is a rectangle, and it would square off the corners the window cuts. The
-surface still keeps its own cell inset, so the window's arc never falls on a glyph.
+surface still keeps its own cell inset (`SESSION_TERMINAL_PADDING`, wider than the
+composer's inline inset), so the window's arc never falls on a glyph and the grid
+stops short of the frame on all four sides.
 
 The page draws no header. A terminal session's title, Agent and capability state
 already ride the title bar and the sidebar row; a second row repeating the title
 costs the grid height without telling the reader anything new. Status that has no
 home there belongs in the Agent's own TUI, which owns the window's whole body.
+
+A wheel over a program that reports its own mouse state (`modes.mouse_reporting`,
+unless shift is held for local scrollback) is forwarded as a mouse report, and that
+report must carry the cell under the pointer (`cell_at_position`, with the grid's
+middle as the fallback for the insets). A full-screen CLI hit-tests the wheel
+against its own layout: the transcript scrolls under the pointer and the header
+does not, so reporting every wheel at (0, 0) lands on the header and the reader
+sees a terminal that will not scroll.
 
 ### GPUI Button hover ownership
 

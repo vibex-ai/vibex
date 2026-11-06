@@ -82,6 +82,13 @@ const TERMINAL_SUBCELL_LINES: f32 = 24.0;
 // terminal does not gain standalone chrome or lose the expected content edge.
 const PREVIEW_TERMINAL_PADDING: f32 = 8.0;
 const COMPOSER_TERMINAL_PADDING: f32 = 4.0;
+/// The session page's inset inside its rounded window.
+///
+/// The page keeps a gutter of its own tone *around* the window; this is the
+/// breathing room *inside* it. Without it the first column sits on the window's
+/// edge and the corner arcs fall across glyphs, which reads as a clipped
+/// rectangle rather than a window the terminal sits in.
+const SESSION_TERMINAL_PADDING: f32 = 8.0;
 const TERMINAL_ACTIVE_POLL_INTERVAL: Duration = Duration::from_millis(16);
 const TERMINAL_IDLE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const TERMINAL_IDLE_POLL_THRESHOLD: u16 = 4;
@@ -134,7 +141,7 @@ impl TerminalSurfaceMode {
             Self::Standalone => TERMINAL_HORIZONTAL_PADDING,
             Self::Preview => PREVIEW_TERMINAL_PADDING,
             Self::Composer => COMPOSER_TERMINAL_PADDING,
-            Self::Session => COMPOSER_TERMINAL_PADDING,
+            Self::Session => SESSION_TERMINAL_PADDING,
         }
     }
 
@@ -143,7 +150,7 @@ impl TerminalSurfaceMode {
             Self::Standalone => TERMINAL_VERTICAL_PADDING,
             Self::Preview => PREVIEW_TERMINAL_PADDING,
             Self::Composer => COMPOSER_TERMINAL_PADDING,
-            Self::Session => COMPOSER_TERMINAL_PADDING,
+            Self::Session => SESSION_TERMINAL_PADDING,
         }
     }
 }
@@ -285,6 +292,11 @@ pub struct TerminalSurface {
     _subscriptions: Vec<Subscription>,
     #[cfg(test)]
     input_log: Vec<Vec<u8>>,
+    /// Mouse reports the surface handed to the program, in the order it sent
+    /// them. Tests read this instead of the PTY so a wheel's cell can be
+    /// asserted without a live program to echo it back.
+    #[cfg(test)]
+    mouse_log: Vec<TerminalMouseEvent>,
 }
 
 impl TerminalSurface {
@@ -600,6 +612,8 @@ impl TerminalSurface {
             _subscriptions: vec![focus_in, focus_out, window_activation],
             #[cfg(test)]
             input_log: Vec::new(),
+            #[cfg(test)]
+            mouse_log: Vec::new(),
         };
         this.install_search_subscription(window, cx);
         if this.foreground_active {
@@ -1588,16 +1602,20 @@ impl TerminalSurface {
         let Some((terminal_id, backend)) = self.active_runtime() else {
             return;
         };
-        let bytes = backend.lock().ok().and_then(|backend| {
-            backend.encode_mouse(TerminalMouseEvent {
-                kind,
-                button,
-                row: point.row,
-                column: point.column,
-                modifiers,
-            })
-        });
+        let event = TerminalMouseEvent {
+            kind,
+            button,
+            row: point.row,
+            column: point.column,
+            modifiers,
+        };
+        let bytes = backend
+            .lock()
+            .ok()
+            .and_then(|backend| backend.encode_mouse(event));
         if let Some(bytes) = bytes {
+            #[cfg(test)]
+            self.mouse_log.push(event);
             self.send_terminal_bytes(terminal_id, bytes, cx);
         }
     }
@@ -1617,13 +1635,15 @@ impl TerminalSurface {
             } else {
                 TerminalMouseKind::WheelDown
             };
-            self.send_mouse(
-                kind,
-                0,
-                TerminalGridPoint { row: 0, column: 0 },
-                terminal_modifiers(event.modifiers),
-                cx,
-            );
+            // The cell under the pointer, not the grid's origin: a full-screen
+            // program hit-tests the wheel like any other mouse event, so it
+            // scrolls only the region under the pointer and ignores a wheel
+            // reported at the top-left corner. Sending every wheel as (0, 0) is
+            // what made an Agent's transcript refuse to move.
+            let point = self
+                .cell_at_position(event.position)
+                .unwrap_or_else(|| self.scroll_report_cell());
+            self.send_mouse(kind, 0, point, terminal_modifiers(event.modifiers), cx);
             return;
         }
         // Whole lines only: the terminal's display offset is integral, so a
@@ -2077,6 +2097,24 @@ impl TerminalSurface {
                 });
             })
             .into_any_element()
+    }
+
+    /// The cell a wheel report falls back to when the pointer is outside them.
+    ///
+    /// The pointer can sit in the grid's own inset, or past the last row of a
+    /// program that has not painted its full height. The middle of the grid is
+    /// the safe guess: a program's top-left corner is usually its header, and a
+    /// wheel reported there moves nothing, which is the bug this avoids.
+    fn scroll_report_cell(&self) -> TerminalGridPoint {
+        let (rows, columns) = self
+            .active_tab
+            .and_then(|index| self.tabs.get(index))
+            .map(|tab| (tab.frame.rows(), tab.frame.columns()))
+            .unwrap_or((1, 1));
+        TerminalGridPoint {
+            row: rows.saturating_sub(1) / 2,
+            column: columns.saturating_sub(1) / 2,
+        }
     }
 
     /// The grid point under a window-space position, or `None` outside the cells.
@@ -3592,6 +3630,110 @@ mod tests {
         assert_ne!(foreground, background);
     }
 
+    /// A program that reports its own mouse state is told where the wheel
+    /// turned, not just that it did.
+    ///
+    /// A full-screen CLI hit-tests the wheel against its own layout: the
+    /// transcript scrolls only while the pointer is over the transcript, and a
+    /// wheel reported at the grid's top-left corner lands on the header and
+    /// moves nothing. Sending every wheel as cell (0, 0) is what made an Agent's
+    /// scrollback appear frozen.
+    #[gpui::test]
+    fn a_mouse_reporting_terminal_hears_the_wheel_at_the_pointer(cx: &mut TestAppContext) {
+        let (surface, mut cx) = styled_terminal_surface(cx);
+        // Turn mouse reporting on the way a full-screen program does.
+        surface.update(&mut cx, |surface, _| {
+            let tab = surface.tabs.first_mut().expect("terminal tab");
+            let session = tab.session.clone();
+            let data = b"\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h".to_vec();
+            // The helper already synced sequence 1, so the mode change arrives
+            // as the next chunk and is ingested rather than rejected as stale.
+            let snapshot = vibex_terminal::TerminalRawSnapshot {
+                session,
+                retained_bytes: data.len(),
+                chunks: vec![vibex_terminal::TerminalRawOutputChunk { sequence: 2, data }],
+                next_sequence: 3,
+                dropped_chunks: 0,
+            };
+            let mut backend = tab.backend.lock().expect("terminal backend");
+            backend.sync(&snapshot).expect("terminal sync");
+            let frame = backend.frame();
+            drop(backend);
+            tab.frame.force_full_repaint();
+            tab.frame.apply(&frame);
+            surface.mouse_log.clear();
+        });
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        assert!(
+            surface.read_with(&cx, |surface, _| surface.tabs[0]
+                .frame
+                .modes()
+                .mouse_reporting),
+            "the program has to be reporting the mouse for this to mean anything"
+        );
+
+        let (origin, metrics) = surface.read_with(&cx, |surface, _| {
+            (
+                surface.grid_bounds.expect("grid bounds").origin,
+                surface.cell_metrics,
+            )
+        });
+        let inside = |column: u16, row: u16| {
+            point(
+                origin.x + px((f32::from(column) + 0.5) * metrics.cell_width),
+                origin.y + px((f32::from(row) + 0.5) * metrics.cell_height),
+            )
+        };
+        let wheel = |cx: &mut VisualTestContext, position, lines: f32| {
+            cx.simulate_event(gpui::ScrollWheelEvent {
+                position,
+                delta: ScrollDelta::Lines(point(0.0, lines)),
+                modifiers: Default::default(),
+                touch_phase: gpui::TouchPhase::Moved,
+            });
+            cx.run_until_parked();
+        };
+
+        wheel(&mut cx, inside(3, 2), 3.0);
+        wheel(&mut cx, inside(20, 7), -3.0);
+
+        let log = surface.read_with(&cx, |surface, _| surface.mouse_log.clone());
+        assert_eq!(
+            log.iter()
+                .map(|event| (event.kind, event.row, event.column))
+                .collect::<Vec<_>>(),
+            vec![
+                (TerminalMouseKind::WheelUp, 2, 3),
+                (TerminalMouseKind::WheelDown, 7, 20),
+            ],
+            "each wheel report carries the cell the pointer was over: {log:?}"
+        );
+
+        // A wheel in the grid's own inset has no cell under it. The fallback is
+        // the middle of the grid, not the origin: a program's top-left corner is
+        // its header, and a report there scrolls nothing.
+        wheel(&mut cx, point(origin.x - px(1.0), origin.y - px(1.0)), 3.0);
+        let (rows, columns) = surface.read_with(&cx, |surface, _| {
+            (
+                surface.tabs[0].frame.rows(),
+                surface.tabs[0].frame.columns(),
+            )
+        });
+        let fallback = surface.read_with(&cx, |surface, _| surface.mouse_log.clone());
+        let last = fallback.last().expect("the inset wheel still reports");
+        assert_eq!(
+            (last.kind, last.row, last.column),
+            (
+                TerminalMouseKind::WheelUp,
+                rows.saturating_sub(1) / 2,
+                columns.saturating_sub(1) / 2
+            ),
+            "a wheel outside the cells lands in the middle of the grid: {last:?}"
+        );
+    }
+
     #[gpui::test]
     fn grid_maps_pointer_positions_to_cells(cx: &mut TestAppContext) {
         let (surface, mut cx) = styled_terminal_surface(cx);
@@ -3736,18 +3878,26 @@ mod tests {
     }
 
     /// A terminal-mode session gives the whole column to the Agent, so its
-    /// surface draws no tabs and no toolbar, and takes the compact inset.
+    /// surface draws no tabs and no toolbar, and keeps an inset of its own.
+    ///
+    /// The inset is what makes the rounded window read as a frame: the cells
+    /// stop short of the edge on all four sides, so the corner arcs fall on the
+    /// window's fill instead of on a glyph.
     #[test]
     fn a_session_terminal_draws_no_chrome() {
         assert!(!TerminalSurfaceMode::Session.shows_chrome());
         assert_eq!(
             TerminalSurfaceMode::Session.horizontal_padding(),
-            COMPOSER_TERMINAL_PADDING
+            SESSION_TERMINAL_PADDING
         );
         assert_eq!(
             TerminalSurfaceMode::Session.vertical_padding(),
-            COMPOSER_TERMINAL_PADDING
+            SESSION_TERMINAL_PADDING
         );
+        // The framed window needs more room than the composer's inline surface:
+        // a 4px inset still puts the corner arcs across the first and last
+        // cells.
+        assert_ne!(SESSION_TERMINAL_PADDING, COMPOSER_TERMINAL_PADDING);
     }
 
     /// The session page's surface stays transparent.
