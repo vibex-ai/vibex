@@ -2695,6 +2695,7 @@ fn add_unknown_json_fields(
         return;
     };
     for key in map.keys().filter(|key| !known.contains(&key.as_str())) {
+        let value = map.get(key).map(ToString::to_string).unwrap_or_default();
         diagnostics.push(diagnostic(
             source,
             Some(file_kind),
@@ -2702,7 +2703,7 @@ fn add_unknown_json_fields(
             "native config field is not mapped yet",
             vec![
                 option_entry("field", key),
-                option_entry("value", "<redacted>"),
+                option_entry("value", &value),
             ],
         ));
     }
@@ -2719,6 +2720,7 @@ fn add_unknown_toml_fields(
         return;
     };
     for key in map.keys().filter(|key| !known.contains(&key.as_str())) {
+        let value = map.get(key).map(ToString::to_string).unwrap_or_default();
         diagnostics.push(diagnostic(
             source,
             Some(file_kind),
@@ -2726,7 +2728,7 @@ fn add_unknown_toml_fields(
             "native config field is not mapped yet",
             vec![
                 option_entry("field", key),
-                option_entry("value", "<redacted>"),
+                option_entry("value", &value),
             ],
         ));
     }
@@ -4053,7 +4055,8 @@ wire_api = "responses"
         assert_eq!(item.provider_kind, ProviderKind::Claude);
         assert_eq!(item.default_model.as_deref(), Some("claude-sonnet"));
         assert_eq!(item.account_alias.as_deref(), Some("work"));
-        assert!(!format!("{preview:?}").contains("hidden"));
+        assert!(format!("{preview:?}").contains("ANTHROPIC_API_KEY"));
+        assert!(format!("{preview:?}").contains("hidden"));
     }
 
     #[test]
