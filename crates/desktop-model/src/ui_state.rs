@@ -14,7 +14,7 @@ use vibex_core::{
 
 use crate::{
     AgentSortStrategy, NewSessionLocation, SidebarHierarchyMode, SidebarOrganizationState,
-    ThemeSelection,
+    SidebarSessionSort, ThemeSelection,
 };
 
 pub const DESKTOP_UI_STATE_SCHEMA_VERSION: u32 = 1;
@@ -828,6 +828,13 @@ pub struct SidebarUiState {
     /// degrades to pure recency until the next deliberate arrangement.
     #[serde(default)]
     pub session_order_anchored_at_ms: i64,
+    /// How the session rows inside each project are ordered.
+    ///
+    /// Pinned sessions stay in their own band above the sorted rows. Legacy
+    /// state without this field opens in [`SidebarSessionSort::Created`],
+    /// which is the desktop's default.
+    #[serde(default, skip_serializing_if = "SidebarSessionSort::is_created")]
+    pub session_sort: SidebarSessionSort,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub workspace_order: BTreeMap<String, Vec<String>>,
     pub pinned_session_ids: BTreeSet<String>,
@@ -3582,6 +3589,31 @@ mod tests {
         );
         assert_eq!(restored.sidebar.project_order, vec!["project-legacy"]);
         assert!(restored.sidebar.authority_arrangements.is_empty());
+    }
+
+    #[test]
+    fn sidebar_session_sort_defaults_to_creation_and_round_trips() {
+        let default = SidebarUiState::default();
+        assert_eq!(default.session_sort, SidebarSessionSort::Created);
+        let encoded = serde_json::to_value(&default).unwrap();
+        assert!(encoded.get("sessionSort").is_none());
+
+        let mut state = SidebarUiState::default();
+        state.session_sort = SidebarSessionSort::Updated;
+        let encoded = serde_json::to_value(&state).unwrap();
+        assert_eq!(encoded["sessionSort"], serde_json::json!("updated"));
+        let restored: SidebarUiState = serde_json::from_value(encoded).unwrap();
+        assert_eq!(restored.session_sort, SidebarSessionSort::Updated);
+
+        // A state file written before the sort existed opens on the new default.
+        let legacy: SidebarUiState = serde_json::from_value(serde_json::json!({
+            "projectOrder": [],
+            "sessionOrder": [],
+            "pinnedSessionIds": [],
+            "collapsedProjectIds": [],
+        }))
+        .unwrap();
+        assert_eq!(legacy.session_sort, SidebarSessionSort::Created);
     }
 
     #[test]

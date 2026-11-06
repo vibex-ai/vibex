@@ -751,7 +751,7 @@ pub fn sidebar_project_projections(
     pinned_session_ids: &BTreeSet<String>,
     query: &str,
 ) -> Vec<SidebarProjectProjection> {
-    sidebar_project_projections_with_workspace_order(
+    sidebar_project_projections_with_workspace_order_and_sort(
         workspaces,
         sessions,
         contexts,
@@ -760,6 +760,7 @@ pub fn sidebar_project_projections(
         session_order_anchored_at_ms,
         &BTreeMap::new(),
         pinned_session_ids,
+        SidebarSessionSort::Manual,
         query,
     )
 }
@@ -774,6 +775,38 @@ pub fn sidebar_project_projections_with_workspace_order(
     session_order_anchored_at_ms: i64,
     workspace_order: &BTreeMap<String, Vec<String>>,
     pinned_session_ids: &BTreeSet<String>,
+    query: &str,
+) -> Vec<SidebarProjectProjection> {
+    sidebar_project_projections_with_workspace_order_and_sort(
+        workspaces,
+        sessions,
+        contexts,
+        project_order,
+        session_order,
+        session_order_anchored_at_ms,
+        workspace_order,
+        pinned_session_ids,
+        SidebarSessionSort::Manual,
+        query,
+    )
+}
+
+/// Projects the sidebar, ordering each session band by `session_sort`.
+///
+/// Project and workspace order are independent of the session sort: the
+/// reader's chosen session order only rearranges the rows inside a band, which
+/// is why a project never moves when the sort changes.
+#[allow(clippy::too_many_arguments)]
+pub fn sidebar_project_projections_with_workspace_order_and_sort(
+    workspaces: &[(ProjectRecord, WorkspaceRecord)],
+    sessions: &[AgentSession],
+    contexts: &BTreeMap<String, WorkspaceContextProjection>,
+    project_order: &[String],
+    session_order: &[String],
+    session_order_anchored_at_ms: i64,
+    workspace_order: &BTreeMap<String, Vec<String>>,
+    pinned_session_ids: &BTreeSet<String>,
+    session_sort: SidebarSessionSort,
     query: &str,
 ) -> Vec<SidebarProjectProjection> {
     let query = query.trim().to_lowercase();
@@ -884,11 +917,12 @@ pub fn sidebar_project_projections_with_workspace_order(
                     })
                     .cloned()
                     .collect::<Vec<_>>();
-                sort_sidebar_sessions(
+                sort_sidebar_sessions_by(
                     &mut workspace_sessions,
                     session_order,
                     session_order_anchored_at_ms,
                     pinned_session_ids,
+                    session_sort,
                 );
                 let agent_summary = WorkspaceAgentSummary::from_sessions(&workspace_sessions);
                 let context = contexts
@@ -941,11 +975,12 @@ pub fn sidebar_project_projections_with_workspace_order(
                 .iter()
                 .flat_map(|workspace| workspace.sessions.iter().cloned())
                 .collect::<Vec<_>>();
-            sort_sidebar_sessions(
+            sort_sidebar_sessions_by(
                 &mut compact_sessions,
                 session_order,
                 session_order_anchored_at_ms,
                 pinned_session_ids,
+                session_sort,
             );
             Some(SidebarProjectProjection {
                 row_id: format!("project:{}", project.id.as_str()),
@@ -957,23 +992,74 @@ pub fn sidebar_project_projections_with_workspace_order(
         .collect()
 }
 
-/// Sorts one sidebar session band. A session listed in `order` keeps its
-/// manual position only while it has been inactive since `anchored_at_ms`
-/// (the wall-clock of the last deliberate manual arrangement); a listed
-/// session active after that anchor re-sorts by recency as if newly
-/// discovered, so long-running conversations surface instead of sinking
-/// under stale manual entries. Sessions absent from `order` always sort by
-/// recency within the band. Pinned sessions stay in their own band above
-/// everything else.
+/// How a sidebar session band orders its unpinned rows.
 ///
-/// Every shell that draws a session band calls this — the Desktop's own tree,
-/// the compact clients mirroring it, and the character-grid client — so the
-/// order a reader arranged on one surface is the order the others show.
+/// Pinned sessions always stay in their own band above the sorted rows. The
+/// default is [`SidebarSessionSort::Created`]: opening the column is usually
+/// about the conversation that was just started, not the one that happened to
+/// receive a message most recently. [`SidebarSessionSort::Updated`] keeps the
+/// old recency stream, and [`SidebarSessionSort::Manual`] keeps the arrangement
+/// the reader made by dragging.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SidebarSessionSort {
+    #[default]
+    Created,
+    Updated,
+    Title,
+    Manual,
+}
+
+impl SidebarSessionSort {
+    /// The choices the desktop's sort section lists, in reading order.
+    pub const ALL: [Self; 4] = [Self::Created, Self::Updated, Self::Title, Self::Manual];
+
+    /// Whether this is the default mode, so the persisted state can omit it.
+    pub const fn is_created(&self) -> bool {
+        matches!(self, Self::Created)
+    }
+}
+
+/// Sorts one sidebar session band with the saved manual arrangement.
+///
+/// This is the compatibility entry point for shells without a sort selector;
+/// it preserves their existing behavior by choosing
+/// [`SidebarSessionSort::Manual`]. The desktop passes the reader's choice to
+/// [`sort_sidebar_sessions_by`] instead.
+///
+/// A session listed in `order` keeps its manual position only while it has
+/// been inactive since `anchored_at_ms` (the wall-clock of the last deliberate
+/// manual arrangement); a listed session active after that anchor re-sorts by
+/// recency as if newly discovered, so long-running conversations surface
+/// instead of sinking under stale manual entries. Sessions absent from `order`
+/// always sort by recency within the band. Pinned sessions stay in their own
+/// band above everything else.
 pub fn sort_sidebar_sessions(
     sessions: &mut [AgentSession],
     order: &[String],
     anchored_at_ms: i64,
     pinned: &BTreeSet<String>,
+) {
+    sort_sidebar_sessions_by(
+        sessions,
+        order,
+        anchored_at_ms,
+        pinned,
+        SidebarSessionSort::Manual,
+    );
+}
+
+/// Sorts one sidebar session band by the mode the reader chose.
+///
+/// Every mode keeps pinned sessions in their own band above the sorted rows;
+/// only the unpinned order changes. `Manual` is the historical drag
+/// arrangement described on [`sort_sidebar_sessions`].
+pub fn sort_sidebar_sessions_by(
+    sessions: &mut [AgentSession],
+    order: &[String],
+    anchored_at_ms: i64,
+    pinned: &BTreeSet<String>,
+    sort: SidebarSessionSort,
 ) {
     let manual_positions = order
         .iter()
@@ -990,19 +1076,41 @@ pub fn sort_sidebar_sessions(
             .copied()
     };
     sessions.sort_by(|left, right| {
-        (!pinned.contains(left.id.as_str()))
-            .cmp(&!pinned.contains(right.id.as_str()))
-            .then_with(|| match (manual_position(left), manual_position(right)) {
-                (Some(left_position), Some(right_position)) => left_position.cmp(&right_position),
-                // Newly discovered or re-activated sessions surface above the
-                // frozen manual band, matching the recency stream.
-                (Some(_), None) => std::cmp::Ordering::Greater,
-                (None, Some(_)) => std::cmp::Ordering::Less,
-                (None, None) => right
-                    .last_message_at_ms
-                    .cmp(&left.last_message_at_ms)
-                    .then_with(|| left.id.as_str().cmp(right.id.as_str())),
-            })
+        let pinned_order =
+            (!pinned.contains(left.id.as_str())).cmp(&!pinned.contains(right.id.as_str()));
+        if pinned_order != std::cmp::Ordering::Equal {
+            return pinned_order;
+        }
+        match sort {
+            SidebarSessionSort::Created => right
+                .created_at_ms
+                .cmp(&left.created_at_ms)
+                .then_with(|| left.id.as_str().cmp(right.id.as_str())),
+            SidebarSessionSort::Updated => right
+                .last_message_at_ms
+                .cmp(&left.last_message_at_ms)
+                .then_with(|| left.id.as_str().cmp(right.id.as_str())),
+            SidebarSessionSort::Title => left
+                .title
+                .to_lowercase()
+                .cmp(&right.title.to_lowercase())
+                .then_with(|| left.id.as_str().cmp(right.id.as_str())),
+            SidebarSessionSort::Manual => {
+                match (manual_position(left), manual_position(right)) {
+                    (Some(left_position), Some(right_position)) => {
+                        left_position.cmp(&right_position)
+                    }
+                    // Newly discovered or re-activated sessions surface above
+                    // the frozen manual band, matching the recency stream.
+                    (Some(_), None) => std::cmp::Ordering::Greater,
+                    (None, Some(_)) => std::cmp::Ordering::Less,
+                    (None, None) => right
+                        .last_message_at_ms
+                        .cmp(&left.last_message_at_ms)
+                        .then_with(|| left.id.as_str().cmp(right.id.as_str())),
+                }
+            }
+        }
     });
 }
 
@@ -1450,6 +1558,154 @@ mod tests {
     }
 
     #[test]
+    fn sidebar_session_sort_modes_order_unpinned_rows_below_pins() {
+        let project = project();
+        let checkout = workspace(&project, WorkspaceMode::CurrentCheckout, "/repo");
+        let mut alpha = session(&checkout, "Alpha", AgentSessionState::Idle);
+        alpha.created_at_ms = 10;
+        alpha.last_message_at_ms = 10;
+        let mut newest_created = session(&checkout, "Newest created", AgentSessionState::Idle);
+        newest_created.created_at_ms = 30;
+        newest_created.last_message_at_ms = 5;
+        let mut newest_updated = session(&checkout, "Newest updated", AgentSessionState::Idle);
+        newest_updated.created_at_ms = 20;
+        newest_updated.last_message_at_ms = 40;
+        let mut pinned = session(&checkout, "Pinned", AgentSessionState::Idle);
+        pinned.created_at_ms = 1;
+        pinned.last_message_at_ms = 1;
+        let pinned_ids = BTreeSet::from([pinned.id.as_str().to_string()]);
+        let sessions = vec![
+            alpha.clone(),
+            newest_updated.clone(),
+            pinned.clone(),
+            newest_created.clone(),
+        ];
+
+        let expected = |items: &[&str]| {
+            items
+                .iter()
+                .map(|title| title.to_string())
+                .collect::<Vec<_>>()
+        };
+        let ordered = |sort: SidebarSessionSort| {
+            let mut sorted = sessions.clone();
+            sort_sidebar_sessions_by(&mut sorted, &[], 0, &pinned_ids, sort);
+            sorted
+                .into_iter()
+                .map(|session| session.title)
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            ordered(SidebarSessionSort::Created),
+            expected(&["Pinned", "Newest created", "Newest updated", "Alpha"])
+        );
+        assert_eq!(
+            ordered(SidebarSessionSort::Updated),
+            expected(&["Pinned", "Newest updated", "Alpha", "Newest created"])
+        );
+        // Titles compare case-insensitively; pins still stay above the band.
+        assert_eq!(
+            ordered(SidebarSessionSort::Title),
+            expected(&["Pinned", "Alpha", "Newest created", "Newest updated"])
+        );
+
+        // Manual mode keeps the listed arrangement below the pin band.
+        let manual_order = vec![
+            newest_updated.id.as_str().to_string(),
+            newest_created.id.as_str().to_string(),
+            alpha.id.as_str().to_string(),
+            pinned.id.as_str().to_string(),
+        ];
+        let mut sorted = sessions.clone();
+        sort_sidebar_sessions_by(
+            &mut sorted,
+            &manual_order,
+            50,
+            &pinned_ids,
+            SidebarSessionSort::Manual,
+        );
+        assert_eq!(
+            sorted
+                .iter()
+                .map(|session| session.title.as_str())
+                .collect::<Vec<_>>(),
+            ["Pinned", "Newest updated", "Newest created", "Alpha"]
+        );
+    }
+
+    #[test]
+    fn sidebar_session_sort_changes_rows_without_moving_projects() {
+        let project_a = project();
+        let project_b = ProjectRecord {
+            id: ProjectId::new(),
+            name: "Other".into(),
+            root_path: "/other".into(),
+            created_at_ms: 2,
+            updated_at_ms: 2,
+        };
+        let checkout_a = workspace(&project_a, WorkspaceMode::CurrentCheckout, "/repo");
+        let checkout_b = workspace(&project_b, WorkspaceMode::CurrentCheckout, "/other");
+
+        let mut old_a = session(&checkout_a, "Old A", AgentSessionState::Idle);
+        old_a.created_at_ms = 10;
+        old_a.last_message_at_ms = 100;
+        let mut new_a = session(&checkout_a, "New A", AgentSessionState::Idle);
+        new_a.created_at_ms = 20;
+        new_a.last_message_at_ms = 50;
+        let mut old_b = session(&checkout_b, "Old B", AgentSessionState::Idle);
+        old_b.created_at_ms = 10;
+        old_b.last_message_at_ms = 100;
+        let mut new_b = session(&checkout_b, "New B", AgentSessionState::Idle);
+        new_b.created_at_ms = 20;
+        new_b.last_message_at_ms = 50;
+
+        let workspaces = vec![(project_a, checkout_a), (project_b, checkout_b)];
+        let sessions = vec![old_a, new_a, old_b, new_b];
+        let projected = |sort: SidebarSessionSort| {
+            sidebar_project_projections_with_workspace_order_and_sort(
+                &workspaces,
+                &sessions,
+                &BTreeMap::new(),
+                &[],
+                &[],
+                0,
+                &BTreeMap::new(),
+                &BTreeSet::new(),
+                sort,
+                "",
+            )
+        };
+        let by_created = projected(SidebarSessionSort::Created);
+        let by_updated = projected(SidebarSessionSort::Updated);
+
+        let project_ids = |groups: &[SidebarProjectProjection]| {
+            groups
+                .iter()
+                .map(|group| group.project.id.as_str().to_string())
+                .collect::<Vec<_>>()
+        };
+        // The sort only rearranges rows inside each band.
+        assert_eq!(project_ids(&by_created), project_ids(&by_updated));
+        fn titles(groups: &[SidebarProjectProjection]) -> Vec<Vec<&str>> {
+            groups
+                .iter()
+                .map(|group| {
+                    group
+                        .compact_sessions
+                        .iter()
+                        .map(|session| session.title.as_str())
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+        }
+        assert_eq!(titles(&by_created)[0], ["New A", "Old A"]);
+        assert_eq!(titles(&by_updated)[0], ["Old A", "New A"]);
+        assert_eq!(titles(&by_created)[1], ["New B", "Old B"]);
+        assert_eq!(titles(&by_updated)[1], ["Old B", "New B"]);
+    }
+
+    #[test]
     fn sidebar_projection_folds_legacy_worktree_projects_into_the_origin_project() {
         let project = project();
         let checkout = workspace(&project, WorkspaceMode::CurrentCheckout, "/repo");
@@ -1554,7 +1810,7 @@ mod tests {
         assert_eq!(working[0].workspaces[0].agent_summary.needs_input, 0);
 
         let waiting = sidebar_project_projections(
-            &[(project, checkout.clone())],
+            &[(project.clone(), checkout.clone())],
             &[terminal(vibex_core::TerminalActivity::Waiting)],
             &BTreeMap::new(),
             &[],
@@ -1565,6 +1821,22 @@ mod tests {
         );
         assert_eq!(waiting[0].workspaces[0].agent_summary.needs_input, 1);
         assert_eq!(waiting[0].workspaces[0].agent_summary.running, 0);
+
+        // A CLI that reported a failure is neither busy nor resting, and the
+        // badge has to count it as failed rather than dropping it.
+        let failed = sidebar_project_projections(
+            &[(project, checkout.clone())],
+            &[terminal(vibex_core::TerminalActivity::Failed)],
+            &BTreeMap::new(),
+            &[],
+            &[],
+            0,
+            &BTreeSet::new(),
+            "",
+        );
+        assert_eq!(failed[0].workspaces[0].agent_summary.failed, 1);
+        assert_eq!(failed[0].workspaces[0].agent_summary.running, 0);
+        assert_eq!(failed[0].workspaces[0].agent_summary.needs_input, 0);
     }
 
     #[test]

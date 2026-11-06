@@ -56,6 +56,7 @@ use gpui_component::{
     avatar::Avatar,
     bubble::{Bubble, BubbleContent, BubbleReactions},
     button::{Button, ButtonCustomVariant, ButtonVariants as _},
+    checkbox::Checkbox,
     collapsible::Collapsible,
     command::{Command, CommandGroup, CommandItem, CommandState},
     dialog::{DialogAction, DialogClose, DialogFooter},
@@ -79,6 +80,7 @@ use gpui_component::{
     notification::NotificationType,
     popover::Popover,
     progress::{Progress, ProgressCircle},
+    radio::{Radio, RadioGroup},
     resizable::{h_resizable, resizable_panel, v_resizable},
     scroll::{ScrollableElement as _, ScrollbarAxis},
     searchable_list::{SearchableListItem, SearchableVec},
@@ -170,8 +172,8 @@ use vibex_desktop_model::{
     SessionUiState, SidebarHierarchyMode, SidebarMutationOutcome, SidebarMutationRejection,
     SidebarOrganizationItem, SidebarOrganizationScope, SidebarOrganizationState,
     SidebarOrganizationView, SidebarProjectAppearance, SidebarProjectLogo, SidebarProjectLogoColor,
-    SidebarProjectProjection, SidebarQueuedSend, SidebarScheduledSend, SidebarState,
-    SidebarUiState, SidebarWorkspaceProjection, StartupDestination, TerminalOpenMode,
+    SidebarProjectProjection, SidebarQueuedSend, SidebarScheduledSend, SidebarSessionSort,
+    SidebarState, SidebarUiState, SidebarWorkspaceProjection, StartupDestination, TerminalOpenMode,
     TerminalWorkingDirectory, ThemeMode as ModelThemeMode, ThrottledUiStateWriter,
     TimelineAnchorSpan, TimelineConversationTurn, TimelineDelegationProjection,
     TimelineFollowState, TimelineModel, TimelineProcessActivityGroup, TimelineRow, TimelineRowKind,
@@ -182,7 +184,7 @@ use vibex_desktop_model::{
     has_managed_child_agent_delegations, is_runtime_model_favorite, move_string_relative,
     move_strings_relative, ordered_agent_ids, parse_unified_diff, runtime_auth_source_use_count,
     runtime_selection_use_count, sidebar_project_custom_logo_file_is_valid, sidebar_project_items,
-    sidebar_project_items_for_workspace, sidebar_project_projections_with_workspace_order,
+    sidebar_project_items_for_workspace, sidebar_project_projections_with_workspace_order_and_sort,
     sidebar_root_items, split_share, timeline_agent_message_count_after_sequence,
     timeline_conversation_turns, timeline_conversation_turns_with_leading_turn_start,
     timeline_conversation_turns_with_reasoning_mode, timeline_row_delegation,
@@ -9347,17 +9349,15 @@ enum SidebarMoveSelectionKind {
     Session,
 }
 
-/// Which session rows the sidebar keeps on screen.
+/// One posture the sidebar can narrow its session rows to.
 ///
 /// The Provider column narrows its list by what a record still needs; a session
 /// row is narrowed by the posture its status column already draws — what the
 /// Agent is doing, and what still asks for the reader. A filter never edits a
 /// session, it only decides which rows the column paints, so every action the
 /// rows carry keeps working on the sessions that remain.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SidebarSessionFilter {
-    #[default]
-    All,
     Running,
     WaitingForYou,
     Unread,
@@ -9366,8 +9366,8 @@ enum SidebarSessionFilter {
 }
 
 impl SidebarSessionFilter {
-    const ALL: [Self; 6] = [
-        Self::All,
+    /// The selectable postures, in the order the filter surface lists them.
+    const ALL: [Self; 5] = [
         Self::Running,
         Self::WaitingForYou,
         Self::Unread,
@@ -9377,7 +9377,6 @@ impl SidebarSessionFilter {
 
     fn label(self) -> &'static str {
         match self {
-            Self::All => locale::text("All sessions", "全部会话", "全部會話"),
             Self::Running => locale::text("Running", "运行中", "執行中"),
             Self::WaitingForYou => locale::text("Waiting for you", "等待你处理", "等待你處理"),
             Self::Unread => locale::text("Unread", "未读", "未讀"),
@@ -9386,10 +9385,79 @@ impl SidebarSessionFilter {
         }
     }
 
+    fn bit(self) -> u8 {
+        match self {
+            Self::Running => 1 << 0,
+            Self::WaitingForYou => 1 << 1,
+            Self::Unread => 1 << 2,
+            Self::Failed => 1 << 3,
+            Self::Pinned => 1 << 4,
+        }
+    }
+}
+
+/// The union of postures the sidebar keeps visible, held as independent toggles.
+///
+/// An empty set means every session is shown, which is also the state the "All
+/// sessions" row selects. The checked postures are a union rather than an
+/// intersection: a session is kept when it matches any one of them, so checking
+/// a second filter widens the column instead of leaving it empty.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct SidebarSessionFilters {
+    bits: u8,
+}
+
+impl SidebarSessionFilters {
+    fn all_label() -> &'static str {
+        locale::text("All sessions", "全部会话", "全部會話")
+    }
+
+    fn contains(self, filter: SidebarSessionFilter) -> bool {
+        self.bits & filter.bit() != 0
+    }
+
+    fn toggle(&mut self, filter: SidebarSessionFilter, checked: bool) {
+        if checked {
+            self.bits |= filter.bit();
+        } else {
+            self.bits &= !filter.bit();
+        }
+    }
+
+    /// The checked postures, in the order the filter surface lists them.
+    fn selected(self) -> impl Iterator<Item = SidebarSessionFilter> {
+        SidebarSessionFilter::ALL
+            .into_iter()
+            .filter(move |filter| self.contains(*filter))
+    }
+
     /// Whether the column is narrowed at all, so an empty list means "nothing
     /// matches" rather than "there is nothing".
     fn narrowed(self) -> bool {
-        self != Self::All
+        self.bits != 0
+    }
+
+    /// The checked postures as one caption, or "All sessions" when none are.
+    ///
+    /// Only the empty state asks for this, so building the joined label here
+    /// keeps the frame path allocation-free while the column still has rows.
+    fn label(self) -> String {
+        if !self.narrowed() {
+            return Self::all_label().to_string();
+        }
+        self.selected()
+            .map(SidebarSessionFilter::label)
+            .collect::<Vec<_>>()
+            .join(locale::text(", ", "、", "、"))
+    }
+}
+
+fn sidebar_session_sort_label(sort: SidebarSessionSort) -> &'static str {
+    match sort {
+        SidebarSessionSort::Created => locale::text("Creation time", "创建时间", "建立時間"),
+        SidebarSessionSort::Updated => locale::text("Last updated", "更新时间", "更新時間"),
+        SidebarSessionSort::Title => locale::text("Title", "名称", "名稱"),
+        SidebarSessionSort::Manual => locale::text("Manual order", "手动排序", "手動排序"),
     }
 }
 
@@ -9925,12 +9993,13 @@ pub struct VibexWorkbench {
     sidebar_scroll: gpui::ScrollHandle,
     selected_session_scroll_anchor: gpui::ScrollAnchor,
     sidebar_batch_mode: bool,
-    /// Which sessions the column paints, chosen from the toolbar's filter menu.
+    /// Which sessions the column paints, chosen from the toolbar's filter.
     ///
     /// Presentation state, so it lives on the shell rather than in the
     /// persisted arrangement: it narrows what is on screen now and is not a
-    /// statement about the sessions themselves.
-    sidebar_session_filter: SidebarSessionFilter,
+    /// statement about the sessions themselves. Several postures may be
+    /// checked at once; no posture checked means every session.
+    sidebar_session_filter: SidebarSessionFilters,
     sidebar_move_selected_items: BTreeSet<SidebarOrganizationItem>,
     sidebar_move_selection_anchor: Option<SidebarOrganizationItem>,
     /// The shift/ctrl multi-selection resolved for the rows of one frame.
@@ -11679,7 +11748,7 @@ impl VibexWorkbench {
             sidebar_scroll,
             selected_session_scroll_anchor,
             sidebar_batch_mode: false,
-            sidebar_session_filter: SidebarSessionFilter::default(),
+            sidebar_session_filter: SidebarSessionFilters::default(),
             sidebar_move_selected_items: BTreeSet::new(),
             sidebar_move_selection_anchor: None,
             sidebar_selection_index: SidebarSelectionIndex::default(),
@@ -20357,7 +20426,7 @@ impl VibexWorkbench {
             return cache.groups.clone();
         }
 
-        let groups = Rc::new(sidebar_project_projections_with_workspace_order(
+        let groups = Rc::new(sidebar_project_projections_with_workspace_order_and_sort(
             &self.workspaces,
             &self.sessions,
             &self.workspace_contexts,
@@ -20366,6 +20435,7 @@ impl VibexWorkbench {
             self.ui_state.sidebar.session_order_anchored_at_ms,
             &self.ui_state.sidebar.workspace_order,
             &self.sidebar_state.pinned_ids,
+            self.ui_state.sidebar.session_sort,
             &normalized_query,
         ));
         if normalized_query.is_empty() {
@@ -20553,7 +20623,7 @@ impl VibexWorkbench {
     }
 
     fn ordered_sidebar_session_projects(&self) -> Vec<(String, String)> {
-        let projected = sidebar_project_projections_with_workspace_order(
+        let projected = sidebar_project_projections_with_workspace_order_and_sort(
             &self.workspaces,
             &self.sessions,
             &self.workspace_contexts,
@@ -20562,6 +20632,7 @@ impl VibexWorkbench {
             self.ui_state.sidebar.session_order_anchored_at_ms,
             &self.ui_state.sidebar.workspace_order,
             &self.sidebar_state.pinned_ids,
+            self.ui_state.sidebar.session_sort,
             "",
         );
         let mut projected_scopes = BTreeMap::new();
@@ -22173,7 +22244,7 @@ impl VibexWorkbench {
 
     fn sidebar_session_project_scopes(&self) -> BTreeMap<String, String> {
         let mut projects = BTreeMap::new();
-        for group in sidebar_project_projections_with_workspace_order(
+        for group in sidebar_project_projections_with_workspace_order_and_sort(
             &self.workspaces,
             &self.sessions,
             &self.workspace_contexts,
@@ -22182,6 +22253,7 @@ impl VibexWorkbench {
             self.ui_state.sidebar.session_order_anchored_at_ms,
             &self.ui_state.sidebar.workspace_order,
             &self.sidebar_state.pinned_ids,
+            self.ui_state.sidebar.session_sort,
             "",
         ) {
             let project_id = group.project.id.as_str().to_string();
@@ -22815,7 +22887,7 @@ impl VibexWorkbench {
         cx.notify();
     }
 
-    /// Narrows the column to the sessions one filter names.
+    /// Replaces the postures the column keeps visible.
     ///
     /// A filter that hides the open session is still allowed: the reader is
     /// looking at the timeline, not the column, and the row comes back the
@@ -22823,15 +22895,19 @@ impl VibexWorkbench {
     /// selection behind that the reader can no longer see, so the selection is
     /// pruned to the rows that stay visible, the same rule a moved session
     /// already follows.
-    fn set_sidebar_session_filter(&mut self, filter: SidebarSessionFilter, cx: &mut Context<Self>) {
-        if self.sidebar_session_filter == filter {
+    fn set_sidebar_session_filter(
+        &mut self,
+        filters: SidebarSessionFilters,
+        cx: &mut Context<Self>,
+    ) {
+        if self.sidebar_session_filter == filters {
             return;
         }
-        self.sidebar_session_filter = filter;
+        self.sidebar_session_filter = filters;
         // A batch action on hidden rows is the one state the column cannot
         // explain, so a narrowing filter drops the rows it hides from the
         // selection instead of quietly keeping them.
-        if filter.narrowed() {
+        if filters.narrowed() {
             let visible = self
                 .sidebar_filtered_groups()
                 .iter()
@@ -22853,6 +22929,43 @@ impl VibexWorkbench {
                 self.sidebar_move_selection_anchor = None;
             }
         }
+        self.publish_sidebar_invalidation();
+        cx.notify();
+    }
+
+    /// Checks or unchecks one posture without closing the filter surface.
+    ///
+    /// Checking a posture moves the column off "All sessions", which is only
+    /// the empty set. Unchecking the last checked posture returns it there
+    /// instead of leaving a filter that matches nothing.
+    fn toggle_sidebar_session_filter(
+        &mut self,
+        filter: SidebarSessionFilter,
+        checked: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let mut filters = self.sidebar_session_filter;
+        filters.toggle(filter, checked);
+        self.set_sidebar_session_filter(filters, cx);
+    }
+
+    /// Checks "All sessions" and unchecks every posture under it.
+    fn clear_sidebar_session_filters(&mut self, cx: &mut Context<Self>) {
+        self.set_sidebar_session_filter(SidebarSessionFilters::default(), cx);
+    }
+
+    /// Switches the order of the session rows inside every project band.
+    ///
+    /// Project and worktree order are independent of this choice. The sort is
+    /// a persisted view preference, so it queues the UI state and tells remote
+    /// clients that the projection changed.
+    fn set_sidebar_session_sort(&mut self, sort: SidebarSessionSort, cx: &mut Context<Self>) {
+        if self.ui_state.sidebar.session_sort == sort {
+            return;
+        }
+        self.ui_state.sidebar.session_sort = sort;
+        self.queue_ui_state();
+        self.invalidate_sidebar_projection_cache();
         self.publish_sidebar_invalidation();
         cx.notify();
     }
@@ -23482,6 +23595,10 @@ impl VibexWorkbench {
                 self.ui_state.sidebar.session_order = self.sidebar_state.row_order.clone();
                 if changed {
                     self.ui_state.sidebar.session_order_anchored_at_ms = unix_timestamp_ms();
+                    // A drop is a manual arrangement. A field sort would undo
+                    // it on the next projection, so the drop also chooses the
+                    // manual order the reader just produced.
+                    self.ui_state.sidebar.session_sort = SidebarSessionSort::Manual;
                 }
                 changed
             }
@@ -24949,6 +25066,9 @@ impl VibexWorkbench {
         ) || self.sidebar_state.row_order != original_order;
         if changed {
             self.ui_state.sidebar.session_order_anchored_at_ms = unix_timestamp_ms();
+            // The drag targets the rows the reader sees. Keeping a field sort
+            // would ignore the drop, so the new arrangement is manual.
+            self.ui_state.sidebar.session_sort = SidebarSessionSort::Manual;
             self.queue_agent_ui_state();
             self.publish_sidebar_invalidation();
         }
@@ -43005,7 +43125,7 @@ impl VibexWorkbench {
                     .any(|candidate| candidate.id == session.id)
             })
         {
-            self.sidebar_session_filter = SidebarSessionFilter::All;
+            self.sidebar_session_filter = SidebarSessionFilters::default();
             self.publish_sidebar_invalidation();
         }
         let mut revealed = reveal_sidebar_session(
@@ -47778,6 +47898,164 @@ impl VibexWorkbench {
         menu
     }
 
+    /// The funnel's filter surface: persistent checkboxes, not a one-shot menu.
+    ///
+    /// A menu can only hand back the last clicked item because it dismisses on
+    /// every activation. The sidebar needs several postures at once, so this
+    /// control is a popover that stays open while its rows are checked. "All
+    /// sessions" is the empty set: choosing it clears the other rows, and
+    /// clearing the last posture falls back to it.
+    fn render_sidebar_session_filter_popover(
+        &mut self,
+        filters: SidebarSessionFilters,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let entity = cx.weak_entity();
+        let trigger = Button::new("sidebar-session-filter")
+            .small()
+            .ghost()
+            .compact()
+            .w(px(28.0))
+            .h(px(28.0))
+            .when(filters.narrowed(), |button| button.selected(true))
+            .icon(sidebar_icon("icons/vibex/funnel.svg"))
+            .tooltip(locale::text("Filter sessions", "筛选会话", "篩選會話"))
+            .accessibility_label(locale::text("Filter sessions", "筛选会话", "篩選會話"));
+
+        let all_entity = entity.clone();
+        let all_row = Checkbox::new("sidebar-session-filter-all")
+            .small()
+            .w_full()
+            .px_2()
+            .py_1()
+            .rounded(px(6.0))
+            .checked(!filters.narrowed())
+            .label(SidebarSessionFilters::all_label())
+            .hover(|style| style.bg(cx.theme().sidebar_accent.opacity(0.35)))
+            .on_click(move |_, _, cx| {
+                let _ = all_entity.update(cx, |this, cx| this.clear_sidebar_session_filters(cx));
+            });
+
+        let mut rows = Vec::with_capacity(SidebarSessionFilter::ALL.len());
+        for filter in SidebarSessionFilter::ALL {
+            let entity = entity.clone();
+            rows.push(
+                Checkbox::new(SharedString::from(format!(
+                    "sidebar-session-filter-{filter:?}"
+                )))
+                .small()
+                .w_full()
+                .px_2()
+                .py_1()
+                .rounded(px(6.0))
+                .checked(filters.contains(filter))
+                .label(filter.label())
+                .hover(|style| style.bg(cx.theme().sidebar_accent.opacity(0.35)))
+                .on_click(move |checked, _, cx| {
+                    let _ = entity.update(cx, |this, cx| {
+                        this.toggle_sidebar_session_filter(filter, *checked, cx)
+                    });
+                }),
+            );
+        }
+
+        let sort = self.ui_state.sidebar.session_sort;
+        let sort_entity = entity.clone();
+        let sort_group = RadioGroup::new("sidebar-session-sort")
+            .selected_index(Some(
+                SidebarSessionSort::ALL
+                    .iter()
+                    .position(|candidate| *candidate == sort)
+                    .unwrap_or_default(),
+            ))
+            .on_click(move |index, _, cx| {
+                let Some(sort) = SidebarSessionSort::ALL.get(*index).copied() else {
+                    return;
+                };
+                let _ = sort_entity.update(cx, |this, cx| this.set_sidebar_session_sort(sort, cx));
+            })
+            .children(SidebarSessionSort::ALL.map(|option| {
+                Radio::new(SharedString::from(format!(
+                    "sidebar-session-sort-{option:?}"
+                )))
+                .small()
+                .w_full()
+                .px_2()
+                .py_1()
+                .rounded(px(6.0))
+                .label(sidebar_session_sort_label(option))
+                .hover(|style| style.bg(cx.theme().sidebar_accent.opacity(0.35)))
+            }));
+
+        let panel = v_flex()
+            .w(px(184.0))
+            .gap(px(2.0))
+            .child(
+                div()
+                    .px_2()
+                    .pb_1()
+                    .text_xs()
+                    .font_medium()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(locale::text("Show sessions", "显示会话", "顯示會話")),
+            )
+            .child(all_row)
+            .child(
+                div()
+                    .mx_1()
+                    .my_1()
+                    .h(px(1.0))
+                    .bg(cx.theme().border.opacity(0.60)),
+            )
+            .children(rows)
+            .child(
+                div()
+                    .mx_1()
+                    .my_1()
+                    .h(px(1.0))
+                    .bg(cx.theme().border.opacity(0.60)),
+            )
+            .child(
+                div()
+                    .px_2()
+                    .pb_1()
+                    .text_xs()
+                    .font_medium()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(locale::text("Sort by", "排序", "排序")),
+            )
+            .child(sort_group);
+
+        Popover::new("sidebar-session-filter-popover")
+            .anchor(Anchor::TopRight)
+            .appearance(false)
+            // The popover occludes the floating sidebar, which reports the
+            // pointer as gone; latch the hover preview exactly as the column's
+            // menus do so it does not slide away under an open filter.
+            .on_open_change(cx.listener(|this, open: &bool, window, cx| {
+                if *open {
+                    this.begin_sidebar_menu_hover(cx);
+                } else {
+                    this.end_sidebar_menu_hover(window, cx);
+                }
+            }))
+            .trigger(trigger)
+            .child(
+                v_flex()
+                    .w(px(200.0))
+                    .gap(px(2.0))
+                    .rounded(px(8.0))
+                    .border_1()
+                    .border_color(cx.theme().border.opacity(0.80))
+                    .bg(cx.theme().popover)
+                    .p_2()
+                    .shadow_lg()
+                    .text_color(cx.theme().popover_foreground)
+                    .child(panel),
+            )
+            .into_any_element()
+    }
+
     fn render_agent_sidebar(&mut self, cx: &mut Context<Self>) -> AnyElement {
         self.sidebar_visible_session_ids.clear();
         // The selection index answers questions the rows ask while they are
@@ -47856,7 +48134,6 @@ impl VibexWorkbench {
             cx.has_active_drag() && self.session_group_tab_removal_active;
         let root_menu_entity = cx.weak_entity();
         let toolbar_more_entity = cx.weak_entity();
-        let session_filter_entity = cx.weak_entity();
         let session_filter_state = self.sidebar_session_filter;
         let toolbar_more_state = SidebarToolbarMoreMenuState {
             strings,
@@ -47983,66 +48260,15 @@ impl VibexWorkbench {
                                 // The Provider column puts its filter beside
                                 // the section it narrows; the same control
                                 // sits in this toolbar row for the same
-                                // reason, and the funnel stays lit while a
-                                // filter is on so the list never looks
-                                // shorter for no reason.
-                                Button::new("sidebar-session-filter")
-                                    .small()
-                                    .ghost()
-                                    .compact()
-                                    .w(px(28.0))
-                                    .h(px(28.0))
-                                    .when(session_filter_state.narrowed(), |button| {
-                                        button.selected(true)
-                                    })
-                                    .icon(sidebar_icon("icons/vibex/funnel.svg"))
-                                    .tooltip(locale::text(
-                                        "Filter sessions",
-                                        "筛选会话",
-                                        "篩選會話",
-                                    ))
-                                    .accessibility_label(locale::text(
-                                        "Filter sessions",
-                                        "筛选会话",
-                                        "篩選會話",
-                                    ))
-                                    .dropdown_menu(move |mut menu, window, cx| {
-                                        let entity = session_filter_entity.clone();
-                                        // The column's own menus latch the
-                                        // hover preview; this one is built
-                                        // inline, so it arms the latch here.
-                                        let menu_entity = cx.entity();
-                                        let _ = entity.update(cx, |this, cx| {
-                                            this.begin_sidebar_menu_hover(cx)
-                                        });
-                                        Self::hold_sidebar_hover_preview_for_menu(
-                                            &menu_entity,
-                                            &entity,
-                                            window,
-                                            cx,
-                                        );
-                                        menu = menu.label(locale::text(
-                                            "Show sessions",
-                                            "显示会话",
-                                            "顯示會話",
-                                        ));
-                                        for filter in SidebarSessionFilter::ALL {
-                                            let entity = entity.clone();
-                                            menu = menu.item(
-                                                PopupMenuItem::new(filter.label())
-                                                    .checked(filter == session_filter_state)
-                                                    .on_click(move |_, _, cx| {
-                                                        let _ = entity.update(cx, |this, cx| {
-                                                            this.set_sidebar_session_filter(
-                                                                filter, cx,
-                                                            )
-                                                        });
-                                                    }),
-                                            );
-                                        }
-                                        menu
-                                    })
-                                    .anchor(gpui::Anchor::TopRight),
+                                // reason. The surface stays open while rows
+                                // are checked, so one pass can narrow by
+                                // several postures, and the funnel stays lit
+                                // while the column is narrowed so the list
+                                // never looks shorter for no reason.
+                                self.render_sidebar_session_filter_popover(
+                                    session_filter_state,
+                                    cx,
+                                ),
                             )
                             .child(
                                 Button::new("sidebar-collapse-all")
@@ -48341,10 +48567,7 @@ impl VibexWorkbench {
                                                         "顯示全部會話",
                                                     ))
                                                     .on_click(cx.listener(|this, _, _, cx| {
-                                                        this.set_sidebar_session_filter(
-                                                            SidebarSessionFilter::All,
-                                                            cx,
-                                                        );
+                                                        this.clear_sidebar_session_filters(cx);
                                                     })),
                                             )
                                         },
@@ -80204,7 +80427,11 @@ fn sidebar_session_state_label(
     }
 }
 
-/// Whether one session answers the filter the reader chose.
+/// Whether one session answers the filters the reader checked.
+///
+/// The checked postures form a union: a session stays visible when it matches
+/// any one of them. No checked posture is the "All sessions" state and keeps
+/// every row.
 ///
 /// `display_state` is resolved by the caller the way
 /// [`VibexWorkbench::sidebar_session_row_state`] resolves it, so the filter and
@@ -80213,24 +80440,27 @@ fn sidebar_session_state_label(
 /// column draws both from sets only the shell holds in front of the projection.
 fn sidebar_session_matches_filter(
     session: &AgentSession,
-    filter: SidebarSessionFilter,
+    filters: SidebarSessionFilters,
     display_state: AgentSessionState,
     unread: &BTreeSet<String>,
     pinned: &BTreeSet<String>,
 ) -> bool {
-    match filter {
-        SidebarSessionFilter::All => true,
-        // An initializing session has no row yet for the reader to watch, so it
-        // reads as running here exactly as it does in the status column.
-        SidebarSessionFilter::Running => matches!(
-            display_state,
-            AgentSessionState::Running | AgentSessionState::Initializing
-        ),
-        SidebarSessionFilter::WaitingForYou => display_state == AgentSessionState::NeedsInput,
-        SidebarSessionFilter::Unread => unread.contains(session.id.as_str()),
-        SidebarSessionFilter::Failed => display_state == AgentSessionState::Error,
-        SidebarSessionFilter::Pinned => pinned.contains(session.id.as_str()),
+    if !filters.narrowed() {
+        return true;
     }
+    // An initializing session has no row yet for the reader to watch, so it
+    // reads as running here exactly as it does in the status column.
+    let running = matches!(
+        display_state,
+        AgentSessionState::Running | AgentSessionState::Initializing
+    );
+    (filters.contains(SidebarSessionFilter::Running) && running)
+        || (filters.contains(SidebarSessionFilter::WaitingForYou)
+            && display_state == AgentSessionState::NeedsInput)
+        || (filters.contains(SidebarSessionFilter::Unread) && unread.contains(session.id.as_str()))
+        || (filters.contains(SidebarSessionFilter::Failed)
+            && display_state == AgentSessionState::Error)
+        || (filters.contains(SidebarSessionFilter::Pinned) && pinned.contains(session.id.as_str()))
 }
 
 /// What a branch is holding back, in the sidebar's own words.
@@ -104976,66 +105206,135 @@ mod tests {
         session.state = AgentSessionState::Idle;
         let unread = BTreeSet::<String>::new();
         let pinned = BTreeSet::<String>::new();
-        let keeps = |state: AgentSessionState, filter: SidebarSessionFilter| {
-            sidebar_session_matches_filter(&session, filter, state, &unread, &pinned)
+        let filters = |options: &[SidebarSessionFilter]| {
+            let mut filters = SidebarSessionFilters::default();
+            for filter in options {
+                filters.toggle(*filter, true);
+            }
+            filters
+        };
+        let keeps = |state: AgentSessionState, filters: SidebarSessionFilters| {
+            sidebar_session_matches_filter(&session, filters, state, &unread, &pinned)
         };
 
-        assert!(keeps(AgentSessionState::Idle, SidebarSessionFilter::All));
+        // No checked posture is the "All sessions" state.
+        assert!(keeps(
+            AgentSessionState::Idle,
+            SidebarSessionFilters::default()
+        ));
         assert!(keeps(
             AgentSessionState::Running,
-            SidebarSessionFilter::Running
+            filters(&[SidebarSessionFilter::Running])
         ));
         // A session still preparing its runtime has no row of its own yet; it
         // reads as running, exactly as the status column draws it.
         assert!(keeps(
             AgentSessionState::Initializing,
-            SidebarSessionFilter::Running
+            filters(&[SidebarSessionFilter::Running])
         ));
         assert!(!keeps(
             AgentSessionState::NeedsInput,
-            SidebarSessionFilter::Running
+            filters(&[SidebarSessionFilter::Running])
         ));
         assert!(keeps(
             AgentSessionState::NeedsInput,
-            SidebarSessionFilter::WaitingForYou
+            filters(&[SidebarSessionFilter::WaitingForYou])
         ));
         assert!(keeps(
             AgentSessionState::Error,
-            SidebarSessionFilter::Failed
+            filters(&[SidebarSessionFilter::Failed])
         ));
         assert!(!keeps(
             AgentSessionState::Running,
-            SidebarSessionFilter::Failed
+            filters(&[SidebarSessionFilter::Failed])
         ));
         assert!(!keeps(
             AgentSessionState::Idle,
-            SidebarSessionFilter::Unread
+            filters(&[SidebarSessionFilter::Unread])
         ));
         assert!(!keeps(
             AgentSessionState::Idle,
-            SidebarSessionFilter::Pinned
+            filters(&[SidebarSessionFilter::Pinned])
         ));
+
+        // Several checked postures are a union: a row that matches either one
+        // stays, and only a row that matches neither is hidden.
+        let running_or_failed =
+            filters(&[SidebarSessionFilter::Running, SidebarSessionFilter::Failed]);
+        assert!(keeps(AgentSessionState::Running, running_or_failed));
+        assert!(keeps(AgentSessionState::Error, running_or_failed));
+        assert!(!keeps(AgentSessionState::Idle, running_or_failed));
+        assert!(!keeps(AgentSessionState::NeedsInput, running_or_failed));
+
         let unread = BTreeSet::from([session.id.as_str().to_string()]);
         let pinned = BTreeSet::from([session.id.as_str().to_string()]);
         assert!(sidebar_session_matches_filter(
             &session,
-            SidebarSessionFilter::Unread,
+            filters(&[SidebarSessionFilter::Unread]),
             AgentSessionState::Idle,
             &unread,
             &pinned
         ));
         assert!(sidebar_session_matches_filter(
             &session,
-            SidebarSessionFilter::Pinned,
+            filters(&[SidebarSessionFilter::Pinned]),
             AgentSessionState::Idle,
             &unread,
             &pinned
         ));
+        // The reader facts are independent toggles too.
+        assert!(sidebar_session_matches_filter(
+            &session,
+            filters(&[SidebarSessionFilter::Unread, SidebarSessionFilter::Pinned,]),
+            AgentSessionState::Idle,
+            &unread,
+            &pinned
+        ));
+
         // A narrowed filter is what makes an empty column say "nothing matches"
         // instead of "there are no sessions", and it is what lights the funnel.
-        assert!(!SidebarSessionFilter::All.narrowed());
-        assert!(SidebarSessionFilter::Unread.narrowed());
-        assert!(SidebarSessionFilter::Pinned.narrowed());
+        assert!(!SidebarSessionFilters::default().narrowed());
+        assert!(filters(&[SidebarSessionFilter::Unread]).narrowed());
+        assert!(
+            filters(&[SidebarSessionFilter::Running, SidebarSessionFilter::Pinned,]).narrowed()
+        );
+    }
+
+    /// Checking one posture must not clear the others, and checking "All
+    /// sessions" clears every posture under it.
+    #[test]
+    fn the_session_filter_toggles_independently_and_all_clears_the_rest() {
+        let mut filters = SidebarSessionFilters::default();
+        assert!(!filters.narrowed());
+        filters.toggle(SidebarSessionFilter::Running, true);
+        filters.toggle(SidebarSessionFilter::Unread, true);
+        assert!(filters.contains(SidebarSessionFilter::Running));
+        assert!(filters.contains(SidebarSessionFilter::Unread));
+        assert!(!filters.contains(SidebarSessionFilter::Failed));
+
+        // Unchecking one row leaves the other checked: the rows are
+        // independent, unlike the old radio-style filter.
+        filters.toggle(SidebarSessionFilter::Running, false);
+        assert!(!filters.contains(SidebarSessionFilter::Running));
+        assert!(filters.contains(SidebarSessionFilter::Unread));
+        filters.toggle(SidebarSessionFilter::Unread, false);
+        assert!(!filters.narrowed());
+        assert_eq!(filters, SidebarSessionFilters::default());
+
+        // The caption names every checked posture instead of one.
+        let mut two = SidebarSessionFilters::default();
+        two.toggle(SidebarSessionFilter::Running, true);
+        two.toggle(SidebarSessionFilter::Pinned, true);
+        let caption = two.label();
+        assert!(caption.contains(SidebarSessionFilter::Running.label()));
+        assert!(caption.contains(SidebarSessionFilter::Pinned.label()));
+
+        // "All sessions" is the empty set that the rest of the surface clears
+        // to when it is chosen.
+        two.toggle(SidebarSessionFilter::Running, false);
+        two.toggle(SidebarSessionFilter::Pinned, false);
+        assert_eq!(two, SidebarSessionFilters::default());
+        assert_eq!(two.label(), SidebarSessionFilters::all_label());
     }
 
     /// Narrowing the column drops the rows it hides from a batch selection: an
@@ -105060,32 +105359,78 @@ mod tests {
             .find("self.sidebar_move_selected_items.retain")
             .expect("the shift/ctrl selection should be pruned");
         assert!(filtered < select && select < group_selection);
-        assert!(setter.contains("if filter.narrowed()"));
+        assert!(setter.contains("if filters.narrowed()"));
         assert!(setter.contains("self.publish_sidebar_invalidation();"));
 
         // The render path paints the filtered projection, and the empty row
-        // names the filter instead of claiming the project has no sessions.
+        // names the checked postures instead of claiming the project has no
+        // sessions.
         let render = source
             .split_once("    fn render_agent_sidebar(")
             .and_then(|(_, tail)| tail.split_once("\n    fn build_sidebar_toolbar_more_menu("))
             .map(|(body, _)| body)
             .expect("the sidebar renderer should remain inspectable");
         assert!(render.contains("self.sidebar_filtered_groups()"));
-        assert!(render.contains("Button::new(\"sidebar-session-filter\")"));
+        assert!(render.contains("self.render_sidebar_session_filter_popover("));
         assert!(render.contains("Button::new(\"sidebar-clear-session-filter\")"));
         assert!(render.contains("self.sidebar_session_filter.label()"));
-        assert!(render.contains("SidebarSessionFilter::ALL"));
-        // The funnel stays lit while a filter is on, so a shorter list never
-        // looks shorter for no reason.
-        assert!(render.contains(".when(session_filter_state.narrowed(), |button| {"));
-        // The menu latches the hover preview, like every other sidebar menu.
-        let filter_menu = render
-            .split_once("Button::new(\"sidebar-session-filter\")")
-            .and_then(|(_, tail)| tail.split_once("Button::new(\"sidebar-collapse-all\")"))
+
+        // The filter is a checklist surface, not the old one-shot menu: it
+        // stays open across rows, shows every checked posture, and latches the
+        // hover preview like the column's other popups.
+        let filter_surface = source
+            .split_once("    fn render_sidebar_session_filter_popover(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_agent_sidebar("))
             .map(|(body, _)| body)
-            .expect("the filter menu should remain inspectable");
-        assert!(filter_menu.contains("begin_sidebar_menu_hover"));
-        assert!(filter_menu.contains("hold_sidebar_hover_preview_for_menu"));
+            .expect("the filter surface should remain inspectable");
+        assert!(filter_surface.contains("Popover::new("));
+        assert!(filter_surface.contains("Button::new(\"sidebar-session-filter\")"));
+        assert!(filter_surface.contains("Checkbox::new(\"sidebar-session-filter-all\")"));
+        assert!(filter_surface.contains("for filter in SidebarSessionFilter::ALL"));
+        assert!(filter_surface.contains(".checked(filters.contains(filter))"));
+        assert!(
+            filter_surface.contains("this.toggle_sidebar_session_filter(filter, *checked, cx)")
+        );
+        assert!(filter_surface.contains("clear_sidebar_session_filters"));
+        assert!(
+            filter_surface.contains(".when(filters.narrowed(), |button| button.selected(true))")
+        );
+        assert!(filter_surface.contains("begin_sidebar_menu_hover"));
+        assert!(filter_surface.contains("end_sidebar_menu_hover"));
+        assert!(!filter_surface.contains(".dropdown_menu("));
+
+        // The same surface carries the single-select sort section.
+        assert!(filter_surface.contains("RadioGroup::new(\"sidebar-session-sort\")"));
+        assert!(filter_surface.contains("SidebarSessionSort::ALL"));
+        assert!(filter_surface.contains("this.set_sidebar_session_sort(sort, cx)"));
+        assert!(filter_surface.contains("sidebar_session_sort_label(option)"));
+        assert!(filter_surface.contains("locale::text(\"Sort by\", \"排序\", \"排序\")"));
+    }
+
+    /// The sort is a persisted view preference, and it only rearranges the
+    /// session rows: projects and worktrees keep their own order.
+    #[test]
+    fn the_session_sort_is_persisted_and_leaves_project_order_alone() {
+        let source = include_str!("app.rs");
+        let setter = source
+            .split_once("    fn set_sidebar_session_sort(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn toggle_all_batch_sessions("))
+            .map(|(body, _)| body)
+            .expect("the session sort setter should remain inspectable");
+        assert!(setter.contains("self.ui_state.sidebar.session_sort = sort;"));
+        assert!(setter.contains("self.queue_ui_state();"));
+        assert!(setter.contains("self.invalidate_sidebar_projection_cache();"));
+        assert!(setter.contains("self.publish_sidebar_invalidation();"));
+
+        // The projection receives the mode, so only session bands move.
+        assert!(source.contains("sidebar_project_projections_with_workspace_order_and_sort("));
+        assert!(source.contains("self.ui_state.sidebar.session_sort,"));
+
+        // A drop switches to the manual order it just produced; a field sort
+        // would otherwise undo the gesture on the next projection.
+        assert!(
+            source.contains("self.ui_state.sidebar.session_sort = SidebarSessionSort::Manual;")
+        );
     }
 
     #[test]
