@@ -2102,10 +2102,6 @@ pub struct ManagementCenter {
     /// that are not configured yet, and because editing a Model's id must not
     /// move the selection to whatever now sits at that position.
     profile_model_selection: Option<String>,
-    profile_model_edit_wire_api: Option<vibex_core::ProviderModelWireApi>,
-    /// The Model's declared thinking-depth opt-out: `true` writes
-    /// `reasoning: false`, which is the one answer that removes the control.
-    profile_model_edit_reasoning_disabled: bool,
     /// The open Model editor's problem, tagged with the field it belongs to so
     /// the message lands next to the control that produced it.
     /// Per-protocol endpoint overrides stay behind a disclosure: most Providers
@@ -2147,11 +2143,6 @@ pub struct ManagementCenter {
     profile_protocol_base_urls: Vec<(vibex_core::ProviderModelWireApi, Entity<InputState>)>,
     profile_model_draft: Entity<InputState>,
     profile_model_search: Entity<InputState>,
-    profile_model_edit_id: Entity<InputState>,
-    profile_model_edit_name: Entity<InputState>,
-    profile_model_edit_efforts: Entity<InputState>,
-    profile_model_edit_context_tokens: Entity<InputState>,
-    profile_model_edit_output_tokens: Entity<InputState>,
     profile_api_key: Entity<InputState>,
     acp_command: Entity<InputState>,
     acp_args: Entity<InputState>,
@@ -2467,41 +2458,6 @@ impl ManagementCenter {
                 "秒，留空關閉",
             ))
         });
-        let profile_model_edit_id = cx.new(|cx| {
-            InputState::new(window, cx).placeholder(management_locale_text(
-                "Model id",
-                "模型 ID",
-                "模型 ID",
-            ))
-        });
-        let profile_model_edit_name = cx.new(|cx| {
-            InputState::new(window, cx).placeholder(management_locale_text(
-                "Display name",
-                "显示名称",
-                "顯示名稱",
-            ))
-        });
-        let profile_model_edit_efforts = cx.new(|cx| {
-            InputState::new(window, cx).placeholder(management_locale_text(
-                "off, low, high, max",
-                "off, low, high, max",
-                "off, low, high, max",
-            ))
-        });
-        let profile_model_edit_context_tokens = cx.new(|cx| {
-            InputState::new(window, cx).placeholder(management_locale_text(
-                "e.g. 1000000",
-                "例如 1000000",
-                "例如 1000000",
-            ))
-        });
-        let profile_model_edit_output_tokens = cx.new(|cx| {
-            InputState::new(window, cx).placeholder(management_locale_text(
-                "e.g. 128000",
-                "例如 128000",
-                "例如 128000",
-            ))
-        });
         let profile_api_key = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder(PROVIDER_API_KEY_PLACEHOLDER)
@@ -2756,62 +2712,6 @@ impl ManagementCenter {
                 }
                 cx.notify();
             }),
-            // The Model editor has no Apply step: every field that still parses
-            // is the Model's new value, so nothing typed there can be left
-            // behind by the dialog's own Save.
-            cx.subscribe(&profile_model_edit_id, |this, _, event: &InputEvent, cx| {
-                if !management_input_changed(event) {
-                    return;
-                }
-                this.apply_profile_model_edit(cx);
-            }),
-            cx.subscribe(
-                &profile_model_edit_name,
-                |this, _, event: &InputEvent, cx| {
-                    if !management_input_changed(event) {
-                        return;
-                    }
-                    this.apply_profile_model_edit(cx);
-                },
-            ),
-            cx.subscribe(
-                &profile_model_edit_efforts,
-                |this, _, event: &InputEvent, cx| {
-                    if !management_input_changed(event) {
-                        return;
-                    }
-                    // A written table is the more specific answer, so typing one
-                    // leaves the non-reasoning choice behind.
-                    if !this
-                        .profile_model_edit_efforts
-                        .read(cx)
-                        .value()
-                        .trim()
-                        .is_empty()
-                    {
-                        this.profile_model_edit_reasoning_disabled = false;
-                    }
-                    this.apply_profile_model_edit(cx);
-                },
-            ),
-            cx.subscribe(
-                &profile_model_edit_context_tokens,
-                |this, _, event: &InputEvent, cx| {
-                    if !management_input_changed(event) {
-                        return;
-                    }
-                    this.apply_profile_model_edit(cx);
-                },
-            ),
-            cx.subscribe(
-                &profile_model_edit_output_tokens,
-                |this, _, event: &InputEvent, cx| {
-                    if !management_input_changed(event) {
-                        return;
-                    }
-                    this.apply_profile_model_edit(cx);
-                },
-            ),
             // Typing a value replaces the stored Secret; a value the user
             // removes again only stops that replacement, it never clears what
             // is stored. Clearing is its own command.
@@ -3305,8 +3205,6 @@ impl ManagementCenter {
             profile_available_models: Vec::new(),
             profile_detached_models: Vec::new(),
             profile_model_selection: None,
-            profile_model_edit_wire_api: None,
-            profile_model_edit_reasoning_disabled: false,
             profile_protocol_advanced_open: false,
             profile_headers: Vec::new(),
             profile_headers_open: false,
@@ -3333,11 +3231,6 @@ impl ManagementCenter {
             profile_protocol_base_urls: Vec::new(),
             profile_model_draft,
             profile_model_search,
-            profile_model_edit_id,
-            profile_model_edit_name,
-            profile_model_edit_efforts,
-            profile_model_edit_context_tokens,
-            profile_model_edit_output_tokens,
             profile_api_key,
             acp_command,
             acp_args,
@@ -3495,30 +3388,6 @@ impl ManagementCenter {
             (
                 &self.profile_model_search,
                 ("Search models", "搜索模型", "搜尋模型"),
-            ),
-            (
-                &self.profile_model_edit_id,
-                ("Model id", "模型 ID", "模型 ID"),
-            ),
-            (
-                &self.profile_model_edit_name,
-                ("Display name", "显示名称", "顯示名稱"),
-            ),
-            (
-                &self.profile_model_edit_efforts,
-                (
-                    "off, low, high, max",
-                    "off, low, high, max",
-                    "off, low, high, max",
-                ),
-            ),
-            (
-                &self.profile_model_edit_context_tokens,
-                ("e.g. 1000000", "例如 1000000", "例如 1000000"),
-            ),
-            (
-                &self.profile_model_edit_output_tokens,
-                ("e.g. 128000", "例如 128000", "例如 128000"),
             ),
             (&self.acp_command, ("ACP command", "ACP 命令", "ACP 命令")),
             (
@@ -6380,16 +6249,6 @@ impl ManagementCenter {
             .update(cx, |state, cx| state.set_value("", window, cx));
         self.profile_model_search
             .update(cx, |state, cx| state.set_value("", window, cx));
-        self.profile_model_edit_id
-            .update(cx, |state, cx| state.set_value("", window, cx));
-        self.profile_model_edit_name
-            .update(cx, |state, cx| state.set_value("", window, cx));
-        self.profile_model_edit_efforts
-            .update(cx, |state, cx| state.set_value("", window, cx));
-        self.profile_model_edit_context_tokens
-            .update(cx, |state, cx| state.set_value("", window, cx));
-        self.profile_model_edit_output_tokens
-            .update(cx, |state, cx| state.set_value("", window, cx));
         self.profile_api_key.update(cx, |state, cx| {
             state.set_masked(true, window, cx);
             state.set_placeholder(PROVIDER_API_KEY_PLACEHOLDER, window, cx);
@@ -6406,8 +6265,6 @@ impl ManagementCenter {
         self.profile_available_models.clear();
         self.profile_detached_models.clear();
         self.profile_model_selection = None;
-        self.profile_model_edit_wire_api = None;
-        self.profile_model_edit_reasoning_disabled = false;
         self.profile_protocol_advanced_open = false;
         self.profile_provider_options = vibex_core::ProviderOptions::empty();
         self.clear_profile_headers(window, cx);
@@ -6465,16 +6322,6 @@ impl ManagementCenter {
             .update(cx, |state, cx| state.set_value("", window, cx));
         self.profile_model_search
             .update(cx, |state, cx| state.set_value("", window, cx));
-        self.profile_model_edit_id
-            .update(cx, |state, cx| state.set_value("", window, cx));
-        self.profile_model_edit_name
-            .update(cx, |state, cx| state.set_value("", window, cx));
-        self.profile_model_edit_efforts
-            .update(cx, |state, cx| state.set_value("", window, cx));
-        self.profile_model_edit_context_tokens
-            .update(cx, |state, cx| state.set_value("", window, cx));
-        self.profile_model_edit_output_tokens
-            .update(cx, |state, cx| state.set_value("", window, cx));
         self.profile_api_key.update(cx, |state, cx| {
             state.set_masked(true, window, cx);
             state.set_placeholder(PROVIDER_API_KEY_PLACEHOLDER, window, cx);
@@ -6505,8 +6352,6 @@ impl ManagementCenter {
         self.profile_available_models.clear();
         self.profile_detached_models.clear();
         self.profile_model_selection = None;
-        self.profile_model_edit_wire_api = None;
-        self.profile_model_edit_reasoning_disabled = false;
         self.profile_provider_options = full_profile
             .map(|profile| profile.provider_options)
             .unwrap_or_else(vibex_core::ProviderOptions::empty);
@@ -6689,7 +6534,6 @@ impl ManagementCenter {
         self.profile_available_models.clear();
         self.profile_detached_models.clear();
         self.profile_model_selection = None;
-        self.profile_model_edit_wire_api = None;
         self.model_capability_suggestion = None;
         self.model_capability_task = None;
         self.profile_protocol_advanced_open = false;
@@ -8049,7 +7893,15 @@ impl ManagementCenter {
     /// half-typed level list or token count keeps the Model's previous value
     /// and reports the problem under the field it came from.
     fn apply_profile_model_edit(&mut self, cx: &mut Context<Self>) {
-        self.apply_model_editor(cx);
+        // One entrance for changes that arrive outside the shared body (a token
+        // preset writes its field and then calls this). The host's choice was
+        // recorded on the draft during render: the Agent dialog writes through,
+        // the Models tab waits for its Save button.
+        if self.model_editor.write_through {
+            self.apply_model_editor(cx);
+        } else {
+            cx.notify();
+        }
     }
 
     fn duplicate_provider_profile(&mut self, profile_id: String, cx: &mut Context<Self>) {
@@ -44687,6 +44539,36 @@ mod tests {
         // A field that does not parse keeps the Model's previous value.
         assert!(read.contains("declared_token_limits(&context_text, &output_text)"));
         assert!(read.contains("if id.is_empty()"));
+    }
+
+    /// A typed Model id reaches the dialog's draft without waiting for another
+    /// control to write through: the Agent dialog has no Apply step, so the
+    /// dialog's own Save must see the new id.
+    #[gpui::test]
+    fn typing_a_model_id_writes_it_through_to_the_agent_draft(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let (center, cx) = cx.add_window_view(ManagementCenter::new);
+        cx.update(|window, cx| {
+            center.update(cx, |center, cx| {
+                center.profile_configured_models = vec![test_provider_model("old-id", None)];
+                center.profile_model_selection = Some("old-id".to_string());
+                center.load_profile_model_editor(0, window, cx);
+                // The Agent dialog's pane is the host that writes through; the
+                // Models tab keeps this false and waits for its Save button.
+                center.model_editor.write_through = true;
+                center.model_editor.id.update(cx, |state, cx| {
+                    state.set_value("renamed-id", window, cx);
+                    cx.emit(InputEvent::Change);
+                });
+            });
+        });
+        center.read_with(cx, |center, _| {
+            assert_eq!(center.profile_configured_models[0].id, "renamed-id");
+            assert_eq!(
+                center.profile_model_selection.as_deref(),
+                Some("renamed-id")
+            );
+        });
     }
 
     #[test]

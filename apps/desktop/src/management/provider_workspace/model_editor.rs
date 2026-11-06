@@ -55,6 +55,12 @@ pub(in crate::management) struct ModelEditDraft {
     pub(in crate::management) temperature: Option<bool>,
     pub(in crate::management) reasoning: Option<bool>,
     pub(in crate::management) enabled: bool,
+    /// Whether a field edit is the value immediately.
+    ///
+    /// The Agent dialog has no Apply step, so its pane writes each keystroke
+    /// into the dialog's draft. The Models tab waits for its Save button and
+    /// reads the fields directly, so the same editor must not write there.
+    pub(in crate::management) write_through: bool,
     /// The model the loaded values describe, so the host can tell a reload from
     /// a repaint without keeping a second selection.
     pub(in crate::management) target_id: Option<String>,
@@ -66,6 +72,10 @@ pub(in crate::management) struct ModelEditDraft {
     pub(in crate::management) error_message: Option<String>,
     pub(in crate::management) suggestion: Option<vibex_core::GatewayCapabilitySuggestion>,
     pub(in crate::management) suggestion_auto_filled: usize,
+    /// The field subscriptions that write edits through, kept alive with the
+    /// draft. Dropping them would silently turn the editor back into one that
+    /// only writes through on its controls.
+    _subscriptions: Vec<gpui::Subscription>,
 }
 
 /// One protocol the editor may offer, and how the host can support it.
@@ -92,7 +102,7 @@ impl ModelEditDraft {
         let mut text = |placeholder: &'static str| {
             cx.new(|cx| InputState::new(window, cx).placeholder(placeholder))
         };
-        Self {
+        let mut draft = Self {
             id: text(management_locale_text("Model id", "模型 ID", "模型 ID")),
             display_name: text(management_locale_text(
                 "Display name",
@@ -117,6 +127,7 @@ impl ModelEditDraft {
             temperature: None,
             reasoning: None,
             enabled: true,
+            write_through: false,
             target_id: None,
             context_tokens_cache: None,
             output_tokens_cache: None,
@@ -124,7 +135,44 @@ impl ModelEditDraft {
             error_message: None,
             suggestion: None,
             suggestion_auto_filled: 0,
+            _subscriptions: Vec::new(),
+        };
+        // The fields write themselves into the owning draft as they are typed.
+        // A host that only repaints on a change (the Models tab) leaves its
+        // values here for its Save button to read; the Agent dialog, which has
+        // no Apply step, cannot wait for a control that happens to write
+        // through, or a typed Model id would be dropped by the dialog's Save.
+        let mut subscriptions = Vec::new();
+        for input in [
+            &draft.id,
+            &draft.display_name,
+            &draft.context_tokens,
+            &draft.output_tokens,
+        ] {
+            subscriptions.push(cx.subscribe(input, |this, _, event: &InputEvent, cx| {
+                if !crate::management::management_input_changed(event) {
+                    return;
+                }
+                let write_through = this.model_editor.write_through;
+                this.model_editor_changed(write_through, cx);
+            }));
         }
+        subscriptions.push(
+            cx.subscribe(&draft.efforts, |this, _, event: &InputEvent, cx| {
+                if !crate::management::management_input_changed(event) {
+                    return;
+                }
+                // A written table is the more specific answer, so typing one leaves
+                // the non-reasoning choice behind.
+                if !this.model_editor.efforts.read(cx).value().trim().is_empty() {
+                    this.model_editor.reasoning_disabled = false;
+                }
+                let write_through = this.model_editor.write_through;
+                this.model_editor_changed(write_through, cx);
+            }),
+        );
+        draft._subscriptions = subscriptions;
+        draft
     }
 
     /// Points the fields at one model.
@@ -434,6 +482,10 @@ impl ManagementCenter {
             shows_enabled,
             write_through,
         } = config;
+        // The host decides what a keystroke means, and the field subscriptions
+        // installed when the draft was built read it back. Recording it on the
+        // draft keeps one editor body shared by both hosts.
+        self.model_editor.write_through = write_through;
         let reasoning_disabled = self.model_editor.reasoning_disabled;
         let error_message = self.model_editor.error_message.clone();
         let mut editor = v_flex()
