@@ -1410,11 +1410,28 @@ impl AgentManager {
         if request.title.is_some() {
             SessionRepository::lock_title(&conn, &session.id)?;
         }
+        let environment = self.terminal_session_env(&request, &session)?;
+        // Claude Code applies the reader's `~/.claude/settings.json` after the
+        // process environment, so a Profile's endpoint and credential only win
+        // on the command-line settings tier. The projection file is restated
+        // both in the recorded argv and in the launch that carries the prompt.
+        if let Some(settings_path) = environment.claude_settings_path.as_deref() {
+            crate::terminal_settings::apply_claude_settings_argument(
+                &mut argv,
+                &session.agent_id,
+                settings_path,
+            );
+            crate::terminal_settings::apply_claude_settings_argument(
+                &mut launch_argv,
+                &session.agent_id,
+                settings_path,
+            );
+        }
         let spec = vibex_core::TerminalSessionLaunchSpec {
             workspace_id: workspace.id,
             workspace_root: workspace.root_path,
             argv: launch_argv,
-            env: self.terminal_session_env(&request, &session)?,
+            env: environment.env,
             title: session.title.clone(),
             rows: request.rows,
             cols: request.cols,
@@ -1489,22 +1506,24 @@ impl AgentManager {
         &self,
         request: &CreateTerminalSessionRequest,
         session: &AgentSession,
-    ) -> VibexResult<Vec<(String, String)>> {
+    ) -> VibexResult<crate::session_terminal::TerminalSessionEnvironment> {
         match request.provider_profile_id.as_ref() {
             Some(profile_id) => self.terminal_session_env_overlays(profile_id, session),
-            None => Ok(Vec::new()),
+            None => Ok(crate::session_terminal::TerminalSessionEnvironment::default()),
         }
     }
 
     /// The environment overlays a Profile-backed terminal Agent inherits.
     ///
     /// Exposed so a restart can rebuild them from the recorded Profile id
-    /// instead of persisting resolved credentials.
+    /// instead of persisting resolved credentials. A Claude projection also
+    /// produces the settings file its CLI must load, because the process
+    /// environment alone loses to `~/.claude/settings.json`.
     pub fn terminal_session_env_overlays(
         &self,
         profile_id: &ProviderProfileId,
         session: &AgentSession,
-    ) -> VibexResult<Vec<(String, String)>> {
+    ) -> VibexResult<crate::session_terminal::TerminalSessionEnvironment> {
         let conn = self.open_migrated()?;
         let profile = ProviderProfileRepository::get(&conn, profile_id)?.ok_or_else(|| {
             VibexError::validation(
@@ -1541,7 +1560,15 @@ impl AgentManager {
             TERMINAL_SESSION_PROJECTION_FINGERPRINT_ENV.to_string(),
             projection.fingerprint.clone(),
         ));
-        Ok(env)
+        let claude_settings_path = if session.agent_id.as_str() == "claude" {
+            projection.write_claude_terminal_settings()?
+        } else {
+            None
+        };
+        Ok(crate::session_terminal::TerminalSessionEnvironment {
+            env,
+            claude_settings_path,
+        })
     }
 
     pub async fn create_session(
@@ -3177,17 +3204,27 @@ impl AgentManager {
         }
         // The environment is re-resolved from the Profile rather than kept: the
         // credentials never touched the database, so this is the only way the
-        // restarted Agent reaches the same provider.
-        let env = match record.provider_profile_id.as_ref() {
+        // restarted Agent reaches the same provider. A Claude session also gets
+        // its settings file rewritten, because the projection it names can have
+        // changed since the first launch.
+        let environment = match record.provider_profile_id.as_ref() {
             Some(profile_id) => self.terminal_session_env_overlays(profile_id, &session)?,
-            None => Vec::new(),
+            None => crate::session_terminal::TerminalSessionEnvironment::default(),
         };
         // The Agent's conversation lives in its own store, and a restart has to
         // continue it rather than start a second one beside it. The exit notice
         // names the exact session when it printed one; failing that, both CLIs
         // can continue the most recent conversation in this directory, which is
         // this session unless the reader ran another one there since.
-        let mut argv = record.argv.clone();
+        let mut recorded_argv = record.argv.clone();
+        if let Some(settings_path) = environment.claude_settings_path.as_deref() {
+            crate::terminal_settings::apply_claude_settings_argument(
+                &mut recorded_argv,
+                &session.agent_id,
+                settings_path,
+            );
+        }
+        let mut argv = recorded_argv.clone();
         match record
             .facts
             .native_session_id
@@ -3213,7 +3250,7 @@ impl AgentManager {
             workspace_id: record.workspace_id.clone(),
             workspace_root: session.workspace_root.clone(),
             argv,
-            env,
+            env: environment.env,
             title: session.title.clone(),
             rows: 24,
             cols: 100,
@@ -3232,7 +3269,7 @@ impl AgentManager {
             session_id,
             &handle.terminal_id,
             &record.workspace_id,
-            &record.argv,
+            &recorded_argv,
             &session.workspace_root,
             record.provider_profile_id.as_ref(),
         )?;
@@ -13605,6 +13642,89 @@ mod tests {
         assert!(
             !stored.contains("API_KEY") && !stored.contains("TOKEN"),
             "the recorded argv must not carry credential material: {stored}"
+        );
+    }
+
+    /// A Profile-backed Claude session states its connection on the settings
+    /// tier, because the process environment loses to the reader's own file.
+    #[tokio::test]
+    async fn a_claude_terminal_session_gets_the_provider_settings_tier() {
+        let (manager, launcher, dir) = terminal_manager();
+        let service = ProviderConfigService::new(&dir.join("vibex.db"));
+        let shared = service
+            .create_model_provider_profile(vibex_core::ModelProviderProfileCreateRequest {
+                display_name: "Claude Terminal".to_string(),
+                vendor_hint: None,
+                endpoints: vec![vibex_core::ModelProviderEndpoint {
+                    id: "api".to_string(),
+                    kind: vibex_core::ModelProviderEndpointKind::Api,
+                    url: "https://claude.example.invalid".to_string(),
+                    wire_protocol_id: Some(
+                        vibex_core::WIRE_PROTOCOL_ANTHROPIC_MESSAGES.to_string(),
+                    ),
+                }],
+                proxy_policy: vibex_core::ModelProviderProxyPolicy::InheritSystem,
+                credentials: Vec::new(),
+                configured_models: vec![vibex_core::ModelProviderCatalogEntry {
+                    id: "claude-opus-4-6".to_string(),
+                    display_name: None,
+                    enabled: true,
+                    capabilities: Default::default(),
+                    metadata: Default::default(),
+                }],
+                default_model_id: Some("claude-opus-4-6".to_string()),
+                headers: Vec::new(),
+                metadata: Default::default(),
+                status: vibex_core::ModelProviderProfileStatus::Enabled,
+            })
+            .unwrap();
+        let profile = service
+            .bind_provider_to_agent(vibex_core::AgentModelProviderBindRequest {
+                provider_profile_id: vibex_core::ProviderProfileId::new(),
+                model_provider_profile_id: Some(shared.id),
+                agent_id: AgentId::parse("claude").unwrap(),
+                make_default: false,
+            })
+            .unwrap();
+        let mut request = terminal_request("claude", &dir);
+        request.provider_profile_id = Some(profile.id);
+        let session = manager.create_terminal_session(request).await.unwrap();
+
+        let launches = launcher.launches();
+        let argv = &launches[0].argv;
+        let settings_index = argv
+            .iter()
+            .position(|argument| argument == "--settings")
+            .expect("a Claude session with a Profile must pass --settings");
+        assert_eq!(settings_index, 1, "the flag must stay ahead of the prompt");
+        let settings_path = std::path::PathBuf::from(&argv[settings_index + 1]);
+        let settings: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&settings_path).unwrap()).unwrap();
+        assert_eq!(
+            settings["env"]["ANTHROPIC_BASE_URL"],
+            "https://claude.example.invalid"
+        );
+
+        // A restart rebuilds the environment from the Profile and must keep one
+        // settings pair, not append a second one or drop the recorded flag.
+        launcher.kill(&launcher.watched()[0].0).unwrap();
+        manager.restart_terminal_session(&session.id).await.unwrap();
+        let launches = launcher.launches();
+        let restarted = launches.last().expect("the restart launched");
+        assert_eq!(
+            restarted
+                .argv
+                .iter()
+                .filter(|argument| *argument == "--settings")
+                .count(),
+            1,
+            "a restart must not duplicate the settings pair"
+        );
+        let settings: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&settings_path).unwrap()).unwrap();
+        assert_eq!(
+            settings["env"]["ANTHROPIC_BASE_URL"], "https://claude.example.invalid",
+            "the restart must rewrite the same private settings file"
         );
     }
 

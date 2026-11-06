@@ -4799,30 +4799,40 @@ impl DesktopRuntime {
             }
             // Credentials are re-resolved from the Profile rather than read
             // back: the link row stores which Profile was used, never what it
-            // resolved to.
-            let env = match record.provider_profile_id.as_ref() {
+            // resolved to. A Claude session also gets its settings file
+            // rewritten, because the projection it names can have changed since
+            // the process was last started.
+            let environment = match record.provider_profile_id.as_ref() {
                 Some(profile_id) => match self
                     .agent
                     .manager()
                     .terminal_session_env_overlays(profile_id, &session)
                 {
-                    Ok(env) => env,
+                    Ok(environment) => environment,
                     Err(error) => {
                         tracing::warn!(
                             target: "vibex_desktop",
                             error_code = %error.code,
                             "terminal session profile could not be re-resolved"
                         );
-                        Vec::new()
+                        vibex_agent::TerminalSessionEnvironment::default()
                     }
                 },
-                None => Vec::new(),
+                None => vibex_agent::TerminalSessionEnvironment::default(),
             };
+            let mut argv = record.argv.clone();
+            if let Some(settings_path) = environment.claude_settings_path.as_deref() {
+                vibex_agent::apply_claude_settings_argument(
+                    &mut argv,
+                    &session.agent_id,
+                    settings_path,
+                );
+            }
             let spec = vibex_core::TerminalSessionLaunchSpec {
                 workspace_id: record.workspace_id.clone(),
                 workspace_root: session.workspace_root.clone(),
-                argv: record.argv.clone(),
-                env,
+                argv: argv.clone(),
+                env: environment.env,
                 title: session.title.clone(),
                 rows: 24,
                 cols: 100,
@@ -4834,7 +4844,7 @@ impl DesktopRuntime {
                         &session.id,
                         &handle.terminal_id,
                         &record.workspace_id,
-                        &record.argv,
+                        &argv,
                         &session.workspace_root,
                         record.provider_profile_id.as_ref(),
                     )?;
