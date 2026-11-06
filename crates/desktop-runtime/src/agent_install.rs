@@ -339,6 +339,14 @@ impl AgentInstallService {
         }
         let root = Path::new(record.install_root.as_deref()?);
         let manifest = read_install_manifest(root)?;
+        // Claude and Codex are the two Agents whose managed package *is* the
+        // ACP adapter, not the product CLI with an ACP mode. Their interactive
+        // interface lives in a dependency of that adapter, so running the
+        // adapter's entry point here would start a stdio ACP server in the
+        // reader's terminal.
+        if matches!(agent_id.as_str(), "claude" | "codex") {
+            return managed_adapter_native_cli(agent_id, root, &manifest);
+        }
         let mut path_entries = Vec::new();
         let (program, arguments) = match manifest.launch {
             ManifestLaunch::Binary { command, .. } => {
@@ -4655,6 +4663,89 @@ fn validate_npm_integrity(integrity: &str) -> VibexResult<()> {
     Ok(())
 }
 
+/// The native interface inside an Agent whose managed package is the adapter.
+///
+/// `claude-agent-acp` and `codex-acp` are standalone Adapters; the product CLI
+/// they drive is a dependency in the same tree. Returning `None` when that
+/// dependency is absent is deliberate: the caller then falls back to the bare
+/// command on `PATH`, which is the behavior these two Agents had before
+/// managed resolution existed.
+fn managed_adapter_native_cli(
+    agent_id: &AgentId,
+    root: &Path,
+    manifest: &InstallManifest,
+) -> Option<ManagedCliLaunch> {
+    let node = match &manifest.launch {
+        ManifestLaunch::Node { node, .. } => PathBuf::from(node),
+        _ => return None,
+    };
+    if !node.is_file() {
+        return None;
+    }
+    let mut path_entries = Vec::new();
+    if let Some(parent) = node.parent() {
+        path_entries.push(parent.to_string_lossy().into_owned());
+    }
+    path_entries.push(
+        root.join("node_modules")
+            .join(".bin")
+            .to_string_lossy()
+            .into_owned(),
+    );
+    let (program, arguments) = match agent_id.as_str() {
+        "claude" => (managed_claude_sdk_binary(root)?, Vec::new()),
+        "codex" => {
+            let script = root.join("node_modules/@openai/codex/bin/codex.js");
+            if !script.is_file() {
+                return None;
+            }
+            (
+                node.to_string_lossy().into_owned(),
+                vec![script.to_string_lossy().into_owned()],
+            )
+        }
+        _ => return None,
+    };
+    path_entries.sort();
+    path_entries.dedup();
+    Some(ManagedCliLaunch {
+        program,
+        arguments,
+        path_entries,
+    })
+}
+
+/// The Claude Code binary bundled with the Claude Agent SDK.
+///
+/// The SDK ships the CLI as a platform package
+/// (`@anthropic-ai/claude-agent-sdk-<platform>/claude`), which is the same
+/// interactive interface a globally installed `claude` starts.
+fn managed_claude_sdk_binary(root: &Path) -> Option<String> {
+    let binary = if cfg!(windows) {
+        "claude.exe"
+    } else {
+        "claude"
+    };
+    let scope = root.join("node_modules").join("@anthropic-ai");
+    let entries = fs::read_dir(scope).ok()?;
+    let mut candidates = entries
+        .flatten()
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("claude-agent-sdk")
+        })
+        .map(|entry| entry.path().join(binary))
+        .filter(|candidate| candidate.is_file())
+        .collect::<Vec<_>>();
+    candidates.sort();
+    candidates
+        .into_iter()
+        .next()
+        .map(|candidate| candidate.to_string_lossy().into_owned())
+}
+
 fn read_install_manifest(root: &Path) -> Option<InstallManifest> {
     let bytes = fs::read(root.join("vibex-install.json")).ok()?;
     serde_json::from_slice(&bytes).ok()
@@ -7317,6 +7408,178 @@ printf '%s\n' '{"version":"1.2.3","scripts":["test-package"]}'
             },
         )
         .unwrap();
+    }
+
+    /// Claude's managed package is the ACP adapter. The terminal must start
+    /// the Claude Code binary the adapter depends on, not the adapter itself.
+    #[cfg(unix)]
+    #[test]
+    fn a_managed_claude_installation_resolves_the_sdk_binary() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("vibex.db");
+        let root = temp.path().join("managed-agents");
+        let service =
+            AgentInstallService::new(&db_path, &root, ProviderConfigService::new(&db_path))
+                .unwrap();
+        let node = root.join("runtimes/node/external/bin/node");
+        fs::create_dir_all(node.parent().unwrap()).unwrap();
+        fs::write(&node, b"fixture").unwrap();
+        let install_root = root.join("agents/claude/1.0.0-fixture");
+        let adapter =
+            install_root.join("node_modules/@agentclientprotocol/claude-agent-acp/dist/index.js");
+        fs::create_dir_all(adapter.parent().unwrap()).unwrap();
+        fs::write(&adapter, b"// adapter").unwrap();
+        let native =
+            install_root.join("node_modules/@anthropic-ai/claude-agent-sdk-linux-x64/claude");
+        fs::create_dir_all(native.parent().unwrap()).unwrap();
+        fs::write(&native, b"// claude").unwrap();
+        write_json_private(
+            &install_root.join("vibex-install.json"),
+            &InstallManifest {
+                registry_agent_id: "claude-acp".to_string(),
+                version: "1.0.0".to_string(),
+                fingerprint: "fixture".to_string(),
+                runtime_version: None,
+                runtime_dependencies: BTreeMap::new(),
+                distribution_kind: AgentManagedDistributionKind::Npm,
+                launch: ManifestLaunch::Node {
+                    node: node.to_string_lossy().into_owned(),
+                    script: "node_modules/@agentclientprotocol/claude-agent-acp/dist/index.js"
+                        .to_string(),
+                    args: Vec::new(),
+                },
+            },
+        )
+        .unwrap();
+        let claude = AgentId::parse("claude").unwrap();
+        record_managed_install(
+            &db_path,
+            &claude,
+            "claude-acp",
+            &install_root,
+            AgentCommandConfig {
+                command: node.to_string_lossy().into_owned(),
+                args: vec![adapter.to_string_lossy().into_owned()],
+            },
+            AgentManagedDistributionKind::Npm,
+        );
+
+        let launch = service.native_cli_launch(&claude).unwrap();
+        assert_eq!(launch.program, native.to_string_lossy());
+        assert!(launch.arguments.is_empty());
+    }
+
+    /// Codex's managed package also ships the adapter; the native CLI is the
+    /// `@openai/codex` dependency beside it.
+    #[cfg(unix)]
+    #[test]
+    fn a_managed_codex_installation_resolves_the_native_cli() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("vibex.db");
+        let root = temp.path().join("managed-agents");
+        let service =
+            AgentInstallService::new(&db_path, &root, ProviderConfigService::new(&db_path))
+                .unwrap();
+        let node = root.join("runtimes/node/external/bin/node");
+        fs::create_dir_all(node.parent().unwrap()).unwrap();
+        fs::write(&node, b"fixture").unwrap();
+        let install_root = root.join("agents/codex/1.0.0-fixture");
+        let adapter =
+            install_root.join("node_modules/@agentclientprotocol/codex-acp/dist/index.js");
+        fs::create_dir_all(adapter.parent().unwrap()).unwrap();
+        fs::write(&adapter, b"// adapter").unwrap();
+        let native = install_root.join("node_modules/@openai/codex/bin/codex.js");
+        fs::create_dir_all(native.parent().unwrap()).unwrap();
+        fs::write(&native, b"// codex").unwrap();
+        write_json_private(
+            &install_root.join("vibex-install.json"),
+            &InstallManifest {
+                registry_agent_id: "codex-acp".to_string(),
+                version: "1.0.0".to_string(),
+                fingerprint: "fixture".to_string(),
+                runtime_version: None,
+                runtime_dependencies: BTreeMap::new(),
+                distribution_kind: AgentManagedDistributionKind::Npm,
+                launch: ManifestLaunch::Node {
+                    node: node.to_string_lossy().into_owned(),
+                    script: "node_modules/@agentclientprotocol/codex-acp/dist/index.js".to_string(),
+                    args: Vec::new(),
+                },
+            },
+        )
+        .unwrap();
+        let codex = AgentId::parse("codex").unwrap();
+        record_managed_install(
+            &db_path,
+            &codex,
+            "codex-acp",
+            &install_root,
+            AgentCommandConfig {
+                command: node.to_string_lossy().into_owned(),
+                args: vec![adapter.to_string_lossy().into_owned()],
+            },
+            AgentManagedDistributionKind::Npm,
+        );
+
+        let launch = service.native_cli_launch(&codex).unwrap();
+        assert_eq!(launch.program, node.to_string_lossy());
+        assert_eq!(
+            launch.arguments,
+            vec![native.to_string_lossy().into_owned()]
+        );
+    }
+
+    /// An adapter-only tree with no native dependency must fall back to the
+    /// bare command on `PATH` rather than launch an ACP server as the TUI.
+    #[cfg(unix)]
+    #[test]
+    fn a_managed_adapter_without_a_native_cli_falls_back_to_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("vibex.db");
+        let root = temp.path().join("managed-agents");
+        let service =
+            AgentInstallService::new(&db_path, &root, ProviderConfigService::new(&db_path))
+                .unwrap();
+        let node = root.join("runtimes/node/external/bin/node");
+        fs::create_dir_all(node.parent().unwrap()).unwrap();
+        fs::write(&node, b"fixture").unwrap();
+        let install_root = root.join("agents/claude/1.0.0-fixture");
+        let adapter =
+            install_root.join("node_modules/@agentclientprotocol/claude-agent-acp/dist/index.js");
+        fs::create_dir_all(adapter.parent().unwrap()).unwrap();
+        fs::write(&adapter, b"// adapter").unwrap();
+        write_json_private(
+            &install_root.join("vibex-install.json"),
+            &InstallManifest {
+                registry_agent_id: "claude-acp".to_string(),
+                version: "1.0.0".to_string(),
+                fingerprint: "fixture".to_string(),
+                runtime_version: None,
+                runtime_dependencies: BTreeMap::new(),
+                distribution_kind: AgentManagedDistributionKind::Npm,
+                launch: ManifestLaunch::Node {
+                    node: node.to_string_lossy().into_owned(),
+                    script: "node_modules/@agentclientprotocol/claude-agent-acp/dist/index.js"
+                        .to_string(),
+                    args: Vec::new(),
+                },
+            },
+        )
+        .unwrap();
+        let claude = AgentId::parse("claude").unwrap();
+        record_managed_install(
+            &db_path,
+            &claude,
+            "claude-acp",
+            &install_root,
+            AgentCommandConfig {
+                command: node.to_string_lossy().into_owned(),
+                args: vec![adapter.to_string_lossy().into_owned()],
+            },
+            AgentManagedDistributionKind::Npm,
+        );
+
+        assert!(service.native_cli_launch(&claude).is_none());
     }
 
     #[cfg(unix)]
