@@ -150,6 +150,22 @@ impl Render for TeamSidebarHost {
     }
 }
 
+/// The workbench column on its own, for tests that assert what a session
+/// group pane paints.
+struct TeamColumnHost {
+    workbench: Entity<VibexWorkbench>,
+    _subscription: Subscription,
+}
+
+impl Render for TeamColumnHost {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div().size_full().child(
+            self.workbench
+                .update(cx, |workbench, cx| workbench.render_column_page(cx)),
+        )
+    }
+}
+
 fn session(index: usize) -> AgentSession {
     AgentSession {
         id: VibexSessionId::parse(format!("session_team_{index}")).unwrap(),
@@ -170,6 +186,19 @@ fn session(index: usize) -> AgentSession {
         transport: vibex_core::SessionTransport::Acp,
         terminal: None,
     }
+}
+
+fn terminal_session(index: usize) -> AgentSession {
+    let mut session = session(index);
+    session.transport = SessionTransport::Terminal;
+    session.terminal = Some(Box::new(TerminalSessionFacts {
+        terminal_id: Some(TerminalId::parse(format!("terminal_{index}")).unwrap()),
+        activity: TerminalActivity::Idle,
+        source: TerminalActivitySource::Hook,
+        observed_at_ms: 1,
+        ..Default::default()
+    }));
+    session
 }
 
 fn node(index: usize, parent: Option<usize>, children: usize) -> SessionTreeNode {
@@ -3455,4 +3484,90 @@ fn a_locally_dispatched_turn_settles_the_queued_auto_send(cx: &mut TestAppContex
             .is_ok_and(|observed| matches!(observed, Observed::Message(_)))
     });
     assert!(sent, "the submission path received the queued message");
+}
+
+#[gpui::test]
+fn the_group_row_opens_its_context_menu(cx: &mut TestAppContext) {
+    let (workbench, cx, _) = fixture(cx, 2);
+    workbench.update(cx, |workbench, cx| {
+        // The group's members leave the project's compact session list, so the
+        // project needs one ungrouped row to stay on screen.
+        workbench.sessions.push(session(2));
+        group(workbench, 2);
+        workbench.selected_session_id = Some(session(0).id);
+        workbench.invalidate_sidebar_projection_cache();
+        cx.notify();
+    });
+    draw(cx);
+    let row = cx
+        .debug_bounds("sidebar-group-row-team")
+        .expect("the group row should be painted");
+    let position = row.center();
+    cx.simulate_mouse_down(position, MouseButton::Right, Default::default());
+    cx.simulate_mouse_up(position, MouseButton::Right, Default::default());
+    draw(cx);
+    assert_eq!(
+        workbench.read_with(cx, |workbench, _| workbench
+            .sidebar_context_menu_target
+            .clone()),
+        Some(SidebarContextMenuTarget::Group("team".into())),
+        "right-clicking the group row should open its own menu"
+    );
+    // A menu that opened but never painted would still set the target above.
+    // Driving one of its items by keyboard proves a live popup, not just the
+    // deferred builder. "Auto continue" writes the opposite of the effective
+    // default the menu read when it was built.
+    let project_default = workbench.read_with(cx, |workbench, _| {
+        workbench.project_auto_continue_enabled_for("project_team")
+    });
+    cx.simulate_mouse_move(point(px(0.0), px(0.0)), None, Default::default());
+    cx.simulate_keystrokes("down down enter");
+    draw(cx);
+    assert_eq!(
+        workbench.read_with(cx, |workbench, _| workbench
+            .ui_state
+            .sidebar
+            .organization
+            .group("team")
+            .and_then(|group| group.auto_continue)),
+        Some(!project_default),
+        "the group menu's Auto continue item should run"
+    );
+}
+
+/// A native terminal session in a group renders its terminal page.
+///
+/// The pane used to run every member through the conversation builder, so a
+/// terminal tab painted the empty "start a conversation" surface. The whole
+/// column is rendered here, not just the source, so the fix is pinned at the
+/// boundary the reader sees.
+#[gpui::test]
+fn a_group_pane_draws_a_terminal_session_as_a_terminal(cx: &mut TestAppContext) {
+    let (workbench, cx, _) = fixture(cx, 2);
+    workbench.update(cx, |workbench, cx| {
+        let terminal = terminal_session(0);
+        workbench.sessions = vec![terminal.clone(), session(2)];
+        workbench.selected_session_id = Some(terminal.id);
+        group(workbench, 2);
+        workbench.invalidate_sidebar_projection_cache();
+        cx.notify();
+    });
+
+    let column_workbench = workbench.clone();
+    let (_, cx) = cx.add_window_view(|window, cx| {
+        let host = cx.new(|cx| TeamColumnHost {
+            _subscription: cx.observe(&column_workbench, |_, _, cx| cx.notify()),
+            workbench: column_workbench,
+        });
+        Root::new(host, window, cx)
+    });
+    draw(cx);
+    assert!(
+        cx.debug_bounds("session-group-workspace").is_some(),
+        "the group workspace should own the column"
+    );
+    assert!(
+        cx.debug_bounds("session-terminal-page").is_some(),
+        "the group pane should paint the terminal page"
+    );
 }

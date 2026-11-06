@@ -9858,8 +9858,12 @@ pub struct VibexWorkbench {
     /// dropped `TerminalSurface` would close the Agent's PTY and take the
     /// running turn with it.
     session_terminal_surfaces: BTreeMap<String, Entity<TerminalSurface>>,
-    /// The terminal-mode session whose surface is currently polling.
-    active_session_terminal_id: Option<String>,
+    /// The terminal-mode sessions whose surfaces are currently polling.
+    ///
+    /// A group workspace can show several terminal sessions at once, one per
+    /// pane, and each visible grid has to keep its own frame stream. A hidden
+    /// tab or a pane the maximized layout is not painting stays out of the set.
+    active_session_terminal_ids: BTreeSet<String>,
     /// The terminal session whose page should take the keyboard once its
     /// surface is on screen.
     ///
@@ -11874,7 +11878,7 @@ impl VibexWorkbench {
         let mut this = Self {
             focus_handle,
             session_terminal_surfaces: BTreeMap::new(),
-            active_session_terminal_id: None,
+            active_session_terminal_ids: BTreeSet::new(),
             session_terminal_focus_request: None,
             session_terminal_view: None,
             terminal_session_restart_pending: None,
@@ -50342,6 +50346,7 @@ impl VibexWorkbench {
             });
         v_flex()
             .id("session-group-workspace")
+            .debug_selector(|| "session-group-workspace".to_string())
             .size_full()
             .min_w_0()
             .min_h_0()
@@ -51188,6 +51193,31 @@ impl VibexWorkbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let Ok(pane_session_id) = VibexSessionId::parse(session_id) else {
+            return Empty.into_any_element();
+        };
+        let Some(pane_session) = self.registered_session(pane_session_id.as_str()).cloned() else {
+            return Empty.into_any_element();
+        };
+        // A terminal-mode session has no timeline: the Agent owns its own
+        // interface inside the PTY. The pane draws that page — the same one the
+        // single-session column draws — instead of an empty conversation and a
+        // composer over it. This branch owns the whole pane, so it returns
+        // before the timeline borrow the conversation path needs.
+        if pane_session.is_terminal() {
+            return div()
+                .flex_1()
+                .min_w_0()
+                .min_h_0()
+                .overflow_hidden()
+                .child(self.render_session_terminal_page_for_session(
+                    pane_session,
+                    focused,
+                    window,
+                    cx,
+                ))
+                .into_any_element();
+        }
         if let Some(error) = self.session_group_view_errors.get(session_id).cloned() {
             let session_id = session_id.to_string();
             return v_flex()
@@ -51216,12 +51246,6 @@ impl VibexWorkbench {
                         })),
                 )
                 .into_any_element();
-        }
-        let Ok(pane_session_id) = VibexSessionId::parse(session_id).ok().ok_or(()) else {
-            return Empty.into_any_element();
-        };
-        if self.registered_session(pane_session_id.as_str()).is_none() {
-            return Empty.into_any_element();
         }
         // A pane renders its own session's view, full stop. Focus only decides
         // where the keyboard goes; it never decides which conversation a pane
@@ -51335,12 +51359,27 @@ impl VibexWorkbench {
             self.forget_session_view(&id);
         }
         for member_id in &members {
+            // A terminal pane draws its PTY, not a timeline, so materializing a
+            // conversation for it would fetch an empty history and keep an
+            // unused view resident.
+            if self
+                .registered_session(member_id)
+                .is_some_and(AgentSession::is_terminal)
+            {
+                continue;
+            }
             let Ok(session_id) = VibexSessionId::parse(member_id) else {
                 continue;
             };
             self.ensure_session_view(&session_id);
         }
         for member_id in members {
+            if self
+                .registered_session(&member_id)
+                .is_some_and(AgentSession::is_terminal)
+            {
+                continue;
+            }
             let Ok(session_id) = VibexSessionId::parse(&member_id) else {
                 continue;
             };
@@ -51877,6 +51916,10 @@ impl VibexWorkbench {
 
         let mut row = div()
             .id(format!("sidebar-group-row-{group_id}"))
+            .debug_selector({
+                let selector = format!("sidebar-group-row-{group_id}");
+                move || selector.clone()
+            })
             .group(hover_group.clone())
             .relative()
             .h(px(SIDEBAR_REORDER_ROW_HEIGHT))
@@ -51991,33 +52034,39 @@ impl VibexWorkbench {
             .when(renaming, |this| {
                 this.on_key_down(cx.listener(Self::on_sidebar_rename_key_down))
             })
-            .context_menu(move |menu, window, cx| {
-                let _ = context_hover_entity.update(cx, |this, cx| {
-                    this.set_sidebar_context_menu_target(
-                        SidebarContextMenuTarget::Group(menu_group_id.clone()),
-                        cx,
-                    );
-                });
-                let popup_entity = cx.entity();
-                let _ = context_entity.update(cx, |this, cx| this.begin_sidebar_menu_hover(cx));
-                Self::hold_sidebar_hover_preview_for_menu(
-                    &popup_entity,
-                    &context_entity,
-                    window,
-                    cx,
-                );
-                Self::build_sidebar_group_menu(
-                    menu,
-                    menu_group_id.clone(),
-                    menu_group_name.clone(),
-                    auto_continue,
-                    context_entity.clone(),
-                    window,
-                    cx,
-                )
-            })
             .child(
                 h_flex()
+                    // The menu hangs off the row's content, not off the row
+                    // itself, exactly as a session row's does. A trigger
+                    // registered on the same element as the row's right-click
+                    // guard never fires: the guard consumes the press first.
+                    .id(format!("sidebar-group-select-{group_id}"))
+                    .context_menu(move |menu, window, cx| {
+                        let _ = context_hover_entity.update(cx, |this, cx| {
+                            this.set_sidebar_context_menu_target(
+                                SidebarContextMenuTarget::Group(menu_group_id.clone()),
+                                cx,
+                            );
+                        });
+                        let popup_entity = cx.entity();
+                        let _ = context_entity
+                            .update(cx, |this, cx| this.begin_sidebar_menu_hover(cx));
+                        Self::hold_sidebar_hover_preview_for_menu(
+                            &popup_entity,
+                            &context_entity,
+                            window,
+                            cx,
+                        );
+                        Self::build_sidebar_group_menu(
+                            menu,
+                            menu_group_id.clone(),
+                            menu_group_name.clone(),
+                            auto_continue,
+                            context_entity.clone(),
+                            window,
+                            cx,
+                        )
+                    })
                     .size_full()
                     .min_w_0()
                     .items_center()
@@ -72367,10 +72416,30 @@ impl VibexWorkbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let body = self.render_session_terminal_body(window, cx);
+        let Some(session) = self.selected_session().cloned() else {
+            return empty_center_content();
+        };
+        self.render_session_terminal_page_for_session(session, true, window, cx)
+    }
+
+    /// The terminal page for one session.
+    ///
+    /// The single-session column and every terminal tab in a group workspace
+    /// draw the same page. `focused` says whether this page is the one the
+    /// keyboard belongs to; a visible pane that does not hold it still streams
+    /// its Agent's output, it just does not consume the focus hand-off.
+    fn render_session_terminal_page_for_session(
+        &mut self,
+        session: AgentSession,
+        focused: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let body = self.render_session_terminal_body(session, focused, window, cx);
         let window_fill = cx.theme().background;
         div()
             .id("session-terminal-page")
+            .debug_selector(|| "session-terminal-page".to_string())
             .size_full()
             .min_w_0()
             .min_h_0()
@@ -72400,12 +72469,11 @@ impl VibexWorkbench {
     /// The surface the page frames, or the stand-in that explains its absence.
     fn render_session_terminal_body(
         &mut self,
+        session: AgentSession,
+        focused: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let Some(session) = self.selected_session().cloned() else {
-            return empty_center_content();
-        };
         // A session whose Agent ended is answered before the surface is
         // considered. The link survives a quit on purpose — that is what lets
         // the page offer a restart — so checking the link first kept drawing the
@@ -72472,7 +72540,8 @@ impl VibexWorkbench {
         // The surface registers its focus handle while it renders, so the
         // keyboard moves on the deferred pass rather than in the middle of the
         // tree that is still being built.
-        if self.active_session_terminal_id.as_deref() == Some(key.as_str())
+        if focused
+            && self.active_session_terminal_ids.contains(key.as_str())
             && self.session_terminal_focus_request.as_deref() == Some(key.as_str())
         {
             self.session_terminal_focus_request = None;
@@ -72604,9 +72673,7 @@ impl VibexWorkbench {
                         // resize forced a fresh snapshot.
                         let key = session.id.as_str().to_string();
                         if let Some(surface) = this.session_terminal_surfaces.remove(&key) {
-                            if this.active_session_terminal_id.as_deref() == Some(key.as_str()) {
-                                this.active_session_terminal_id = None;
-                            }
+                            this.active_session_terminal_ids.remove(key.as_str());
                             surface.update(cx, |surface, cx| surface.set_active(false, cx));
                         }
                         this.upsert_session_snapshot(session);
@@ -72623,35 +72690,98 @@ impl VibexWorkbench {
         cx.notify();
     }
 
-    /// Keeps exactly the visible terminal-mode session polling.
+    /// Keeps exactly the visible terminal-mode surfaces polling.
     fn sync_session_terminal_surface_activity(&mut self, cx: &mut Context<Self>) {
-        let desired = (self.ui_state.workbench.active_tab == "agent"
-            && !self.new_session_open
-            && !self.settings_open)
-            .then(|| {
-                self.selected_session()
-                    .map(|session| session.id.as_str().to_string())
-            })
-            .flatten()
-            .filter(|key| self.session_terminal_surfaces.contains_key(key));
-        if desired == self.active_session_terminal_id {
+        let desired = self.visible_terminal_session_ids();
+        if desired == self.active_session_terminal_ids {
             return;
         }
-        if let Some(active) = self.active_session_terminal_id.take()
-            && let Some(surface) = self.session_terminal_surfaces.get(&active)
-        {
-            surface.update(cx, |surface, cx| surface.set_active(false, cx));
+        let stopped: Vec<String> = self
+            .active_session_terminal_ids
+            .difference(&desired)
+            .cloned()
+            .collect();
+        let started: Vec<String> = desired
+            .difference(&self.active_session_terminal_ids)
+            .cloned()
+            .collect();
+        for key in &stopped {
+            if let Some(surface) = self.session_terminal_surfaces.get(key) {
+                surface.update(cx, |surface, cx| surface.set_active(false, cx));
+            }
         }
-        if let Some(key) = desired {
-            if let Some(surface) = self.session_terminal_surfaces.get(&key) {
+        for key in &started {
+            if let Some(surface) = self.session_terminal_surfaces.get(key) {
                 surface.update(cx, |surface, cx| surface.set_active(true, cx));
             }
-            // The page just became the visible terminal. Whatever held the
-            // keyboard before — the sidebar row that selected it, or the
-            // previous page — the Agent's TUI is now what the reader means to
-            // type into, so the surface claims it once it has rendered.
-            self.session_terminal_focus_request = Some(key.clone());
-            self.active_session_terminal_id = Some(key);
+        }
+        // Only the selected page takes the keyboard. A group's other terminal
+        // panes stream frames but leave the keys where the reader put them.
+        let selected = self
+            .selected_session_id
+            .as_ref()
+            .map(|session_id| session_id.as_str().to_string());
+        if selected
+            .as_ref()
+            .is_some_and(|session_id| started.iter().any(|key| key == session_id))
+        {
+            self.session_terminal_focus_request = selected;
+        }
+        self.active_session_terminal_ids = desired;
+    }
+
+    /// The terminal surfaces a painted page is showing right now.
+    ///
+    /// The single-session column shows one terminal; an open group shows the
+    /// active tab of every pane it paints. A hidden tab and a pane the
+    /// maximized layout is not drawing are not visible, so they stay out.
+    fn visible_terminal_session_ids(&self) -> BTreeSet<String> {
+        let mut visible = BTreeSet::new();
+        if self.ui_state.workbench.active_tab != "agent"
+            || self.new_session_open
+            || self.settings_open
+        {
+            return visible;
+        }
+        if let Some((_, group)) = self.active_session_group() {
+            let live = group.live_session_ids();
+            for pane_id in group.layout.pane_ids() {
+                if group
+                    .maximized_pane_id
+                    .as_deref()
+                    .is_some_and(|maximized| maximized != pane_id)
+                {
+                    continue;
+                }
+                let Some(active) = group
+                    .layout
+                    .find_pane(&pane_id)
+                    .and_then(|pane| pane.active_session_id.as_deref())
+                else {
+                    continue;
+                };
+                if live.iter().any(|id| id == active) {
+                    self.note_visible_terminal_session(&mut visible, active);
+                }
+            }
+        } else if let Some(session) = self.selected_session() {
+            self.note_visible_terminal_session(&mut visible, session.id.as_str());
+        }
+        visible
+    }
+
+    /// Adds one session to the visible terminal set when it can actually paint.
+    fn note_visible_terminal_session(
+        &self,
+        visible: &mut BTreeSet<String>,
+        session_id: &str,
+    ) {
+        if self
+            .registered_session(session_id)
+            .is_some_and(AgentSession::is_terminal)
+            && self.session_terminal_surfaces.contains_key(session_id)
+        {
+            visible.insert(session_id.to_string());
         }
     }
 
@@ -73743,6 +73873,13 @@ impl VibexWorkbench {
     /// The workbench column's own page: the open session group, or the timeline
     /// when no group is in front.
     fn render_column_page(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        // A page change may hide the terminal that was polling. Sync before the
+        // arm so every frame — group workspace, conversation, or terminal —
+        // leaves exactly the visible grids running. An empty set means nothing
+        // to stop, so the common non-terminal frame pays nothing.
+        if !self.active_session_terminal_ids.is_empty() {
+            self.sync_session_terminal_surface_activity(cx);
+        }
         let page = if let Some((group_id, group)) = self.active_session_group() {
             self.render_session_group_workspace(&group_id, &group, cx)
         } else if self
@@ -106934,8 +107071,8 @@ mod tests {
             .map(|(body, _)| body)
             .expect("the activity sync should remain inspectable");
         assert!(
-            sync.contains("self.session_terminal_focus_request = Some(key.clone());"),
-            "activating a terminal page must hand it the keyboard"
+            sync.contains("self.session_terminal_focus_request = selected;"),
+            "activating the selected terminal page must hand it the keyboard"
         );
         let page = source
             .split_once("    fn render_session_terminal_body(")
@@ -107137,7 +107274,7 @@ mod tests {
             restart.contains("this.session_terminal_surfaces.remove(&key)"),
             "the old surface has to go, or it keeps showing the dead grid"
         );
-        assert!(restart.contains("this.active_session_terminal_id = None"));
+        assert!(restart.contains("this.active_session_terminal_ids.remove(key.as_str())"));
     }
 
     /// A snapshot without terminal facts does not erase a known link.
@@ -120113,6 +120250,58 @@ mod tests {
         assert!(
             actions.contains("this.resolve_permission(\n                            session_id,")
         );
+    }
+
+    /// A terminal session in a group pane draws its PTY page.
+    ///
+    /// A group pane used to render every member through the conversation
+    /// builder, so a native terminal tab showed the empty "start a
+    /// conversation" page: the terminal branch belonged to the single-session
+    /// column only. The pane now owns the same terminal page, before the
+    /// timeline borrow and before the empty-conversation fallback.
+    #[test]
+    fn a_terminal_group_pane_draws_its_terminal_page() {
+        let source = include_str!("app.rs");
+        let content = source
+            .split_once("    fn render_session_group_pane_content(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// Puts a pane's own composer under its conversation.")
+            })
+            .map(|(body, _)| body)
+            .expect("group pane content should remain inspectable");
+        let terminal = content
+            .find("if pane_session.is_terminal()")
+            .expect("a terminal pane must be recognized");
+        let borrow = content
+            .find("self.borrow_session_view_unweighed(&pane_session_id)")
+            .expect("an ACP pane still borrows its view");
+        assert!(terminal < borrow);
+        assert!(content.contains("self.render_session_terminal_page_for_session("));
+        // The terminal page takes the pane whole: it must not be put under the
+        // conversation composer wrapper.
+        let terminal_branch = &content[terminal..borrow];
+        assert!(terminal_branch.contains(".flex_1()"));
+        assert!(!terminal_branch.contains("session_group_pane_with_composer("));
+        // The page and the body take the session the pane names, not whatever
+        // the sidebar selected.
+        let page = source
+            .split_once("    fn render_session_terminal_page_for_session(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// The surface the page frames, or the stand-in")
+            })
+            .map(|(body, _)| body)
+            .expect("the per-session terminal page should remain inspectable");
+        assert!(page.contains("session: AgentSession"));
+        assert!(page.contains("self.render_session_terminal_body(session, focused, window, cx)"));
+        let body = source
+            .split_once("    fn render_session_terminal_body(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// What the page shows when the session has no running PTY.")
+            })
+            .map(|(body, _)| body)
+            .expect("the terminal body should remain inspectable");
+        assert!(body.contains("session: AgentSession"));
+        assert!(!body.contains("self.selected_session()"));
     }
 
     /// Every pane renders the same composer as the main workbench, reading its
