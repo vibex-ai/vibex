@@ -188,6 +188,76 @@ that provider-facing header from the embedding ACP client name. This preserves
 compatibility with Responses gateways that authorize the Codex HTTP engine while
 keeping ACP client attribution accurate.
 
+## Scenario: Route Model Runtime Options
+
+### 1. Scope / Trigger
+
+- Trigger: the runtime option catalog renders a model that names a route
+  (`group/<id>/<model>`) or a direct route appended outside the gateway Profile.
+- A route model is a composition, not a Provider model. Its option must not be
+  left empty just because the Agent cannot answer for the synthetic id, and it
+  must not borrow another model's controls.
+
+### 2. Signatures
+
+```text
+RuntimeRouteFacts {
+  direct_member_by_agent: Map<AgentId, RuntimeRouteMemberFacts>,
+  ..
+}
+RuntimeRouteMemberFacts {
+  provider_profile_id,
+  model_id,
+  reasoning_efforts,
+}
+build_runtime_option_catalog(agents, profiles, evidence_by_profile, routes)
+append_direct_route_runtime_options(catalog, agents, routes, evidence_by_profile)
+```
+
+### 3. Contracts
+
+- A gateway route model (`group/<route>/<model>`) is an explicitly configured
+  model of the hidden gateway Profile. Its reasoning selector uses, in order:
+  non-empty model probe evidence, then the route model's declared
+  `ProviderModelCapabilities.reasoning_efforts`. A complete but empty probe does
+  not suppress the declaration, because the synthetic id has no native
+  vocabulary for the Agent to answer.
+- Modes and Features on a gateway route are Agent session controls, not upstream
+  model parameters. The gateway Profile's current evidence supplies them when the
+  route model's own answer is empty; a non-empty model answer still wins.
+- A direct route's option reads the exact `(launch Profile, member model)` entry
+  the ordinary configured-model path reads. The launch Profile is resolved per
+  bound Agent through `legacy_profile_for_route`; the option never hard-codes an
+  empty reasoning/mode/feature set.
+- Before a direct route model has probe evidence, its member's declared
+  `reasoning_efforts` is the fallback. Modes and Features have no authored source
+  and remain empty rather than borrowing the Agent fallback.
+- A direct route still contributes exactly one option per bound Agent. This
+  evidence path changes the option's controls, not its identity or failover
+  subtitle.
+
+### 4. Validation & Error Matrix
+
+| Condition | Required result |
+| --- | --- |
+| Gateway route model, complete but empty model probe | Keep the declared efforts and the Profile's modes/features. |
+| Gateway route model, non-empty model probe | Use the model's own efforts/modes/features; fill only an empty dimension from the Profile. |
+| Gateway route model with no declared efforts and no model evidence | Emit an empty effort list; do not invent a level. |
+| Direct route, matching model evidence | Use that model's efforts/modes/features and Feature defaults. |
+| Direct route, no matching evidence but a declared table | Emit the declared efforts; leave modes/features empty. |
+| Direct route with no resolvable launch Profile | Keep the option selectable with empty controls rather than dropping it. |
+
+### 5. Tests Required
+
+- Catalog unit: a gateway route with a complete empty model probe and declared
+  efforts still exposes those levels.
+- Catalog unit: gateway Profile modes/Features survive an empty model answer,
+  and a non-empty model answer overrides them.
+- Catalog unit: a direct route reads its member model's probe evidence, including
+  Feature defaults.
+- Catalog unit: a direct route with no probe uses its declared efforts and does
+  not inherit Agent modes/Features.
+
 ## Scenario: ACP Agent Authentication And Profile Secret Transactions
 
 ### 1. Scope / Trigger

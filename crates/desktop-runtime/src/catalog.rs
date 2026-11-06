@@ -6,8 +6,9 @@ use async_trait::async_trait;
 use vibex_agent::AgentManager;
 use vibex_agent_acp::{
     AcpRuntimeClient, RuntimeOptionCatalogProfileEvidence, RuntimeRouteFacts,
-    SessionModelCatalogEntry, SessionModelCatalogSource, append_agent_account_runtime_options,
-    build_runtime_option_catalog, refresh_runtime_option_catalog_revision,
+    RuntimeRouteMemberFacts, SessionModelCatalogEntry, SessionModelCatalogSource,
+    append_agent_account_runtime_options, build_runtime_option_catalog,
+    refresh_runtime_option_catalog_revision,
 };
 use vibex_config_switch::ProviderConfigService;
 use vibex_core::{
@@ -244,6 +245,7 @@ impl RuntimeOptionCatalogService {
             &mut catalog,
             &agents.agents,
             &route_facts,
+            &evidence_by_profile,
         );
         let account_fingerprints =
             self.merge_agent_account_sources(&mut catalog, &agents.agents)?;
@@ -359,13 +361,48 @@ impl RuntimeOptionCatalogService {
                     .into_iter()
                     .map(str::to_string)
                     .collect::<Vec<_>>();
+                let agent_ids = self.route_agents(&route.id).unwrap_or_default();
+                // A direct route launches through the per-Agent Profile the
+                // compatibility layer materialized for its one shared Provider.
+                // That row, not the shared traffic record, carries the
+                // model-scoped option evidence a configured model reads.
+                let mut direct_member_by_agent = BTreeMap::new();
+                if !route.kind.via_gateway()
+                    && let Some(member) = route.enabled_members().next()
+                {
+                    let model_id = member.model_id.trim();
+                    if !model_id.is_empty() {
+                        for agent_id in &agent_ids {
+                            let Ok(Some(profile)) = self
+                                .provider_config
+                                .legacy_profile_for_route(agent_id, &route.id)
+                            else {
+                                continue;
+                            };
+                            let reasoning_efforts = profile
+                                .configured_models
+                                .iter()
+                                .find(|model| model.enabled && model.id.trim() == model_id)
+                                .and_then(|model| model.capabilities.reasoning_efforts.clone());
+                            direct_member_by_agent.insert(
+                                agent_id.clone(),
+                                RuntimeRouteMemberFacts {
+                                    provider_profile_id: profile.id,
+                                    model_id: model_id.to_string(),
+                                    reasoning_efforts,
+                                },
+                            );
+                        }
+                    }
+                }
                 let facts = RuntimeRouteFacts {
                     display_name: route.display_name.clone(),
-                    agent_ids: self.route_agents(&route.id).unwrap_or_default(),
+                    agent_ids,
                     member_count: route.enabled_members().count(),
                     models,
                     via_gateway: route.kind.via_gateway(),
                     kind: route.kind,
+                    direct_member_by_agent,
                 };
                 (route.id, facts)
             })

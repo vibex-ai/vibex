@@ -13,11 +13,12 @@ use sha2::{Digest, Sha256};
 use vibex_core::{
     AgentAuthContext, AgentAuthContextStatus, AgentAuthModelCatalogSnapshot,
     AgentAuthModelCatalogStatus, AgentConfigStatus, AgentId, AgentReasoningEffort,
-    AgentRuntimeStatus, AgentSnapshotEntry, ProviderKind, ProviderProfileStatus,
-    ProviderProfileSummary, ProviderSessionConfigOption, ProviderSessionConfigOptionKind,
-    ProviderSessionConfigValue, RuntimeAgentSummary, RuntimeAuthSource, RuntimeAuthSourceAction,
-    RuntimeAuthSourceAvailability, RuntimeAuthSourceKind, RuntimeAuthSourceSummary,
-    RuntimeModelSelection, RuntimeOptionAvailability, SessionConfigValue, SessionRuntimeFeature,
+    AgentRuntimeStatus, AgentSnapshotEntry, ProviderKind, ProviderModelReasoningEfforts,
+    ProviderProfileId, ProviderProfileStatus, ProviderProfileSummary, ProviderSessionConfigOption,
+    ProviderSessionConfigOptionKind, ProviderSessionConfigValue, RuntimeAgentSummary,
+    RuntimeAuthSource, RuntimeAuthSourceAction, RuntimeAuthSourceAvailability,
+    RuntimeAuthSourceKind, RuntimeAuthSourceSummary, RuntimeModelSelection,
+    RuntimeOptionAvailability, SessionConfigValue, SessionRuntimeFeature,
     SessionRuntimeFeatureKind, SessionRuntimeOption, SessionRuntimeOptionCatalog,
     SessionRuntimeSelection,
 };
@@ -872,9 +873,25 @@ pub struct RuntimeOptionCatalogAgentEvidence {
     pub temporarily_unavailable: bool,
 }
 
-/// Builds the runtime option catalog from one persisted capability snapshot
-/// per Agent. Provider Profiles contribute only their configured model IDs;
-/// no profile config is consulted for modes, efforts, or Features.
+/// One member of a route, as the option catalog needs it.
+///
+/// A direct route names exactly one of these, and its option is built from the
+/// same model-scoped evidence a plain configured model reads. Gateway groups do
+/// not use this map: their option is built from the gateway Profile because the
+/// Agent session is shared across every member.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RuntimeRouteMemberFacts {
+    /// The Provider Profile that serves the member.
+    pub provider_profile_id: ProviderProfileId,
+    /// The upstream model id this member names.
+    pub model_id: String,
+    /// The reasoning levels the member declares for that model.
+    ///
+    /// This is the authored fallback when no probe has answered for the exact
+    /// model yet. Probe evidence always outranks it.
+    pub reasoning_efforts: Option<ProviderModelReasoningEfforts>,
+}
+
 /// What the catalog needs to know about a route.
 ///
 /// A gateway Profile carries `group/<id>/<model>` entries, so the name a reader
@@ -898,6 +915,14 @@ pub struct RuntimeRouteFacts {
     /// The route's kind, so the catalogue can name a group's models the way a
     /// request names them.
     pub kind: vibex_core::RouteKind,
+    /// The launch Profile a direct route resolves to, per bound Agent.
+    ///
+    /// A direct route names one shared model Provider, but the ACP session
+    /// still launches through the per-Agent Provider Profile the compatibility
+    /// layer materialized. That row is what carries model-scoped evidence, so
+    /// the option reads it by Agent. A gateway group has no per-Agent entry
+    /// here: its option is built from the gateway Profile instead.
+    pub direct_member_by_agent: BTreeMap<AgentId, RuntimeRouteMemberFacts>,
 }
 
 impl RuntimeRouteFacts {
@@ -1276,60 +1301,75 @@ pub fn build_runtime_option_catalog(
         let fallback_features = catalog_features(evidence);
         for (model_id, model_label) in configured_models {
             let model_evidence = evidence_models.get(&model_id).copied();
+            // A gateway route publishes a synthetic model id. The Agent cannot
+            // answer for that model the way it answers for a real Provider
+            // model, so the Profile's session-wide controls stay available even
+            // though the model is explicitly configured. Resolve the route
+            // identity before choosing either set.
+            let route_entry = route_model_ids(&model_id);
+            let route_source = route_entry.as_ref().map(|(id, _)| id.as_str().to_string());
+            let is_gateway_route = route_entry.is_some();
             let allow_profile_runtime_options = !has_explicit_model_configuration;
             let allow_profile_modes_and_features = allow_profile_runtime_options
                 || model_evidence.is_some_and(|model| {
                     model.source == SessionModelCatalogSource::Session
                         && !model.runtime_options_complete
                 });
-            let modes = model_evidence
-                .filter(|model| model.runtime_options_complete || !model.modes.is_empty())
-                .map(|model| {
-                    catalog_modes(Some(&RuntimeOptionCatalogProfileEvidence {
-                        modes: model.modes.clone(),
-                        ..Default::default()
-                    }))
-                })
-                .unwrap_or_else(|| {
-                    if allow_profile_modes_and_features {
-                        fallback_modes.clone()
-                    } else {
-                        Default::default()
-                    }
-                });
-            let features = model_evidence
-                .filter(|model| model.runtime_options_complete || !model.options.is_empty())
-                .map(|model| {
-                    catalog_features(Some(&RuntimeOptionCatalogProfileEvidence {
-                        options: model.options.clone(),
-                        ..Default::default()
-                    }))
-                })
-                .unwrap_or_else(|| {
-                    if allow_profile_modes_and_features {
-                        fallback_features.clone()
-                    } else {
-                        Default::default()
-                    }
-                });
-            let feature_config_values = features
-                .iter()
-                .filter_map(|feature| {
-                    feature
-                        .current_value
-                        .as_ref()
-                        .or(feature.default_value.as_ref())
-                        .map(|value| (feature.id.clone(), value.value.clone()))
-                })
-                .collect::<BTreeMap<_, _>>();
+            let model_modes = model_evidence
+                .filter(|model| !model.modes.is_empty())
+                .map(|model| catalog_mode_values(model.modes.iter()));
+            let modes = if is_gateway_route {
+                // A complete but empty probe for a synthetic model is not
+                // evidence that the Agent lost its modes. A non-empty answer
+                // for the model still wins.
+                model_modes.unwrap_or_else(|| fallback_modes.clone())
+            } else {
+                model_evidence
+                    .filter(|model| model.runtime_options_complete || !model.modes.is_empty())
+                    .map(|model| catalog_mode_values(model.modes.iter()))
+                    .unwrap_or_else(|| {
+                        if allow_profile_modes_and_features {
+                            fallback_modes.clone()
+                        } else {
+                            Default::default()
+                        }
+                    })
+            };
+            let model_features = model_evidence
+                .filter(|model| !model.options.is_empty())
+                .map(|model| runtime_features_from_options(&model.options));
+            let features = if is_gateway_route {
+                model_features.unwrap_or_else(|| fallback_features.clone())
+            } else {
+                model_evidence
+                    .filter(|model| model.runtime_options_complete || !model.options.is_empty())
+                    .map(|model| runtime_features_from_options(&model.options))
+                    .unwrap_or_else(|| {
+                        if allow_profile_modes_and_features {
+                            fallback_features.clone()
+                        } else {
+                            Default::default()
+                        }
+                    })
+            };
+            let feature_config_values = default_feature_values(&features);
+            let declared_reasoning_efforts = if is_gateway_route {
+                profile
+                    .configured_models
+                    .iter()
+                    .find(|model| model.id.trim() == model_id)
+                    .and_then(|model| model.capabilities.reasoning_efforts.as_ref())
+                    .map(declared_reasoning_effort_values)
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
             // This builder is the one the runtime publishes, and it used to name
             // a gateway model by its raw id. A group's id is
             // `group/<route>/<model>`, so the picker would show that whole
             // storage string. Resolve it here the same way
             // `build_runtime_option_catalog_for_agents` does, so the reader sees
             // the group's name and the model.
-            let route_entry = route_model_ids(&model_id);
-            let route_source = route_entry.as_ref().map(|(id, _)| id.as_str().to_string());
             let plain_provider = SessionRuntimeSelection::provider(
                 agent.id.clone(),
                 profile.id.clone(),
@@ -1377,29 +1417,38 @@ pub fn build_runtime_option_catalog(
                 .as_ref()
                 .and_then(|route_id| route_member_counts.get(route_id).copied())
                 .unwrap_or(1);
-            options.push(SessionRuntimeOption {
-                selection,
-                agent_label: bounded_catalog_label(&agent.label),
-                auth_source_label,
-                model_label,
-                reasoning_efforts: model_evidence
+            let reasoning_efforts = if is_gateway_route {
+                // An empty answer for a synthetic model is not a capability
+                // answer. The authored table is the model-scoped fallback; a
+                // non-empty model answer still wins.
+                model_evidence
+                    .filter(|model| !model.reasoning_efforts.is_empty())
+                    .map(catalog_reasoning_efforts)
+                    .unwrap_or(declared_reasoning_efforts)
+            } else {
+                model_evidence
                     .filter(|model| {
                         model.runtime_options_complete || !model.reasoning_efforts.is_empty()
                     })
                     .map(catalog_reasoning_efforts)
                     .unwrap_or_else(|| {
                         if allow_profile_runtime_options {
-                            {
-                                catalog_reasoning_effort_values(
-                                    evidence
-                                        .map(|evidence| evidence.reasoning_efforts.as_slice())
-                                        .unwrap_or_default(),
-                                )
-                            }
+                            catalog_reasoning_effort_values(
+                                evidence
+                                    .map(|evidence| evidence.reasoning_efforts.as_slice())
+                                    .unwrap_or_default(),
+                            )
                         } else {
                             Default::default()
                         }
-                    }),
+                    })
+            };
+            options.push(SessionRuntimeOption {
+                selection,
+                agent_label: bounded_catalog_label(&agent.label),
+                auth_source_label,
+                model_label,
+                reasoning_efforts,
                 modes,
                 features,
                 availability,
@@ -1426,9 +1475,6 @@ pub fn build_runtime_option_catalog(
     catalog
 }
 
-/// Adds the one default account owned by an Agent to an existing Provider
-/// catalog. Account sources remain visible while signed out; executable model
-/// options are emitted only from evidence for the current context revision.
 /// Adds one option per Agent-bound route that the gateway does not serve.
 ///
 /// A gateway route already reaches the catalogue as its `group/<id>/<model>`
@@ -1439,10 +1485,15 @@ pub fn build_runtime_option_catalog(
 ///
 /// Without this a direct route would be visible in the route graph and selectable
 /// nowhere — the Agent could be given one but never choose it.
+///
+/// Its controls come from the launch Profile the route resolves to, read per
+/// bound Agent, because a direct route names one real Provider model and the
+/// Agent answers for that model the way it answers for a configured one.
 pub fn append_direct_route_runtime_options(
     catalog: &mut SessionRuntimeOptionCatalog,
     agents: &[AgentSnapshotEntry],
     routes: &BTreeMap<vibex_core::ModelRouteId, RuntimeRouteFacts>,
+    evidence_by_profile: &BTreeMap<ProviderProfileId, RuntimeOptionCatalogProfileEvidence>,
 ) {
     let agents_by_id = agents
         .iter()
@@ -1457,10 +1508,47 @@ pub fn append_direct_route_runtime_options(
             let Some(agent) = agents_by_id.get(agent_id) else {
                 continue;
             };
+            // A direct route names one real Provider model, so its option reads
+            // the same evidence a plain configured model does. The member's
+            // authored table is the fallback before a probe answers.
+            let member = facts.direct_member_by_agent.get(agent_id);
+            let model_evidence = member.and_then(|member| {
+                evidence_by_profile
+                    .get(&member.provider_profile_id)
+                    .and_then(|evidence| {
+                        evidence
+                            .models
+                            .iter()
+                            .find(|model| model.model_id == member.model_id)
+                    })
+            });
+            let declared_efforts = member
+                .and_then(|member| member.reasoning_efforts.as_ref())
+                .map(declared_reasoning_effort_values)
+                .unwrap_or_default();
+            let reasoning_efforts = match model_evidence {
+                Some(model)
+                    if model.runtime_options_complete || !model.reasoning_efforts.is_empty() =>
+                {
+                    catalog_reasoning_efforts(model)
+                }
+                _ if !declared_efforts.is_empty() => declared_efforts,
+                _ => Vec::new(),
+            };
+            let modes = model_evidence
+                .filter(|model| model.runtime_options_complete || !model.modes.is_empty())
+                .map(|model| catalog_mode_values(model.modes.iter()))
+                .unwrap_or_default();
+            let features = model_evidence
+                .filter(|model| model.runtime_options_complete || !model.options.is_empty())
+                .map(|model| runtime_features_from_options(&model.options))
+                .unwrap_or_default();
+            let config_values = default_feature_values(&features);
             // A route that skips the gateway is one selectable model, so it
             // contributes exactly one option, named the way a request names it.
-            let selection =
+            let mut selection =
                 SessionRuntimeSelection::model_route(agent.id.clone(), route_id.clone());
+            selection.config_values = config_values;
             catalog.options.push(SessionRuntimeOption {
                 selection,
                 agent_label: bounded_catalog_label(&agent.label),
@@ -1470,9 +1558,9 @@ pub fn append_direct_route_runtime_options(
                 } else {
                     bounded_catalog_label(&facts.models.join(" \u{b7} "))
                 },
-                reasoning_efforts: Vec::new(),
-                modes: Vec::new(),
-                features: Vec::new(),
+                reasoning_efforts,
+                modes,
+                features,
                 availability: RuntimeOptionAvailability::Available,
                 member_count: facts.member_count,
                 auto_routes: facts.member_count > 1,
@@ -1727,9 +1815,14 @@ fn catalog_availability(
 fn catalog_modes(
     evidence: Option<&RuntimeOptionCatalogProfileEvidence>,
 ) -> Vec<SessionConfigValue> {
-    let mut modes = evidence
+    catalog_mode_values(evidence.into_iter().flat_map(|entry| entry.modes.iter()))
+}
+
+fn catalog_mode_values<'a>(
+    modes: impl IntoIterator<Item = &'a ProviderSessionConfigValue>,
+) -> Vec<SessionConfigValue> {
+    let mut modes = modes
         .into_iter()
-        .flat_map(|entry| entry.modes.iter())
         .filter_map(|mode| {
             let value = validate_mode_value(&mode.value).ok()?;
             Some(SessionConfigValue {
@@ -1778,6 +1871,26 @@ fn catalog_reasoning_efforts(model: &SessionModelCatalogEntry) -> Vec<SessionCon
     catalog_reasoning_effort_values(&model.reasoning_efforts)
 }
 
+/// The authored levels a route Model declares when no probe has answered.
+///
+/// The declaration is the same one the Provider Model editor writes and the
+/// harness projections consume. A route group's virtual model has no native
+/// vocabulary, so this table is the only model-scoped answer available before a
+/// probe succeeds.
+fn declared_reasoning_effort_values(
+    efforts: &ProviderModelReasoningEfforts,
+) -> Vec<SessionConfigValue> {
+    let mut values = efforts
+        .declared_levels()
+        .filter_map(|(level, _)| {
+            let value = validate_effort_value(level.as_str()).ok()?;
+            Some(SessionConfigValue { value, label: None })
+        })
+        .collect::<Vec<_>>();
+    values.dedup_by(|left, right| left.value == right.value);
+    values
+}
+
 fn catalog_reasoning_effort_values(
     reasoning_efforts: &[AgentReasoningEffort],
 ) -> Vec<SessionConfigValue> {
@@ -1799,9 +1912,17 @@ fn catalog_reasoning_effort_values(
 fn catalog_features(
     evidence: Option<&RuntimeOptionCatalogProfileEvidence>,
 ) -> Vec<SessionRuntimeFeature> {
-    let mut features = evidence
+    evidence
         .into_iter()
-        .flat_map(|entry| entry.options.iter())
+        .flat_map(|entry| catalog_features_from_options(&entry.options))
+        .collect()
+}
+
+fn catalog_features_from_options(
+    options: &[ProviderSessionConfigOption],
+) -> Vec<SessionRuntimeFeature> {
+    let mut features = options
+        .iter()
         .filter_map(|option| {
             let id = normalize_identifier(&option.id);
             if id.is_empty()
@@ -1851,10 +1972,7 @@ fn catalog_features(
 pub(crate) fn runtime_features_from_options(
     options: &[ProviderSessionConfigOption],
 ) -> Vec<SessionRuntimeFeature> {
-    catalog_features(Some(&RuntimeOptionCatalogProfileEvidence {
-        options: options.to_vec(),
-        ..Default::default()
-    }))
+    catalog_features_from_options(options)
 }
 
 /// Category cursor-agent gives every model parameter that is not reasoning
@@ -3713,7 +3831,10 @@ mod tests {
 #[cfg(test)]
 mod route_catalog_tests {
     use super::*;
-    use vibex_core::builtin_agent_definitions;
+    use vibex_core::{
+        ProviderConfiguredModel, ProviderModelCapabilities, ProviderModelReasoningEfforts,
+        ProviderReasoningEffortLevel, builtin_agent_definitions,
+    };
 
     fn agent(id: &str) -> AgentSnapshotEntry {
         let definition = builtin_agent_definitions()
@@ -3730,6 +3851,85 @@ mod route_catalog_tests {
         agent
     }
 
+    fn gateway_profile(
+        agent_id: &str,
+        configured_models: Vec<ProviderConfiguredModel>,
+    ) -> ProviderProfileSummary {
+        ProviderProfileSummary {
+            id: ProviderProfileId::new(),
+            agent_id: AgentId::parse(agent_id).unwrap(),
+            kind: ProviderKind::Acp,
+            display_name: "Vibex Gateway".to_string(),
+            status: ProviderProfileStatus::Enabled,
+            account_alias: None,
+            default_model: configured_models.first().map(|model| model.id.clone()),
+            configured_models,
+            secret_setup_state: vibex_core::ProviderSecretSetupState::Available,
+            launch_revision: 1,
+            updated_at_ms: 1,
+        }
+    }
+
+    fn effort_table(levels: &[ProviderReasoningEffortLevel]) -> ProviderModelReasoningEfforts {
+        let mut table = ProviderModelReasoningEfforts::new();
+        for level in levels {
+            table.insert(*level, Some(level.as_str().to_string()));
+        }
+        table
+    }
+
+    fn route_model(id: &str, levels: &[ProviderReasoningEffortLevel]) -> ProviderConfiguredModel {
+        ProviderConfiguredModel {
+            id: id.to_string(),
+            display_name: None,
+            enabled: true,
+            wire_api: None,
+            capabilities: ProviderModelCapabilities {
+                reasoning_efforts: Some(effort_table(levels)),
+                ..Default::default()
+            },
+        }
+    }
+
+    fn mode(value: &str) -> ProviderSessionConfigValue {
+        ProviderSessionConfigValue {
+            value: value.to_string(),
+            label: None,
+        }
+    }
+
+    fn auto_approve() -> ProviderSessionConfigOption {
+        let enabled = ProviderSessionConfigValue {
+            value: "true".to_string(),
+            label: None,
+        };
+        ProviderSessionConfigOption {
+            id: "auto_approve".to_string(),
+            label: "Auto approve".to_string(),
+            category: Some("features".to_string()),
+            description: None,
+            kind: ProviderSessionConfigOptionKind::Boolean,
+            current_value: Some(enabled.clone()),
+            default_value: Some(enabled),
+            values: Vec::new(),
+        }
+    }
+
+    fn effort_values(values: &[SessionConfigValue]) -> Vec<&str> {
+        values.iter().map(|value| value.value.as_str()).collect()
+    }
+
+    fn route_option<'a>(
+        catalog: &'a SessionRuntimeOptionCatalog,
+        route_id: &vibex_core::ModelRouteId,
+    ) -> &'a SessionRuntimeOption {
+        catalog
+            .options
+            .iter()
+            .find(|option| option.selection.auth_source.model_route_id() == Some(route_id))
+            .expect("the route must produce a selectable option")
+    }
+
     fn route_facts(agent_id: &str, name: &str, count: usize) -> RuntimeRouteFacts {
         RuntimeRouteFacts {
             kind: vibex_core::RouteKind::ModelGroup,
@@ -3738,6 +3938,7 @@ mod route_catalog_tests {
             member_count: count,
             models: vec!["m".to_string()],
             via_gateway: true,
+            direct_member_by_agent: BTreeMap::new(),
         }
     }
 
@@ -3824,6 +4025,173 @@ mod route_catalog_tests {
         assert_eq!(facts.member_count, 1);
         assert!(facts.member_count <= 1);
     }
+
+    /// A gateway route's synthetic model has no native vocabulary, so the
+    /// levels its members declare are the model-scoped answer before a probe
+    /// exists. Without this the option carried an empty selector even though
+    /// the route already knew the supported depths.
+    #[test]
+    fn a_gateway_route_uses_declared_efforts_before_a_probe() {
+        let route_id = vibex_core::ModelRouteId::new();
+        let model_id = format!("group/{}/deepseek-chat", route_id.as_str());
+        let profile = gateway_profile(
+            "codex",
+            vec![route_model(
+                &model_id,
+                &[
+                    ProviderReasoningEffortLevel::Off,
+                    ProviderReasoningEffortLevel::High,
+                    ProviderReasoningEffortLevel::Max,
+                ],
+            )],
+        );
+        let routes = [(route_id.clone(), route_facts("codex", "Team", 1))]
+            .into_iter()
+            .collect::<BTreeMap<_, _>>();
+        let mut evidence = BTreeMap::new();
+        evidence.insert(
+            profile.id.clone(),
+            RuntimeOptionCatalogProfileEvidence {
+                models: vec![SessionModelCatalogEntry {
+                    model_id: model_id.clone(),
+                    reasoning_efforts: Vec::new(),
+                    default_reasoning_effort: None,
+                    modes: Vec::new(),
+                    options: Vec::new(),
+                    runtime_options_complete: true,
+                    source: SessionModelCatalogSource::Probe,
+                }],
+                modes: Vec::new(),
+                reasoning_efforts: Vec::new(),
+                options: Vec::new(),
+                temporarily_unavailable: false,
+            },
+        );
+
+        let catalog =
+            build_runtime_option_catalog(&[agent("codex")], &[profile], &evidence, &routes);
+        let option = route_option(&catalog, &route_id);
+
+        assert_eq!(
+            effort_values(&option.reasoning_efforts),
+            ["off", "high", "max"]
+        );
+    }
+
+    /// Modes and Features are Agent session controls, not upstream model
+    /// parameters. A gateway route keeps the Profile's set even though the
+    /// synthetic model is explicitly configured and its probe is empty.
+    #[test]
+    fn a_gateway_route_keeps_the_profiles_session_modes_and_features() {
+        let route_id = vibex_core::ModelRouteId::new();
+        let model_id = format!("group/{}/deepseek-chat", route_id.as_str());
+        let profile = gateway_profile(
+            "codex",
+            vec![route_model(
+                &model_id,
+                &[ProviderReasoningEffortLevel::High],
+            )],
+        );
+        let routes = [(route_id.clone(), route_facts("codex", "Team", 1))]
+            .into_iter()
+            .collect::<BTreeMap<_, _>>();
+        let mut evidence = BTreeMap::new();
+        evidence.insert(
+            profile.id.clone(),
+            RuntimeOptionCatalogProfileEvidence {
+                models: Vec::new(),
+                modes: vec![mode("plan")],
+                reasoning_efforts: Vec::new(),
+                options: vec![auto_approve()],
+                temporarily_unavailable: false,
+            },
+        );
+
+        let catalog =
+            build_runtime_option_catalog(&[agent("codex")], &[profile], &evidence, &routes);
+        let option = route_option(&catalog, &route_id);
+
+        assert_eq!(
+            option
+                .modes
+                .iter()
+                .map(|mode| mode.value.as_str())
+                .collect::<Vec<_>>(),
+            ["plan"]
+        );
+        assert_eq!(
+            option
+                .features
+                .iter()
+                .map(|feature| feature.id.as_str())
+                .collect::<Vec<_>>(),
+            ["auto_approve"]
+        );
+        assert_eq!(
+            option.selection.config_values.get("auto_approve"),
+            Some(&"true".to_string()),
+            "the feature's default must reach the selection"
+        );
+    }
+
+    /// A route model answer that names controls still wins over the Profile's
+    /// session-wide set. The Profile is a fallback for the synthetic model,
+    /// not a replacement for evidence about it.
+    #[test]
+    fn a_gateway_route_model_answer_outranks_the_profile_controls() {
+        let route_id = vibex_core::ModelRouteId::new();
+        let model_id = format!("group/{}/deepseek-chat", route_id.as_str());
+        let profile = gateway_profile(
+            "codex",
+            vec![route_model(
+                &model_id,
+                &[ProviderReasoningEffortLevel::High],
+            )],
+        );
+        let routes = [(route_id.clone(), route_facts("codex", "Team", 1))]
+            .into_iter()
+            .collect::<BTreeMap<_, _>>();
+        let mut evidence = BTreeMap::new();
+        evidence.insert(
+            profile.id.clone(),
+            RuntimeOptionCatalogProfileEvidence {
+                models: vec![SessionModelCatalogEntry {
+                    model_id: model_id.clone(),
+                    reasoning_efforts: Vec::new(),
+                    default_reasoning_effort: None,
+                    modes: vec![mode("accept_edits")],
+                    options: Vec::new(),
+                    runtime_options_complete: true,
+                    source: SessionModelCatalogSource::Probe,
+                }],
+                modes: vec![mode("plan")],
+                reasoning_efforts: Vec::new(),
+                options: vec![auto_approve()],
+                temporarily_unavailable: false,
+            },
+        );
+
+        let catalog =
+            build_runtime_option_catalog(&[agent("codex")], &[profile], &evidence, &routes);
+        let option = route_option(&catalog, &route_id);
+
+        assert_eq!(
+            option
+                .modes
+                .iter()
+                .map(|mode| mode.value.as_str())
+                .collect::<Vec<_>>(),
+            ["accept_edits"],
+            "the model's own answer must win"
+        );
+        assert!(
+            option
+                .features
+                .iter()
+                .any(|feature| feature.id == "auto_approve"),
+            "an empty model feature set keeps the Profile's session-wide features"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -3896,6 +4264,7 @@ mod selector_route_priority_tests {
                 member_count: 2,
                 models: vec!["m".to_string()],
                 via_gateway: true,
+                direct_member_by_agent: BTreeMap::new(),
                 kind: vibex_core::RouteKind::ModelGroup,
             },
         )]
@@ -3946,6 +4315,7 @@ mod selector_route_priority_tests {
                 member_count: 2,
                 models: vec!["deepseek-chat".to_string()],
                 via_gateway: true,
+                direct_member_by_agent: BTreeMap::new(),
                 kind: vibex_core::RouteKind::ModelGroup,
             },
         )]
@@ -4002,6 +4372,7 @@ mod selector_route_priority_tests {
                 member_count: 2,
                 models: vec!["deepseek-chat".to_string()],
                 via_gateway: true,
+                direct_member_by_agent: BTreeMap::new(),
                 kind: vibex_core::RouteKind::ModelGroup,
             },
         )]
@@ -4070,7 +4441,7 @@ mod selector_route_priority_tests {
 #[cfg(test)]
 mod direct_route_option_tests {
     use super::*;
-    use vibex_core::builtin_agent_definitions;
+    use vibex_core::{ProviderReasoningEffortLevel, builtin_agent_definitions};
 
     fn agent(id: &str) -> AgentSnapshotEntry {
         let definition = builtin_agent_definitions()
@@ -4087,6 +4458,72 @@ mod direct_route_option_tests {
         agent
     }
 
+    fn effort_table(levels: &[ProviderReasoningEffortLevel]) -> ProviderModelReasoningEfforts {
+        let mut table = ProviderModelReasoningEfforts::new();
+        for level in levels {
+            table.insert(*level, Some(level.as_str().to_string()));
+        }
+        table
+    }
+
+    fn mode(value: &str) -> ProviderSessionConfigValue {
+        ProviderSessionConfigValue {
+            value: value.to_string(),
+            label: None,
+        }
+    }
+
+    fn auto_approve() -> ProviderSessionConfigOption {
+        let enabled = ProviderSessionConfigValue {
+            value: "true".to_string(),
+            label: None,
+        };
+        ProviderSessionConfigOption {
+            id: "auto_approve".to_string(),
+            label: "Auto approve".to_string(),
+            category: Some("features".to_string()),
+            description: None,
+            kind: ProviderSessionConfigOptionKind::Boolean,
+            current_value: Some(enabled.clone()),
+            default_value: Some(enabled),
+            values: Vec::new(),
+        }
+    }
+
+    fn direct_facts(agent_id: &str, member: RuntimeRouteMemberFacts) -> RuntimeRouteFacts {
+        RuntimeRouteFacts {
+            kind: vibex_core::RouteKind::Direct,
+            display_name: "Direct".to_string(),
+            agent_ids: vec![AgentId::parse(agent_id).unwrap()],
+            member_count: 1,
+            models: vec![member.model_id.clone()],
+            via_gateway: false,
+            direct_member_by_agent: [(AgentId::parse(agent_id).unwrap(), member)]
+                .into_iter()
+                .collect(),
+        }
+    }
+
+    fn member(
+        provider_profile_id: ProviderProfileId,
+        model_id: &str,
+        reasoning_efforts: Option<ProviderModelReasoningEfforts>,
+    ) -> RuntimeRouteMemberFacts {
+        RuntimeRouteMemberFacts {
+            provider_profile_id,
+            model_id: model_id.to_string(),
+            reasoning_efforts,
+        }
+    }
+
+    fn append_direct(
+        catalog: &mut SessionRuntimeOptionCatalog,
+        routes: &BTreeMap<vibex_core::ModelRouteId, RuntimeRouteFacts>,
+        evidence: &BTreeMap<ProviderProfileId, RuntimeOptionCatalogProfileEvidence>,
+    ) {
+        append_direct_route_runtime_options(catalog, &[agent("codex")], routes, evidence);
+    }
+
     fn facts(agent_id: &str, name: &str, via_gateway: bool) -> RuntimeRouteFacts {
         RuntimeRouteFacts {
             kind: if via_gateway {
@@ -4099,6 +4536,7 @@ mod direct_route_option_tests {
             member_count: 1,
             models: vec!["m".to_string()],
             via_gateway,
+            direct_member_by_agent: BTreeMap::new(),
         }
     }
 
@@ -4116,7 +4554,12 @@ mod direct_route_option_tests {
         .collect::<BTreeMap<_, _>>();
         let mut catalog =
             build_runtime_option_catalog(&[agent("codex")], &[], &BTreeMap::new(), &routes);
-        append_direct_route_runtime_options(&mut catalog, &[agent("codex")], &routes);
+        append_direct_route_runtime_options(
+            &mut catalog,
+            &[agent("codex")],
+            &routes,
+            &BTreeMap::new(),
+        );
 
         let selected = catalog
             .options
@@ -4146,7 +4589,12 @@ mod direct_route_option_tests {
         .collect::<BTreeMap<_, _>>();
         let mut catalog =
             build_runtime_option_catalog(&[agent("codex")], &[], &BTreeMap::new(), &routes);
-        append_direct_route_runtime_options(&mut catalog, &[agent("codex")], &routes);
+        append_direct_route_runtime_options(
+            &mut catalog,
+            &[agent("codex")],
+            &routes,
+            &BTreeMap::new(),
+        );
         assert!(
             catalog.options.is_empty(),
             "a gateway route belongs to the gateway catalogue, not here"
@@ -4164,12 +4612,119 @@ mod direct_route_option_tests {
         .collect::<BTreeMap<_, _>>();
         let agents = vec![agent("codex"), agent("claude")];
         let mut catalog = build_runtime_option_catalog(&agents, &[], &BTreeMap::new(), &routes);
-        append_direct_route_runtime_options(&mut catalog, &agents, &routes);
+        append_direct_route_runtime_options(&mut catalog, &agents, &routes, &BTreeMap::new());
         let agents_with_options = catalog
             .options
             .iter()
             .map(|option| option.selection.agent_id.as_str().to_string())
             .collect::<Vec<_>>();
         assert_eq!(agents_with_options, vec!["codex"]);
+    }
+
+    fn effort_values(values: &[SessionConfigValue]) -> Vec<&str> {
+        values.iter().map(|value| value.value.as_str()).collect()
+    }
+
+    /// A direct route names one real Provider model, so its option must read
+    /// that model's own probe evidence instead of an empty hard-coded set.
+    #[test]
+    fn a_direct_route_reads_its_member_models_runtime_options() {
+        let route_id = vibex_core::ModelRouteId::new();
+        let profile_id = ProviderProfileId::new();
+        let routes = [(
+            route_id.clone(),
+            direct_facts("codex", member(profile_id.clone(), "m", None)),
+        )]
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+        let mut evidence = BTreeMap::new();
+        evidence.insert(
+            profile_id,
+            RuntimeOptionCatalogProfileEvidence {
+                models: vec![SessionModelCatalogEntry {
+                    model_id: "m".to_string(),
+                    reasoning_efforts: vec![AgentReasoningEffort {
+                        value: "high".to_string(),
+                        description: None,
+                    }],
+                    default_reasoning_effort: None,
+                    modes: vec![mode("plan")],
+                    options: vec![auto_approve()],
+                    runtime_options_complete: true,
+                    source: SessionModelCatalogSource::Probe,
+                }],
+                modes: Vec::new(),
+                reasoning_efforts: Vec::new(),
+                options: Vec::new(),
+                temporarily_unavailable: false,
+            },
+        );
+
+        let mut catalog =
+            build_runtime_option_catalog(&[agent("codex")], &[], &BTreeMap::new(), &routes);
+        append_direct(&mut catalog, &routes, &evidence);
+        let option = catalog
+            .options
+            .last()
+            .expect("the direct route must produce an option");
+
+        assert_eq!(effort_values(&option.reasoning_efforts), ["high"]);
+        assert_eq!(
+            option
+                .modes
+                .iter()
+                .map(|mode| mode.value.as_str())
+                .collect::<Vec<_>>(),
+            ["plan"]
+        );
+        assert_eq!(
+            option
+                .features
+                .iter()
+                .map(|feature| feature.id.as_str())
+                .collect::<Vec<_>>(),
+            ["auto_approve"]
+        );
+        assert_eq!(
+            option.selection.config_values.get("auto_approve"),
+            Some(&"true".to_string())
+        );
+    }
+
+    /// Before a probe answers, a direct route uses the member model's authored
+    /// levels. Modes and Features have no authored source, so they stay empty
+    /// rather than borrowing another model's answer.
+    #[test]
+    fn a_direct_route_uses_declared_efforts_before_a_probe() {
+        let route_id = vibex_core::ModelRouteId::new();
+        let profile_id = ProviderProfileId::new();
+        let routes = [(
+            route_id,
+            direct_facts(
+                "codex",
+                member(
+                    profile_id,
+                    "m",
+                    Some(effort_table(&[
+                        ProviderReasoningEffortLevel::Off,
+                        ProviderReasoningEffortLevel::High,
+                    ])),
+                ),
+            ),
+        )]
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+
+        let mut catalog =
+            build_runtime_option_catalog(&[agent("codex")], &[], &BTreeMap::new(), &routes);
+        append_direct(&mut catalog, &routes, &BTreeMap::new());
+        let option = catalog
+            .options
+            .last()
+            .expect("the direct route must produce an option");
+
+        assert_eq!(effort_values(&option.reasoning_efforts), ["off", "high"]);
+        assert!(option.modes.is_empty());
+        assert!(option.features.is_empty());
     }
 }
