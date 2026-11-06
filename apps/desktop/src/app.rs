@@ -481,6 +481,11 @@ const RIGHT_ACTIVITY_BAR_WIDTH: f32 = 40.0;
 const RIGHT_ACTIVITY_BUTTON_SIZE: f32 = 32.0;
 const RIGHT_ACTIVITY_ITEM_GAP: f32 = 4.0;
 const RIGHT_ACTIVITY_BAR_VERTICAL_PADDING: f32 = 8.0;
+/// How much of the session page's own tone is left around the embedded terminal
+/// window, so the window reads as inset rather than filling the column.
+const SESSION_TERMINAL_FRAME_INSET: f32 = 8.0;
+/// The embedded terminal window's corner radius.
+const SESSION_TERMINAL_WINDOW_RADIUS: f32 = 10.0;
 const SIDEBAR_INLINE_TRANSITION_DURATION: Duration = Duration::from_millis(200);
 const SIDEBAR_FLOATING_TRANSITION_DURATION: Duration = Duration::from_millis(200);
 const SIDEBAR_REORDER_TRANSITION_DURATION: Duration = Duration::from_millis(160);
@@ -71297,7 +71302,49 @@ impl VibexWorkbench {
     /// whole conversation: no timeline, no composer, no permission cards. What
     /// Vibex keeps outside that rectangle — the sidebar dot, the title, unread,
     /// archive — is drawn by the shell around it exactly as for any session.
+    ///
+    /// The grid itself is framed as an embedded window: a gutter of the
+    /// sidebar's tone runs around it and its corners are rounded, so the Agent's
+    /// TUI reads as a terminal inside the workbench rather than as the workbench.
+    /// The page draws no header of its own either — the session's title already
+    /// rides the title bar, and repeating it here only cost the grid a row.
     fn render_session_terminal_page(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let body = self.render_session_terminal_body(window, cx);
+        let window_fill = cx.theme().background;
+        div()
+            .id("session-terminal-page")
+            .size_full()
+            .min_w_0()
+            .min_h_0()
+            // The gutter is the sidebar's tone, so the window reads as a panel
+            // set into the workbench rather than as the workbench itself.
+            .p(px(SESSION_TERMINAL_FRAME_INSET))
+            .bg(cx.theme().sidebar)
+            .child(
+                div()
+                    .id("session-terminal-window")
+                    .size_full()
+                    .min_w_0()
+                    .min_h_0()
+                    .overflow_hidden()
+                    .rounded(px(SESSION_TERMINAL_WINDOW_RADIUS))
+                    // The window owns the fill the grid would otherwise paint:
+                    // a square surface background would spill into the corners
+                    // the radius cuts away.
+                    .bg(window_fill)
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .child(body),
+            )
+            .into_any_element()
+    }
+
+    /// The surface the page frames, or the stand-in that explains its absence.
+    fn render_session_terminal_body(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -71305,7 +71352,6 @@ impl VibexWorkbench {
         let Some(session) = self.selected_session().cloned() else {
             return empty_center_content();
         };
-        let strings = self.strings();
         // A session whose Agent ended is answered before the surface is
         // considered. The link survives a quit on purpose — that is what lets
         // the page offer a restart — so checking the link first kept drawing the
@@ -71368,8 +71414,7 @@ impl VibexWorkbench {
             entry.insert(surface);
         }
         self.sync_session_terminal_surface_activity(cx);
-        let body = self
-            .session_terminal_surfaces
+        self.session_terminal_surfaces
             .get(&key)
             .cloned()
             .map(|surface| {
@@ -71379,88 +71424,7 @@ impl VibexWorkbench {
                 // width and the PTY never claimed the space back.
                 surface.into_any_element()
             })
-            .unwrap_or_else(|| self.render_session_terminal_placeholder(&session, cx));
-        v_flex()
-            .id("session-terminal-page")
-            .size_full()
-            .min_w_0()
-            .min_h_0()
-            .child(self.render_session_terminal_header(&session, strings, cx))
-            .child(
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .min_w_0()
-                    .overflow_hidden()
-                    .child(body),
-            )
-            .into_any_element()
-    }
-
-    /// The one line above the grid.
-    ///
-    /// A terminal session has no timeline to carry the "approvals happen in the
-    /// terminal" contract, so the page states it once, beside the Agent's name,
-    /// instead of leaving the reader to discover it at the first prompt.
-    fn render_session_terminal_header(
-        &self,
-        session: &AgentSession,
-        strings: &'static Strings,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let _ = strings;
-        let activity = session
-            .terminal
-            .as_ref()
-            .map(|facts| facts.activity)
-            .unwrap_or(vibex_core::TerminalActivity::Unknown);
-        let activity_label = terminal_activity_label(activity);
-        h_flex()
-            .id("session-terminal-header")
-            .flex_none()
-            .w_full()
-            .min_w_0()
-            .items_center()
-            .gap_2()
-            .px_3()
-            .py_2()
-            .border_b_1()
-            .border_color(cx.theme().border)
-            .child(
-                div()
-                    .min_w_0()
-                    .truncate()
-                    .text_sm()
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .child(session.title.clone()),
-            )
-            .child(
-                div()
-                    .flex_none()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(session.agent_id.as_str().to_string()),
-            )
-            .child(div().flex_1())
-            .child(
-                div()
-                    .flex_none()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(activity_label),
-            )
-            .child(
-                div()
-                    .flex_none()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(crate::locale::text(
-                        "Approvals happen in the terminal",
-                        "审批在终端内完成",
-                        "審批在終端內完成",
-                    )),
-            )
-            .into_any_element()
+            .unwrap_or_else(|| self.render_session_terminal_placeholder(&session, cx))
     }
 
     /// What the page shows when the session has no running PTY.
@@ -80109,18 +80073,6 @@ fn sidebar_delete_project_description(
         locale::ResolvedLocale::ZhTw => format!(
             "從 Vibex 中移除「{project_name}」？不會刪除磁碟上的專案檔案，關聯的 Vibex 會話會從側欄移除。"
         ),
-    }
-}
-
-/// How a terminal-mode session's observed activity reads in the session header.
-fn terminal_activity_label(activity: vibex_core::TerminalActivity) -> &'static str {
-    match activity {
-        vibex_core::TerminalActivity::Working => crate::locale::text("Working", "运行中", "執行中"),
-        vibex_core::TerminalActivity::Waiting => {
-            crate::locale::text("Waiting for you", "等待你操作", "等待你操作")
-        }
-        vibex_core::TerminalActivity::Idle => crate::locale::text("Idle", "空闲", "閒置"),
-        vibex_core::TerminalActivity::Unknown => crate::locale::text("Unknown", "未知", "未知"),
     }
 }
 
@@ -105455,10 +105407,14 @@ mod tests {
     fn an_ended_terminal_session_is_answered_before_its_surface() {
         let source = include_str!("app.rs");
         let page = source
-            .split_once("    fn render_session_terminal_page(")
-            .and_then(|(_, tail)| tail.split_once("\n    /// The one line above the grid."))
+            .split_once("    fn render_session_terminal_body(")
+            .and_then(|(_, tail)| {
+                tail.split_once(
+                    "\n    /// What the page shows when the session has no running PTY.",
+                )
+            })
             .map(|(body, _)| body)
-            .expect("the terminal page should remain inspectable");
+            .expect("the terminal page body should remain inspectable");
         let ended = page
             .find("vibex_core::AgentSessionState::Closed")
             .expect("the page must recognize an ended session");
@@ -105470,6 +105426,52 @@ mod tests {
             "an ended session must be answered before the terminal link is consulted"
         );
         assert!(page.contains("render_session_terminal_placeholder(&session, cx)"));
+    }
+
+    /// A terminal-mode session embeds its grid as a rounded window.
+    ///
+    /// The frame is what separates the Agent's own TUI from the workbench around
+    /// it: the page keeps a gutter of its tone on every side, the window clips
+    /// its contents to a radius, and the page draws no header — the session's
+    /// title already rides the title bar above it.
+    #[test]
+    fn a_terminal_session_is_framed_as_an_embedded_window() {
+        let source = include_str!("app.rs");
+        let page = source
+            .split_once("    fn render_session_terminal_page(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// The surface the page frames"))
+            .map(|(body, _)| body)
+            .expect("the terminal page should remain inspectable");
+        let window = page
+            .split_once("\"session-terminal-window\"")
+            .expect("the page embeds the grid in its own window");
+        let frame = window.0;
+        let embedded = window.1;
+        assert!(
+            frame.contains(".p(px(SESSION_TERMINAL_FRAME_INSET))"),
+            "the page keeps a gutter of its own tone around the window"
+        );
+        assert!(
+            frame.contains(".bg(cx.theme().sidebar)"),
+            "the gutter is the sidebar's tone, so the window reads as inset"
+        );
+        assert!(
+            embedded.contains(".overflow_hidden()"),
+            "the window must clip its contents to its radius"
+        );
+        assert!(
+            embedded.contains(".rounded(px(SESSION_TERMINAL_WINDOW_RADIUS))"),
+            "the embedded window's corners are rounded"
+        );
+        assert!(
+            frame.contains("let window_fill = cx.theme().background;")
+                && embedded.contains(".bg(window_fill)"),
+            "the window owns the fill the grid's default cells stand on"
+        );
+        assert!(
+            !page.contains("session-terminal-header"),
+            "the page must not draw a second header for a title the bar already shows"
+        );
     }
 
     /// The transport lives on the workspace row, not inside the prompt box.

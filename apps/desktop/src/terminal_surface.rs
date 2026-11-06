@@ -120,6 +120,15 @@ impl TerminalSurfaceMode {
         self == Self::Standalone
     }
 
+    /// Whether the surface paints the page tone behind its cells.
+    ///
+    /// A session page embeds the grid in a rounded window of its own, so the
+    /// surface must stay transparent: an opaque fill here is a rectangle, and
+    /// its corners would square off the window it was given.
+    fn paints_surface_background(self) -> bool {
+        self != Self::Session
+    }
+
     fn horizontal_padding(self) -> f32 {
         match self {
             Self::Standalone => TERMINAL_HORIZONTAL_PADDING,
@@ -1964,7 +1973,9 @@ impl TerminalSurface {
             .min_w_0()
             .relative()
             .overflow_hidden()
-            .bg(cx.theme().background)
+            .when(self.mode.paints_surface_background(), |grid| {
+                grid.bg(cx.theme().background)
+            })
             .px(px(horizontal_padding))
             .py(px(vertical_padding))
             .font_family(cx.theme().mono_font_family.clone())
@@ -3156,7 +3167,9 @@ impl Render for TerminalSurface {
             .size_full()
             .min_h_0()
             .min_w_0()
-            .bg(cx.theme().background)
+            .when(self.mode.paints_surface_background(), |surface| {
+                surface.bg(cx.theme().background)
+            })
             .text_color(cx.theme().foreground)
             .when(self.mode.shows_chrome(), |surface| {
                 surface
@@ -3735,6 +3748,19 @@ mod tests {
             TerminalSurfaceMode::Session.vertical_padding(),
             COMPOSER_TERMINAL_PADDING
         );
+    }
+
+    /// The session page's surface stays transparent.
+    ///
+    /// The page embeds the grid in a rounded window, and the window's fill is
+    /// what the grid's default cells stand on. Painting the page tone here too
+    /// would draw an opaque rectangle over the window's rounded corners.
+    #[test]
+    fn only_the_session_surface_leaves_its_background_to_the_page() {
+        assert!(!TerminalSurfaceMode::Session.paints_surface_background());
+        assert!(TerminalSurfaceMode::Standalone.paints_surface_background());
+        assert!(TerminalSurfaceMode::Preview.paints_surface_background());
+        assert!(TerminalSurfaceMode::Composer.paints_surface_background());
     }
 
     #[gpui::test]

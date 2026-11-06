@@ -222,6 +222,22 @@ the activity strip only adds its divider while the panel it belongs to is open. 
 management view's compact sidebar limits read `TITLE_BAR_HEIGHT` too, so the chrome
 height lives in one constant.
 
+### Embedded terminal window
+
+A terminal-mode session is not the workbench column: the column frames the Agent's
+TUI so it reads as a window set into the app. `render_session_terminal_page` paints
+a `SESSION_TERMINAL_FRAME_INSET` gutter in the sidebar tone around
+`session-terminal-window`, which clips its contents with the column background and
+`SESSION_TERMINAL_WINDOW_RADIUS` corners. `TerminalSurfaceMode::Session` therefore
+paints no background of its own (`paints_surface_background` is false): an opaque
+grid fill is a rectangle, and it would square off the corners the window cuts. The
+surface still keeps its own cell inset, so the window's arc never falls on a glyph.
+
+The page draws no header. A terminal session's title, Agent and capability state
+already ride the title bar and the sidebar row; a second row repeating the title
+costs the grid height without telling the reader anything new. Status that has no
+home there belongs in the Agent's own TUI, which owns the window's whole body.
+
 ### GPUI Button hover ownership
 
 The kit's `gpui-component` `Button` renderer owns the enabled/unselected hover
