@@ -57014,24 +57014,26 @@ impl VibexWorkbench {
     ///
     /// The choice is made once, here, because it is not a preference a session
     /// can change later: a terminal-mode session is born in its PTY and the
-    /// Agent owns the conversation inside it. The second option is disabled for
-    /// an Agent this release has not verified, so the panel cannot advertise a
-    /// mode that would fail on submit.
-    /// The interface choice, as a segmented pill.
+    /// Agent owns the conversation inside it.
     ///
-    /// Two modes of one control, so they read as a choice rather than as two
-    /// unrelated buttons: one track, one raised segment for the active mode, and
-    /// an icon pair that says "Vibex draws it" against "the Agent draws it".
-    /// Both segments keep their tooltip, and an Agent this release cannot run in
-    /// a terminal disables only the terminal half.
+    /// The switch is drawn only when the Agent offers both interfaces. An Agent
+    /// this release cannot run in a terminal has one interface, not a choice
+    /// between two: a lone, permanently disabled "Native terminal" segment
+    /// advertised a mode it could never select, so the control is left out and
+    /// the page simply is the interface mode.
+    ///
+    /// When it is drawn, the two modes are one control, so they read as a
+    /// choice rather than as two unrelated buttons: one track, one raised
+    /// segment for the active mode, and an icon pair that says "Vibex draws it"
+    /// against "the Agent draws it".
     fn render_new_session_transport_switch(
         &self,
         agent_id: Option<&AgentId>,
         cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let supported = agent_id
-            .map(|agent_id| vibex_core::terminal_session_support(agent_id).is_supported())
-            .unwrap_or(false);
+    ) -> Option<AnyElement> {
+        if !new_session_terminal_mode_available(agent_id) {
+            return None;
+        }
         // Terminal mode can only carry a Provider Profile: the profile is what
         // becomes the child's environment. An Agent account is a credential the
         // ACP adapter holds, and the native CLI has no way to receive it, so it
@@ -57057,19 +57059,12 @@ impl VibexWorkbench {
         let selected_fg = cx.theme().foreground;
         let unselected = cx.theme().muted_foreground;
         let terminal_accent = theme::semantic_color("accent", is_dark);
-        let disabled_label = crate::locale::text(
-            "This Agent has no verified terminal mode",
-            "该 Agent 尚未验证终端模式",
-            "該 Agent 尚未驗證終端模式",
-        )
-        .to_string();
         let options = [
             (
                 NewSessionTransport::Acp,
                 "new-session-transport-acp",
                 IconName::LayoutDashboard,
                 crate::locale::text("Vibex interface", "Vibex 界面", "Vibex 介面"),
-                false,
                 crate::locale::text(
                     "Vibex draws the conversation, approvals, and file changes.",
                     "由 Vibex 绘制对话、审批和文件改动。",
@@ -57083,10 +57078,7 @@ impl VibexWorkbench {
                 "new-session-transport-terminal",
                 IconName::SquareTerminal,
                 crate::locale::text("Native terminal", "原生终端", "原生終端"),
-                !supported,
-                if !supported {
-                    disabled_label.clone()
-                } else if !profile_backed {
+                if !profile_backed {
                     crate::locale::text(
                         "Terminal mode runs the Agent's own CLI, which can only be pointed at a Provider Profile. Choose one on this page, or the Agent will use the CLI's own login.",
                         "终端模式运行 Agent 自己的 CLI，只能通过供应商配置注入凭据。请在本页选择一个供应商配置，否则 CLI 会使用它自己的登录态。",
@@ -57105,7 +57097,7 @@ impl VibexWorkbench {
             ),
         ];
         let mut segments = Vec::with_capacity(options.len());
-        for (mode, id, icon, label, option_disabled, tooltip, _active_color) in options {
+        for (mode, id, icon, label, tooltip, _active_color) in options {
             let selected = current == mode;
             segments.push(
                 Button::new(id)
@@ -57115,8 +57107,6 @@ impl VibexWorkbench {
                     .px_2()
                     .rounded(px(7.0))
                     .when(selected, |this| this.bg(selected_bg).shadow_xs())
-                    .when(option_disabled, |this| this.opacity(0.45))
-                    .disabled(option_disabled)
                     .tooltip(tooltip)
                     .child(
                         // Colour is set on the content rather than only on the
@@ -57152,16 +57142,18 @@ impl VibexWorkbench {
                     .into_any_element(),
             );
         }
-        h_flex()
-            .id("new-session-transport")
-            .flex_none()
-            .items_center()
-            .gap(px(2.0))
-            .p(px(2.0))
-            .rounded(px(9.0))
-            .bg(track)
-            .children(segments)
-            .into_any_element()
+        Some(
+            h_flex()
+                .id("new-session-transport")
+                .flex_none()
+                .items_center()
+                .gap(px(2.0))
+                .p(px(2.0))
+                .rounded(px(9.0))
+                .bg(track)
+                .children(segments)
+                .into_any_element(),
+        )
     }
 
     fn render_new_session_runtime_cascade(
@@ -58619,9 +58611,13 @@ impl VibexWorkbench {
                 // Pushed to the far end: the transport is a property of the
                 // session this page will create, not another "where does it
                 // run" control, so it sits opposite the workspace row rather
-                // than inside the prompt box.
+                // than inside the prompt box. An Agent with only the interface
+                // mode draws no switch, so the spacer simply has nothing to
+                // push.
                 .child(div().flex_1())
-                .child(div().flex_none().child(transport_switch)),
+                .when_some(transport_switch, |this, transport_switch| {
+                    this.child(div().flex_none().child(transport_switch))
+                }),
         );
 
         let worktree_form_valid = !worktree_selected
@@ -77996,22 +77992,29 @@ fn default_new_session_runtime_selection(
         .map(|option| option.selection.clone())
 }
 
+/// Whether the new-session page offers a choice of interfaces for this Agent.
+///
+/// Both halves of the switch have to be runnable, or it is not a choice: an
+/// Agent without a verified terminal opens only the interface mode, so the page
+/// omits the control rather than advertising a mode that can never be selected.
+fn new_session_terminal_mode_available(agent_id: Option<&AgentId>) -> bool {
+    agent_id.is_some_and(|agent_id| vibex_core::terminal_session_support(agent_id).is_supported())
+}
+
 /// The transport the new-session page can actually run for this Agent.
 ///
 /// The remembered choice outlives the Agent that offered it: a reader who last
 /// created a terminal session and then returns on an Agent without a verified
-/// terminal keeps that stored value. Drawing it directly would disable the
-/// terminal half and leave the switch with neither segment raised, and the
-/// prompt would wear a terminal mark for a mode submission will not use. The
-/// page therefore reads the stored choice through this function, which falls
-/// back to the interface mode whenever the Agent cannot run a terminal.
+/// terminal keeps that stored value. The page no longer draws a switch there,
+/// and the prompt would wear a terminal mark for a mode submission will not
+/// use. The page therefore reads the stored choice through this function,
+/// which falls back to the interface mode whenever the Agent cannot run a
+/// terminal.
 fn effective_new_session_transport(
     stored: NewSessionTransport,
     agent_id: Option<&AgentId>,
 ) -> NewSessionTransport {
-    let terminal_supported = agent_id
-        .is_some_and(|agent_id| vibex_core::terminal_session_support(agent_id).is_supported());
-    if stored.is_terminal() && !terminal_supported {
+    if stored.is_terminal() && !new_session_terminal_mode_available(agent_id) {
         NewSessionTransport::Acp
     } else {
         stored
@@ -106539,33 +106542,55 @@ mod tests {
     }
 
     /// The new-session page offers terminal mode only for an Agent this release
-    /// verified, so the panel cannot advertise a mode that fails on submit.
+    /// verified, and an Agent without one draws no switch at all.
     #[test]
-    fn the_new_session_transport_switch_disables_unverified_agents() {
+    fn the_new_session_transport_switch_is_absent_without_terminal_mode() {
         let source = include_str!("app.rs");
         let switch = source
             .split_once("    fn render_new_session_transport_switch(")
             .and_then(|(_, tail)| tail.split_once("\n    fn render_new_session_runtime_cascade("))
             .map(|(body, _)| body)
             .expect("the transport switch should remain inspectable");
-        assert!(switch.contains("terminal_session_support(agent_id).is_supported()"));
-        assert!(switch.contains(".disabled(option_disabled)"));
+        assert!(switch.contains("if !new_session_terminal_mode_available(agent_id) {"));
+        assert!(switch.contains("return None;"));
+        assert!(
+            !switch.contains(".disabled("),
+            "both segments are runnable, so neither one is drawn disabled"
+        );
         assert!(switch.contains("ui_state.session.new_session_transport = mode"));
         // A remembered terminal mode on an unsupported Agent reads as the
-        // interface mode, so one segment is always raised.
-        assert!(switch.contains("let current = effective_new_session_transport(stored, agent_id);"));
+        // interface mode, so the visible segment is always the one raised.
+        assert!(
+            switch.contains("let current = effective_new_session_transport(stored, agent_id);")
+        );
         let panel = source
             .split_once("    fn render_new_session_panel(")
             .and_then(|(_, tail)| tail.split_once("\n    fn show_turn_preview_rail("))
             .map(|(body, _)| body)
             .expect("the new-session panel should remain inspectable");
-        assert!(panel.contains(".child(transport_switch)"));
+        assert!(panel.contains(".when_some(transport_switch"));
+    }
+
+    /// Both interfaces have to exist before the page offers a choice between
+    /// them, so an Agent without a verified terminal gets no switch.
+    #[test]
+    fn only_agents_with_a_terminal_mode_get_the_transport_switch() {
+        let claude = AgentId::parse("claude").unwrap();
+        let codex = AgentId::parse("codex").unwrap();
+        let deepseek = AgentId::parse("deepseek-harness").unwrap();
+        assert!(new_session_terminal_mode_available(Some(&claude)));
+        assert!(new_session_terminal_mode_available(Some(&codex)));
+        assert!(!new_session_terminal_mode_available(Some(&deepseek)));
+        assert!(
+            !new_session_terminal_mode_available(None),
+            "a page with no Agent yet has no second interface to offer"
+        );
     }
 
     /// Changing the Agent away from a terminal-capable one drops terminal mode.
     ///
-    /// The switch disables the option, but a disabled control does not undo a
-    /// choice already made. Left alone, the next submit would route an
+    /// The switch disappears for that Agent, but hiding a control does not undo
+    /// a choice already made. Left alone, the next submit would route an
     /// unsupported Agent into a terminal launch and answer "this Agent has no
     /// verified terminal mode" for a session the reader asked to open in the
     /// ordinary interface.
@@ -106581,7 +106606,7 @@ mod tests {
             .and_then(|(_, tail)| tail.split_once("\nfn default_new_session_agent_id("))
             .map(|(body, _)| body)
             .expect("the effective transport should remain inspectable");
-        assert!(effective.contains("terminal_session_support(agent_id).is_supported()"));
+        assert!(effective.contains("new_session_terminal_mode_available(agent_id)"));
         assert!(effective.contains("NewSessionTransport::Acp"));
         let reconcile = source
             .split_once("    fn reconcile_new_session_transport(")
@@ -106823,7 +106848,7 @@ mod tests {
             .and_then(|(_, tail)| tail.split_once("\n        let worktree_form_valid"))
             .map(|(body, _)| body)
             .expect("the workspace row should remain inspectable");
-        assert!(workspace_row.contains(".child(transport_switch)"));
+        assert!(workspace_row.contains(".when_some(transport_switch"));
         // And it no longer shares a row with the model/reasoning controllers.
         let runtime_row = panel
             .split_once("new-session-runtime-controls-cascade")
@@ -106834,7 +106859,7 @@ mod tests {
                 .split("new-session-submit")
                 .next()
                 .unwrap_or_default()
-                .contains("child(transport_switch)"),
+                .contains("transport_switch"),
             "the prompt box must not host the transport switch"
         );
     }
