@@ -17,6 +17,18 @@ use vibex_core::{
     WorkspaceId,
 };
 
+/// The child environment a terminal-mode Agent inherits.
+///
+/// `claude_settings_path` is the file a Claude session must pass through
+/// `--settings`: Claude Code applies the reader's `~/.claude/settings.json`
+/// after the process environment, so the projection's endpoint and credential
+/// only win on that command-line tier.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TerminalSessionEnvironment {
+    pub env: Vec<(String, String)>,
+    pub claude_settings_path: Option<PathBuf>,
+}
+
 /// Starts and stops the PTY behind a terminal-mode session.
 pub trait SessionTerminalLauncher: Send + Sync + 'static {
     /// Starts the Agent's native interface.

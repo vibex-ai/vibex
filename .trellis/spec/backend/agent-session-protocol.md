@@ -418,6 +418,24 @@ an adapter extension, present since `claude-agent-acp` 0.71.0, so it is only
 built for the `claude` Agent; the probe, live session, and runtime identity
 probe all read the same per-process value so their model catalogs cannot drift.
 
+### Claude Code terminal-mode settings note
+
+A terminal-mode Claude session has no ACP `_meta` request to carry the
+programmatic tier, so `--model` on the argv is the only channel that survives
+the reader's `~/.claude/settings.json` untouched. The connection is restated
+through `--settings <file>`: the projection writes the same environment it
+would have passed to the process into a 0600 `claude-terminal-settings.json`
+under its private overlay root, and the launch inserts the flag immediately
+after the executable. `--settings` is a command-line argument, so it is
+applied after the reader's file; the process environment alone is not.
+
+The file is rewritten on every create, restart, and crash restore, and its path
+is part of the recorded argv rather than its contents. A caller-supplied
+`--settings` is replaced, because it names a file Vibex cannot merge and a
+later occurrence would shadow the Provider the session was created with. Codex
+does not need this tier: `CODEX_HOME` already points at the projection's own
+`config.toml`.
+
 ### Codex ACP model selection note
 
 `codex-acp` applies a session's model through the Codex app-server, and it

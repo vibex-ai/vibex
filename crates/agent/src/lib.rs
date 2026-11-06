@@ -17,6 +17,7 @@ pub mod session_terminal;
 pub mod smoke_workspace;
 pub mod state_machine;
 pub(crate) mod storage_retry;
+pub(crate) mod terminal_settings;
 #[cfg(test)]
 pub(crate) mod test_support;
 
@@ -79,9 +80,13 @@ pub use scheduler::{
     DEFAULT_SCHEDULED_TASK_DUE_LIMIT, DEFAULT_SCHEDULED_TASK_STALE_AFTER_MS,
     ScheduledTaskRunOutcome, ScheduledTaskRunner, ScheduledTaskTickResult, next_run_after,
 };
-pub use session_terminal::{RecordingTerminalLauncher, SessionTerminalLauncher, TerminalWorkspace};
+pub use session_terminal::{
+    RecordingTerminalLauncher, SessionTerminalLauncher, TerminalSessionEnvironment,
+    TerminalWorkspace,
+};
 pub use smoke_workspace::{
     AGENT_SMOKE_FORBIDDEN_ROOT_ENV, AGENT_SMOKE_WORKSPACE_ENV, forbidden_agent_smoke_root,
     reject_forbidden_agent_smoke_workspace, resolve_agent_smoke_workspace,
 };
 pub use state_machine::{is_transition_allowed, validate_transition};
+pub use terminal_settings::apply_claude_settings_argument;

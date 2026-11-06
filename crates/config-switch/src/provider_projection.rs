@@ -57,6 +57,12 @@ const CODEX_PROVIDER_ORIGINATOR: &str = "codex_cli_rs";
 const CLAUDE_AGENT_ID: &str = "claude";
 const CLAUDE_API_KEY_ENV: &str = "ANTHROPIC_API_KEY";
 const CLAUDE_AUTH_TOKEN_ENV: &str = "ANTHROPIC_AUTH_TOKEN";
+/// The file a terminal-mode Claude Code session passes through `--settings`.
+///
+/// It lives beside the projection's other private files because it carries the
+/// resolved credential: Claude Code must read it from a 0600 file, never from a
+/// JSON string in the argv.
+const CLAUDE_TERMINAL_SETTINGS_FILE: &str = "claude-terminal-settings.json";
 const OVERLAY_SECRET_PLACEHOLDER_PREFIX: &str = "__VIBEX_SECRET_ENV_";
 const OVERLAY_SECRET_PLACEHOLDER_SUFFIX: &str = "__";
 
@@ -149,6 +155,34 @@ impl ResolvedAgentProviderProjection {
                     .map(|entry| (entry.key.clone(), entry.value.expose().to_string())),
             )
             .collect()
+    }
+
+    /// Writes the settings file a terminal-mode Claude Code session loads.
+    ///
+    /// Claude Code applies `~/.claude/settings.json`'s `env` block *after* the
+    /// subprocess environment, so a Provider Profile's projected endpoint and
+    /// credential lose to whatever the reader's own file defines. `--settings`
+    /// is a command-line argument and is applied after that file, so restating
+    /// the projection's environment there is what makes the selected Provider
+    /// authoritative for a terminal session, the way `_meta.claudeCode` is for
+    /// an ACP one.
+    ///
+    /// Returns `None` when the projection carries no environment to restate, so
+    /// a Profile that projects nothing does not get a pointless file. The file
+    /// is written into the projection's private directory with mode 0600; a
+    /// caller must pass the path, never the JSON, because the content includes
+    /// the resolved credential.
+    pub fn write_claude_terminal_settings(&self) -> VibexResult<Option<PathBuf>> {
+        let environment = self.child_environment();
+        if environment.is_empty() {
+            return Ok(None);
+        }
+        let settings = serde_json::json!({
+            "env": environment.into_iter().collect::<BTreeMap<_, _>>(),
+        });
+        let path = self.overlay_root.join(CLAUDE_TERMINAL_SETTINGS_FILE);
+        write_private_file_atomic(&path, settings.to_string().as_bytes())?;
+        Ok(Some(path))
     }
 }
 
@@ -10153,6 +10187,91 @@ mod tests {
             .find(|descriptor| descriptor.route.agent_id.as_str() == agent_id)
             .cloned()
             .unwrap()
+    }
+
+    fn terminal_settings_projection(
+        root: &std::path::Path,
+        non_secret_env: BTreeMap<String, String>,
+        secret_env: Vec<ResolvedProjectionSecretEnv>,
+    ) -> ResolvedAgentProviderProjection {
+        ResolvedAgentProviderProjection {
+            binding_id: vibex_core::AgentModelProviderBindingId::new(),
+            non_secret_env,
+            secret_env,
+            overlay_root: root.to_path_buf(),
+            overlay_files: Vec::new(),
+            process_args: Vec::new(),
+            session_config: Vec::new(),
+            effective_model: None,
+            switch_behavior: ProviderSwitchBehavior::RestartAndResume,
+            fingerprint: "sha256:terminal-settings".to_string(),
+            session_env_keys: Vec::new(),
+            session_header_env: Vec::new(),
+        }
+    }
+
+    /// Claude Code only lets the profile win on the `--settings` tier, and the
+    /// file that carries it must stay private because it holds the credential.
+    #[test]
+    fn claude_terminal_settings_restate_the_projection_environment_privately() {
+        let root = tempdir().unwrap();
+        let projection = terminal_settings_projection(
+            root.path(),
+            BTreeMap::from([
+                (
+                    "ANTHROPIC_BASE_URL".to_string(),
+                    "https://claude.example.invalid".to_string(),
+                ),
+                (
+                    "ANTHROPIC_CUSTOM_HEADERS".to_string(),
+                    "X-Test: one".to_string(),
+                ),
+            ]),
+            vec![ResolvedProjectionSecretEnv {
+                key: "ANTHROPIC_AUTH_TOKEN".to_string(),
+                value: ResolvedProjectionSecret("terminal-secret".to_string()),
+            }],
+        );
+
+        let path = projection
+            .write_claude_terminal_settings()
+            .unwrap()
+            .expect("a projection with environment writes the settings file");
+        assert_eq!(path, root.path().join(CLAUDE_TERMINAL_SETTINGS_FILE));
+
+        let settings: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            settings["env"]["ANTHROPIC_BASE_URL"],
+            "https://claude.example.invalid"
+        );
+        assert_eq!(
+            settings["env"]["ANTHROPIC_CUSTOM_HEADERS"],
+            "X-Test: one"
+        );
+        assert_eq!(settings["env"]["ANTHROPIC_AUTH_TOKEN"], "terminal-secret");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "the credential file must stay private");
+        }
+    }
+
+    #[test]
+    fn claude_terminal_settings_are_omitted_when_nothing_is_projected() {
+        let root = tempdir().unwrap();
+        let projection =
+            terminal_settings_projection(root.path(), BTreeMap::new(), Vec::new());
+        assert!(
+            projection
+                .write_claude_terminal_settings()
+                .unwrap()
+                .is_none(),
+            "an empty projection must not write a settings file"
+        );
+        assert!(!root.path().join(CLAUDE_TERMINAL_SETTINGS_FILE).exists());
     }
 }
 
