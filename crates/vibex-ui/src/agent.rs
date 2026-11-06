@@ -4137,6 +4137,16 @@ mod terminal_session_display_tests {
             )),
             AgentSessionState::Idle
         );
+        // A program that reported a failure is still running, and the row has
+        // to say so: drawing it as idle would hide the one thing the reader
+        // needs to look at.
+        assert_eq!(
+            display_state(&session(
+                SessionTransport::Terminal,
+                Some(TerminalActivity::Failed)
+            )),
+            AgentSessionState::Error
+        );
     }
 
     /// `Unknown` is not `Idle`: a session whose observation has not landed, or
@@ -4179,6 +4189,7 @@ mod terminal_session_display_tests {
         for activity in [
             TerminalActivity::Working,
             TerminalActivity::Waiting,
+            TerminalActivity::Failed,
             TerminalActivity::Idle,
             TerminalActivity::Unknown,
         ] {

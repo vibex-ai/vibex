@@ -152,6 +152,13 @@ pub enum TerminalActivity {
     Working,
     /// The CLI is blocked on the reader, most often an approval prompt.
     Waiting,
+    /// The CLI reported a failure it cannot continue from.
+    ///
+    /// Distinct from `Unknown`: a failed launch is a lifecycle fact, but a
+    /// program that says `error` is still running and still says so, and a row
+    /// that drew it as idle or busy would hide the thing the reader has to
+    /// look at.
+    Failed,
 }
 
 /// Which observation produced [`TerminalActivity`].

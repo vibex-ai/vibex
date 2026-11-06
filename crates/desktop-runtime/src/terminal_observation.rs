@@ -4,8 +4,13 @@
 //! only question is the one the sidebar has to answer: is this session working,
 //! is it parked on the reader, or has it settled — and how sure are we.
 //!
-//! Two rules shape the module:
+//! Three rules shape the module:
 //!
+//! * **A program that reports its own state is believed over the screen.** The
+//!   Program Status Protocol (OSC 7501) is the Agent saying what it is doing;
+//!   the screen rules are what is left when it says nothing. A terminal that
+//!   parses the reports but never answers the protocol's capability probe
+//!   receives none of them, which is why the PTY host answers it.
 //! * **A terminal is read from its bottom buffer, never from the viewport.** A
 //!   reader who scrolls up has not changed what the Agent is doing, so the
 //!   emulator is fed in full and the *last screenful* is what rules see.
@@ -22,7 +27,7 @@
 use std::collections::HashMap;
 
 use vibex_core::{AgentId, TerminalActivity, TerminalActivitySource, TerminalId};
-use vibex_terminal_ui::TerminalEmulator;
+use vibex_terminal_ui::{ProgramState, ProgramStatusScanner, TerminalEmulator};
 
 /// How long an observation stays believable.
 ///
@@ -43,6 +48,9 @@ pub enum ScreenReading {
     Idle,
     Working,
     Waiting,
+    /// The Agent's CLI reported, or the screen showed, a failure it will not
+    /// continue from on its own.
+    Failed,
     /// The Agent's CLI has ended its session but the process is still there.
     ///
     /// A terminal Agent does not die on the first interrupt: Claude asks for a
@@ -51,7 +59,7 @@ pub enum ScreenReading {
     /// never sees the session end — the screen is the only place the CLI says
     /// so.
     Exited,
-    /// The screen shows no live chrome either way.
+    /// The screen shows no live chrome either way, and no report arrived.
     Unknown,
 }
 
@@ -61,6 +69,7 @@ impl ScreenReading {
             Self::Idle => TerminalActivity::Idle,
             Self::Working => TerminalActivity::Working,
             Self::Waiting => TerminalActivity::Waiting,
+            Self::Failed => TerminalActivity::Failed,
             // A session whose CLI ended is not "doing" anything: it reports no
             // activity, and the caller closes the session from the reading.
             Self::Exited | Self::Unknown => TerminalActivity::Unknown,
@@ -70,6 +79,18 @@ impl ScreenReading {
     /// Whether the screen says the Agent's session is over.
     pub fn is_exit(self) -> bool {
         self == Self::Exited
+    }
+
+    fn from_program_state(state: ProgramState) -> Option<Self> {
+        match state {
+            ProgramState::Idle | ProgramState::Done => Some(Self::Idle),
+            ProgramState::Working => Some(Self::Working),
+            ProgramState::Blocked => Some(Self::Waiting),
+            ProgramState::Error => Some(Self::Failed),
+            // A withdrawal is not a reading: the next sweep falls back to the
+            // rules rather than inventing one.
+            ProgramState::Clear => None,
+        }
     }
 }
 
@@ -116,10 +137,7 @@ impl ScreenProfile {
                     ScreenRule {
                         reading: ScreenReading::Exited,
                         contains: &[],
-                        any: &[
-                            "press ctrl-c again to exit",
-                            "press ctrl+c again to exit",
-                        ],
+                        any: &["press ctrl-c again to exit", "press ctrl+c again to exit"],
                         without: &[],
                     },
                     ScreenRule {
@@ -242,16 +260,24 @@ impl Damping {
     /// Decides what to publish for a fresh reading.
     ///
     /// `working -> idle` needs several agreeing scans because it is the
-    /// transition that fires completions. Every other change publishes at once:
-    /// a blocker is worth interrupting for, and a return to work should clear
-    /// the mark without a delay.
-    fn accept(&mut self, reading: ScreenReading) -> Option<TerminalActivity> {
+    /// transition that fires completions, and a TUI that blanks between
+    /// repaints would otherwise announce a finished turn. Every other change
+    /// publishes at once: a blocker is worth interrupting for, and a return to
+    /// work should clear the mark without a delay.
+    ///
+    /// `reported` is the program's own word, so it is not damped: a program
+    /// that says it finished means it finished, and waiting for three sweeps
+    /// only delays the reader's answer.
+    fn accept(&mut self, reading: ScreenReading, reported: bool) -> Option<TerminalActivity> {
         let next = reading.activity();
         if next == self.published {
             self.pending_idle = 0;
             return None;
         }
-        if self.published == TerminalActivity::Working && next == TerminalActivity::Idle {
+        if !reported
+            && self.published == TerminalActivity::Working
+            && next == TerminalActivity::Idle
+        {
             self.pending_idle = self.pending_idle.saturating_add(1);
             if self.pending_idle < IDLE_CONFIRMATIONS {
                 return None;
@@ -300,7 +326,9 @@ fn resume_session_id(screen: &str) -> Option<String> {
                 .split_whitespace()
                 .next()
                 .unwrap_or_default()
-                .trim_matches(|character: char| !character.is_ascii_alphanumeric() && character != '-');
+                .trim_matches(|character: char| {
+                    !character.is_ascii_alphanumeric() && character != '-'
+                });
             // A uuid, not a flag: the notice is copied from a screen a reader
             // also reads, so the check is on shape rather than on position.
             if id.len() >= 8 && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
@@ -324,6 +352,15 @@ pub struct WatchedTerminal {
     published: Option<(TerminalActivity, TerminalActivitySource)>,
     /// Set once the screen has said the session is over.
     published_exit: bool,
+    /// Reports from the Program Status Protocol, which outrank the screen.
+    scanner: ProgramStatusScanner,
+    /// What the program last said about the session itself.
+    ///
+    /// Kept beside the screen reading rather than replacing it: a program that
+    /// reports once and then goes quiet is still the best evidence there is,
+    /// and a program that only ever reports a child record has said nothing
+    /// about the session.
+    reported: Option<ProgramState>,
 }
 
 impl WatchedTerminal {
@@ -367,6 +404,8 @@ impl WatchedTerminal {
             damping: Damping::default(),
             published: None,
             published_exit: false,
+            scanner: ProgramStatusScanner::new(),
+            reported: None,
         }
     }
 
@@ -379,9 +418,22 @@ impl WatchedTerminal {
     /// The emulator's own scrollback is what makes the bottom buffer correct;
     /// the reader's scroll position is not part of it.
     pub fn advance(&mut self, bytes: &[u8]) {
-        if !bytes.is_empty() {
-            self.emulator.advance(bytes);
+        if bytes.is_empty() {
+            return;
         }
+        for report in self.scanner.push(bytes) {
+            // A program's own record describes the session. Records it opens
+            // for the things it runs are its business, and letting one of them
+            // paint the row would report a subtask's state as the session's.
+            if !report.is_root() {
+                continue;
+            }
+            self.reported = match report.state {
+                ProgramState::Clear => None,
+                state => Some(state),
+            };
+        }
+        self.emulator.advance(bytes);
     }
 
     /// The last screenful, which is what rules read.
@@ -389,13 +441,32 @@ impl WatchedTerminal {
         self.emulator.visible_text()
     }
 
+    /// The activity the program last said it was doing, when it said anything.
+    ///
+    /// This is the only evidence a CLI gives that does not have to be guessed
+    /// from pixels, so the row's reading is taken from it whenever it exists.
+    fn reported_reading(&self) -> Option<ScreenReading> {
+        self.reported.and_then(ScreenReading::from_program_state)
+    }
+
     /// Reads the screen and returns the activity to publish, if it changed.
     ///
     /// The caller supplies `now_ms` so the update is stamped with the same
     /// clock the store writes, and so tests need no wall clock.
     pub fn scan(&mut self, now_ms: i64) -> Option<ObservationUpdate> {
-        let reading = self.rules.read(&self.bottom_screen());
-        if reading.is_exit() {
+        let screen = self.bottom_screen();
+        let screen_reading = self.rules.read(&screen);
+        // A program's own report wins over the screen. It is the only evidence
+        // that does not have to be inferred, and the CLIs that speak the
+        // protocol keep their chrome terse enough that rules misread it: an
+        // "esc to interrupt" footer can survive the end of a turn, and an
+        // approval dialog built from a border and a list matches no rule at all.
+        //
+        // The exit notice is the exception, because it is not part of the turn
+        // the program reported on: the process is alive behind a prompt, and
+        // the screen is the only place that says so.
+        let reported = self.reported_reading();
+        if screen_reading.is_exit() {
             // Publish once. The session is then closed by the caller, and a
             // closed session produces no further readings.
             if self.published_exit {
@@ -405,7 +476,7 @@ impl WatchedTerminal {
             // The CLI prints how to continue this conversation. Capturing it is
             // what lets a restart resume the Agent's own history instead of
             // starting a second, empty session beside it.
-            let native_session_id = resume_session_id(&self.bottom_screen());
+            let native_session_id = resume_session_id(&screen);
             return Some(ObservationUpdate {
                 terminal_id: TerminalId::new(),
                 session_id: self.session_id.clone(),
@@ -416,12 +487,15 @@ impl WatchedTerminal {
                 native_session_id,
             });
         }
-        let activity = self.damping.accept(reading)?;
+        let reading = reported.unwrap_or(screen_reading);
+        let activity = self.damping.accept(reading, reported.is_some())?;
         let source = match activity {
-            TerminalActivity::Idle | TerminalActivity::Working | TerminalActivity::Waiting => {
-                TerminalActivitySource::Screen
-            }
             TerminalActivity::Unknown => TerminalActivitySource::None,
+            // A reading the program supplied is a hook report, even when the
+            // screen would have said the same thing: the reader is told which
+            // one to trust if they ever disagree.
+            _ if reported.is_some() => TerminalActivitySource::Hook,
+            _ => TerminalActivitySource::Screen,
         };
         if self.published == Some((activity, source)) {
             return None;
@@ -450,6 +524,15 @@ impl WatchedTerminal {
 pub struct TerminalObservations {
     profiles: Vec<ScreenProfile>,
     terminals: HashMap<TerminalId, WatchedTerminal>,
+    /// Updates produced by the byte tap between two sweeps.
+    ///
+    /// The tap runs on the PTY reader thread and has nowhere to publish to, so
+    /// a reading it produced used to be dropped on the floor: the tap advanced
+    /// the damping, and the sweep then saw an unchanged reading and published
+    /// nothing. A turn that started and finished inside one 300ms window was
+    /// therefore invisible. Queueing it here makes the tap a producer and the
+    /// sweep the single publisher.
+    pending: Vec<ObservationUpdate>,
 }
 
 impl TerminalObservations {
@@ -457,6 +540,7 @@ impl TerminalObservations {
         Self {
             profiles: ScreenProfile::bundled(),
             terminals: HashMap::new(),
+            pending: Vec::new(),
         }
     }
 
@@ -486,6 +570,12 @@ impl TerminalObservations {
     }
 
     pub fn unwatch(&mut self, terminal_id: &TerminalId) -> Option<WatchedTerminal> {
+        // A reading the tap queued but the sweep has not published describes a
+        // terminal nobody is watching any more. Publishing it would write an
+        // activity onto a session that has already been retired, which reads as
+        // a closed session whose Agent started working again.
+        self.pending
+            .retain(|update| &update.terminal_id != terminal_id);
         self.terminals.remove(terminal_id)
     }
 
@@ -496,23 +586,27 @@ impl TerminalObservations {
 
     /// Feeds one read and records whether the reading changed.
     ///
-    /// Returns the update so the caller can persist it; an unchanged screen
-    /// returns `None` and costs only the rule evaluation.
-    pub fn observe(
-        &mut self,
-        terminal_id: &TerminalId,
-        bytes: &[u8],
-        now_ms: i64,
-    ) -> Option<ObservationUpdate> {
-        let watched = self.terminals.get_mut(terminal_id)?;
+    /// The update is queued for the next sweep rather than returned, because
+    /// the caller is the PTY reader thread: it must not touch the session store
+    /// or the event bus, and the sweep is the one place that publishes.
+    pub fn observe(&mut self, terminal_id: &TerminalId, bytes: &[u8], now_ms: i64) {
+        let Some(watched) = self.terminals.get_mut(terminal_id) else {
+            return;
+        };
         watched.advance(bytes);
-        watched.scan(now_ms)
+        if let Some(mut update) = watched.scan(now_ms) {
+            update.terminal_id = terminal_id.clone();
+            self.pending.push(update);
+        }
     }
 
-    /// Scans every watched terminal, for the periodic sweep that re-confirms a
-    /// steady screen and ages stale readings out.
+    /// Everything that changed since the last sweep.
+    ///
+    /// The queue comes first: a report the tap already read is older than
+    /// whatever the screen says now, and publishing it after the fresh scan
+    /// would make the row walk backwards.
     pub fn scan_all(&mut self, now_ms: i64) -> Vec<ObservationUpdate> {
-        let mut updates = Vec::new();
+        let mut updates = std::mem::take(&mut self.pending);
         for (terminal_id, watched) in self.terminals.iter_mut() {
             if let Some(mut update) = watched.scan(now_ms) {
                 update.terminal_id = terminal_id.clone();
@@ -533,7 +627,6 @@ mod tests {
             .find(|profile| profile.agent().as_str() == "claude")
             .expect("claude has a bundle")
     }
-
 
     /// The screen says when the CLI ended its session, even though the process
     /// is still alive.
@@ -597,17 +690,20 @@ mod tests {
         assert!(observations.scan_all(1_100).is_empty());
     }
 
-
     /// The exit notice's resume command is the only place the Agent's own
     /// session id appears, so it is what a restart continues from.
     #[test]
     fn the_exit_notice_yields_the_agents_session_id() {
         assert_eq!(
-            resume_session_id("Resume this session with:\nclaude --resume 54689079-d7b6-4dc5-9a38-8a4202f5f2ad"),
+            resume_session_id(
+                "Resume this session with:\nclaude --resume 54689079-d7b6-4dc5-9a38-8a4202f5f2ad"
+            ),
             Some("54689079-d7b6-4dc5-9a38-8a4202f5f2ad".to_string())
         );
         assert_eq!(
-            resume_session_id("To reconnect, run:\n  codex resume 01a1aa4d-b3b1-7723-a20b-3e04da40dd97"),
+            resume_session_id(
+                "To reconnect, run:\n  codex resume 01a1aa4d-b3b1-7723-a20b-3e04da40dd97"
+            ),
             Some("01a1aa4d-b3b1-7723-a20b-3e04da40dd97".to_string())
         );
     }
@@ -661,18 +757,18 @@ mod tests {
     fn a_working_screen_needs_agreement_before_it_settles() {
         let mut damping = Damping::default();
         assert_eq!(
-            damping.accept(ScreenReading::Working),
+            damping.accept(ScreenReading::Working, false),
             Some(TerminalActivity::Working)
         );
         for expected in 1..IDLE_CONFIRMATIONS {
             assert_eq!(
-                damping.accept(ScreenReading::Idle),
+                damping.accept(ScreenReading::Idle, false),
                 None,
                 "scan {expected} must not settle the session"
             );
         }
         assert_eq!(
-            damping.accept(ScreenReading::Idle),
+            damping.accept(ScreenReading::Idle, false),
             Some(TerminalActivity::Idle)
         );
     }
@@ -683,11 +779,11 @@ mod tests {
     fn a_blocker_is_published_without_damping() {
         let mut damping = Damping::default();
         assert_eq!(
-            damping.accept(ScreenReading::Working),
+            damping.accept(ScreenReading::Working, false),
             Some(TerminalActivity::Working)
         );
         assert_eq!(
-            damping.accept(ScreenReading::Waiting),
+            damping.accept(ScreenReading::Waiting, false),
             Some(TerminalActivity::Waiting)
         );
     }
@@ -761,6 +857,226 @@ mod tests {
             .advance(b"\x1b[2J\x1b[H? for shortcuts");
         // The first scan publishes idle, and the second publishes nothing.
         assert_eq!(observations.scan_all(1_000).len(), 1);
+        assert!(observations.scan_all(1_100).is_empty());
+    }
+
+    /// A report the program sent is what the row publishes, whatever the
+    /// screen around it looks like.
+    ///
+    /// This is the whole reason the protocol exists: Claude Code keeps an
+    /// "esc to interrupt" footer after a turn ends and draws an approval dialog
+    /// no bottom-of-screen rule recognizes, so the screen rules alone report
+    /// the wrong state exactly when the reader needs the right one.
+    #[test]
+    fn a_program_report_outranks_the_screen() {
+        let mut watched = WatchedTerminal::new(
+            "session-1",
+            AgentId::parse("claude").unwrap(),
+            6,
+            60,
+            &ScreenProfile::bundled(),
+        );
+        let update = |watched: &mut WatchedTerminal, now| watched.scan(now).unwrap();
+
+        watched
+            .advance(b"\x1b[2J\x1b[H? for shortcuts\x1b]7501;state=working:app=claude-code\x1b\\");
+        let working = update(&mut watched, 1_000);
+        assert_eq!(working.activity, TerminalActivity::Working);
+        assert_eq!(working.source, TerminalActivitySource::Hook);
+
+        // The footer survives the end of the turn; the report does not.
+        watched.advance(b"\x1b]7501;state=done:app=claude-code\x1b\\");
+        let done = update(&mut watched, 1_100);
+        assert_eq!(done.activity, TerminalActivity::Idle);
+        assert_eq!(done.source, TerminalActivitySource::Hook);
+        assert_eq!(
+            watched.current_reading(),
+            ScreenReading::Idle,
+            "the screen still shows the idle footer, so only the report can tell"
+        );
+        // The report is addressed to the terminal, not to the reader: the
+        // emulator must consume it instead of drawing its fields.
+        assert!(
+            !watched.bottom_screen().contains("7501")
+                && !watched.bottom_screen().contains("state="),
+            "a status report must never reach the visible screen: {:?}",
+            watched.bottom_screen()
+        );
+    }
+
+    /// `blocked` is the state a row has to interrupt for, and the report
+    /// publishes it without waiting for a second agreeing scan.
+    #[test]
+    fn a_blocked_report_publishes_at_once() {
+        let mut watched = WatchedTerminal::new(
+            "session-1",
+            AgentId::parse("claude").unwrap(),
+            6,
+            60,
+            &ScreenProfile::bundled(),
+        );
+        watched.advance(b"\x1b[2J\x1b[H? for shortcuts\x1b]7501;state=working\x1b\\");
+        assert_eq!(
+            watched.scan(1_000).unwrap().activity,
+            TerminalActivity::Working
+        );
+
+        watched.advance(b"\x1b]7501;state=blocked:kind=permission\x1b\\");
+        let blocked = watched.scan(1_100).unwrap();
+        assert_eq!(blocked.activity, TerminalActivity::Waiting);
+        assert_eq!(blocked.source, TerminalActivitySource::Hook);
+    }
+
+    /// A report that says `error` is a failure the reader can act on, not an
+    /// unknown observation.
+    #[test]
+    fn an_error_report_reads_as_failed() {
+        let mut watched = WatchedTerminal::new(
+            "session-1",
+            AgentId::parse("codex").unwrap(),
+            6,
+            60,
+            &ScreenProfile::bundled(),
+        );
+        watched.advance(b"\x1b]7501;state=error:app=codex\x1b\\");
+        let update = watched.scan(1_000).unwrap();
+        assert_eq!(update.activity, TerminalActivity::Failed);
+        assert_eq!(update.source, TerminalActivitySource::Hook);
+    }
+
+    /// A program that withdraws its report leaves the screen rules in charge.
+    #[test]
+    fn a_cleared_report_falls_back_to_the_screen() {
+        let mut watched = WatchedTerminal::new(
+            "session-1",
+            AgentId::parse("claude").unwrap(),
+            6,
+            60,
+            &ScreenProfile::bundled(),
+        );
+        watched.advance(b"\x1b[2J\x1b[H? for shortcuts\x1b]7501;state=working\x1b\\");
+        assert_eq!(
+            watched.scan(1_000).unwrap().activity,
+            TerminalActivity::Working
+        );
+
+        // The program withdrew its record; the idle footer is now the only
+        // evidence, and it is damped like any other screen reading.
+        watched.advance(b"\x1b]7501;state=clear\x1b\\");
+        // The screen still says idle, but the damping that guards every screen
+        // reading applies again now that the program withdrew its word.
+        let mut settled = None;
+        for scan in 1..=u32::from(IDLE_CONFIRMATIONS) {
+            settled = watched.scan(1_000 + i64::from(scan) * 100);
+            if scan < u32::from(IDLE_CONFIRMATIONS) {
+                assert_eq!(settled, None, "scan {scan} must not settle the session");
+            }
+        }
+        let settled = settled.unwrap();
+        assert_eq!(settled.activity, TerminalActivity::Idle);
+        assert_eq!(settled.source, TerminalActivitySource::Screen);
+    }
+
+    /// A record the program opened for one of its tasks is not the program.
+    #[test]
+    fn a_child_record_does_not_paint_the_session() {
+        let mut watched = WatchedTerminal::new(
+            "session-1",
+            AgentId::parse("claude").unwrap(),
+            6,
+            60,
+            &ScreenProfile::bundled(),
+        );
+        watched.advance(b"\x1b[2J\x1b[Hesc to interrupt\x1b]7501;state=working\x1b\\");
+        assert_eq!(
+            watched.scan(1_000).unwrap().activity,
+            TerminalActivity::Working
+        );
+
+        watched.advance(b"\x1b]7501;state=idle:id=task/1\x1b\\");
+        assert_eq!(
+            watched.scan(1_100),
+            None,
+            "a subtask finishing must not settle the session"
+        );
+    }
+
+    /// The exit notice is not part of a turn report: the process is still
+    /// alive behind a prompt, and only the screen says so.
+    #[test]
+    fn an_exit_notice_outranks_a_stale_report() {
+        let mut watched = WatchedTerminal::new(
+            "session-1",
+            AgentId::parse("claude").unwrap(),
+            8,
+            60,
+            &ScreenProfile::bundled(),
+        );
+        watched.advance(b"\x1b]7501;state=working\x1b\\");
+        assert_eq!(
+            watched.scan(1_000).unwrap().activity,
+            TerminalActivity::Working
+        );
+
+        watched.advance(b"\x1b[2J\x1b[HPress Ctrl-C again to exit");
+        let exit = watched.scan(1_100).unwrap();
+        assert!(exit.exited);
+        assert_eq!(exit.activity, TerminalActivity::Unknown);
+    }
+
+    /// An update the byte tap produced is published by the next sweep.
+    ///
+    /// The tap runs on the PTY reader thread and cannot write to the store, so
+    /// what it observed has to survive until the sweep runs. Dropping it made a
+    /// turn that started and finished inside one 300ms window invisible: the
+    /// tap had already advanced the damping, so the sweep saw no change and
+    /// published nothing.
+    #[test]
+    fn a_tap_update_is_published_by_the_next_sweep() {
+        let mut observations = TerminalObservations::new();
+        let terminal_id = TerminalId::new();
+        observations.watch(
+            terminal_id.clone(),
+            "session-1",
+            AgentId::parse("claude").unwrap(),
+            6,
+            60,
+        );
+        observations.observe(
+            &terminal_id,
+            b"\x1b[2J\x1b[H? for shortcuts\x1b]7501;state=working\x1b\\",
+            1_000,
+        );
+        let updates = observations.scan_all(1_100);
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].activity, TerminalActivity::Working);
+        assert_eq!(updates[0].source, TerminalActivitySource::Hook);
+        assert_eq!(updates[0].terminal_id, terminal_id);
+        // And it is published once, like any other update.
+        assert!(observations.scan_all(1_200).is_empty());
+    }
+
+    /// A reading queued for a terminal that stopped being watched is dropped.
+    ///
+    /// The session was already retired, so publishing the update would write an
+    /// activity onto a closed row and make it look like the Agent came back.
+    #[test]
+    fn unwatching_drops_what_the_tap_queued() {
+        let mut observations = TerminalObservations::new();
+        let terminal_id = TerminalId::new();
+        observations.watch(
+            terminal_id.clone(),
+            "session-1",
+            AgentId::parse("claude").unwrap(),
+            6,
+            60,
+        );
+        observations.observe(
+            &terminal_id,
+            b"\x1b[2J\x1b[Hesc to interrupt\x1b]7501;state=working\x1b\\",
+            1_000,
+        );
+        observations.unwatch(&terminal_id);
         assert!(observations.scan_all(1_100).is_empty());
     }
 

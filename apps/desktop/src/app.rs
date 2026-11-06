@@ -4596,6 +4596,28 @@ fn authoritative_loaded_turn_status(items: &[TimelineItem]) -> Option<bool> {
     (latest_timeline_turn_ended_normally(items) == Some(true)).then_some(true)
 }
 
+/// When a terminal session's Agent last finished a turn.
+///
+/// An ACP session's completion is a timeline item, which is compared by
+/// sequence and already invalidates the sidebar. A terminal session has no
+/// transcript: its completion is the observation itself, stamped when the
+/// activity left `Working`. That stamp is what the unread mark is raised from,
+/// so it is also what the cached sidebar projection has to notice.
+///
+/// `0` for every session that is not terminal, and for a terminal one that has
+/// not finished a turn yet, so an ordinary timestamp update stays the
+/// non-event it was.
+fn session_completion_at_ms(session: &AgentSession) -> i64 {
+    if !session.is_terminal() {
+        return 0;
+    }
+    session
+        .terminal
+        .as_deref()
+        .and_then(|facts| facts.completed_at_ms)
+        .unwrap_or_default()
+}
+
 /// Session snapshots also carry the latest timeline timestamp. That timestamp
 /// changes for every streamed item, but it does not change the sidebar shape.
 /// Keep the comparison focused on fields that can affect the sidebar so a
@@ -4606,6 +4628,9 @@ fn authoritative_loaded_turn_status(items: &[TimelineItem]) -> Option<bool> {
 /// from a cached projection. Comparing only the lifecycle state meant the cache
 /// kept the reading the row was first built with, so a native terminal never
 /// stopped looking idle however the Agent inside it moved.
+///
+/// A finished terminal turn is shape for a second reason: it is the clock the
+/// unread mark is raised from.
 fn session_snapshot_sidebar_changed(previous: Option<&AgentSession>, next: &AgentSession) -> bool {
     let Some(previous) = previous else {
         return true;
@@ -4619,6 +4644,9 @@ fn session_snapshot_sidebar_changed(previous: Option<&AgentSession>, next: &Agen
         || previous.agent_id != next.agent_id
         || previous.state != next.state
         || previous.display_state() != next.display_state()
+        // A terminal session's completion clock is what raises the unread
+        // mark, and it lives on the observation rather than on the session.
+        || session_completion_at_ms(previous) != session_completion_at_ms(next)
         || previous.created_at_ms != next.created_at_ms
         || previous.archived_at_ms != next.archived_at_ms
         || previous.deleted_at_ms != next.deleted_at_ms
@@ -10341,6 +10369,10 @@ pub struct VibexWorkbench {
     /// committed item, so a completion the reader watched end can be replayed
     /// after they switch away. Without this mark that replay raised an unread
     /// dot for a turn that was never unseen.
+    ///
+    /// A terminal session has no sequence of its own, so its completion clock
+    /// (see [`session_completion_at_ms`]) is recorded here instead. The two
+    /// never collide: a session is one transport for its whole life.
     unread_completion_watermarks: BTreeMap<String, i64>,
     /// Session ids with an unresolved approval or input request, mapped to the
     /// request ids still waiting for an answer.
@@ -28500,6 +28532,17 @@ impl VibexWorkbench {
                         existing.state != session.state
                             || existing.updated_at_ms != session.updated_at_ms
                     });
+                // A terminal turn that ended while the reader was elsewhere
+                // raises the unread mark here: this snapshot is the only place
+                // the CLI's own completion reaches the workbench. The row is
+                // already compared above, so this is the last use of the
+                // previous snapshot and the only mutation before the upsert.
+                // `upsert_session_snapshot` invalidates the cached projection
+                // itself, and the branch below handles the unknown row, so the
+                // mark only has to be raised.
+                if !hidden {
+                    self.mark_terminal_completions_unread(std::slice::from_ref(&session));
+                }
                 if changed {
                     let session_id = session.id.clone();
                     if unknown {
@@ -53455,6 +53498,57 @@ impl VibexWorkbench {
         } else {
             workspace.into_any_element()
         }
+    }
+
+    /// Raises the unread mark for terminal turns that ended unseen.
+    ///
+    /// An ACP session's completion is a timeline item, which the live stream
+    /// delivers and [`update_unread_agent_completions`] reads. A terminal
+    /// session has no transcript Vibex can see: its completion is the agent
+    /// CLI's own report, folded into `completed_at_ms` when the activity left
+    /// `Working`. Without this the row for a CLI that finished while the reader
+    /// was elsewhere stayed plain — the one state the mark exists for.
+    ///
+    /// The same watermark protects both: a completion the reader was watching
+    /// when it happened must not raise a dot when the next snapshot replays it.
+    /// Returns whether a mark was raised. The caller decides what to do with
+    /// [`Self::unread_agent_completion_session_ids`]; the sidebar projection is
+    /// invalidated by the snapshot upsert and by the unknown-row branch.
+    fn mark_terminal_completions_unread(&mut self, sessions: &[AgentSession]) -> bool {
+        let selected = self.selected_session_id.clone();
+        let mut changed = false;
+        for session in sessions {
+            let Some(completed_at_ms) = session
+                .terminal
+                .as_deref()
+                .filter(|_| session.is_terminal())
+                .and_then(|facts| facts.completed_at_ms)
+            else {
+                continue;
+            };
+            if completed_at_ms <= 0 {
+                continue;
+            }
+            let session_id = session.id.as_str().to_string();
+            let watermark = self
+                .unread_completion_watermarks
+                .get(&session_id)
+                .copied()
+                .unwrap_or_default();
+            if completed_at_ms <= watermark {
+                continue;
+            }
+            self.unread_completion_watermarks
+                .insert(session_id.clone(), completed_at_ms);
+            // The reader was looking at the turn as it ended, so it is not
+            // unread; the watermark still advances, which is what keeps the
+            // next snapshot from raising it.
+            if selected.as_ref() == Some(&session.id) {
+                continue;
+            }
+            changed |= self.unread_agent_completion_session_ids.insert(session_id);
+        }
+        changed
     }
 
     /// The state one sidebar row reports for a session.
@@ -102337,6 +102431,16 @@ mod tests {
             Some(&working),
             &heartbeat
         ));
+        // A turn ending is shape even though the activity does not move: it is
+        // the completion clock the unread mark is raised from.
+        let mut completed = heartbeat.clone();
+        if let Some(facts) = completed.terminal.as_mut() {
+            facts.completed_at_ms = Some(9);
+        }
+        assert!(
+            session_snapshot_sidebar_changed(Some(&heartbeat), &completed),
+            "a finished terminal turn has to reach the row that badges it"
+        );
         // The row itself resolves through the same projection, so the state it
         // paints is the Agent's activity rather than the open row.
         assert_eq!(session.display_state(), AgentSessionState::Running);

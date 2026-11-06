@@ -84,9 +84,10 @@ impl TerminalManagerSessionLauncher {
 
 /// Registers a session's terminal for observation.
 ///
-/// The tap runs on the PTY reader thread and only enqueues bytes; the emulator
-/// and the rules are read by the runtime's sweep. Kept as one function so the
-/// launcher and the runtime's own `watch_session_terminal` cannot drift.
+/// The tap runs on the PTY reader thread and only reads the bytes into the
+/// emulator, queueing whatever reading changed; the runtime's sweep is what
+/// persists and broadcasts. Kept as one function so the launcher and the
+/// runtime's own `watch_session_terminal` cannot drift.
 pub fn watch_session_terminal(
     manager: &TerminalManager,
     observations: &std::sync::Arc<

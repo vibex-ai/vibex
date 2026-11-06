@@ -11,6 +11,7 @@ mod emulator;
 mod emulator_wasm;
 
 mod capability;
+mod program_status;
 
 pub use capability::{
     COLOR_TERM, ChildEnvironment, DRAWS_PICTURES, IMAGE_OVERRIDE, KITTY_KEYBOARD_PROTOCOL,
@@ -20,3 +21,7 @@ pub use capability::{
 pub use emulator::*;
 #[cfg(target_family = "wasm")]
 pub use emulator_wasm::*;
+pub use program_status::{
+    PROGRAM_STATUS_PROBE, PROGRAM_STATUS_PROBE_REPLY, ProgramState, ProgramStatus,
+    ProgramStatusScanner, is_probe_prefix, probe_length,
+};

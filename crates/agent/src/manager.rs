@@ -3083,9 +3083,21 @@ impl AgentManager {
                 (vibex_core::TerminalActivity::Waiting, since) => since,
                 _ => None,
             },
-            completed_at_ms: match (activity, record.facts.completed_at_ms) {
-                (vibex_core::TerminalActivity::Idle, _) => Some(observed_at_ms),
-                (_, completed) => completed,
+            // A turn ends when the observation leaves `Working`. `Idle` alone
+            // is not a completion: it is also what a CLI reports the moment it
+            // starts, and a row must not raise "unread" for a session that has
+            // not done any work yet. The timestamp is stamped once per turn,
+            // which is what keeps a steady idle screen from rewriting the row
+            // (and re-raising the mark) on every sweep.
+            completed_at_ms: match (
+                activity,
+                record.facts.activity,
+                record.facts.completed_at_ms,
+            ) {
+                (vibex_core::TerminalActivity::Idle, vibex_core::TerminalActivity::Working, _) => {
+                    Some(observed_at_ms)
+                }
+                (_, _, completed) => completed,
             },
         };
         if !SessionTerminalRepository::update_facts(&conn, session_id, &facts)? {
@@ -13118,15 +13130,13 @@ mod tests {
         );
     }
 
-    /// A session list carries the terminal id a remote client needs to reach the
-    /// Agent's PTY.
-    ///
-    /// The plain repository read leaves `terminal` empty because most reads
-    /// never look at it; a client rendering the Agent's terminal has to be able
-    /// to find the PTY, and the id lives only in the link table.
-
     /// A terminal session keeps its link across the list read that follows
     /// creation.
+    ///
+    /// A session list carries the terminal id a remote client needs to reach
+    /// the Agent's PTY: the plain repository read leaves `terminal` empty
+    /// because most reads never look at it, so the list read has to fill it in
+    /// from the link table.
     ///
     /// The workbench answers creation with the returned snapshot and then
     /// replaces the whole list from an authoritative read. Both have to carry
@@ -13592,6 +13602,72 @@ mod tests {
                 .is_err(),
             "an unchanged observation must not repaint every row"
         );
+    }
+
+    /// A finished turn is stamped once, and only when work actually ended.
+    ///
+    /// `completed_at_ms` is what raises the unread mark for a terminal session,
+    /// which has no transcript to announce a final answer. Stamping every idle
+    /// reading would re-raise it on each sweep, and stamping the first idle a
+    /// CLI reports on startup would badge a session that never worked.
+    #[tokio::test]
+    async fn a_finished_terminal_turn_is_stamped_once() {
+        let (manager, _, dir) = terminal_manager();
+        let session = manager
+            .create_terminal_session(terminal_request("claude", &dir))
+            .await
+            .unwrap();
+        let facts = |session: &vibex_core::AgentSession| {
+            let conn = open_database(&dir.join("vibex.db")).unwrap();
+            vibex_db::SessionTerminalRepository::get(&conn, &session.id)
+                .unwrap()
+                .expect("the session records its terminal")
+                .facts
+        };
+
+        // The CLI's first observation of every launch is idle; that is not a
+        // finished turn.
+        manager
+            .record_terminal_observation(
+                &session.id,
+                vibex_core::TerminalActivity::Idle,
+                vibex_core::TerminalActivitySource::Hook,
+                1_000,
+            )
+            .unwrap();
+        assert_eq!(facts(&session).completed_at_ms, None);
+
+        manager
+            .record_terminal_observation(
+                &session.id,
+                vibex_core::TerminalActivity::Working,
+                vibex_core::TerminalActivitySource::Hook,
+                2_000,
+            )
+            .unwrap();
+        assert_eq!(facts(&session).completed_at_ms, None);
+
+        manager
+            .record_terminal_observation(
+                &session.id,
+                vibex_core::TerminalActivity::Idle,
+                vibex_core::TerminalActivitySource::Hook,
+                3_000,
+            )
+            .unwrap();
+        assert_eq!(facts(&session).completed_at_ms, Some(3_000));
+
+        // A steady idle screen keeps the turn's own timestamp instead of
+        // restamping it, so the unread mark cannot be raised a second time.
+        manager
+            .record_terminal_observation(
+                &session.id,
+                vibex_core::TerminalActivity::Idle,
+                vibex_core::TerminalActivitySource::Hook,
+                4_000,
+            )
+            .unwrap();
+        assert_eq!(facts(&session).completed_at_ms, Some(3_000));
     }
 
     /// Deleting a terminal-mode session stops its PTY and drops the link.

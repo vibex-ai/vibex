@@ -486,6 +486,7 @@ impl AgentSession {
         match self.terminal_activity() {
             Some(crate::terminal::TerminalActivity::Working) => AgentSessionState::Running,
             Some(crate::terminal::TerminalActivity::Waiting) => AgentSessionState::NeedsInput,
+            Some(crate::terminal::TerminalActivity::Failed) => AgentSessionState::Error,
             Some(crate::terminal::TerminalActivity::Idle) => AgentSessionState::Idle,
             Some(crate::terminal::TerminalActivity::Unknown) | None => self.state,
         }

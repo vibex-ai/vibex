@@ -4454,6 +4454,112 @@ let visible = groups.iter().flat_map(|group| &group.compact_sessions);
 self.sidebar_state.selected_ids.retain(|id| visible.any(|session| session.id == id));
 ```
 
+## Scenario: Terminal Agent Status Reports (OSC 7501)
+
+### 1. Scope / Trigger
+
+- Trigger: any change to how a native terminal Agent's state is observed, or to
+  the PTY host that sits between the CLI and Vibex.
+
+### 2. Signatures
+
+```rust
+// vibex-terminal-ui
+pub enum ProgramState { Idle, Working, Done, Blocked, Error, Clear }
+pub struct ProgramStatus { pub state: ProgramState, pub kind: Option<String>, pub id: String, pub app: String }
+pub struct ProgramStatusScanner { /* ... */ }
+impl ProgramStatusScanner {
+    pub fn push(&mut self, bytes: &[u8]) -> Vec<ProgramStatus>;
+}
+pub const PROGRAM_STATUS_PROBE: &[u8];        // ESC ] 7501 ; ?
+pub const PROGRAM_STATUS_PROBE_REPLY: &[u8];  // ESC ] 7501 ; ? ESC \
+pub fn probe_length(bytes: &[u8]) -> Option<Option<usize>>;
+pub fn is_probe_prefix(bytes: &[u8]) -> bool;
+```
+
+### 3. Contracts
+
+- The protocol is the Agent CLI stating its own state; it is not scraped from
+  the screen. It outranks every bottom-of-screen rule in
+  `crates/desktop-runtime/src/terminal_observation.rs`.
+- **A terminal must answer the capability probe.** A CLI that reports its state
+  sends `ESC ] 7501 ; ? ESC \` first and emits nothing if the terminal does not
+  echo it back. Parsing reports without answering the probe is a terminal that
+  never receives one — the bug this contract exists to prevent.
+  `TerminalCompatibilityResponder` answers it on the PTY reader thread, before
+  the bytes reach any screen, and consumes the probe so it is never drawn.
+- State reports themselves are not consumed: they must reach the emulator, which
+  parses and swallows them (they carry no printable content).
+- The state words are the program's. `idle` and `done` both read as `Idle`;
+  `working` as `Working`; `blocked` as `Waiting`; `error` as `Failed`; `clear`
+  withdraws the record, after which the screen rules are the evidence again. An
+  unknown word is ignored, never guessed at.
+- Only the root record (`id` empty) describes the session. A record a program
+  opens for one of the things it runs must not paint the row.
+- A report is not damped: `working -> idle` waits for
+  `IDLE_CONFIRMATIONS` agreeing *scans*, because a blank TUI frame is not a
+  finished turn. A report is a turn boundary the program asserted.
+- Source is `TerminalActivitySource::Hook` whenever the reading came from a
+  report, so a reader can tell a confident answer from a screen guess.
+- The PTY byte tap queues its update; the runtime sweep is the single publisher.
+  The tap runs on the reader thread and must not touch the store or the event bus.
+
+### 4. Validation & Error Matrix
+
+| Condition | Required result |
+| --- | --- |
+| Probe `ESC ] 7501 ; ?` (either terminator, any read boundary) | Reply echoed once, probe not drawn |
+| Report split across reads | One report, no duplicate |
+| `state=working` / `state=idle` / `state=done` | `Working` / `Idle` / `Idle`, source `Hook` |
+| `state=blocked` | `Waiting` at once, source `Hook` |
+| `state=error` | `Failed`, projects to `Error` |
+| `state=clear` | Record dropped; screen rules take over |
+| `state=bogus` | Ignored |
+| Report with a non-empty `id` | Ignored for the session state |
+| Screen says `Press Ctrl-C again to exit` | `Exited` still wins over a stale report |
+| Report body never terminated | Buffer bounded, dropped |
+
+### 5. Good/Base/Bad Cases
+
+- Good: Claude Code starts, the host echoes the probe, and the first
+  `state=idle`/`state=working` pair reaches the sidebar without any screen rule
+  matching.
+- Base: an Agent that does not speak the protocol is unaffected — its screen
+  rules run exactly as before.
+- Bad: implementing the report parser without the probe reply (the CLI stays
+  silent), treating `done` as `Unknown` (the completion is lost), or letting a
+  child record settle the session.
+
+### 6. Tests Required
+
+- `vibex-terminal-ui`: split reports, both terminators, unknown word, child
+  record, `clear`, the probe not being a report, bounded buffer.
+- `vibex-terminal`: every responder case plus one end-to-end child that writes
+  the probe and checks the bytes it reads back.
+- `vibex-desktop-runtime`: report outranks the screen, `blocked` publishes at
+  once, `error` is `Failed`, `clear` falls back to the rules, the exit notice
+  still wins, a tap update is published by the next sweep.
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```rust
+// The reports are parsed, but the program was never told the terminal can
+// receive them, so it never sends any.
+let reports = scanner.push(bytes); // always empty
+```
+
+#### Correct
+
+```rust
+// The PTY host answers the handshake, so the program starts reporting.
+if let Some(Some(length)) = vibex_terminal_ui::probe_length(remaining) {
+    writer.write_all(vibex_terminal_ui::PROGRAM_STATUS_PROBE_REPLY)?;
+    index += length;
+}
+```
+
 ## Scenario: Terminal Session Display State
 
 ### 1. Scope / Trigger
@@ -4490,9 +4596,19 @@ impl AgentSession {
   collapsed group and a Tab order all take `display_state`, never the raw
   lifecycle state.
 - The observation is sidebar shape: `session_snapshot_sidebar_changed` compares
-  `display_state`, so a terminal Agent that starts or stops working invalidates
-  the cached sidebar projection. Freshness-only ticks (`observed_at_ms`) are not
-  shape and must not rebuild it.
+  `display_state` and the terminal completion clock `session_completion_at_ms`
+  (a terminal session's `completed_at_ms`, and `0` for everything else), so a
+  terminal Agent that starts, stops or finishes a turn invalidates the cached
+  sidebar projection. An ACP completion is already a compared sequence. Freshness
+  ticks (`observed_at_ms`) are not shape and must not rebuild it.
+- A terminal session's unread mark is raised from its own completion clock, not
+  from a timeline item it never has: `mark_terminal_completions_unread` inserts
+  into the same `unread_agent_completion_session_ids` the ACP path uses, guarded
+  by the same per-session watermark so a replayed snapshot cannot raise a dot for
+  a turn the reader watched end.
+- `completed_at_ms` is stamped only when the activity leaves `Working`. An idle
+  reading on its own is not a completion — it is also the first thing a CLI
+  reports — and a steady idle screen must not keep re-raising the mark.
 
 ### 4. Validation & Error Matrix
 
@@ -4502,6 +4618,7 @@ impl AgentSession {
 | Terminal session, activity `Working` | `Running` (row pulse, aggregate running) |
 | Terminal session, activity `Waiting` | `NeedsInput` (attention glyph, aggregate waiting) |
 | Terminal session, activity `Idle` | `Idle` |
+| Terminal session, activity `Failed` | `Error` (danger dot, aggregate failed) |
 | Terminal session, activity `Unknown` | `session.state` |
 | Terminal session with `terminal: None` | `session.state` |
 | Terminal Agent starts or stops working | `session_snapshot_sidebar_changed` is true |
@@ -4522,10 +4639,22 @@ impl AgentSession {
 
 - `vibex-ui` asserts its `display_state` equals `AgentSession::display_state`
   for every activity, and that an ACP session keeps its lifecycle state.
-- `vibex-desktop-model` asserts a terminal `Working`/`Waiting` session counts in
-  `WorkspaceAgentSummary`, and that `project_sidebar_rows` emits the projection.
+- `vibex-desktop-model` asserts a terminal `Working`/`Waiting`/`Failed` session
+  counts in `WorkspaceAgentSummary`, and that `project_sidebar_rows` emits the
+  projection.
 - `vibex-desktop` asserts a changed observation makes
-  `session_snapshot_sidebar_changed` true while a freshness-only tick does not.
+  `session_snapshot_sidebar_changed` true while a freshness-only tick does not,
+  and that a newly stamped completion is shape.
+- `vibex-terminal-ui` asserts the OSC 7501 scanner parses split reports, ignores
+  an unknown state word and never treats a child record or the capability probe
+  as the session's state.
+- `vibex-terminal` asserts the PTY host answers `ESC ] 7501 ; ?` over a real
+  child, because a CLI that speaks the protocol stays silent when it is not
+  answered.
+- `vibex-desktop-runtime` asserts a report outranks the screen, that `blocked`
+  publishes at once, that `error` reads as `Failed`, that `clear` falls back to
+  the rules, and that an update queued by the byte tap is published by the next
+  sweep.
 
 ### 7. Wrong vs Correct
 

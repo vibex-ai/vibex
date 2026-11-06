@@ -1126,7 +1126,25 @@ impl TerminalCompatibilityResponder {
                 continue;
             }
 
-            if is_primary_device_attributes_query_prefix(remaining) {
+            // The Program Status Protocol handshake: a program that reports its
+            // own state asks first and stays silent when nobody answers.
+            match vibex_terminal_ui::probe_length(remaining) {
+                Some(Some(query_length)) => {
+                    let _ = writer.write_all(vibex_terminal_ui::PROGRAM_STATUS_PROBE_REPLY);
+                    let _ = writer.flush();
+                    index += query_length;
+                    continue;
+                }
+                Some(None) => {
+                    self.pending.extend_from_slice(remaining);
+                    break;
+                }
+                None => {}
+            }
+
+            if is_primary_device_attributes_query_prefix(remaining)
+                || vibex_terminal_ui::is_probe_prefix(remaining)
+            {
                 self.pending.extend_from_slice(remaining);
                 break;
             }
@@ -1956,6 +1974,78 @@ mod tests {
         );
     }
 
+    /// The probe is answered over a real PTY, not only through the filter.
+    ///
+    /// A program that reports its own state only does so once a terminal
+    /// answers, so this measures the handshake end to end: a child writes the
+    /// probe, and what comes back on its stdin has to be the reply. Measuring
+    /// the filter alone would pass even if the reader thread never installed
+    /// it.
+    #[cfg(unix)]
+    #[test]
+    fn a_spawned_child_has_its_status_probe_answered() {
+        let manager = TerminalManager::new();
+        let session = manager
+            .create_command(
+                std::env::temp_dir(),
+                TerminalCommandRequest {
+                    workspace_id: WorkspaceId::new(),
+                    title: None,
+                    command: "sh".to_string(),
+                    args: vec![
+                        "-c".to_string(),
+                        // Ask, then read exactly the reply and dump it as hex.
+                        // The reply is byte-identical to the question, so a
+                        // readable echo would prove nothing; the dump is what
+                        // only an answered probe can produce. The terminal has
+                        // to leave canonical mode first: the reply has no
+                        // newline, so the line discipline would otherwise hold
+                        // it back forever.
+                        "stty -echo -icanon min 1 time 0; \
+                         printf '\\033]7501;?\\033\\\\'; \
+                         dd bs=1 count=10 2>/dev/null | od -An -tx1 | tr -d '\\n'"
+                            .to_string(),
+                    ],
+                    cwd: Some(std::env::temp_dir().display().to_string()),
+                    env: Vec::new(),
+                    rows: 24,
+                    cols: 80,
+                },
+            )
+            .unwrap();
+
+        let mut output = String::new();
+        for _ in 0..300 {
+            output = manager
+                .snapshot(&session.id)
+                .map(|snapshot| {
+                    snapshot
+                        .chunks
+                        .iter()
+                        .map(|chunk| chunk.data.as_str())
+                        .collect()
+                })
+                .unwrap_or_default();
+            if output.len() > 8 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let _ = manager.release(&session.id);
+
+        // The reply is the probe echoed back, so the child's own dump of what
+        // it read from stdin has to show the introducer and the question.
+        let hex = output
+            .split_whitespace()
+            .filter(|token| token.len() == 2 && token.chars().all(|c| c.is_ascii_hexdigit()))
+            .map(|token| u8::from_str_radix(token, 16).expect("two hex digits"))
+            .collect::<Vec<_>>();
+        assert!(
+            hex.starts_with(&[0x1b, b']', b'7', b'5', b'0', b'1', b';', b'?']),
+            "the child's status probe went unanswered: {output:?} ({hex:?})"
+        );
+    }
+
     #[test]
     fn compatibility_responder_answers_primary_device_attributes() {
         let mut responder = TerminalCompatibilityResponder::default();
@@ -1979,6 +2069,68 @@ mod tests {
         assert_eq!(first_output, b"before");
         assert_eq!(second_output, b"after");
         assert_eq!(response, PRIMARY_DEVICE_ATTRIBUTES_RESPONSE);
+        assert!(responder.flush().is_empty());
+    }
+
+    /// A program that reports its own state asks first, and stays silent when
+    /// nobody answers.
+    ///
+    /// This is the handshake that makes OSC 7501 usable at all: Claude Code
+    /// emits `ESC ] 7501 ; ? ESC \\` on startup and sends no state report if
+    /// the terminal does not echo the query back. Parsing reports without
+    /// answering the probe is a terminal that never receives one.
+    #[test]
+    fn compatibility_responder_answers_the_program_status_probe() {
+        let mut responder = TerminalCompatibilityResponder::default();
+        let mut response = Vec::new();
+
+        let output = responder.filter(b"before\x1b]7501;?\x1b\\after", &mut response);
+
+        assert_eq!(output, b"beforeafter");
+        assert_eq!(response, vibex_terminal_ui::PROGRAM_STATUS_PROBE_REPLY);
+        assert!(responder.flush().is_empty());
+    }
+
+    /// Both terminator spellings ask the same question.
+    #[test]
+    fn compatibility_responder_answers_a_bel_terminated_probe() {
+        let mut responder = TerminalCompatibilityResponder::default();
+        let mut response = Vec::new();
+
+        responder.filter(b"\x1b]7501;?\x07", &mut response);
+
+        assert_eq!(response, vibex_terminal_ui::PROGRAM_STATUS_PROBE_REPLY);
+    }
+
+    /// The probe can land on a read boundary like any other sequence.
+    #[test]
+    fn compatibility_responder_answers_a_split_probe() {
+        let mut responder = TerminalCompatibilityResponder::default();
+        let mut response = Vec::new();
+
+        let first_output = responder.filter(b"before\x1b]75", &mut response);
+        let second_output = responder.filter(b"01;?\x1b\\after", &mut response);
+
+        assert_eq!(first_output, b"before");
+        assert_eq!(second_output, b"after");
+        assert_eq!(response, vibex_terminal_ui::PROGRAM_STATUS_PROBE_REPLY);
+        assert!(responder.flush().is_empty());
+    }
+
+    /// A state report is a program talking to the terminal, not to the reader:
+    /// it must reach the screen's parser untouched and draw nothing.
+    #[test]
+    fn compatibility_responder_passes_a_state_report_through() {
+        let mut responder = TerminalCompatibilityResponder::default();
+        let mut response = Vec::new();
+
+        let report = b"\x1b]7501;state=working:app=claude-code\x1b\\";
+        let output = responder.filter(b"before", &mut response);
+        assert_eq!(output, b"before");
+        let output = responder.filter(report, &mut response);
+
+        assert_eq!(output, report);
+        assert!(response.is_empty());
         assert!(responder.flush().is_empty());
     }
 
