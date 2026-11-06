@@ -904,6 +904,62 @@ mod tests {
         );
     }
 
+    /// Codex's own report sequence, which differs from Claude's in one word.
+    ///
+    /// Codex has no `done`: a finished turn is `working` followed by `idle`.
+    /// The projection has to treat that as a completion all the same, or a
+    /// Codex session would only ever be marked as having started.
+    #[test]
+    fn a_codex_turn_is_visible_from_its_own_reports() {
+        let mut watched = WatchedTerminal::new(
+            "session-1",
+            AgentId::parse("codex").unwrap(),
+            8,
+            80,
+            &ScreenProfile::bundled(),
+        );
+        watched.advance(b"\x1b]7501;state=idle:app=codex\x1b\\");
+        let idle = watched.scan(1_000).unwrap();
+        assert_eq!(idle.activity, TerminalActivity::Idle);
+        assert_eq!(idle.source, TerminalActivitySource::Hook);
+
+        watched.advance(b"\x1b]7501;state=working:app=codex\x1b\\");
+        assert_eq!(
+            watched.scan(1_100).unwrap().activity,
+            TerminalActivity::Working
+        );
+
+        watched.advance(b"\x1b]7501;state=idle:app=codex\x1b\\");
+        let settled = watched.scan(1_200).unwrap();
+        assert_eq!(
+            settled.activity,
+            TerminalActivity::Idle,
+            "a Codex turn ends by returning to idle, not by saying done"
+        );
+        assert_eq!(settled.source, TerminalActivitySource::Hook);
+    }
+
+    /// The protocol is what a program says, not who it is.
+    ///
+    /// Nothing on this path looks at the Agent id: an Agent Vibex has no screen
+    /// profile for still reports its state, and still gets the right row. Gating
+    /// the reports behind the two bundled CLIs would mean every new Agent needs
+    /// a code change to be observable at all.
+    #[test]
+    fn a_report_is_read_without_a_screen_profile() {
+        let mut watched = WatchedTerminal::new(
+            "session-1",
+            AgentId::parse("opencode").unwrap(),
+            8,
+            80,
+            &ScreenProfile::bundled(),
+        );
+        watched.advance(b"\x1b]7501;state=blocked:kind=permission:app=opencode\x1b\\");
+        let blocked = watched.scan(1_000).unwrap();
+        assert_eq!(blocked.activity, TerminalActivity::Waiting);
+        assert_eq!(blocked.source, TerminalActivitySource::Hook);
+    }
+
     /// `blocked` is the state a row has to interrupt for, and the report
     /// publishes it without waiting for a second agreeing scan.
     #[test]

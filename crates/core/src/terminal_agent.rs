@@ -112,7 +112,12 @@ pub fn native_cli_option_arguments(
             }
             // Codex takes the effort as configuration rather than a flag of
             // its own.
-            "codex" if matches!(effort, "none" | "minimal" | "low" | "medium" | "high" | "xhigh") => {
+            "codex"
+                if matches!(
+                    effort,
+                    "none" | "minimal" | "low" | "medium" | "high" | "xhigh"
+                ) =>
+            {
                 arguments.push("-c".to_string());
                 arguments.push(format!("model_reasoning_effort=\"{effort}\""));
             }
@@ -134,6 +139,10 @@ pub fn native_cli_option_arguments(
                 if let Some(approval) = codex_approval_policy(mode) {
                     arguments.push("-c".to_string());
                     arguments.push(format!("approval_policy=\"{approval}\""));
+                }
+                if let Some(sandbox) = codex_sandbox_policy(mode) {
+                    arguments.push("-c".to_string());
+                    arguments.push(format!("sandbox_mode=\"{sandbox}\""));
                 }
             }
             _ => {}
@@ -159,12 +168,32 @@ fn claude_permission_mode(mode: &str) -> Option<&'static str> {
 }
 
 /// Vibex's conversation mode as a Codex approval policy.
+///
+/// The values are the ones Codex 0.166 accepts. `untrusted` used to mean "ask
+/// before anything the sandbox does not already cover", and it is now rejected
+/// outright at startup (`approval_policy = "untrusted" is no longer supported`),
+/// which would leave the reader with a session that dies before the interface
+/// appears. Read-only is therefore spelled as its two surviving halves: ask on
+/// request, and confine execution with the read-only sandbox.
 fn codex_approval_policy(mode: &str) -> Option<&'static str> {
     match mode {
         "ask" | "default" | "manual" => Some("on-request"),
         "auto" | "auto-edit" | "accept-edits" => Some("on-failure"),
-        "plan" | "read-only" | "readonly" => Some("untrusted"),
+        "plan" | "read-only" | "readonly" => Some("on-request"),
         "bypass" | "yolo" | "full-access" | "never-ask" | "dont-ask" => Some("never"),
+        _ => None,
+    }
+}
+
+/// The sandbox policy that completes a read-only conversation mode.
+///
+/// Codex splits the old `untrusted` approval policy into "when may I ask" and
+/// "what may I touch". Only the read-only mode needs the second half; the
+/// others leave the sandbox at Codex's own default so the reader's configuration
+/// still decides.
+fn codex_sandbox_policy(mode: &str) -> Option<&'static str> {
+    match mode {
+        "plan" | "read-only" | "readonly" => Some("read-only"),
         _ => None,
     }
 }
@@ -245,6 +274,18 @@ mod option_argument_tests {
             native_cli_option_arguments(&agent("codex"), None, Some("bypass")),
             vec!["-c".to_string(), "approval_policy=\"never\"".to_string()]
         );
+        // Read-only is spelled with the two settings Codex still accepts:
+        // `approval_policy = "untrusted"` is rejected at startup, and a session
+        // that dies before it draws is worse than one with a wider sandbox.
+        assert_eq!(
+            native_cli_option_arguments(&agent("codex"), None, Some("read-only")),
+            vec![
+                "-c".to_string(),
+                "approval_policy=\"on-request\"".to_string(),
+                "-c".to_string(),
+                "sandbox_mode=\"read-only\"".to_string(),
+            ]
+        );
     }
 
     /// A value the flag would reject is not passed at all.
@@ -255,7 +296,9 @@ mod option_argument_tests {
     fn a_value_the_flag_would_reject_is_skipped() {
         assert!(native_cli_option_arguments(&agent("claude"), Some("ultra"), None).is_empty());
         assert!(native_cli_option_arguments(&agent("claude"), None, Some("vibex-only")).is_empty());
-        assert!(native_cli_option_arguments(&agent("opencode"), Some("high"), Some("plan")).is_empty());
+        assert!(
+            native_cli_option_arguments(&agent("opencode"), Some("high"), Some("plan")).is_empty()
+        );
     }
 
     /// Nothing chosen means nothing passed.
