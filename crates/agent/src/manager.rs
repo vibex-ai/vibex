@@ -1347,13 +1347,20 @@ impl AgentManager {
             ));
         }
         // The recorded argv is the launch, not the conversation: it is what a
-        // restart replays, so the first prompt must stay out of it.
-        let mut argv = Vec::with_capacity(request.args.len() + 1);
+        // restart replays, so the first prompt must stay out of it. The CLI's
+        // own launch flags (Cline's and Hermes' TUI switch) do belong to it.
+        let mut argv = Vec::with_capacity(
+            request.args.len()
+                + 1
+                + vibex_core::native_cli_launch_arguments(&request.agent_id).len(),
+        );
         argv.push(executable.to_string());
+        argv.extend(vibex_core::native_cli_launch_arguments(&request.agent_id));
         argv.extend(request.args.iter().cloned());
-        // The prompt rides the first launch as the CLI's positional argument.
-        // Both CLIs accept one, and it is the only channel that reaches an Agent
-        // Vibex is not talking to.
+        // The prompt rides the first launch in whatever form the CLI reads:
+        // a positional for most, `--prompt` for OpenCode, `-i` for Copilot, and
+        // `--` for Devin. It is the only channel that reaches an Agent Vibex is
+        // not talking to.
         let mut launch_argv = argv.clone();
         if let Some(prompt) = request
             .first_prompt
@@ -1367,7 +1374,10 @@ impl AgentManager {
                     "the first prompt must be a single line",
                 ));
             }
-            launch_argv.push(prompt.to_string());
+            launch_argv.extend(vibex_core::native_cli_prompt_arguments(
+                &request.agent_id,
+                prompt,
+            ));
         }
 
         let conn = self.open_migrated()?;
@@ -1428,6 +1438,7 @@ impl AgentManager {
             );
         }
         let spec = vibex_core::TerminalSessionLaunchSpec {
+            agent_id: session.agent_id.clone(),
             workspace_id: workspace.id,
             workspace_root: workspace.root_path,
             argv: launch_argv,
@@ -3183,9 +3194,11 @@ impl AgentManager {
             )
         })?;
         let conn = self.open_migrated()?;
-        let session = self.client_session_snapshot(&conn, session_id)?.ok_or_else(|| {
-            VibexError::validation("session_not_found", "Agent session was not found")
-        })?;
+        let session = self
+            .client_session_snapshot(&conn, session_id)?
+            .ok_or_else(|| {
+                VibexError::validation("session_not_found", "Agent session was not found")
+            })?;
         if !session.transport.is_terminal() {
             return Err(VibexError::conflict(
                 "session_transport_mismatch",
@@ -3213,9 +3226,10 @@ impl AgentManager {
         };
         // The Agent's conversation lives in its own store, and a restart has to
         // continue it rather than start a second one beside it. The exit notice
-        // names the exact session when it printed one; failing that, both CLIs
+        // names the exact session when it printed one; failing that, most CLIs
         // can continue the most recent conversation in this directory, which is
-        // this session unless the reader ran another one there since.
+        // this session unless the reader ran another one there since. Each CLI
+        // spells both paths differently, so the table owns the spelling.
         let mut recorded_argv = record.argv.clone();
         if let Some(settings_path) = environment.claude_settings_path.as_deref() {
             crate::terminal_settings::apply_claude_settings_argument(
@@ -3225,28 +3239,16 @@ impl AgentManager {
             );
         }
         let mut argv = recorded_argv.clone();
-        match record
-            .facts
-            .native_session_id
-            .as_deref()
-            .filter(|id| !id.trim().is_empty())
-        {
-            Some(native_session_id) => {
-                argv.push("--resume".to_string());
-                argv.push(native_session_id.to_string());
-            }
-            None => match session.agent_id.as_str() {
-                // `--continue` needs no id, which is what makes a restart keep
-                // its history even when the CLI exited without printing one.
-                "claude" => argv.push("--continue".to_string()),
-                "codex" => {
-                    argv.push("resume".to_string());
-                    argv.push("--last".to_string());
-                }
-                _ => {}
-            },
-        }
+        argv.extend(vibex_core::native_cli_resume_arguments(
+            &session.agent_id,
+            record
+                .facts
+                .native_session_id
+                .as_deref()
+                .filter(|id| !id.trim().is_empty()),
+        ));
         let spec = vibex_core::TerminalSessionLaunchSpec {
+            agent_id: session.agent_id.clone(),
             workspace_id: record.workspace_id.clone(),
             workspace_root: session.workspace_root.clone(),
             argv,
@@ -3281,12 +3283,14 @@ impl AgentManager {
             spec.cols,
         );
         SessionRepository::update_state(&conn, session_id, AgentSessionState::Idle)?;
-        let restarted = self.client_session_snapshot(&conn, session_id)?.ok_or_else(|| {
-            VibexError::storage(
-                "terminal_session_missing_after_restart",
-                "the terminal session could not be reloaded",
-            )
-        })?;
+        let restarted = self
+            .client_session_snapshot(&conn, session_id)?
+            .ok_or_else(|| {
+                VibexError::storage(
+                    "terminal_session_missing_after_restart",
+                    "the terminal session could not be reloaded",
+                )
+            })?;
         self.publish_root_session_update(&conn, restarted.clone());
         Ok(restarted)
     }
@@ -13460,6 +13464,40 @@ mod tests {
         (manager, launcher, dir)
     }
 
+    /// Enables an Agent whose builtin definition is off by default.
+    ///
+    /// Terminal-mode tests start real Agents from the catalog; the catalog's
+    /// default-enabled flag is a product decision, not a terminal capability,
+    /// so the test states the reader's choice the way the Config Center would.
+    fn enable_agent(manager: &AgentManager, agent: &str) {
+        let agent_id = AgentId::parse(agent).unwrap();
+        let definition = builtin_agent_definitions()
+            .into_iter()
+            .find(|definition| definition.id == agent_id)
+            .expect("the test Agent is a builtin");
+        let now = unix_timestamp_ms();
+        let conn = manager.open_migrated().unwrap();
+        AgentConfigRepository::upsert(
+            &conn,
+            &vibex_core::AgentConfig {
+                agent_id,
+                runtime_kind: definition.runtime_kind,
+                source_kind: definition.source_kind,
+                label_override: None,
+                description_override: None,
+                enabled: true,
+                order_index: definition.order_index,
+                command: definition.command,
+                env: Default::default(),
+                params: definition.params,
+                created_at_ms: now,
+                updated_at_ms: now,
+                deleted_at_ms: None,
+            },
+        )
+        .unwrap();
+    }
+
     fn terminal_request(agent: &str, root: &std::path::Path) -> CreateTerminalSessionRequest {
         CreateTerminalSessionRequest {
             session_id: None,
@@ -13523,19 +13561,117 @@ mod tests {
     async fn a_terminal_session_rejects_an_unverified_agent() {
         let (manager, launcher, dir) = terminal_manager();
         let error = manager
-            .create_terminal_session(terminal_request("opencode", &dir))
+            .create_terminal_session(terminal_request("deepseek-harness", &dir))
             .await
             .unwrap_err();
-        assert!(
-            error.code == "terminal_session_agent_unsupported"
-                || error.code == "terminal_session_agent_unverified",
-            "unexpected error code {}",
-            error.code
-        );
+        assert_eq!(error.code, "terminal_session_agent_unsupported");
         assert!(launcher.launches().is_empty());
         // Nothing was persisted for an Agent this release cannot run.
         let sessions = manager.list_sessions(true).await.unwrap();
         assert!(sessions.is_empty());
+    }
+
+    /// An Agent whose CLI reads the prompt through a flag gets the flag, and
+    /// the prompt stays out of the recorded argv.
+    #[tokio::test]
+    async fn a_terminal_session_uses_the_clis_prompt_interface() {
+        let (manager, launcher, dir) = terminal_manager();
+        enable_agent(&manager, "opencode");
+        let mut request = terminal_request("opencode", &dir);
+        request.first_prompt = Some("fix the failing test".to_string());
+        let session = manager.create_terminal_session(request).await.unwrap();
+        let launches = launcher.launches();
+        assert_eq!(
+            launches[0].argv,
+            vec![
+                "opencode".to_string(),
+                "--prompt".to_string(),
+                "fix the failing test".to_string()
+            ]
+        );
+        let conn = open_database(&dir.join("vibex.db")).unwrap();
+        let link = vibex_db::SessionTerminalRepository::get(&conn, &session.id)
+            .unwrap()
+            .expect("the session must record its terminal");
+        assert_eq!(
+            link.argv,
+            vec!["opencode".to_string()],
+            "a restart must not replay the first prompt"
+        );
+    }
+
+    /// A CLI that needs a TUI flag to stay interactive carries it in the
+    /// recorded argv, so the restarted session is still the same interface.
+    #[tokio::test]
+    async fn a_terminal_session_records_the_clis_launch_arguments() {
+        let (manager, launcher, dir) = terminal_manager();
+        enable_agent(&manager, "cline");
+        let session = manager
+            .create_terminal_session(terminal_request("cline", &dir))
+            .await
+            .unwrap();
+        let launches = launcher.launches();
+        assert_eq!(
+            launches[0].argv,
+            vec!["cline".to_string(), "--tui".to_string()]
+        );
+        let conn = open_database(&dir.join("vibex.db")).unwrap();
+        let link = vibex_db::SessionTerminalRepository::get(&conn, &session.id)
+            .unwrap()
+            .expect("the session must record its terminal");
+        assert_eq!(link.argv, vec!["cline".to_string(), "--tui".to_string()]);
+    }
+
+    /// A restart continues an Agent whose resume flag is not Claude's.
+    #[tokio::test]
+    async fn a_restart_uses_the_agents_own_resume_spelling() {
+        let (manager, launcher, dir) = terminal_manager();
+        enable_agent(&manager, "opencode");
+        let session = manager
+            .create_terminal_session(terminal_request("opencode", &dir))
+            .await
+            .unwrap();
+        let terminal_id = launcher.watched()[0].0.clone();
+        launcher.kill(&terminal_id).unwrap();
+        manager
+            .mark_session_terminal_ended(&session.id, Some("ses_01JABCDEF"))
+            .unwrap();
+
+        manager.restart_terminal_session(&session.id).await.unwrap();
+        let launches = launcher.launches();
+        assert_eq!(
+            launches.last().expect("the restart launched").argv,
+            vec!["opencode", "--session", "ses_01JABCDEF"]
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Without an id, a new Agent falls back to its own continue-last flag.
+    #[tokio::test]
+    async fn a_restart_without_an_id_uses_the_agents_continue_flag() {
+        let (manager, launcher, dir) = terminal_manager();
+        enable_agent(&manager, "gemini");
+        let session = manager
+            .create_terminal_session(terminal_request("gemini", &dir))
+            .await
+            .unwrap();
+        let terminal_id = launcher.watched()[0].0.clone();
+        launcher.kill(&terminal_id).unwrap();
+        manager
+            .mark_session_terminal_ended(&session.id, None)
+            .unwrap();
+
+        manager.restart_terminal_session(&session.id).await.unwrap();
+        let launches = launcher.launches();
+        assert_eq!(
+            launches.last().expect("the restart launched").argv,
+            vec!["gemini", "--resume", "latest"]
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        );
     }
 
     #[tokio::test]
@@ -13869,7 +14005,6 @@ mod tests {
         assert!(plain.terminal.is_none());
     }
 
-
     /// A terminal session whose Agent process ended is retired.
     ///
     /// The screen cannot say this. A TUI that stopped repainting reads like an
@@ -13890,7 +14025,9 @@ mod tests {
         let terminal_id = launcher.watched()[0].0.clone();
         launcher.kill(&terminal_id).unwrap();
 
-        manager.mark_session_terminal_ended(&session.id, None).unwrap();
+        manager
+            .mark_session_terminal_ended(&session.id, None)
+            .unwrap();
 
         let retired = manager.get_session(&session.id).await.unwrap();
         assert_eq!(retired.state, AgentSessionState::Closed);
@@ -13905,7 +14042,6 @@ mod tests {
             "retiring must not drop the link"
         );
     }
-
 
     /// A session whose Agent quit can be started again, with the same command.
     ///
@@ -13922,7 +14058,9 @@ mod tests {
 
         // The reader quits the CLI.
         launcher.kill(&first_terminal).unwrap();
-        manager.mark_session_terminal_ended(&session.id, None).unwrap();
+        manager
+            .mark_session_terminal_ended(&session.id, None)
+            .unwrap();
         assert_eq!(
             manager.get_session(&session.id).await.unwrap().state,
             AgentSessionState::Closed
@@ -13942,7 +14080,10 @@ mod tests {
         );
         // And it is watched again, so the sidebar can report its activity.
         let watched = launcher.watched();
-        assert_eq!(watched.last().expect("the restart is watched").1, session.id.as_str());
+        assert_eq!(
+            watched.last().expect("the restart is watched").1,
+            session.id.as_str()
+        );
     }
 
     /// Restarting a session that is already running starts nothing.
@@ -13962,7 +14103,6 @@ mod tests {
             "a second press must not start a second Agent"
         );
     }
-
 
     /// A terminal session is named after what the reader typed.
     ///
@@ -13988,7 +14128,6 @@ mod tests {
         assert_eq!(created.title, "claude terminal");
     }
 
-
     /// A restart replays the launch flags, never the first prompt.
     ///
     /// The prompt is the turn the reader already had answered. Keeping it in the
@@ -14006,10 +14145,15 @@ mod tests {
         let first = launcher.launches();
         assert_eq!(
             first[0].argv,
-            vec!["claude", "--model", "claude-opus-4-6", "explain the failing test"]
-                .into_iter()
-                .map(str::to_string)
-                .collect::<Vec<_>>()
+            vec![
+                "claude",
+                "--model",
+                "claude-opus-4-6",
+                "explain the failing test"
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>()
         );
         // What was recorded is the launch, without the prompt.
         let conn = open_database(&dir.join("vibex.db")).unwrap();
@@ -14069,7 +14213,6 @@ mod tests {
             "the restart continues the conversation instead of starting an empty one"
         );
     }
-
 
     /// A restart with no recorded id still continues the conversation.
     ///
@@ -14162,6 +14305,7 @@ mod tests {
         // The launcher is what rebuilds the process; the restore entry point
         // lives on the runtime, so this test pins the durable half it reads.
         let spec = vibex_core::TerminalSessionLaunchSpec {
+            agent_id: session.agent_id.clone(),
             workspace_id: record.workspace_id.clone(),
             workspace_root: session.workspace_root.clone(),
             argv: record.argv.clone(),

@@ -3081,14 +3081,27 @@ impl DesktopRuntime {
         // the sweep below must watch the same terminals.
         let terminal_observations =
             Arc::new(Mutex::new(terminal_observation::TerminalObservations::new()));
+        // Built before the launcher because a terminal session has to be able
+        // to start the native CLI inside a Vibex-managed installation, not only
+        // one the reader put on `PATH` themselves. The service is independent of
+        // the Agent runtime; it only needs the database path and the runtime
+        // options, both of which exist by now.
+        let db_path = manager.database_path().to_path_buf();
+        let install_service = Arc::new(AgentInstallService::new_with_runtime_options(
+            db_path.clone(),
+            config.home_dir.join("acp-agents"),
+            provider_config_service.clone(),
+            config.agent_node_runtime.clone(),
+            config.agent_uv_runtime.clone(),
+        )?);
         manager.install_session_terminal_launcher(
             &session_terminal::TerminalManagerSessionLauncher::shared(
                 terminals.clone(),
                 Arc::clone(&terminal_observations),
+                install_service.clone(),
             ),
         )?;
         let manager = Arc::new(manager);
-        let db_path = manager.database_path().to_path_buf();
         let team_budget = vibex_use::load_budget_policy(&config.home_dir, &db_path)?;
         let usage = AgentUsageService::new(db_path.clone())?;
         let (usage_sender, usage_receiver) = mpsc::unbounded_channel();
@@ -3162,13 +3175,6 @@ impl DesktopRuntime {
             // arranged, not the order the Agent definitions were added in.
             .with_ui_state_path(config.home_dir.join(DESKTOP_UI_STATE_FILE)),
         );
-        let install_service = Arc::new(AgentInstallService::new_with_runtime_options(
-            db_path.clone(),
-            config.home_dir.join("acp-agents"),
-            provider_config_service.clone(),
-            config.agent_node_runtime.clone(),
-            config.agent_uv_runtime.clone(),
-        )?);
         let git = GitHandle {
             db_path: db_path.clone(),
             mutation_claims: Arc::new(Mutex::new(std::collections::BTreeSet::new())),
@@ -3795,14 +3801,10 @@ impl DesktopRuntime {
                         // open forever behind a prompt nobody can answer.
                         if update.exited {
                             runtime.unwatch_session_terminal(&update.terminal_id);
-                            if let Err(error) = runtime
-                                .agent
-                                .manager()
-                                .mark_session_terminal_ended(
-                                    &session_id,
-                                    update.native_session_id.as_deref(),
-                                )
-                            {
+                            if let Err(error) = runtime.agent.manager().mark_session_terminal_ended(
+                                &session_id,
+                                update.native_session_id.as_deref(),
+                            ) {
                                 tracing::warn!(
                                     target: "vibex_desktop",
                                     error_code = %error.code,
@@ -4829,6 +4831,7 @@ impl DesktopRuntime {
                 );
             }
             let spec = vibex_core::TerminalSessionLaunchSpec {
+                agent_id: session.agent_id.clone(),
                 workspace_id: record.workspace_id.clone(),
                 workspace_root: session.workspace_root.clone(),
                 argv: argv.clone(),

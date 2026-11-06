@@ -267,6 +267,13 @@ impl TerminalSessionFacts {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TerminalSessionLaunchSpec {
+    /// The Agent whose native CLI this is.
+    ///
+    /// Kept beside the argv because a launcher may have to translate the
+    /// logical command name into a path inside a Vibex-managed installation,
+    /// and that resolution is per Agent. The argv itself stores the logical
+    /// name so a recorded session survives an installation moving on disk.
+    pub agent_id: AgentId,
     pub workspace_id: WorkspaceId,
     pub workspace_root: String,
     /// The Agent's native interactive executable followed by its arguments.

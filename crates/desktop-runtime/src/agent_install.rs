@@ -26,8 +26,8 @@ use vibex_agent_acp::sanitize_inherited_appimage_environment;
 use vibex_config_switch::ProviderConfigService;
 use vibex_core::{
     AgentCommandConfig, AgentId, AgentListRequest, AgentManagedDistributionKind,
-    AgentManagedInstallState, AgentManagedInstallStatus, AgentUpdateConfigRequest, VibexError,
-    VibexResult, acp_agent_verified_version, acp_registry_agent_id, unix_timestamp_ms,
+    AgentManagedInstallState, AgentManagedInstallStatus, AgentUpdateConfigRequest, TerminalCli,
+    VibexError, VibexResult, acp_agent_verified_version, acp_registry_agent_id, unix_timestamp_ms,
 };
 use vibex_db::{
     AgentManagedInstallationRecord, AgentManagedInstallationRepository, apply_migrations,
@@ -207,6 +207,18 @@ const AGENT_UV_PATH_ENV: &str = "VIBEX_AGENT_UV_PATH";
 const UV_MANAGED_PYTHON_REQUEST: &str = "3.12";
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(1);
 
+/// A native interactive CLI found inside a Vibex-managed installation.
+///
+/// The launcher starts `program` with `arguments` and then the recorded
+/// arguments. `path_entries` are prepended to the child's `PATH`, because an
+/// npm-managed CLI may itself spawn `node` or a helper from its own tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagedCliLaunch {
+    pub program: String,
+    pub arguments: Vec<String>,
+    pub path_entries: Vec<String>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AgentNodeRuntimeOptions {
     pub node_path: Option<PathBuf>,
@@ -305,6 +317,104 @@ impl AgentInstallService {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// The Agent's native interactive CLI inside its managed installation.
+    ///
+    /// A managed ACP installation is not only the adapter: for most Agents the
+    /// adapter is the product's own CLI started with `--acp`, and the same
+    /// package tree contains the interactive entry point terminal mode needs.
+    /// Resolving it here is what lets a reader who installed the Agent through
+    /// Vibex use terminal mode without also installing it globally.
+    ///
+    /// Returns `None` when the Agent has no managed installation, when the
+    /// installation is not usable, or when its layout does not contain a native
+    /// entry point. The caller then falls back to the bare command on `PATH`,
+    /// which is the same behavior an externally installed Agent gets.
+    pub fn native_cli_launch(&self, agent_id: &AgentId) -> Option<ManagedCliLaunch> {
+        TerminalCli::for_agent(agent_id)?;
+        let record = self.read_record(agent_id).ok().flatten()?;
+        if !record_has_usable_installation(&record) {
+            return None;
+        }
+        let root = Path::new(record.install_root.as_deref()?);
+        let manifest = read_install_manifest(root)?;
+        let mut path_entries = Vec::new();
+        let (program, arguments) = match manifest.launch {
+            ManifestLaunch::Binary { command, .. } => {
+                let program = root.join(safe_relative_path(&command, "binary command").ok()?);
+                if !program.is_file() {
+                    return None;
+                }
+                if let Some(parent) = program.parent() {
+                    path_entries.push(parent.to_string_lossy().into_owned());
+                }
+                (program.to_string_lossy().into_owned(), Vec::new())
+            }
+            ManifestLaunch::Node { node, script, .. } => {
+                let node = PathBuf::from(node);
+                if !node.is_file() {
+                    return None;
+                }
+                if let Some(parent) = node.parent() {
+                    path_entries.push(parent.to_string_lossy().into_owned());
+                }
+                path_entries.push(
+                    root.join("node_modules")
+                        .join(".bin")
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+                let script = if let Some(command) = npm_companion_command(agent_id) {
+                    // The ACP adapter for these Agents is a companion launcher,
+                    // so the manifest's script is not the native CLI. The bin
+                    // shim beside it is.
+                    let shim = npm_command_path(root, command);
+                    #[cfg(windows)]
+                    if shim.extension().is_some_and(|extension| extension == "cmd") {
+                        // A `.cmd` shim needs `cmd.exe`; resolving it here would
+                        // replace an interactive TUI with a shell wrapper.
+                        return None;
+                    }
+                    fs::canonicalize(&shim).unwrap_or(shim)
+                } else {
+                    root.join(safe_relative_path(&script, "npm script").ok()?)
+                };
+                if !script.is_file() {
+                    return None;
+                }
+                (
+                    node.to_string_lossy().into_owned(),
+                    vec![script.to_string_lossy().into_owned()],
+                )
+            }
+            ManifestLaunch::Python { .. } => {
+                let entry = managed_uvx_entry_point(agent_id)?;
+                let bin_dir = if cfg!(windows) {
+                    root.join("venv").join("Scripts")
+                } else {
+                    root.join("venv").join("bin")
+                };
+                let candidate = if cfg!(windows) {
+                    bin_dir.join(format!("{entry}.exe"))
+                } else {
+                    bin_dir.join(entry)
+                };
+                if !candidate.is_file() {
+                    return None;
+                }
+                path_entries.push(bin_dir.to_string_lossy().into_owned());
+                (candidate.to_string_lossy().into_owned(), Vec::new())
+            }
+        };
+        path_entries.retain(|entry| !entry.trim().is_empty());
+        path_entries.sort();
+        path_entries.dedup();
+        Some(ManagedCliLaunch {
+            program,
+            arguments,
+            path_entries,
+        })
     }
 
     fn http_client(&self) -> VibexResult<Client> {
@@ -4545,6 +4655,11 @@ fn validate_npm_integrity(integrity: &str) -> VibexResult<()> {
     Ok(())
 }
 
+fn read_install_manifest(root: &Path) -> Option<InstallManifest> {
+    let bytes = fs::read(root.join("vibex-install.json")).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
 fn load_installed_agent(root: &Path, expected_fingerprint: &str) -> VibexResult<InstalledAgent> {
     let bytes = fs::read(root.join("vibex-install.json")).map_err(|error| {
         storage_error(
@@ -7169,6 +7284,209 @@ printf '%s\n' '{"version":"1.2.3","scripts":["test-package"]}'
         assert!(check_archive_budget(ARCHIVE_MAX_ENTRIES + 1, 0).is_err());
         assert!(check_archive_budget(1, ARCHIVE_MAX_UNPACKED_BYTES + 1).is_err());
         assert!(validate_https_url("https://:secret@example.com/agent", "Agent").is_err());
+    }
+
+    fn record_managed_install(
+        db_path: &Path,
+        agent_id: &AgentId,
+        registry_agent_id: &str,
+        install_root: &Path,
+        command: AgentCommandConfig,
+        kind: AgentManagedDistributionKind,
+    ) {
+        let mut conn = open_database(db_path).unwrap();
+        apply_migrations(&mut conn).unwrap();
+        vibex_db::AgentManagedInstallationRepository::upsert(
+            &conn,
+            &AgentManagedInstallationRecord {
+                agent_id: agent_id.clone(),
+                registry_agent_id: registry_agent_id.to_string(),
+                state: AgentManagedInstallState {
+                    managed: true,
+                    status: AgentManagedInstallStatus::Installed,
+                    distribution_kind: Some(kind),
+                    installed_version: Some("1.0.0".to_string()),
+                    available_version: Some("1.0.0".to_string()),
+                    last_error_code: None,
+                    last_error_message: None,
+                    updated_at_ms: Some(unix_timestamp_ms()),
+                },
+                command: Some(command),
+                install_root: Some(install_root.to_string_lossy().into_owned()),
+                updated_at_ms: unix_timestamp_ms(),
+            },
+        )
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_managed_npm_installation_resolves_its_native_cli() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("vibex.db");
+        let root = temp.path().join("managed-agents");
+        let service =
+            AgentInstallService::new(&db_path, &root, ProviderConfigService::new(&db_path))
+                .unwrap();
+        let node = root.join("runtimes/node/external/bin/node");
+        fs::create_dir_all(node.parent().unwrap()).unwrap();
+        fs::write(&node, b"fixture").unwrap();
+        let install_root = root.join("agents/gemini/1.0.0-fixture");
+        let script_rel = "node_modules/@google/gemini-cli/bundle/gemini.js";
+        let script = install_root.join(script_rel);
+        fs::create_dir_all(script.parent().unwrap()).unwrap();
+        fs::write(&script, b"// gemini").unwrap();
+        write_json_private(
+            &install_root.join("vibex-install.json"),
+            &InstallManifest {
+                registry_agent_id: "gemini".to_string(),
+                version: "1.0.0".to_string(),
+                fingerprint: "fixture".to_string(),
+                runtime_version: None,
+                runtime_dependencies: BTreeMap::new(),
+                distribution_kind: AgentManagedDistributionKind::Npm,
+                launch: ManifestLaunch::Node {
+                    node: node.to_string_lossy().into_owned(),
+                    script: script_rel.to_string(),
+                    args: vec!["--acp".to_string()],
+                },
+            },
+        )
+        .unwrap();
+        let gemini = AgentId::parse("gemini").unwrap();
+        record_managed_install(
+            &db_path,
+            &gemini,
+            "gemini",
+            &install_root,
+            AgentCommandConfig {
+                command: node.to_string_lossy().into_owned(),
+                args: vec![script.to_string_lossy().into_owned(), "--acp".to_string()],
+            },
+            AgentManagedDistributionKind::Npm,
+        );
+
+        let launch = service.native_cli_launch(&gemini).unwrap();
+        assert_eq!(launch.program, node.to_string_lossy());
+        assert_eq!(
+            launch.arguments,
+            vec![script.to_string_lossy().into_owned()],
+            "the ACP subcommand must not ride the native launch"
+        );
+        assert!(
+            launch
+                .path_entries
+                .iter()
+                .any(|entry| entry.ends_with("node_modules/.bin"))
+        );
+    }
+
+    /// A companion Adapter installs the native CLI beside the adapter. The
+    /// resolver must pick the companion, not the adapter launcher.
+    #[cfg(unix)]
+    #[test]
+    fn a_managed_companion_installation_resolves_the_companion_binary() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("vibex.db");
+        let root = temp.path().join("managed-agents");
+        let service =
+            AgentInstallService::new(&db_path, &root, ProviderConfigService::new(&db_path))
+                .unwrap();
+        let node = root.join("runtimes/node/external/bin/node");
+        fs::create_dir_all(node.parent().unwrap()).unwrap();
+        fs::write(&node, b"fixture").unwrap();
+        let install_root = root.join("agents/pi/1.0.0-fixture");
+        let adapter = install_root.join("vibex-acp-companion-launcher.cjs");
+        fs::create_dir_all(adapter.parent().unwrap()).unwrap();
+        fs::write(&adapter, b"// adapter").unwrap();
+        let native = install_root.join("node_modules/.bin/pi");
+        fs::create_dir_all(native.parent().unwrap()).unwrap();
+        fs::write(&native, b"// pi").unwrap();
+        write_json_private(
+            &install_root.join("vibex-install.json"),
+            &InstallManifest {
+                registry_agent_id: "pi-acp".to_string(),
+                version: "1.0.0".to_string(),
+                fingerprint: "fixture".to_string(),
+                runtime_version: Some("1.0.0".to_string()),
+                runtime_dependencies: BTreeMap::new(),
+                distribution_kind: AgentManagedDistributionKind::Npm,
+                launch: ManifestLaunch::Node {
+                    node: node.to_string_lossy().into_owned(),
+                    script: "vibex-acp-companion-launcher.cjs".to_string(),
+                    args: Vec::new(),
+                },
+            },
+        )
+        .unwrap();
+        let pi = AgentId::parse("pi").unwrap();
+        record_managed_install(
+            &db_path,
+            &pi,
+            "pi-acp",
+            &install_root,
+            AgentCommandConfig {
+                command: node.to_string_lossy().into_owned(),
+                args: vec![adapter.to_string_lossy().into_owned()],
+            },
+            AgentManagedDistributionKind::Npm,
+        );
+
+        let launch = service.native_cli_launch(&pi).unwrap();
+        assert_eq!(launch.program, node.to_string_lossy());
+        assert_eq!(
+            launch.arguments,
+            vec![native.to_string_lossy().into_owned()],
+            "the companion CLI is the native interface, not the ACP adapter"
+        );
+    }
+
+    /// A binary distribution runs the binary inside the managed tree.
+    #[cfg(unix)]
+    #[test]
+    fn a_managed_binary_installation_resolves_the_native_binary() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("vibex.db");
+        let root = temp.path().join("managed-agents");
+        let service =
+            AgentInstallService::new(&db_path, &root, ProviderConfigService::new(&db_path))
+                .unwrap();
+        let install_root = root.join("agents/cursor/1.0.0-fixture");
+        let binary = install_root.join("dist-package/cursor-agent");
+        fs::create_dir_all(binary.parent().unwrap()).unwrap();
+        fs::write(&binary, b"fixture").unwrap();
+        write_json_private(
+            &install_root.join("vibex-install.json"),
+            &InstallManifest {
+                registry_agent_id: "cursor".to_string(),
+                version: "1.0.0".to_string(),
+                fingerprint: "fixture".to_string(),
+                runtime_version: None,
+                runtime_dependencies: BTreeMap::new(),
+                distribution_kind: AgentManagedDistributionKind::Binary,
+                launch: ManifestLaunch::Binary {
+                    command: "dist-package/cursor-agent".to_string(),
+                    args: vec!["acp".to_string()],
+                },
+            },
+        )
+        .unwrap();
+        let cursor = AgentId::parse("cursor").unwrap();
+        record_managed_install(
+            &db_path,
+            &cursor,
+            "cursor",
+            &install_root,
+            AgentCommandConfig {
+                command: binary.to_string_lossy().into_owned(),
+                args: vec!["acp".to_string()],
+            },
+            AgentManagedDistributionKind::Binary,
+        );
+
+        let launch = service.native_cli_launch(&cursor).unwrap();
+        assert_eq!(launch.program, binary.to_string_lossy());
+        assert!(launch.arguments.is_empty());
     }
 
     #[test]
