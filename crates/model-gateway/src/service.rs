@@ -1956,12 +1956,26 @@ impl ModelGatewayService {
 
         let mut candidates = Vec::new();
         let preferred = policy.preferred_keys.get(&profile_id);
-        let bare_model = bare_model_name(&request.model);
+        // The scope names the model the member actually calls, not the group's
+        // virtual id. Using `bare_model_name(request.model)` here made every
+        // group request look like the group's display name, so a model-scoped
+        // Key was skipped and the group reported that it had no Key at all.
+        let member_model = resolved.model.as_str();
+        let served_model = upstream
+            .metadata
+            .model_aliases
+            .iter()
+            .find(|alias| alias.alias == member_model)
+            .map(|alias| alias.upstream.as_str())
+            .unwrap_or(member_model);
         for (index, credential) in upstream.credentials.iter().enumerate() {
             // A Key with a model scope serves only those ids. An empty scope
             // keeps the pre-existing "this Key serves the Provider" meaning.
             if !credential.models.is_empty()
-                && !credential.models.iter().any(|model| model == &bare_model)
+                && !credential
+                    .models
+                    .iter()
+                    .any(|model| model == member_model || model == served_model)
             {
                 continue;
             }
@@ -2940,44 +2954,52 @@ impl ModelGatewayService {
         body: &[u8],
         error: &GatewayError,
     ) {
-        let Ok(connection) = self.connection() else {
-            return;
-        };
-        let requested_model = serde_json::from_slice::<Value>(body)
-            .ok()
-            .and_then(|value| {
-                value
-                    .get("model")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-            })
-            .unwrap_or_default();
-        let log = ModelGatewayRequestLog {
-            request_id: RequestId::new(),
-            agent_id: agent_id_from_headers(headers),
-            // A refusal that never matched a member has no Provider to blame;
-            // the ledger requires one, so an unreadable id stands in.
-            model_provider_profile_id: ModelProviderProfileId::new(),
-            credential_id: None,
-            model_requested: requested_model,
-            model_served: None,
-            wire_in: inbound.wire_protocol_id().to_string(),
-            wire_out: inbound.wire_protocol_id().to_string(),
-            status: Some(error.status()),
-            input_tokens: 0,
-            output_tokens: 0,
-            cached_read_tokens: 0,
-            cached_write_tokens: 0,
-            reasoning_tokens: 0,
-            latency_ms: None,
+        let request_id = RequestId::new();
+        if let Ok(connection) = self.connection() {
+            let requested_model = serde_json::from_slice::<Value>(body)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("model")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+                .unwrap_or_default();
+            let log = ModelGatewayRequestLog {
+                request_id: request_id.clone(),
+                agent_id: agent_id_from_headers(headers),
+                // A refusal that never matched a member has no Provider to blame;
+                // the ledger requires one, so an unreadable id stands in.
+                model_provider_profile_id: ModelProviderProfileId::new(),
+                credential_id: None,
+                model_requested: requested_model,
+                model_served: None,
+                wire_in: inbound.wire_protocol_id().to_string(),
+                wire_out: inbound.wire_protocol_id().to_string(),
+                status: Some(error.status()),
+                input_tokens: 0,
+                output_tokens: 0,
+                cached_read_tokens: 0,
+                cached_write_tokens: 0,
+                reasoning_tokens: 0,
+                latency_ms: None,
+                outcome: GatewayRequestOutcome::Rejected,
+                route: Some(GatewayRouteTrace {
+                    error_code: Some(error.code().to_string()),
+                    ..GatewayRouteTrace::new(0, 0)
+                }),
+                created_at_ms: vibex_core::unix_timestamp_ms(),
+            };
+            let _ = ModelGatewayRequestLogRepository::insert(&connection, &log);
+        }
+        // A refusal is still a finished request from the caller's point of
+        // view. Announcing it lets the request list, the traffic counts and
+        // the route story load the row that was just written instead of
+        // staying on the last request that reached a member.
+        self.publish_event(vibex_core::GatewayEvent::Ended {
+            request_id,
             outcome: GatewayRequestOutcome::Rejected,
-            route: Some(GatewayRouteTrace {
-                error_code: Some(error.code().to_string()),
-                ..GatewayRouteTrace::new(0, 0)
-            }),
-            created_at_ms: vibex_core::unix_timestamp_ms(),
-        };
-        let _ = ModelGatewayRequestLogRepository::insert(&connection, &log);
+        });
     }
 
     /// Lists the most recent ledger rows.
@@ -5328,6 +5350,56 @@ mod inflight_tests {
         // Every event names the same request, which is what lets a client
         // follow one request rather than guess.
         assert!(events.iter().all(|event| event.request_id() == &request_id));
+    }
+
+    /// A refusal is a finished request too: it must be written *and* announced.
+    ///
+    /// The desktop reloads its request list on `Ended`. A refusal that wrote a
+    /// ledger row silently left the list, the traffic counts and the route
+    /// story on the previous request, which is exactly the state a user cannot
+    /// diagnose from.
+    #[test]
+    fn a_refusal_is_recorded_and_announced() {
+        let service = service();
+        let seen: Arc<StdMutex<Vec<vibex_core::GatewayEvent>>> =
+            Arc::new(StdMutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        service.set_event_sink(Arc::new(move |event| {
+            sink.lock().unwrap().push(event);
+        }));
+
+        let model = "group/model_route_test/deepseek-chat";
+        service.record_refusal(
+            WireProtocol::Responses,
+            &HeaderMap::new(),
+            format!(r#"{{"model":"{model}"}}"#).as_bytes(),
+            &GatewayError::AllKeysCooling {
+                model: model.to_string(),
+                retry_after_ms: None,
+            },
+        );
+
+        let events = seen.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            events[0],
+            vibex_core::GatewayEvent::Ended {
+                outcome: vibex_core::GatewayRequestOutcome::Rejected,
+                ..
+            }
+        ));
+
+        let logs = service.recent_requests(1).unwrap();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].outcome, vibex_core::GatewayRequestOutcome::Rejected);
+        assert_eq!(
+            logs[0]
+                .route
+                .as_ref()
+                .and_then(|route| route.error_code.as_deref()),
+            Some("model_gateway_keys_cooling")
+        );
+        assert_eq!(logs[0].request_id, *events[0].request_id());
     }
 
     #[test]

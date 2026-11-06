@@ -574,6 +574,37 @@ impl ManagementCenter {
                     .when(invalid, |row| {
                         row.child(
                             Button::new(SharedString::from(format!(
+                                "management-gateway-retry-key-{}-{}",
+                                upstream.model_provider_profile_id.as_str(),
+                                key.credential_id.as_str()
+                            )))
+                            .small()
+                            .outline()
+                            .label(management_locale_text("Retry", "重试", "重試"))
+                            .tooltip(management_locale_text(
+                                "Try this Key again after fixing the account or endpoint",
+                                "账号或端点修好后，立即重试这个 Key",
+                                "帳號或端點修好後，立即重試這個 Key",
+                            ))
+                            .disabled(pending)
+                            .on_click(cx.listener({
+                                let profile = upstream.model_provider_profile_id.clone();
+                                let credential = key.credential_id.clone();
+                                move |this, _, _, cx| {
+                                    // Re-enabling is the durable "try again"
+                                    // command: it clears an authentication
+                                    // verdict without replacing the Secret.
+                                    this.set_gateway_key_enabled(
+                                        profile.clone(),
+                                        credential.clone(),
+                                        true,
+                                        cx,
+                                    )
+                                }
+                            })),
+                        )
+                        .child(
+                            Button::new(SharedString::from(format!(
                                 "management-gateway-replace-key-{}-{}",
                                 upstream.model_provider_profile_id.as_str(),
                                 key.credential_id.as_str()

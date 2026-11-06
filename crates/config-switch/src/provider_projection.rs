@@ -34,7 +34,8 @@ use vibex_core::{
 };
 use vibex_db::{
     AgentModelProviderBindingRepository, AgentRuntimeProfileRepository,
-    ModelProviderProfileRepository, ProviderProjectionCompatibilityRepository,
+    ModelProviderAccountStateRepository, ModelProviderProfileRepository,
+    ProviderProjectionCompatibilityRepository,
 };
 
 use super::{ProviderConfigService, secrets};
@@ -807,8 +808,25 @@ impl ProviderConfigService {
         profile.revision = request.expected_revision.saturating_add(1);
         profile.updated_at_ms = unix_timestamp_ms().max(profile.updated_at_ms.saturating_add(1));
         let conn = self.open_connection()?;
+        let previous = ModelProviderProfileRepository::get(&conn, &profile.id)?;
         let updated =
             ModelProviderProfileRepository::update(&conn, &profile, request.expected_revision)?;
+        // An authentication failure never expires on its own. A change to how
+        // the Provider is reached or authenticated makes that old verdict
+        // stale, so it has to be cleared; otherwise repairing the endpoint or
+        // auth header would still leave every Key refused until the user
+        // replaced the Secret.
+        if let Some(previous) = previous
+            && provider_auth_surface_changed(&previous, &updated)
+        {
+            for credential in &updated.credentials {
+                ModelProviderAccountStateRepository::clear_cooldown(
+                    &conn,
+                    &updated.id,
+                    &credential.id,
+                )?;
+            }
+        }
         self.refresh_bindings_for_model_provider(&conn, &updated.id)?;
         Ok(updated)
     }
@@ -5863,6 +5881,39 @@ fn hex_digest(bytes: &[u8]) -> String {
     output
 }
 
+/// Whether an update changed a fact the gateway used when it judged a Key.
+///
+/// An authentication verdict is about how the Provider is reached and
+/// authenticated, not about its display name or model catalogue. Comparing only
+/// that surface lets a repaired endpoint or auth header revive a Key without
+/// turning every cosmetic edit into a retry.
+fn provider_auth_surface_changed(
+    before: &ModelProviderProfile,
+    after: &ModelProviderProfile,
+) -> bool {
+    before.endpoints != after.endpoints
+        || before.proxy_policy != after.proxy_policy
+        || before.headers != after.headers
+        || before.status != after.status
+        || before.metadata.auth_header_mode != after.metadata.auth_header_mode
+        || before.metadata.extra_body_json != after.metadata.extra_body_json
+        || before.metadata.user_agent_mode != after.metadata.user_agent_mode
+        || before.metadata.tls_accept_invalid != after.metadata.tls_accept_invalid
+        || credentials_auth_surface_changed(&before.credentials, &after.credentials)
+}
+
+fn credentials_auth_surface_changed(
+    before: &[ModelProviderCredentialReference],
+    after: &[ModelProviderCredentialReference],
+) -> bool {
+    before.len() != after.len()
+        || before.iter().zip(after).any(|(before, after)| {
+            before.id != after.id
+                || before.credential != after.credential
+                || before.proxy_url != after.proxy_url
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
@@ -9447,6 +9498,92 @@ mod tests {
         assert!(!format!("{resolved:?}").contains(secret_value));
         assert!(!format!("{:?}", resolved.secret_env).contains(secret_value));
         secrets::delete_provider_secret(&lookup_key).unwrap();
+    }
+
+    /// Repairing how a Provider is reached must let its rejected Key be tried
+    /// again; renaming the Provider must not.
+    #[test]
+    fn provider_auth_surface_update_clears_an_authentication_failure() {
+        let dir = tempdir().unwrap();
+        let service = ProviderConfigService::new(dir.path().join("vibex.db"));
+        let provider = service
+            .create_model_provider_profile(ModelProviderProfileCreateRequest {
+                display_name: "Free".to_string(),
+                vendor_hint: None,
+                endpoints: vec![ModelProviderEndpoint {
+                    id: "api".to_string(),
+                    kind: ModelProviderEndpointKind::Api,
+                    url: "https://old.example.invalid/v1".to_string(),
+                    wire_protocol_id: None,
+                }],
+                proxy_policy: ModelProviderProxyPolicy::InheritSystem,
+                credentials: Vec::new(),
+                configured_models: vec![ModelProviderCatalogEntry {
+                    id: "deepseek-v4.1-flash".to_string(),
+                    display_name: None,
+                    enabled: true,
+                    metadata: Vec::new(),
+                    capabilities: Default::default(),
+                }],
+                default_model_id: Some("deepseek-v4.1-flash".to_string()),
+                headers: Vec::new(),
+                status: ModelProviderProfileStatus::Enabled,
+                metadata: Default::default(),
+            })
+            .unwrap();
+        let provider = service
+            .add_model_provider_credential(vibex_core::AddModelProviderCredentialRequest {
+                model_provider_profile_id: provider.id.clone(),
+                display_name: None,
+                value: "sk-original".to_string(),
+            })
+            .unwrap();
+        let credential = provider.credentials[0].id.clone();
+        {
+            let connection = service.open_connection().unwrap();
+            let mut state =
+                vibex_core::ModelProviderAccountState::ready(provider.id.clone(), credential);
+            state.cooldown_reason = Some(vibex_core::GatewayFailureKind::Auth);
+            state.consecutive_failures = 1;
+            ModelProviderAccountStateRepository::upsert(&connection, &state).unwrap();
+        }
+
+        // A cosmetic edit keeps the old verdict: the Key was not retried.
+        let mut renamed = provider.clone();
+        renamed.display_name = "Free renamed".to_string();
+        renamed.metadata.note = Some("cosmetic note".to_string());
+        let renamed = service
+            .update_model_provider_profile(ModelProviderProfileUpdateRequest {
+                profile: renamed,
+                expected_revision: provider.revision,
+            })
+            .unwrap();
+        {
+            let connection = service.open_connection().unwrap();
+            let states =
+                ModelProviderAccountStateRepository::list(&connection, &renamed.id).unwrap();
+            assert_eq!(
+                states[0].cooldown_reason,
+                Some(vibex_core::GatewayFailureKind::Auth)
+            );
+        }
+
+        // Repairing the endpoint makes that verdict stale, so the Key is tried
+        // again instead of staying invalid until the Secret is replaced.
+        let mut repaired = renamed.clone();
+        repaired.endpoints[0].url = "https://new.example.invalid/v1".to_string();
+        let repaired = service
+            .update_model_provider_profile(ModelProviderProfileUpdateRequest {
+                profile: repaired,
+                expected_revision: renamed.revision,
+            })
+            .unwrap();
+        let connection = service.open_connection().unwrap();
+        let states = ModelProviderAccountStateRepository::list(&connection, &repaired.id).unwrap();
+        assert!(
+            states[0].is_ready_at(vibex_core::unix_timestamp_ms()),
+            "repairing the endpoint must clear the stale auth verdict: {states:?}"
+        );
     }
 
     #[test]

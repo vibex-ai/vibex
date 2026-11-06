@@ -1587,6 +1587,78 @@ async fn all_keys_cooling_is_a_429_without_an_upstream_call() {
     cleanup(path);
 }
 
+/// A Key's model scope names the model its member calls, not the group's name.
+///
+/// The gateway used to read the Agent-facing group model (`Group Display`) as
+/// the Key's scope, which matches no upstream model, so the only Key was
+/// skipped and the group reported that it had no Key at all.
+#[tokio::test]
+async fn a_model_scoped_key_serves_a_route_group() {
+    let path = database_path();
+    let (upstream_url, recorder, upstream_task) = mock_upstream(200, chat_stream(), None).await;
+    let config = ProviderConfigService::new(&path);
+    let upstream = seed_upstream(
+        &config,
+        &upstream_url,
+        WireProtocol::ChatCompletions,
+        &["deepseek-chat"],
+        "sk-scoped",
+    );
+    {
+        let mut connection = open_database(&path).unwrap();
+        apply_migrations(&mut connection).unwrap();
+        let mut profile = vibex_db::ModelProviderProfileRepository::get(&connection, &upstream)
+            .unwrap()
+            .expect("the upstream exists");
+        profile.credentials[0].models = vec!["deepseek-chat".to_string()];
+        let revision = profile.revision;
+        profile.revision = revision + 1;
+        profile.updated_at_ms = profile.updated_at_ms.saturating_add(1);
+        vibex_db::ModelProviderProfileRepository::update(&connection, &profile, revision).unwrap();
+    }
+    enable_gateway_at(&path, GatewayPolicy::default());
+    let connection = open_database(&path).unwrap();
+    let route = vibex_core::ModelRoute {
+        display_name: "Group Display".to_string(),
+        kind: vibex_core::RouteKind::ModelGroup,
+        agent_model_id: Some("Group Display".to_string()),
+        status: vibex_core::RouteStatus::Enabled,
+        members: vec![vibex_core::ModelRouteMember::new(
+            upstream,
+            "deepseek-chat",
+            0,
+        )],
+        ..Default::default()
+    };
+    vibex_db::ModelRouteRepository::insert(&connection, &route).unwrap();
+    let group = route.id.clone();
+    let (service, gateway_url, gateway_task) = gateway(&path).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{gateway_url}/v1/chat/completions"))
+        .header(header::HOST, "127.0.0.1")
+        .json(&json!({
+            "model": group_model(&group, "Group Display"),
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = response.text().await.unwrap();
+    assert_eq!(status, 200, "gateway answered {body}");
+    assert!(
+        !recorder.lock().await.path.is_empty(),
+        "the scoped Key must reach the upstream through the group"
+    );
+
+    gateway_task.abort();
+    upstream_task.abort();
+    service.shutdown().await;
+    cleanup(path);
+}
+
 #[tokio::test]
 async fn an_unknown_model_lists_the_closest_configured_ones() {
     let path = database_path();
