@@ -35635,11 +35635,15 @@ impl VibexWorkbench {
             return;
         };
         let Some(query) = entry.query.clone() else {
-            if entry.searched.take().is_some() {
-                entry
-                    .state
-                    .update(cx, |state, cx| state.clear_range_highlights(cx));
-            }
+            // Closing the find bar drops the query, and the highlights have to
+            // go with it. `searched` was already cleared when the query
+            // changed, so it cannot say whether the surface still paints hits:
+            // clearing is idempotent, and the state only notifies when it had
+            // any.
+            entry.searched = None;
+            entry
+                .state
+                .update(cx, |state, cx| state.clear_range_highlights(cx));
             return;
         };
         let state = entry.state.clone();
@@ -97564,6 +97568,93 @@ mod tests {
         // paint a background, which used to bury the keyword in a yellow block.
         assert!(!reveal.contains(".bg("));
         assert!(reveal.contains(".on_prepaint("));
+    }
+
+    /// Closing find takes the keyword tint off the surfaces it painted.
+    ///
+    /// A close forgets the query and the search it stood for in the same step,
+    /// so the surface's `searched` bookkeeping is already empty when the
+    /// highlight refresh runs. It cannot be what decides whether there is
+    /// anything to clear: the retained text view still paints the hits from
+    /// the previous frame, and only an explicit clear takes them off.
+    #[gpui::test]
+    fn closing_find_clears_the_highlight_left_on_a_markdown_surface(cx: &mut TestAppContext) {
+        struct FindHighlightProbe {
+            workbench: Entity<VibexWorkbench>,
+        }
+
+        impl Render for FindHighlightProbe {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                self.workbench.clone()
+            }
+        }
+
+        cx.update(gpui_component::init);
+        let (probe, cx) = cx.add_window_view(|window, cx| {
+            let mut ui_state = DesktopUiStateV1::default();
+            ui_state.appearance.locale = LocaleMode::En;
+            let workbench =
+                cx.new(|cx| VibexWorkbench::with_initial_state(None, ui_state, None, window, cx));
+            FindHighlightProbe { workbench }
+        });
+        let workbench = probe.read_with(cx, |probe, _| probe.workbench.clone());
+        let state = workbench.update(cx, |workbench, cx| {
+            let state = cx.new(|cx| TextViewState::markdown("alpha beta".into(), cx));
+            let observed = cx.observe(&state, |_, _, _| {});
+            workbench.markdown_text_states.insert(
+                "find-highlight-probe".to_owned(),
+                MarkdownTextState {
+                    state: state.clone(),
+                    _observed: observed,
+                    source: Arc::from("alpha beta"),
+                    streaming: false,
+                    // The close already dropped both the query and the search
+                    // bookkeeping; the surface itself still paints the hits.
+                    query: None,
+                    active: false,
+                    searched: None,
+                    last_painted: 0,
+                },
+            );
+            state
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            state.read_with(cx, |state, _| state
+                .rendered_text()
+                .as_str()
+                .trim_end()
+                .to_owned()),
+            "alpha beta",
+            "the probe surface should parse before the highlight is set"
+        );
+        cx.update(|_, cx| {
+            state.update(cx, |state, cx| {
+                state
+                    .set_range_highlights([RangeHighlight::new(0..5, cx.theme().warning)], cx)
+                    .expect("the probe text indexes the range");
+            });
+        });
+
+        let notifications = Rc::new(Cell::new(0));
+        let observed = notifications.clone();
+        let _subscription = workbench.update(cx, |_, cx| {
+            cx.observe(&state, move |_, _, _| {
+                observed.set(observed.get() + 1);
+            })
+        });
+        workbench.update(cx, |workbench, cx| {
+            workbench.refresh_markdown_search_highlights(
+                &MarkdownSurfaceOwner::BorrowedView,
+                "find-highlight-probe",
+                cx,
+            );
+        });
+
+        assert!(
+            notifications.get() > 0,
+            "a surface whose query went away has to clear the highlight it still paints"
+        );
     }
 
     #[test]

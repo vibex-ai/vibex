@@ -1444,7 +1444,11 @@ gpui_base::text::TextViewState::set_range_highlights(highlights, cx) -> Result<(
   and paints hits with `set_range_highlights`, driven by a parse observer so a
   document that lands after the query still highlights. Setting highlights must
   be skipped when the rendered revision did not change, or the observer and the
-  repaint it causes would keep each other awake.
+  repaint it causes would keep each other awake. Closing the conversation's find
+  bar drops the query and the surface's `searched` bookkeeping in the same step,
+  so the refresh has to clear range highlights whenever the query is gone
+  instead of asking `searched` whether there was a search — otherwise the tints
+  from the last painted frame outlive the bar.
 - A rendered file preview has a find bar of its own, and find follows focus
   there as it does for the editor and the browser: `focused_markdown_preview`
   answers the chord while the preview's text view — or the source editor the
