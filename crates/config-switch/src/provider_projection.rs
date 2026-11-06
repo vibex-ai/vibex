@@ -340,7 +340,7 @@ impl AgentProviderProjectionEngine {
                 field: "proxy".to_string(),
                 target_kind: ProjectionTargetKind::Environment,
                 target: "HTTPS_PROXY".to_string(),
-                value_preview: redact_endpoint(proxy),
+                value_preview: endpoint_preview(proxy),
                 secret: false,
             });
         }
@@ -1705,7 +1705,7 @@ fn project_provider_control(
                 target_kind: ProjectionTargetKind::ManagedOverlay,
                 target: overlay.relative_path.clone(),
                 value_preview: endpoint
-                    .map(|endpoint| redact_endpoint(&endpoint.url))
+                    .map(|endpoint| endpoint_preview(&endpoint.url))
                     .unwrap_or_else(|| "not configured".to_string()),
                 secret: false,
             });
@@ -1749,7 +1749,7 @@ fn project_provider_control(
                 field: "endpoint".to_string(),
                 target_kind: ProjectionTargetKind::AgentManaged,
                 target: "Agent-owned endpoint".to_string(),
-                value_preview: redact_endpoint(base_url),
+                value_preview: endpoint_preview(base_url),
                 secret: false,
             });
         }
@@ -5772,7 +5772,7 @@ fn endpoint_target(key: &str, value: &str) -> ProjectionTargetPreview {
         field: "endpoint".to_string(),
         target_kind: ProjectionTargetKind::Environment,
         target: key.to_string(),
-        value_preview: redact_endpoint(value),
+        value_preview: endpoint_preview(value),
         secret: false,
     }
 }
@@ -5816,18 +5816,8 @@ fn command_summary(runtime: &AgentRuntimeProfile) -> String {
     format!("{command} ({} argument(s))", runtime.args.len())
 }
 
-fn redact_endpoint(value: &str) -> String {
-    reqwest::Url::parse(value).map_or_else(
-        |_| "configured endpoint".to_string(),
-        |url| {
-            let host = url.host_str().unwrap_or("configured-host");
-            let port = url
-                .port()
-                .map(|port| format!(":{port}"))
-                .unwrap_or_default();
-            format!("{}://{host}{port}", url.scheme())
-        },
-    )
+fn endpoint_preview(value: &str) -> String {
+    value.to_string()
 }
 
 fn sanitize_provider_id(value: &str) -> String {
@@ -8470,7 +8460,7 @@ mod tests {
     }
 
     #[test]
-    fn structured_overlay_is_deterministic_private_and_redacted() {
+    fn structured_overlay_is_deterministic_private_and_exact() {
         let (provider, runtime, binding, descriptor) =
             fixture(ConfigOverlayStrategy::StructuredJsonOverlay);
         let first = AgentProviderProjectionEngine::plan(
@@ -8491,7 +8481,7 @@ mod tests {
         .unwrap();
         assert_eq!(first.fingerprint, second.fingerprint);
         let encoded = serde_json::to_string(&first.preview).unwrap();
-        assert!(!encoded.contains("never-preview"));
+        assert!(encoded.contains("https://user:pass@example.invalid/v1?token=never-preview"));
         assert!(!encoded.contains("/private/user"));
 
         let dir = tempdir().unwrap();

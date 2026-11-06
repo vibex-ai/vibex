@@ -1079,28 +1079,18 @@ impl GatewayRouteTrace {
     }
 }
 
-/// Redacts and bounds a vendor message for the ledger.
+/// Bounds a vendor message for the ledger.
 ///
 /// An upstream refusal is the only description of which field it objected to,
-/// so it is worth keeping — but it is vendor text that may quote a request
-/// header or a path. Both are already the gateway's own diagnostics contract:
-/// a bounded length and the shared sensitive-value check.
+/// so it is worth keeping exactly as the vendor wrote it. The ledger is read by
+/// the person who configured the Key, and hiding a message behind a keyword
+/// filter only removes the evidence they need. It is still bounded so one
+/// oversized body cannot dominate the row.
 pub fn gateway_diagnostic_text(message: &str) -> String {
     const MAX: usize = 512;
     let trimmed = message.trim();
     if trimmed.is_empty() {
         return String::new();
-    }
-    let lower = trimmed.to_ascii_lowercase();
-    let sensitive = lower.contains("api_key")
-        || lower.contains("apikey")
-        || lower.contains("authorization")
-        || lower.contains("bearer ")
-        || lower.contains("password")
-        || lower.contains("secret")
-        || lower.starts_with("sk-");
-    if sensitive {
-        return "[redacted-sensitive-output]".to_string();
     }
     if trimmed.chars().count() <= MAX {
         return trimmed.to_string();
@@ -2513,6 +2503,17 @@ mod gateway_defaults_tests {
             policy.validate().unwrap_err().code,
             "model_gateway_cooldown_invalid"
         );
+    }
+
+    #[test]
+    fn diagnostic_text_keeps_a_vendor_refusal_verbatim() {
+        let message = "Invalid schema for function 'read_file': API key sk-test was not accepted";
+        assert_eq!(gateway_diagnostic_text(message), message);
+
+        let oversized = "x".repeat(600);
+        let bounded = gateway_diagnostic_text(&oversized);
+        assert_eq!(bounded.chars().count(), 513);
+        assert!(bounded.ends_with('…'));
     }
 
     #[test]

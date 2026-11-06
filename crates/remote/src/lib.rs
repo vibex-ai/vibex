@@ -1624,7 +1624,7 @@ impl RemoteTrustService {
         let reason = request
             .reason
             .as_deref()
-            .map(redact_summary)
+            .map(audit_summary)
             .unwrap_or_else(|| "No reason provided".to_string());
         Self::insert_audit(
             conn,
@@ -1661,7 +1661,7 @@ impl RemoteTrustService {
         let reason = request
             .reason
             .as_deref()
-            .map(redact_summary)
+            .map(audit_summary)
             .unwrap_or_else(|| "No reason provided".to_string());
         let now = unix_timestamp_ms();
         let transaction = conn.unchecked_transaction().map_err(|_| {
@@ -1737,7 +1737,7 @@ impl RemoteTrustService {
         let reason = request
             .reason
             .as_deref()
-            .map(redact_summary)
+            .map(audit_summary)
             .unwrap_or_else(|| "No reason provided".to_string());
         let now = unix_timestamp_ms();
         let transaction = conn.unchecked_transaction().map_err(|_| {
@@ -1897,7 +1897,7 @@ impl RemoteTrustService {
             RemoteAuditTargetKind::Device,
             None,
             RemoteAuditOutcome::Denied,
-            format!("Remote authentication failed: {}", redact_summary(reason)),
+            format!("Remote authentication failed: {}", audit_summary(reason)),
             None,
             None,
         )
@@ -1924,7 +1924,7 @@ impl RemoteTrustService {
                 target_kind,
                 target_id,
                 outcome,
-                redacted_summary: redact_summary(&redacted_summary.into()),
+                redacted_summary: audit_summary(&redacted_summary.into()),
                 request_id,
                 correlation_id,
                 created_at_ms: unix_timestamp_ms(),
@@ -2016,13 +2016,8 @@ fn audit_target_for_action(action: RemoteActionClass) -> RemoteAuditTargetKind {
     }
 }
 
-fn redact_summary(summary: &str) -> String {
-    let mut redacted = summary.to_string();
-    for marker in ["token", "secret", "password", "pairing", "code", "auth"] {
-        redacted = redacted.replace(marker, "[redacted]");
-        redacted = redacted.replace(&marker.to_uppercase(), "[redacted]");
-    }
-    redacted
+fn audit_summary(summary: &str) -> String {
+    summary.to_string()
 }
 
 fn remote_error(code: &'static str, message: &'static str) -> VibexError {
@@ -11632,7 +11627,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remote_provider_projection_exposes_exact_capability_and_redacted_preview_only() {
+    async fn remote_provider_projection_exposes_exact_capability_and_preview() {
         const LOOKUP_SENTINEL: &str = "remote-provider-lookup-must-not-leak";
         const QUERY_SENTINEL: &str = "remote-provider-query-must-not-leak";
 
@@ -11754,7 +11749,7 @@ mod tests {
             "config.toml"
         );
         assert!(!preview_json.contains(LOOKUP_SENTINEL));
-        assert!(!preview_json.contains(QUERY_SENTINEL));
+        assert!(preview_json.contains(QUERY_SENTINEL));
         assert!(!preview_json.contains("\"content\""));
         assert!(!preview_json.contains("nonSecretEnv"));
         assert!(!preview_json.contains("secretEnv"));

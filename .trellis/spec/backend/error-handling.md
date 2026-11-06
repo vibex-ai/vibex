@@ -42,7 +42,7 @@ Do not return raw SDK errors directly to the UI.
 
 ## Provider Adapter Errors
 
-Adapters should preserve raw error data in redacted diagnostics while mapping to
+Adapters should preserve raw error data in bounded diagnostics while mapping to
 Vibex error categories. Required behavior:
 
 - Include provider type and detected provider version when known.
@@ -53,8 +53,7 @@ Vibex error categories. Required behavior:
   says authentication/login is required maps to
   `provider/provider_authentication_required`, with a sign-in recovery hint,
   instead of the generic `acp_rpc_error` or `acp_process_exited`. Classify the
-  original bounded text before redaction removes the discriminating wording;
-  diagnostics still store only the redacted form.
+  original bounded text; the diagnostics keep that same wording.
 - When an ACP process exits before its response, allow one short bounded stderr
   drain before classifying the failure. Absence of an explicit authentication
   signal remains `process/acp_process_exited`; do not infer authentication from
@@ -71,10 +70,10 @@ Vibex error categories. Required behavior:
   session to renew, and signing in cannot change a value the Agent never
   accepted. Keep the raw bounded wording in `rpcMessage`, and let a genuine
   rejection (401, revoked, expired) keep routing to the authentication path.
-  Note that this wording names the credential variable, so the shared redactor
-  replaces it whole — carry the actionable distinction in a derived
-  `credentialShape` token (`not_http_header_safe`, `blank`) instead of assuming
-  `rpcMessage` survives.
+  The wording names the credential variable and is preserved in `rpcMessage`;
+  carry the actionable distinction in the derived `credentialShape` token
+  (`not_http_header_safe`, `blank`) as well, so a reader can act on it without
+  parsing prose.
 
 ## Permission Errors
 

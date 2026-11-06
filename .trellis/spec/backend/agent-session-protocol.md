@@ -1079,8 +1079,8 @@ PermissionRepository::pending_for_session(VibexSessionId)
   parsed ACP option summaries, and attachment fence until exactly one
   resolution, cancellation, detach, or process crash drains it.
 - `PermissionRequest.response_options` persists every recognized ACP option as
-  `{ optionId, label, response }` in Agent order. `label` is the bounded,
-  redacted Agent display name; `response` is the provider-neutral semantic kind.
+  `{ optionId, label, response }` in Agent order. `label` is the bounded Agent
+  display name, preserved as written; `response` is the provider-neutral semantic kind.
   `allowed_responses` remains the compatibility fallback for old records and
   non-ACP permission producers.
 - UI clients render `response_options` when non-empty and return the selected
@@ -1088,9 +1088,9 @@ PermissionRepository::pending_for_session(VibexSessionId)
   collapse multiple options with the same semantic response: an Agent may offer
   both a session-wide allow and a command-prefix allow as distinct
   `allow_always` options.
-- Timeline permission payloads must include safe details for tool kind,
-  tool-call id, raw input summary, option kinds, or source. Secret-like values
-  must be redacted before persistence.
+- Timeline permission payloads must include the details for tool kind, tool-call
+  id, raw input summary, option kinds, or source exactly as the Agent supplied
+  them. Bound the length; do not keyword-filter the text.
 - `Approve` prefers `allow_once`, then `allow_always`; `AlwaysAllowForSession`
   prefers `allow_always`, then `allow_once`; `Deny` prefers `reject_once`, then
   `reject_always`. Option aliases such as `approve`, `deny`, and hyphen/space
@@ -1906,9 +1906,12 @@ carry `rawExtension?: AgentEventRawExtension`. Absence preserves legacy JSON.
   in the authoritative Timeline. Keyword detection must never replace them with
   `[redacted]` or `[redacted-sensitive-output]`. The `...(truncated)` form must
   restore internal truncation state after JSON deserialization so bounds and
-  round-trip equality remain stable. Debug exposes only counts, keys, modes,
-  and presence flags; diagnostics, permission details, provider configuration,
-  and credential projections keep their separate redaction contracts.
+  round-trip equality remain stable. Permission titles and details, provider
+  configuration summaries, notices, and errors shown to the user follow the same
+  rule: preserve the text, bound its length, never keyword-filter it. Debug and
+  diagnostic projections may carry counts and keys instead of payloads, but they
+  must not be the only copy of a value the user-visible surface needs.
+  Credential storage remains a reference boundary, not a display filter.
 - Attachment-local tool state merges live updates only after native route and
   four-field current-fence validation. Cumulative output emits `snapshot`, then
   suffix-only `append`; exact duplicates carry no raw output, non-prefix
@@ -2056,8 +2059,9 @@ Normal single-session Agent operation must continue with a capability warning.
   smoke binaries.
 - Incoming ACP `session/request_permission` requests must be converted at the
   adapter boundary into provider-neutral `PermissionRequest` timeline events
-  with bounded/redacted titles and details. Do not persist raw ACP permission
-  payloads, full tool inputs, prompts, terminal logs, env values, or tokens.
+  with bounded titles and details that preserve the adapter's text. Do not
+  persist the raw ACP permission envelope; the structured fields are the
+  record.
 - If the adapter has not implemented a full provider-side approval callback
   lifecycle, it may conservatively cancel/deny the native ACP request only after
   recording the provider-neutral permission event and returning an incomplete
@@ -2257,8 +2261,8 @@ and `AdapterDiagnosticsRepository`.
 - Permission requests are both `permission_requests` rows and
   `permission_request` timeline payloads. Resolutions append a
   `permission_resolution` timeline payload.
-- Adapter diagnostics are bounded/redacted and must not become user-visible
-  authoritative timeline content.
+- Adapter diagnostics are bounded and content-preserving. A failure shown to
+  the user must not be replaced by a keyword placeholder.
 
 ### 4. Validation & Error Matrix
 
@@ -2279,7 +2283,7 @@ and `AdapterDiagnosticsRepository`.
 - Send while session state is `running` -> `conflict/agent_turn_already_running`.
 - Unsupported ACP operation -> `capability/acp_*_unsupported`.
 - Missing Adapter/Agent binary -> `process/acp_*` with bounded diagnostics.
-- ACP/Adapter failure -> `provider/acp_*` with redacted diagnostic details.
+- ACP/Adapter failure -> `provider/acp_*` with bounded diagnostic details.
 - DB migration or repository failure -> `storage/*`.
 - Permission wait is `needs_input`, not `error`; only failed/expired provider
   behavior should move the session to `error`.
@@ -3188,7 +3192,8 @@ logout({})
 - Agent methods call ACP `authenticate` directly. Environment methods require
   an ACP Provider Profile, save each exact advertised key, then call
   `authenticate` with that Profile's projected environment. Terminal methods
-  use the shared PTY host and return a redacted `TerminalAuthActionDescriptor`.
+  use the shared PTY host and return a `TerminalAuthActionDescriptor` that names
+  the exact command, arguments, cwd, and env values.
   CodeWhale's verified `codewhale-terminal-auth` method replaces the trailing
   `serve --acp` launch mode with its advertised `auth set --provider ...`
   arguments while preserving any managed launcher prefix such as
@@ -3272,7 +3277,7 @@ logout({})
 ### 6. Tests Required
 
 - `cargo test -p vibex-agent-acp auth::tests --locked` covers method parsing,
-  bounds, exact ids, logout capability, terminal-value redaction, the
+  bounds, exact ids, logout capability, terminal-value preservation, the
   fail-closed Auggie/Kiro/Poolside/Pi CLI login mappings, and CodeWhale
   terminal auth argument replacement across direct and managed launchers.
 - `cargo test -p vibex-agent-acp agent_auth_methods_authenticate_terminal_and_logout_round_trip --locked`
@@ -3402,8 +3407,8 @@ AgentAuthModelCatalogSnapshot {
   effect requires a Provider Profile, persists one operation row, and uses the
   same Agent/account launch context as verification and later sessions.
   Interactive terminal/browser work returns an execution location and a
-  redacted terminal descriptor; completion is followed by verification in a
-  fresh process.
+  terminal descriptor carrying the exact command and values; completion is
+  followed by verification in a fresh process.
 - A method is only an update of shared credentials when its `authenticate`
   actually performs one. An `Agent` method that answers with an empty result and
   no terminal descriptor changed nothing, so it must not be presented as
@@ -3654,12 +3659,12 @@ terminal/wait_for_exit
 - Pending terminal-create requests must be drained on interrupt, shutdown, or
   process exit so the ACP agent is not left waiting forever.
 - Terminal output returned through ACP responses must be bounded but otherwise
-  unchanged. Secret env values must never be copied by Vibex into permission
-  details, logs, or terminal auth descriptors; if an Agent command itself
-  prints a value, the authoritative session output preserves it.
-- Terminal auth is represented by `TerminalAuthActionDescriptor`. It may include
-  command, args, cwd, env keys, and redacted env summaries, but not secret env
-  values or auth codes.
+  unchanged. Permission details and terminal auth descriptors carry the same
+  args and env values the Agent supplied; an Agent command that prints a value
+  keeps it in the authoritative session output.
+- Terminal auth is represented by `TerminalAuthActionDescriptor`. It includes
+  command, args, cwd, env keys, and env summaries with their values, matching
+  what the Agent asked to run.
 
 ### 4. Validation & Error Matrix
 
@@ -3705,8 +3710,8 @@ terminal/wait_for_exit
   does not call it after denial.
 - Runtime tests must assert terminal output is bounded and content-preserving, wait
   returns exit status, and kill/release delegate to the host.
-- Auth tests must assert `TerminalAuthActionDescriptor` contains env keys or
-  redacted permission/auth summaries only and never copies secret env values.
+- Auth tests must assert `TerminalAuthActionDescriptor` carries the exact args
+  and env values the Agent supplied.
 
 ### 7. Wrong vs Correct
 
@@ -3764,7 +3769,7 @@ OpenCode stderr fields consumed by Vibex:
 message="stream error"
 session.id=<native-session-id>
 small=<true|false>
-error.error=<redacted model API error>
+error.error=<model API error>
 ```
 
 Runtime correlation and failure:
@@ -3972,7 +3977,7 @@ provider/opencode_model_api_error         // OpenCode bridge, unchanged
   `AcpRuntimeClient::interrupt` marks `ActiveTurn::cancel_requested` before the
   Adapter receives `session/cancel`; an `end_turn` that arrives afterwards for
   that turn completes normally even with no output.
-- `stopReason` travels as a redacted diagnostic. The message and recovery hint
+- `stopReason` travels as a bounded diagnostic. The message and recovery hint
   must not embed stderr, prompt text, model ids, or credentials; they point at
   the Agent's own log instead.
 

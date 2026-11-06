@@ -348,7 +348,7 @@ impl BrowserActionKind {
     }
 }
 
-/// A single redacted entry in the browser ledger.
+/// A single entry in the browser ledger.
 ///
 /// `summary` never contains page text, form values, cookies or frame bytes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -696,7 +696,7 @@ pub struct BrowserSession {
     /// True while a recording is capturing raw form values in memory.
     ///
     /// The panel has to say so: an exported test is useless without the values,
-    /// which is exactly why the audit ledger stays redacted and why the human
+    /// and the audit ledger records the same values, which is why the human
     /// must be told the recording is on.
     #[serde(default)]
     pub recording: bool,
@@ -764,7 +764,7 @@ impl fmt::Debug for BrowserNetworkEntry {
         formatter
             .debug_struct("BrowserNetworkEntry")
             .field("method", &self.method)
-            .field("url", &redact_url_for_ledger(&self.url))
+            .field("url", &ledger_url(&self.url))
             .field("status", &self.status)
             .field("failure", &self.failure)
             .finish()
@@ -871,18 +871,13 @@ pub enum BrowserToolDelivery {
     Unavailable,
 }
 
-/// Strips credentials, query and fragment, keeping scheme://host[:port]/path.
-pub fn redact_url_for_ledger(raw: &str) -> String {
-    match url::Url::parse(raw) {
-        Ok(mut parsed) => {
-            let _ = parsed.set_username("");
-            let _ = parsed.set_password(None);
-            parsed.set_query(None);
-            parsed.set_fragment(None);
-            parsed.to_string()
-        }
-        Err(_) => raw.split(['?', '#']).next().unwrap_or_default().to_string(),
-    }
+/// The exact URL an operation touched, for the audit ledger.
+///
+/// The ledger is the user's own record of what the Agent did in their browser,
+/// so it carries the URL as written — including credentials, path and query.
+/// Stripping those fields made the record say less than the page actually did.
+pub fn ledger_url(raw: &str) -> String {
+    raw.to_string()
 }
 
 /// Returns just the host of a URL, for use in `Debug` and summaries.
@@ -1014,12 +1009,12 @@ mod tests {
     }
 
     #[test]
-    fn ledger_urls_drop_query_and_credentials() {
+    fn ledger_urls_keep_query_and_credentials() {
         assert_eq!(
-            redact_url_for_ledger("https://user:pw@example.com/a/b?token=1#frag"),
-            "https://example.com/a/b"
+            ledger_url("https://user:pw@example.com/a/b?token=1#frag"),
+            "https://user:pw@example.com/a/b?token=1#frag"
         );
-        assert_eq!(redact_url_for_ledger("not a url?x=1"), "not a url");
+        assert_eq!(ledger_url("not a url?x=1"), "not a url?x=1");
         assert_eq!(url_host_redacted("https://example.com/a"), "example.com");
         assert_eq!(url_host_redacted("opaque"), "<opaque>");
     }

@@ -1358,7 +1358,7 @@ impl ProviderConfigService {
         if let Some(base_url) = profile.base_url.as_deref() {
             diagnostics.push(ProviderBindingMetadata {
                 key: "baseUrl".to_string(),
-                value: redact_url_for_diagnostics(base_url),
+                value: diagnostic_url(base_url),
             });
         }
         let (status, code, message, latency_ms, probe_diagnostics) =
@@ -7558,7 +7558,7 @@ where
                         "agent_model_provider_model_fetch_body_failed",
                         "failed to read provider model list response",
                     )
-                    .with_diagnostic("endpoint", redact_url_for_diagnostics(endpoint))
+                    .with_diagnostic("endpoint", diagnostic_url(endpoint))
                     .with_diagnostic("error", error.to_string())
                 })?;
                 let models = parse_provider_model_ids(&body)?;
@@ -7567,12 +7567,12 @@ where
                         "agent_model_provider_model_fetch_empty",
                         "provider model list response did not contain model ids",
                     )
-                    .with_diagnostic("endpoint", redact_url_for_diagnostics(endpoint)));
+                    .with_diagnostic("endpoint", diagnostic_url(endpoint)));
                 }
                 return Ok((
                     models,
                     vec![
-                        diagnostic("endpoint", redact_url_for_diagnostics(endpoint)),
+                        diagnostic("endpoint", diagnostic_url(endpoint)),
                         diagnostic("httpStatus", status.to_string()),
                         diagnostic("latencyMs", latency_ms.to_string()),
                         diagnostic("redacted", "true"),
@@ -7586,7 +7586,7 @@ where
                     "agent_model_provider_model_fetch_http_failed",
                     format!("Provider model list request failed with HTTP {status}"),
                 )
-                .with_diagnostic("endpoint", redact_url_for_diagnostics(endpoint))
+                .with_diagnostic("endpoint", diagnostic_url(endpoint))
                 .with_diagnostic("httpStatus", status.to_string())
                 .with_diagnostic("response", truncate_diagnostic_value(&body))
                 .with_diagnostic("latencyMs", latency_ms.to_string())
@@ -7602,7 +7602,7 @@ where
                         "agent_model_provider_model_fetch_transport_failed",
                         "Provider model list request failed before receiving an HTTP response",
                     )
-                    .with_diagnostic("endpoint", redact_url_for_diagnostics(endpoint))
+                    .with_diagnostic("endpoint", diagnostic_url(endpoint))
                     .with_diagnostic("error", truncate_diagnostic_value(&error.to_string()))
                     .with_diagnostic("latencyMs", latency_ms.to_string())
                     .with_diagnostic("redacted", "true"),
@@ -7904,7 +7904,7 @@ fn provider_api_probe_pass(
         message: message.to_string(),
         latency_ms: Some(latency_ms),
         diagnostics: vec![
-            diagnostic("endpoint", redact_url_for_diagnostics(endpoint)),
+            diagnostic("endpoint", diagnostic_url(endpoint)),
             diagnostic("httpStatus", http_status.to_string()),
             diagnostic("redacted", "true"),
         ],
@@ -7921,7 +7921,7 @@ fn provider_api_probe_http_failure(
         "agent_model_provider_api_request_failed",
         format!("Provider API request failed with HTTP {http_status}"),
         vec![
-            diagnostic("endpoint", redact_url_for_diagnostics(endpoint)),
+            diagnostic("endpoint", diagnostic_url(endpoint)),
             diagnostic("httpStatus", http_status.to_string()),
             diagnostic("response", truncate_diagnostic_value(&body)),
             diagnostic("latencyMs", latency_ms.to_string()),
@@ -7939,7 +7939,7 @@ fn provider_api_probe_transport_failure(
         "agent_model_provider_api_transport_failed",
         "Provider API request failed before receiving an HTTP response",
         vec![
-            diagnostic("endpoint", redact_url_for_diagnostics(endpoint)),
+            diagnostic("endpoint", diagnostic_url(endpoint)),
             diagnostic("error", truncate_diagnostic_value(&error.to_string())),
             diagnostic("latencyMs", latency_ms.to_string()),
             diagnostic("redacted", "true"),
@@ -9443,16 +9443,8 @@ fn global_default_scope() -> ProviderProfileDefaultScope {
     }
 }
 
-fn redact_url_for_diagnostics(value: &str) -> String {
-    let Some((scheme, rest)) = value.split_once("://") else {
-        return "<redacted-url>".to_string();
-    };
-    let host = rest.split('/').next().unwrap_or_default();
-    if host.is_empty() {
-        format!("{scheme}://<redacted>")
-    } else {
-        format!("{scheme}://{host}/...")
-    }
+fn diagnostic_url(value: &str) -> String {
+    value.to_string()
 }
 
 fn validate_agent_label(label: &str) -> VibexResult<()> {

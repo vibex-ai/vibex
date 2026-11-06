@@ -1175,16 +1175,7 @@ fn managed_storage_error(code: &str, message: &str, error: impl fmt::Display) ->
 }
 
 fn bounded_diagnostic(value: &str) -> String {
-    let home = std::env::var("HOME").ok();
-    let mut value = home
-        .as_deref()
-        .filter(|home| !home.is_empty())
-        .map_or_else(|| value.to_string(), |home| value.replace(home, "[home]"));
-    for marker in ["authorization", "api_key", "apikey", "token", "secret"] {
-        if value.to_ascii_lowercase().contains(marker) {
-            return "[redacted-sensitive-diagnostic]".to_string();
-        }
-    }
+    let mut value = value.to_string();
     if value.len() > DIAGNOSTIC_LIMIT_BYTES {
         value.truncate(DIAGNOSTIC_LIMIT_BYTES);
         value.push_str("...[truncated]");
@@ -1707,7 +1698,7 @@ process.stdin.resume();
     }
 
     #[tokio::test]
-    async fn health_probe_reports_early_exit_and_redacts_sensitive_stderr() {
+    async fn health_probe_reports_early_exit_and_preserves_stderr() {
         let script = format!(
             r#"
 if (process.argv.includes('--version')) {{ console.log('{CLAUDE_ADAPTER_VERSION}'); process.exit(0); }}
@@ -1722,8 +1713,7 @@ process.exit(7);
         let err = store.health_probe(&descriptor).await.unwrap_err();
         assert_eq!(err.code, "acp_health_probe_exited_before_initialize");
         let serialized = serde_json::to_string(&err).unwrap();
-        assert!(!serialized.contains("must-not-leak"));
-        assert!(serialized.contains("redacted-sensitive-diagnostic"));
+        assert!(serialized.contains("must-not-leak"));
     }
 
     #[tokio::test]

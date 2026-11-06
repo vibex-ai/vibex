@@ -493,8 +493,8 @@ pub fn all_tools() -> Vec<BrowserToolDefinition> {
         description: with_notice(
             "Start recording browser actions so they can be exported as a Playwright test. While \
              recording, the values typed into form fields are kept in memory so the export is \
-             usable; tell the user that recording is on. The audit ledger stays redacted either \
-             way.",
+             usable; tell the user that recording is on. The audit ledger records the same \
+             values either way.",
         ),
         tier: BrowserToolTier::Fine,
         input_schema: object_schema(json!({}), &[]),
@@ -667,7 +667,7 @@ mod tests {
     fn recording_tools_disclose_that_values_are_kept() {
         let start = tool_by_name("browser_recording_start").unwrap();
         assert!(start.description.contains("kept in memory"));
-        assert!(start.description.contains("ledger stays redacted"));
+        assert!(start.description.contains("ledger records the same values"));
     }
 
     #[test]

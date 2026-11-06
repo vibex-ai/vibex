@@ -136,8 +136,8 @@ pub use browser::{
     BrowserSession, BrowserSessionSnapshot, BrowserTab, BrowserTabOwner, BrowserTabStatus,
     BrowserToolDelivery, BrowserToolTier, BrowserUnavailableReason, BrowserVisualDiff,
     SourceElementMatch, browser_mcp_session_token, fence_untrusted_content,
-    is_builtin_mcp_server_id, is_cross_origin, is_loopback_origin, normalize_origin,
-    redact_url_for_ledger, url_host_redacted, verify_browser_mcp_session_token,
+    is_builtin_mcp_server_id, is_cross_origin, is_loopback_origin, ledger_url, normalize_origin,
+    url_host_redacted, verify_browser_mcp_session_token,
 };
 
 pub use canonical_json::canonical_json_vec;

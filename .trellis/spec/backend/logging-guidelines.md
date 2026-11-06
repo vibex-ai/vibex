@@ -68,25 +68,37 @@ Audit logs are separate from diagnostic logs. Record remote or destructive
 actions that affect local state, including permission approvals, Git operations,
 terminal input, file writes/deletes, provider export, and device revocation.
 
-Audit logs should reference operation ids and timeline ids rather than copying
-sensitive payload contents.
+Audit logs are read by the person who owns the runtime. They name the operation,
+the target, and the value the Agent actually used. Do not replace a field with
+`[redacted]` merely because its text contains a word such as `token` or
+`secret`: a record that cannot say what happened is not an audit record.
 
-## Redaction
+## Content Transparency
 
-Always redact:
+Vibex is installed and run by the person using it. Everything the product
+presents back to that person is reproduced exactly, subject only to size bounds:
 
-- API keys and auth tokens.
-- HTTP headers that may contain secrets.
-- Private keys and pairing secrets.
-- Environment variable values that look credential-like.
-- Full `.env` contents.
-- Provider injection secret values.
+- Session content, tool calls, permission titles/details, notices, and errors.
+- Gateway route traces, including the vendor's refusal text.
+- Browser and terminal action ledgers, including URLs, commands, arguments, and
+  values typed into a page.
+- Managed-adapter install and health diagnostics.
+
+A keyword or pattern match must never replace user-visible text with
+`[redacted]`, `[redacted-sensitive-output]`, or another placeholder. The person
+running Vibex owns the machine and the data; hiding the evidence they need makes
+the product less safe, not more.
+
+Credential storage is a separate boundary. A secret the user configured stays a
+secret reference and is not copied into a non-secret projection. That is a
+decision about what Vibex stores, not a filter on what it shows.
 
 ## Anti-Patterns
 
 - Do not log full prompts by default.
 - Do not log terminal output at `info` level.
 - Do not put secrets into structured fields and rely on later filtering.
+- Do not keyword-filter user-visible content; preserve it and bound its size.
 - Do not let Relay logs include decrypted business payloads because Relay must
   never see plaintext business payloads.
 

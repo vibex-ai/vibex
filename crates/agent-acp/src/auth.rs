@@ -37,7 +37,7 @@ impl fmt::Debug for AcpTerminalAuthSpec {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("AcpTerminalAuthSpec")
-            .field("title", &crate::redact_summary(&self.title))
+            .field("title", &crate::bounded_text(&self.title))
             .field("has_command", &!self.command.trim().is_empty())
             .field("argument_count", &self.args.len())
             .field("has_cwd", &self.cwd.is_some())

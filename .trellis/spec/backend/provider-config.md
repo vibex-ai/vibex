@@ -2014,7 +2014,7 @@ ProviderProfileChangeListener::on_provider_profile_saved(profile_id, updated_at_
 - Build the snapshot from an explicit process-field allowlist. Do not serialize or hash the whole API DTO, `ProviderProfile`, or `SessionRuntimeConfigState`.
 - Canonical encoding is domain-separated, length-delimited, ordered by fixed field order, with sorted `BTreeMap` keys and preserved vector order. The digest is the only externally observable fingerprint value.
 - `profile_revision` is a deterministic revision of the process-effective projection, not the wall-clock `updated_at_ms`; equivalent saves therefore recover the original fingerprint.
-- Secret values never enter the snapshot, Debug output, event, log, or error. Secret references use opaque reference metadata/version (or a keyed digest supplied by the secret owner). Sensitive literal env entries are rejected; sensitive parent-environment entries keep only a stable env reference.
+- Secret references stay opaque: the snapshot carries reference metadata/version (or a keyed digest supplied by the secret owner), never the resolved value. Literal and process-environment entries are the user's own values and are carried into the snapshot as configured; a key whose name contains `token` or `secret` is not special-cased.
 - The launch path materializes effective args/env once, uses that materialization for the child and the acquire key, and never resolves a secret in the stale-refresh-only path.
 - The process acquire key remains `(route_key, provider_profile_id, process_spawn_fingerprint, workspace_scope)`. Session, binding, native session and PID are not process identity.
 - A registered process retains its immutable launch snapshot and current observed fingerprint/status. Profile save refresh compares against the launch snapshot, emits one bounded event for a new observed fingerprint, and does not terminate or mutate the process. Active turns and host requests continue until the later switch coordinator applies its policy.
@@ -2026,7 +2026,6 @@ ProviderProfileChangeListener::on_provider_profile_saved(profile_id, updated_at_
 
 - Empty process fingerprint -> `validation/acp_process_spawn_fingerprint_empty`.
 - Invalid/empty secret reference metadata -> `validation/acp_secret_reference_version_invalid`.
-- Sensitive literal environment value -> `validation/acp_sensitive_literal_env`; use `SecretReference` instead.
 - Refresh for a removed process -> `process/acp_process_instance_missing`; the config write remains committed and the runtime skips that lost instance.
 - Unknown/unsupported live mutation capability -> classify as `StaleRestartRequired`, never silently mutate the old process.
 - Registry lock failure -> `process/acp_process_registry_lock_poisoned`; no process shutdown is attempted by stale detection.
@@ -2695,8 +2694,9 @@ ProviderProfile.providerOptions.entries[
 - Injection preview expands ACP config into redacted command, arg, env, cwd,
   model, mode, feature, and disabled-tool fields. It must not show the raw
   `acp.config.v1` JSON blob.
-- Plaintext credential-like env literals are rejected. Credential env values
-  must use process environment or secret-reference metadata.
+- Credential values may be configured literally, taken from the process
+  environment, or held as a secret reference. The preview names the source and
+  the key; a secret reference never contributes its resolved value.
 
 ### 4. Validation & Error Matrix
 
@@ -5264,7 +5264,7 @@ ManagementBackend::fetch_agent_model_provider_draft_models(request)
 | Draft has no request URL | `agent_model_provider_endpoint_missing`. |
 | Protocol is Mistral Conversations | `agent_model_provider_protocol_unsupported`; add Models manually. |
 | No Model pins a protocol and the Agent declares none | `agent_model_provider_protocol_missing`. |
-| Endpoint answers 404/405 on one candidate path | try the next candidate; other HTTP failures surface with a redacted endpoint and status. |
+| Endpoint answers 404/405 on one candidate path | try the next candidate; other HTTP failures surface with the exact endpoint and status. |
 
 ### 5. Good / Base / Bad Cases
 

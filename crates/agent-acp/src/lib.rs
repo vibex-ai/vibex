@@ -130,7 +130,7 @@ pub use registry::{
 pub use runtime::{
     AcpRuntimeClient, AcpRuntimeLifecycleBackend, AcpRuntimeSwitchBridge, AcpTerminalAuthRequest,
     AcpTerminalCreateRequest, AcpTerminalExitStatus, AcpTerminalHost, AcpTerminalOutput,
-    DisabledAcpTerminalHost, redacted_terminal_auth_action_descriptor,
+    DisabledAcpTerminalHost, terminal_auth_action_descriptor,
 };
 pub use runtime_probe::{AgentRuntimeProbeReconcileReport, AgentRuntimeProbeService};
 pub use session_attachment_registry::{
@@ -169,7 +169,6 @@ const OPENCODE_ACP_MODEL_SAMPLE_LIMIT: usize = 5;
 const OPENCODE_ACP_CATEGORY_SAMPLE_LIMIT: usize = 12;
 const OPENCODE_ACP_PERMISSION_DETAIL_LIMIT: usize = 6;
 const OPENCODE_ACP_PERMISSION_VALUE_LIMIT: usize = 120;
-const REDACTED_SENSITIVE_OUTPUT: &str = "[redacted-sensitive-output]";
 const CODEX_ACP_PROVIDER_COMMANDS: &[CodexAcpSlashCommand] = &[
     CodexAcpSlashCommand {
         name: "plan",
@@ -784,7 +783,7 @@ impl OpenCodeAcpRuntimeConfig {
                 "acp_opencode_args_missing_acp",
                 "OpenCode ACP runtime must be configured with the opencode acp subcommand",
             )
-            .with_diagnostic("args", redacted_args_summary(&config.args)));
+            .with_diagnostic("args", display_args_summary(&config.args)));
         }
         if let Some(cwd_template) = config.cwd_template.as_deref()
             && cwd_template != "{workspaceRoot}"
@@ -1192,7 +1191,7 @@ impl OpenCodeAcpStdioSession {
                 "OpenCode ACP runtime process could not be started",
             )
             .with_diagnostic("command", command.display().to_string())
-            .with_diagnostic("args", redacted_args_summary(&args))
+            .with_diagnostic("args", display_args_summary(&args))
             .with_diagnostic("cwd", workspace_path.display().to_string())
             .with_diagnostic("error", err.to_string())
         })?;
@@ -1440,7 +1439,7 @@ impl OpenCodeAcpStdioSession {
                             error
                                 .get("message")
                                 .and_then(Value::as_str)
-                                .map(redact_summary)
+                                .map(bounded_text)
                                 .unwrap_or_else(|| "unknown".to_string()),
                         ));
                     }
@@ -1523,7 +1522,7 @@ impl OpenCodeAcpStdioSession {
             return None;
         }
         let joined = lines.join("\n");
-        Some(redact_summary(&joined))
+        Some(bounded_text(&joined))
     }
 
     fn shutdown(mut self) -> Option<i32> {
@@ -1547,7 +1546,7 @@ fn parse_json_rpc_line(line: &str) -> VibexResult<Value> {
             "OpenCode ACP runtime emitted non-JSON-RPC stdout",
         )
         .with_diagnostic("error", err.to_string())
-        .with_diagnostic("lineSummary", redact_summary(line))
+        .with_diagnostic("lineSummary", bounded_text(line))
     })?;
     if !value.is_object() {
         return Err(VibexError::provider(
@@ -1588,7 +1587,7 @@ fn summarize_opencode_permission_request(message: &Value) -> OpenCodeAcpPermissi
     let tool_call = params.and_then(|params| params.get("toolCall"));
     let provider_request_id = message
         .get("id")
-        .and_then(json_rpc_id_to_redacted_string)
+        .and_then(json_rpc_id_to_string)
         .filter(|value| !value.is_empty());
     let title = permission_request_title(params, tool_call);
     let risk_source = permission_risk_source(params, tool_call, &title);
@@ -1638,8 +1637,8 @@ fn permission_request_title(params: Option<&Value>, tool_call: Option<&Value>) -
     let Some(raw_title) = raw_title else {
         return "OpenCode ACP permission request".to_string();
     };
-    let title = bounded_redacted_value(&raw_title);
-    if title.is_empty() || title == REDACTED_SENSITIVE_OUTPUT {
+    let title = bounded_permission_value(&raw_title);
+    if title.is_empty() {
         "OpenCode ACP permission request".to_string()
     } else {
         title
@@ -1683,7 +1682,7 @@ fn permission_string_field(value: Option<&Value>, keys: &[&str]) -> Option<Strin
     })
 }
 
-fn json_rpc_id_to_redacted_string(value: &Value) -> Option<String> {
+fn json_rpc_id_to_string(value: &Value) -> Option<String> {
     let raw = if let Some(value) = value.as_str() {
         value.to_string()
     } else if let Some(value) = value.as_i64() {
@@ -1691,14 +1690,14 @@ fn json_rpc_id_to_redacted_string(value: &Value) -> Option<String> {
     } else {
         value.as_u64()?.to_string()
     };
-    Some(bounded_redacted_value(&raw))
+    Some(bounded_permission_value(&raw))
 }
 
 fn push_permission_detail(details: &mut Vec<PermissionActionDetail>, label: &str, value: &str) {
     if details.len() >= OPENCODE_ACP_PERMISSION_DETAIL_LIMIT {
         return;
     }
-    let value = bounded_redacted_value(value);
+    let value = bounded_permission_value(value);
     if value.is_empty() {
         return;
     }
@@ -1708,8 +1707,8 @@ fn push_permission_detail(details: &mut Vec<PermissionActionDetail>, label: &str
     });
 }
 
-fn bounded_redacted_value(value: &str) -> String {
-    let value = redact_summary(value);
+fn bounded_permission_value(value: &str) -> String {
+    let value = bounded_text(value);
     if value.len() > OPENCODE_ACP_PERMISSION_VALUE_LIMIT {
         let prefix: String = value
             .chars()
@@ -1791,7 +1790,7 @@ fn extract_session_config_snapshot(result: &Value) -> OpenCodeAcpSessionConfigSn
                 let Some(category) = entry.get("category").and_then(Value::as_str) else {
                     continue;
                 };
-                let category = redact_summary(category);
+                let category = bounded_text(category);
                 if category.is_empty() || categories.iter().any(|value| value == &category) {
                     continue;
                 }
@@ -1835,7 +1834,7 @@ fn extract_session_config_snapshot(result: &Value) -> OpenCodeAcpSessionConfigSn
                 .and_then(|entry| entry.get("currentValue"))
                 .and_then(Value::as_str)
         })
-        .map(redact_summary)
+        .map(bounded_text)
         .filter(|value| !value.is_empty());
     let model_option_count = raw_model_options.map_or(0, |models| models.len());
     let model_options_sample = raw_model_options
@@ -1892,7 +1891,7 @@ fn value_key_list(value: &Value) -> Vec<String> {
 
 fn model_option_summary(value: &Value) -> Option<OpenCodeAcpModelOptionSummary> {
     if let Some(model_id) = value.as_str() {
-        let model_id = redact_summary(model_id);
+        let model_id = bounded_text(model_id);
         if model_id.is_empty() {
             return None;
         }
@@ -1907,12 +1906,12 @@ fn model_option_summary(value: &Value) -> Option<OpenCodeAcpModelOptionSummary> 
         .and_then(Value::as_str)
         .or_else(|| value.get("value").and_then(Value::as_str))
         .or_else(|| value.get("id").and_then(Value::as_str))
-        .map(redact_summary)
+        .map(bounded_text)
         .filter(|value| !value.is_empty())?;
     let name = value
         .get("name")
         .and_then(Value::as_str)
-        .map(redact_summary)
+        .map(bounded_text)
         .filter(|value| !value.is_empty());
 
     Some(OpenCodeAcpModelOptionSummary { model_id, name })
@@ -1936,7 +1935,7 @@ fn opencode_session_metadata(
         },
         ProviderBindingMetadata {
             key: "args".to_string(),
-            value: redacted_args_summary(&runtime_config.stdio_args()),
+            value: display_args_summary(&runtime_config.stdio_args()),
         },
         ProviderBindingMetadata {
             key: "workspacePath".to_string(),
@@ -1978,13 +1977,13 @@ fn opencode_session_metadata(
     if let Some(agent_name) = initialize.agent_name.as_deref() {
         metadata.push(ProviderBindingMetadata {
             key: "agentName".to_string(),
-            value: redact_summary(agent_name),
+            value: bounded_text(agent_name),
         });
     }
     if let Some(agent_version) = initialize.agent_version.as_deref() {
         metadata.push(ProviderBindingMetadata {
             key: "agentVersion".to_string(),
-            value: redact_summary(agent_version),
+            value: bounded_text(agent_version),
         });
     }
     if let Some(model) = runtime_config.model.as_deref() {
@@ -2002,7 +2001,7 @@ fn opencode_session_metadata(
     if let Some(stderr_summary) = stderr_summary {
         metadata.push(ProviderBindingMetadata {
             key: "stderrSummary".to_string(),
-            value: redact_summary(stderr_summary),
+            value: bounded_text(stderr_summary),
         });
     }
     metadata
@@ -3282,7 +3281,7 @@ fn probe_opencode_version(binary_path: &Path) -> OpenCodeAcpSmokeRunResult<Strin
             output.status.code()
         )));
     }
-    Ok(redacted_output_summary(&output.stdout).unwrap_or_else(|| "unknown".to_string()))
+    Ok(output_summary(&output.stdout).unwrap_or_else(|| "unknown".to_string()))
 }
 
 async fn attempt_acp_adapter_boundary(
@@ -3388,13 +3387,11 @@ async fn attempt_acp_turn_boundary(
     }
 }
 
-fn redacted_output_summary(output: &[u8]) -> Option<String> {
+fn output_summary(output: &[u8]) -> Option<String> {
     let text = String::from_utf8_lossy(output);
     let text = text.trim();
     if text.is_empty() {
         None
-    } else if looks_sensitive(text) {
-        Some("[redacted-sensitive-output]".to_string())
     } else if text.len() > 300 {
         let prefix: String = text.chars().take(300).collect();
         Some(format!("{prefix}...(truncated)"))
@@ -3403,49 +3400,28 @@ fn redacted_output_summary(output: &[u8]) -> Option<String> {
     }
 }
 
-pub(crate) fn redacted_args_summary(args: &[String]) -> String {
-    redacted_args(args).join(" ")
+pub(crate) fn display_args_summary(args: &[String]) -> String {
+    display_args(args).join(" ")
 }
 
-pub(crate) fn redacted_args(args: &[String]) -> Vec<String> {
-    let mut redact_next = false;
-    args.iter()
-        .map(|arg| {
-            let redact_current = redact_next || looks_sensitive(arg);
-            redact_next = sensitive_option_takes_value(arg);
-            if redact_current {
-                "[redacted]".to_string()
-            } else {
-                arg.clone()
-            }
-        })
-        .collect()
+pub(crate) fn display_args(args: &[String]) -> Vec<String> {
+    args.to_vec()
 }
 
-fn sensitive_option_takes_value(argument: &str) -> bool {
-    argument.starts_with('-') && !argument.contains('=') && looks_sensitive(argument)
-}
-
-pub(crate) fn redact_summary(value: &str) -> String {
+pub(crate) fn bounded_text(value: &str) -> String {
     let value = value.trim();
     if value.is_empty() {
         return String::new();
-    }
-    if looks_sensitive(value) {
-        return "[redacted-sensitive-output]".to_string();
     }
     bounded_summary(value)
 }
 
 /// User-visible session content is preserved exactly apart from the shared
-/// timeline size bound. Redaction belongs to diagnostics and credential
-/// projections, not to the authoritative conversation.
+/// timeline size bound. The runtime never replaces content it is about to show
+/// the user with a redaction placeholder; the person running Vibex owns that
+/// surface and decides what is safe to display.
 pub(crate) fn bounded_session_content(value: &str) -> String {
-    let value = value.trim();
-    if value.is_empty() {
-        return String::new();
-    }
-    bounded_summary(value)
+    bounded_text(value)
 }
 
 fn bounded_summary(value: &str) -> String {
@@ -3482,11 +3458,11 @@ fn provider_binding(
         auth_source,
         auth_source_revision,
         native: ProviderNativeBinding {
-            native_session_id: sanitize_optional_native_value(acp_session.native_session_id),
-            native_thread_id: sanitize_optional_native_value(acp_session.native_thread_id),
-            native_resume_token: sanitize_optional_native_value(acp_session.native_resume_token),
+            native_session_id: acp_session.native_session_id,
+            native_thread_id: acp_session.native_thread_id,
+            native_resume_token: acp_session.native_resume_token,
             session_config_state: acp_session.session_config_state,
-            redacted_metadata: sanitize_metadata(acp_session.redacted_metadata),
+            redacted_metadata: acp_session.redacted_metadata,
         },
         created_at_ms: created_at_ms.unwrap_or(now),
         updated_at_ms: now,
@@ -3677,11 +3653,6 @@ pub(crate) fn map_acp_event(
         }
         AcpEvent::Goal(payload) => ProviderEvent::provider(TimelinePayload::Goal(payload)),
         AcpEvent::Unknown { event_kind } => {
-            let event_kind = if looks_sensitive(&event_kind) {
-                "redacted".to_string()
-            } else {
-                event_kind
-            };
             ProviderEvent::provider(TimelinePayload::SystemNotice(SystemNoticePayload {
                 level: SystemNoticeLevel::Warning,
                 message: format!("Ignored unsupported ACP event kind: {event_kind}"),
@@ -3732,22 +3703,6 @@ fn retry_attempts_from_text(text: &str) -> (Option<u32>, Option<u32>) {
             .ok()
             .filter(|value| *value > 0),
     )
-}
-
-fn sanitize_metadata(metadata: Vec<ProviderBindingMetadata>) -> Vec<ProviderBindingMetadata> {
-    metadata
-        .into_iter()
-        .filter_map(|entry| {
-            if looks_sensitive(&entry.key) || looks_sensitive(&entry.value) {
-                return None;
-            }
-            Some(entry)
-        })
-        .collect()
-}
-
-fn sanitize_optional_native_value(value: Option<String>) -> Option<String> {
-    value.filter(|value| !looks_sensitive(value))
 }
 
 pub(crate) fn looks_sensitive(value: &str) -> bool {
@@ -4579,8 +4534,8 @@ mod tests {
     }
 
     #[test]
-    fn redacted_args_summary_removes_secret_like_values() {
-        let summary = redacted_args_summary(&[
+    fn display_args_summary_preserves_secret_like_values() {
+        let summary = display_args_summary(&[
             "acp".to_string(),
             "--token".to_string(),
             "plain-secret-value".to_string(),
@@ -4588,9 +4543,7 @@ mod tests {
             "safe".to_string(),
         ]);
 
-        assert!(summary.contains("[redacted]"));
-        assert!(!summary.contains("plain-secret-value"));
-        assert!(summary.ends_with("--mode safe"));
+        assert_eq!(summary, "acp --token plain-secret-value --mode safe");
     }
 
     #[test]
@@ -4697,7 +4650,7 @@ mod tests {
     }
 
     #[test]
-    fn opencode_permission_request_summary_redacts_secret_like_values() {
+    fn opencode_permission_request_summary_preserves_secret_like_values() {
         let summary = summarize_opencode_permission_request(&json!({
             "jsonrpc": "2.0",
             "id": "sk-secret-request-id",
@@ -4717,11 +4670,11 @@ mod tests {
 
         assert_eq!(
             summary.provider_request_id.as_deref(),
-            Some(REDACTED_SENSITIVE_OUTPUT)
+            Some("sk-secret-request-id")
         );
-        assert_eq!(summary.title, "OpenCode ACP permission request");
-        assert!(!serialized.contains("sk-secret"));
-        assert!(!serialized.contains("token-tool-call"));
+        assert_eq!(summary.title, "Run command with sk-secret-token");
+        assert!(serialized.contains("sk-secret"));
+        assert!(serialized.contains("token-tool-call"));
     }
 
     #[test]
@@ -4769,7 +4722,7 @@ mod tests {
     }
 
     #[test]
-    fn session_config_snapshot_bounds_samples_and_redacts_secret_like_values() {
+    fn session_config_snapshot_bounds_samples_and_preserves_secret_like_values() {
         let snapshot = extract_session_config_snapshot(&json!({
             "sessionId": "session-1",
             "availableModels": [
@@ -4786,15 +4739,12 @@ mod tests {
         assert_eq!(snapshot.model_option_count, 6);
         assert_eq!(
             snapshot.current_model_id.as_deref(),
-            Some("[redacted-sensitive-output]")
+            Some("sk-secret-model")
         );
         assert_eq!(snapshot.model_options_sample.len(), 5);
-        assert_eq!(
-            snapshot.model_options_sample[0].model_id,
-            "[redacted-sensitive-output]"
-        );
+        assert_eq!(snapshot.model_options_sample[0].model_id, "sk-secret-model");
         let serialized = serde_json::to_string(&snapshot).unwrap();
-        assert!(!serialized.contains("sk-secret-model"));
+        assert!(serialized.contains("sk-secret-model"));
         assert!(!serialized.contains("provider/model-6"));
     }
 
@@ -4908,7 +4858,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_session_redacts_secret_like_metadata() {
+    async fn create_session_preserves_secret_like_metadata() {
         let provider = AcpAgentProvider::new(Arc::new(FixtureAcpClient::new(
             AcpSession {
                 native_session_id: Some("acp-session-1".to_string()),
@@ -4951,12 +4901,15 @@ mod tests {
             .unwrap();
 
         assert_eq!(handle.binding.provider_kind, ProviderKind::Acp);
-        assert_eq!(handle.binding.native.native_resume_token, None);
-        assert_eq!(handle.binding.native.redacted_metadata.len(), 1);
+        assert_eq!(
+            handle.binding.native.native_resume_token.as_deref(),
+            Some("secret-token-value")
+        );
+        assert_eq!(handle.binding.native.redacted_metadata.len(), 2);
         assert_eq!(handle.binding.native.redacted_metadata[0].key, "client");
         let binding_json = format!("{:?}", handle.binding);
-        assert!(!binding_json.contains("sk-should-not-persist"));
-        assert!(!binding_json.contains("secret-token-value"));
+        assert!(binding_json.contains("sk-should-not-persist"));
+        assert!(binding_json.contains("secret-token-value"));
     }
 
     #[tokio::test]

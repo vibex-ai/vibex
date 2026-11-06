@@ -15,7 +15,7 @@
 
 use std::path::{Component, PathBuf};
 
-use vibex_core::{BrowserUnavailableReason, is_loopback_origin, redact_url_for_ledger};
+use vibex_core::{BrowserUnavailableReason, is_loopback_origin, ledger_url};
 
 use crate::error::{BrowserError, BrowserResult};
 
@@ -441,11 +441,11 @@ pub fn unavailable_detail(reason: BrowserUnavailableReason) -> String {
     }
 }
 
-/// Summary text for a ledger entry, with anything sensitive removed.
+/// Summary text for a ledger entry, naming the exact target.
 pub fn ledger_summary(action: &str, target: Option<&str>) -> String {
     match target {
         Some(target) if !target.is_empty() => {
-            format!("{action} {}", redact_url_for_ledger(target))
+            format!("{action} {}", ledger_url(target))
         }
         _ => action.to_string(),
     }
@@ -785,10 +785,10 @@ mod tests {
     }
 
     #[test]
-    fn ledger_summaries_drop_query_strings() {
+    fn ledger_summaries_keep_query_strings() {
         assert_eq!(
             ledger_summary("navigate to", Some("https://example.com/a?token=1")),
-            "navigate to https://example.com/a"
+            "navigate to https://example.com/a?token=1"
         );
         assert_eq!(ledger_summary("list tabs", None), "list tabs");
     }

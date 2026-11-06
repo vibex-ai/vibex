@@ -419,7 +419,7 @@ impl BrowserRuntime {
         }
     }
 
-    /// Maps a redacted ledger entry onto the persisted audit row.
+    /// Maps a ledger entry onto the persisted audit row.
     pub fn audit_record(
         entry: &BrowserActionRecord,
         agent_session_id: Option<&VibexSessionId>,

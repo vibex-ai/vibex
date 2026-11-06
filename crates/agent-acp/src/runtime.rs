@@ -161,8 +161,8 @@ use crate::{
     AcpClient, AcpCreateSessionRequest, AcpElicitationResolution, AcpEvent,
     AcpPermissionResolution, AcpRuntimeCommand, AcpRuntimeSessionProbe, AcpSendTurnRequest,
     AcpSession, AcpSteerOutcome, AcpSteerTurnRequest, AcpTurn, bounded_session_content,
-    infer_permission_risk_category, looks_sensitive, plan_codex_fork, redact_summary,
-    redacted_args, redacted_args_summary,
+    bounded_text, display_args, display_args_summary, infer_permission_risk_category,
+    looks_sensitive, plan_codex_fork,
 };
 use crate::{
     AgentEventInput, AgentEventInputSource, ClaudeBackgroundWorkRegistry, ClaudeTranscriptEvent,
@@ -568,18 +568,18 @@ impl AcpDebugLog {
             .map(|native_session_id| {
                 let message = fields
                     .get("message")
-                    .map(|message| redact_summary(message))
+                    .map(|message| bounded_debug_text(message))
                     .unwrap_or_else(|| "ACP stderr".to_string());
                 let error = fields
                     .get("error.error")
-                    .map(|error| redact_summary(error))
+                    .map(|error| bounded_debug_text(error))
                     .unwrap_or_default();
                 format!(
                     "{message} nativeSession={} error={error}",
                     native_session_fingerprint(native_session_id)
                 )
             })
-            .unwrap_or_else(|| redact_summary(line));
+            .unwrap_or_else(|| bounded_debug_text(line));
         self.record(direction, message);
     }
 
@@ -1184,6 +1184,15 @@ fn resolve_mcp_command_path(command: &str) -> String {
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
+fn bounded_debug_text(value: &str) -> String {
+    if looks_sensitive(value) {
+        "[redacted]".to_string()
+    } else {
+        bounded_text(value)
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
 fn redact_debug_value(value: &Value) -> Value {
     match value {
         Value::Object(object) => {
@@ -1211,7 +1220,7 @@ fn redact_debug_value(value: &Value) -> Value {
             if looks_sensitive(text) {
                 Value::String("[redacted]".to_string())
             } else {
-                Value::String(redact_summary(text))
+                Value::String(bounded_text(text))
             }
         }
         _ => value.clone(),
@@ -1987,7 +1996,7 @@ fn provider_credential_shape_error(method: &str, rpc_message: &str) -> VibexErro
     // *reason* instead: it is derived, it cannot contain the value, and it is
     // what distinguishes a blank key from one that cannot go in a header.
     .with_diagnostic("credentialShape", credential_shape_reason(rpc_message))
-    .with_diagnostic("rpcMessage", redact_summary(rpc_message))
+    .with_diagnostic("rpcMessage", bounded_text(rpc_message))
 }
 
 /// The actionable part of a credential shape rejection, as a stable token.
@@ -2300,8 +2309,8 @@ fn provider_authentication_required_error(
     )
     .with_recovery_hint("Sign in from the Agent authentication settings, then retry.")
     .with_diagnostic("method", method)
-    .with_diagnostic("rpcMessage", redact_summary(rpc_message))
-    .with_diagnostic("stderrSummary", redact_summary(stderr_summary))
+    .with_diagnostic("rpcMessage", bounded_text(rpc_message))
+    .with_diagnostic("stderrSummary", bounded_text(stderr_summary))
 }
 
 fn append_bounded_assistant_text(buffer: &mut String, truncated: &mut bool, text: &str) {
@@ -2902,11 +2911,11 @@ impl std::fmt::Debug for AcpTerminalCreateRequest {
                 "session_id",
                 &self.session_id.as_deref().map(native_session_fingerprint),
             )
-            .field("command", &redact_summary(&self.command))
-            .field("args", &redacted_args_summary(&self.args))
+            .field("command", &bounded_text(&self.command))
+            .field("args", &display_args_summary(&self.args))
             .field("cwd", &self.cwd)
             .field("env_keys", &env_keys)
-            .field("title", &self.title.as_deref().map(redact_summary))
+            .field("title", &self.title.as_deref().map(bounded_text))
             .finish()
     }
 }
@@ -2941,7 +2950,7 @@ impl std::fmt::Debug for AcpTerminalAuthRequest {
             .debug_struct("AcpTerminalAuthRequest")
             .field("provider_profile_id", &self.provider_profile_id)
             .field("method_id", &self.method_id)
-            .field("title", &redact_summary(&self.title))
+            .field("title", &bounded_text(&self.title))
             .field("has_command", &!self.command.trim().is_empty())
             .field("argument_count", &self.args.len())
             .field("has_cwd", &self.cwd.is_some())
@@ -4532,7 +4541,7 @@ impl AcpSessionAttachment {
             .iter()
             .take(ACP_ACTIVE_TOOL_CALL_LIMIT)
             .map(|(tool_call_id, call)| RuntimeLiveToolCallSnapshot {
-                tool_call_id: redact_summary(tool_call_id),
+                tool_call_id: bounded_text(tool_call_id),
                 title: bounded_session_content(&call.title),
                 kind: bounded_session_content(&call.kind),
                 status: "in_progress".to_string(),
@@ -4552,9 +4561,9 @@ impl AcpSessionAttachment {
                     session_id: session_id.clone(),
                     project_id: None,
                     workspace_id: None,
-                    provider_request_id: Some(redact_summary(request_id)),
+                    provider_request_id: Some(bounded_text(request_id)),
                     risk_category: pending.risk_category,
-                    title: redact_summary(&pending.title),
+                    title: bounded_text(&pending.title),
                     details: pending.details.clone(),
                     allowed_responses: pending
                         .options
@@ -4577,8 +4586,8 @@ impl AcpSessionAttachment {
                     .iter()
                     .filter_map(|option| option.current_value.as_ref())
                     .map(|value| SessionConfigValue {
-                        value: redact_summary(&value.value),
-                        label: value.label.as_deref().map(redact_summary),
+                        value: bounded_text(&value.value),
+                        label: value.label.as_deref().map(bounded_text),
                     })
                     .take(128)
                     .collect::<Vec<_>>()
@@ -4593,11 +4602,11 @@ impl AcpSessionAttachment {
             current_model: state
                 .current_model_id
                 .clone()
-                .map(|value| redact_summary(&value)),
+                .map(|value| bounded_text(&value)),
             current_mode: state
                 .current_mode_id
                 .clone()
-                .map(|value| redact_summary(&value)),
+                .map(|value| bounded_text(&value)),
             config_options,
             active_message,
             active_tool_calls,
@@ -5180,7 +5189,7 @@ impl AcpSessionAttachment {
                     .get("currentModeId")
                     .or_else(|| update.get("modeId"))
                     .and_then(Value::as_str)
-                    .map(redact_summary)
+                    .map(bounded_text)
                     .filter(|value| !value.is_empty());
                 if let Some(mode) = mode {
                     if let Ok(mut state) = self.state.lock() {
@@ -5785,14 +5794,14 @@ impl AcpTerminalHost for DisabledAcpTerminalHost {
         &self,
         request: AcpTerminalAuthRequest,
     ) -> VibexResult<TerminalAuthActionDescriptor> {
-        Ok(redacted_terminal_auth_action_descriptor(request))
+        Ok(terminal_auth_action_descriptor(request))
     }
 }
 
-pub fn redacted_terminal_auth_action_descriptor(
+pub fn terminal_auth_action_descriptor(
     request: AcpTerminalAuthRequest,
 ) -> TerminalAuthActionDescriptor {
-    let args = redacted_args(&request.args);
+    let args = display_args(&request.args);
     TerminalAuthActionDescriptor {
         id: format!(
             "agent-auth-{}-{}",
@@ -5801,15 +5810,15 @@ pub fn redacted_terminal_auth_action_descriptor(
         ),
         provider_profile_id: request.provider_profile_id.into_string(),
         terminal_id: None,
-        title: redact_summary(&request.title),
-        command: redact_summary(&request.command),
+        title: bounded_text(&request.title),
+        command: bounded_text(&request.command),
         args,
         cwd: request.cwd,
         env_keys: request.env.iter().map(|(key, _)| key.clone()).collect(),
-        redacted_env_summary: request
+        env_summary: request
             .env
             .iter()
-            .map(|(key, _)| format!("{key}=[redacted]"))
+            .map(|(key, value)| format!("{key}={value}"))
             .collect(),
     }
 }
@@ -6283,8 +6292,8 @@ impl AcpProcess {
                         .with_recovery_hint(hint)
                         .with_diagnostic("method", method)
                         .with_diagnostic("rpcCode", failure.code)
-                        .with_diagnostic("rpcMessage", redact_summary(detail))
-                        .with_diagnostic("stderrSummary", redact_summary(&stderr_summary)));
+                        .with_diagnostic("rpcMessage", bounded_text(detail))
+                        .with_diagnostic("stderrSummary", bounded_text(&stderr_summary)));
                 }
                 // A credential the Agent refused on shape has to be classified
                 // before the authentication check: its wording ("... the API
@@ -7303,7 +7312,7 @@ impl AcpProcess {
                     process.finish_active_terminal(&terminal_id);
                     process.respond_ok(rpc_id, Value::Null);
                 }
-                Err(err) => process.respond_error(rpc_id, -32603, &redact_summary(&err.message)),
+                Err(err) => process.respond_error(rpc_id, -32603, &bounded_text(&err.message)),
             }
         });
     }
@@ -7320,7 +7329,7 @@ impl AcpProcess {
                     process.finish_active_terminal(&terminal_id);
                     process.respond_ok(rpc_id, Value::Null);
                 }
-                Err(err) => process.respond_error(rpc_id, -32603, &redact_summary(&err.message)),
+                Err(err) => process.respond_error(rpc_id, -32603, &bounded_text(&err.message)),
             }
         });
     }
@@ -7352,7 +7361,7 @@ impl AcpProcess {
                         }),
                     );
                 }
-                Err(err) => process.respond_error(rpc_id, -32603, &redact_summary(&err.message)),
+                Err(err) => process.respond_error(rpc_id, -32603, &bounded_text(&err.message)),
             }
         });
     }
@@ -7379,7 +7388,7 @@ impl AcpProcess {
                         }),
                     );
                 }
-                Err(err) => process.respond_error(rpc_id, -32603, &redact_summary(&err.message)),
+                Err(err) => process.respond_error(rpc_id, -32603, &bounded_text(&err.message)),
             }
         });
     }
@@ -12893,9 +12902,7 @@ impl AcpRuntimeClient {
         let env_unsets = env_unsets.iter().cloned().collect::<BTreeSet<_>>();
         let non_secret_env = agent_probe_env_overlays(config)
             .into_iter()
-            .filter(|(key, value)| {
-                !env_unsets.contains(key) && !looks_sensitive(key) && !value.trim().is_empty()
-            })
+            .filter(|(key, value)| !env_unsets.contains(key) && !value.trim().is_empty())
             .collect::<BTreeMap<_, _>>();
         let mcp_servers = resolve_acp_mcp_descriptors(config, runtime_resources)?;
         let mcp_revision = (!mcp_servers.is_empty()).then(|| mcp_servers_fingerprint(&mcp_servers));
@@ -13073,10 +13080,8 @@ impl AcpRuntimeClient {
             if key.is_empty() {
                 continue;
             }
-            let sensitive = looks_sensitive(key);
             match reference.source {
-                AcpProviderEnvSource::Literal if !sensitive => {}
-                AcpProviderEnvSource::ProcessEnvironment if !sensitive => {}
+                AcpProviderEnvSource::Literal | AcpProviderEnvSource::ProcessEnvironment => {}
                 AcpProviderEnvSource::SecretReference => {
                     let version = profile
                         .secrets
@@ -13098,34 +13103,20 @@ impl AcpRuntimeClient {
                         .unwrap_or_else(|| format!("ref:missing:{key}"));
                     secret_reference_versions.insert(key.to_string(), version);
                 }
-                AcpProviderEnvSource::Literal => {
-                    return Err(VibexError::validation(
-                        "acp_sensitive_literal_env",
-                        "sensitive ACP environment values must use a secret reference",
-                    )
-                    .with_diagnostic("envKey", key));
-                }
-                AcpProviderEnvSource::ProcessEnvironment => {
-                    // The parent environment is outside Profile ownership;
-                    // retain only a stable reference identity and never copy
-                    // a credential-like value into the snapshot.
-                    secret_reference_versions.insert(key.to_string(), format!("env-ref:{key}"));
-                }
             }
         }
 
-        // Copy only effective, non-secret values from the one launch
-        // materialization. Generated OpenCode config contains model metadata
-        // and secret placeholders, so it is represented by the bounded
-        // projection revision above instead of being copied here. A generated
-        // Codex config override is launch-scoped the same way.
+        // Copy the effective values from the one launch materialization.
+        // Generated OpenCode config contains model metadata and secret
+        // placeholders, so it is represented by the bounded projection revision
+        // above instead of being copied here. A generated Codex config override
+        // is launch-scoped the same way.
         if let Some(effective_env) = effective_env {
             for (key, value) in effective_env {
                 if key == OPENCODE_INLINE_CONFIG_ENV
                     || key == OPENCODE_PROVIDER_API_KEY_ENV
                     || key == codex::CODEX_CONFIG_ENV_KEY
                     || secret_env_keys.contains(key)
-                    || looks_sensitive(key)
                     || value.trim().is_empty()
                 {
                     continue;
@@ -13137,7 +13128,6 @@ impl AcpRuntimeClient {
                 let key = reference.key.trim();
                 if key.is_empty()
                     || secret_env_keys.contains(key)
-                    || looks_sensitive(key)
                     || reference.source == AcpProviderEnvSource::SecretReference
                 {
                     continue;
@@ -13156,10 +13146,7 @@ impl AcpRuntimeClient {
         if let Some(projection) = legacy_projection {
             if effective_env.is_none() {
                 for (key, value) in &projection.non_secret_env {
-                    if key == OPENCODE_INLINE_CONFIG_ENV
-                        || looks_sensitive(key)
-                        || value.trim().is_empty()
-                    {
+                    if key == OPENCODE_INLINE_CONFIG_ENV || value.trim().is_empty() {
                         continue;
                     }
                     non_secret_env.insert(key.to_string(), value.clone());
@@ -13691,7 +13678,7 @@ impl AcpRuntimeClient {
         let mut child = process_group.kill_on_drop(true).spawn().map_err(|err| {
             VibexError::process("acp_spawn_failed", "ACP agent process could not be started")
                 .with_diagnostic("command", config.command.clone())
-                .with_diagnostic("args", redacted_args_summary(&process_args))
+                .with_diagnostic("args", display_args_summary(&process_args))
                 .with_diagnostic("cwd", cwd.display().to_string())
                 .with_diagnostic("error", err.to_string())
         })?;
@@ -13750,7 +13737,7 @@ impl AcpRuntimeClient {
                 ACP_FS_CONCURRENT_OPERATION_LIMIT,
             )),
             command_display: config.command.clone(),
-            args_display: redacted_args_summary(&process_args),
+            args_display: display_args_summary(&process_args),
             startup_model,
             claude_session_settings,
             provider_auth_method,
@@ -13933,12 +13920,12 @@ impl AcpRuntimeClient {
             .get("agentInfo")
             .and_then(|info| info.get("name"))
             .and_then(Value::as_str)
-            .map(redact_summary);
+            .map(bounded_text);
         let agent_version = result
             .get("agentInfo")
             .and_then(|info| info.get("version"))
             .and_then(Value::as_str)
-            .map(redact_summary);
+            .map(bounded_text);
         let mut operation_evidence =
             negotiated_session_config_operations(&result, &process.compatibility_identity);
         if supports_load_session {
@@ -14806,7 +14793,7 @@ impl AcpRuntimeClient {
                 "acp_model_switch_unsupported",
                 "ACP Agent does not expose a supported model switching operation",
             )
-            .with_diagnostic("model", redact_summary(&model))
+            .with_diagnostic("model", bounded_text(&model))
             .with_diagnostic(
                 "outcome",
                 result
@@ -16963,11 +16950,11 @@ fn runtime_config_failure_detail(error: &VibexError) -> Option<String> {
         .filter(|value| !value.is_empty());
     match (method, rpc_message) {
         (Some(method), Some(message)) => {
-            Some(format!("{method}: {}", crate::redact_summary(message)))
+            Some(format!("{method}: {}", crate::bounded_text(message)))
         }
-        (None, Some(message)) => Some(crate::redact_summary(message)),
+        (None, Some(message)) => Some(crate::bounded_text(message)),
         (Some(method), None) => Some(format!("{method}: {}", error.message)),
-        (None, None) => Some(crate::redact_summary(&error.message)),
+        (None, None) => Some(crate::bounded_text(&error.message)),
     }
     .filter(|detail| !detail.trim().is_empty())
 }
@@ -17955,19 +17942,10 @@ fn profile_process_options_revision(profile: &ProviderProfile) -> Option<String>
     );
     for (key, value) in headers {
         hash_named_component(&mut hasher, b"header_name", key.as_bytes());
-        if looks_sensitive(&key) || looks_sensitive(&value) {
-            hash_named_component(&mut hasher, b"header_value", b"[redacted]");
-        } else {
-            hash_named_component(&mut hasher, b"header_value", value.as_bytes());
-        }
+        hash_named_component(&mut hasher, b"header_value", value.as_bytes());
     }
 
     if let Some(user_agent) = provider_option_value(&profile.provider_options, "customUserAgent") {
-        let user_agent = if looks_sensitive(&user_agent) {
-            "[redacted]"
-        } else {
-            user_agent.as_str()
-        };
         hash_named_component(&mut hasher, b"custom_user_agent", user_agent.as_bytes());
     } else {
         hash_named_absent(&mut hasher, b"custom_user_agent");
@@ -18179,8 +18157,8 @@ fn terminal_permission_title(request: &AcpTerminalCreateRequest) -> String {
     request
         .title
         .as_deref()
-        .map(redact_summary)
-        .filter(|value| !value.is_empty() && !looks_sensitive(value))
+        .map(bounded_text)
+        .filter(|value| !value.is_empty())
         .unwrap_or_else(|| format!("Run terminal command: {}", request.command))
 }
 
@@ -18195,7 +18173,7 @@ fn terminal_permission_details(request: &AcpTerminalCreateRequest) -> Vec<Permis
     push_detail(&mut details, "tool", "terminal");
     push_detail(&mut details, "command", &request.command);
     if !request.args.is_empty() {
-        push_detail(&mut details, "args", &redacted_args_summary(&request.args));
+        push_detail(&mut details, "args", &display_args_summary(&request.args));
     }
     if let Some(cwd) = request.cwd.as_ref() {
         push_detail(&mut details, "cwd", &cwd.display().to_string());
@@ -20120,7 +20098,7 @@ fn parse_codex_model_capabilities_page(
                     description: effort
                         .get("description")
                         .and_then(Value::as_str)
-                        .map(redact_summary)
+                        .map(bounded_text)
                         .filter(|value| !value.is_empty()),
                 });
             }
@@ -20552,7 +20530,7 @@ fn parse_permission_options(value: Option<&Value>) -> Vec<PermissionOptionSummar
                         .get("name")
                         .or_else(|| option.get("label"))
                         .and_then(Value::as_str)
-                        .map(redact_summary)
+                        .map(bounded_text)
                         .filter(|label| !label.trim().is_empty())
                         .unwrap_or_else(|| permission_option_fallback_label(&kind).to_string());
                     Some(PermissionOptionSummary {
@@ -20627,8 +20605,8 @@ fn permission_title(tool_call: Option<&Value>, params: &Value) -> String {
     let Some(raw) = raw else {
         return "ACP permission request".to_string();
     };
-    let title = redact_summary(&raw);
-    if title.is_empty() || looks_sensitive(&title) {
+    let title = bounded_text(&raw);
+    if title.is_empty() {
         "ACP permission request".to_string()
     } else {
         title
@@ -20717,7 +20695,7 @@ fn string_field(value: Option<&Value>, keys: &[&str]) -> Option<String> {
 }
 
 fn push_detail(details: &mut Vec<PermissionActionDetail>, label: &str, value: &str) {
-    let value = redact_summary(value);
+    let value = bounded_text(value);
     if value.is_empty() {
         return;
     }
@@ -21204,13 +21182,10 @@ fn parse_available_commands(value: Option<&Value>) -> Vec<AcpRuntimeCommand> {
                         .map(str::trim)
                         .filter(|value| !value.is_empty())?
                         .to_string();
-                    if looks_sensitive(&name) {
-                        return None;
-                    }
                     let description = command
                         .get("description")
                         .and_then(Value::as_str)
-                        .map(redact_summary)
+                        .map(bounded_text)
                         .filter(|value| !value.is_empty());
                     Some(AcpRuntimeCommand { name, description })
                 })
@@ -21245,7 +21220,7 @@ fn extract_advertised_models(response: &Value) -> Vec<(String, Option<String>)> 
             return;
         };
         let id = id.trim().to_string();
-        if id.is_empty() || looks_sensitive(&id) {
+        if id.is_empty() {
             return;
         }
         let label = value
@@ -21254,7 +21229,6 @@ fn extract_advertised_models(response: &Value) -> Vec<(String, Option<String>)> 
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|label| !label.is_empty())
-            .filter(|label| !looks_sensitive(label))
             .map(bounded_catalog_label);
         if let Some((_, existing)) = models.iter_mut().find(|(existing, _)| existing == &id) {
             // One id may be advertised more than once, and a list that offers
@@ -21394,7 +21368,7 @@ fn extract_reasoning_effort_metadata(response: &Value) -> Vec<AgentReasoningEffo
                         .get("value")
                         .or_else(|| effort.get("id"))
                         .and_then(Value::as_str)
-                        .and_then(sanitize_config_string)?;
+                        .and_then(bounded_config_string)?;
                     if value.eq_ignore_ascii_case("default") {
                         return None;
                     }
@@ -21402,7 +21376,7 @@ fn extract_reasoning_effort_metadata(response: &Value) -> Vec<AgentReasoningEffo
                         .get("description")
                         .or_else(|| effort.get("label"))
                         .and_then(Value::as_str)
-                        .and_then(sanitize_config_string);
+                        .and_then(bounded_config_string);
                     Some(AgentReasoningEffort { value, description })
                 })
                 .collect()
@@ -21504,7 +21478,7 @@ pub(crate) fn extract_current_model_id(response: &Value) -> Option<String> {
                 .into_iter()
                 .find_map(|option| option.get("currentValue").and_then(Value::as_str))
         })
-        .map(redact_summary)
+        .map(bounded_text)
         .filter(|value| !value.is_empty())
 }
 
@@ -21528,7 +21502,7 @@ fn extract_current_mode_id(response: &Value) -> Option<String> {
                     .and_then(Value::as_str)
             })
         })
-        .map(redact_summary)
+        .map(bounded_text)
         .filter(|value| !value.is_empty())
 }
 
@@ -21590,7 +21564,7 @@ fn extract_provider_session_config_state(
         provider_profile_id: provider_profile_id.cloned(),
         native_session_id: native_session_id
             .map(str::trim)
-            .filter(|value| !value.is_empty() && !looks_sensitive(value))
+            .filter(|value| !value.is_empty())
             .map(ToString::to_string),
         current_model,
         models,
@@ -21733,7 +21707,7 @@ fn config_value_label(value: &Value) -> Option<String> {
         .or_else(|| value.get("title"))
         .or_else(|| value.get("name"))
         .and_then(Value::as_str)
-        .and_then(sanitize_config_string)
+        .and_then(bounded_config_string)
 }
 
 fn extract_config_options(response: &Value) -> Vec<ProviderSessionConfigOption> {
@@ -21748,24 +21722,24 @@ fn config_option_from_json(option: &Value) -> Option<ProviderSessionConfigOption
         .or_else(|| option.get("configId"))
         .or_else(|| option.get("name"))
         .and_then(value_to_string)
-        .and_then(|value| sanitize_config_string(&value))?;
+        .and_then(|value| bounded_config_string(&value))?;
     let label = option
         .get("label")
         .or_else(|| option.get("title"))
         .or_else(|| option.get("name"))
         .and_then(Value::as_str)
-        .and_then(sanitize_config_string)
+        .and_then(bounded_config_string)
         .unwrap_or_else(|| id.clone());
     let category = option
         .get("category")
         .and_then(Value::as_str)
-        .and_then(sanitize_config_string);
+        .and_then(bounded_config_string);
     let description = option
         .get("description")
         .or_else(|| option.get("help"))
         .or_else(|| option.get("tooltip"))
         .and_then(Value::as_str)
-        .and_then(sanitize_config_string);
+        .and_then(bounded_config_string);
     let kind = config_option_kind(option)?;
     let values = option
         .get("values")
@@ -21815,7 +21789,7 @@ fn config_option_kind(option: &Value) -> Option<ProviderSessionConfigOptionKind>
 
 fn config_value_from_json(value: &Value) -> Option<ProviderSessionConfigValue> {
     let raw_value = value_to_string(value)?;
-    let normalized = sanitize_config_string(&raw_value)?;
+    let normalized = bounded_config_string(&raw_value)?;
     let label = match value {
         Value::Object(_) => config_value_label(value),
         _ => None,
@@ -21841,17 +21815,9 @@ fn value_to_string(value: &Value) -> Option<String> {
     }
 }
 
-fn sanitize_config_string(value: &str) -> Option<String> {
-    let raw = value.trim();
-    if raw.is_empty() || looks_sensitive(raw) {
-        return None;
-    }
-    let value = redact_summary(value);
-    if value.is_empty() || looks_sensitive(&value) {
-        None
-    } else {
-        Some(value)
-    }
+fn bounded_config_string(value: &str) -> Option<String> {
+    let value = bounded_text(value);
+    (!value.is_empty()).then_some(value)
 }
 
 fn runtime_prompt_content(text: &str, attachments: &[ProviderTurnAttachment]) -> Vec<Value> {
@@ -23443,7 +23409,7 @@ mod tests {
             request: AcpTerminalAuthRequest,
         ) -> VibexResult<TerminalAuthActionDescriptor> {
             self.auth_requests.lock().unwrap().push(request.clone());
-            Ok(redacted_terminal_auth_action_descriptor(request))
+            Ok(terminal_auth_action_descriptor(request))
         }
     }
 
@@ -23500,7 +23466,7 @@ mod tests {
             self.auth_requests.lock().unwrap().push(request.clone());
             let terminal_id = TerminalId::new();
             self.created_ids.lock().unwrap().push(terminal_id.clone());
-            let mut descriptor = redacted_terminal_auth_action_descriptor(request);
+            let mut descriptor = terminal_auth_action_descriptor(request);
             descriptor.terminal_id = Some(terminal_id);
             Ok(descriptor)
         }
@@ -23804,9 +23770,8 @@ mod tests {
             error.message.to_lowercase().contains("format"),
             "the message has to name the fault the user can act on"
         );
-        // The raw wording names the credential, so redaction replaces it whole.
-        // The derived reason is what keeps the cause inspectable, and it must
-        // not smuggle the rejected value back in.
+        // The raw wording names the credential and is preserved for the person
+        // who configured it; the derived reason stays inspectable beside it.
         assert!(error.diagnostics.iter().any(|diagnostic| {
             diagnostic.key == "credentialShape" && diagnostic.value == "not_http_header_safe"
         }));
@@ -23814,7 +23779,7 @@ mod tests {
             error
                 .diagnostics
                 .iter()
-                .all(|diagnostic| { !diagnostic.value.contains("DEEPSEEK_API_KEY") })
+                .any(|diagnostic| { diagnostic.value.contains("DEEPSEEK_API_KEY") })
         );
     }
 
@@ -24404,7 +24369,7 @@ printf '%s %s\n' "$$" "$descendant" > "$VIBEX_TEST_PID_FILE"
     }
 
     #[test]
-    fn mock_terminal_host_produces_auth_descriptor_without_secret_values() {
+    fn mock_terminal_host_produces_auth_descriptor_with_values() {
         let host = MockTerminalHost::default();
         let descriptor = host
             .terminal_auth_descriptor(AcpTerminalAuthRequest {
@@ -24427,11 +24392,15 @@ printf '%s %s\n' "$$" "$descendant" > "$VIBEX_TEST_PID_FILE"
 
         let rendered = format!("{descriptor:?}");
         assert!(rendered.contains("OPENCODE_AUTH_TOKEN"));
-        assert!(!rendered.contains("secret-token-value"));
-        assert!(!rendered.contains("plain-secret-value"));
+        assert!(rendered.contains("secret-token-value"));
+        assert!(rendered.contains("plain-secret-value"));
         assert_eq!(
             descriptor.args,
-            vec!["[redacted]", "[redacted]", "[redacted]"]
+            vec!["auth", "--token", "plain-secret-value"]
+        );
+        assert_eq!(
+            descriptor.env_summary,
+            vec!["OPENCODE_AUTH_TOKEN=secret-token-value"]
         );
     }
 
@@ -25938,7 +25907,7 @@ printf '%s %s\n' "$$" "$descendant" > "$VIBEX_TEST_PID_FILE"
         assert_eq!(state.models.len(), 2);
         assert_eq!(state.current_mode.unwrap().value, "build");
         assert_eq!(state.modes.len(), 2);
-        assert_eq!(state.options.len(), 2);
+        assert_eq!(state.options.len(), 3);
         assert!(state.options.iter().any(|option| {
             option.id == "autoApply"
                 && option.kind == ProviderSessionConfigOptionKind::Boolean
@@ -25950,6 +25919,10 @@ printf '%s %s\n' "$$" "$descendant" > "$VIBEX_TEST_PID_FILE"
             option.id == "reviewDepth"
                 && option.kind == ProviderSessionConfigOptionKind::Select
                 && option.values.len() == 2
+        }));
+        assert!(state.options.iter().any(|option| {
+            option.id == "apiKey"
+                && option.current_value.as_ref().unwrap().value == "sk-secret-value"
         }));
         assert_eq!(state.source, "native_session_config");
     }

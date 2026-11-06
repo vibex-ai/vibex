@@ -16,7 +16,7 @@ The runtime owns everything that has authority:
 | Tab / ref / generation state | Input capture and coordinate conversion |
 | Screencast frame slots and the ack credit | Address bar, dialog cards, file-chooser cards |
 | Domain policy, downloads, dialogs, file choosers | The preview-panel tab that hosts the surface |
-| The redacted operation ledger and its persistence | |
+| The operation ledger and its persistence | |
 
 A client never holds a CDP connection. It reaches the browser through
 `BrowserBackend` (native: in-process service; remote: Remote v2), which mirrors
@@ -355,17 +355,17 @@ retained pixel detail and full coverage after resizing, scrolling, and repaintin
   live transport test pins both behaviours so a Chrome change fails a test
   instead of freezing the panel.
 
-## Audit and redaction
+## Audit and transparency
 
-`BrowserActionRecord.summary` is redacted before it reaches the ledger:
-URLs lose credentials, query strings and fragments; form values never appear.
-`browser_recording_*` is the one place raw values are kept, in memory only,
-because an exported test is useless without them — and the tool description says
-so out loud, as does the panel: `BrowserSession::recording` carries the flag in
-the session snapshot and the panel renders a banner while it is set, refreshed
-by the `SessionChanged` the tool emits. The persisted `browser_audit_records` table stores no page content,
-form value, cookie or screenshot. `Debug` for frames, observations, tabs,
-sessions and network entries prints metadata only.
+`BrowserActionRecord.summary` is the human's record of what the Agent did, so it
+names the exact URL and, for a fill, the value that was typed. URLs keep their
+credentials, query strings and fragments; stripping them made the record less
+useful than the page itself. `browser_recording_*` keeps the same values in
+memory for Playwright export, and the panel says so: `BrowserSession::recording`
+carries the flag in the session snapshot and the panel renders a banner while it
+is set, refreshed by the `SessionChanged` the tool emits. `Debug` for frames,
+observations, tabs, sessions and network entries may print metadata only, but
+the persisted `browser_audit_records` row carries the summary shown in the panel.
 
 ## MCP delivery
 
@@ -524,9 +524,9 @@ carries the one piece of page state that can be restored — the address.
 
 The stored address is **local UI state**, not an audit record: it keeps its
 query string and fragment, the way a browser's own session restore does, because
-a stripped address reopens the wrong page. The redaction rules for
-`BrowserActionRecord` and the persisted `browser_audit_records` table are
-unchanged and are not the place a restorable address may be read back from.
+a stripped address reopens the wrong page. `BrowserActionRecord` and the
+persisted `browser_audit_records` table now keep the same exact URL, and neither
+is the place a restorable address may be read back from.
 
 ## New-tab page and search engine
 
@@ -700,11 +700,11 @@ forwards image content from a tool result, and say so in the commit.
 
 `crates/browser` carries the unit tests for the parts that fail silently or
 dangerously: reference lifecycle, URL classification and path authorization,
-CDP framing, tool tiering, redaction and Playwright mapping. The GPUI surface
+CDP framing, tool tiering, audit transparency and Playwright mapping. The GPUI surface
 covers coordinate conversion and decode layout. `apps/desktop` exposes an
 `EmbeddedBrowserContractProbe` (`--probe`) asserting that degradation stays
 explicit, the tier ladder is monotonic, the frame drop is present, and audited
-records carry no page content.
+records carry the page content and form value they acted on.
 
 `cdp::tests` pins the framing rule of invariant 11 against both transports: a
 real websocket server must receive one JSON text frame with no NUL, and a pipe

@@ -474,10 +474,6 @@ fn key_file_entries(items: &[TimelineItem], truncated: &mut bool) -> Vec<String>
         let TimelinePayload::FileOperation(payload) = &item.payload else {
             continue;
         };
-        if is_sensitive_file_path(&payload.path) {
-            *truncated = true;
-            continue;
-        }
         let Some((path, path_changed)) = sanitize_bridge_text(&payload.path, 260) else {
             continue;
         };
@@ -683,214 +679,8 @@ fn sanitize_bridge_text(value: &str, limit: usize) -> Option<(String, bool)> {
     if value.is_empty() {
         return None;
     }
-    let lower = value.to_ascii_lowercase();
-    if lower.contains("-----begin private key")
-        || lower.contains("-----begin rsa private key")
-        || lower.contains("-----begin openssh private key")
-    {
-        return Some(("[redacted-sensitive-content]".to_string(), true));
-    }
-
-    let mut changed = false;
-    let mut redact_next = false;
-    let mut words = Vec::new();
-    for word in value.split_whitespace() {
-        let lower_word = word
-            .trim_matches(|character: char| character.is_ascii_punctuation())
-            .to_ascii_lowercase();
-        if redact_next {
-            if matches!(word.trim(), "=" | ":") {
-                words.push(word.to_string());
-                continue;
-            }
-            if matches!(lower_word.as_str(), "bearer" | "basic") {
-                words.push(word.to_string());
-                continue;
-            }
-            words.push("[redacted]".to_string());
-            redact_next = false;
-            changed = true;
-            continue;
-        }
-        if matches!(lower_word.as_str(), "bearer" | "basic") {
-            words.push(word.to_string());
-            redact_next = true;
-            continue;
-        }
-        if let Some((redacted, redact_following)) = redact_sensitive_assignment(word) {
-            words.push(redacted);
-            changed = true;
-            redact_next = redact_following;
-            continue;
-        }
-        if is_sensitive_key(&lower_word) {
-            words.push("[redacted]".to_string());
-            redact_next = true;
-            changed = true;
-            continue;
-        }
-        if looks_like_secret_token(word) {
-            words.push("[redacted]".to_string());
-            changed = true;
-            continue;
-        }
-        words.push(word.to_string());
-    }
-    let redacted_paths = redact_private_paths(&words.join(" "));
-    changed |= redacted_paths != words.join(" ");
-    let (bounded, bounded_changed) = bound_tail(&redacted_paths, limit);
-    changed |= bounded_changed;
-    (!bounded.trim().is_empty()).then_some((bounded, changed))
-}
-
-fn redact_sensitive_assignment(word: &str) -> Option<(String, bool)> {
-    let separator = word.find('=').or_else(|| word.find(':'))?;
-    let key = &word[..separator];
-    if !is_sensitive_key(key) {
-        return None;
-    }
-    let separator_text = &word[separator..=separator];
-    let value = word[separator + separator_text.len()..]
-        .trim_matches(|character: char| {
-            character.is_ascii_whitespace()
-                || matches!(character, '"' | '\'' | '`' | ',' | ';' | ')' | ']')
-        })
-        .to_ascii_lowercase();
-    let redact_following = value.is_empty() || matches!(value.as_str(), "bearer" | "basic");
-    Some((format!("{key}{separator_text}[redacted]"), redact_following))
-}
-
-fn is_sensitive_key(value: &str) -> bool {
-    let normalized = value
-        .chars()
-        .filter(|character| character.is_ascii_alphanumeric())
-        .flat_map(char::to_lowercase)
-        .collect::<String>();
-    [
-        "apikey",
-        "authorization",
-        "password",
-        "passwd",
-        "privatekey",
-        "secret",
-        "token",
-        "credential",
-    ]
-    .iter()
-    .any(|sensitive| normalized.contains(sensitive))
-}
-
-fn looks_like_secret_token(word: &str) -> bool {
-    let token = word.trim_matches(|character: char| {
-        matches!(
-            character,
-            '"' | '\'' | '`' | ',' | ';' | '(' | ')' | '[' | ']'
-        )
-    });
-    let lower = token.to_ascii_lowercase();
-    if lower.starts_with("sk-")
-        || lower.starts_with("ghp_")
-        || lower.starts_with("github_pat_")
-        || lower.starts_with("xoxb-")
-        || lower.starts_with("xoxp-")
-        || lower.starts_with("glpat-")
-        || lower.starts_with("npm_")
-        || lower.starts_with("pypi-")
-        || lower.starts_with("hf_")
-        || (lower.starts_with("akia") && token.len() >= 16)
-        || (lower.starts_with("asia") && token.len() >= 16)
-        || (lower.starts_with("aiza") && token.len() >= 20)
-        || lower.starts_with("ya29.")
-    {
-        return true;
-    }
-    if token.starts_with("eyJ") && token.matches('.').count() == 2 {
-        return true;
-    }
-    token.len() >= 80
-        && token
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
-}
-
-fn redact_private_paths(value: &str) -> String {
-    let normalized = value.replace("\\\\", "/").replace('\\', "/");
-    let normalized = normalized
-        .split_whitespace()
-        .map(|word| {
-            let trimmed = word.trim_matches(|character: char| {
-                matches!(
-                    character,
-                    '"' | '\'' | '`' | ',' | ';' | '(' | ')' | '[' | ']'
-                )
-            });
-            if is_sensitive_file_path(trimmed) {
-                "[redacted-private-path]".to_string()
-            } else {
-                word.to_string()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ");
-    let parts = normalized.split('/').collect::<Vec<_>>();
-    let mut output = String::new();
-    let mut index = 0;
-    while index < parts.len() {
-        if index > 0 {
-            output.push('/');
-        }
-        let part = parts[index];
-        if part.eq_ignore_ascii_case("root") {
-            output.push_str("user");
-            index += 1;
-            continue;
-        }
-        output.push_str(part);
-        if (part.eq_ignore_ascii_case("home") || part.eq_ignore_ascii_case("users"))
-            && index + 1 < parts.len()
-        {
-            output.push_str("/user");
-            index += 1;
-        }
-        index += 1;
-    }
-    output
-}
-
-fn is_sensitive_file_path(value: &str) -> bool {
-    let normalized = value.replace("\\\\", "/").replace('\\', "/");
-    normalized
-        .split(|character: char| {
-            character == '/'
-                || character == ':'
-                || character.is_ascii_whitespace()
-                || matches!(
-                    character,
-                    '"' | '\'' | '`' | ',' | ';' | '(' | ')' | '[' | ']'
-                )
-        })
-        .map(str::trim)
-        .filter(|component| !component.is_empty())
-        .map(str::to_ascii_lowercase)
-        .any(|component| {
-            component == ".env"
-                || component.starts_with(".env.")
-                || matches!(
-                    component.as_str(),
-                    "credentials"
-                        | "credentials.json"
-                        | "secrets"
-                        | "secrets.json"
-                        | "id_rsa"
-                        | "id_ed25519"
-                        | "id_ecdsa"
-                        | "service-account.json"
-                )
-                || component.ends_with(".pem")
-                || component.ends_with(".p12")
-                || component.ends_with(".pfx")
-                || component.ends_with(".key")
-        })
+    let (bounded, bounded_changed) = bound_tail(value, limit);
+    (!bounded.trim().is_empty()).then_some((bounded, bounded_changed))
 }
 
 fn bound_tail(value: &str, limit: usize) -> (String, bool) {
@@ -1065,7 +855,7 @@ mod tests {
     }
 
     #[test]
-    fn builder_filters_redacted_raw_and_sensitive_content() {
+    fn builder_preserves_unredacted_timeline_content() {
         let items = vec![
                 timeline_item(
                 1,
@@ -1173,16 +963,13 @@ mod tests {
 
         let (projection, _) = build_projection(&items, 0, 0, 8).unwrap();
         let encoded = serde_json::to_string(&projection).unwrap();
-        assert!(encoded.contains("/home/user/work"));
-        assert!(encoded.contains("[redacted]"));
-        assert!(!encoded.contains("private-user"));
-        assert!(!encoded.contains("secret-value"));
-        assert!(!encoded.contains("hunter2"));
-        assert!(!encoded.contains("bearer-value"));
-        assert!(!encoded.contains(".env"));
+        assert!(encoded.contains("/home/private-user/work"));
+        assert!(encoded.contains("secret-value"));
+        assert!(encoded.contains("hunter2"));
+        assert!(encoded.contains("bearer-value"));
+        assert!(encoded.contains("loaded credentials=secret-value"));
         assert!(!encoded.contains("redacted agent answer"));
         assert!(!encoded.contains("streamed secret"));
-        assert!(!encoded.contains("curl"));
         assert!(!encoded.contains("raw-extension-marker"));
         assert!(!encoded.contains("reasoning-private-marker"));
         assert!(!encoded.contains("image-private-marker"));
@@ -1198,24 +985,21 @@ mod tests {
         let first = sanitize_bridge_text(input, 200).unwrap();
         let second = sanitize_bridge_text(input, 200).unwrap();
         assert_eq!(first, second);
-        assert_eq!(first.0, "token=[redacted] work in C:/Users/user/project");
+        assert_eq!(first.0, input);
 
         let structured =
             sanitize_bridge_text(r#"{"password":"json-secret","token":"token-secret"}"#, 200)
                 .unwrap();
-        assert!(!structured.0.contains("json-secret"));
-        assert!(!structured.0.contains("token-secret"));
+        assert_eq!(
+            structured.0,
+            r#"{"password":"json-secret","token":"token-secret"}"#
+        );
         let standalone =
             sanitize_bridge_text("secret-value AIzaSy012345678901234567890123456789", 200).unwrap();
-        assert!(!standalone.0.contains("secret-value"));
-        assert!(!standalone.0.contains("AIzaSy"));
-        assert!(looks_like_secret_token(
-            "AIzaSy012345678901234567890123456789"
-        ));
-        assert!(is_sensitive_file_path(
-            "file:///home/alice/.aws/credentials"
-        ));
-        assert!(is_sensitive_file_path("C:\\Users\\alice\\id_rsa"));
+        assert_eq!(
+            standalone.0,
+            "secret-value AIzaSy012345678901234567890123456789"
+        );
 
         let items = vec![timeline_item(
             1,

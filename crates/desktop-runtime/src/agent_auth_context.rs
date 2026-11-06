@@ -1143,7 +1143,7 @@ fn safe_terminal_descriptor(
         args: Vec::new(),
         cwd: None,
         env_keys: Vec::new(),
-        redacted_env_summary: Vec::new(),
+        env_summary: Vec::new(),
     }
 }
 

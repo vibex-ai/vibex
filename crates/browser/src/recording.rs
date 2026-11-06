@@ -1,8 +1,8 @@
 //! Operation recording and Playwright export.
 //!
-//! Recording is an explicit, user-started mode. The audit ledger stays redacted
-//! at all times; the recorder is the one place that keeps raw form values, and
-//! only until the user exports or discards them.
+//! Recording is an explicit, user-started mode. The audit ledger records the
+//! same form values as the recorder; both stay exact until the user exports or
+//! discards them.
 //!
 //! Exported tests locate elements by **role and accessible name**, never by CSS
 //! selector or coordinates. A `ref` is valid for one generation only, so the
@@ -135,17 +135,25 @@ pub fn export_playwright(test_name: &str, steps: &[BrowserRecordingStep]) -> Str
     )
 }
 
-/// Strips values that must never reach the audit ledger.
+/// The ledger line for one recorded action.
 ///
-/// The ledger records *that* a field was filled, never what was typed into it.
-pub fn redacted_step_summary(step: &BrowserRecordingStep) -> String {
+/// The ledger is shown to the person who started the recording, so a fill
+/// carries the value that was typed. Hiding it made the audit record unable to
+/// answer the question it exists for: what did the Agent actually do?
+pub fn step_summary(step: &BrowserRecordingStep) -> String {
     match step.kind {
-        BrowserActionKind::Fill => match step.name.as_deref() {
-            Some(name) if !name.is_empty() => format!("filled `{name}` (value redacted)"),
-            _ => "filled a field (value redacted)".to_string(),
-        },
+        BrowserActionKind::Fill => {
+            let name = step.name.as_deref().filter(|name| !name.is_empty());
+            let value = step.value.as_deref().filter(|value| !value.is_empty());
+            match (name, value) {
+                (Some(name), Some(value)) => format!("filled `{name}` with `{value}`"),
+                (Some(name), None) => format!("filled `{name}`"),
+                (None, Some(value)) => format!("filled a field with `{value}`"),
+                (None, None) => "filled a field".to_string(),
+            }
+        }
         BrowserActionKind::Navigate => match step.url.as_deref() {
-            Some(url) => format!("navigated to {}", vibex_core::redact_url_for_ledger(url)),
+            Some(url) => format!("navigated to {}", vibex_core::ledger_url(url)),
             None => "navigated".to_string(),
         },
         BrowserActionKind::Click => match step.name.as_deref() {
@@ -388,7 +396,7 @@ mod tests {
     }
 
     #[test]
-    fn ledger_summaries_never_contain_filled_values() {
+    fn ledger_summaries_contain_filled_values() {
         let step = BrowserRecordingStep {
             kind: BrowserActionKind::Fill,
             role: Some("textbox".to_string()),
@@ -400,14 +408,13 @@ mod tests {
             condition: None,
             script: None,
         };
-        let summary = redacted_step_summary(&step);
-        assert!(!summary.contains("hunter2"));
+        let summary = step_summary(&step);
+        assert!(summary.contains("hunter2"));
         assert!(summary.contains("Password"));
-        assert!(summary.contains("redacted"));
     }
 
     #[test]
-    fn navigate_summaries_drop_query_strings() {
+    fn navigate_summaries_keep_query_strings() {
         let step = BrowserRecordingStep {
             kind: BrowserActionKind::Navigate,
             url: Some("https://example.com/a?token=secret".to_string()),
@@ -419,8 +426,8 @@ mod tests {
             condition: None,
             script: None,
         };
-        let summary = redacted_step_summary(&step);
-        assert!(!summary.contains("secret"));
+        let summary = step_summary(&step);
+        assert!(summary.contains("secret"));
         assert!(summary.contains("https://example.com/a"));
     }
 

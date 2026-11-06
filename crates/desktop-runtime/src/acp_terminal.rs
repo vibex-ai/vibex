@@ -4,7 +4,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use vibex_agent_acp::{
     AcpTerminalAuthRequest, AcpTerminalCreateRequest, AcpTerminalExitStatus, AcpTerminalHost,
-    AcpTerminalOutput, redacted_terminal_auth_action_descriptor,
+    AcpTerminalOutput, terminal_auth_action_descriptor,
 };
 use vibex_core::{TerminalAuthActionDescriptor, TerminalId, VibexError, VibexResult, WorkspaceId};
 use vibex_terminal::{TerminalCommandRequest, TerminalManager};
@@ -162,7 +162,7 @@ impl AcpTerminalHost for DesktopAcpTerminalHost {
             request.cwd.as_deref().map(PathBuf::from),
             request.env.clone(),
         )?;
-        let mut descriptor = redacted_terminal_auth_action_descriptor(request);
+        let mut descriptor = terminal_auth_action_descriptor(request);
         descriptor.terminal_id = Some(terminal_id);
         Ok(descriptor)
     }

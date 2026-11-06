@@ -14,7 +14,7 @@ use vibex_core::{
     BROWSER_MAX_SCREENSHOT_BYTES, BROWSER_MAX_SCRIPT_CHARS, BROWSER_MAX_SCRIPT_RESULT_CHARS,
     BROWSER_MAX_SCROLL_DELTA, BrowserActionKind, BrowserCaptureQuality, BrowserElementSource,
     BrowserExecutionSource, BrowserOperationStatus, BrowserRecordingStep, BrowserTabId,
-    BrowserTabOwner, BrowserTabStatus, BrowserVisualDiff, redact_url_for_ledger,
+    BrowserTabOwner, BrowserTabStatus, BrowserVisualDiff, ledger_url,
 };
 
 use crate::ax::ReferenceRejection;
@@ -541,7 +541,7 @@ impl BrowserService {
         let (url, title) = self.tab_url_title(&tab_id).await;
         let mut text = format!(
             "Opened {}\nTitle: {}\n\n{}",
-            redact_url_for_ledger(&url),
+            ledger_url(&url),
             if title.is_empty() {
                 "(untitled)"
             } else {
@@ -694,7 +694,7 @@ impl BrowserService {
         }
         let mut text = format!(
             "{} — {}\n{}\n",
-            redact_url_for_ledger(&url),
+            ledger_url(&url),
             title,
             vibex_core::fence_untrusted_content(listing.trim_end())
         );
@@ -756,7 +756,7 @@ impl BrowserService {
         Ok(BrowserToolOutcome {
             text: format!(
                 "Navigated to {} ({})",
-                redact_url_for_ledger(&url),
+                ledger_url(&url),
                 if title.is_empty() { "untitled" } else { &title }
             ),
             is_error: false,
@@ -907,7 +907,7 @@ impl BrowserService {
                 ctx,
                 &tab_id,
                 BrowserActionKind::Fill,
-                format!("filled `{name}` (value redacted)"),
+                fill_ledger_summary(&name, text),
                 BrowserOperationStatus::Dispatched,
             )
             .await;
@@ -1694,7 +1694,7 @@ impl BrowserService {
             text.push_str(&format!(
                 "  {} — {} — {}{}\n",
                 tab.tab_id,
-                redact_url_for_ledger(&tab.url),
+                ledger_url(&tab.url),
                 if tab.title.is_empty() {
                     "(untitled)"
                 } else {
@@ -1939,7 +1939,7 @@ impl BrowserService {
                 entry
                     .url
                     .as_deref()
-                    .map(|url| format!(" ({})", redact_url_for_ledger(url)))
+                    .map(|url| format!(" ({})", ledger_url(url)))
                     .unwrap_or_default(),
                 entry
                     .line
@@ -2008,7 +2008,7 @@ impl BrowserService {
             text.push_str(&format!(
                 "  {} {} → {}{}\n",
                 entry.method,
-                redact_url_for_ledger(&entry.url),
+                ledger_url(&entry.url),
                 entry
                     .status
                     .map(|status| status.to_string())
@@ -2438,9 +2438,9 @@ impl BrowserService {
         // change has to reach it without waiting for the next tool call.
         self.notify_session_changed(&ctx.session_id).await;
         Ok(BrowserToolOutcome::text(
-            "Recording started. Values typed into form fields are kept in memory so the exported \
-             test is usable; the audit ledger stays redacted. The panel now shows a recording \
-             banner.",
+            "Recording started. Values typed into form fields are kept in memory and in \
+             the audit ledger so the exported test and the record are exact. The panel now \
+             shows a recording banner.",
         ))
     }
 
@@ -2853,7 +2853,7 @@ impl BrowserService {
         }
         let mut text = format!(
             "URL: {}\nTitle: {}\nGeneration: {generation}\n{}\n",
-            redact_url_for_ledger(&url),
+            ledger_url(&url),
             if title.is_empty() {
                 "(untitled)"
             } else {
@@ -3172,6 +3172,15 @@ fn describe_element_source(
         );
     }
     text
+}
+
+fn fill_ledger_summary(name: &str, value: &str) -> String {
+    const MAX: usize = 300;
+    if value.chars().count() <= MAX {
+        return format!("filled `{name}` with `{value}`");
+    }
+    let prefix: String = value.chars().take(MAX).collect();
+    format!("filled `{name}` with `{prefix}...(truncated)`")
 }
 
 #[cfg(test)]

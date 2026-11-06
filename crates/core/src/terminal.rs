@@ -102,7 +102,8 @@ pub struct TerminalAuthActionDescriptor {
     pub args: Vec<String>,
     pub cwd: Option<String>,
     pub env_keys: Vec<String>,
-    pub redacted_env_summary: Vec<String>,
+    #[serde(default, alias = "redactedEnvSummary")]
+    pub env_summary: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------

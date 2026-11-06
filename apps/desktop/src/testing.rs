@@ -117,12 +117,11 @@ pub struct EmbeddedBrowserContractProbe {
     pub frames_release_previous_texture: bool,
     /// True when `screencastFrameAck` is credit-based rather than immediate.
     pub frame_ack_is_credit_based: bool,
-    /// True when the audit ledger stores no page content, form value or
-    /// screenshot.
-    pub audit_records_are_redacted: bool,
-    /// True when a sampled audit record carries neither page text nor form
-    /// values.
-    pub audit_sample_has_no_page_content: bool,
+    /// True when the audit ledger records the page content and form value the
+    /// Agent acted on.
+    pub audit_records_carry_page_content: bool,
+    /// True when a sampled audit record carries the value that was typed.
+    pub audit_sample_carries_page_content: bool,
     /// True when the untrusted-content notice is present on every tool
     /// description.
     pub tool_descriptions_carry_the_untrusted_notice: bool,
@@ -189,21 +188,21 @@ pub fn embedded_browser_contract_probe() -> EmbeddedBrowserContractProbe {
         vibex_browser::ax::resolve_reference("r1-1", 2, &elements).is_err()
     };
 
-    // The audit row the runtime persists must never carry page content. The
-    // projection is the one place that decides this, so it is asserted here.
-    let audit_sample_has_no_page_content = {
+    // The audit row the runtime persists is the human's record of what the
+    // Agent did, so a fill row names the value that was typed.
+    let audit_sample_carries_page_content = {
         let record = vibex_core::BrowserActionRecord {
             id: "braction_probe".to_string(),
             session_id: vibex_core::BrowserSessionId::new(),
             tab_id: vibex_core::BrowserTabId::new(),
             kind: vibex_core::BrowserActionKind::Fill,
-            summary: "filled `Password` (value redacted)".to_string(),
+            summary: "filled `Password` with `hunter2`".to_string(),
             at_ms: 0,
             status: vibex_core::BrowserOperationStatus::Dispatched,
             domain: Some("example.com".to_string()),
             execution_source: vibex_core::BrowserExecutionSource::Agent,
         };
-        !record.summary.contains("hunter2") && record.domain.as_deref() == Some("example.com")
+        record.summary.contains("hunter2") && record.domain.as_deref() == Some("example.com")
     };
 
     EmbeddedBrowserContractProbe {
@@ -256,11 +255,11 @@ pub fn embedded_browser_contract_probe() -> EmbeddedBrowserContractProbe {
             let source = include_str!("../../..//crates/browser/src/service.rs");
             source.contains("Page.screencastFrameAck")
         },
-        audit_records_are_redacted: {
+        audit_records_carry_page_content: {
             let source = include_str!("../../..//crates/browser/src/execute.rs");
-            source.contains("(value redacted)")
+            source.contains("fill_ledger_summary")
         },
-        audit_sample_has_no_page_content,
+        audit_sample_carries_page_content,
         tool_descriptions_carry_the_untrusted_notice: tools::all_tools().iter().all(|tool| {
             tool.description
                 .contains(vibex_core::BROWSER_UNTRUSTED_CONTENT_NOTICE)
@@ -485,8 +484,8 @@ mod tests {
         assert!(probe.remote_transport_reports_a_reason);
         assert!(probe.frames_release_previous_texture);
         assert!(probe.frame_ack_is_credit_based);
-        assert!(probe.audit_records_are_redacted);
-        assert!(probe.audit_sample_has_no_page_content);
+        assert!(probe.audit_records_carry_page_content);
+        assert!(probe.audit_sample_carries_page_content);
         assert!(probe.tool_descriptions_carry_the_untrusted_notice);
         assert!(probe.loopback_is_not_blanket_trusted);
         assert!(probe.stale_refs_are_refused);

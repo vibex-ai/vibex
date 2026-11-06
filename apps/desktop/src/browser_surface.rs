@@ -230,10 +230,10 @@ pub struct BrowserSurface {
     /// True while a search is in flight, so the bar can say so instead of
     /// showing a count that is about to change.
     find_pending: bool,
-    /// The session's redacted operation ledger, newest last.
+    /// The session's operation ledger, newest last.
     ///
     /// This is what lets a human see what the Agent did without having watched
-    /// the whole run; the entries carry no page content by construction.
+    /// the whole run; each entry names the action and the value it touched.
     ledger: Vec<BrowserActionRecord>,
     /// True while the activity list is docked under the page.
     ledger_open: bool,
@@ -2405,9 +2405,9 @@ impl BrowserSurface {
 
     /// The recording banner.
     ///
-    /// An exported test needs the values typed into the page, so recording keeps
-    /// them in memory while the audit ledger stays redacted. That trade is the
-    /// human's to make, which means the panel has to say it is happening.
+    /// An exported test needs the values typed into the page, and the audit
+    /// ledger records those same values. That trade is the human's to make,
+    /// which means the panel has to say it is happening.
     fn render_recording(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
         // The flag is the runtime's answer from the session snapshot, so it is
         // already false until a snapshot says otherwise.
@@ -2431,10 +2431,10 @@ impl BrowserSurface {
                         .text_xs()
                         .text_color(cx.theme().foreground)
                         .child(locale::text(
-                            "Recording: values typed into this page are kept in memory so the \
-                             exported test is usable. The audit ledger stays redacted.",
-                            "录制中：输入到页面的内容会保存在内存中，以便导出可用的测试；审计记录仍然脱敏。",
-                            "錄製中：輸入到頁面的內容會保存在記憶體中，以便匯出可用的測試；審計記錄仍然脫敏。",
+                            "Recording: values typed into this page are kept in memory and in the audit \
+                             ledger so the exported test and the record stay exact.",
+                            "录制中：输入到页面的内容会保存在内存和审计记录中，以便导出准确的测试与记录。",
+                            "錄製中：輸入到頁面的內容會保存在記憶體和審計記錄中，以便匯出準確的測試與記錄。",
                         )),
                 )
                 .into_any_element(),
@@ -2551,7 +2551,7 @@ impl BrowserSurface {
 
     /// The docked activity list.
     ///
-    /// It shows the same redacted ledger the runtime persists, so a human can
+    /// It shows the same ledger the runtime persists, so a human can
     /// answer "what did it just do?" without having watched the run.
     fn render_ledger(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
         if !self.ledger_open {
@@ -2658,9 +2658,9 @@ impl BrowserSurface {
                                 .text_xs()
                                 .text_color(cx.theme().muted_foreground)
                                 .child(locale::text(
-                                    "Agent activity in this tab (redacted)",
-                                    "Agent 在此标签页的操作（已脱敏）",
-                                    "Agent 在此分頁的操作（已脫敏）",
+                                    "Agent activity in this tab",
+                                    "Agent 在此标签页的操作",
+                                    "Agent 在此分頁的操作",
                                 )),
                         )
                         .child(

@@ -2684,7 +2684,7 @@ impl ModelGatewayService {
                             message: format!(
                                 "{}: {}",
                                 member.provider_name,
-                                redact_transport(&error)
+                                transport_message(&error)
                             ),
                         });
                         break;
@@ -4232,18 +4232,10 @@ fn truncate(value: &str) -> String {
     truncated
 }
 
-fn redact_transport(error: &reqwest::Error) -> String {
-    // A transport error can carry the full URL, including a query string some
-    // vendors put a Key into. Only the reason is reported.
-    if error.is_timeout() {
-        "the upstream did not answer in time".to_string()
-    } else if error.is_connect() {
-        "the upstream could not be reached".to_string()
-    } else if error.is_redirect() {
-        "the upstream redirected the request".to_string()
-    } else {
-        "the upstream connection failed".to_string()
-    }
+fn transport_message(error: &reqwest::Error) -> String {
+    // The transport error is the only description of what failed, including
+    // the URL the gateway actually called. Report it verbatim, bounded.
+    truncate(&error.to_string())
 }
 
 /// Streams one response to the client, recording what it carried.
