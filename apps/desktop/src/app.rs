@@ -18561,7 +18561,14 @@ impl VibexWorkbench {
             self.new_session_agent_id.as_ref(),
             preferred.as_ref(),
         );
-        self.set_new_session_runtime_selection(selection)
+        let changed = self.set_new_session_runtime_selection(selection);
+        // The Agent id is assigned before the catalog resolves its selection.
+        // Now that both are known, the remembered transport can be checked
+        // against the Agent and profile actually on the page. The id is cloned
+        // because the check needs `&mut self` for its fallback write.
+        let agent_id = self.new_session_agent_id.clone();
+        self.reconcile_new_session_transport(agent_id.as_ref());
+        changed
     }
 
     fn preferred_new_session_runtime_for_agent(
@@ -37510,6 +37517,13 @@ impl VibexWorkbench {
                 )
             });
             self.set_new_session_runtime_selection(selection);
+            // The remembered transport is global; the Agent this draft
+            // defaults to may not offer it. Reconcile once the draft's
+            // selection is known, so the page cannot open on a terminal mode
+            // the Agent cannot run. The id is cloned because the check takes
+            // `&mut self` for its fallback write.
+            let agent_id = self.new_session_agent_id.clone();
+            self.reconcile_new_session_transport(agent_id.as_ref());
             self.new_session_input
                 .update(cx, |input, cx| input.set_value("", window, cx));
             self.new_session_workspace.clear(
@@ -38162,23 +38176,32 @@ impl VibexWorkbench {
     /// is unsupported. Falling back to the interface mode is what the reader
     /// meant — the page no longer offers them a terminal at all.
     fn reconcile_new_session_transport(&mut self, agent_id: Option<&AgentId>) {
-        if !self.ui_state.session.new_session_transport.is_terminal() {
+        let effective =
+            effective_new_session_transport(self.ui_state.session.new_session_transport, agent_id);
+        if effective != NewSessionTransport::Terminal {
+            if self.ui_state.session.new_session_transport.is_terminal() {
+                self.ui_state.session.new_session_transport = NewSessionTransport::Acp;
+                self.queue_ui_state();
+            }
             return;
         }
-        let supported = agent_id
-            .map(|agent_id| vibex_core::terminal_session_support(agent_id).is_supported())
-            .unwrap_or(false);
         // Terminal mode also needs a Provider Profile to carry, because the
         // profile is what becomes the child's environment. An Agent account is a
         // credential only the ACP adapter holds, so a terminal session under one
         // would start on the user's own login — a different provider than the
         // page shows. Falling back keeps the mode the page offers and the mode it
         // can actually run in agreement.
-        let profile_backed = self
-            .new_session_runtime_selection
-            .as_ref()
-            .is_some_and(|selection| selection.provider_profile_id().is_some());
-        if !supported || !profile_backed {
+        //
+        // The catalog is what answers whether the selection is profile-backed.
+        // Before it arrives the selection is legitimately empty, so keep the
+        // remembered choice and let the catalog load reconcile it rather than
+        // reading "not loaded yet" as "no profile".
+        if self.runtime_catalog.is_some()
+            && !self
+                .new_session_runtime_selection
+                .as_ref()
+                .is_some_and(|selection| selection.provider_profile_id().is_some())
+        {
             self.ui_state.session.new_session_transport = NewSessionTransport::Acp;
             self.queue_ui_state();
         }
@@ -56334,7 +56357,13 @@ impl VibexWorkbench {
             .new_session_runtime_selection
             .as_ref()
             .is_some_and(|selection| selection.provider_profile_id().is_some());
-        let current = self.ui_state.session.new_session_transport;
+        // The remembered transport is global, so it can name a mode this Agent
+        // does not offer. A disabled segment cannot wear the raised style, and
+        // drawing the stored mode directly then left both halves flat. Read it
+        // through the effective choice instead: the interface mode is always a
+        // segment this page can actually create.
+        let stored = self.ui_state.session.new_session_transport;
+        let current = effective_new_session_transport(stored, agent_id);
         let is_dark = cx.theme().is_dark();
         let track = theme::semantic_color("muted", is_dark).opacity(0.55);
         // The raised segment is the card, not the page background: on a dark
@@ -56806,14 +56835,25 @@ impl VibexWorkbench {
             .as_ref()
             .map(|projection| projection.features.clone())
             .unwrap_or_default();
-        let transport_switch = self.render_new_session_transport_switch(
-            selection.as_ref().map(|selection| &selection.agent_id),
-            cx,
-        );
+        // The switch and the prompt mark agree on the Agent: the resolved
+        // runtime is the page's selection, and the draft's Agent is the same
+        // one while the catalog is still arriving.
+        let transport_agent_id = selection
+            .as_ref()
+            .map(|selection| &selection.agent_id)
+            .or(self.new_session_agent_id.as_ref());
+        let transport_switch =
+            self.render_new_session_transport_switch(transport_agent_id, cx);
         // The mode is announced by the prompt mark, not by repainting the box:
         // changing the surface and padding moved the input line and the send
-        // button every time the reader switched.
-        let terminal_transport = self.ui_state.session.new_session_transport.is_terminal();
+        // button every time the reader switched. A remembered terminal choice
+        // that this Agent cannot run is not a terminal mode, so it earns no
+        // mark.
+        let terminal_transport = effective_new_session_transport(
+            self.ui_state.session.new_session_transport,
+            transport_agent_id,
+        )
+        .is_terminal();
         // The reader's configured code face, which is the one a terminal would
         // use: the prompt should not invent a second monospace.
         let prompt_font = self
@@ -77201,6 +77241,28 @@ fn default_new_session_runtime_selection(
         })
         .or_else(|| available.into_iter().next())
         .map(|option| option.selection.clone())
+}
+
+/// The transport the new-session page can actually run for this Agent.
+///
+/// The remembered choice outlives the Agent that offered it: a reader who last
+/// created a terminal session and then returns on an Agent without a verified
+/// terminal keeps that stored value. Drawing it directly would disable the
+/// terminal half and leave the switch with neither segment raised, and the
+/// prompt would wear a terminal mark for a mode submission will not use. The
+/// page therefore reads the stored choice through this function, which falls
+/// back to the interface mode whenever the Agent cannot run a terminal.
+fn effective_new_session_transport(
+    stored: NewSessionTransport,
+    agent_id: Option<&AgentId>,
+) -> NewSessionTransport {
+    let terminal_supported = agent_id
+        .is_some_and(|agent_id| vibex_core::terminal_session_support(agent_id).is_supported());
+    if stored.is_terminal() && !terminal_supported {
+        NewSessionTransport::Acp
+    } else {
+        stored
+    }
 }
 
 fn default_new_session_agent_id(
@@ -105340,6 +105402,9 @@ mod tests {
         assert!(switch.contains("terminal_session_support(agent_id).is_supported()"));
         assert!(switch.contains(".disabled(option_disabled)"));
         assert!(switch.contains("ui_state.session.new_session_transport = mode"));
+        // A remembered terminal mode on an unsupported Agent reads as the
+        // interface mode, so one segment is always raised.
+        assert!(switch.contains("let current = effective_new_session_transport(stored, agent_id);"));
         let panel = source
             .split_once("    fn render_new_session_panel(")
             .and_then(|(_, tail)| tail.split_once("\n    fn show_turn_preview_rail("))
@@ -105362,12 +105427,19 @@ mod tests {
             .split("\nmod tests {")
             .next()
             .expect("the module has production code");
+        let effective = source
+            .split_once("fn effective_new_session_transport(")
+            .and_then(|(_, tail)| tail.split_once("\nfn default_new_session_agent_id("))
+            .map(|(body, _)| body)
+            .expect("the effective transport should remain inspectable");
+        assert!(effective.contains("terminal_session_support(agent_id).is_supported()"));
+        assert!(effective.contains("NewSessionTransport::Acp"));
         let reconcile = source
             .split_once("    fn reconcile_new_session_transport(")
             .and_then(|(_, tail)| tail.split_once("\n    fn choose_new_session_runtime("))
             .map(|(body, _)| body)
             .expect("the transport reconciliation should remain inspectable");
-        assert!(reconcile.contains("terminal_session_support(agent_id).is_supported()"));
+        assert!(reconcile.contains("effective_new_session_transport("));
         assert!(reconcile.contains("new_session_transport = NewSessionTransport::Acp"));
         // Both ways of choosing an Agent reconcile.
         assert_eq!(
@@ -105377,6 +105449,26 @@ mod tests {
             2,
             "every Agent choice has to reconcile the transport"
         );
+        // The Agent is also assigned automatically — when the catalog resolves
+        // its selection and when the page opens — so those paths reconcile too.
+        let runtime_selection = source
+            .split_once("    fn reconcile_new_session_runtime_selection(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    fn preferred_new_session_runtime_for_agent(")
+            })
+            .map(|(body, _)| body)
+            .expect("the runtime selection reconciliation should remain inspectable");
+        assert!(runtime_selection.contains("let agent_id = self.new_session_agent_id.clone();"));
+        assert!(
+            runtime_selection.contains("self.reconcile_new_session_transport(agent_id.as_ref());")
+        );
+        let open = source
+            .split_once("    fn open_new_session(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn clear_submitted_new_session_draft("))
+            .map(|(body, _)| body)
+            .expect("opening the new-session page should remain inspectable");
+        assert!(open.contains("let agent_id = self.new_session_agent_id.clone();"));
+        assert!(open.contains("self.reconcile_new_session_transport(agent_id.as_ref());"));
         // And the submit path re-checks rather than trusting the page state.
         let submit = source
             .split_once("    fn submit_new_session(")
@@ -105388,6 +105480,37 @@ mod tests {
                 "if vibex_core::terminal_session_support(&selection.agent_id).is_supported()"
             ),
             "a stale terminal choice must not reach the terminal launch"
+        );
+    }
+
+    /// A remembered terminal mode is never drawn for an Agent that cannot run
+    /// one.
+    ///
+    /// The switch paints a disabled segment without its raised style, so drawing
+    /// the stored mode directly left both halves flat: the interface half was
+    /// not selected and the terminal half could not look selected. The effective
+    /// choice also keeps the terminal prompt mark off that Agent's composer.
+    #[test]
+    fn a_remembered_terminal_mode_falls_back_before_it_is_drawn() {
+        let claude = AgentId::parse("claude").unwrap();
+        let deepseek = AgentId::parse("deepseek-harness").unwrap();
+        assert_eq!(
+            effective_new_session_transport(NewSessionTransport::Terminal, Some(&claude)),
+            NewSessionTransport::Terminal
+        );
+        assert_eq!(
+            effective_new_session_transport(NewSessionTransport::Terminal, Some(&deepseek)),
+            NewSessionTransport::Acp,
+            "an unsupported terminal mode reads as the interface mode"
+        );
+        assert_eq!(
+            effective_new_session_transport(NewSessionTransport::Acp, Some(&deepseek)),
+            NewSessionTransport::Acp
+        );
+        assert_eq!(
+            effective_new_session_transport(NewSessionTransport::Terminal, None),
+            NewSessionTransport::Acp,
+            "an unknown Agent cannot offer a terminal either"
         );
     }
 
@@ -105585,9 +105708,8 @@ mod tests {
             .and_then(|(_, tail)| tail.split_once("\n    fn show_turn_preview_rail("))
             .map(|(body, _)| body)
             .expect("the new-session panel should remain inspectable");
-        assert!(panel.contains(
-            "let terminal_transport = self.ui_state.session.new_session_transport.is_terminal();"
-        ));
+        assert!(panel.contains("let terminal_transport = effective_new_session_transport("));
+        assert!(panel.contains(".is_terminal();"));
         assert!(panel.contains(".when(terminal_transport, |this| {"));
         // The box itself does not change between modes: a box that repaints its
         // surface, border and padding moved the input and the send button every
