@@ -1421,6 +1421,14 @@ impl AgentManager {
             SessionRepository::lock_title(&conn, &session.id)?;
         }
         let environment = self.terminal_session_env(&request, &session)?;
+        // A terminal session hands the argv straight to the CLI, so the model
+        // has to be renamed here rather than at an ACP boundary. Resolved after
+        // the environment because projecting the Profile is what materializes
+        // the compatibility binding this mapping is read from.
+        let projections =
+            self.terminal_model_id_projections(request.provider_profile_id.as_ref())?;
+        vibex_core::native_cli_project_model_arguments(&mut argv, &projections);
+        vibex_core::native_cli_project_model_arguments(&mut launch_argv, &projections);
         // Claude Code applies the reader's `~/.claude/settings.json` after the
         // process environment, so a Profile's endpoint and credential only win
         // on the command-line settings tier. The projection file is restated
@@ -1580,6 +1588,30 @@ impl AgentManager {
             env,
             claude_settings_path,
         })
+    }
+
+    /// The model id spellings a Profile projects for its Agent's native CLI.
+    ///
+    /// The catalogue names a model by its product identity, while a projection
+    /// can register a different runtime spelling: OpenCode prefixes the provider
+    /// id it generated, and Hermes prefixes `custom:`. A terminal session has no
+    /// ACP layer to translate between the two, so the command line must carry the
+    /// projected spelling. Resolving the Profile also materializes the
+    /// compatibility binding this mapping is read from, which is why callers run
+    /// it after `terminal_session_env_overlays`.
+    fn terminal_model_id_projections(
+        &self,
+        provider_profile_id: Option<&ProviderProfileId>,
+    ) -> VibexResult<Vec<(String, String)>> {
+        let Some(profile_id) = provider_profile_id else {
+            return Ok(Vec::new());
+        };
+        Ok(ProviderConfigService::new(self.db_path.clone())
+            .legacy_agent_provider_model_id_projections(profile_id)?
+            .unwrap_or_default()
+            .into_iter()
+            .map(|entry| (entry.product_model_id, entry.runtime_model_id))
+            .collect())
     }
 
     pub async fn create_session(
@@ -3238,6 +3270,12 @@ impl AgentManager {
                 settings_path,
             );
         }
+        // A session recorded before the projected spelling was applied still
+        // names the catalogue id. Rewriting on restart repairs it instead of
+        // replaying a command the CLI rejects.
+        let projections =
+            self.terminal_model_id_projections(record.provider_profile_id.as_ref())?;
+        vibex_core::native_cli_project_model_arguments(&mut recorded_argv, &projections);
         let mut argv = recorded_argv.clone();
         argv.extend(vibex_core::native_cli_resume_arguments(
             &session.agent_id,
@@ -13861,6 +13899,121 @@ mod tests {
         assert_eq!(
             settings["env"]["ANTHROPIC_BASE_URL"], "https://claude.example.invalid",
             "the restart must rewrite the same private settings file"
+        );
+    }
+
+    /// An OpenCode model is named by the id its projection registered, not by
+    /// the product-facing id the catalogue shows.
+    ///
+    /// The CLI parses `--model` itself, so it cannot read the ACP projection the
+    /// way the adapter does. Passing the catalogue id makes OpenCode answer with
+    /// an invalid-model-format error before its interface appears.
+    #[tokio::test]
+    async fn an_opencode_terminal_session_uses_the_projected_model_id() {
+        let (manager, launcher, dir) = terminal_manager();
+        enable_agent(&manager, "opencode");
+        // The projection descriptor is selected from the detected OpenCode
+        // version. Without one the runtime resolves to the conservative
+        // contract, which has no model projection to apply.
+        let conn = manager.open_migrated().unwrap();
+        vibex_db::AgentDiscoveryRepository::insert(
+            &conn,
+            &vibex_core::AgentDiscoveryRecord {
+                discovery_record_id: "opencode-terminal-discovery".to_string(),
+                agent_id: AgentId::parse("opencode").unwrap(),
+                cwd_scope: "home".to_string(),
+                install_status: vibex_core::AgentInstallStatus::Installed,
+                config_status: vibex_core::AgentConfigStatus::Configured,
+                runtime_status: vibex_core::AgentRuntimeStatus::Ready,
+                binary_path: None,
+                version: Some(vibex_core::OPENCODE_LAST_VERIFIED_VERSION.to_string()),
+                native_config_paths: Vec::new(),
+                models: Vec::new(),
+                modes: Vec::new(),
+                diagnostics: Vec::new(),
+                discovered_at_ms: 1,
+            },
+        )
+        .unwrap();
+        drop(conn);
+        let service = ProviderConfigService::new(&dir.join("vibex.db"));
+        let shared = service
+            .create_model_provider_profile(vibex_core::ModelProviderProfileCreateRequest {
+                display_name: "OpenCode Terminal".to_string(),
+                vendor_hint: Some("acme".to_string()),
+                endpoints: vec![vibex_core::ModelProviderEndpoint {
+                    id: "api".to_string(),
+                    kind: vibex_core::ModelProviderEndpointKind::Api,
+                    url: "https://opencode.example.invalid".to_string(),
+                    wire_protocol_id: Some(
+                        vibex_core::WIRE_PROTOCOL_ANTHROPIC_MESSAGES.to_string(),
+                    ),
+                }],
+                proxy_policy: vibex_core::ModelProviderProxyPolicy::InheritSystem,
+                credentials: Vec::new(),
+                configured_models: vec![vibex_core::ModelProviderCatalogEntry {
+                    id: "claude-opus-4-6".to_string(),
+                    display_name: None,
+                    enabled: true,
+                    capabilities: Default::default(),
+                    metadata: Default::default(),
+                }],
+                default_model_id: Some("claude-opus-4-6".to_string()),
+                headers: Vec::new(),
+                metadata: Default::default(),
+                status: vibex_core::ModelProviderProfileStatus::Enabled,
+            })
+            .unwrap();
+        let profile = service
+            .bind_provider_to_agent(vibex_core::AgentModelProviderBindRequest {
+                provider_profile_id: vibex_core::ProviderProfileId::new(),
+                model_provider_profile_id: Some(shared.id),
+                agent_id: AgentId::parse("opencode").unwrap(),
+                make_default: false,
+            })
+            .unwrap();
+        let mut request = terminal_request("opencode", &dir);
+        request.provider_profile_id = Some(profile.id);
+        request.args = vec!["--model".to_string(), "claude-opus-4-6".to_string()];
+        let session = manager.create_terminal_session(request).await.unwrap();
+
+        let expected = vec![
+            "opencode".to_string(),
+            "--model".to_string(),
+            "acme-anthropic/claude-opus-4-6".to_string(),
+        ];
+        assert_eq!(launcher.launches()[0].argv, expected);
+
+        // The recorded argv is what a restart replays, so it has to carry the
+        // same projected spelling.
+        let conn = open_database(&dir.join("vibex.db")).unwrap();
+        let record = vibex_db::SessionTerminalRepository::get(&conn, &session.id)
+            .unwrap()
+            .expect("the session must record its terminal");
+        assert_eq!(record.argv, expected);
+
+        // A session recorded before the translation names the catalogue id.
+        // Restarting it repairs the command rather than replaying the id the
+        // CLI rejects.
+        let stale = vec!["opencode", "--model", "claude-opus-4-6"];
+        conn.execute(
+            "UPDATE session_terminals SET argv_json = ?2 WHERE session_id = ?1",
+            rusqlite::params![session.id.as_str(), serde_json::to_string(&stale).unwrap()],
+        )
+        .unwrap();
+        drop(conn);
+
+        launcher.kill(&launcher.watched()[0].0).unwrap();
+        manager.restart_terminal_session(&session.id).await.unwrap();
+        let mut resumed = expected;
+        resumed.push("--continue".to_string());
+        assert_eq!(
+            launcher
+                .launches()
+                .last()
+                .expect("the restart launched")
+                .argv,
+            resumed
         );
     }
 

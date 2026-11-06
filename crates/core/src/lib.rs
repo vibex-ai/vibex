@@ -625,8 +625,8 @@ pub use terminal::{
 pub use terminal_agent::{
     TerminalCli, native_cli_accepts_initial_prompt, native_cli_executable,
     native_cli_launch_arguments, native_cli_model_arguments, native_cli_option_arguments,
-    native_cli_prompt_arguments, native_cli_resume_arguments, native_cli_resume_notice_prefixes,
-    terminal_session_support,
+    native_cli_project_model_arguments, native_cli_prompt_arguments, native_cli_resume_arguments,
+    native_cli_resume_notice_prefixes, terminal_session_support,
 };
 pub use time::unix_timestamp_ms;
 pub mod team;

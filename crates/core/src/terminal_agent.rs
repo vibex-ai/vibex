@@ -488,6 +488,57 @@ pub fn native_cli_model_arguments(agent_id: &AgentId, model_id: Option<&str>) ->
         .unwrap_or_default()
 }
 
+/// Rewrites product-facing model ids in an already-built argv into the spelling
+/// the Agent's projection understands.
+///
+/// A Provider Profile does not necessarily use the id the product shows. OpenCode
+/// namespaces every model by the provider id its config overlay generates, so the
+/// catalogue value `claude-opus-4-6` becomes `vibex-anthropic/claude-opus-4-6`
+/// on the ACP wire. Terminal mode builds its command line from the catalogue
+/// value and hands it to the CLI directly, so without this rewrite the Agent
+/// starts on an id its own parser rejects — OpenCode reports that as an invalid
+/// model format.
+///
+/// Only the known model flags are touched, and only values with a projection are
+/// replaced: an id the caller already wrote in the CLI's own spelling stays as
+/// it is, and an unrelated argument that happens to match a product id is not
+/// rewritten.
+pub fn native_cli_project_model_arguments(argv: &mut [String], projections: &[(String, String)]) {
+    if projections.is_empty() {
+        return;
+    }
+    let projected = |value: &str| {
+        projections
+            .iter()
+            .find(|(product, _)| product == value)
+            .map(|(_, runtime)| runtime.clone())
+    };
+    let mut index = 1;
+    while index < argv.len() {
+        match argv[index].as_str() {
+            "--model" | "-m" => {
+                if let Some(value) = argv.get(index + 1).cloned()
+                    && let Some(runtime) = projected(&value)
+                {
+                    argv[index + 1] = runtime;
+                }
+                index += 2;
+            }
+            argument => {
+                for prefix in ["--model=", "-m="] {
+                    if let Some(value) = argument.strip_prefix(prefix)
+                        && let Some(runtime) = projected(value)
+                    {
+                        argv[index] = format!("{prefix}{runtime}");
+                        break;
+                    }
+                }
+                index += 1;
+            }
+        }
+    }
+}
+
 /// The arguments that make a native CLI start with the session's other options.
 ///
 /// Terminal mode hands the interface to the Agent, but the page still chooses
@@ -715,6 +766,75 @@ mod tests {
             native_cli_model_arguments(&agent("cursor"), Some("sonnet-4-thinking")),
             vec!["--model".to_string(), "sonnet-4-thinking".to_string()]
         );
+    }
+
+    /// A projected model id reaches the CLI in the spelling its config overlay
+    /// registered, not the product-facing one the catalogue lists.
+    #[test]
+    fn a_projected_model_id_replaces_the_product_spelling() {
+        let projections = vec![(
+            "claude-opus-4-6".to_string(),
+            "vibex-anthropic/claude-opus-4-6".to_string(),
+        )];
+
+        let mut argv = vec![
+            "opencode".to_string(),
+            "--model".to_string(),
+            "claude-opus-4-6".to_string(),
+            "--prompt".to_string(),
+            "claude-opus-4-6".to_string(),
+        ];
+        native_cli_project_model_arguments(&mut argv, &projections);
+        assert_eq!(
+            argv,
+            vec![
+                "opencode".to_string(),
+                "--model".to_string(),
+                "vibex-anthropic/claude-opus-4-6".to_string(),
+                "--prompt".to_string(),
+                "claude-opus-4-6".to_string(),
+            ],
+            "only the model value may be rewritten"
+        );
+
+        let mut equals = vec![
+            "opencode".to_string(),
+            "--model=claude-opus-4-6".to_string(),
+        ];
+        native_cli_project_model_arguments(&mut equals, &projections);
+        assert_eq!(equals[1], "--model=vibex-anthropic/claude-opus-4-6");
+
+        let mut short = vec![
+            "opencode".to_string(),
+            "-m".to_string(),
+            "claude-opus-4-6".to_string(),
+        ];
+        native_cli_project_model_arguments(&mut short, &projections);
+        assert_eq!(short[2], "vibex-anthropic/claude-opus-4-6");
+    }
+
+    /// A model id with no projection is already in the CLI's own spelling.
+    #[test]
+    fn an_unprojected_model_id_is_left_alone() {
+        let projections = vec![(
+            "claude-opus-4-6".to_string(),
+            "vibex-anthropic/claude-opus-4-6".to_string(),
+        )];
+        let mut argv = vec![
+            "opencode".to_string(),
+            "--model".to_string(),
+            "anthropic/claude-opus-4-6".to_string(),
+        ];
+        native_cli_project_model_arguments(&mut argv, &projections);
+        assert_eq!(argv[2], "anthropic/claude-opus-4-6");
+
+        let mut no_projection = vec![
+            "opencode".to_string(),
+            "--model".to_string(),
+            "claude-opus-4-6".to_string(),
+        ];
+        native_cli_project_model_arguments(&mut no_projection, &[]);
+        assert_eq!(no_projection[2], "claude-opus-4-6");
     }
 
     /// The Agent's own default stays its own: no flag, no guess.
