@@ -3351,6 +3351,7 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
                             crate::composer::CompletionTrigger::At => {
                                 menu.lists.files = rows(&discovery.response.entries);
                                 menu.lists.delegation = rows(&discovery.delegation_entries);
+                                menu.lists.sessions = rows(&discovery.session_entries);
                             }
                             crate::composer::CompletionTrigger::Dollar => {
                                 menu.lists.commands = rows(&discovery.response.entries);
@@ -7592,6 +7593,7 @@ mod tests {
             skills: true,
             quick_phrases: Vec::new(),
             delegation_entries: Vec::new(),
+            session_entries: Vec::new(),
         };
         apply_message(
             &mut app,
@@ -7606,7 +7608,7 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].detail, "Agent 账户 - you@example.com · gpt-5");
         // The reference is a workspace file's panel sibling: an `@` answer fills
-        // the files and the delegation panels, not the commands one.
+        // the files, delegation and conversation panels, not the commands one.
         assert_eq!(
             app.completion.as_ref().unwrap().active_tab(),
             crate::composer::CompletionTab::Files
@@ -7653,6 +7655,7 @@ mod tests {
             skills: true,
             quick_phrases: vec![discovered_entry("/review", AgentCommandSourceKind::Prompt)],
             delegation_entries: Vec::new(),
+            session_entries: Vec::new(),
         };
         apply_message(
             app,
@@ -7760,6 +7763,7 @@ mod tests {
             skills: true,
             quick_phrases: Vec::new(),
             delegation_entries: Vec::new(),
+            session_entries: Vec::new(),
         };
         apply_message(
             &mut app,

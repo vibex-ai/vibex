@@ -1630,8 +1630,13 @@ pub struct MobileApp {
     composer_commands: Vec<AgentCommandEntry>,
     /// The reusable Prompts of the `/` popup's second tab, from the same read.
     composer_quick_phrases: Vec<AgentCommandEntry>,
-    /// The collaborators and conversations of the `@` popup's second tab.
+    /// The collaborators of the `@` popup's second tab.
     composer_delegations: Vec<AgentCommandEntry>,
+    /// The conversations of the `@` popup's third tab, from the same read.
+    ///
+    /// A conversation is context a task may point at, not a delegation target,
+    /// so it has its own list and its own tab.
+    composer_sessions: Vec<AgentCommandEntry>,
     /// Which trigger the three lists above answer. A trigger's own request is
     /// what keeps the authority's own bound on each list: asking for all three
     /// at once let the workspace file tree fill the reply and starve the
@@ -2279,8 +2284,9 @@ enum AttachmentTarget {
 ///
 /// The desktop's popup carries the same four: `/` opens on the Agent's
 /// commands and keeps the reusable Prompts on a second tab, `@` opens on the
-/// workspace files and keeps the collaborators on a second. `$` has one list
-/// — the Skills — and so draws no tab header at all.
+/// workspace files and keeps the collaborators and the conversations on its
+/// other two. `$` has one list — the Skills — and so draws no tab header at
+/// all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum ComposerSuggestionTab {
     #[default]
@@ -2288,6 +2294,7 @@ enum ComposerSuggestionTab {
     Phrases,
     Files,
     Delegation,
+    Sessions,
 }
 
 impl ComposerSuggestionTab {
@@ -2295,7 +2302,7 @@ impl ComposerSuggestionTab {
     fn tabs(trigger: AgentCommandTrigger) -> &'static [Self] {
         match trigger {
             AgentCommandTrigger::Slash => &[Self::Commands, Self::Phrases],
-            AgentCommandTrigger::Mention => &[Self::Files, Self::Delegation],
+            AgentCommandTrigger::Mention => &[Self::Files, Self::Delegation, Self::Sessions],
             AgentCommandTrigger::Dollar => &[Self::Commands],
         }
     }
@@ -2307,6 +2314,7 @@ impl ComposerSuggestionTab {
             Self::Phrases => "phrases",
             Self::Files => "files",
             Self::Delegation => "delegation",
+            Self::Sessions => "sessions",
         }
     }
 
@@ -2316,6 +2324,7 @@ impl ComposerSuggestionTab {
             Self::Phrases => locale::text("Quick phrases", "快捷短语", "快捷短語"),
             Self::Files => locale::text("Workspace files", "工作区文件", "工作區檔案"),
             Self::Delegation => locale::text("Agent delegation", "Agent 委派", "Agent 委派"),
+            Self::Sessions => locale::text("Referenced conversations", "引用会话", "引用會話"),
         }
     }
 
@@ -2326,12 +2335,14 @@ impl ComposerSuggestionTab {
         phrases: &'a [AgentCommandEntry],
         files: &'a [AgentCommandEntry],
         delegation: &'a [AgentCommandEntry],
+        sessions: &'a [AgentCommandEntry],
     ) -> &'a [AgentCommandEntry] {
         match self {
             Self::Commands => commands,
             Self::Phrases => phrases,
             Self::Files => files,
             Self::Delegation => delegation,
+            Self::Sessions => sessions,
         }
     }
 }
@@ -2430,6 +2441,7 @@ struct ComposerSuggestions {
     phrases: Vec<AgentCommandEntry>,
     files: Vec<AgentCommandEntry>,
     delegation: Vec<AgentCommandEntry>,
+    sessions: Vec<AgentCommandEntry>,
     /// The lists this trigger opens have not arrived yet.
     loading: bool,
 }
@@ -2444,6 +2456,7 @@ impl ComposerSuggestions {
             phrases: Vec::new(),
             files: Vec::new(),
             delegation: Vec::new(),
+            sessions: Vec::new(),
             loading: true,
         }
     }
@@ -2466,7 +2479,13 @@ impl ComposerSuggestions {
     }
 
     fn rows(&self, tab: ComposerSuggestionTab) -> &[AgentCommandEntry] {
-        tab.rows(&self.commands, &self.phrases, &self.files, &self.delegation)
+        tab.rows(
+            &self.commands,
+            &self.phrases,
+            &self.files,
+            &self.delegation,
+            &self.sessions,
+        )
     }
 }
 
@@ -2610,7 +2629,7 @@ fn file_suggestions_for(catalogue: &[AgentCommandEntry], draft: &str) -> Vec<Age
     files
 }
 
-/// The collaborators and conversations the `@` popup's second tab offers.
+/// The collaborator rows the `@` panel's delegation tab offers.
 ///
 /// Each row carries the reference the send resolves; what it does not carry is
 /// the desktop's direct "delegate now" action. The phone arms the reference
@@ -2641,6 +2660,28 @@ fn delegation_suggestions_for(
         // The same collaborator is offered once per configuration; on a phone
         // screen one row per collaborator is what fits.
         if rows.iter().any(|existing| existing.label == entry.label) {
+            continue;
+        }
+        rows.push(entry.clone());
+        if rows.len() >= COMPOSER_SUGGESTION_ROWS {
+            break;
+        }
+    }
+    rows
+}
+
+/// The conversation rows the `@` panel's conversation tab offers.
+///
+/// A conversation is context a task may point at, never a delegation target:
+/// the row inserts its reference and nothing here offers to hand work over.
+fn session_suggestions_for(sessions: &[AgentCommandEntry], draft: &str) -> Vec<AgentCommandEntry> {
+    let Some(prefix) = mention_prefix(draft) else {
+        return Vec::new();
+    };
+    let needle = prefix.to_lowercase();
+    let mut rows: Vec<AgentCommandEntry> = Vec::new();
+    for entry in sessions {
+        if !suggestion_entry_matches(entry, &needle) {
             continue;
         }
         rows.push(entry.clone());
@@ -3934,6 +3975,7 @@ impl MobileApp {
             composer_commands: Vec::new(),
             composer_quick_phrases: Vec::new(),
             composer_delegations: Vec::new(),
+            composer_sessions: Vec::new(),
             composer_suggestions_trigger: None,
             composer_suggestions_in_flight: None,
             composer_commands_generation: 0,
@@ -9098,6 +9140,7 @@ impl MobileApp {
         self.composer_commands.clear();
         self.composer_quick_phrases.clear();
         self.composer_delegations.clear();
+        self.composer_sessions.clear();
         self.composer_suggestions_trigger = None;
         // The catalogue is a remote read, so it belongs on the Tokio runtime:
         // a `vibex-remote-client` future builds its timer from the runtime
@@ -9131,6 +9174,7 @@ impl MobileApp {
                     this.composer_commands = discovery.response.entries;
                     this.composer_quick_phrases = discovery.quick_phrases;
                     this.composer_delegations = discovery.delegation_entries;
+                    this.composer_sessions = discovery.session_entries;
                     this.composer_suggestions_trigger = Some(trigger);
                     cx.notify();
                 }
@@ -9151,6 +9195,7 @@ impl MobileApp {
         self.composer_commands.clear();
         self.composer_quick_phrases.clear();
         self.composer_delegations.clear();
+        self.composer_sessions.clear();
         self.composer_suggestions_trigger = None;
         self.composer_suggestions_in_flight = None;
     }
@@ -9211,6 +9256,7 @@ impl MobileApp {
             phrases: phrase_suggestions_for(&self.composer_quick_phrases, draft),
             files: file_suggestions_for(&self.composer_commands, draft),
             delegation: delegation_suggestions_for(&self.composer_delegations, draft),
+            sessions: session_suggestions_for(&self.composer_sessions, draft),
             loading: false,
         })
     }
@@ -23385,6 +23431,13 @@ impl MobileApp {
             locale::text("Loading…", "加载中…", "載入中…").to_string()
         } else if active == ComposerSuggestionTab::Phrases && suggestions.query.is_empty() {
             locale::text("No quick phrases yet", "还没有快捷短语", "還沒有快捷短語").to_string()
+        } else if active == ComposerSuggestionTab::Sessions && suggestions.query.is_empty() {
+            locale::text(
+                "No conversations to reference yet",
+                "还没有可引用的会话",
+                "還沒有可引用的會話",
+            )
+            .to_string()
         } else {
             locale::text("No matches", "没有匹配项", "沒有符合項目").to_string()
         };
@@ -38169,8 +38222,8 @@ mod tests {
     /// Each trigger opens the tabs the desktop's popup opens.
     ///
     /// `/` carries the Agent's commands and the reusable Prompts, `@` the
-    /// workspace files and the collaborators, and `$` its single Skills list —
-    /// which is why the last one draws no header at all.
+    /// workspace files, the collaborators and the conversations, and `$` its
+    /// single Skills list — which is why the last one draws no header at all.
     #[test]
     fn each_trigger_opens_the_desktops_tabs() {
         use AgentCommandTrigger::{Dollar, Mention, Slash};
@@ -38185,7 +38238,8 @@ mod tests {
             ComposerSuggestionTab::tabs(Mention),
             [
                 ComposerSuggestionTab::Files,
-                ComposerSuggestionTab::Delegation
+                ComposerSuggestionTab::Delegation,
+                ComposerSuggestionTab::Sessions
             ]
         );
         assert_eq!(

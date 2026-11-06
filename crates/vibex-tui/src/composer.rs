@@ -58,10 +58,10 @@ pub struct Completion {
 /// Which panel of an open completion drawer is showing.
 ///
 /// A `/` drawer carries the Agent's commands and the reusable Prompts; an `@`
-/// drawer carries the workspace files and the collaborators a reader may hand
-/// work to. `$` keeps its single Skills panel, which is [`Self::Commands`]'
-/// list, so a trigger without panels still has one — the same shape the desktop
-/// popup has.
+/// drawer carries the workspace files, the collaborators a reader may hand work
+/// to, and the conversations a task may point at. `$` keeps its single Skills
+/// panel, which is [`Self::Commands`]' list, so a trigger without panels still
+/// has one — the same shape the desktop popup has.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CompletionTab {
     #[default]
@@ -69,6 +69,7 @@ pub enum CompletionTab {
     Phrases,
     Files,
     Delegation,
+    Sessions,
 }
 
 impl CompletionTab {
@@ -76,7 +77,7 @@ impl CompletionTab {
     pub const fn tabs(trigger: CompletionTrigger) -> &'static [Self] {
         match trigger {
             CompletionTrigger::Slash => &[Self::Commands, Self::Phrases],
-            CompletionTrigger::At => &[Self::Files, Self::Delegation],
+            CompletionTrigger::At => &[Self::Files, Self::Delegation, Self::Sessions],
             CompletionTrigger::Dollar => &[Self::Commands],
         }
     }
@@ -88,6 +89,7 @@ impl CompletionTab {
             Self::Phrases => "phrases",
             Self::Files => "files",
             Self::Delegation => "delegation",
+            Self::Sessions => "sessions",
         }
     }
 
@@ -121,6 +123,7 @@ pub struct CompletionLists {
     pub phrases: Vec<Completion>,
     pub files: Vec<Completion>,
     pub delegation: Vec<Completion>,
+    pub sessions: Vec<Completion>,
 }
 
 impl CompletionLists {
@@ -131,6 +134,7 @@ impl CompletionLists {
             CompletionTab::Phrases => &self.phrases,
             CompletionTab::Files => &self.files,
             CompletionTab::Delegation => &self.delegation,
+            CompletionTab::Sessions => &self.sessions,
         }
     }
 }
@@ -2474,14 +2478,19 @@ mod tests {
     fn panels_follow_the_trigger_and_clamp_at_their_edges() {
         // The same panels the desktop popup opens, in the same order: `/`
         // carries the commands and the reusable Prompts, `@` the workspace
-        // files and the collaborators, and `$` keeps its one Skills panel.
+        // files, the collaborators and the conversations, and `$` keeps its one
+        // Skills panel.
         assert_eq!(
             CompletionTab::tabs(CompletionTrigger::Slash),
             &[CompletionTab::Commands, CompletionTab::Phrases]
         );
         assert_eq!(
             CompletionTab::tabs(CompletionTrigger::At),
-            &[CompletionTab::Files, CompletionTab::Delegation]
+            &[
+                CompletionTab::Files,
+                CompletionTab::Delegation,
+                CompletionTab::Sessions
+            ]
         );
         assert_eq!(
             CompletionTab::tabs(CompletionTrigger::Dollar),

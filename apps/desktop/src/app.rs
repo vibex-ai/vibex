@@ -1150,9 +1150,10 @@ impl ComposerDelegationAction {
 /// Which list of the composer popup is showing.
 ///
 /// A `/` popup carries the Agent's commands and the reusable Prompts; an `@`
-/// popup carries the workspace files and the collaborators a reader may hand
-/// work to. `$` keeps its single Skills panel, which is [`Self::Commands`]'
-/// list, so a trigger without tabs still has one.
+/// popup carries the workspace files, the collaborators a reader may hand work
+/// to, and the conversations a task may point at. `$` keeps its single Skills
+/// panel, which is [`Self::Commands`]' list, so a trigger without tabs still has
+/// one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum ComposerSuggestionTab {
     #[default]
@@ -1160,6 +1161,7 @@ enum ComposerSuggestionTab {
     Phrases,
     Files,
     Delegation,
+    Sessions,
 }
 
 impl ComposerSuggestionTab {
@@ -1167,7 +1169,7 @@ impl ComposerSuggestionTab {
     fn tabs(trigger: Option<AgentCommandTrigger>) -> &'static [Self] {
         match trigger {
             Some(AgentCommandTrigger::Slash) => &[Self::Commands, Self::Phrases],
-            Some(AgentCommandTrigger::Mention) => &[Self::Files, Self::Delegation],
+            Some(AgentCommandTrigger::Mention) => &[Self::Files, Self::Delegation, Self::Sessions],
             _ => &[Self::Commands],
         }
     }
@@ -1179,6 +1181,7 @@ impl ComposerSuggestionTab {
             Self::Phrases => "phrases",
             Self::Files => "files",
             Self::Delegation => "delegation",
+            Self::Sessions => "sessions",
         }
     }
 
@@ -1192,12 +1195,14 @@ impl ComposerSuggestionTab {
         phrases: &'a [AgentCommandEntry],
         files: &'a [AgentCommandEntry],
         delegation: &'a [AgentCommandEntry],
+        sessions: &'a [AgentCommandEntry],
     ) -> &'a [AgentCommandEntry] {
         match self {
             Self::Commands => commands,
             Self::Phrases => phrases,
             Self::Files => files,
             Self::Delegation => delegation,
+            Self::Sessions => sessions,
         }
     }
 
@@ -1235,11 +1240,11 @@ impl ComposerTarget {
 
 /// Where one composer discovery runs, and how its outcome is read back.
 ///
-/// `@` resolves the workspace file tree and the collaborator catalogue — file
-/// and database work that never asks a provider — so it runs on the background
-/// executor: the async runtime carries the Agents' own I/O and timeline work,
-/// and a popup must not queue its rows behind that. `/` and `$` do ask the
-/// Agent, which needs the runtime.
+/// `@` resolves the workspace file tree, the collaborator catalogue and the
+/// conversations — file and database work that never asks a provider — so it
+/// runs on the background executor: the async runtime carries the Agents' own
+/// I/O and timeline work, and a popup must not queue its rows behind that. `/`
+/// and `$` do ask the Agent, which needs the runtime.
 enum ComposerDiscovery {
     Background(Task<vibex_core::VibexResult<vibex_core::AgentCommandDiscovery>>),
     Async(
@@ -1489,6 +1494,43 @@ fn delegation_suggestions(entries: Vec<AgentCommandEntry>) -> Vec<AgentCommandEn
         .into_iter()
         .filter(|entry| !composer_suggestion_is_delegate_now(entry))
         .collect()
+}
+
+/// Whether one suggestion row points at a conversation.
+fn composer_suggestion_is_session(entry: &AgentCommandEntry) -> bool {
+    entry.id.starts_with("reference:session:")
+        || entry
+            .metadata
+            .iter()
+            .any(|metadata| metadata.key == vibex_desktop_runtime::COMPOSER_SESSION_REFERENCE_KEY)
+}
+
+/// Splits one discovery's `@` rows into the delegation tab's and the
+/// conversation tab's.
+///
+/// A current authority sends the two lists apart, so this mostly just applies
+/// the delegation filters. An older paired authority still folds the
+/// conversations into `delegation_entries`: those rows are moved rather than
+/// drawn under Agent delegation, where the popup would offer a hand-off
+/// control that cannot carry a conversation. Duplicate ids collapse so a
+/// mixed answer cannot draw a row twice.
+fn split_mention_suggestions(
+    delegation_entries: Vec<AgentCommandEntry>,
+    session_entries: Vec<AgentCommandEntry>,
+) -> (Vec<AgentCommandEntry>, Vec<AgentCommandEntry>) {
+    let mut collaborators = Vec::new();
+    let mut conversations = Vec::new();
+    for entry in delegation_entries {
+        if composer_suggestion_is_session(&entry) && !composer_suggestion_is_agent(&entry) {
+            conversations.push(entry);
+        } else {
+            collaborators.push(entry);
+        }
+    }
+    conversations.extend(session_entries);
+    let mut seen = std::collections::HashSet::new();
+    conversations.retain(|entry| seen.insert(entry.id.clone()));
+    (delegation_suggestions(collaborators), conversations)
 }
 
 /// The Agent id one delegation row names.
@@ -5405,9 +5447,15 @@ pub struct SessionView {
     /// local and behaves the same against a paired authority as against the
     /// native one.
     phrase_suggestions: Vec<AgentCommandEntry>,
-    /// Collaborators and conversations offered by the `@` popup's delegation
-    /// tab, fetched beside the workspace files of `suggestions`.
+    /// Collaborators offered by the `@` popup's delegation tab, fetched beside
+    /// the workspace files of `suggestions`.
     delegation_suggestions: Vec<AgentCommandEntry>,
+    /// Conversations offered by the `@` popup's conversation tab.
+    ///
+    /// A conversation is context a task may point at, not a delegation target,
+    /// so it has its own list and its own tab instead of sharing the
+    /// collaborator rows.
+    session_suggestions: Vec<AgentCommandEntry>,
     /// The Agent whose provider/model choice the delegation tab is editing.
     ///
     /// While this is set the popup shows that Agent's available
@@ -5559,6 +5607,7 @@ impl SessionView {
             suggestions: Vec::new(),
             phrase_suggestions: Vec::new(),
             delegation_suggestions: Vec::new(),
+            session_suggestions: Vec::new(),
             delegation_edit_agent: None,
             delegation_edit_entries: Vec::new(),
             suggestion_tab: ComposerSuggestionTab::default(),
@@ -30584,6 +30633,7 @@ impl VibexWorkbench {
         self.suggestions.clear();
         self.phrase_suggestions.clear();
         self.delegation_suggestions.clear();
+        self.session_suggestions.clear();
         self.delegation_edit_agent = None;
         self.delegation_edit_entries.clear();
         self.suggestion_tab = ComposerSuggestionTab::default();
@@ -30784,6 +30834,7 @@ impl VibexWorkbench {
             self.suggestions.clear();
             self.phrase_suggestions.clear();
             self.delegation_suggestions.clear();
+            self.session_suggestions.clear();
             self.suggestion_tab = ComposerSuggestionTab::default();
             self.suggestion_selection.dismiss();
             self.suggestion_delegation_action = ComposerDelegationAction::default();
@@ -30795,6 +30846,7 @@ impl VibexWorkbench {
             self.suggestions.clear();
             self.phrase_suggestions.clear();
             self.delegation_suggestions.clear();
+            self.session_suggestions.clear();
             self.suggestion_selection.dismiss();
             self.suggestion_delegation_action = ComposerDelegationAction::default();
             self.suggestion_loading = false;
@@ -30827,17 +30879,22 @@ impl VibexWorkbench {
                         return;
                     }
                     this.suggestion_loading = false;
-                    let (entries, quick_phrases, delegation_entries) = match outcome {
-                        Ok(discovery) => (
-                            discovery.response.entries,
-                            discovery.quick_phrases,
-                            discovery.delegation_entries,
-                        ),
-                        Err(_) => (Vec::new(), Vec::new(), Vec::new()),
-                    };
+                    let (entries, quick_phrases, delegation_entries, session_entries) =
+                        match outcome {
+                            Ok(discovery) => (
+                                discovery.response.entries,
+                                discovery.quick_phrases,
+                                discovery.delegation_entries,
+                                discovery.session_entries,
+                            ),
+                            Err(_) => (Vec::new(), Vec::new(), Vec::new(), Vec::new()),
+                        };
                     this.suggestions = entries;
                     this.phrase_suggestions = quick_phrases;
-                    this.delegation_suggestions = delegation_suggestions(delegation_entries);
+                    let (delegation_entries, session_entries) =
+                        split_mention_suggestions(delegation_entries, session_entries);
+                    this.delegation_suggestions = delegation_entries;
+                    this.session_suggestions = session_entries;
                     // Keep the selected row where it was across a query update;
                     // the active tab decides which list supplies the count.
                     this.reseat_suggestion_selection(false);
@@ -30912,9 +30969,9 @@ impl VibexWorkbench {
 
     /// Whether the open popup offers more than one tab.
     ///
-    /// `/` resolves commands and quick phrases, `@` files and collaborators;
-    /// `$` skills keep their single-panel popup and their plain `Left`/`Right`
-    /// caret movement.
+    /// `/` resolves commands and quick phrases, `@` files, collaborators and
+    /// conversations; `$` skills keep their single-panel popup and their plain
+    /// `Left`/`Right` caret movement.
     fn composer_suggestion_tabs_available(&self, target: ComposerTarget) -> bool {
         self.suggestion_context
             .as_ref()
@@ -30957,6 +31014,7 @@ impl VibexWorkbench {
             &self.phrase_suggestions,
             &self.suggestions,
             &self.delegation_suggestions,
+            &self.session_suggestions,
         )
     }
 
@@ -69835,16 +69893,21 @@ impl VibexWorkbench {
         };
 
         let empty_state = visible_entries.is_empty().then(|| {
+            let query_is_empty = context
+                .request
+                .query
+                .as_deref()
+                .is_none_or(|query| query.trim().is_empty());
             let message = if self.suggestion_loading {
                 locale::text("Loading...", "加载中...", "載入中...")
-            } else if active_tab == ComposerSuggestionTab::Phrases
-                && context
-                    .request
-                    .query
-                    .as_deref()
-                    .is_none_or(|query| query.trim().is_empty())
-            {
+            } else if active_tab == ComposerSuggestionTab::Phrases && query_is_empty {
                 locale::text("No quick phrases yet", "还没有快捷短语", "還沒有快捷短語")
+            } else if active_tab == ComposerSuggestionTab::Sessions && query_is_empty {
+                locale::text(
+                    "No conversations to reference yet",
+                    "还没有可引用的会话",
+                    "還沒有可引用的會話",
+                )
             } else {
                 locale::text("No matches", "没有匹配项", "沒有符合項目")
             };
@@ -69966,6 +70029,9 @@ impl VibexWorkbench {
             }
             ComposerSuggestionTab::Delegation => {
                 locale::text("Agent delegation", "Agent 委派", "Agent 委派")
+            }
+            ComposerSuggestionTab::Sessions => {
+                locale::text("Referenced conversations", "引用会话", "引用會話")
             }
         };
         h_flex()
@@ -100003,9 +100069,9 @@ mod tests {
     #[test]
     fn composer_suggestion_tabs_clamp_and_pick_their_own_rows() {
         // `/` opens on commands and Right reaches phrases; `@` opens on the
-        // workspace files and Right reaches the delegation list; neither end
-        // wraps, so the popup keeps owning the arrow key instead of moving the
-        // caret.
+        // workspace files and Right walks to the collaborators, then to the
+        // conversations; neither end wraps, so the popup keeps owning the arrow
+        // key instead of moving the caret.
         let slash = ComposerSuggestionTab::tabs(Some(AgentCommandTrigger::Slash));
         assert_eq!(
             ComposerSuggestionTab::default(),
@@ -100029,13 +100095,15 @@ mod tests {
             ComposerSuggestionTab::Commands
         );
 
-        // `@` resolves its own two lists, files first.
+        // `@` resolves its own three lists: files, collaborators, then the
+        // conversations a task may point at.
         let mention = ComposerSuggestionTab::tabs(Some(AgentCommandTrigger::Mention));
         assert_eq!(
             mention,
             &[
                 ComposerSuggestionTab::Files,
-                ComposerSuggestionTab::Delegation
+                ComposerSuggestionTab::Delegation,
+                ComposerSuggestionTab::Sessions
             ]
         );
         assert_eq!(
@@ -100048,7 +100116,11 @@ mod tests {
         );
         assert_eq!(
             ComposerSuggestionTab::Delegation.moved(mention, true),
-            ComposerSuggestionTab::Delegation
+            ComposerSuggestionTab::Sessions
+        );
+        assert_eq!(
+            ComposerSuggestionTab::Sessions.moved(mention, true),
+            ComposerSuggestionTab::Sessions
         );
         // A leftover `/` tab clamps onto the `@` popup's own first tab.
         assert_eq!(
@@ -100091,12 +100163,19 @@ mod tests {
             None,
         );
         collaborator.id = "reference:agent:codex:sha256:test".into();
+        let mut conversation = command_entry(
+            AgentCommandSourceKind::Reference,
+            AgentCommandTrigger::Mention,
+            None,
+        );
+        conversation.id = "reference:session:session-1".into();
         let commands = vec![command.clone()];
         let phrases = vec![phrase.clone()];
         let files = vec![file.clone()];
         let delegation = vec![collaborator.clone()];
+        let sessions = vec![conversation.clone()];
         let rows = |tab: ComposerSuggestionTab| {
-            tab.rows(&commands, &phrases, &files, &delegation)
+            tab.rows(&commands, &phrases, &files, &delegation, &sessions)
                 .iter()
                 .map(|entry| entry.id.as_str())
                 .collect::<Vec<_>>()
@@ -100110,6 +100189,10 @@ mod tests {
         assert_eq!(
             rows(ComposerSuggestionTab::Delegation),
             vec!["reference:agent:codex:sha256:test"]
+        );
+        assert_eq!(
+            rows(ComposerSuggestionTab::Sessions),
+            vec!["reference:session:session-1"]
         );
     }
 
@@ -100151,6 +100234,56 @@ mod tests {
             delegation_target(&rows[0]),
             Some(("codex".to_string(), "sha256:test".to_string()))
         );
+    }
+
+    #[test]
+    fn conversations_keep_their_own_tab_when_the_authority_folds_them_in() {
+        let mut collaborator = command_entry(
+            AgentCommandSourceKind::Reference,
+            AgentCommandTrigger::Mention,
+            None,
+        );
+        collaborator.id = "reference:agent:codex:sha256:test".into();
+        collaborator.label = "@Codex".into();
+        collaborator.metadata = vec![
+            vibex_core::ProviderBindingMetadata {
+                key: vibex_desktop_runtime::COMPOSER_AGENT_REFERENCE_KEY.to_string(),
+                value: "codex".into(),
+            },
+            vibex_core::ProviderBindingMetadata {
+                key: vibex_desktop_runtime::COMPOSER_SELECTION_REFERENCE_KEY.to_string(),
+                value: "sha256:test".into(),
+            },
+        ];
+        let mut conversation = command_entry(
+            AgentCommandSourceKind::Reference,
+            AgentCommandTrigger::Mention,
+            None,
+        );
+        conversation.id = "reference:session:session-1".into();
+        conversation.label = "@Fix the flaky test".into();
+        conversation.metadata = vec![vibex_core::ProviderBindingMetadata {
+            key: vibex_desktop_runtime::COMPOSER_SESSION_REFERENCE_KEY.to_string(),
+            value: "vibex://session/session-1".into(),
+        }];
+
+        // An older paired authority sends the conversations inside the
+        // delegation list. They must move to the conversation tab instead of
+        // being drawn with a hand-off control they cannot honour, and a row
+        // that arrives twice must still be drawn once.
+        let (delegation, sessions) = split_mention_suggestions(
+            vec![
+                collaborator.clone(),
+                conversation.clone(),
+                conversation.clone(),
+            ],
+            vec![conversation.clone()],
+        );
+
+        assert_eq!(delegation.len(), 1);
+        assert_eq!(delegation[0].id, collaborator.id);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, "reference:session:session-1");
     }
 
     #[test]

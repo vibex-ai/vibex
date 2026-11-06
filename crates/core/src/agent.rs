@@ -1095,8 +1095,8 @@ pub struct AgentCommandDiscovery {
     /// switching local instead of a round trip through the authority.
     #[serde(default)]
     pub quick_phrases: Vec<AgentCommandEntry>,
-    /// The collaborators, conversations and direct delegation actions the `@`
-    /// popup offers on its second tab.
+    /// The collaborators and direct delegation actions the `@` popup offers on
+    /// its second tab.
     ///
     /// They travel beside the workspace file references in `response.entries`
     /// for the same reason as the quick phrases: one discovery answers both
@@ -1104,6 +1104,13 @@ pub struct AgentCommandDiscovery {
     /// returns to the authority.
     #[serde(default)]
     pub delegation_entries: Vec<AgentCommandEntry>,
+    /// The conversations the `@` popup offers on its third tab.
+    ///
+    /// A conversation is context a task may point at, not a delegation target,
+    /// so it travels apart from the collaborators: the popup draws it under
+    /// its own heading instead of mixing two different actions in one list.
+    #[serde(default)]
+    pub session_entries: Vec<AgentCommandEntry>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -12431,6 +12431,7 @@ mod tests {
                     skills: false,
                     quick_phrases: Vec::new(),
                     delegation_entries: Vec::new(),
+                    session_entries: Vec::new(),
                 })
             }
         }

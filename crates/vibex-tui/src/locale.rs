@@ -471,6 +471,11 @@ strings! {
     composer_tab_phrases => { "Quick phrases", "快捷短语", "快捷短語" },
     composer_tab_files => { "Workspace files", "工作区文件", "工作區檔案" },
     composer_tab_delegation => { "Agent delegation", "Agent 委派", "Agent 委派" },
+    composer_tab_sessions => {
+        "Referenced conversations",
+        "引用会话",
+        "引用會話"
+    },
     composer_phrases_empty => { "No quick phrases yet", "还没有快捷短语", "還沒有快捷短語" },
     composer_no_matches => { "No matches", "没有匹配项", "沒有符合項目" },
 

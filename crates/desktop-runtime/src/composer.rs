@@ -53,12 +53,15 @@ pub async fn discover_composer_commands(
     let manager = agent.manager();
     let mut response = manager.discover_commands(request.clone()).await?;
     let capabilities = manager.command_discovery_capabilities(&request)?;
-    // The workspace files are the `@` popup's own list; the collaborators are
-    // its second tab. They are bounded separately, so neither one's size can
-    // decide what the other offers.
-    let delegation_entries = match vibex_use {
-        Some(vibex_use) => collaborator_reference_commands(vibex_use, files, &request).await?,
-        None => Vec::new(),
+    // The workspace files are the `@` popup's own list; the collaborators and
+    // the conversations are its second and third tabs. Each is bounded on its
+    // own, so neither one's size can decide what the others offer.
+    let (delegation_entries, session_entries) = match vibex_use {
+        Some(vibex_use) => (
+            collaborator_reference_commands(vibex_use, files, &request).await?,
+            session_reference_commands(vibex_use, &request)?,
+        ),
+        None => (Vec::new(), Vec::new()),
     };
     append_file_reference_commands(files, &request, &mut response)?;
     append_workspace_skill_commands(providers, &request, &mut response, capabilities.skills)?;
@@ -69,6 +72,7 @@ pub async fn discover_composer_commands(
         skills: capabilities.skills,
         quick_phrases,
         delegation_entries,
+        session_entries,
     })
 }
 
@@ -97,6 +101,31 @@ async fn collaborator_reference_commands(
     if !mention_references_are_offered(request) {
         return Ok(Vec::new());
     }
+    let catalog_service = vibex_use.runtime_option_catalog();
+    let catalog = catalog_service.list().await?;
+    let preferences = catalog_service.composer_preferences();
+    let selection = DelegationSelection::load(files, &catalog, request, preferences);
+    Ok(runtime_reference_commands(
+        &catalog.options,
+        request,
+        &selection,
+    ))
+}
+
+/// The entries of the `@` popup's conversation tab.
+///
+/// A conversation reference is context, not a target: it points a task at a
+/// session it may read, and picking one inserts the reference instead of
+/// starting a delegation. It is resolved against the same bounded session
+/// lookup the delegation tab used to share, now with a budget of its own so a
+/// long collaborator list cannot hide the conversations.
+fn session_reference_commands(
+    vibex_use: &Arc<VibexUseService>,
+    request: &AgentCommandDiscoverRequest,
+) -> VibexResult<Vec<AgentCommandEntry>> {
+    if !mention_references_are_offered(request) {
+        return Ok(Vec::new());
+    }
     let limit = request.limit.unwrap_or(50) as usize;
     let query = request
         .query
@@ -104,52 +133,38 @@ async fn collaborator_reference_commands(
         .map(str::trim)
         .unwrap_or("")
         .to_lowercase();
-    let catalog_service = vibex_use.runtime_option_catalog();
-    let catalog = catalog_service.list().await?;
-    let preferences = catalog_service.composer_preferences();
-    let selection = DelegationSelection::load(files, &catalog, request, preferences);
-    let mut entries = runtime_reference_commands(&catalog.options, request, &selection);
-    // An Agent's own configurations usually fill the tab, and the session
-    // lookup is a database read of its own: only reach for it when the list
-    // still has room.
-    if entries.len() >= limit {
-        return Ok(entries);
-    }
-    let mut existing_ids = entries
+    Ok(vibex_use
+        .referenceable_sessions(&query, limit)?
         .iter()
-        .map(|entry| entry.id.clone())
-        .collect::<HashSet<_>>();
+        .map(|session| session_reference_entry(&session.id, &session.title, &session.agent_id))
+        .collect())
+}
 
-    for session in vibex_use.referenceable_sessions(&query, limit)? {
-        if entries.len() >= limit {
-            break;
-        }
-        let entry = AgentCommandEntry {
-            id: format!("reference:session:{}", session.id.as_str()),
-            trigger: AgentCommandTrigger::Mention,
-            source_kind: AgentCommandSourceKind::Reference,
-            label: format!("@{}", session.title),
-            description: Some(session.agent_id.to_string()),
-            insertion_text: format!("@{} ", session.title),
-            command_name: None,
-            provider_kind: Some(ProviderKind::Acp),
-            prompt_id: None,
-            skill_id: None,
-            reference_path: None,
-            selection_behavior: AgentCommandSelectionBehavior::Insert,
-            execution_behavior: AgentCommandExecutionBehavior::None,
-            destructive: false,
-            metadata: vec![ProviderBindingMetadata {
-                key: COMPOSER_SESSION_REFERENCE_KEY.to_string(),
-                value: VibexUseRef::session(&session.id).as_uri(),
-            }],
-        };
-        if !existing_ids.insert(entry.id.clone()) {
-            continue;
-        }
-        entries.push(entry);
+fn session_reference_entry(
+    session_id: &vibex_core::VibexSessionId,
+    title: &str,
+    agent_id: &AgentId,
+) -> AgentCommandEntry {
+    AgentCommandEntry {
+        id: format!("reference:session:{}", session_id.as_str()),
+        trigger: AgentCommandTrigger::Mention,
+        source_kind: AgentCommandSourceKind::Reference,
+        label: format!("@{title}"),
+        description: Some(agent_id.to_string()),
+        insertion_text: format!("@{title} "),
+        command_name: None,
+        provider_kind: Some(ProviderKind::Acp),
+        prompt_id: None,
+        skill_id: None,
+        reference_path: None,
+        selection_behavior: AgentCommandSelectionBehavior::Insert,
+        execution_behavior: AgentCommandExecutionBehavior::None,
+        destructive: false,
+        metadata: vec![ProviderBindingMetadata {
+            key: COMPOSER_SESSION_REFERENCE_KEY.to_string(),
+            value: VibexUseRef::session(session_id).as_uri(),
+        }],
     }
-    Ok(entries)
 }
 
 /// The evidence behind the one configuration shown for each Agent.
@@ -767,7 +782,8 @@ mod tests {
     use super::*;
     use vibex_core::{
         AgentAuthContextId, AgentId, FileEntryKind, ProviderProfileId, RuntimeOptionAvailability,
-        SessionConfigValue, SessionRuntimeOption, SessionRuntimeSelection, WorkspaceId,
+        SessionConfigValue, SessionRuntimeOption, SessionRuntimeSelection, VibexSessionId,
+        WorkspaceId,
     };
     use vibex_db::{WorkspaceRepository, apply_migrations, open_database};
 
@@ -857,6 +873,44 @@ mod tests {
         // rows: the list answers "who can take this work".
         assert_eq!(commands.len(), 1);
         assert_eq!(commands[0].label, "@Codex");
+    }
+
+    #[test]
+    fn a_conversation_is_an_insert_only_reference_without_an_agent_target() {
+        let agent_id = AgentId::parse("codex").unwrap();
+        let session_id = VibexSessionId::new();
+        let entry = session_reference_entry(&session_id, "Fix the flaky test", &agent_id);
+
+        // The conversation tab points at a session to read. It must carry no
+        // Agent or selection reference: those two are what turn a row into a
+        // delegation target in the popup.
+        assert_eq!(
+            entry.id,
+            format!("reference:session:{}", session_id.as_str())
+        );
+        assert_eq!(entry.label, "@Fix the flaky test");
+        assert_eq!(entry.insertion_text, "@Fix the flaky test ");
+        assert_eq!(
+            entry.selection_behavior,
+            AgentCommandSelectionBehavior::Insert
+        );
+        assert_eq!(
+            entry.execution_behavior,
+            AgentCommandExecutionBehavior::None
+        );
+        assert!(entry.metadata.iter().all(|metadata| {
+            metadata.key != COMPOSER_AGENT_REFERENCE_KEY
+                && metadata.key != COMPOSER_SELECTION_REFERENCE_KEY
+        }));
+        let reference = entry
+            .metadata
+            .iter()
+            .find(|metadata| metadata.key == COMPOSER_SESSION_REFERENCE_KEY)
+            .map(|metadata| metadata.value.as_str());
+        assert_eq!(
+            reference,
+            Some(format!("vibex://session/{}", session_id.as_str()).as_str())
+        );
     }
 
     #[test]

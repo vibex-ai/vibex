@@ -5482,6 +5482,7 @@ fn completion_tab_label(tab: crate::composer::CompletionTab, strings: Strings) -
         CompletionTab::Phrases => strings.composer_tab_phrases(),
         CompletionTab::Files => strings.composer_tab_files(),
         CompletionTab::Delegation => strings.composer_tab_delegation(),
+        CompletionTab::Sessions => strings.composer_tab_sessions(),
     }
 }
 
