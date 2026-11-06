@@ -2701,10 +2701,7 @@ fn add_unknown_json_fields(
             Some(file_kind),
             "provider_native_import_unknown_field",
             "native config field is not mapped yet",
-            vec![
-                option_entry("field", key),
-                option_entry("value", &value),
-            ],
+            vec![option_entry("field", key), option_entry("value", &value)],
         ));
     }
 }
@@ -2726,10 +2723,7 @@ fn add_unknown_toml_fields(
             Some(file_kind),
             "provider_native_import_unknown_field",
             "native config field is not mapped yet",
-            vec![
-                option_entry("field", key),
-                option_entry("value", &value),
-            ],
+            vec![option_entry("field", key), option_entry("value", &value)],
         ));
     }
 }
