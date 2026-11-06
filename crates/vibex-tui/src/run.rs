@@ -2147,6 +2147,33 @@ fn apply_clipboard(
     }
 }
 
+/// Whether a refreshed catalogue describes the same rows in the same order.
+///
+/// A picker indexes its rows by position and holds the run-option values of the
+/// row it is on. A catalogue that only enriches those rows — the case a
+/// finished probe produces — can replace the one the picker opened without
+/// moving anything under the cursor. One that adds, removes or reorders rows
+/// cannot, and is left for the next visit rather than applied under the
+/// reader's selection.
+fn catalogue_rows_match(
+    current: Option<&vibex_core::SessionRuntimeOptionCatalog>,
+    refreshed: &vibex_core::SessionRuntimeOptionCatalog,
+) -> bool {
+    let Some(current) = current else {
+        return true;
+    };
+    current.options.len() == refreshed.options.len()
+        && current
+            .options
+            .iter()
+            .zip(&refreshed.options)
+            .all(|(left, right)| {
+                left.selection.agent_id == right.selection.agent_id
+                    && left.selection.auth_source == right.selection.auth_source
+                    && left.selection.model == right.selection.model
+            })
+}
+
 fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> BackendResult<()> {
     match message {
         AppMessage::Pasted {
@@ -2365,8 +2392,12 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
                         )
                     );
                     // Indices and run-option values refer to the catalogue the
-                    // reader opened. An unrelated prefetch cannot reorder it.
-                    if !picker_open {
+                    // reader opened. A late answer that would add, remove or
+                    // reorder rows cannot replace it; one that only enriches
+                    // the rows it already has can, which is what lets the run
+                    // options a probe just persisted reach an open picker.
+                    let rows_match = catalogue_rows_match(app.runtime_options.as_ref(), &catalog);
+                    if !picker_open || rows_match {
                         app.runtime_options = Some(catalog);
                         app.reconcile_remembered_runtime();
                     }
@@ -2383,6 +2414,12 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
                     }
                 }
             };
+            // An invalidation that landed while this read was in flight asked
+            // for the catalogue this answer may predate. The in-flight flag is
+            // clear again, so start the one follow-up read now.
+            if let Some(effect) = app.take_runtime_catalogue_refresh() {
+                worker.dispatch(effect);
+            }
         }
         AppMessage::SessionCreated { request_id, result } => {
             if !app.pending_creations.contains_key(&request_id) {
@@ -3427,6 +3464,25 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
                     worker.dispatch(effect);
                 }
             }
+            // A management invalidation is how the authority says the Provider
+            // and Agent projection moved. It is also what a completed runtime
+            // option probe publishes: the evidence that fills an Agent's
+            // thinking depth, conversation mode and features arrives after the
+            // first catalogue read, so keeping that read would leave every
+            // Agent with nothing to tune until the client restarted.
+            let management_invalidated = matches!(
+                &event,
+                vibex_backend::BackendEvent::ProjectionInvalidated(
+                    vibex_backend::BackendProjection::Management
+                )
+            ) || matches!(
+                &event,
+                vibex_backend::BackendEvent::Lagged { refetch, .. }
+                    if refetch.projection == Some(vibex_backend::BackendProjection::Management)
+            );
+            if management_invalidated && let Some(effect) = app.refresh_runtime_catalogue() {
+                worker.dispatch(effect);
+            }
             // The unread mark and the last thing a session did are both the
             // client's own readings of the events it already receives: the
             // event says what arrived, the list says where the reader was when
@@ -4098,6 +4154,183 @@ mod tests {
         assert!(
             app.agent.state.sessions.is_loading(),
             "a lag that named the sidebar left the list stale"
+        );
+    }
+
+    #[test]
+    fn a_management_invalidation_asks_for_the_runtime_catalogue() {
+        // A background probe persists an Agent's and each Model's run options
+        // after the client already read the catalogue. The shell announces the
+        // completed probe with a management invalidation, and a client that
+        // ignores it draws every Agent with no thinking depth, mode or feature
+        // until the process restarts.
+        let (worker, mut messages) =
+            Worker::start(vibex_backend::DisconnectedBackend::facade()).unwrap();
+        let mut app = isolation_app();
+        app.runtime_options_reading = false;
+
+        apply_message(
+            &mut app,
+            &worker,
+            AppMessage::Event(vibex_backend::BackendEvent::ProjectionInvalidated(
+                vibex_backend::BackendProjection::Management,
+            )),
+        )
+        .unwrap();
+        assert!(
+            app.runtime_options_reading,
+            "the invalidation did not ask for the catalogue"
+        );
+
+        // The read reached the worker, which is what makes the next catalogue
+        // the one the selectors see.
+        let observer = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let answered = observer.block_on(async {
+            loop {
+                match tokio::time::timeout(Duration::from_secs(5), messages.recv()).await {
+                    Ok(Some(AppMessage::RuntimeOptions(_))) => break true,
+                    Ok(Some(_)) => {}
+                    Ok(None) | Err(_) => break false,
+                }
+            }
+        });
+        assert!(answered, "the invalidation never reached the worker");
+
+        // A fan-out that lagged past the management projection dropped the
+        // same invalidation, so its refetch has to ask for the same read.
+        app.runtime_options_reading = false;
+        apply_message(
+            &mut app,
+            &worker,
+            AppMessage::Event(vibex_backend::BackendEvent::Lagged {
+                stream: vibex_backend::BackendEventStream::Fanout,
+                skipped: 4,
+                refetch: vibex_backend::BackendRefetch {
+                    session_id: None,
+                    timeline: false,
+                    runtime: false,
+                    runtime_selection: false,
+                    projection: Some(vibex_backend::BackendProjection::Management),
+                },
+                observed_live: false,
+            }),
+        )
+        .unwrap();
+        assert!(
+            app.runtime_options_reading,
+            "a lag that named the management projection left the catalogue stale"
+        );
+    }
+
+    #[test]
+    fn a_catalogue_answer_starts_the_read_an_invalidation_asked_for() {
+        // The invalidation can land while the first read is still on its way.
+        // Its answer may predate the probe that caused the invalidation, so it
+        // must be followed by exactly one more read instead of being kept as
+        // final.
+        let (worker, mut messages) =
+            Worker::start(vibex_backend::DisconnectedBackend::facade()).unwrap();
+        let mut app = isolation_app();
+        let mut catalog = app.runtime_options.take().expect("catalogue fixture");
+        // The answer that landed before the probe finished carries no run
+        // options; the follow-up carries the ones the probe persisted. The
+        // revision is what proves the second answer is the one that stuck.
+        catalog.revision = 7;
+        catalog.options[0].reasoning_efforts = vec![vibex_core::SessionConfigValue {
+            value: "high".to_string(),
+            label: None,
+        }];
+        app.new_session_runtime = Some(catalog.options[0].selection.clone());
+        assert!(
+            app.run_options().is_empty(),
+            "the fixture already had run options"
+        );
+        app.runtime_options_reading = true;
+
+        apply_message(
+            &mut app,
+            &worker,
+            AppMessage::Event(vibex_backend::BackendEvent::ProjectionInvalidated(
+                vibex_backend::BackendProjection::Management,
+            )),
+        )
+        .unwrap();
+        assert!(app.runtime_options_refresh_pending);
+        assert!(
+            app.runtime_options_reading,
+            "the invalidation raced the read already in flight"
+        );
+
+        apply_message(&mut app, &worker, AppMessage::RuntimeOptions(Ok(catalog))).unwrap();
+        assert!(!app.runtime_options_refresh_pending);
+        assert!(
+            app.runtime_options_reading,
+            "the pending invalidation did not start a follow-up read"
+        );
+        assert_eq!(
+            app.runtime_options.as_ref().map(|catalog| catalog.revision),
+            Some(7),
+            "the answer that landed was not kept"
+        );
+        assert!(
+            !app.run_options().is_empty(),
+            "the refreshed catalogue never reached the run options"
+        );
+
+        let observer = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let asked_again = observer.block_on(async {
+            loop {
+                match tokio::time::timeout(Duration::from_secs(5), messages.recv()).await {
+                    Ok(Some(AppMessage::RuntimeOptions(_))) => break true,
+                    Ok(Some(_)) => {}
+                    Ok(None) | Err(_) => break false,
+                }
+            }
+        });
+        assert!(asked_again, "the follow-up read never reached the worker");
+    }
+
+    #[test]
+    fn a_refreshed_catalogue_that_only_adds_run_options_reaches_the_open_picker() {
+        // A catalogue refresh can land while the reader is looking at the
+        // switcher. If the rows are the ones the picker opened — the probe only
+        // added the effort/mode/feature lists — replacing it is safe and is
+        // what makes the run options appear without closing the picker.
+        let (worker, _messages) =
+            Worker::start(vibex_backend::DisconnectedBackend::facade()).unwrap();
+        let mut app = isolation_app();
+        let mut enriched = app.runtime_options.clone().expect("catalogue fixture");
+        app.new_session_runtime = Some(enriched.options[0].selection.clone());
+        app.show_runtime_picker();
+        assert!(matches!(app.overlay, Some(Overlay::RuntimePicker { .. })));
+        assert!(app.picker_run_options().is_empty());
+
+        enriched.revision = 9;
+        enriched.options[0].reasoning_efforts = vec![vibex_core::SessionConfigValue {
+            value: "high".to_string(),
+            label: None,
+        }];
+        apply_message(&mut app, &worker, AppMessage::RuntimeOptions(Ok(enriched))).unwrap();
+
+        assert!(
+            matches!(app.overlay, Some(Overlay::RuntimePicker { .. })),
+            "the refresh closed the picker the reader had open"
+        );
+        assert_eq!(
+            app.runtime_options.as_ref().map(|catalog| catalog.revision),
+            Some(9),
+            "an enrichment that moved nothing was left out of the picker"
+        );
+        assert_eq!(
+            app.picker_run_options().len(),
+            1,
+            "the probe's run options never reached the open picker"
         );
     }
 

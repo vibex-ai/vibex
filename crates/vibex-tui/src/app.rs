@@ -1284,6 +1284,15 @@ pub struct App {
     /// overlay opens when it lands. A catalogue fetched for the composer's
     /// info line must not pop a modal over the session.
     pub runtime_picker_pending: bool,
+    /// Whether an invalidation arrived while a catalogue read was in flight.
+    ///
+    /// The authority publishes `RuntimeOptionsChanged` after a background probe
+    /// persists an Agent's or a Model's run options. That notice can land on a
+    /// read that is already asking for the same catalogue, and a second request
+    /// would only race the first. The flag remembers the notice so the answer
+    /// starts the one follow-up read, and the catalogue read before the probe
+    /// finished is not the one the client keeps for the session.
+    pub runtime_options_refresh_pending: bool,
     /// What the switcher remembers between runs: the selection last applied,
     /// each Agent's own answer, and how each model runs.
     pub runtime_prefs: crate::runtime_prefs::RuntimePreferences,
@@ -2160,6 +2169,7 @@ impl App {
             runtime_options: None,
             runtime_options_reading: false,
             runtime_picker_pending: false,
+            runtime_options_refresh_pending: false,
             runtime_prefs: crate::runtime_prefs::RuntimePreferences::load(
                 options.runtime_path.as_deref(),
             ),

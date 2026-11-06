@@ -6158,7 +6158,10 @@ impl App {
         if let Some(mark_read) = mark_read {
             effects.push(mark_read);
         }
-        if self.runtime_options.is_none() && self.runtime_catalog_available() {
+        if self.runtime_options.is_none()
+            && !self.runtime_options_reading
+            && self.runtime_catalog_available()
+        {
             effects.push(self.read_runtime_catalogue());
         }
         effects.extend(child_read);
@@ -6218,7 +6221,10 @@ impl App {
         // short a time as the read allows, and never spends it saying the
         // runtime is unavailable. It is a read; a failure leaves the page naming
         // the Agent it can.
-        if self.runtime_options.is_none() && self.runtime_catalog_available() {
+        if self.runtime_options.is_none()
+            && !self.runtime_options_reading
+            && self.runtime_catalog_available()
+        {
             effects.push(self.read_runtime_catalogue());
         }
         // The list of existing sessions is read once on the way in even though
@@ -6267,7 +6273,7 @@ impl App {
                 self.strings.runtime_no_agents()
             };
             self.toast(Toast::warning(message.to_string()));
-            return if self.runtime_options.is_none() {
+            return if self.runtime_options.is_none() && !self.runtime_options_reading {
                 Outcome::effects(vec![self.read_runtime_catalogue()])
             } else {
                 Outcome::quiet()
@@ -7315,6 +7321,36 @@ impl App {
         Effect::ListRuntimeOptions
     }
 
+    /// Ask for the catalogue again after the authority said what it is built
+    /// from has changed.
+    ///
+    /// Startup probes persist an Agent's and each Model's run options after the
+    /// runtime is already serving. The shell publishes `RuntimeOptionsChanged`
+    /// for that, and a client that kept the catalogue it read at startup would
+    /// show every Agent with no thinking depth, mode, or feature until it was
+    /// restarted. A read already on its way is the answer to the same request,
+    /// so this records the invalidation instead of racing it; the answer starts
+    /// the one follow-up read.
+    pub(crate) fn refresh_runtime_catalogue(&mut self) -> Option<Effect> {
+        if !self.runtime_catalog_available() {
+            return None;
+        }
+        if self.runtime_options_reading {
+            self.runtime_options_refresh_pending = true;
+            return None;
+        }
+        Some(self.read_runtime_catalogue())
+    }
+
+    /// The follow-up a catalogue answer owes an invalidation that landed while
+    /// the read was in flight.
+    pub(crate) fn take_runtime_catalogue_refresh(&mut self) -> Option<Effect> {
+        if !std::mem::take(&mut self.runtime_options_refresh_pending) {
+            return None;
+        }
+        Some(self.read_runtime_catalogue())
+    }
+
     fn open_runtime_picker(&mut self) -> Outcome {
         // A backend that cannot move a session between runtimes gets an
         // explanation rather than an overlay whose Enter does nothing.
@@ -7338,8 +7374,12 @@ impl App {
         self.runtime_picker_target = Some(self.runtime_target());
         if self.runtime_options.is_none() {
             // Opening the picker is what asked for the catalogue; the message
-            // that carries it is what opens the overlay.
+            // that carries it is what opens the overlay. A read already on its
+            // way will answer this request too, so it is not asked twice.
             self.runtime_picker_pending = true;
+            if self.runtime_options_reading {
+                return Outcome::quiet();
+            }
             return Outcome::effects(vec![self.read_runtime_catalogue()]);
         }
         self.show_runtime_picker();
@@ -9925,6 +9965,73 @@ mod tests {
         );
     }
 
+    /// An invalidation that arrives while the catalogue is already being read
+    /// is the answer that read was asking for, so it must not start a second
+    /// request; the answer starts exactly one follow-up.
+    #[test]
+    fn a_catalogue_invalidation_coalesces_with_the_read_in_flight() {
+        let mut app = capable_app();
+        app.live = crate::app::LiveState::Ready;
+        app.runtime_options_reading = true;
+
+        assert!(
+            app.refresh_runtime_catalogue().is_none(),
+            "a second read raced the one already in flight"
+        );
+        assert!(app.runtime_options_refresh_pending);
+
+        // More notices about the same background work are not more reads.
+        assert!(app.refresh_runtime_catalogue().is_none());
+
+        let follow_up = app
+            .take_runtime_catalogue_refresh()
+            .expect("the invalidation did not ask for a follow-up read");
+        assert!(matches!(follow_up, Effect::ListRuntimeOptions));
+        assert!(app.runtime_options_reading);
+        assert!(!app.runtime_options_refresh_pending);
+        assert!(
+            app.take_runtime_catalogue_refresh().is_none(),
+            "one invalidation produced more than one follow-up"
+        );
+    }
+
+    /// With nothing in flight, an invalidation is what asks for the catalogue.
+    #[test]
+    fn a_catalogue_invalidation_reads_when_nothing_is_in_flight() {
+        let mut app = capable_app();
+        app.live = crate::app::LiveState::Ready;
+        app.runtime_options = Some(run_option_catalog());
+        app.runtime_options_reading = false;
+
+        let effect = app
+            .refresh_runtime_catalogue()
+            .expect("the invalidation was dropped");
+        assert!(matches!(effect, Effect::ListRuntimeOptions));
+        assert!(
+            app.runtime_options_reading,
+            "the invalidation dispatched a read the page cannot account for"
+        );
+        assert!(!app.runtime_options_refresh_pending);
+    }
+
+    /// Opening the switcher while the catalogue is already on its way waits for
+    /// that read instead of dispatching another one.
+    #[test]
+    fn the_switcher_does_not_race_a_catalogue_read_in_flight() {
+        let mut app = capable_app();
+        app.live = crate::app::LiveState::Ready;
+        app.runtime_options = None;
+        app.runtime_options_reading = true;
+        app.navigate_to(Page::Sessions);
+
+        let outcome = app.open_runtime_picker();
+        assert!(
+            outcome.effects.is_empty(),
+            "the picker asked for a second catalogue: {outcome:?}"
+        );
+        assert!(app.runtime_picker_pending);
+    }
+
     #[test]
     fn the_composing_page_names_the_runtime_it_will_create_with() {
         // The page answers for itself. A reader who left a session to write a
@@ -10820,15 +10927,23 @@ mod tests {
         // draft stays in the box for the `Enter` that follows.
         let mut app = capable_app();
         app.live = crate::app::LiveState::Ready;
-        app.perform(Intent::NewSession);
-        app.composer.insert_str("who answers this?");
-        let waiting = app.perform(Intent::SubmitComposer);
+        let opened = app.perform(Intent::NewSession);
         assert!(
-            waiting
+            opened
                 .effects
                 .iter()
                 .any(|effect| matches!(effect, Effect::ListRuntimeOptions)),
-            "the page did not read the catalogue: {waiting:?}"
+            "the page did not read the catalogue: {opened:?}"
+        );
+        app.composer.insert_str("who answers this?");
+        let waiting = app.perform(Intent::SubmitComposer);
+        assert!(
+            waiting.effects.is_empty(),
+            "the send raced the catalogue read the page already asked for: {waiting:?}"
+        );
+        assert!(
+            app.runtime_options_reading,
+            "the page stopped waiting for the catalogue it asked for"
         );
         assert!(
             created_runtime(&waiting).is_none(),
