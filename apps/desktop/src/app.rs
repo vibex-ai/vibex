@@ -18771,17 +18771,16 @@ impl VibexWorkbench {
                                 this.agent_loading = false;
                                 this.finish_startup_loading(cx);
                             }
-                            // The provider read this overview just installed is
-                            // authoritative for the pairs the catalogue is
-                            // built from, and a catalogue read started before it
-                            // may carry the previous configuration. Enrich
-                            // unconditionally: the read is independent of this
-                            // snapshot, and a newer configured catalogue still in
-                            // flight is superseded rather than silently skipped.
-                            // Skipping it was how a provisional catalogue with no
-                            // probe evidence survived when the provider events
-                            // and the overview overlapped.
-                            this.load_agent_runtime_catalog(cx);
+                            // A newer configured catalogue owns the enrichment
+                            // when it started after this overview: it installs
+                            // the newer Agent and Profile snapshot this read
+                            // would otherwise overwrite, and it loads the
+                            // runtime catalogue on both success and failure.
+                            // Loading here too would cancel those newer
+                            // snapshots on the way to the same catalogue.
+                            if this.agent_catalog_generation == catalog_generation {
+                                this.load_agent_runtime_catalog(cx);
+                            }
                         }
                         Ok(Err(error)) => {
                             if this.sessions.is_empty() && this.timeline.session_id.is_none() {
@@ -18789,6 +18788,12 @@ impl VibexWorkbench {
                             }
                             this.agent_error = Some(format!("{}: {}", error.code, error.message));
                             this.finish_startup_loading(cx);
+                            // The overview's failed start already invalidated
+                            // any catalogue read before it. Load the catalogue
+                            // here too so a failed session/workspace read cannot
+                            // strand the provisional options this shell already
+                            // installed.
+                            this.load_agent_runtime_catalog(cx);
                         }
                         Err(error) => {
                             if this.sessions.is_empty() && this.timeline.session_id.is_none() {
@@ -18796,6 +18801,7 @@ impl VibexWorkbench {
                             }
                             this.agent_error = Some(format!("agent overview task failed: {error}"));
                             this.finish_startup_loading(cx);
+                            this.load_agent_runtime_catalog(cx);
                         }
                     }
                     cx.notify();
@@ -114087,11 +114093,11 @@ mod tests {
         assert!(profile_fetch < configured_catalog_assignment);
         assert!(configured_catalog_assignment < configured_catalog_builder);
         assert!(configured_catalog_builder < enriched_catalog);
-        assert_eq!(
+        assert!(
             overview
                 .matches("this.load_agent_runtime_catalog(cx);")
-                .count(),
-            1
+                .count()
+                >= 1
         );
         assert!(overview.contains("this.runtime_catalog.is_none()"));
         assert!(overview.contains("self.agent_catalog_generation = self.agent_catalog_generation"));
@@ -114133,26 +114139,36 @@ mod tests {
         assert!(handler.contains("self.load_agent_runtime_catalog(cx)"));
     }
 
-    /// A provider event and the startup overview used to bump the catalogue
-    /// generation against each other. The overview then skipped its enrichment
-    /// read, and when the overlapping configured read failed the shell kept the
-    /// provisional catalogue — every Agent showing no thinking depth, mode or
-    /// feature until the process restarted.
+    /// A failed overview already invalidated any catalogue read that started
+    /// before it, so it has to start its own. Without that, a failed
+    /// session/workspace read left the provisional catalogue — every Agent
+    /// showing no thinking depth, mode or feature — in place. The success path
+    /// keeps the generation guard: a newer configured catalogue installs the
+    /// newer provider snapshot and loads the same catalogue on its own.
     #[test]
-    fn the_overview_never_skips_catalogue_enrichment() {
+    fn a_failed_overview_still_loads_the_catalogue() {
         let source = include_str!("app.rs");
         let overview = source
             .split_once("    fn load_agent_overview(")
             .and_then(|(_, tail)| tail.split_once("\n    fn load_agent_runtime_catalog("))
             .map(|(body, _)| body)
             .expect("agent overview should remain inspectable");
-        let enrichment = overview
-            .find("this.load_agent_runtime_catalog(cx);")
-            .expect("the overview should enrich the catalogue");
-        let before = &overview[enrichment.saturating_sub(240)..enrichment];
+        let success_guard = overview
+            .find("if this.agent_catalog_generation == catalog_generation {")
+            .expect("the success path should keep the newer-provider guard");
+        let failure = overview
+            .find("this.agent_error = Some(format!(\"{}: {}\", error.code, error.message));")
+            .expect("the overview failure branch should remain inspectable");
         assert!(
-            !before.contains("agent_catalog_generation == catalog_generation"),
-            "the overview still guards its enrichment on the shared generation"
+            success_guard < failure,
+            "the guard belongs to the success path, not the failure paths"
+        );
+        assert_eq!(
+            overview
+                .matches("this.load_agent_runtime_catalog(cx);")
+                .count(),
+            3,
+            "the success path and both failure branches must enrich"
         );
     }
 
