@@ -3111,10 +3111,9 @@ impl Dispatch {
                     });
                 }
                 // The runtime keeps the operation open and names where the reader
-                // has to finish it. The command a terminal method runs is
-                // redacted at the authority boundary — the descriptor carries
-                // the terminal's own title and its id instead — so what can be
-                // said is where to look, not what was run there.
+                // has to finish it. The descriptor names the command the
+                // authority runs, but this client can only repeat its title and
+                // point at the terminal; it cannot say what the screen shows.
                 let detail = result
                     .terminal
                     .as_ref()

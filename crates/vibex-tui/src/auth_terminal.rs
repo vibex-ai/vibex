@@ -14,10 +14,10 @@
 //! of what has already arrived.
 //!
 //! What is deliberately *not* here: running the command. The descriptor the
-//! authority returns has its command and arguments redacted, and a client that
-//! executed them would be a client running an authority-chosen program on the
-//! machine the reader is sitting at. The terminal is the authority's; this
-//! module only looks at it.
+//! authority returns names the command, arguments, and environment values, but
+//! a client that executed them would be a client running an authority-chosen
+//! program on the machine the reader is sitting at. The terminal is the
+//! authority's; this module only looks at it.
 
 use vibex_terminal_ui::{
     TerminalCellSnapshot, TerminalCursorShape, TerminalEmulator, TerminalFrameSnapshot,
