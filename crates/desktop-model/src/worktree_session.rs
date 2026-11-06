@@ -1705,6 +1705,80 @@ mod tests {
         assert_eq!(titles(&by_updated)[1], ["Old B", "New B"]);
     }
 
+    /// The projection sorts `compact_sessions`, but the Desktop paints the rows
+    /// the organization tree hands back. A placed session keeps its slot there,
+    /// so a field sort has to refill those slots or the reader's choice never
+    /// reaches the column.
+    #[test]
+    fn a_field_sort_reaches_the_rows_the_organization_paints() {
+        use crate::{
+            SidebarOrganizationItem, SidebarOrganizationPlacement, SidebarOrganizationState,
+        };
+
+        let project = project();
+        let checkout = workspace(&project, WorkspaceMode::CurrentCheckout, "/repo");
+        let mut old = session(&checkout, "Old", AgentSessionState::Idle);
+        old.created_at_ms = 10;
+        old.last_message_at_ms = 100;
+        let mut new = session(&checkout, "New", AgentSessionState::Idle);
+        new.created_at_ms = 20;
+        new.last_message_at_ms = 50;
+        let old_id = old.id.as_str().to_string();
+        let new_id = new.id.as_str().to_string();
+        let sessions = vec![old, new];
+
+        let project_id = project.id.as_str().to_string();
+        let mut organization = SidebarOrganizationState::default();
+        // Reconciliation leaves placements in the order the rows last had, so
+        // the recency order the projection used before is the tree's now.
+        for session_id in [old_id.clone(), new_id.clone()] {
+            organization.placements.push(SidebarOrganizationPlacement {
+                item: SidebarOrganizationItem::Session(session_id),
+                parent_folder_id: None,
+            });
+        }
+
+        let painted = |sort: SidebarSessionSort| {
+            let groups = sidebar_project_projections_with_workspace_order_and_sort(
+                &[(project.clone(), checkout.clone())],
+                &sessions,
+                &BTreeMap::new(),
+                &[],
+                &[],
+                0,
+                &BTreeMap::new(),
+                &BTreeSet::new(),
+                sort,
+                "",
+            );
+            let session_ids = groups[0]
+                .compact_sessions
+                .iter()
+                .map(|session| session.id.as_str().to_string())
+                .collect::<Vec<_>>();
+            crate::sidebar_project_items_with_sort(
+                &organization,
+                &project_id,
+                &session_ids,
+                &BTreeSet::new(),
+                None,
+                sort,
+            )
+            .into_iter()
+            .filter_map(|item| match item {
+                SidebarOrganizationItem::Session(id) => Some(id),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            painted(SidebarSessionSort::Created),
+            [new_id.clone(), old_id.clone()]
+        );
+        assert_eq!(painted(SidebarSessionSort::Updated), [old_id, new_id]);
+    }
+
     #[test]
     fn sidebar_projection_folds_legacy_worktree_projects_into_the_origin_project() {
         let project = project();
