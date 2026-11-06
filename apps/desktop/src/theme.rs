@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 
-use crate::typography::apply_code_font_weight;
+use crate::typography::{apply_code_font_weight, apply_terminal_visuals};
 use gpui::{App, Hsla, Window, WindowAppearance, px};
 use gpui_component::{
     Theme, ThemeMode as ComponentThemeMode,
@@ -537,6 +537,11 @@ pub fn apply_appearance(
         restore_window_plate(cx);
     }
     apply_code_font_weight(appearance.code_font.weight, cx);
+    apply_terminal_visuals(
+        appearance.terminal_ligatures,
+        appearance.terminal_opacity_percent,
+        cx,
+    );
 }
 
 /// Puts the window's own base plate back to the authored page color.

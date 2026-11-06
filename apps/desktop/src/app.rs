@@ -209,7 +209,7 @@ use crate::markdown::{
     escape_markdown_literal, plain_text as markdown_plain_text, resolve_workspace_path,
     resources as markdown_resources, text_view_style, utf8_prefix,
 };
-use crate::typography::{apply_code_font_weight, code_font_weight};
+use crate::typography::{apply_code_font_weight, apply_terminal_visuals, code_font_weight};
 
 use crate::actions::{
     GoToLineInEditor, NavigateBack, NavigateForward, NewSession, OpenCommandPalette,
@@ -3447,12 +3447,9 @@ impl VibexWorkbench {
             Theme::global_mut(cx).notification.placement = Anchor::TopCenter;
             hint_layer::push(
                 window,
-                hint_notification(
-                    NotificationType::Error,
-                    locale::localize_ui_message(&error),
-                )
-                .id::<RuntimeNoteErrorNotification>()
-                .autohide(true),
+                hint_notification(NotificationType::Error, locale::localize_ui_message(&error))
+                    .id::<RuntimeNoteErrorNotification>()
+                    .autohide(true),
                 cx,
             );
         });
@@ -45591,6 +45588,33 @@ impl VibexWorkbench {
         cx.notify();
     }
 
+    fn set_terminal_ligatures(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.ui_state.appearance.terminal_ligatures = enabled;
+        apply_terminal_visuals(
+            self.ui_state.appearance.terminal_ligatures,
+            self.ui_state.appearance.terminal_opacity_percent,
+            cx,
+        );
+        self.queue_ui_state();
+        cx.notify();
+    }
+
+    fn adjust_terminal_opacity(&mut self, delta: i16, cx: &mut Context<Self>) {
+        self.ui_state.appearance.terminal_opacity_percent = adjust_u16(
+            self.ui_state.appearance.terminal_opacity_percent,
+            delta,
+            60,
+            100,
+        );
+        apply_terminal_visuals(
+            self.ui_state.appearance.terminal_ligatures,
+            self.ui_state.appearance.terminal_opacity_percent,
+            cx,
+        );
+        self.queue_ui_state();
+        cx.notify();
+    }
+
     fn set_session_turn_preview_rail(&mut self, enabled: bool, cx: &mut Context<Self>) {
         self.ui_state.session.turn_preview_rail = enabled;
         if !enabled {
@@ -57596,8 +57620,7 @@ impl VibexWorkbench {
             .as_ref()
             .map(|selection| &selection.agent_id)
             .or(self.new_session_agent_id.as_ref());
-        let transport_switch =
-            self.render_new_session_transport_switch(transport_agent_id, cx);
+        let transport_switch = self.render_new_session_transport_switch(transport_agent_id, cx);
         // The mode is announced by the prompt mark, not by repainting the box:
         // changing the surface and padding moved the input line and the send
         // button every time the reader switched. A remembered terminal choice
@@ -82649,6 +82672,26 @@ fn settings_search_candidates(strings: &'static Strings) -> Vec<SettingsSearchCa
         ),
         settings_search_candidate(
             SettingsSection::Appearance,
+            locale::text("Ligatures", "连字", "連字"),
+            locale::text(
+                "Shape programming ligatures in terminal surfaces.",
+                "在终端中启用编程连字。",
+                "在終端機中啟用程式連字。",
+            ),
+            &["ligature", "calt", "连字", "連字", "terminal"],
+        ),
+        settings_search_candidate(
+            SettingsSection::Appearance,
+            locale::text("Terminal opacity", "终端不透明度", "終端機不透明度"),
+            locale::text(
+                "Let the page show through the terminal's background.",
+                "让页面透出终端背景。",
+                "讓頁面透出終端機背景。",
+            ),
+            &["opacity", "transparent", "透明", "不透明", "terminal"],
+        ),
+        settings_search_candidate(
+            SettingsSection::Appearance,
             locale::text("Reduced motion", "减少动效", "減少動效"),
             locale::text(
                 "Reduce non-essential interface animation.",
@@ -86178,6 +86221,20 @@ impl FoundationSettings {
         cx.notify();
     }
 
+    fn set_terminal_ligatures(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        let _ = self
+            .workbench
+            .update(cx, |this, cx| this.set_terminal_ligatures(enabled, cx));
+        cx.notify();
+    }
+
+    fn adjust_terminal_opacity(&mut self, delta: i16, cx: &mut Context<Self>) {
+        let _ = self
+            .workbench
+            .update(cx, |this, cx| this.adjust_terminal_opacity(delta, cx));
+        cx.notify();
+    }
+
     fn set_session_turn_preview_rail(&mut self, enabled: bool, cx: &mut Context<Self>) {
         let _ = self.workbench.update(cx, |this, cx| {
             this.set_session_turn_preview_rail(enabled, cx)
@@ -87782,6 +87839,44 @@ impl FoundationSettings {
                                 cx.listener(|this, _, _, cx| this.adjust_code_font(0, 100, cx)),
                                 strings.decrease_font_weight,
                                 strings.increase_font_weight,
+                                cx,
+                            ),
+                            stacked,
+                            cx,
+                        ),
+                        setting_row(
+                            locale::text("Ligatures", "连字", "連字"),
+                            locale::text(
+                                "Shape programming ligatures in terminal surfaces. Off keeps every glyph on its own cell, which is what column-aligned output assumes.",
+                                "在终端中启用编程连字。关闭时每个字符各占一格，对齐列的输出依赖这一点。",
+                                "在終端機中啟用程式連字。關閉時每個字元各佔一格，對齊欄位的輸出依賴這一點。",
+                            ),
+                            Switch::new("terminal-ligatures")
+                                .small()
+                                .checked(appearance.terminal_ligatures)
+                                .on_click(cx.listener(|this, enabled, _, cx| {
+                                    this.set_terminal_ligatures(*enabled, cx)
+                                })),
+                            stacked,
+                            cx,
+                        ),
+                        setting_row(
+                            locale::text("Terminal opacity", "终端不透明度", "終端機不透明度"),
+                            locale::text(
+                                "Let the page show through the terminal's background instead of painting an opaque rectangle.",
+                                "让页面透出终端背景，而不是绘制一整块不透明矩形。",
+                                "讓頁面透出終端機背景，而不是繪製一整塊不透明矩形。",
+                            ),
+                            settings_number_stepper(
+                                "terminal-opacity",
+                                appearance.terminal_opacity_percent,
+                                Some("%"),
+                                60,
+                                100,
+                                cx.listener(|this, _, _, cx| this.adjust_terminal_opacity(-5, cx)),
+                                cx.listener(|this, _, _, cx| this.adjust_terminal_opacity(5, cx)),
+                                locale::text("More transparent", "更透明", "更透明"),
+                                locale::text("Less transparent", "更不透明", "更不透明"),
                                 cx,
                             ),
                             stacked,

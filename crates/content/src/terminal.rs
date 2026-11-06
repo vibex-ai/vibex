@@ -2,8 +2,8 @@ use serde::Serialize;
 use vibex_core::{TerminalId, TerminalResizeRequest, VibexError, VibexResult};
 use vibex_terminal::{
     TerminalCellSnapshot, TerminalCursorSnapshot, TerminalEmulator, TerminalFrameSnapshot,
-    TerminalGridPoint, TerminalManager, TerminalModeSnapshot, TerminalRawSnapshot,
-    TerminalSearchMatch,
+    TerminalGridPoint, TerminalHostSignals, TerminalManager, TerminalModeSnapshot,
+    TerminalRawSnapshot, TerminalScrollbackMatch, TerminalSearchMatch,
 };
 
 use crate::{
@@ -209,6 +209,10 @@ pub struct TerminalSyncOutcome {
     /// answered by the terminal core; the transport that owns the write side is
     /// the only one that can deliver it.
     pub pty_replies: Vec<u8>,
+    /// Requests the program addressed to the host in this batch: a title, a
+    /// clipboard operation, or a colour query.
+    #[serde(default)]
+    pub host: TerminalHostSignals,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -343,6 +347,7 @@ impl TerminalSurfaceBackend {
             // Drained even when a rebuild replayed every chunk: the program is
             // waiting on the last answer, not on the ones it already got.
             pty_replies: self.emulator.take_pty_replies(),
+            host: self.emulator.take_host_signals(),
         })
     }
 
@@ -360,6 +365,43 @@ impl TerminalSurfaceBackend {
 
     pub fn scroll_to_bottom(&mut self) {
         self.emulator.scroll_to_bottom();
+    }
+
+    /// Scroll so `offset` lines sit above the viewport.
+    pub fn scroll_to_offset(&mut self, offset: usize) {
+        self.emulator.scroll_to_offset(offset);
+    }
+
+    pub fn display_offset(&self) -> usize {
+        self.emulator.display_offset()
+    }
+
+    /// The grid's height, without consuming damage the way `frame` does.
+    pub fn rows(&self) -> u16 {
+        self.emulator.rows()
+    }
+
+    pub fn history_lines(&self) -> usize {
+        self.emulator.history_lines()
+    }
+
+    /// Every match in the retained buffer, scrollback included.
+    pub fn search_scrollback(
+        &self,
+        query: &str,
+        case_sensitive: bool,
+    ) -> Vec<TerminalScrollbackMatch> {
+        self.emulator.find_all(query, case_sensitive)
+    }
+
+    /// Selects the word under a point and returns its text.
+    pub fn select_word_at(&mut self, point: TerminalGridPoint) -> VibexResult<String> {
+        self.emulator.select_word_at(point)
+    }
+
+    /// Selects the whole line under a point and returns its text.
+    pub fn select_line_at(&mut self, point: TerminalGridPoint) -> VibexResult<String> {
+        self.emulator.select_line_at(point)
     }
 
     pub fn select_text(
@@ -407,7 +449,26 @@ impl TerminalSurfaceBackend {
     }
 
     pub fn encode_mouse(&self, event: TerminalMouseEvent) -> Option<Vec<u8>> {
-        encode_mouse(event, self.emulator.modes())
+        encode_mouse(event, self.emulator.modes(), MouseCoordinates::Cells)
+    }
+
+    /// Encodes a report for a program that asked for pixel coordinates
+    /// (`DECSET 1016`). The surface reports grid points, so the cell the pointer
+    /// is over is expanded to that cell's centre in pixels.
+    pub fn encode_mouse_pixels(
+        &self,
+        event: TerminalMouseEvent,
+        cell_width: f32,
+        cell_height: f32,
+    ) -> Option<Vec<u8>> {
+        encode_mouse(
+            event,
+            self.emulator.modes(),
+            MouseCoordinates::Pixels {
+                cell_width,
+                cell_height,
+            },
+        )
     }
 
     pub fn diagnostics(&mut self) -> TerminalSurfaceDiagnostics {
@@ -714,9 +775,19 @@ pub struct TerminalMouseEvent {
     pub modifiers: TerminalModifiers,
 }
 
+/// Which coordinate space a report uses.
+#[derive(Clone, Copy)]
+enum MouseCoordinates {
+    /// Cell coordinates, the original protocol.
+    Cells,
+    /// Device-independent pixels, for `DECSET 1016`.
+    Pixels { cell_width: f32, cell_height: f32 },
+}
+
 fn encode_mouse(
     event: TerminalMouseEvent,
     modes: vibex_terminal::TerminalModeSnapshot,
+    coordinates: MouseCoordinates,
 ) -> Option<Vec<u8>> {
     if !modes.mouse_reporting {
         return None;
@@ -731,6 +802,36 @@ fn encode_mouse(
     code += u8::from(event.modifiers.shift) * 4;
     code += u8::from(event.modifiers.alt) * 8;
     code += u8::from(event.modifiers.control) * 16;
+
+    // 1016 is an extension of 1006: when a program enables both, the pixel
+    // coordinates are what it is asking for. The syntax is SGR either way.
+    if modes.sgr_pixels_mouse {
+        let (x, y) = match coordinates {
+            MouseCoordinates::Pixels {
+                cell_width,
+                cell_height,
+            } if cell_width.is_finite()
+                && cell_height.is_finite()
+                && cell_width > 0.0
+                && cell_height > 0.0 =>
+            {
+                (
+                    ((f32::from(event.column) + 0.5) * cell_width).max(0.0) as u32 + 1,
+                    ((f32::from(event.row) + 0.5) * cell_height).max(0.0) as u32 + 1,
+                )
+            }
+            // Without a cell size the report degrades to cell coordinates in
+            // the same syntax rather than inventing pixels.
+            _ => (u32::from(event.column) + 1, u32::from(event.row) + 1),
+        };
+        let final_byte = if event.kind == TerminalMouseKind::Release {
+            'm'
+        } else {
+            'M'
+        };
+        return Some(format!("\x1b[<{code};{x};{y}{final_byte}").into_bytes());
+    }
+
     let column = u32::from(event.column) + 1;
     let row = u32::from(event.row) + 1;
     if modes.sgr_mouse {
@@ -739,8 +840,28 @@ fn encode_mouse(
         } else {
             'M'
         };
-        Some(format!("\x1b[<{code};{column};{row}{final_byte}").into_bytes())
-    } else if column <= 223 && row <= 223 {
+        return Some(format!("\x1b[<{code};{column};{row}{final_byte}").into_bytes());
+    }
+
+    // 1015 carries the same button code and cell coordinates as the original
+    // protocol, but as a decimal CSI instead of three bytes.
+    if modes.urxvt_mouse {
+        return Some(format!("\x1b[{code};{column};{row}M").into_bytes());
+    }
+
+    // 1005 widens the printable range by encoding each value as UTF-8. The
+    // three-byte X10 form tops out around column 223; this is how a wide
+    // terminal reports a cell past it.
+    if modes.utf8_mouse {
+        let mut output = Vec::with_capacity(12);
+        output.extend_from_slice(b"\x1b[M");
+        for value in [u32::from(code), column, row] {
+            push_utf8_mouse_value(&mut output, value + 32);
+        }
+        return Some(output);
+    }
+
+    if column <= 223 && row <= 223 {
         Some(vec![
             0x1b,
             b'[',
@@ -752,6 +873,13 @@ fn encode_mouse(
     } else {
         None
     }
+}
+
+/// Appends `value` as the UTF-8 code point xterm's 1005 mode expects.
+fn push_utf8_mouse_value(output: &mut Vec<u8>, value: u32) {
+    let character = char::from_u32(value).unwrap_or('\u{fffd}');
+    let mut buffer = [0_u8; 4];
+    output.extend_from_slice(character.encode_utf8(&mut buffer).as_bytes());
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -934,6 +1062,97 @@ mod tests {
         assert_eq!(mouse, b"\x1b[<0;3;2M");
 
         snapshot.next_sequence = 2;
+    }
+
+    /// The three dialects that widen or reshape a mouse report are encoded
+    /// from the modes the scanner tracked, not from a single SGR switch.
+    #[test]
+    fn extended_mouse_dialects_encode_their_own_shape() {
+        let press = TerminalMouseEvent {
+            kind: TerminalMouseKind::Press,
+            button: 0,
+            row: 1,
+            column: 2,
+            modifiers: TerminalModifiers::default(),
+        };
+        // Each dialect gets a fresh backend: `snapshot` mints a new terminal id,
+        // and a second sync would reset the emulator's modes instead of setting
+        // another bit.
+        let encode = |modes: &[u8], event: TerminalMouseEvent, pixels: bool| {
+            let mut backend = TerminalSurfaceBackend::new(4, 40);
+            let data = [b"\x1b[?1000h".as_slice(), modes].concat();
+            backend
+                .sync(&snapshot(vec![(1, &data)], 2))
+                .expect("terminal sync");
+            if pixels {
+                backend.encode_mouse_pixels(event, 8.0, 16.0)
+            } else {
+                backend.encode_mouse(event)
+            }
+        };
+
+        // 1005: each value is a UTF-8 code point with 32 added, which is what
+        // lets a column past the 223-byte limit be reported at all.
+        let wide = TerminalMouseEvent {
+            column: 200,
+            ..press
+        };
+        let bytes = encode(b"\x1b[?1005h", wide, false).expect("utf-8 report");
+        assert_eq!(bytes[..3], [0x1b, b'[', b'M']);
+        assert_eq!(
+            bytes[3..],
+            [0x20, 0xc3, 0xa9, 0x22],
+            "button 32, column 201+32 as UTF-8, row 2+32"
+        );
+
+        // 1015: decimal CSI with the same button code and cell coordinates.
+        assert_eq!(
+            encode(b"\x1b[?1015h", press, false).unwrap(),
+            b"\x1b[0;3;2M",
+            "urxvt reports the cell, 1-based"
+        );
+
+        // 1016: SGR syntax with pixel coordinates. A cell is expanded to its
+        // centre at the measured cell size.
+        assert_eq!(
+            encode(b"\x1b[?1006h\x1b[?1016h", press, true).unwrap(),
+            b"\x1b[<0;21;25M"
+        );
+    }
+
+    /// A title, a clipboard write or a colour query ends up in the outcome the
+    /// host applies, not discarded by the emulator.
+    #[test]
+    fn host_addressed_requests_reach_the_sync_outcome() {
+        let mut backend = TerminalSurfaceBackend::new(4, 40);
+        let outcome = backend
+            .sync(&snapshot(
+                vec![(1, b"\x1b]2;Build\x07\x1b]52;c;aGVsbG8=\x07\x1b]10;?\x07")],
+                2,
+            ))
+            .unwrap();
+        assert_eq!(outcome.host.title.as_deref(), Some("Build"));
+        assert_eq!(outcome.host.clipboard_store.as_deref(), Some("aGVsbG8="));
+        assert_eq!(
+            outcome.host.color_queries,
+            vec![vibex_terminal::TerminalColorQuery::Foreground]
+        );
+        assert!(backend.sync(&snapshot(vec![], 2)).unwrap().host.is_empty());
+    }
+
+    #[test]
+    fn scrollback_search_reaches_lines_the_viewport_cannot_show() {
+        let mut backend = TerminalSurfaceBackend::new(3, 20);
+        let mut data = b"needle first\r\n".to_vec();
+        for index in 0..10 {
+            data.extend(format!("line {index}\r\n").as_bytes());
+        }
+        backend.sync(&snapshot(vec![(1, &data)], 2)).unwrap();
+        assert!(backend.find_visible("needle", false).is_empty());
+        let matches = backend.search_scrollback("needle", false);
+        assert_eq!(matches.len(), 1);
+        backend.scroll_to_offset(backend.history_lines());
+        assert!(backend.frame().display_offset > 0);
     }
 
     #[test]

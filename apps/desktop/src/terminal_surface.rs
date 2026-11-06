@@ -4,8 +4,10 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
+
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 
 use crate::theme;
 use crate::typography::code_font_weight;
@@ -39,9 +41,13 @@ use vibex_core::{
 };
 use vibex_desktop_runtime::validate_external_open_url;
 use vibex_terminal::{
-    TerminalCellColor, TerminalCellSnapshot, TerminalCursorShape, TerminalCursorSnapshot,
-    TerminalFrameSnapshot, TerminalGridPoint, TerminalManager,
+    TerminalCellColor, TerminalCellSnapshot, TerminalColorQuery, TerminalCursorShape,
+    TerminalCursorSnapshot, TerminalFrameSnapshot, TerminalGridPoint, TerminalHostSignals,
+    TerminalManager, TerminalScrollbackMatch,
 };
+
+use crate::terminal_box_drawing::{self, BoxStroke};
+use crate::terminal_links::{self, RowLink};
 
 use crate::motion;
 use crate::terminal_transport::{
@@ -94,6 +100,26 @@ const TERMINAL_IDLE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const TERMINAL_IDLE_POLL_THRESHOLD: u16 = 4;
 const TERMINAL_RESIZE_DEBOUNCE: Duration = Duration::from_millis(80);
 const TERMINAL_CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(500);
+/// Width of the scrollbar overlay painted inside the grid's right edge.
+const TERMINAL_SCROLLBAR_WIDTH: f32 = 6.0;
+/// The horizontal inset that keeps the scrollbar off the grid's edge.
+const TERMINAL_SCROLLBAR_MARGIN: f32 = 2.0;
+/// The pointer band that begins a scrollbar drag. Wider than the bar itself so
+/// a six-pixel thumb is not a precision task.
+const TERMINAL_SCROLLBAR_HIT_WIDTH: f32 = 12.0;
+/// Shortest thumb, in logical pixels, so a deep scrollback still shows a
+/// grabbable handle.
+const TERMINAL_SCROLLBAR_MIN_THUMB: f32 = 24.0;
+/// How much of the cell background an inactive search match takes.
+const TERMINAL_SEARCH_MATCH_OPACITY: f32 = 0.22;
+/// The ink a hovered detected link underlines with.
+const TERMINAL_LINK_UNDERLINE_OPACITY: f32 = 0.8;
+/// How often the scrollback is rescanned while the search bar is open.
+///
+/// A full-buffer scan is cheap once, not once per output poll: an Agent that
+/// streams a long transcript would otherwise rescan ten thousand rows at the
+/// frame rate.
+const TERMINAL_SEARCH_REFRESH_INTERVAL: Duration = Duration::from_millis(120);
 const PHYSICAL_MARKER_COMMAND: &str = "printf vibex-native-content-ok";
 const TERMINAL_KEY_CONTEXT: &str = "VibexTerminal";
 
@@ -163,6 +189,12 @@ struct TerminalTab {
     partial_repaints: u64,
     changed_rows: u64,
     sequence_gaps: u64,
+    /// The title the program published with `OSC 0`/`OSC 2`.
+    ///
+    /// Kept beside the session rather than written into it: the runtime owns
+    /// the session record and its periodic update would overwrite a title the
+    /// program set.
+    osc_title: Option<String>,
 }
 
 impl TerminalTab {
@@ -178,6 +210,7 @@ impl TerminalTab {
             partial_repaints: 0,
             changed_rows: u64::from(initial.rows),
             sequence_gaps: 0,
+            osc_title: None,
         }
     }
 }
@@ -230,6 +263,30 @@ pub struct TerminalPhysicalObservation {
     pub last_error_code: Option<&'static str>,
 }
 
+/// A row's shaped pieces, reused across frames while the row is unchanged.
+#[derive(Clone, Default)]
+struct TerminalRowLayout {
+    runs: Vec<TerminalTextRun>,
+    rects: Vec<TerminalRect>,
+    strokes: Vec<BoxStroke>,
+}
+
+/// The shaped rows from the last prepaint, and the inputs they were shaped from.
+#[derive(Default)]
+struct RowLayoutCache {
+    /// Hash of everything that changes how *every* row is shaped. A different
+    /// epoch means the cached rows describe another font, theme or tab.
+    epoch: u64,
+    rows: Vec<Arc<TerminalRowLayout>>,
+}
+
+/// The scrollbar's track and thumb in window space.
+#[derive(Clone, Copy)]
+struct TerminalScrollbarGeometry {
+    track: Bounds<Pixels>,
+    thumb: Bounds<Pixels>,
+}
+
 pub struct TerminalSurface {
     transport: Arc<dyn TerminalTransport>,
     background: BackgroundExecutor,
@@ -239,12 +296,25 @@ pub struct TerminalSurface {
     active_tab: Option<usize>,
     search_input: Entity<InputState>,
     search_open: bool,
-    search_matches: Vec<vibex_terminal::TerminalSearchMatch>,
+    search_matches: Vec<TerminalScrollbackMatch>,
+    /// When the buffer was last rescanned for the open search bar.
+    last_search_refresh: Option<Instant>,
     active_search_match: usize,
     marked_text: Option<String>,
     selection_anchor: Option<TerminalGridPoint>,
     selection_text: Option<String>,
     active_hyperlink: Option<String>,
+    /// The detected link under the pointer: its row and the columns it covers.
+    ///
+    /// Kept so the paint pass can underline it. `OSC 8` links already carry
+    /// their own underline through the cell style; a detected one has no style
+    /// until the pointer says it is interesting.
+    hovered_link: Option<(u16, RowLink)>,
+    /// Per-row link scan for the row the pointer was last over, keyed by the
+    /// frame's byte count so output invalidates it.
+    row_links: std::cell::RefCell<Option<(u16, u64, u16, Vec<RowLink>)>>,
+    /// Whether the scrollbar thumb is being dragged.
+    scrollbar_drag: bool,
     focus: FocusHandle,
     cell_metrics: TerminalCellMetrics,
     /// Fractional scroll not yet spent as a whole line.
@@ -260,6 +330,13 @@ pub struct TerminalSurface {
     /// than the paint, and a screen of prose is the same handful of strings
     /// frame after frame.
     glyph_cache: std::cell::RefCell<std::collections::HashMap<u64, ShapedLine>>,
+    /// Rows whose shaped layout must be rebuilt before the next paint.
+    ///
+    /// A poll reports exactly the rows it damaged; shaping only those is what
+    /// keeps a busy terminal's frame from re-laying out the whole screen.
+    dirty_rows: std::cell::RefCell<BTreeSet<u16>>,
+    /// Shaped rows from the last prepaint, and the epoch they belong to.
+    row_layouts: std::cell::RefCell<RowLayoutCache>,
     /// Bumped by every local scroll.
     ///
     /// A poll that started before the scroll carries the older viewport; without
@@ -268,8 +345,9 @@ pub struct TerminalSurface {
     scroll_generation: u64,
     resize: TerminalResizeCoordinator,
     resize_task: Option<Task<()>>,
-    /// Content-box bounds of the grid container from the last prepaint — the
-    /// area the cells start at — used to turn pointer positions into grid points.
+    /// Bounds of the painted grid from the last canvas prepaint — the area the
+    /// cells start at — used to turn pointer positions into grid points and to
+    /// place the scrollbar over the cells it scrolls.
     grid_bounds: Option<Bounds<Pixels>>,
     last_grid_bounds: Option<(String, u32, u32)>,
     /// The grid box the terminal should be sized to right now. It follows every
@@ -581,15 +659,21 @@ impl TerminalSurface {
             search_input,
             search_open: false,
             search_matches: Vec::new(),
+            last_search_refresh: None,
             active_search_match: 0,
             marked_text: None,
             selection_anchor: None,
             selection_text: None,
             active_hyperlink: None,
+            hovered_link: None,
+            row_links: std::cell::RefCell::new(None),
+            scrollbar_drag: false,
             focus,
             cell_metrics,
             scroll_remainder: 0.0,
             glyph_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
+            dirty_rows: std::cell::RefCell::new(BTreeSet::new()),
+            row_layouts: std::cell::RefCell::new(RowLayoutCache::default()),
             scroll_generation: 0,
             resize,
             resize_task: None,
@@ -844,6 +928,16 @@ impl TerminalSurface {
                         let visible = !blinking || !this.cursor_visible;
                         if visible != this.cursor_visible {
                             this.cursor_visible = visible;
+                            // The block cursor inverts the cell it covers, so
+                            // blinking changes that row's ink without any
+                            // output having arrived.
+                            if let Some(cursor) = this
+                                .active_tab
+                                .and_then(|index| this.tabs.get(index))
+                                .and_then(|tab| tab.frame.cursor())
+                            {
+                                this.mark_rows_dirty([cursor.row]);
+                            }
                             cx.notify();
                         }
                     })
@@ -892,7 +986,16 @@ impl TerminalSurface {
             // rather than being dropped on the floor.
             self.send_terminal_bytes(terminal_id, bytes, cx);
         }
+        // Host-addressed requests leave the tab loop as data: answering one
+        // needs the clipboard or the theme, neither of which the loop can
+        // borrow while a tab is mutably held.
+        let mut hosts = Vec::new();
+        let mut dirty_rows = BTreeSet::new();
         for result in results {
+            let host = match &result.result {
+                Ok(Some((outcome, _))) => outcome.host.clone(),
+                _ => TerminalHostSignals::default(),
+            };
             let Some(tab) = self
                 .tabs
                 .iter_mut()
@@ -906,17 +1009,37 @@ impl TerminalSurface {
             }
             match result.result {
                 Ok(Some((outcome, frame))) => {
+                    let previous_cursor = tab.frame.cursor();
                     let update = tab.frame.apply(&frame);
+                    let cursor = tab.frame.cursor();
                     if update.full_repaint {
                         tab.full_repaints = tab.full_repaints.saturating_add(1);
+                        dirty_rows.extend(0..frame.rows);
                     } else {
                         tab.partial_repaints = tab.partial_repaints.saturating_add(1);
+                        dirty_rows.extend(update.changed_rows.iter().copied());
                     }
+                    // The block cursor inverts a cell's ink, so the row it left
+                    // and the row it entered were reshaped by the move even when
+                    // no output touched them.
+                    dirty_rows.extend(
+                        [previous_cursor, cursor]
+                            .into_iter()
+                            .flatten()
+                            .map(|cursor| cursor.row),
+                    );
                     tab.changed_rows = tab
                         .changed_rows
                         .saturating_add(update.changed_rows.len() as u64);
                     if outcome.gap_detected {
                         tab.sequence_gaps = tab.sequence_gaps.saturating_add(1);
+                    }
+                    if let Some(title) = &host.title {
+                        tab.osc_title = if title.is_empty() {
+                            None
+                        } else {
+                            Some(title.clone())
+                        };
                     }
                     changed = true;
                 }
@@ -930,15 +1053,75 @@ impl TerminalSurface {
                     }
                 }
             }
+            if !host.is_empty() {
+                hosts.push((result.terminal_id, host));
+            }
+        }
+        self.dirty_rows.borrow_mut().extend(dirty_rows);
+        for (terminal_id, host) in hosts {
+            self.answer_host_signals(&terminal_id, host, cx);
         }
         if changed {
             self.refresh_marker_observation();
-            if self.search_open {
-                self.refresh_search(cx);
-            }
+            self.refresh_search_if_due(cx);
             cx.notify();
         }
         changed
+    }
+
+    /// Acts on the requests the program addressed to the host.
+    ///
+    /// These are plain data out of the emulator, so the clipboard read and the
+    /// colour answers happen here, where the UI's clipboard and theme live.
+    fn answer_host_signals(
+        &mut self,
+        terminal_id: &TerminalId,
+        host: TerminalHostSignals,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(encoded) = host.clipboard_store
+            && let Ok(bytes) = BASE64_STANDARD.decode(encoded.as_bytes())
+            && let Ok(text) = String::from_utf8(bytes)
+            && text.len() <= 1024 * 1024
+        {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+            self.note = "Program set the clipboard".into();
+        }
+        if let Some(selection) = host.clipboard_read {
+            let text = cx
+                .read_from_clipboard()
+                .and_then(|clipboard| clipboard.text())
+                .unwrap_or_default();
+            let encoded = BASE64_STANDARD.encode(text);
+            let reply = format!("\x1b]52;{selection};{encoded}\x1b\\");
+            self.send_terminal_bytes(terminal_id.clone(), reply.into_bytes(), cx);
+        }
+        if !host.color_queries.is_empty() {
+            let mut reply = String::new();
+            for query in host.color_queries {
+                match query {
+                    TerminalColorQuery::Palette { index } => {
+                        let rgb = terminal_hsla_to_xterm(indexed_terminal_color(index));
+                        reply.push_str(&format!("\x1b]4;{index};rgb:{rgb}\x1b\\"));
+                    }
+                    TerminalColorQuery::Foreground => {
+                        let rgb = terminal_hsla_to_xterm(cx.theme().foreground);
+                        reply.push_str(&format!("\x1b]10;rgb:{rgb}\x1b\\"));
+                    }
+                    TerminalColorQuery::Background => {
+                        let rgb = terminal_hsla_to_xterm(cx.theme().background);
+                        reply.push_str(&format!("\x1b]11;rgb:{rgb}\x1b\\"));
+                    }
+                    TerminalColorQuery::Cursor => {
+                        let rgb = terminal_hsla_to_xterm(cx.theme().caret);
+                        reply.push_str(&format!("\x1b]12;rgb:{rgb}\x1b\\"));
+                    }
+                }
+            }
+            if !reply.is_empty() {
+                self.send_terminal_bytes(terminal_id.clone(), reply.into_bytes(), cx);
+            }
+        }
     }
 
     fn refresh_marker_observation(&mut self) {
@@ -1034,6 +1217,7 @@ impl TerminalSurface {
                                 tab.frame.apply(&frame);
                             }
                         }
+                        this.mark_all_rows_dirty(request.rows);
                         this.note = format!("{} rows x {} columns", request.rows, request.cols);
                         this.last_error_code = None;
                         this.reconcile_resize_after_response(
@@ -1404,7 +1588,10 @@ impl TerminalSurface {
         self.selection_anchor = None;
         self.selection_text = None;
         self.active_hyperlink = None;
+        self.hovered_link = None;
+        self.row_links.borrow_mut().take();
         self.search_matches.clear();
+        self.last_search_refresh = None;
         self.active_search_match = 0;
     }
 
@@ -1418,27 +1605,55 @@ impl TerminalSurface {
             self.refresh_search(cx);
         } else {
             self.search_matches.clear();
+            self.last_search_refresh = None;
             self.active_search_match = 0;
             self.focus.focus(window, cx);
         }
         cx.notify();
     }
 
-    fn refresh_search(&mut self, cx: &mut Context<Self>) {
+    /// Rescans every retained line, scrollback included.
+    fn rescan_search(&mut self, cx: &mut Context<Self>) {
         let query = self.search_input.read(cx).value().to_string();
-        self.search_matches = self
+        let matches = self
             .active_runtime()
             .and_then(|(_, backend)| {
                 backend
                     .lock()
                     .ok()
-                    .map(|backend| backend.find_visible(&query, false))
+                    .map(|backend| backend.search_scrollback(&query, false))
             })
             .unwrap_or_default();
+        self.search_matches = matches;
+        self.last_search_refresh = Some(Instant::now());
         self.active_search_match = self
             .active_search_match
             .min(self.search_matches.len().saturating_sub(1));
+    }
+
+    /// Rescans and moves the viewport to the active match.
+    ///
+    /// A query change (or the bar opening) calls this; the poll path uses
+    /// [`Self::refresh_search_if_due`], which only keeps the count current so
+    /// streaming output cannot pull the reader back to a match.
+    fn refresh_search(&mut self, cx: &mut Context<Self>) {
+        self.rescan_search(cx);
         self.apply_active_search_match(cx);
+    }
+
+    /// Rescans the buffer for the open bar, at most every
+    /// [`TERMINAL_SEARCH_REFRESH_INTERVAL`].
+    fn refresh_search_if_due(&mut self, cx: &mut Context<Self>) {
+        if !self.search_open {
+            return;
+        }
+        if self
+            .last_search_refresh
+            .is_some_and(|last| last.elapsed() < TERMINAL_SEARCH_REFRESH_INTERVAL)
+        {
+            return;
+        }
+        self.rescan_search(cx);
     }
 
     fn select_next_search_match(&mut self, cx: &mut Context<Self>) {
@@ -1448,11 +1663,77 @@ impl TerminalSurface {
         }
     }
 
+    fn select_previous_search_match(&mut self, cx: &mut Context<Self>) {
+        if !self.search_matches.is_empty() {
+            self.active_search_match = self
+                .active_search_match
+                .checked_sub(1)
+                .unwrap_or(self.search_matches.len() - 1);
+            self.apply_active_search_match(cx);
+        }
+    }
+
+    /// Scrolls to the active match's row and selects it.
+    ///
+    /// A match above the viewport used to be selected at a row that was not on
+    /// screen, so the bar counted it while nothing moved. The row is converted
+    /// through the display offset the match was found against, then the
+    /// viewport is scrolled so the match sits a third of the way down — a
+    /// little context above it instead of against the top edge.
     fn apply_active_search_match(&mut self, cx: &mut Context<Self>) {
         let Some(search_match) = self.search_matches.get(self.active_search_match).copied() else {
             return;
         };
-        self.select_range(search_match.start, search_match.end, cx);
+        let Some((_, backend)) = self.active_runtime() else {
+            return;
+        };
+        let located = {
+            let Ok(mut backend) = backend.lock() else {
+                return;
+            };
+            let history = backend.history_lines();
+            let rows = usize::from(backend.rows());
+            let offset = backend.display_offset();
+            let line = search_match.line as i64;
+            let history = history as i64;
+            let current_row = line - history + offset as i64;
+            if (0..rows as i64).contains(&current_row) {
+                Some((current_row as u16, offset))
+            } else {
+                let desired_row = (rows / 3).min(rows.saturating_sub(1)) as i64;
+                let target_offset = (history - line + desired_row).clamp(0, history) as usize;
+                backend.scroll_to_offset(target_offset);
+                let viewport_row = (line - history + target_offset as i64).max(0) as u16;
+                Some((viewport_row, target_offset))
+            }
+        };
+        let Some((row, _)) = located else {
+            return;
+        };
+        if row >= self.active_rows() {
+            return;
+        }
+        self.select_range(
+            TerminalGridPoint {
+                row,
+                column: search_match.start_column,
+            },
+            TerminalGridPoint {
+                row,
+                column: search_match.end_column,
+            },
+            cx,
+        );
+        // A scroll the search performed is newer than any poll in flight, just
+        // like a wheel scroll: the cache has to pick up the whole viewport.
+        self.scroll_generation = self.scroll_generation.wrapping_add(1);
+    }
+
+    fn active_rows(&self) -> u16 {
+        self.active_tab
+            .and_then(|index| self.tabs.get(index))
+            .map(|tab| tab.frame.rows())
+            .unwrap_or(1)
     }
 
     fn copy_selection(&mut self, cx: &mut Context<Self>) {
@@ -1516,6 +1797,16 @@ impl TerminalSurface {
                 .changed_rows
                 .saturating_add(update.changed_rows.len() as u64);
         }
+        self.mark_all_rows_dirty(frame.rows);
+    }
+
+    /// Marks rows whose shaped layout is stale.
+    fn mark_rows_dirty(&mut self, rows: impl IntoIterator<Item = u16>) {
+        self.dirty_rows.borrow_mut().extend(rows);
+    }
+
+    fn mark_all_rows_dirty(&mut self, rows: u16) {
+        self.dirty_rows.borrow_mut().extend(0..rows);
     }
 
     fn on_cell_mouse_down(
@@ -1538,9 +1829,57 @@ impl TerminalSurface {
                 terminal_modifiers(event.modifiers),
                 cx,
             );
-        } else {
+            return;
+        }
+        // Selection gestures: a double click takes the word under the pointer,
+        // a triple click its whole line. Both defer to the emulator's own word
+        // and line boundaries so the highlight and the copied text agree.
+        match event.click_count {
+            2 => {
+                self.select_word(point, cx);
+                return;
+            }
+            3 => {
+                self.select_line(point, cx);
+                return;
+            }
+            _ => {}
+        }
+        self.selection_anchor = Some(point);
+        self.select_range(point, point, cx);
+    }
+
+    fn select_word(&mut self, point: TerminalGridPoint, cx: &mut Context<Self>) {
+        self.select_with(point, cx, TerminalSurfaceBackend::select_word_at);
+    }
+
+    fn select_line(&mut self, point: TerminalGridPoint, cx: &mut Context<Self>) {
+        self.select_with(point, cx, TerminalSurfaceBackend::select_line_at);
+    }
+
+    /// Runs one of the emulator's word/line selections and caches its frame.
+    fn select_with(
+        &mut self,
+        point: TerminalGridPoint,
+        cx: &mut Context<Self>,
+        select: fn(
+            &mut TerminalSurfaceBackend,
+            TerminalGridPoint,
+        ) -> vibex_core::VibexResult<String>,
+    ) {
+        let Some((terminal_id, backend)) = self.active_runtime() else {
+            return;
+        };
+        let selected = backend.lock().ok().and_then(|mut backend| {
+            select(&mut backend, point)
+                .ok()
+                .map(|text| (backend.frame(), text))
+        });
+        if let Some((frame, text)) = selected {
             self.selection_anchor = Some(point);
-            self.select_range(point, point, cx);
+            self.selection_text = Some(text);
+            self.apply_local_frame(&terminal_id, frame);
+            cx.notify();
         }
     }
 
@@ -1561,6 +1900,14 @@ impl TerminalSurface {
                     terminal_modifiers(event.modifiers),
                     cx,
                 );
+            }
+        } else {
+            let link = self.link_at(point);
+            if self.hovered_link.as_ref().map(|(row, link)| (*row, link))
+                != link.as_ref().map(|link| (point.row, link))
+            {
+                self.hovered_link = link.map(|link| (point.row, link));
+                cx.notify();
             }
         }
     }
@@ -1584,11 +1931,55 @@ impl TerminalSurface {
                 terminal_modifiers(event.modifiers),
                 cx,
             );
-        } else if self.selection_anchor == Some(point) {
-            self.active_hyperlink = hyperlink;
+        } else {
+            // A cell's own `OSC 8` hyperlink wins over a URL detected in its
+            // text: the program chose that target explicitly.
+            let link = hyperlink.or_else(|| self.link_at(point).map(|link| link.url));
+            if event.modifiers.secondary() && link.is_some() {
+                self.active_hyperlink = link;
+                self.open_hyperlink(cx);
+            } else if self.selection_anchor == Some(point) {
+                self.active_hyperlink = link;
+            }
         }
         self.selection_anchor = None;
         cx.notify();
+    }
+
+    /// The detected link under a cell, if the row has one.
+    fn link_at(&self, point: TerminalGridPoint) -> Option<RowLink> {
+        let tab = self.active_tab.and_then(|index| self.tabs.get(index))?;
+        let bytes = tab.frame.ingested_bytes();
+        let columns = tab.frame.columns();
+        let mut cached = self.row_links.borrow_mut();
+        let stale = cached
+            .as_ref()
+            .is_none_or(|(row, cache_bytes, cache_columns, _)| {
+                *row != point.row || *cache_bytes != bytes || *cache_columns != columns
+            });
+        if stale {
+            let mut cells = Vec::new();
+            for column in 0..tab.frame.columns() {
+                let Some(cell) = tab.frame.cell(TerminalGridPoint {
+                    row: point.row,
+                    column,
+                }) else {
+                    continue;
+                };
+                if cell.wide_spacer || cell.text.is_empty() {
+                    continue;
+                }
+                cells.push((column, cell.text.clone()));
+            }
+            *cached = Some((
+                point.row,
+                bytes,
+                columns,
+                terminal_links::find_links(&cells),
+            ));
+        }
+        let (_, _, _, links) = cached.as_ref()?;
+        terminal_links::link_at(links, point.column).cloned()
     }
 
     fn send_mouse(
@@ -1609,10 +2000,19 @@ impl TerminalSurface {
             column: point.column,
             modifiers,
         };
-        let bytes = backend
-            .lock()
-            .ok()
-            .and_then(|backend| backend.encode_mouse(event));
+        let pixel_mouse = self
+            .active_tab
+            .and_then(|index| self.tabs.get(index))
+            .is_some_and(|tab| tab.frame.modes().sgr_pixels_mouse);
+        let (cell_width, cell_height) =
+            (self.cell_metrics.cell_width, self.cell_metrics.cell_height);
+        let bytes = backend.lock().ok().and_then(|backend| {
+            if pixel_mouse {
+                backend.encode_mouse_pixels(event, cell_width, cell_height)
+            } else {
+                backend.encode_mouse(event)
+            }
+        });
         if let Some(bytes) = bytes {
             #[cfg(test)]
             self.mouse_log.push(event);
@@ -1646,6 +2046,25 @@ impl TerminalSurface {
             self.send_mouse(kind, 0, point, terminal_modifiers(event.modifiers), cx);
             return;
         }
+        // A full-screen program owns its screen and has no scrollback here. The
+        // wheel is a scroll gesture the program never sees, so it becomes the
+        // arrow keys the program already handles — the behaviour every terminal
+        // calls alternate scroll.
+        if modes.is_some_and(|modes| modes.alternate_screen) {
+            let whole = self.accumulate_scroll_lines(lines);
+            if whole == 0 {
+                return;
+            }
+            let key = if whole > 0 {
+                TerminalKey::Up
+            } else {
+                TerminalKey::Down
+            };
+            for _ in 0..whole.unsigned_abs().min(64) {
+                self.send_key(key, TerminalModifiers::default(), cx);
+            }
+            return;
+        }
         // Whole lines only: the terminal's display offset is integral, so a
         // fractional remainder is carried into the next event rather than
         // rounded away or multiplied into a fixed jump.
@@ -1653,21 +2072,7 @@ impl TerminalSurface {
         if whole_lines == 0 {
             return;
         }
-        let Some((terminal_id, backend)) = self.active_runtime() else {
-            return;
-        };
-        let frame = backend.lock().ok().map(|mut backend| {
-            backend.scroll(whole_lines);
-            backend.frame()
-        });
-        if let Some(frame) = frame {
-            // A local scroll is newer than anything a poll in flight can carry,
-            // so the cache is forced through a full repaint and the next poll
-            // result is checked against this floor before it is applied.
-            self.apply_local_frame(&terminal_id, frame);
-            self.scroll_generation = self.scroll_generation.wrapping_add(1);
-            cx.notify();
-        }
+        self.scroll_lines(whole_lines, cx);
     }
 
     /// The scroll delta of one wheel event, in terminal lines.
@@ -1687,6 +2092,181 @@ impl TerminalSurface {
     /// Turn a fractional line delta into the whole lines to scroll now.
     fn accumulate_scroll_lines(&mut self, lines: f32) -> i32 {
         accumulate_scroll_lines(&mut self.scroll_remainder, lines)
+    }
+
+    /// Scrolls the active tab's viewport by whole lines and paints the result.
+    fn scroll_lines(&mut self, lines: i32, cx: &mut Context<Self>) -> bool {
+        if lines == 0 {
+            return false;
+        }
+        let Some((terminal_id, backend)) = self.active_runtime() else {
+            return false;
+        };
+        let frame = backend.lock().ok().map(|mut backend| {
+            backend.scroll(lines);
+            backend.frame()
+        });
+        let Some(frame) = frame else {
+            return false;
+        };
+        // A local scroll is newer than anything a poll in flight can carry, so
+        // the cache is forced through a full repaint and the next poll result
+        // is checked against this floor before it is applied.
+        self.apply_local_frame(&terminal_id, frame);
+        self.scroll_generation = self.scroll_generation.wrapping_add(1);
+        cx.notify();
+        true
+    }
+
+    /// Whether the active tab has scrollback the reader can reach.
+    fn can_scroll_back(&self) -> bool {
+        self.active_tab
+            .and_then(|index| self.tabs.get(index))
+            .is_some_and(|tab| tab.frame.history_lines() > 0 && !tab.frame.modes().alternate_screen)
+    }
+
+    /// Scrolls by viewport pages; a positive count moves back into history,
+    /// matching the sign a wheel's upward delta already uses.
+    fn scroll_pages(&mut self, pages: i32, cx: &mut Context<Self>) {
+        let rows = self.active_rows();
+        let lines = pages.saturating_mul(i32::from(rows.saturating_sub(1)));
+        self.scroll_lines(lines, cx);
+    }
+
+    fn scroll_to_history_edge(&mut self, top: bool, cx: &mut Context<Self>) {
+        let offset = if top {
+            self.active_tab
+                .and_then(|index| self.tabs.get(index))
+                .map(|tab| tab.frame.history_lines())
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        self.scroll_to_offset(offset, cx);
+    }
+
+    /// Scrolls the viewport so `offset` lines sit above it.
+    fn scroll_to_offset(&mut self, offset: usize, cx: &mut Context<Self>) -> bool {
+        let Some((terminal_id, backend)) = self.active_runtime() else {
+            return false;
+        };
+        let frame = backend.lock().ok().map(|mut backend| {
+            backend.scroll_to_offset(offset);
+            backend.frame()
+        });
+        let Some(frame) = frame else {
+            return false;
+        };
+        self.apply_local_frame(&terminal_id, frame);
+        self.scroll_generation = self.scroll_generation.wrapping_add(1);
+        cx.notify();
+        true
+    }
+
+    /// The scrollbar's track and thumb in window space, or `None` when there is
+    /// no scrollback to show.
+    fn scrollbar_geometry(&self) -> Option<TerminalScrollbarGeometry> {
+        self.scrollbar_geometry_for(self.grid_bounds?)
+    }
+
+    fn scrollbar_geometry_for(&self, bounds: Bounds<Pixels>) -> Option<TerminalScrollbarGeometry> {
+        let tab = self.active_tab.and_then(|index| self.tabs.get(index))?;
+        let history = tab.frame.history_lines();
+        if history == 0 || tab.frame.modes().alternate_screen {
+            return None;
+        }
+        let track_height = f32::from(bounds.size.height);
+        if track_height <= 0.0 || !track_height.is_finite() {
+            return None;
+        }
+        let rows = f32::from(tab.frame.rows()).max(1.0);
+        let thumb_height = (track_height * rows / (rows + history as f32))
+            .max(TERMINAL_SCROLLBAR_MIN_THUMB.min(track_height));
+        let travel = (track_height - thumb_height).max(0.0);
+        let offset = tab.frame.display_offset().min(history);
+        let progress = if history == 0 {
+            1.0
+        } else {
+            1.0 - offset as f32 / history as f32
+        };
+        let track = Bounds::new(
+            point(
+                bounds.origin.x + bounds.size.width
+                    - px(TERMINAL_SCROLLBAR_WIDTH + TERMINAL_SCROLLBAR_MARGIN),
+                bounds.origin.y,
+            ),
+            size(px(TERMINAL_SCROLLBAR_WIDTH), bounds.size.height),
+        );
+        let thumb = Bounds::new(
+            point(track.origin.x, track.origin.y + px(travel * progress)),
+            size(px(TERMINAL_SCROLLBAR_WIDTH), px(thumb_height)),
+        );
+        Some(TerminalScrollbarGeometry { track, thumb })
+    }
+
+    fn scrollbar_hit(&self, position: Point<Pixels>) -> Option<TerminalScrollbarGeometry> {
+        let geometry = self.scrollbar_geometry()?;
+        let x = f32::from(position.x);
+        let y = f32::from(position.y);
+        let hit_left = f32::from(geometry.track.origin.x)
+            - (TERMINAL_SCROLLBAR_HIT_WIDTH - TERMINAL_SCROLLBAR_WIDTH);
+        let hit_right = f32::from(geometry.track.origin.x) + TERMINAL_SCROLLBAR_WIDTH;
+        let top = f32::from(geometry.track.origin.y);
+        let bottom = top + f32::from(geometry.track.size.height);
+        (x >= hit_left && x <= hit_right && y >= top && y <= bottom).then_some(geometry)
+    }
+
+    /// Starts a scrollbar drag if `position` is in its band.
+    fn begin_scrollbar_drag(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) -> bool {
+        let Some(geometry) = self.scrollbar_hit(position) else {
+            return false;
+        };
+        self.scrollbar_drag = true;
+        let inside_thumb = position.y >= geometry.thumb.origin.y
+            && position.y <= geometry.thumb.origin.y + geometry.thumb.size.height;
+        if !inside_thumb {
+            self.drag_scrollbar_to(position, geometry, cx);
+        }
+        true
+    }
+
+    fn drag_scrollbar(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) -> bool {
+        if !self.scrollbar_drag {
+            return false;
+        }
+        let Some(geometry) = self.scrollbar_geometry() else {
+            self.scrollbar_drag = false;
+            return false;
+        };
+        self.drag_scrollbar_to(position, geometry, cx);
+        true
+    }
+
+    fn drag_scrollbar_to(
+        &mut self,
+        position: Point<Pixels>,
+        geometry: TerminalScrollbarGeometry,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab) = self.active_tab.and_then(|index| self.tabs.get(index)) else {
+            return;
+        };
+        let history = tab.frame.history_lines();
+        let track_height = f32::from(geometry.track.size.height);
+        let thumb_height = f32::from(geometry.thumb.size.height);
+        let travel = (track_height - thumb_height).max(0.0);
+        if travel <= 0.0 || history == 0 {
+            return;
+        }
+        let relative =
+            (f32::from(position.y) - f32::from(geometry.track.origin.y) - thumb_height / 2.0)
+                .clamp(0.0, travel);
+        let offset = ((1.0 - relative / travel) * history as f32).round() as usize;
+        self.scroll_to_offset(offset, cx);
+    }
+
+    fn end_scrollbar_drag(&mut self) {
+        self.scrollbar_drag = false;
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -1718,6 +2298,35 @@ impl TerminalSurface {
             self.toggle_search(window, cx);
             cx.stop_propagation();
             return;
+        }
+        // Shift+PageUp/PageDown and Shift+Home/End reach the terminal's own
+        // scrollback. They are only claimed when there is scrollback to reach,
+        // so a program that wants the modified chord still receives it on a
+        // live screen or in the alternate screen.
+        if modifiers.shift && !modifiers.control && !modifiers.alt && self.can_scroll_back() {
+            let handled = match key {
+                "pageup" => {
+                    self.scroll_pages(1, cx);
+                    true
+                }
+                "pagedown" => {
+                    self.scroll_pages(-1, cx);
+                    true
+                }
+                "home" => {
+                    self.scroll_to_history_edge(true, cx);
+                    true
+                }
+                "end" => {
+                    self.scroll_to_history_edge(false, cx);
+                    true
+                }
+                _ => false,
+            };
+            if handled {
+                cx.stop_propagation();
+                return;
+            }
         }
         let terminal_modifiers = terminal_modifiers(modifiers);
         let mapped = match key {
@@ -1908,7 +2517,10 @@ impl TerminalSurface {
                     .when_some(active, |bar, index| bar.selected_index(index))
                     .children(self.tabs.iter().map(|tab| {
                         let status = terminal_status_label(tab.session.status);
-                        let title = tab.session.title.clone();
+                        let title = tab
+                            .osc_title
+                            .clone()
+                            .unwrap_or_else(|| tab.session.title.clone());
                         // `Tab` renders `icon` *instead of* `label` when both are
                         // set, so the session title rides the children slot and
                         // `aria_label` carries the accessible name.
@@ -1956,6 +2568,15 @@ impl TerminalSurface {
                     }),
             )
             .child(
+                Button::new("terminal-search-previous")
+                    .small()
+                    .ghost()
+                    .icon(IconName::ArrowUp)
+                    .tooltip("Previous match")
+                    .disabled(self.search_matches.is_empty())
+                    .on_click(cx.listener(|this, _, _, cx| this.select_previous_search_match(cx))),
+            )
+            .child(
                 Button::new("terminal-search-next")
                     .small()
                     .ghost()
@@ -1986,6 +2607,7 @@ impl TerminalSurface {
         let horizontal_padding = self.horizontal_padding();
         let vertical_padding = self.vertical_padding();
         let cell_metrics = measured_terminal_cell_metrics(cx.text_system().as_ref(), cx, self.mode);
+        let terminal_opacity = crate::typography::terminal_opacity(cx);
         v_flex()
             .id("terminal-grid")
             .flex_1()
@@ -1994,7 +2616,7 @@ impl TerminalSurface {
             .relative()
             .overflow_hidden()
             .when(self.mode.paints_surface_background(), |grid| {
-                grid.bg(cx.theme().background)
+                grid.bg(cx.theme().background.opacity(terminal_opacity))
             })
             .px(px(horizontal_padding))
             .py(px(vertical_padding))
@@ -2006,6 +2628,13 @@ impl TerminalSurface {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                    // The scrollbar overlays the last cells, so it has to claim
+                    // the press before the cell under it selects text.
+                    if this.begin_scrollbar_drag(event.position, cx) {
+                        cx.stop_propagation();
+                        return;
+                    }
+                    this.end_scrollbar_drag();
                     this.focus.focus(window, cx);
                     if let Some(point) = this.cell_at_position(event.position) {
                         this.on_cell_mouse_down(point, event, window, cx);
@@ -2013,13 +2642,25 @@ impl TerminalSurface {
                 }),
             )
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
-                if let Some(point) = this.cell_at_position(event.position) {
-                    this.on_cell_mouse_move(point, event, cx);
+                if this.drag_scrollbar(event.position, cx) {
+                    return;
+                }
+                match this.cell_at_position(event.position) {
+                    Some(point) => this.on_cell_mouse_move(point, event, cx),
+                    None => {
+                        if this.hovered_link.take().is_some() {
+                            cx.notify();
+                        }
+                    }
                 }
             }))
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|this, event: &MouseUpEvent, _, cx| {
+                    if this.scrollbar_drag {
+                        this.end_scrollbar_drag();
+                        return;
+                    }
                     let Some(point) = this.cell_at_position(event.position) else {
                         this.selection_anchor = None;
                         return;
@@ -2045,8 +2686,18 @@ impl TerminalSurface {
             // box that is on screen right now.
             .child(
                 canvas(
-                    move |_, window, cx| {
-                        shape_terminal_grid(&prepaint_entity, cell_metrics, window, cx)
+                    move |bounds, window, cx| {
+                        let layout =
+                            shape_terminal_grid(&prepaint_entity, cell_metrics, window, cx);
+                        // The canvas is the content box, which is where the first
+                        // cell starts. Recording its bounds here — rather than
+                        // from the padding-box listener below — keeps pointer
+                        // mapping and the scrollbar in the same space as the
+                        // painted cells.
+                        let _ = prepaint_entity.update(cx, |surface, _| {
+                            surface.grid_bounds = Some(bounds);
+                        });
+                        layout
                     },
                     move |bounds, layout, window, cx| {
                         paint_terminal_grid(bounds, &layout, &paint_entity, window, cx)
@@ -2092,7 +2743,6 @@ impl TerminalSurface {
                 let width = f32::from(bounds.size.width);
                 let height = f32::from(bounds.size.height);
                 let _ = resize_entity.update(cx, |this, cx| {
-                    this.grid_bounds = Some(bounds);
                     this.schedule_resize(width, height, cx);
                 });
             })
@@ -2164,14 +2814,20 @@ struct TerminalTextRun {
     column: u16,
     /// Columns the run occupies; wide cells count twice.
     columns: u16,
+    /// Set when the run is a single symbol glyph fitted to its cell's outline
+    /// rather than sitting on the text baseline.
+    symbol: Option<SymbolFit>,
+}
+
+/// How a symbol glyph was scaled and where its line box sits.
+#[derive(Clone, Copy)]
+struct SymbolFit {
+    line_height: f32,
 }
 
 /// Everything the grid's paint pass needs from its prepaint pass.
 struct TerminalGridLayout {
-    rows: Vec<Vec<TerminalTextRun>>,
-    /// Filled subcell rectangles for the cells that are painted as geometry
-    /// rather than shaped as text.
-    rects: Vec<TerminalRect>,
+    rows: Vec<Arc<TerminalRowLayout>>,
     /// Cell geometry measured from the actual font, not from a design constant.
     metrics: TerminalCellMetrics,
 }
@@ -2180,13 +2836,13 @@ impl TerminalGridLayout {
     fn empty(metrics: TerminalCellMetrics) -> Self {
         Self {
             rows: Vec::new(),
-            rects: Vec::new(),
             metrics,
         }
     }
 }
 
 /// A run of adjacent cells painted as the same filled subcell rectangle.
+#[derive(Clone, Copy)]
 struct TerminalRect {
     row: u16,
     column: u16,
@@ -2532,20 +3188,38 @@ fn terminal_cell_metrics(
     }
 }
 
-/// The font the grid is shaped and measured with: the theme's code family, the
-/// same weight the theme asks for, ligatures off, and the platform's fallbacks
-/// so a missing glyph lands in a font the grid can still measure.
+/// The font the grid is shaped and measured with.
+///
+/// The theme's code family and weight, the ligature preference the reader chose,
+/// and the bundled symbol face plus the platform's fallbacks: a glyph the code
+/// font lacks has to land somewhere the grid can still measure, and the
+/// private-use area an Agent draws from is only covered by the bundled face.
 fn terminal_font(cx: &App) -> Font {
     let mut font = font(cx.theme().mono_font_family.clone());
     font.weight = code_font_weight(cx);
-    font.features = FontFeatures::disable_ligatures();
-    font.fallbacks = Some(FontFallbacks::from_fonts(
+    if !crate::typography::terminal_ligatures(cx) {
+        font.features = FontFeatures::disable_ligatures();
+    }
+    let mut fallbacks = vec![crate::assets::BUNDLED_SYMBOL_FAMILY.to_string()];
+    fallbacks.extend(
         crate::platform::platform_font_fallbacks()
             .iter()
             .filter(|name| *name != &cx.theme().mono_font_family.as_ref())
-            .map(|name| (*name).to_string())
-            .collect(),
-    ));
+            .filter(|name| *name != &crate::assets::BUNDLED_SYMBOL_FAMILY)
+            .map(|name| (*name).to_string()),
+    );
+    font.fallbacks = Some(FontFallbacks::from_fonts(fallbacks));
+    font
+}
+
+/// The bundled symbol family, at the code font's weight.
+///
+/// Symbol cells are shaped with this family explicitly rather than relying on
+/// fallback: the glyph has to come from a font whose outline can be measured
+/// and scaled to the cell, and a fallback pick is not guaranteed to be it.
+fn terminal_symbol_font(cx: &App) -> Font {
+    let mut font = font(crate::assets::BUNDLED_SYMBOL_FAMILY);
+    font.weight = code_font_weight(cx);
     font
 }
 
@@ -2600,6 +3274,8 @@ fn shape_terminal_grid(
 ) -> TerminalGridLayout {
     let font_size = f32::from(cx.theme().mono_font_size);
     let base_font = terminal_font(cx);
+    let symbol_font = terminal_symbol_font(cx);
+    let text_system = window.text_system().clone();
     let surface = entity.read(cx);
     let Some(tab) = surface.active_tab.and_then(|index| surface.tabs.get(index)) else {
         return TerminalGridLayout::empty(metrics);
@@ -2612,22 +3288,123 @@ fn shape_terminal_grid(
     let cursor = frame
         .cursor()
         .filter(|_| surface.marked_text.is_none() && surface.cursor_visible);
-    let mut layout = TerminalGridLayout::empty(metrics);
+    let epoch = terminal_layout_epoch(surface, tab, metrics, cx);
 
-    let mut rest: Vec<TerminalRect> = Vec::new();
     // The cache lives on the surface, behind a cell so the prepaint pass — which
     // only has a shared read of the entity — can still reuse what it shaped last
     // frame.
+    let mut cache = surface.row_layouts.borrow_mut();
     let mut glyph_cache = surface.glyph_cache.borrow_mut();
-    for row in 0..rows {
-        let mut runs = Vec::new();
-        let mut pending: Option<PendingRun> = None;
-        for column in 0..columns {
-            let point = TerminalGridPoint { row, column };
-            let cell = frame.cell(point);
-            // A blank cell carries no ink. It also ends the current run, because
-            // a run's shaped text must hold adjacent columns only.
-            let style = cell.filter(|cell| !cell_is_blank(cell)).map(|cell| {
+    let rebuild_all = cache.epoch != epoch || cache.rows.len() != usize::from(rows);
+    let dirty = if rebuild_all {
+        cache.epoch = epoch;
+        cache.rows.clear();
+        surface.dirty_rows.borrow_mut().clear();
+        (0..rows).collect::<BTreeSet<_>>()
+    } else {
+        std::mem::take(&mut *surface.dirty_rows.borrow_mut())
+    };
+    for row in dirty {
+        if row >= rows {
+            continue;
+        }
+        let shaped = shape_terminal_row(
+            row,
+            frame,
+            columns,
+            cursor,
+            default_foreground,
+            default_background,
+            &base_font,
+            &symbol_font,
+            font_size,
+            metrics,
+            text_system.as_ref(),
+            &mut glyph_cache,
+            window,
+        );
+        if cache.rows.len() <= usize::from(row) {
+            cache
+                .rows
+                .resize_with(usize::from(row) + 1, Default::default);
+        }
+        cache.rows[usize::from(row)] = Arc::new(shaped);
+    }
+    cache.rows.resize_with(usize::from(rows), Default::default);
+    TerminalGridLayout {
+        rows: cache.rows.clone(),
+        metrics,
+    }
+}
+
+/// Everything that changes how every row is shaped.
+///
+/// Damage says which rows changed; this says whether *any* cached row still
+/// means what it meant. The cursor is deliberately not part of the epoch: it
+/// moves often, and the poll path marks the row it left and the row it entered
+/// as damaged, which is cheaper than reshaping the screen twice a second.
+fn terminal_layout_epoch(
+    surface: &TerminalSurface,
+    tab: &TerminalTab,
+    metrics: TerminalCellMetrics,
+    cx: &App,
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    tab.session.id.as_str().hash(&mut hasher);
+    tab.frame.rows().hash(&mut hasher);
+    tab.frame.columns().hash(&mut hasher);
+    hash_terminal_color(cx.theme().foreground, &mut hasher);
+    hash_terminal_color(cx.theme().background, &mut hasher);
+    cx.theme().mono_font_family.hash(&mut hasher);
+    f32::from(cx.theme().mono_font_size)
+        .to_bits()
+        .hash(&mut hasher);
+    code_font_weight(cx).0.to_bits().hash(&mut hasher);
+    crate::typography::terminal_ligatures(cx).hash(&mut hasher);
+    metrics.cell_width.to_bits().hash(&mut hasher);
+    metrics.cell_height.to_bits().hash(&mut hasher);
+    metrics.horizontal_padding.to_bits().hash(&mut hasher);
+    metrics.vertical_padding.to_bits().hash(&mut hasher);
+    surface.marked_text.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn hash_terminal_color(color: Hsla, hasher: &mut impl std::hash::Hasher) {
+    use std::hash::Hash;
+    let rgb = color.to_rgb();
+    rgb.r.to_bits().hash(hasher);
+    rgb.g.to_bits().hash(hasher);
+    rgb.b.to_bits().hash(hasher);
+    rgb.a.to_bits().hash(hasher);
+}
+
+/// Shapes one painted row into runs, filled rectangles and box strokes.
+#[allow(clippy::too_many_arguments)]
+fn shape_terminal_row(
+    row: u16,
+    frame: &TerminalFrameCache,
+    columns: u16,
+    cursor: Option<TerminalCursorSnapshot>,
+    default_foreground: Hsla,
+    default_background: Hsla,
+    base_font: &Font,
+    symbol_font: &Font,
+    font_size: f32,
+    metrics: TerminalCellMetrics,
+    text_system: &gpui::TextSystem,
+    glyph_cache: &mut std::collections::HashMap<u64, ShapedLine>,
+    window: &mut Window,
+) -> TerminalRowLayout {
+    let mut layout = TerminalRowLayout::default();
+    let mut pending: Option<PendingRun> = None;
+    for column in 0..columns {
+        let point = TerminalGridPoint { row, column };
+        let cell = frame.cell(point);
+        // A blank cell carries no ink. It also ends the current run, because a
+        // run's shaped text must hold adjacent columns only.
+        let (style, text, wide) = match cell.filter(|cell| !cell_is_blank(cell)) {
+            Some(cell) => {
                 let (foreground, _) = terminal_cell_colors(
                     Some(cell),
                     cursor,
@@ -2635,123 +3412,254 @@ fn shape_terminal_grid(
                     default_foreground,
                     default_background,
                 );
-                TerminalCellStyle {
-                    foreground,
-                    bold: cell.bold,
-                    italic: cell.italic,
-                    underline: cell.underline || cell.hyperlink.is_some(),
-                    strikeout: cell.strikeout,
-                }
-            });
-            let text = cell.map(|cell| cell.text.as_str()).unwrap_or_default();
-            let wide = cell.is_some_and(|cell| cell.wide || cell.wide_spacer);
-            // Boxes, blocks, quadrants, sextants and the shade ramp are drawn as
-            // rectangles rather than shaped: their whole point is to cover their
-            // cell edge to edge, and a glyph from a vector font never does that
-            // the same way twice. Recording them as geometry is what keeps a
-            // border continuous and a logo made of half blocks legible.
-            if let Some(geometry) = cell_geometry(cell) {
-                let opacity = geometry.opacity;
-                if let Some(run) = pending.take() {
-                    flush_pending_run(
-                        &mut runs,
-                        run,
-                        &base_font,
-                        font_size,
-                        metrics,
-                        &mut glyph_cache,
-                        window,
-                    );
-                }
-                let foreground = style.map(|style| style.foreground).unwrap_or_default();
-                for fill in geometry.fills {
-                    // Adjacent subcells of the same colour merge, so a line of
-                    // full blocks is one quad rather than one per cell.
-                    if let Some(last) = rest.last_mut()
-                        && last.row == row
-                        && last.fill == fill
-                        && last.color == foreground
-                        && last.opacity == opacity
-                        && last.column + 1 == column
-                    {
-                        last.columns = last.columns.saturating_add(1);
-                        continue;
-                    }
-                    rest.push(TerminalRect {
-                        row,
-                        column,
-                        columns: 1,
-                        fill,
-                        color: foreground,
-                        opacity,
-                    });
-                }
-                continue;
+                (
+                    Some(TerminalCellStyle {
+                        foreground,
+                        bold: cell.bold,
+                        italic: cell.italic,
+                        underline: cell.underline || cell.hyperlink.is_some(),
+                        strikeout: cell.strikeout,
+                    }),
+                    cell.text.as_str(),
+                    cell.wide || cell.wide_spacer,
+                )
             }
-            match (style, pending.as_mut()) {
-                (Some(style), Some(run)) if run.style == style => {
-                    run.push_cell(column, text, wide);
-                }
-                (Some(style), _) => {
-                    if let Some(run) = pending.take() {
-                        flush_pending_run(
-                            &mut runs,
-                            run,
-                            &base_font,
-                            font_size,
-                            metrics,
-                            &mut glyph_cache,
-                            window,
-                        );
-                    }
-                    let mut run = PendingRun::new(style, column);
-                    run.push_cell(column, text, wide);
-                    pending = Some(run);
-                }
-                (None, Some(_)) => {
-                    if let Some(run) = pending.take() {
-                        flush_pending_run(
-                            &mut runs,
-                            run,
-                            &base_font,
-                            font_size,
-                            metrics,
-                            &mut glyph_cache,
-                            window,
-                        );
-                    }
-                }
-                (None, None) => {}
-            }
-        }
-        if let Some(run) = pending.take() {
+            None => (None, "", false),
+        };
+        let foreground = style.map(|style| style.foreground).unwrap_or_default();
+
+        // A Box Drawing character is painted from its arms, not shaped. Its
+        // whole point is to cover its cell edge to edge and to meet its
+        // neighbour exactly; a font's own glyph does neither consistently.
+        if let Some(character) = single_character(text)
+            && let Some(arms) = terminal_box_drawing::parse(character)
+        {
             flush_pending_run(
-                &mut runs,
-                run,
-                &base_font,
+                &mut layout.runs,
+                pending.take(),
+                base_font,
                 font_size,
                 metrics,
-                &mut glyph_cache,
+                glyph_cache,
                 window,
             );
+            if let Some(last) = layout.strokes.last_mut()
+                && last.continues(row, column, arms, foreground)
+            {
+                last.extend();
+            } else {
+                layout
+                    .strokes
+                    .push(BoxStroke::new(row, column, arms, foreground));
+            }
+            continue;
         }
-        layout.rows.push(runs);
-    }
 
-    layout.rects = rest;
+        // A private-use symbol is fitted to the cell's outline and centred in
+        // it. Shaped as ordinary text it would sit on the baseline at whatever
+        // size the font chose, which is how an Agent's icon ends up either a
+        // speck or a glyph too tall for its row.
+        if let Some(character) = single_character(text)
+            && is_terminal_symbol(character)
+            && let Some(fitted) = fitted_symbol_font_size(
+                text_system,
+                symbol_font,
+                font_size,
+                metrics.cell_width,
+                metrics.cell_height,
+                character,
+            )
+        {
+            flush_pending_run(
+                &mut layout.runs,
+                pending.take(),
+                base_font,
+                font_size,
+                metrics,
+                glyph_cache,
+                window,
+            );
+            let text_run = TextRun {
+                len: text.len(),
+                font: symbol_font.clone(),
+                color: foreground,
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            };
+            let line = shape_cached_line(
+                glyph_cache,
+                &text_run,
+                text.to_string(),
+                fitted,
+                None,
+                window,
+            );
+            layout.runs.push(TerminalTextRun {
+                line,
+                column,
+                columns: if wide { 2 } else { 1 },
+                symbol: Some(SymbolFit {
+                    line_height: fitted * TERMINAL_LINE_HEIGHT_RATIO,
+                }),
+            });
+            continue;
+        }
+
+        // Blocks, quadrants, sextants and the shade ramp are drawn as
+        // rectangles rather than shaped: their whole point is to cover their
+        // cell edge to edge, and a glyph from a vector font never does that the
+        // same way twice. Recording them as geometry is what keeps a border
+        // continuous and a logo made of half blocks legible.
+        if let Some(geometry) = cell_geometry(cell) {
+            let opacity = geometry.opacity;
+            flush_pending_run(
+                &mut layout.runs,
+                pending.take(),
+                base_font,
+                font_size,
+                metrics,
+                glyph_cache,
+                window,
+            );
+            for fill in geometry.fills {
+                // Adjacent subcells of the same colour merge, so a line of
+                // full blocks is one quad rather than one per cell.
+                if let Some(last) = layout.rects.last_mut()
+                    && last.fill == fill
+                    && last.color == foreground
+                    && last.opacity == opacity
+                    && last.column + 1 == column
+                {
+                    last.columns = last.columns.saturating_add(1);
+                    continue;
+                }
+                layout.rects.push(TerminalRect {
+                    row,
+                    column,
+                    columns: 1,
+                    fill,
+                    color: foreground,
+                    opacity,
+                });
+            }
+            continue;
+        }
+
+        match (style, pending.as_mut()) {
+            (Some(style), Some(run)) if run.style == style => {
+                run.push_cell(column, text, wide);
+            }
+            (Some(style), _) => {
+                flush_pending_run(
+                    &mut layout.runs,
+                    pending.take(),
+                    base_font,
+                    font_size,
+                    metrics,
+                    glyph_cache,
+                    window,
+                );
+                let mut run = PendingRun::new(style, column);
+                run.push_cell(column, text, wide);
+                pending = Some(run);
+            }
+            (None, Some(_)) => {
+                flush_pending_run(
+                    &mut layout.runs,
+                    pending.take(),
+                    base_font,
+                    font_size,
+                    metrics,
+                    glyph_cache,
+                    window,
+                );
+            }
+            (None, None) => {}
+        }
+    }
+    flush_pending_run(
+        &mut layout.runs,
+        pending.take(),
+        base_font,
+        font_size,
+        metrics,
+        glyph_cache,
+        window,
+    );
     layout
+}
+
+/// The character a cell paints, when it is exactly one.
+fn single_character(text: &str) -> Option<char> {
+    let mut characters = text.chars();
+    let character = characters.next()?;
+    if characters.next().is_some() || character.is_control() {
+        return None;
+    }
+    Some(character)
+}
+
+/// Whether a code point is in the private-use area Nerd Fonts covers.
+///
+/// The same ranges [`crate::assets::BUNDLED_SYMBOL_FAMILY`] draws: the three
+/// private-use planes plus the handful of powerline marks Nerd Fonts keeps
+/// outside them.
+fn is_terminal_symbol(character: char) -> bool {
+    matches!(
+        character as u32,
+        0x23FB..=0x23FE
+            | 0x2B58
+            | 0x2665
+            | 0x26A1
+            | 0xE000..=0xF8FF
+            | 0xF0000..=0xFFFFD
+            | 0x100000..=0x10FFFD
+    )
+}
+
+/// The font size at which a symbol's ink fills most of its cell.
+///
+/// The size is measured from the glyph's typographic bounds at the code font's
+/// size, then scaled so the longer dimension covers [`SYMBOL_CELL_FILL`] of the
+/// cell. Clamping keeps a pathological glyph from becoming either invisible or
+/// a row-breaking block.
+fn fitted_symbol_font_size(
+    text_system: &gpui::TextSystem,
+    font: &Font,
+    base_size: f32,
+    cell_width: f32,
+    cell_height: f32,
+    character: char,
+) -> Option<f32> {
+    const SYMBOL_CELL_FILL: f32 = 0.92;
+    let font_id = text_system.resolve_font(font);
+    let bounds = text_system
+        .typographic_bounds(font_id, px(base_size), character)
+        .ok()?;
+    let width = f32::from(bounds.size.width);
+    let height = f32::from(bounds.size.height);
+    if !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0 {
+        return None;
+    }
+    let scale =
+        (cell_width * SYMBOL_CELL_FILL / width).min(cell_height * SYMBOL_CELL_FILL / height);
+    Some((base_size * scale).clamp(base_size * 0.5, base_size * 1.4))
 }
 
 /// Shape one accumulated run and record the columns it covers.
 fn flush_pending_run(
     runs: &mut Vec<TerminalTextRun>,
-    run: PendingRun,
+    run: Option<PendingRun>,
     base_font: &Font,
     font_size: f32,
     metrics: TerminalCellMetrics,
     cache: &mut std::collections::HashMap<u64, ShapedLine>,
     window: &mut Window,
 ) {
+    let Some(run) = run else {
+        return;
+    };
     if run.text.is_empty() {
         return;
     }
@@ -2782,6 +3690,7 @@ fn flush_pending_run(
         line,
         column: run.start_column,
         columns,
+        symbol: None,
     });
 }
 
@@ -2901,40 +3810,67 @@ fn paint_terminal_grid_masked(
     // painting them here keeps a border continuous and a half-block logo legible
     // whatever the font draws for those code points.
     paint_terminal_rects(bounds, layout, window);
+    // Box Drawing characters are lines, joined across cells at their edges.
+    paint_terminal_strokes(bounds, layout, window);
 
     // Text next, one shaped run at a time. The shaper laid each run out from its
     // first column with the cell width forced, so painting it at that column is
     // enough: every following glyph lands on its own column already. This is
     // outside the entity borrow above, because painting a shaped line needs
     // `&mut App`.
-    for (row, runs) in layout.rows.iter().enumerate() {
-        let row_top = bounds.origin.y + px(row as f32 * metrics.cell_height);
-        for text_run in runs {
-            let origin = point(
+    let scale = window.scale_factor();
+    for (row, row_layout) in layout.rows.iter().enumerate() {
+        let row_top = snap_terminal_pixels(
+            bounds.origin.y + px(row as f32 * metrics.cell_height),
+            scale,
+        );
+        for text_run in &row_layout.runs {
+            let cell_x = snap_terminal_pixels(
                 bounds.origin.x + px(f32::from(text_run.column) * metrics.cell_width),
-                row_top,
+                scale,
             );
-            let _ = text_run.line.paint(
-                origin,
-                px(metrics.cell_height),
-                TextAlign::Left,
-                Some(px(f32::from(text_run.columns) * metrics.cell_width)),
-                window,
-                cx,
-            );
+            let width = Some(px(f32::from(text_run.columns) * metrics.cell_width));
+            if let Some(symbol) = text_run.symbol {
+                // The fitted glyph is centred in its cell rather than aligned
+                // to the text baseline: icons have no baseline relationship
+                // with the letters beside them.
+                let line_height = px(symbol.line_height);
+                let origin = point(
+                    cell_x,
+                    row_top + px((metrics.cell_height - symbol.line_height) / 2.0),
+                );
+                let _ =
+                    text_run
+                        .line
+                        .paint(origin, line_height, TextAlign::Center, width, window, cx);
+            } else {
+                let _ = text_run.line.paint(
+                    point(cell_x, row_top),
+                    px(metrics.cell_height),
+                    TextAlign::Left,
+                    width,
+                    window,
+                    cx,
+                );
+            }
         }
     }
+
+    paint_terminal_scrollbar(bounds, entity, window, cx);
 
     let Some(cursor) = cursor else {
         return;
     };
-    let cursor_bounds = cell_bounds(
-        bounds.origin,
-        TerminalGridPoint {
-            row: cursor.row,
-            column: cursor.column,
-        },
-        metrics,
+    let cursor_bounds = snap_terminal_rect(
+        cell_bounds(
+            bounds.origin,
+            TerminalGridPoint {
+                row: cursor.row,
+                column: cursor.column,
+            },
+            metrics,
+        ),
+        scale,
     );
     match cursor.shape {
         // A block cursor is painted by inverting the cell it sits on, which the
@@ -2978,32 +3914,107 @@ fn paint_terminal_grid_masked(
 /// whole subcell without accumulating rounding error across a row.
 fn paint_terminal_rects(bounds: Bounds<Pixels>, layout: &TerminalGridLayout, window: &mut Window) {
     let metrics = layout.metrics;
+    let scale = window.scale_factor();
     let subcell_width = metrics.cell_width / TERMINAL_SUBCELL_COLUMNS;
     let subcell_height = metrics.cell_height / TERMINAL_SUBCELL_LINES;
-    for rect in &layout.rects {
-        let (x, y, columns, lines) = rect.fill;
-        let origin = point(
-            bounds.origin.x
-                + px(f32::from(rect.column) * metrics.cell_width)
-                + px(f32::from(x) * subcell_width),
-            bounds.origin.y
-                + px(f32::from(rect.row) * metrics.cell_height)
-                + px(f32::from(y) * subcell_height),
-        );
-        let size = size(
-            px((f32::from(columns)
-                + f32::from(rect.columns.saturating_sub(1)) * TERMINAL_SUBCELL_COLUMNS)
-                * subcell_width),
-            px(f32::from(lines) * subcell_height),
-        );
-        if size.width <= px(0.0) || size.height <= px(0.0) {
+    for row in &layout.rows {
+        for rect in &row.rects {
+            let (x, y, columns, lines) = rect.fill;
+            let origin = point(
+                bounds.origin.x
+                    + px(f32::from(rect.column) * metrics.cell_width)
+                    + px(f32::from(x) * subcell_width),
+                bounds.origin.y
+                    + px(f32::from(rect.row) * metrics.cell_height)
+                    + px(f32::from(y) * subcell_height),
+            );
+            let size = size(
+                px((f32::from(columns)
+                    + f32::from(rect.columns.saturating_sub(1)) * TERMINAL_SUBCELL_COLUMNS)
+                    * subcell_width),
+                px(f32::from(lines) * subcell_height),
+            );
+            if size.width <= px(0.0) || size.height <= px(0.0) {
+                continue;
+            }
+            window.paint_quad(fill(
+                snap_terminal_rect(Bounds::new(origin, size), scale),
+                rect.color.opacity(rect.opacity),
+            ));
+        }
+    }
+}
+
+/// Paint the scrollbar overlay and its thumb.
+///
+/// The bar lives inside the grid rather than beside it: the grid's own width is
+/// the terminal's width, so taking a gutter for chrome would make every program
+/// reflow when the history grew past a screen.
+fn paint_terminal_scrollbar(
+    bounds: Bounds<Pixels>,
+    entity: &Entity<TerminalSurface>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let surface = entity.read(cx);
+    let Some(geometry) = surface.scrollbar_geometry_for(bounds) else {
+        return;
+    };
+    let scale = window.scale_factor();
+    window.paint_quad(fill(
+        snap_terminal_rect(geometry.track, scale),
+        cx.theme().foreground.opacity(0.06),
+    ));
+    let opacity = if surface.scrollbar_drag { 0.55 } else { 0.26 };
+    window.paint_quad(fill(
+        snap_terminal_rect(geometry.thumb, scale),
+        cx.theme().foreground.opacity(opacity),
+    ));
+}
+
+/// Paint the Box Drawing runs recorded during prepaint.
+fn paint_terminal_strokes(
+    bounds: Bounds<Pixels>,
+    layout: &TerminalGridLayout,
+    window: &mut Window,
+) {
+    let metrics = layout.metrics;
+    for row in &layout.rows {
+        if row.strokes.is_empty() {
             continue;
         }
-        window.paint_quad(fill(
-            Bounds::new(origin, size),
-            rect.color.opacity(rect.opacity),
-        ));
+        terminal_box_drawing::paint(
+            bounds,
+            metrics.cell_width,
+            metrics.cell_height,
+            &row.strokes,
+            window,
+        );
     }
+}
+
+/// Snaps one coordinate to the device pixel grid.
+///
+/// A cell boundary that lands on a fraction of a physical pixel is what leaves
+/// a hairline gap between two background runs, or a border that is one pixel
+/// thick in one row and two in the next.
+fn snap_terminal_pixels(value: Pixels, scale: f32) -> Pixels {
+    if !scale.is_finite() || scale <= 0.0 {
+        return value;
+    }
+    px((f32::from(value) * scale).round() / scale)
+}
+
+fn snap_terminal_rect(bounds: Bounds<Pixels>, scale: f32) -> Bounds<Pixels> {
+    let origin = point(
+        snap_terminal_pixels(bounds.origin.x, scale),
+        snap_terminal_pixels(bounds.origin.y, scale),
+    );
+    let corner = point(
+        snap_terminal_pixels(bounds.origin.x + bounds.size.width, scale),
+        snap_terminal_pixels(bounds.origin.y + bounds.size.height, scale),
+    );
+    Bounds::from_corners(origin, corner)
 }
 
 /// Paint every cell's background and return the cursor the text pass still owes.
@@ -3032,6 +4043,7 @@ fn paint_terminal_backgrounds(
     let cursor = frame
         .cursor()
         .filter(|_| surface.marked_text.is_none() && surface.cursor_visible);
+    let scale = window.scale_factor();
     for row in 0..rows {
         let mut run_start: Option<(u16, Hsla)> = None;
         for column in 0..=columns {
@@ -3055,7 +4067,7 @@ fn paint_terminal_backgrounds(
                     let mut run_bounds = cell_bounds(bounds.origin, first, metrics);
                     run_bounds.size.width =
                         px(f32::from(column.saturating_sub(start)) * metrics.cell_width);
-                    window.paint_quad(fill(run_bounds, color));
+                    window.paint_quad(fill(snap_terminal_rect(run_bounds, scale), color));
                     run_start = match next {
                         Some(background) if background != default_background => {
                             Some((column, background))
@@ -3069,6 +4081,64 @@ fn paint_terminal_backgrounds(
                 (None, _) => {}
             }
         }
+    }
+
+    // Every other match on screen, not just the one the bar navigated to. The
+    // active match is the emulator's own selection, which the background pass
+    // above already painted; overlapping a second wash on it would only muddy
+    // the colour.
+    let history = frame.history_lines() as i64;
+    let offset = frame.display_offset() as i64;
+    for (index, search_match) in surface.search_matches.iter().enumerate() {
+        if index == surface.active_search_match {
+            continue;
+        }
+        let row = search_match.line as i64 - history + offset;
+        if row < 0 || row >= i64::from(rows) {
+            continue;
+        }
+        let start = search_match.start_column;
+        let end = search_match.end_column.saturating_add(1);
+        if end <= start {
+            continue;
+        }
+        let highlight = Bounds::new(
+            point(
+                bounds.origin.x + px(f32::from(start) * metrics.cell_width),
+                bounds.origin.y + px(row as f32 * metrics.cell_height),
+            ),
+            size(
+                px(f32::from(end - start) * metrics.cell_width),
+                px(metrics.cell_height),
+            ),
+        );
+        window.paint_quad(fill(
+            snap_terminal_rect(highlight, scale),
+            cx.theme().yellow.opacity(TERMINAL_SEARCH_MATCH_OPACITY),
+        ));
+    }
+
+    // A detected link only exists while the pointer is on it, so the underline
+    // is painted here rather than shaped into the cell.
+    if let Some((row, link)) = &surface.hovered_link
+        && *row < rows
+        && link.columns.end > link.columns.start
+    {
+        let underline = Bounds::new(
+            point(
+                bounds.origin.x + px(f32::from(link.columns.start) * metrics.cell_width),
+                bounds.origin.y
+                    + px(f32::from(*row) * metrics.cell_height + metrics.cell_height - 1.0),
+            ),
+            size(
+                px(f32::from(link.columns.end - link.columns.start) * metrics.cell_width),
+                px(1.0),
+            ),
+        );
+        window.paint_quad(fill(
+            snap_terminal_rect(underline, scale),
+            cx.theme().accent.opacity(TERMINAL_LINK_UNDERLINE_OPACITY),
+        ));
     }
     cursor
 }
@@ -3285,6 +4355,20 @@ async fn run_poll_work(work: TerminalPollWork) -> TerminalPollResult {
     }
 }
 
+/// Format a colour the way an xterm colour query expects it.
+///
+/// `rgb:rrrr/gggg/bbbb` — four hex digits per channel, which is what every
+/// terminal that answers `OSC 10`/`OSC 11` writes and what a program that parses
+/// the reply assumes.
+fn terminal_hsla_to_xterm(color: Hsla) -> String {
+    let rgb = color.to_rgb();
+    let channel = |value: f32| {
+        let byte = (value.clamp(0.0, 1.0) * 255.0).round() as u8;
+        format!("{byte:02x}{byte:02x}")
+    };
+    format!("{}/{}/{}", channel(rgb.r), channel(rgb.g), channel(rgb.b))
+}
+
 fn terminal_color(
     color: TerminalCellColor,
     default_foreground: Hsla,
@@ -3443,6 +4527,15 @@ mod tests {
             drop(backend);
             tab.frame.force_full_repaint();
             tab.frame.apply(&frame);
+            surface.mark_all_rows_dirty(frame.rows);
+        });
+        // A manually synced frame is the fixture's source of truth. The live
+        // PTY poll would restart the raw sequence at 1 and rebuild the
+        // emulator, wiping the fixture between the sync and the assertions.
+        surface.update(&mut cx, |surface, _| {
+            surface.foreground_active = false;
+            surface.poll_task = None;
+            surface.blink_task = None;
         });
         cx.update(|window, cx| {
             surface.update(cx, |surface, cx| surface.focus_input(window, cx));
@@ -3455,7 +4548,7 @@ mod tests {
     /// glyph is not, because a wide glyph already spans two cells and forcing
     /// every glyph to one cell would overlap it with the text after it.
     #[gpui::test]
-    fn only_narrow_runs_are_forced_onto_the_cell_pitch(cx: &mut TestAppContext) {
+    fn only_narrow_runs_are_forced_onto_the_cell_pitch(_cx: &mut TestAppContext) {
         let mut narrow = PendingRun::new(
             TerminalCellStyle {
                 foreground: rgb(0xffffff).into(),
@@ -3495,20 +4588,25 @@ mod tests {
         // Blank cells between them start no run, so the line becomes three runs
         // and each one begins at the column its first glyph belongs to.
         assert_eq!(
-            row.len(),
+            row.runs.len(),
             3,
             "one run per style change: {:?}",
-            row.iter()
+            row.runs
+                .iter()
                 .map(|run| (run.column, run.columns, run.line.text.to_string()))
                 .collect::<Vec<_>>()
         );
-        assert_eq!(row[0].column, 0);
-        assert_eq!(row[0].line.text.as_ref(), "underlined");
-        assert_eq!(row[1].column, 11);
-        assert_eq!(row[1].line.text.as_ref(), "plain");
-        assert_eq!(row[2].column, 17);
-        assert_eq!(row[2].line.text.as_ref(), "red");
-        assert!(layout.rows[1..].iter().all(Vec::is_empty));
+        assert_eq!(row.runs[0].column, 0);
+        assert_eq!(row.runs[0].line.text.as_ref(), "underlined");
+        assert_eq!(row.runs[1].column, 11);
+        assert_eq!(row.runs[1].line.text.as_ref(), "plain");
+        assert_eq!(row.runs[2].column, 17);
+        assert_eq!(row.runs[2].line.text.as_ref(), "red");
+        assert!(
+            layout.rows[1..]
+                .iter()
+                .all(|row| row.runs.is_empty() && row.rects.is_empty() && row.strokes.is_empty())
+        );
     }
 
     /// A run is shaped with the cell width forced, so a font whose advance does
@@ -3527,7 +4625,7 @@ mod tests {
             (layout, width)
         });
         assert!(cell_width > 0.0);
-        let run = &layout.rows[0][2];
+        let run = &layout.rows[0].runs[2];
         assert_eq!(run.columns, 3, "three cells in the run");
         // The shaped advances are the cell width, whatever the font's own
         // advance is: this is what force_width buys.
@@ -4145,7 +5243,11 @@ mod tests {
         });
 
         let burst = "abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwxyz";
-        surface.update(&mut cx, |surface, _| {
+        surface.update(&mut cx, |surface, cx| {
+            // This test is about the poll loop restarting after input, so the
+            // fixture's quiescence is lifted here.
+            surface.foreground_active = true;
+            surface.start_polling(cx);
             surface.idle_poll_count = TERMINAL_IDLE_POLL_THRESHOLD;
         });
         cx.simulate_input(burst);
@@ -4212,5 +5314,254 @@ mod tests {
             vec!["中文".as_bytes().to_vec()]
         );
         assert!(surface.read_with(&cx, |surface, _| surface.marked_text.is_none()));
+    }
+
+    /// Appends one raw chunk after the helper's initial sync and applies it the
+    /// way a poll would.
+    fn append_terminal_output(
+        surface: &Entity<TerminalSurface>,
+        cx: &mut VisualTestContext,
+        sequence: i64,
+        data: &[u8],
+    ) {
+        surface.update(cx, |surface, _| {
+            let tab = surface.tabs.first_mut().expect("terminal tab");
+            let snapshot = vibex_terminal::TerminalRawSnapshot {
+                session: tab.session.clone(),
+                retained_bytes: data.len(),
+                chunks: vec![vibex_terminal::TerminalRawOutputChunk {
+                    sequence,
+                    data: data.to_vec(),
+                }],
+                next_sequence: sequence + 1,
+                dropped_chunks: 0,
+            };
+            let mut backend = tab.backend.lock().expect("terminal backend");
+            backend.sync(&snapshot).expect("terminal sync");
+            let frame = backend.frame();
+            drop(backend);
+            tab.frame.apply(&frame);
+            surface.mark_all_rows_dirty(frame.rows);
+        });
+    }
+
+    fn draw_terminal(surface: &Entity<TerminalSurface>, cx: &mut VisualTestContext) {
+        cx.update(|window, cx| {
+            surface.update(cx, |_, cx| cx.notify());
+            let _ = window.draw(cx);
+        });
+    }
+
+    fn many_lines(count: usize) -> String {
+        let mut data = String::new();
+        for index in 0..count {
+            data.push_str(&format!("line-{index:03}\r\n"));
+        }
+        data
+    }
+
+    #[gpui::test]
+    fn shift_page_keys_move_through_the_scrollback(cx: &mut TestAppContext) {
+        let (surface, mut cx) = styled_terminal_surface(cx);
+        append_terminal_output(&surface, &mut cx, 2, many_lines(80).as_bytes());
+        draw_terminal(&surface, &mut cx);
+        assert!(
+            surface.read_with(&cx, |surface, _| surface.tabs[0].frame.history_lines()) > 0,
+            "the fixture has to produce scrollback for this to mean anything"
+        );
+        assert_eq!(
+            surface.read_with(&cx, |surface, _| surface.tabs[0].frame.display_offset()),
+            0
+        );
+
+        cx.simulate_keystrokes("shift-pageup");
+        cx.run_until_parked();
+        assert!(
+            surface.read_with(&cx, |surface, _| surface.tabs[0].frame.display_offset()) > 0,
+            "Shift+PageUp must reach the scrollback, not the program"
+        );
+
+        cx.simulate_keystrokes("shift-pagedown");
+        cx.run_until_parked();
+        assert_eq!(
+            surface.read_with(&cx, |surface, _| surface.tabs[0].frame.display_offset()),
+            0,
+            "Shift+PageDown returns to the live screen"
+        );
+    }
+
+    #[gpui::test]
+    fn a_full_screen_program_hears_the_wheel_as_arrow_keys(cx: &mut TestAppContext) {
+        let (surface, mut cx) = styled_terminal_surface(cx);
+        append_terminal_output(&surface, &mut cx, 2, b"\x1b[?1049h");
+        draw_terminal(&surface, &mut cx);
+        assert!(surface.read_with(&cx, |surface, _| {
+            surface.tabs[0].frame.modes().alternate_screen
+        }));
+        surface.update(&mut cx, |surface, _| surface.input_log.clear());
+
+        let origin = surface.read_with(&cx, |surface, _| {
+            surface.grid_bounds.expect("grid bounds").origin
+        });
+        cx.simulate_event(gpui::ScrollWheelEvent {
+            position: point(origin.x + px(20.0), origin.y + px(20.0)),
+            delta: ScrollDelta::Lines(point(0.0, 3.0)),
+            modifiers: Default::default(),
+            touch_phase: gpui::TouchPhase::Moved,
+        });
+        cx.run_until_parked();
+
+        let sent = surface.read_with(&cx, |surface, _| surface.input_log.clone());
+        assert_eq!(
+            sent,
+            vec![b"\x1b[A".to_vec(); 3],
+            "each wheel notch becomes the arrows the full-screen program handles"
+        );
+    }
+
+    #[gpui::test]
+    fn the_scrollbar_thumb_moves_the_viewport(cx: &mut TestAppContext) {
+        let (surface, mut cx) = styled_terminal_surface(cx);
+        append_terminal_output(&surface, &mut cx, 2, many_lines(200).as_bytes());
+        draw_terminal(&surface, &mut cx);
+        let history = surface.read_with(&cx, |surface, _| surface.tabs[0].frame.history_lines());
+        assert!(history > 0);
+        let geometry = surface
+            .read_with(&cx, |surface, _| surface.scrollbar_geometry())
+            .expect("a terminal with scrollback draws a scrollbar");
+
+        // The top of the track is the oldest retained line.
+        let top = point(
+            geometry.track.origin.x + px(1.0),
+            geometry.track.origin.y + px(1.0),
+        );
+        surface.update(&mut cx, |surface, cx| {
+            assert!(surface.begin_scrollbar_drag(top, cx));
+        });
+        assert_eq!(
+            surface.read_with(&cx, |surface, _| surface.tabs[0].frame.display_offset()),
+            history,
+            "clicking the top of the track scrolls to the oldest line"
+        );
+
+        // The bottom returns to the live screen.
+        let bottom = point(
+            geometry.track.origin.x + px(1.0),
+            geometry.track.origin.y + geometry.track.size.height - px(1.0),
+        );
+        surface.update(&mut cx, |surface, cx| {
+            let _ = surface.drag_scrollbar(bottom, cx);
+            surface.end_scrollbar_drag();
+        });
+        assert_eq!(
+            surface.read_with(&cx, |surface, _| surface.tabs[0].frame.display_offset()),
+            0
+        );
+    }
+
+    #[gpui::test]
+    fn double_and_triple_clicks_select_a_word_and_a_line(cx: &mut TestAppContext) {
+        let (surface, mut cx) = styled_terminal_surface(cx);
+        let click = |count: usize| MouseDownEvent {
+            button: MouseButton::Left,
+            position: point(px(0.0), px(0.0)),
+            modifiers: Default::default(),
+            click_count: count,
+            first_mouse: false,
+        };
+
+        cx.update(|window, cx| {
+            surface.update(cx, |surface, cx| {
+                surface.on_cell_mouse_down(
+                    TerminalGridPoint { row: 0, column: 2 },
+                    &click(2),
+                    window,
+                    cx,
+                );
+            });
+        });
+        assert_eq!(
+            surface.read_with(&cx, |surface, _| surface.selection_text.clone()),
+            Some("underlined".to_string()),
+            "a double click takes the word the emulator's word boundaries name"
+        );
+
+        cx.update(|window, cx| {
+            surface.update(cx, |surface, cx| {
+                surface.on_cell_mouse_down(
+                    TerminalGridPoint { row: 0, column: 15 },
+                    &click(3),
+                    window,
+                    cx,
+                );
+            });
+        });
+        let line = surface
+            .read_with(&cx, |surface, _| surface.selection_text.clone())
+            .expect("a triple click selects the row");
+        assert!(
+            line.contains("underlined"),
+            "the whole line is selected: {line:?}"
+        );
+        assert!(line.contains("red"), "the whole line is selected: {line:?}");
+    }
+
+    #[gpui::test]
+    fn a_plain_url_in_a_row_is_detected_under_the_pointer(cx: &mut TestAppContext) {
+        let (surface, mut cx) = styled_terminal_surface(cx);
+        append_terminal_output(
+            &surface,
+            &mut cx,
+            2,
+            b"\r\nsee https://example.com/docs now",
+        );
+        draw_terminal(&surface, &mut cx);
+
+        let link = surface.read_with(&cx, |surface, _| {
+            surface.link_at(TerminalGridPoint { row: 1, column: 9 })
+        });
+        let link = link.expect("the URL in the row should be detected");
+        assert_eq!(link.url, "https://example.com/docs");
+        assert_eq!(link.columns, 4..28);
+        // A cell just past the URL is not part of it.
+        assert!(
+            surface
+                .read_with(&cx, |surface, _| surface
+                    .link_at(TerminalGridPoint { row: 1, column: 30 }))
+                .is_none()
+        );
+    }
+
+    #[gpui::test]
+    fn search_navigates_to_a_match_above_the_viewport(cx: &mut TestAppContext) {
+        let (surface, mut cx) = styled_terminal_surface(cx);
+        let mut data = b"needle at the top\r\n".to_vec();
+        data.extend(many_lines(80).as_bytes());
+        append_terminal_output(&surface, &mut cx, 2, &data);
+        draw_terminal(&surface, &mut cx);
+
+        cx.update(|window, cx| {
+            surface.update(cx, |surface, cx| {
+                surface.search_open = true;
+                surface
+                    .search_input
+                    .update(cx, |input, cx| input.set_value("needle", window, cx));
+                surface.refresh_search(cx);
+            });
+        });
+
+        assert_eq!(
+            surface.read_with(&cx, |surface, _| surface.search_matches.len()),
+            1,
+            "the scan has to reach the oldest retained line"
+        );
+        assert!(
+            surface.read_with(&cx, |surface, _| surface.tabs[0].frame.display_offset()) > 0,
+            "locating the match scrolls it into view"
+        );
+        assert_eq!(
+            surface.read_with(&cx, |surface, _| surface.selection_text.clone()),
+            Some("needle".to_string())
+        );
     }
 }

@@ -425,6 +425,23 @@ pub struct AppearanceUiState {
     /// color. Absent keeps the theme in charge of the whole window.
     #[serde(default)]
     pub background_image: BackgroundImageUiState,
+    /// Draw the code font's programming ligatures in terminal surfaces.
+    ///
+    /// Off by default: a ligature collapses several cells' glyphs into one, and
+    /// a program that aligns columns assumes the font draws them separately.
+    #[serde(default)]
+    pub terminal_ligatures: bool,
+    /// How opaque the terminal's own background is, in percent.
+    ///
+    /// Below `100` the page (or the wallpaper) shows through the grid's fill,
+    /// which is what makes a terminal read as a window over the workbench
+    /// instead of a rectangle pasted onto it.
+    #[serde(default = "default_terminal_opacity_percent")]
+    pub terminal_opacity_percent: u16,
+}
+
+const fn default_terminal_opacity_percent() -> u16 {
+    100
 }
 
 /// How a user background image is fitted to the window.
@@ -740,6 +757,8 @@ impl Default for AppearanceUiState {
             high_contrast: false,
             theme_selection: ThemeSelection::default(),
             background_image: BackgroundImageUiState::default(),
+            terminal_ligatures: false,
+            terminal_opacity_percent: default_terminal_opacity_percent(),
         }
     }
 }
@@ -1881,6 +1900,8 @@ impl DesktopUiStateV1 {
         self.appearance.interface_font.normalize(12);
         self.appearance.code_font.normalize(10);
         self.appearance.background_image.normalize();
+        self.appearance.terminal_opacity_percent =
+            self.appearance.terminal_opacity_percent.clamp(60, 100);
         self.network_proxy.proxy_url = bounded_optional(self.network_proxy.proxy_url.take(), 2_048);
         self.network_proxy.bypass = self
             .network_proxy

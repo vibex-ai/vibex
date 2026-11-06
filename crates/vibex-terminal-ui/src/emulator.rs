@@ -3,13 +3,15 @@ use std::sync::{Arc, Mutex};
 use alacritty_terminal::{
     event::{Event, EventListener},
     grid::{Dimensions, Scroll},
-    index::{Column, Point, Side},
+    index::{Column, Line, Point, Side},
     selection::{Selection, SelectionType},
     term::{Config, Term, TermDamage, TermMode, cell::Flags, point_to_viewport, viewport_to_point},
     vte::ansi::{self, Color, CursorShape},
 };
 use serde::Serialize;
 use vibex_core::{VibexError, VibexResult};
+
+use crate::signals::{TerminalHostSignals, TerminalMouseModes, TerminalSignalScanner};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -91,6 +93,15 @@ pub struct TerminalModeSnapshot {
     /// `Enter`.
     #[serde(default)]
     pub kitty_keyboard_flags: u8,
+    /// `DECSET 1005`: X10-shaped mouse reports with UTF-8 values.
+    #[serde(default)]
+    pub utf8_mouse: bool,
+    /// `DECSET 1015`: urxvt mouse reports with decimal coordinates.
+    #[serde(default)]
+    pub urxvt_mouse: bool,
+    /// `DECSET 1016`: SGR mouse reports whose coordinates are pixels.
+    #[serde(default)]
+    pub sgr_pixels_mouse: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -113,6 +124,19 @@ pub struct TerminalFrameSnapshot {
 pub struct TerminalSearchMatch {
     pub start: TerminalGridPoint,
     pub end: TerminalGridPoint,
+}
+
+/// One match found anywhere in the retained buffer.
+///
+/// `line` counts from the oldest retained line, so a match keeps its meaning
+/// while the viewport is scrolled; the host converts it to a viewport row with
+/// the display offset it is painting at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalScrollbackMatch {
+    pub line: u32,
+    pub start_column: u16,
+    pub end_column: u16,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -190,6 +214,7 @@ pub struct TerminalEmulator {
     parser: ansi::Processor,
     ingested_bytes: u64,
     replies: PtyReplyQueue,
+    signals: TerminalSignalScanner,
 }
 
 impl TerminalEmulator {
@@ -213,10 +238,14 @@ impl TerminalEmulator {
             parser: ansi::Processor::new(),
             ingested_bytes: 0,
             replies,
+            signals: TerminalSignalScanner::new(),
         }
     }
 
     pub fn advance(&mut self, bytes: &[u8]) {
+        // The scanner sees the same bytes the parser does and only records
+        // requests addressed to the host. It never edits the stream.
+        self.signals.observe(bytes);
         self.parser.advance(&mut self.term, bytes);
         self.ingested_bytes = self.ingested_bytes.saturating_add(bytes.len() as u64);
     }
@@ -243,7 +272,18 @@ impl TerminalEmulator {
     }
 
     pub fn modes(&self) -> TerminalModeSnapshot {
-        mode_snapshot(*self.term.mode())
+        mode_snapshot(*self.term.mode(), self.signals.mouse_modes())
+    }
+
+    /// Requests addressed to the host — a title, a clipboard operation, a
+    /// colour query — accumulated since the last call.
+    pub fn take_host_signals(&mut self) -> TerminalHostSignals {
+        self.signals.take()
+    }
+
+    /// The mouse dialects the program has enabled beyond alacritty's own mode.
+    pub fn mouse_modes(&self) -> TerminalMouseModes {
+        self.signals.mouse_modes()
     }
 
     /// Replies the emulator owes the program, to be written back into the PTY.
@@ -260,6 +300,29 @@ impl TerminalEmulator {
 
     pub fn scroll_to_bottom(&mut self) {
         self.term.scroll_display(Scroll::Bottom);
+    }
+
+    /// The number of lines the viewport is scrolled back from the live screen.
+    pub fn display_offset(&self) -> usize {
+        self.term.grid().display_offset()
+    }
+
+    /// Lines of scrollback retained above the viewport.
+    pub fn history_lines(&self) -> usize {
+        self.term.grid().history_size()
+    }
+
+    /// Scrolls so that `offset` lines are hidden above the viewport.
+    ///
+    /// The scrollbar and a search jump both need an absolute position, while
+    /// the core only exposes relative movement.
+    pub fn scroll_to_offset(&mut self, offset: usize) {
+        let current = self.display_offset();
+        let target = offset.min(self.history_lines());
+        if target != current {
+            self.term
+                .scroll_display(Scroll::Delta(target as i32 - current as i32));
+        }
     }
 
     pub fn visible_text(&self) -> String {
@@ -309,6 +372,57 @@ impl TerminalEmulator {
 
     pub fn clear_selection(&mut self) {
         self.term.selection = None;
+    }
+
+    /// Selects the word under `point` the way a double click does.
+    ///
+    /// The core owns the word boundaries (`semantic_escape_chars`), so the
+    /// selected text and the highlighted cells come from the same rule instead
+    /// of a host-side approximation that would disagree at punctuation.
+    pub fn select_word_at(&mut self, point: TerminalGridPoint) -> VibexResult<String> {
+        self.validate_point(point)?;
+        let display_offset = self.term.grid().display_offset();
+        self.term.selection = Some(Selection::new(
+            SelectionType::Semantic,
+            viewport_point(display_offset, point),
+            Side::Left,
+        ));
+        self.term.selection_to_string().ok_or_else(|| {
+            VibexError::validation(
+                "terminal_selection_empty",
+                "terminal selection did not contain any text",
+            )
+        })
+    }
+
+    /// Selects the whole viewport line under `point`, as a triple click does.
+    pub fn select_line_at(&mut self, point: TerminalGridPoint) -> VibexResult<String> {
+        self.validate_point(point)?;
+        let display_offset = self.term.grid().display_offset();
+        let last_column = self.size.columns.saturating_sub(1);
+        let start = viewport_point(
+            display_offset,
+            TerminalGridPoint {
+                row: point.row,
+                column: 0,
+            },
+        );
+        let end = viewport_point(
+            display_offset,
+            TerminalGridPoint {
+                row: point.row,
+                column: last_column,
+            },
+        );
+        let mut selection = Selection::new(SelectionType::Lines, start, Side::Left);
+        selection.update(end, Side::Right);
+        self.term.selection = Some(selection);
+        self.term.selection_to_string().ok_or_else(|| {
+            VibexError::validation(
+                "terminal_selection_empty",
+                "terminal selection did not contain any text",
+            )
+        })
     }
 
     pub fn hyperlink_at(&self, point: TerminalGridPoint) -> VibexResult<Option<String>> {
@@ -366,6 +480,61 @@ impl TerminalEmulator {
                             row: row as u16,
                             column: *end_column,
                         },
+                    });
+                }
+            }
+        }
+        matches
+    }
+
+    /// Searches every retained line, scrollback included.
+    ///
+    /// [`Self::find_visible`] can only answer for the rows currently painted,
+    /// which is why a match above the viewport used to look like no match at
+    /// all. This walks the whole buffer and reports rows counted from the
+    /// oldest retained line; the host translates them with the display offset
+    /// when it paints or scrolls to one.
+    pub fn find_all(&self, query: &str, case_sensitive: bool) -> Vec<TerminalScrollbackMatch> {
+        if query.is_empty() {
+            return Vec::new();
+        }
+        let needle = normalize_search_text(query, case_sensitive);
+        let grid = self.term.grid();
+        let history = grid.history_size();
+        let screen_lines = usize::from(self.size.rows);
+        let columns = usize::from(self.size.columns);
+        let mut matches = Vec::new();
+        for line in 0..history.saturating_add(screen_lines) {
+            // Absolute grid lines are negative for history: the oldest line is
+            // `-history`, and line 0 is the top row of the live screen.
+            let absolute = Line(line as i32 - history as i32);
+            let row = &grid[absolute];
+            let mut text = String::new();
+            let mut byte_to_column = Vec::new();
+            for column in 0..columns {
+                let cell = &row[Column(column)];
+                if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                    continue;
+                }
+                let mut cell_text = cell.c.to_string();
+                if let Some(combining) = cell.zerowidth() {
+                    cell_text.extend(combining);
+                }
+                for _ in 0..cell_text.len() {
+                    byte_to_column.push(column as u16);
+                }
+                text.push_str(&cell_text);
+            }
+            let haystack = normalize_search_text(&text, case_sensitive);
+            for (start, _) in haystack.match_indices(&needle) {
+                let end_byte = start + needle.len() - 1;
+                if let (Some(start_column), Some(end_column)) =
+                    (byte_to_column.get(start), byte_to_column.get(end_byte))
+                {
+                    matches.push(TerminalScrollbackMatch {
+                        line: line as u32,
+                        start_column: *start_column,
+                        end_column: *end_column,
                     });
                 }
             }
@@ -460,7 +629,7 @@ impl TerminalEmulator {
             damage,
             cells,
             cursor,
-            modes: mode_snapshot(mode),
+            modes: mode_snapshot(mode, self.signals.mouse_modes()),
             ingested_bytes: self.ingested_bytes,
         }
     }
@@ -514,7 +683,7 @@ fn cursor_shape(shape: CursorShape) -> TerminalCursorShape {
     }
 }
 
-fn mode_snapshot(mode: TermMode) -> TerminalModeSnapshot {
+fn mode_snapshot(mode: TermMode, mouse: TerminalMouseModes) -> TerminalModeSnapshot {
     TerminalModeSnapshot {
         alternate_screen: mode.contains(TermMode::ALT_SCREEN),
         application_cursor: mode.contains(TermMode::APP_CURSOR),
@@ -523,6 +692,10 @@ fn mode_snapshot(mode: TermMode) -> TerminalModeSnapshot {
         sgr_mouse: mode.contains(TermMode::SGR_MOUSE),
         focus_reporting: mode.contains(TermMode::FOCUS_IN_OUT),
         kitty_keyboard_flags: kitty_keyboard_flags(mode),
+        // 1005 is also a core mode; 1015 and 1016 are only in the scanner.
+        utf8_mouse: mouse.utf8 || mode.contains(TermMode::UTF8_MOUSE),
+        urxvt_mouse: mouse.urxvt,
+        sgr_pixels_mouse: mouse.sgr_pixels,
     }
 }
 
@@ -738,6 +911,66 @@ mod tests {
         // Popping every pushed mode restores legacy encoding.
         emulator.advance(b"\x1b[<u");
         assert_eq!(emulator.modes().kitty_keyboard_flags, 0);
+    }
+
+    #[test]
+    fn finds_a_match_above_the_viewport_and_can_scroll_to_it() {
+        let mut emulator = TerminalEmulator::new(3, 20);
+        emulator.advance(b"needle first\r\n");
+        for index in 0..10 {
+            emulator.advance(format!("line {index}\r\n").as_bytes());
+        }
+        assert!(emulator.history_lines() > 0);
+
+        // The viewport-only scan cannot see the oldest line.
+        assert!(emulator.find_visible("needle", false).is_empty());
+        let matches = emulator.find_all("NEEDLE", false);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].line, 0);
+        assert_eq!(matches[0].start_column, 0);
+        assert_eq!(matches[0].end_column, 5);
+
+        emulator.scroll_to_offset(emulator.history_lines());
+        assert!(emulator.visible_text().starts_with("needle first"));
+        emulator.scroll_to_offset(0);
+        assert_eq!(emulator.display_offset(), 0);
+    }
+
+    #[test]
+    fn selects_a_word_or_a_line_the_way_a_double_or_triple_click_does() {
+        let mut emulator = TerminalEmulator::new(3, 30);
+        emulator.advance(b"alpha beta-gamma delta\r\nsecond line");
+
+        let word = emulator
+            .select_word_at(TerminalGridPoint { row: 0, column: 8 })
+            .unwrap();
+        assert_eq!(word, "beta-gamma");
+
+        let line = emulator
+            .select_line_at(TerminalGridPoint { row: 0, column: 3 })
+            .unwrap();
+        assert!(line.starts_with("alpha beta-gamma delta"));
+        assert!(!line.contains("second line"));
+    }
+
+    #[test]
+    fn collects_the_requests_the_host_has_to_answer() {
+        let mut emulator = TerminalEmulator::new(4, 20);
+        emulator.advance(b"\x1b]2;Build\x07");
+        emulator.advance(b"\x1b]52;c;aGVsbG8=\x07");
+        emulator.advance(b"\x1b]11;?\x07\x1b[?1000h\x1b[?1015h\x1b[?1016h");
+        let signals = emulator.take_host_signals();
+        assert_eq!(signals.title.as_deref(), Some("Build"));
+        assert_eq!(signals.clipboard_store.as_deref(), Some("aGVsbG8="));
+        assert_eq!(
+            signals.color_queries,
+            vec![crate::TerminalColorQuery::Background]
+        );
+        assert!(emulator.modes().mouse_reporting);
+        assert!(emulator.modes().urxvt_mouse);
+        assert!(emulator.modes().sgr_pixels_mouse);
+        // The queue drains, so the host does not answer twice.
+        assert!(emulator.take_host_signals().is_empty());
     }
 
     /// Advertising the protocol does not change what a program that never asks

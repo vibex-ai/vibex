@@ -68,6 +68,19 @@ pub const BUNDLED_SANS_FAMILY: &str = "IBM Plex Sans";
 /// the heap the first time the editor opened.
 pub(crate) const WQY_MICROHEI: &[u8] =
     include_bytes!("../../mobile/assets/fonts/wqy-microhei/wqy-microhei.ttc");
+/// The bundled symbol family, used by the terminal and the code workbench.
+///
+/// Agent TUIs draw status marks, file icons and arrows from the private-use
+/// area, which no text font covers. Without a font that does, those cells paint
+/// the "missing glyph" box — the tofu an Agent's transcript is full of. Nerd
+/// Fonts' symbols-only build covers exactly that area and nothing else, so it
+/// cannot steal ordinary text from the code font; it is loaded on every
+/// platform because it is not something a user is expected to have installed.
+pub const BUNDLED_SYMBOL_FAMILY: &str = "Symbols Nerd Font Mono";
+pub(crate) const SYMBOLS_NERD_FONT: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/assets/fonts/nerd-symbols/SymbolsNerdFontMono-Regular.ttf"
+));
 const BUNDLED_GPUI_FONT_ASSETS: &[(&str, &[u8])] = &[
     (
         "fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf",
@@ -90,6 +103,10 @@ const BUNDLED_GPUI_FONT_ASSETS: &[(&str, &[u8])] = &[
     ("fonts/lilex/Lilex-Bold.ttf", LILEX_BOLD),
     ("fonts/lilex/Lilex-BoldItalic.ttf", LILEX_BOLD_ITALIC),
     ("fonts/wqy-microhei/wqy-microhei.ttc", WQY_MICROHEI),
+    (
+        "fonts/nerd-symbols/SymbolsNerdFontMono-Regular.ttf",
+        SYMBOLS_NERD_FONT,
+    ),
 ];
 const APP_ICON: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -2640,6 +2657,10 @@ pub fn load_fonts(cx: &mut App) -> Result<AssetLoadReport, String> {
         .map(Cow::Borrowed),
     );
     fonts.push(Cow::Borrowed(WQY_MICROHEI));
+    // Not a user-installed family: the private-use area an Agent draws from is
+    // empty in every text font, so this face is what turns its icons into
+    // glyphs instead of missing-glyph boxes.
+    fonts.push(Cow::Borrowed(SYMBOLS_NERD_FONT));
     // DirectWrite rejects some formats that CoreText/fontconfig accept
     // (notably WOFF2 and TTC). Load each face independently so one
     // unsupported face does not prevent the app from opening; the UI falls

@@ -37,6 +37,8 @@ pub mod skeleton;
 pub mod spinner;
 pub mod ssh_connection;
 pub mod system_tray;
+pub mod terminal_box_drawing;
+pub mod terminal_links;
 pub mod terminal_surface;
 pub mod terminal_transport;
 pub mod testing;

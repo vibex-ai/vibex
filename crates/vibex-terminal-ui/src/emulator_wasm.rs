@@ -80,6 +80,12 @@ pub struct TerminalModeSnapshot {
     pub mouse_reporting: bool,
     pub sgr_mouse: bool,
     pub focus_reporting: bool,
+    #[serde(default)]
+    pub utf8_mouse: bool,
+    #[serde(default)]
+    pub urxvt_mouse: bool,
+    #[serde(default)]
+    pub sgr_pixels_mouse: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -134,6 +140,9 @@ impl TerminalEmulator {
                 mouse_reporting: false,
                 sgr_mouse: false,
                 focus_reporting: false,
+                utf8_mouse: false,
+                urxvt_mouse: false,
+                sgr_pixels_mouse: false,
             },
             history_lines: 0,
         }
@@ -244,6 +253,18 @@ impl TerminalEmulator {
     }
     pub fn scroll(&mut self, _line_delta: i32) {}
     pub fn scroll_to_bottom(&mut self) {}
+    pub fn scroll_to_offset(&mut self, _offset: usize) {}
+    pub fn display_offset(&self) -> usize {
+        0
+    }
+    pub fn history_lines(&self) -> usize {
+        self.history_lines
+    }
+    /// The fallback host has no escape scanner; requests it cannot answer are
+    /// reported as empty rather than guessed.
+    pub fn take_host_signals(&mut self) -> crate::TerminalHostSignals {
+        crate::TerminalHostSignals::default()
+    }
 
     pub fn visible_text(&self) -> String {
         (0..self.rows)
@@ -317,6 +338,29 @@ impl TerminalEmulator {
                 },
             })
             .collect()
+    }
+
+    /// The WASM fallback keeps no scrollback, so only the painted rows exist.
+    pub fn find_all(
+        &self,
+        _query: &str,
+        _case_sensitive: bool,
+    ) -> Vec<crate::TerminalScrollbackMatch> {
+        Vec::new()
+    }
+
+    pub fn select_word_at(&mut self, point: TerminalGridPoint) -> VibexResult<String> {
+        self.select_text(point, point)
+    }
+
+    pub fn select_line_at(&mut self, point: TerminalGridPoint) -> VibexResult<String> {
+        self.select_text(
+            TerminalGridPoint {
+                row: point.row,
+                column: 0,
+            },
+            point,
+        )
     }
 
     pub fn frame(&mut self) -> TerminalFrameSnapshot {

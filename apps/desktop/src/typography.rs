@@ -10,15 +10,24 @@
 
 use gpui::{App, FontWeight, Global, Rems, rems};
 
-/// The weight code surfaces paint at, as chosen in Appearance settings.
+/// The visual choices code surfaces paint with, as chosen in Appearance
+/// settings.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct CodeTypography {
     weight: u16,
+    /// Draw the code font's programming ligatures in the terminal.
+    terminal_ligatures: bool,
+    /// How opaque the terminal's own background is, in percent.
+    terminal_opacity_percent: u16,
 }
 
 impl Default for CodeTypography {
     fn default() -> Self {
-        Self { weight: 400 }
+        Self {
+            weight: 400,
+            terminal_ligatures: false,
+            terminal_opacity_percent: 100,
+        }
     }
 }
 
@@ -26,8 +35,26 @@ impl Global for CodeTypography {}
 
 /// Publish the preferred code font weight for the whole application.
 pub fn apply_code_font_weight(weight: u16, cx: &mut App) {
+    let previous = cx
+        .try_global::<CodeTypography>()
+        .copied()
+        .unwrap_or_default();
     cx.set_global(CodeTypography {
         weight: weight.clamp(100, 900),
+        ..previous
+    });
+}
+
+/// Publish the terminal's ligature and opacity choices.
+pub fn apply_terminal_visuals(ligatures: bool, opacity_percent: u16, cx: &mut App) {
+    let previous = cx
+        .try_global::<CodeTypography>()
+        .copied()
+        .unwrap_or_default();
+    cx.set_global(CodeTypography {
+        terminal_ligatures: ligatures,
+        terminal_opacity_percent: clamp_terminal_opacity(opacity_percent),
+        ..previous
     });
 }
 
@@ -39,6 +66,30 @@ pub fn code_font_weight(cx: &App) -> FontWeight {
             .unwrap_or_default()
             .weight as f32,
     )
+}
+
+/// Whether the terminal should shape programming ligatures.
+pub fn terminal_ligatures(cx: &App) -> bool {
+    cx.try_global::<CodeTypography>()
+        .copied()
+        .unwrap_or_default()
+        .terminal_ligatures
+}
+
+/// The terminal background's opacity, `0.6` to `1.0`.
+pub fn terminal_opacity(cx: &App) -> f32 {
+    f32::from(clamp_terminal_opacity(
+        cx.try_global::<CodeTypography>()
+            .copied()
+            .unwrap_or_default()
+            .terminal_opacity_percent,
+    )) / 100.0
+}
+
+/// Keeps a translucent terminal readable: below sixty percent the ink stops
+/// having a field of its own.
+fn clamp_terminal_opacity(percent: u16) -> u16 {
+    percent.clamp(60, 100)
 }
 
 /// The ladder's values in logical pixels at the default 16px root.
@@ -86,6 +137,14 @@ mod tests {
             );
         }
         assert!((menu_row().0 - rems(MENU_ROW / 16.0).0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn terminal_opacity_stays_inside_the_readable_range() {
+        assert_eq!(clamp_terminal_opacity(100), 100);
+        assert_eq!(clamp_terminal_opacity(0), 60);
+        assert_eq!(clamp_terminal_opacity(80), 80);
+        assert_eq!(clamp_terminal_opacity(250), 100);
     }
 
     #[test]
