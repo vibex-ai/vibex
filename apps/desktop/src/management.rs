@@ -1101,6 +1101,21 @@ struct AgentProviderProjectionState {
     preview: Option<vibex_core::AgentProviderProjectionPreview>,
 }
 
+impl AgentProviderProjectionState {
+    /// Whether this projection carries the two controls a Provider needs.
+    ///
+    /// A runtime profile whose version could not be trusted resolves to the
+    /// conservative contract, which has neither a Key field nor a Model pane.
+    /// The snapshot lists runtime profiles newest-first, so such a stale entry
+    /// can outrank the installed projection; `sync_projection_editor` uses this
+    /// to skip it rather than let it decide what the form can author.
+    fn authors_model_provider(&self) -> bool {
+        let controls = &self.capability.form_controls;
+        controls.contains(&vibex_core::AgentProjectionFormControl::ApiKey)
+            && controls.contains(&vibex_core::AgentProjectionFormControl::Model)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ManagementMutation {
     Gateway,
@@ -5353,9 +5368,15 @@ impl ManagementCenter {
             })
             .or_else(|| {
                 selected_agent_id.and_then(|agent_id| {
+                    // A stale runtime profile can sort first while resolving to
+                    // the conservative contract. Prefer a projection that can
+                    // author a Provider, and only then accept the first one, so
+                    // the installed projection is not shadowed by an entry
+                    // whose version is untrusted.
                     self.projection_states
                         .iter()
-                        .find(|projection| projection.agent_id == agent_id)
+                        .filter(|projection| projection.agent_id == agent_id)
+                        .min_by_key(|projection| !projection.authors_model_provider())
                 })
             });
         if let Some(projection) = projection {
@@ -6158,15 +6179,15 @@ impl ManagementCenter {
         // The dialog is opened from an Agent card, so the new shared record is
         // enabled for that Agent after it is written.
         self.provider_editor_bind_agent = true;
-        // The editor is still Agent-scoped: the projection descriptor is what
-        // says whether a Key field exists and what a model catalogue means for
-        // this Agent. Opening it from the global Providers page must therefore
-        // borrow a configurable Agent rather than fall through to the empty
-        // "unsupported runtime" surface.
-        // A new Provider has no legacy profile, so a selection left over from
-        // the previous edit must not decide which projection descriptor the
-        // form borrows.
+        // The editor is Agent-scoped: the projection descriptor is what says
+        // whether a Key field exists and what a model catalogue means for this
+        // Agent. A new Provider has no legacy profile, so a selection left over
+        // from the previous edit must not decide which projection descriptor
+        // the form borrows.
         self.selected_provider_profile_id = None;
+        // Re-sync after clearing it: readiness below is a fact about the
+        // selected Agent's projection, not about the profile that was open.
+        self.sync_projection_editor();
         // A configurable Agent is only usable here when its descriptor actually
         // carries the Key field and a Model catalogue. A leftover selection of
         // an Agent-managed provider (Cursor, Devin, ...) has a capability too,
@@ -6178,7 +6199,14 @@ impl ManagementCenter {
             && self
                 .projection_editor
                 .shows(vibex_core::AgentProjectionFormControl::Model);
-        if self.selected_agent_id.is_none() || !current_ready {
+        // Only the global Providers page has no Agent of its own, so only it
+        // borrows a configurable Agent. The Agent card keeps the Agent it is
+        // showing even when that Agent's projection cannot author a Provider;
+        // silently selecting another Agent moved the page away from the card
+        // the reader had just clicked.
+        if origin == ProviderPickerOrigin::ProvidersPage
+            && (self.selected_agent_id.is_none() || !current_ready)
+        {
             let configurable = vibex_core::model_provider_configurable_agent_ids().ok();
             let chosen = self
                 .projection_states
@@ -46756,6 +46784,142 @@ fn save(cx: &mut Context<Self>) {
         }
     }
 
+    /// The full-form projection, attributed to another Agent.
+    ///
+    /// The capability's Agent id is what `sync_projection_editor` matches on,
+    /// so a fixture that needs two Agents cannot reuse the Codex one.
+    fn projection_capability_with_models_for(
+        agent_id: &str,
+    ) -> vibex_core::AgentProviderProjectionCapability {
+        let mut capability = projection_capability_with_models();
+        capability.agent_id = AgentId::parse(agent_id).expect("fixture Agent id");
+        capability
+    }
+
+    /// The conservative contract an untrusted runtime version resolves to.
+    ///
+    /// It carries neither credential nor Model controls, which is what made a
+    /// stale runtime profile look like an Agent that cannot author a Provider.
+    fn conservative_projection_capability(
+        agent_id: &str,
+    ) -> vibex_core::AgentProviderProjectionCapability {
+        use vibex_core::AgentProjectionFormControl as Control;
+        let mut capability = projection_capability_with_models_for(agent_id);
+        capability.match_kind = vibex_core::ProjectionDescriptorMatch::Conservative;
+        capability.form_controls = vec![
+            Control::AdvancedCustomEnvironment,
+            Control::ProjectionPreview,
+        ];
+        capability
+    }
+
+    /// The Agent card's chooser must stay on the Agent that opened it.
+    ///
+    /// A stale runtime profile can leave the selected Agent's projection with
+    /// no Key or Model controls. The creator used to borrow the first
+    /// configurable Agent in that case, which moved the page from Gemini CLI to
+    /// Claude Code the moment the reader clicked New route group or Add model
+    /// provider.
+    #[gpui::test]
+    fn the_agent_card_creator_keeps_the_agent_that_opened_it(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let mut built = None;
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            let center = cx.new(|cx| ManagementCenter::new(window, cx));
+            let root = gpui_base::Root::new(center.clone(), window, cx);
+            built = Some(center);
+            root
+        });
+        let center = built.expect("the management window builds its center");
+        center.update(cx, |center, _| {
+            center.selected_agent_id = Some("gemini".to_string());
+            center.projection_states = vec![
+                AgentProviderProjectionState {
+                    agent_id: "gemini".to_string(),
+                    legacy_profile_id: None,
+                    capability: conservative_projection_capability("gemini"),
+                    preview: None,
+                },
+                // The Agent the old fallback picked: the first configurable
+                // projection that could author a Provider.
+                AgentProviderProjectionState {
+                    agent_id: "claude".to_string(),
+                    legacy_profile_id: None,
+                    capability: projection_capability_with_models_for("claude"),
+                    preview: None,
+                },
+            ];
+            center.sync_projection_editor();
+        });
+        center.read_with(cx, |center, _| {
+            assert!(
+                !center
+                    .projection_editor
+                    .shows(vibex_core::AgentProjectionFormControl::ApiKey),
+                "the fixture must reproduce a stale Agent projection"
+            );
+        });
+
+        let handle = cx.windows().pop().expect("test window");
+        let _ = cx.update_window(handle, |_, window, cx| {
+            center.update(cx, |center, cx| {
+                center.open_profile_creator_from(
+                    window,
+                    ProviderPickerOrigin::AgentCard,
+                    ProviderPickerTab::Providers,
+                    cx,
+                );
+            });
+        });
+        center.read_with(cx, |center, _| {
+            assert_eq!(
+                center.selected_agent_id.as_deref(),
+                Some("gemini"),
+                "opening the chooser from an Agent card must not select another Agent"
+            );
+        });
+    }
+
+    /// A stale runtime profile must not shadow the Agent's authoring projection.
+    ///
+    /// The snapshot lists runtime profiles newest-first, so an entry whose
+    /// version is untrusted can sit in front of the installed projection. The
+    /// editor must still pick the one carrying the Key and Model controls.
+    #[gpui::test]
+    fn the_editor_prefers_the_agents_projection_that_can_author(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let (center, cx) = cx.add_window_view(ManagementCenter::new);
+        center.update(cx, |center, _| {
+            center.selected_agent_id = Some("gemini".to_string());
+            center.projection_states = vec![
+                AgentProviderProjectionState {
+                    agent_id: "gemini".to_string(),
+                    legacy_profile_id: None,
+                    capability: conservative_projection_capability("gemini"),
+                    preview: None,
+                },
+                AgentProviderProjectionState {
+                    agent_id: "gemini".to_string(),
+                    legacy_profile_id: None,
+                    capability: projection_capability_with_models_for("gemini"),
+                    preview: None,
+                },
+            ];
+            center.sync_projection_editor();
+        });
+        center.read_with(cx, |center, _| {
+            assert!(
+                center
+                    .projection_editor
+                    .shows(vibex_core::AgentProjectionFormControl::ApiKey)
+                    && center
+                        .projection_editor
+                        .shows(vibex_core::AgentProjectionFormControl::Model),
+                "the installed projection must outrank the stale conservative one"
+            );
+        });
+    }
+
     /// A preset names a catalogue entry; its rows are that entry's models.
     ///
     /// This is the contract the preset table gives up when it stops carrying
@@ -52007,6 +52171,10 @@ mod gateway_surface_tests {
         assert!(opening.contains("self.selected_provider_profile_id = None;"));
         assert!(opening.contains("AgentProjectionFormControl::ApiKey"));
         assert!(opening.contains("self.sync_projection_editor();"));
+        assert!(
+            opening.contains("origin == ProviderPickerOrigin::ProvidersPage"),
+            "only a surface without an Agent of its own may borrow one"
+        );
     }
 
     #[test]
