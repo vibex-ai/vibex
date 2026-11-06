@@ -1624,6 +1624,35 @@ fn composer_suggestion_row(
         )
 }
 
+/// The `/` popup's scrollable row list.
+///
+/// The list owns a definite height rather than a maximum: the popup shell is
+/// content-sized, so a scroll area under it grows to its rows and the shell
+/// merely clips them. Plain `overflow_y_scroll` keeps `handle` as the real
+/// scroll driver — `overflow_y_scrollbar()` wraps the element in a second,
+/// keyed scroller, leaving `handle` tracking a region nothing moves — and the
+/// pinned bar stays put while the rows travel under it.
+fn composer_suggestion_scroll(
+    id: impl Into<ElementId>,
+    handle: &ScrollHandle,
+    list_height: f32,
+    rows: Vec<AnyElement>,
+    empty_state: Option<AnyElement>,
+) -> AnyElement {
+    v_flex()
+        .id(id)
+        .track_scroll(handle)
+        .w_full()
+        .h(px(list_height))
+        .p(px(4.0))
+        .children(rows)
+        .when_some(empty_state, |this, empty_state| this.child(empty_state))
+        .overflow_y_scroll()
+        .pinned_scrollbar(handle, ScrollbarAxis::Vertical)
+        .scroll_gutter()
+        .into_any_element()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ComposerCommandInvocation {
     command_id: Option<String>,
@@ -69264,6 +69293,18 @@ impl VibexWorkbench {
             - COMPOSER_SUGGESTION_MENU_HEADER_HEIGHT
             - tab_footer_height)
             .max(1.0);
+        // The list must own a definite height, not just a maximum: the menu is
+        // content-sized, and a scroll area under an auto-height parent grows
+        // to its content, so the wheel has nothing to scroll and the rows are
+        // merely clipped by the shell.
+        let list_row_count = visible_entries.len().min(COMPOSER_SUGGESTION_MAX_ROWS);
+        let list_content_height = if list_row_count == 0 {
+            COMPOSER_SUGGESTION_MENU_EMPTY_HEIGHT - COMPOSER_SUGGESTION_MENU_HEADER_HEIGHT
+        } else {
+            COMPOSER_SUGGESTION_MENU_VERTICAL_PADDING
+                + composer_suggestion_row_height(phrase_layout) * list_row_count as f32
+        };
+        let list_height = list_content_height.min(list_max_height).max(1.0);
         let (menu_title, menu_icon, trigger_symbol) = match context.request.trigger {
             Some(AgentCommandTrigger::Slash) => (
                 locale::text("Commands", "命令", "命令"),
@@ -69334,6 +69375,7 @@ impl VibexWorkbench {
                 .on_click(cx.listener(move |this, _, window, cx| {
                     this.apply_suggestion(target, selected_entry.clone(), body_choice, window, cx)
                 }))
+                .into_any_element()
             })
             .collect::<Vec<_>>();
 
@@ -69388,44 +69430,39 @@ impl VibexWorkbench {
                 )
         };
 
-        // ScrollableElement adds a normal-flow wrapper, so it must stay inside
-        // the absolutely positioned shell or it will shrink the workbench.
-        let scroll_content = v_flex()
-            .id(format!("composer-command-menu-scroll:{}", target.id()))
-            .track_scroll(&self.suggestion_scroll)
-            .w_full()
-            .max_h(px(list_max_height))
-            .p(px(4.0))
-            .when(!rows.is_empty(), |this| this.children(rows))
-            .when(visible_entries.is_empty(), |this| {
-                let message = if self.suggestion_loading {
-                    locale::text("Loading...", "加载中...", "載入中...")
-                } else if active_tab == ComposerSuggestionTab::Phrases
-                    && context
-                        .request
-                        .query
-                        .as_deref()
-                        .is_none_or(|query| query.trim().is_empty())
-                {
-                    locale::text("No quick phrases yet", "还没有快捷短语", "還沒有快捷短語")
-                } else {
-                    locale::text("No matches", "没有匹配项", "沒有符合項目")
-                };
-                this.child(
-                    div()
-                        .h(px(COMPOSER_SUGGESTION_MENU_EMPTY_HEIGHT
-                            - COMPOSER_SUGGESTION_MENU_HEADER_HEIGHT
-                            - COMPOSER_SUGGESTION_MENU_VERTICAL_PADDING))
-                        .flex()
-                        .items_center()
-                        .px_3()
-                        .text_sm()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(message),
-                )
-            })
-            .overflow_y_scrollbar()
-            .scroll_gutter();
+        let empty_state = visible_entries.is_empty().then(|| {
+            let message = if self.suggestion_loading {
+                locale::text("Loading...", "加载中...", "載入中...")
+            } else if active_tab == ComposerSuggestionTab::Phrases
+                && context
+                    .request
+                    .query
+                    .as_deref()
+                    .is_none_or(|query| query.trim().is_empty())
+            {
+                locale::text("No quick phrases yet", "还没有快捷短语", "還沒有快捷短語")
+            } else {
+                locale::text("No matches", "没有匹配项", "沒有符合項目")
+            };
+            div()
+                .h(px(COMPOSER_SUGGESTION_MENU_EMPTY_HEIGHT
+                    - COMPOSER_SUGGESTION_MENU_HEADER_HEIGHT
+                    - COMPOSER_SUGGESTION_MENU_VERTICAL_PADDING))
+                .flex()
+                .items_center()
+                .px_3()
+                .text_sm()
+                .text_color(cx.theme().muted_foreground)
+                .child(message)
+                .into_any_element()
+        });
+        let scroll_content = composer_suggestion_scroll(
+            format!("composer-command-menu-scroll:{}", target.id()),
+            &self.suggestion_scroll,
+            list_height,
+            rows,
+            empty_state,
+        );
 
         // A quick phrase is an editable object, so its tab carries the one
         // action that changes the list itself. The command tabs have no such
@@ -98341,6 +98378,41 @@ mod tests {
         }
     }
 
+    /// The popup's scroll region, with more rows than it can show.
+    ///
+    /// Rendered through the same [`composer_suggestion_scroll`] the popup uses,
+    /// so a wheel event proves the region is a real viewport rather than a
+    /// clipped column of rows.
+    struct ComposerSuggestionScrollProbe {
+        handle: ScrollHandle,
+    }
+
+    impl Render for ComposerSuggestionScrollProbe {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let rows = (0..COMPOSER_SUGGESTION_MAX_ROWS)
+                .map(|index| {
+                    div()
+                        .h(px(COMPOSER_SUGGESTION_MENU_ROW_HEIGHT))
+                        .flex_shrink_0()
+                        .when(index == 0, |this| {
+                            this.debug_selector(|| "suggestion-scroll-first".to_string())
+                        })
+                        .when(index + 1 == COMPOSER_SUGGESTION_MAX_ROWS, |this| {
+                            this.debug_selector(|| "suggestion-scroll-last".to_string())
+                        })
+                        .into_any_element()
+                })
+                .collect::<Vec<_>>();
+            div().w(px(420.0)).child(composer_suggestion_scroll(
+                "composer-command-menu-scroll:test",
+                &self.handle,
+                200.0,
+                rows,
+                None,
+            ))
+        }
+    }
+
     /// A composer textarea in a window, so an accepted suggestion can be
     /// written into a real editing state and read back.
     struct ComposerTokenProbe {
@@ -99680,6 +99752,87 @@ mod tests {
             bounds("composer-suggestion-description"),
             bounds("composer-suggestion-source"),
         )
+    }
+
+    /// The `/`, `@` and `$` panels share this list, so the wheel must move it
+    /// and the popup's own handle must follow — that same handle is what
+    /// keyboard reveal scrolls.
+    #[gpui::test]
+    fn composer_suggestion_list_scrolls_and_tracks_its_handle(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let handle = ScrollHandle::new();
+        let observed = handle.clone();
+        let (_, cx) = cx.add_window_view(|_, _| ComposerSuggestionScrollProbe { handle });
+
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        assert!(
+            observed.max_offset().y > px(0.0),
+            "the list should overflow its viewport: {:?}",
+            observed.max_offset()
+        );
+        let initial_last = cx
+            .debug_bounds("suggestion-scroll-last")
+            .expect("the last row is laid out")
+            .origin
+            .y;
+
+        cx.simulate_event(ScrollWheelEvent {
+            position: point(px(20.0), px(20.0)),
+            delta: ScrollDelta::Pixels(point(px(0.0), px(-120.0))),
+            modifiers: Default::default(),
+            touch_phase: gpui::TouchPhase::Moved,
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        assert!(
+            observed.offset().y < px(0.0),
+            "the wheel should move the tracked handle: {:?}",
+            observed.offset()
+        );
+        let scrolled_last = cx
+            .debug_bounds("suggestion-scroll-last")
+            .expect("the last row is still laid out")
+            .origin
+            .y;
+        assert!(
+            scrolled_last < initial_last,
+            "the rows should travel under the viewport: {initial_last:?} -> {scrolled_last:?}"
+        );
+
+        let before_reveal = observed.offset().y;
+        observed.scroll_to_item(COMPOSER_SUGGESTION_MAX_ROWS - 1);
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            observed.offset().y < before_reveal,
+            "keyboard reveal should scroll the same region: {:?} -> {:?}",
+            before_reveal,
+            observed.offset()
+        );
+    }
+
+    /// The popup must go through the tracked viewport helper above. Rendering
+    /// the list inline was how it drifted back into `overflow_y_scrollbar()`,
+    /// which leaves the popup's handle attached to a region nothing scrolls.
+    #[test]
+    fn composer_suggestion_popup_uses_the_tracked_scroll_region() {
+        let source = include_str!("app.rs");
+        let popup = source
+            .split_once("    fn render_composer_suggestions(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// One tab of the `/` popup header."))
+            .map(|(body, _)| body)
+            .expect("the suggestion popup should remain inspectable");
+        assert!(popup.contains("composer_suggestion_scroll("));
+        assert!(!popup.contains(".overflow_y_scrollbar()"));
     }
 
     /// A quick phrase is the text it inserts, so the phrase row has to show that
