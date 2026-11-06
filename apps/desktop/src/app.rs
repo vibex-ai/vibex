@@ -9854,6 +9854,15 @@ pub struct VibexWorkbench {
     session_terminal_surfaces: BTreeMap<String, Entity<TerminalSurface>>,
     /// The terminal-mode session whose surface is currently polling.
     active_session_terminal_id: Option<String>,
+    /// The terminal session whose page should take the keyboard once its
+    /// surface is on screen.
+    ///
+    /// A sidebar row focuses itself when it is clicked, so selecting a
+    /// terminal-mode session leaves the keyboard in the list even though the
+    /// Agent's TUI is what the reader wants to type into. This request is
+    /// consumed by the terminal page on the frame it renders, after the
+    /// surface has registered its focus handle.
+    session_terminal_focus_request: Option<String>,
     /// The session page's terminal render boundary, created on first use.
     session_terminal_view: Option<Entity<SessionTerminalView>>,
     /// The terminal session whose restart is in flight, so its button can say so.
@@ -11848,6 +11857,7 @@ impl VibexWorkbench {
             focus_handle,
             session_terminal_surfaces: BTreeMap::new(),
             active_session_terminal_id: None,
+            session_terminal_focus_request: None,
             session_terminal_view: None,
             terminal_session_restart_pending: None,
             session_terminal_error: None,
@@ -27116,9 +27126,19 @@ impl VibexWorkbench {
             self.ui_state.workbench.active_tab = "agent".to_string();
             self.queue_ui_state();
         }
-        self.select_session_with_history(session_id, !primary_tab_changed, cx);
+        self.select_session_with_history(session_id.clone(), !primary_tab_changed, cx);
         if primary_tab_changed {
             self.push_current_navigation_entry();
+        }
+        // Clicking the row of the terminal session that is already open does
+        // not navigate anywhere, so the activity sync never sees a change. The
+        // click still put the keyboard on the row; ask the page to take it
+        // back.
+        if self
+            .registered_session(session_id.as_str())
+            .is_some_and(AgentSession::is_terminal)
+        {
+            self.session_terminal_focus_request = Some(session_id.as_str().to_string());
         }
         cx.notify();
     }
@@ -72365,9 +72385,21 @@ impl VibexWorkbench {
             entry.insert(surface);
         }
         self.sync_session_terminal_surface_activity(cx);
-        self.session_terminal_surfaces
-            .get(&key)
-            .cloned()
+        let surface = self.session_terminal_surfaces.get(&key).cloned();
+        // The surface registers its focus handle while it renders, so the
+        // keyboard moves on the deferred pass rather than in the middle of the
+        // tree that is still being built.
+        if self.active_session_terminal_id.as_deref() == Some(key.as_str())
+            && self.session_terminal_focus_request.as_deref() == Some(key.as_str())
+        {
+            self.session_terminal_focus_request = None;
+            if let Some(surface) = surface.clone() {
+                cx.defer_in(window, move |_, window, cx| {
+                    surface.update(cx, |surface, cx| surface.focus_input(window, cx));
+                });
+            }
+        }
+        surface
             .map(|surface| {
                 // Rendered directly rather than through `cached`: a cached
                 // element keeps the size it was first laid out at, so opening or
@@ -72531,6 +72563,11 @@ impl VibexWorkbench {
             if let Some(surface) = self.session_terminal_surfaces.get(&key) {
                 surface.update(cx, |surface, cx| surface.set_active(true, cx));
             }
+            // The page just became the visible terminal. Whatever held the
+            // keyboard before — the sidebar row that selected it, or the
+            // previous page — the Agent's TUI is now what the reader means to
+            // type into, so the surface claims it once it has rendered.
+            self.session_terminal_focus_request = Some(key.clone());
             self.active_session_terminal_id = Some(key);
         }
     }
@@ -106794,6 +106831,56 @@ mod tests {
                 || include_str!("terminal_surface.rs")
                     .contains("from_session_shared_session_with_transport")
         );
+    }
+
+    /// A terminal-mode page takes the keyboard when it opens.
+    ///
+    /// The sidebar row focuses itself on click, so without this hand-off the
+    /// Agent's TUI is visible but every keystroke still goes to the session
+    /// list until the reader clicks the grid.
+    #[test]
+    fn a_terminal_session_page_claims_the_keyboard() {
+        let source = include_str!("app.rs");
+        let source = source
+            .split("\nmod tests {")
+            .next()
+            .expect("the module has production code");
+        let sync = source
+            .split_once("    fn sync_session_terminal_surface_activity(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_runtime_failure("))
+            .map(|(body, _)| body)
+            .expect("the activity sync should remain inspectable");
+        assert!(
+            sync.contains("self.session_terminal_focus_request = Some(key.clone());"),
+            "activating a terminal page must hand it the keyboard"
+        );
+        let page = source
+            .split_once("    fn render_session_terminal_body(")
+            .and_then(|(_, tail)| {
+                tail.split_once(
+                    "\n    /// What the page shows when the session has no running PTY.",
+                )
+            })
+            .map(|(body, _)| body)
+            .expect("the terminal page body should remain inspectable");
+        assert!(
+            page.contains("self.session_terminal_focus_request.as_deref() == Some(key.as_str())")
+        );
+        assert!(page.contains("surface.focus_input(window, cx)"));
+        let select = source
+            .split_once("    fn select_session(")
+            .and_then(|(_, tail)| {
+                tail.split_once(
+                    "\n    /// Selects the session named by a clicked system notification.",
+                )
+            })
+            .map(|(body, _)| body)
+            .expect("session selection should remain inspectable");
+        assert!(
+            select.contains("AgentSession::is_terminal"),
+            "a selected terminal session must ask its page for the keyboard"
+        );
+        assert!(select.contains("self.session_terminal_focus_request"));
     }
 
     /// The new-session page offers terminal mode only for an Agent this release

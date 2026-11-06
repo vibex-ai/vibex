@@ -657,8 +657,8 @@ fn encode_key(
     Some(sequence.into_bytes())
 }
 
-/// `DISAMBIGUATE_ESC_CODES`: report a chord as `CSI u` instead of its legacy
-/// bytes.
+/// `DISAMBIGUATE_ESC_CODES`: report ambiguous chords as `CSI u` instead of
+/// their legacy bytes. Functional keys keep the legacy CSI/SS3 form.
 const KITTY_DISAMBIGUATE: u8 = 1;
 /// `REPORT_ALTERNATE_KEYS`: also report the shifted key and the base layout key.
 const KITTY_ALTERNATE_KEYS: u8 = 4;
@@ -682,23 +682,24 @@ fn encode_kitty_key(key: TerminalKey, modifiers: TerminalModifiers, flags: u8) -
         TerminalKey::Tab => (9, None),
         TerminalKey::Backspace => (127, None),
         TerminalKey::Escape => (27, None),
-        TerminalKey::Up => (57352, None),
-        TerminalKey::Down => (57353, None),
-        TerminalKey::Left => (57351, None),
-        TerminalKey::Right => (57350, None),
-        TerminalKey::Home => (57356, None),
-        TerminalKey::End => (57357, None),
-        TerminalKey::PageUp => (57358, None),
-        TerminalKey::PageDown => (57359, None),
-        TerminalKey::Insert => (57348, None),
-        TerminalKey::Delete => (57349, None),
-        TerminalKey::Function(number) => {
-            // F1..F12 are the contiguous range 57364..=57375.
-            if !(1..=12).contains(&number) {
-                return None;
-            }
-            (57363 + u32::from(number), None)
-        }
+        // The kitty protocol does not give the cursor and editing keys new
+        // CSI-u numbers. They keep the legacy `CSI 1;modifier A` form (and the
+        // `CSI number;modifier ~` form for insert/delete/page/functions), which
+        // the legacy encoder below already produces. Reporting them as CSI u
+        // with Private Use Area code points made a program that had just
+        // enabled the protocol — Pi, for one — drop every arrow press as an
+        // unknown key.
+        TerminalKey::Up
+        | TerminalKey::Down
+        | TerminalKey::Left
+        | TerminalKey::Right
+        | TerminalKey::Home
+        | TerminalKey::End
+        | TerminalKey::PageUp
+        | TerminalKey::PageDown
+        | TerminalKey::Insert
+        | TerminalKey::Delete
+        | TerminalKey::Function(_) => return None,
         TerminalKey::Text(character) => {
             if flags & KITTY_ALL_KEYS_AS_ESC == 0 {
                 return None;
@@ -1272,6 +1273,48 @@ mod tests {
             .encode_key(TerminalKey::Enter, TerminalModifiers::default())
             .unwrap();
         assert_eq!(plain, b"\x1b[13u");
+    }
+
+    /// Cursor keys keep their legacy shape after the protocol is negotiated.
+    ///
+    /// The kitty protocol routes arrows and the editing keys through the same
+    /// `CSI 1;modifier A` form older programs already parse; it does not give
+    /// them Private Use Area CSI-u numbers. A TUI parses the former and treats
+    /// the latter as an unknown key, which is how a working prompt loses every
+    /// arrow press.
+    #[test]
+    fn negotiated_cursor_and_editing_keys_keep_their_legacy_shape() {
+        let mut backend = TerminalSurfaceBackend::new(4, 20);
+        // The exact push Pi sends: disambiguate, event types, alternate keys.
+        backend.sync(&snapshot(vec![(1, b"\x1b[>7u")], 2)).unwrap();
+        assert_eq!(backend.modes().kitty_keyboard_flags, 7);
+        let encode = |key: TerminalKey, modifiers: TerminalModifiers| {
+            backend.encode_key(key, modifiers).unwrap()
+        };
+        let shift = TerminalModifiers {
+            shift: true,
+            ..Default::default()
+        };
+        let control = TerminalModifiers {
+            control: true,
+            ..Default::default()
+        };
+
+        assert_eq!(encode(TerminalKey::Up, Default::default()), b"\x1b[A");
+        assert_eq!(encode(TerminalKey::Down, shift), b"\x1b[1;2B");
+        assert_eq!(encode(TerminalKey::Left, control), b"\x1b[1;5D");
+        assert_eq!(encode(TerminalKey::Right, Default::default()), b"\x1b[C");
+        assert_eq!(encode(TerminalKey::Home, Default::default()), b"\x1b[H");
+        assert_eq!(encode(TerminalKey::End, shift), b"\x1b[1;2F");
+        assert_eq!(encode(TerminalKey::PageUp, Default::default()), b"\x1b[5~");
+        assert_eq!(encode(TerminalKey::PageDown, control), b"\x1b[6;5~");
+        assert_eq!(encode(TerminalKey::Insert, Default::default()), b"\x1b[2~");
+        assert_eq!(encode(TerminalKey::Delete, Default::default()), b"\x1b[3~");
+        assert_eq!(
+            encode(TerminalKey::Function(1), Default::default()),
+            b"\x1bOP"
+        );
+        assert_eq!(encode(TerminalKey::Function(5), shift), b"\x1b[15;2~");
     }
 
     /// A program that pushes the mode and then pops it returns to legacy bytes,
