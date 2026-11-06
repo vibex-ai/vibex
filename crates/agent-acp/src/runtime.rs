@@ -17742,7 +17742,12 @@ pub(super) fn effective_acp_process_args(
         .any(|arg| arg == "--log-level" || arg.starts_with("--log-level="));
     if !has_log_level {
         args.push("--log-level".to_string());
-        args.push("ERROR".to_string());
+        // OpenCode parses this value case-sensitively and accepts only the
+        // lowercase names (`all|trace|debug|info|warn|warning|error|fatal|
+        // none`). `ERROR` is rejected by its CLI parser before the ACP server
+        // starts, so the process exits without answering `initialize` and the
+        // picker reports a bare `acp_rpc_error` instead of the CLI message.
+        args.push("error".to_string());
     }
     args
 }
@@ -25022,9 +25027,11 @@ printf '%s %s\n' "$$" "$descendant" > "$VIBEX_TEST_PID_FILE"
         };
 
         assert_eq!(effective_acp_process_args(&config, "cline"), config.args);
+        // OpenCode's CLI parser is case-sensitive: the lowercase level is the
+        // only spelling that reaches its ACP server.
         assert_eq!(
             effective_acp_process_args(&config, OPENCODE_AGENT_ID),
-            vec!["acp", "--print-logs", "--log-level", "ERROR"]
+            vec!["acp", "--print-logs", "--log-level", "error"]
         );
 
         config.args = vec![
