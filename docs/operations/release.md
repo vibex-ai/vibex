@@ -101,10 +101,17 @@ this order:
    rendered from the assets the run actually publishes, so a platform whose job
    failed drops out instead of leaving a dead link, and a missing server tarball
    renders as `—`.
-3. **What's Changed**, **New Contributors** and **Full Changelog** — English
-   only. The job asks GitHub to generate them from merged pull requests; a range
-   that carries only direct commits generates no entries, so the composer falls
-   back to the commit log between the previous tag and this one.
+3. **New Contributors** and **Full Changelog** — English only. The job asks
+   GitHub to generate the release notes over the range and reuses only the
+   contributor credit, which names each new contributor's first pull request; a
+   range that carries only direct commits generates none, so the composer
+   credits the author of a first commit between the previous tag and this one.
+
+The page deliberately carries no per-change list. A release spans several
+hundred commits, so a `What's Changed` list is longer than everything a reader
+came for, and the notes above already say what changed in the terms a reader
+cares about. The composer drops that section even when GitHub generates it, and
+the publish job fails if it ever reaches the body.
 
 `scripts/release-body.mjs` builds the body and `scripts/release-body.test.mjs`
 pins its rules. A local draft needs the tagged notes and, optionally, the asset
@@ -124,9 +131,9 @@ node scripts/release-body.mjs \
 ```
 
 Without `--assets` the Downloads table is omitted, and an empty or missing
-`--changelog` selects the commit-log fallback. The publish job reads the file
-through `gh release create --notes-file`, so the page and the notes asset always
-describe the same release.
+`--changelog` selects the commit-log fallback for the contributor credit. The
+publish job reads the file through `gh release create --notes-file`, so the page
+and the notes asset always describe the same release.
 
 The Downloads table is a convenience for readers. The updater never reads it:
 artifact trust stays with the signed `vibex-update.json`, and every link is

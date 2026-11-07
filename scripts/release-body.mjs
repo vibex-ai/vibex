@@ -5,18 +5,22 @@
 //
 //   1. the tagged bilingual notes, one level-two section per language;
 //   2. a Downloads table rendered from the assets this run is about to upload;
-//   3. the changelog: "What's Changed", "New Contributors" and the comparison
-//      link GitHub publishes at the end of generated release notes.
+//   3. the contributor credit and the comparison link that close the page.
 //
 // English is the release's primary language. The notes carry one section per
-// language, while the Downloads table and the changelog are English only and
-// follow both note sections, so a reader picks a language once and the shared
-// release data stays in one place.
+// language, while the Downloads table and the closing sections are English only
+// and follow both note sections, so a reader picks a language once and the
+// shared release data stays in one place.
 //
-// The changelog is normally the body GitHub generates from merged pull
-// requests. A range that contains direct commits has no pull requests to list,
-// so an empty generated body falls back to the commit log between the previous
-// tag and this one and renders the same headings.
+// The page deliberately carries no per-change list: a range of several hundred
+// commits makes one, and the bilingual notes above already say what changed in
+// the terms a reader cares about. Only the two facts a change list adds survive
+// here — who contributed for the first time, and where the full comparison is.
+//
+// The contributor credit comes from the notes GitHub generates for the release
+// range, which names each new contributor's first pull request. A range built
+// from direct commits generates no entries, so the composer falls back to the
+// commit log and credits the author of a first commit in the range.
 //
 // Usage:
 //   node scripts/release-body.mjs \
@@ -69,8 +73,8 @@ const USAGE = `usage: node scripts/release-body.mjs --version <version> --notes 
   --repository <owner/name> GitHub repository (default: $GITHUB_REPOSITORY or ${DEFAULT_REPOSITORY})
   --notes <file>            Tagged release notes document with one section per language
   --assets <directory>      Published asset directory used to render the Downloads table
-  --changelog <file>        GitHub generated release notes; empty entries fall back to the commit log
-  --previous-tag <tag>      Tag the changelog compares against (default: git describe of the tag)
+  --changelog <file>        GitHub generated release notes; its contributor credit is reused
+  --previous-tag <tag>      Tag the page compares against (default: git describe of the tag)
   --output <file>           Write the body here instead of printing it
 `;
 
@@ -251,106 +255,81 @@ export function renderDownloads({ version, repository, tag, assetNames }) {
   return lines.join("\n").trimEnd();
 }
 
-const CHANGELOG_GROUPS = [
-  { type: "feat", title: "Features" },
-  { type: "fix", title: "Fixes" },
-  { type: "perf", title: "Performance" },
-  { type: "other", title: "Other changes" }
-];
-
-function changelogGroup(subject) {
-  const match = /^([a-z]+)(?:\([^)]*\))?!?:[ \t]/u.exec(subject);
-  const type = match ? match[1] : "";
-  return CHANGELOG_GROUPS.some((group) => group.type === type) ? type : "other";
-}
-
-// Release preparation commits describe the version bump, not a change a reader
-// of the release notes can use, so they stay out of the changelog. Older
-// releases wrote `chore: update <version>` before `chore(release): prepare ...`
-// became the convention, and both forms have to stay out.
-const VERSION_BUMP =
-  /^chore(?:\([^)]*\))?:[ \t]+(?:update|bump)[ \t]+(?:to[ \t]+)?v?\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:[ \t].*)?$/u;
-
-function isChangeEntry(subject) {
-  const trimmed = subject.trim();
-  if (trimmed === "") return false;
-  if (/^chore\(release\):/u.test(trimmed)) return false;
-  if (VERSION_BUMP.test(trimmed)) return false;
-  if (/^Merge[ \t]/u.test(trimmed)) return false;
-  return true;
-}
-
-export function renderCommitChangelog({ repository, from, to, commits, newContributors }) {
-  const groups = new Map(CHANGELOG_GROUPS.map((group) => [group.type, { title: group.title, entries: [] }]));
-  // A subject can land twice — a cherry-pick, or the same change authored on
-  // two branches — and the release page only needs to say it once.
-  const seen = new Set();
-  for (const commit of commits) {
-    if (!isChangeEntry(commit.subject)) continue;
-    const subject = commit.subject.trim();
-    if (seen.has(subject)) continue;
-    seen.add(subject);
-    const group = groups.get(changelogGroup(subject));
-    const sha = commit.sha.slice(0, 7);
-    group.entries.push(`* ${subject} ([${sha}](https://github.com/${repository}/commit/${commit.sha}))`);
+// Credits and the comparison link: the part of a generated changelog the notes
+// cannot state themselves. `contributors` holds ready-to-render list lines, so
+// a GitHub-generated credit keeps the pull request it points at.
+export function renderClosing({ repository, from, to, contributors = [], fullChangelog = "" }) {
+  const lines = [];
+  if (contributors.length > 0) {
+    lines.push("## New Contributors", "", ...contributors, "");
   }
-
-  const lines = ["## What's Changed", ""];
-  for (const group of groups.values()) {
-    if (group.entries.length === 0) continue;
-    lines.push(`### ${group.title}`, "", ...group.entries, "");
-  }
-  if (newContributors.length > 0) {
-    lines.push("## New Contributors", "", ...newContributors.map((name) => `* ${name} made their first contribution`), "");
-  }
-  lines.push(
-    from
+  const comparison =
+    fullChangelog.trim() ||
+    (from
       ? `**Full Changelog**: https://github.com/${repository}/compare/${from}...${to}`
-      : `**Full Changelog**: https://github.com/${repository}/releases/tag/${to}`
-  );
+      : `**Full Changelog**: https://github.com/${repository}/releases/tag/${to}`);
+  lines.push(comparison);
   return lines.join("\n").trimEnd();
 }
 
-// Authors that never appear before the previous tag are new to the project.
-// Email is the identity compared here, because a contributor keeps it across
-// author-name changes and every commit records one.
+// The two parts of GitHub's generated notes this page keeps. Its "What's
+// Changed" list is dropped on purpose: several hundred commits per release make
+// it longer than everything a reader came for, and the notes already describe
+// the release in the terms a reader cares about.
+export function parseGeneratedNotes(body) {
+  const lines = body.replace(/\r\n?/gu, "\n").split("\n");
+  const contributors = [];
+  let inContributors = false;
+  for (const line of lines) {
+    if (/^##[ \t]+New Contributors[ \t]*$/u.test(line)) {
+      inContributors = true;
+      continue;
+    }
+    if (!inContributors) continue;
+    if (/^##[ \t]/u.test(line)) break;
+    if (/^\*[ \t]+\S/u.test(line)) contributors.push(line.trimEnd());
+  }
+  const comparison = lines.find((line) => /^\*\*Full Changelog\*\*:/u.test(line.trim()));
+  return { contributors, fullChangelog: comparison?.trim() ?? "" };
+}
+
+// Authors that never appear before the previous tag contributed for the first
+// time. Email is the identity compared here, because a contributor keeps it
+// across author-name changes and every commit records one.
 function readGitRange({ from, to }) {
   const range = from ? `${from}..${to}` : to;
-  const raw = git(["log", "--no-merges", "--format=%H%x00%an%x00%ae%x00%s", range]);
+  // A tag that has not been created yet — a local draft before the tag push —
+  // leaves no range to read. The page then carries the comparison link alone
+  // rather than failing the release over a courtesy credit.
+  let raw = "";
+  let history = "";
+  try {
+    raw = git(["log", "--no-merges", "--format=%an%x00%ae", range]);
+    history = from ? git(["log", "--format=%ae", from]) : "";
+  } catch {
+    return [];
+  }
   const commits = raw
     .split("\n")
     .filter((line) => line.length > 0)
     .map((line) => {
-      const [sha, name, email, subject] = line.split("\u0000");
-      return { sha, name, email, subject };
+      const [name, email] = line.split("\u0000");
+      return { name, email };
     })
     .reverse();
 
   const known = new Set();
-  if (from) {
-    for (const email of git(["log", "--format=%ae", from]).split("\n")) {
-      if (email !== "") known.add(email);
-    }
+  for (const email of history.split("\n")) {
+    if (email !== "") known.add(email);
   }
   const seen = new Set();
   const newContributors = [];
   for (const commit of commits) {
     if (known.has(commit.email) || seen.has(commit.email)) continue;
     seen.add(commit.email);
-    newContributors.push(commit.name);
+    newContributors.push(`* ${commit.name} made their first contribution`);
   }
-  return { commits, newContributors };
-}
-
-// Number of pull-request entries GitHub put under "What's Changed". A body that
-// carries only the comparison link came from a range with no pull requests.
-function changelogEntries(body) {
-  const heading = /^## What's Changed[ \t]*$/mu.exec(body);
-  if (!heading) return 0;
-  const rest = body.slice(heading.index + heading[0].length);
-  const next = /^##[ \t]/mu.exec(rest);
-  const block = next ? rest.slice(0, next.index) : rest;
-  return block.split("\n").filter((line) => /^\*[ \t]+\S/u.test(line)).length;
+  return newContributors;
 }
 
 function previousTagFor(to) {
@@ -370,7 +349,15 @@ function revisionFor(tag) {
   }
 }
 
-export function buildReleaseBody({ version, repository, tag, notesDocument, assetNames = [], changelog = "" }) {
+export function buildReleaseBody({
+  version,
+  repository,
+  tag,
+  notesDocument,
+  assetNames = [],
+  changelog = "",
+  from = ""
+}) {
   const notes = pickNotesSections(notesDocument);
   if (!notes.english) {
     fail("release notes carry no English section; add a level-two `## English` heading");
@@ -379,7 +366,18 @@ export function buildReleaseBody({ version, repository, tag, notesDocument, asse
   if (notes.chinese) parts.push(`## ${notes.chinese.heading}\n\n${notes.chinese.body}`);
   const downloads = renderDownloads({ version, repository, tag, assetNames });
   if (downloads !== "") parts.push(downloads);
-  if (changelog.trim() !== "") parts.push(changelog.trim());
+
+  const generated = parseGeneratedNotes(changelog);
+  const contributors =
+    generated.contributors.length > 0 ? generated.contributors : from ? readGitRange({ from, to: tag }) : [];
+  const closing = renderClosing({
+    repository,
+    from,
+    to: tag,
+    contributors,
+    fullChangelog: generated.fullChangelog
+  });
+  if (closing !== "") parts.push(closing);
   return `${parts.join("\n\n---\n\n")}\n`;
 }
 
@@ -407,14 +405,10 @@ function compose(options) {
   if (options.changelog && existsSync(resolve(ROOT, options.changelog))) {
     changelog = readFileSync(resolve(ROOT, options.changelog), "utf8");
   }
-  if (changelogEntries(changelog) === 0) {
-    const to = revisionFor(tag);
-    const from = options.previousTag ?? previousTagFor(to);
-    const range = readGitRange({ from, to });
-    changelog = renderCommitChangelog({ repository, from, to: tag, ...range });
-  }
+  const to = revisionFor(tag);
+  const from = options.previousTag ?? previousTagFor(to);
 
-  return buildReleaseBody({ version, repository, tag, notesDocument, assetNames, changelog });
+  return buildReleaseBody({ version, repository, tag, notesDocument, assetNames, changelog, from });
 }
 
 function main(argv) {

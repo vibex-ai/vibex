@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 // Self-test for scripts/release-body.mjs.
 //
-// The release body is assembled from three inputs that CI cannot re-derive once
-// the release is public: the tagged notes, the asset list and the changelog.
+// The release body is assembled from inputs CI cannot re-derive once the release
+// is public: the tagged notes, the asset list and the generated changelog.
 // These cases pin the parts that would silently ship an unreadable release page
-// — language selection, the Downloads table, and the changelog fallback.
+// — language selection, the Downloads table, and the contributor credit.
 //
 // Usage: node scripts/release-body.test.mjs
 
@@ -12,8 +12,9 @@ import assert from "node:assert/strict";
 
 import {
   buildReleaseBody,
+  parseGeneratedNotes,
   parseNotesSections,
-  renderCommitChangelog,
+  renderClosing,
   renderDownloads
 } from "./release-body.mjs";
 
@@ -57,24 +58,75 @@ assert.deepEqual(
 assert.ok(sections[0].body.includes("## 中文"), "the fenced heading was dropped from the body");
 assert.ok(!sections[0].body.endsWith("---"), "the section separator leaked into a language body");
 
+// The page keeps only the contributor credit and the comparison link from the
+// generated notes; the per-change list is dropped on purpose.
+const generated = [
+  "## What's Changed",
+  "* feat(desktop): a change by @ada in https://github.com/vibex-ai/vibex/pull/1",
+  "* fix(tui): another change by @grace in https://github.com/vibex-ai/vibex/pull/2",
+  "",
+  "## New Contributors",
+  "* @ada made their first contribution in https://github.com/vibex-ai/vibex/pull/1",
+  "",
+  "**Full Changelog**: https://github.com/vibex-ai/vibex/compare/v0.1.0...v0.2.0",
+  ""
+].join("\n");
+const parsed = parseGeneratedNotes(generated);
+assert.deepEqual(
+  parsed.contributors,
+  ["* @ada made their first contribution in https://github.com/vibex-ai/vibex/pull/1"],
+  "the contributor credit was not lifted from the generated notes"
+);
+assert.equal(
+  parsed.fullChangelog,
+  "**Full Changelog**: https://github.com/vibex-ai/vibex/compare/v0.1.0...v0.2.0",
+  "the comparison link was not lifted from the generated notes"
+);
+
 const body = buildReleaseBody({
   version: "0.2.0",
   repository: "vibex-ai/vibex",
   tag: "v0.2.0",
   notesDocument: NOTES,
   assetNames: [],
-  changelog: "## What's Changed\n\n* a change by @someone in https://example.invalid/pull/1\n"
+  changelog: generated
 });
 assert.ok(body.startsWith("## English\n"), "the body must open with the English section");
 assert.ok(body.indexOf("## English") < body.indexOf("## 中文"), "Chinese must follow English");
 assert.ok(
-  body.indexOf("## 中文") < body.indexOf("## What's Changed"),
-  "the changelog must follow both language sections"
+  body.indexOf("## 中文") < body.indexOf("## New Contributors"),
+  "the closing sections must follow both language sections"
+);
+assert.ok(
+  !body.includes("## What's Changed"),
+  "the per-change list must not reach the release page"
+);
+assert.ok(
+  !body.includes("feat(desktop): a change"),
+  "a generated change entry must not reach the release page"
+);
+assert.ok(body.includes("* @ada made their first contribution"), "the contributor credit was dropped");
+assert.ok(
+  body.trimEnd().endsWith(
+    "**Full Changelog**: https://github.com/vibex-ai/vibex/compare/v0.1.0...v0.2.0"
+  ),
+  "the page must close with the comparison link"
 );
 assert.ok(body.includes("Thank") === false, "the composer must not invent closing prose");
+
+// A release with no new contributor keeps the comparison link and drops the
+// empty heading, so the page never ends on a section with nothing under it.
+const noCredit = renderClosing({
+  repository: "vibex-ai/vibex",
+  from: "v0.1.0",
+  to: "v0.2.0",
+  contributors: []
+});
+assert.ok(!noCredit.includes("New Contributors"), "an empty contributor section was rendered");
+assert.ok(noCredit.startsWith("**Full Changelog**"), "the comparison link must still close the page");
 assert.ok(
-  body.trimEnd().endsWith("https://example.invalid/pull/1"),
-  "a generated changelog must be carried through verbatim"
+  renderClosing({ repository: "vibex-ai/vibex", from: "", to: "v0.0.1" }).includes("/releases/tag/v0.0.1"),
+  "the first release needs a comparison link that points at its own tag"
 );
 
 // The table lists only artifacts this release actually publishes, and pairs a
@@ -109,35 +161,6 @@ assert.ok(
   "a missing server tarball must render as a dash"
 );
 assert.ok(downloads.includes("[SHA256SUMS]"), "the aggregate checksum file was not linked");
-
-// A range with no merged pull requests has no generated entries; the composer
-// falls back to the commit log and keeps the headings a reader expects.
-const fallback = renderCommitChangelog({
-  repository: "vibex-ai/vibex",
-  from: "v0.1.0",
-  to: "v0.2.0",
-  commits: [
-    { sha: "a".repeat(40), subject: "feat(tui): add a button legend" },
-    { sha: "b".repeat(40), subject: "fix(desktop): keep the caret visible" },
-    { sha: "c".repeat(40), subject: "chore(release): prepare the v0.2.0 release" },
-    { sha: "e".repeat(40), subject: "chore: update 0.2.0" },
-    { sha: "d".repeat(40), subject: "update" }
-  ],
-  newContributors: ["Ada"]
-});
-assert.ok(fallback.startsWith("## What's Changed\n"), "the fallback lost the changelog heading");
-assert.ok(fallback.includes("### Features"), "the fallback lost its feature group");
-assert.ok(fallback.includes("### Fixes"), "the fallback lost its fix group");
-assert.ok(fallback.includes("### Other changes"), "an unconventioned subject belongs in other changes");
-assert.ok(!fallback.includes("prepare the v0.2.0 release"), "a release preparation commit reached the changelog");
-assert.ok(!fallback.includes("chore: update 0.2.0"), "a bare version bump reached the changelog");
-assert.ok(fallback.includes("* Ada made their first contribution"), "new contributors were dropped");
-assert.ok(
-  fallback.trimEnd().endsWith(
-    "**Full Changelog**: https://github.com/vibex-ai/vibex/compare/v0.1.0...v0.2.0"
-  ),
-  "the fallback lost its comparison link"
-);
 
 // A body without an English section is unreleasable: the About page resolves
 // English first and would otherwise render an empty changelog.

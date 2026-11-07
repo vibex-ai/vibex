@@ -576,11 +576,12 @@ function validateCurrentReleaseDocs() {
     "runbook does not document the localized release-notes asset"
   );
   // The runbook is where a release owner learns what the Release page will
-  // carry, so the three composed parts have to stay documented next to it.
+  // carry, so the composed parts and the deliberate omission have to stay
+  // documented next to it.
   for (const required of [
     "scripts/release-body.mjs",
     "--notes-file",
-    "What's Changed",
+    "New Contributors",
     "Downloads"
   ]) {
     assert(runbook.includes(required), `runbook does not document the release page: ${required}`);

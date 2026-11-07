@@ -44,8 +44,14 @@ About page renders and the notes a browser reads cannot disagree:
 - English, then the Chinese section, verbatim from the document;
 - a Downloads table naming every desktop and server artifact the run published,
   plus the mobile packages, linked through the verified tag;
-- the English changelog GitHub generates from merged pull requests, or the
-  commit log of the release range when a range carries none.
+- the English `New Contributors` credit GitHub derives from the pull requests in
+  the release range, or the commit log of that range when it carries none, and
+  the `Full Changelog` comparison link.
+
+The page carries no per-change list. A release spans several hundred commits, so
+a `What's Changed` list is longer than everything a reader came for, and the
+notes above it already say what changed. The composer drops that section even
+when GitHub generates it.
 
 The Downloads table is presentation only. Artifact trust stays with the signed
 manifest, and the page is rebuilt from the published asset list on every run

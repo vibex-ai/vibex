@@ -612,10 +612,11 @@ jobs:
               xargs -0 -n1 sha256sum
           ) > target/publish/SHA256SUMS
       # The release page carries the tagged notes, a Downloads table built from
-      # the assets this run publishes, and the changelog. GitHub generates the
-      # changelog from merged pull requests; a range that only carries direct
-      # commits returns an empty list, so the composer falls back to the commit
-      # log instead of shipping a body with a bare comparison link.
+      # the assets this run publishes, and a closing credit. GitHub knows which
+      # contributor is new to the project and which pull request carried them,
+      # so its generated notes supply the credit; the page drops the per-change
+      # list they also carry. A range that only has direct commits generates
+      # none, and the composer falls back to the commit log for the credit.
       - name: Generate changelog
         env:
           GH_TOKEN: ${{ github.token }}
@@ -626,7 +627,7 @@ jobs:
           tag="${GITHUB_REF_NAME}"
           previous="$(git describe --tags --abbrev=0 "${tag}^" 2>/dev/null || true)"
           if [[ -z "${previous}" ]]; then
-            echo "no previous tag reaches ${tag}; the composer will list the commit log"
+            echo "no previous tag reaches ${tag}; the composer will read the commit log"
             : > target/release-body/generated-changelog.md
             exit 0
           fi
@@ -654,9 +655,14 @@ jobs:
           # so every part has to be present before the release is created.
           grep -qxF '## English' "${body}"
           grep -qxF '## Downloads' "${body}"
-          grep -qxF "## What's Changed" "${body}"
           grep -qE '^## (简体中文|簡體中文|中文|繁體中文|繁体中文)$' "${body}"
           grep -qF '**Full Changelog**' "${body}"
+          # The per-change list is deliberately absent: several hundred commits
+          # per release make it longer than everything a reader came for.
+          if grep -qxF "## What's Changed" "${body}"; then
+            echo "release body carries a per-change list; the notes already describe the release" >&2
+            exit 1
+          fi
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
