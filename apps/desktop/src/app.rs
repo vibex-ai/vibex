@@ -95113,7 +95113,6 @@ fn settings_number_stepper(
     cx: &App,
 ) -> AnyElement {
     let is_dark = cx.theme().is_dark();
-    let foreground = theme::semantic_color("foreground", is_dark);
     let muted_foreground = theme::semantic_color("muted-foreground", is_dark);
     let input = theme::semantic_color("input", is_dark);
     let input_background = input.opacity(if is_dark { 0.30 } else { 0.20 });
@@ -95134,7 +95133,6 @@ fn settings_number_stepper(
                 .icon(IconName::Minus)
                 .tooltip(decrease_label)
                 .text_color(muted_foreground)
-                .hover(move |style| style.text_color(foreground))
                 .disabled(value <= minimum)
                 .on_click(decrease),
         )
@@ -95168,7 +95166,6 @@ fn settings_number_stepper(
                 .icon(IconName::Plus)
                 .tooltip(increase_label)
                 .text_color(muted_foreground)
-                .hover(move |style| style.text_color(foreground))
                 .disabled(value >= maximum)
                 .on_click(increase),
         )
@@ -125099,5 +125096,29 @@ mod route_picker_tests {
             group.choices[0].label, "deepseek-chat",
             "the model is named, not its storage id"
         );
+    }
+
+    #[gpui::test]
+    fn settings_number_stepper_renders_without_hover_panic(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        struct StepperProbe;
+        impl Render for StepperProbe {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                settings_number_stepper(
+                    "test-stepper",
+                    100,
+                    Some("%"),
+                    50,
+                    200,
+                    |_, _, _| {},
+                    |_, _, _| {},
+                    "decrease",
+                    "increase",
+                    cx,
+                )
+            }
+        }
+        let (_, cx) = cx.add_window_view(|_, _| StepperProbe);
+        cx.run_until_parked();
     }
 }
