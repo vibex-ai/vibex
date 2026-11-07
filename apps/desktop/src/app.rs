@@ -10374,12 +10374,17 @@ pub struct VibexWorkbench {
     session_group_view_loads: BTreeSet<String>,
     session_group_view_errors: BTreeMap<String, String>,
     session_group_available_width_rem: f32,
-    /// One cached view per rendered group pane, keyed by pane id.
+    /// One cached view per rendered group pane, keyed by group id and pane id.
     ///
     /// A pane that owns its element tree re-renders without rebuilding its
     /// siblings, so the frame cost of a split stops growing with the number of
     /// panes. Entries are dropped with the panes the layout no longer has.
-    session_group_pane_views: BTreeMap<String, Entity<SessionGroupPaneView>>,
+    ///
+    /// Pane ids are only unique inside one group — every group's first pane is
+    /// `SESSION_GROUP_MAIN_PANE_ID` — so the group is part of the key. Keyed by
+    /// pane id alone, opening a second group reused the first group's view,
+    /// which kept rendering that group, or nothing once it was dissolved.
+    session_group_pane_views: BTreeMap<(String, String), Entity<SessionGroupPaneView>>,
     sidebar_organization_drop_target: Option<SidebarOrganizationDropTarget>,
     sidebar_organization_root_drop_target:
         Option<(Vec<SidebarOrganizationItem>, SidebarOrganizationScope)>,
@@ -50475,9 +50480,13 @@ impl VibexWorkbench {
         // workspace only has to drop the views of panes the layout no longer
         // has. A maximized workspace still keeps the panes it is not painting:
         // restoring them must not rebuild their conversations from scratch.
+        // Another group's views go too: its panes share these ids, and its
+        // workspace rebuilds them when it is opened again.
         let live_panes = group.layout.pane_ids();
         self.session_group_pane_views
-            .retain(|pane_id, _| live_panes.iter().any(|live| live == pane_id));
+            .retain(|(view_group_id, pane_id), _| {
+                *view_group_id == group_id && live_panes.iter().any(|live| live == pane_id)
+            });
         // The strip's scroll and reveal state belong to the panes too: a pane
         // the layout dropped must not keep its offset alive for the next pane
         // that reuses the id.
@@ -50659,15 +50668,15 @@ impl VibexWorkbench {
         pane_id: &str,
         cx: &mut Context<Self>,
     ) -> Entity<SessionGroupPaneView> {
-        if let Some(view) = self.session_group_pane_views.get(pane_id) {
+        let key = (group_id.to_string(), pane_id.to_string());
+        if let Some(view) = self.session_group_pane_views.get(&key) {
             return view.clone();
         }
         let workbench = cx.entity();
         let view = cx.new(|cx| {
             SessionGroupPaneView::new(&workbench, group_id.to_string(), pane_id.to_string(), cx)
         });
-        self.session_group_pane_views
-            .insert(pane_id.to_string(), view.clone());
+        self.session_group_pane_views.insert(key, view.clone());
         view
     }
 
@@ -120648,8 +120657,21 @@ mod tests {
             .and_then(|(_, tail)| tail.split_once("\n    fn render_session_group_node("))
             .map(|(body, _)| body)
             .expect("group workspace should remain inspectable");
+        assert!(workspace.contains(".retain(|(view_group_id, pane_id), _|"));
+        assert!(workspace.contains("*view_group_id == group_id"));
+        // Pane ids repeat across groups, so a pane's view is found by its group
+        // too: a pane id alone handed one group's view to the next group.
+        let pane_view_lookup = source
+            .split_once("    fn session_group_pane_view(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_session_group_node("))
+            .map(|(body, _)| body)
+            .expect("the pane view lookup should remain inspectable");
         assert!(
-            workspace.contains("self.session_group_pane_views\n            .retain(|pane_id, _|")
+            pane_view_lookup.contains("let key = (group_id.to_string(), pane_id.to_string());")
+        );
+        assert!(pane_view_lookup.contains("self.session_group_pane_views.get(&key)"));
+        assert!(
+            pane_view_lookup.contains("self.session_group_pane_views.insert(key, view.clone());")
         );
         assert!(workspace.contains("self.render_session_group_node(&group_id, node, cx)"));
         assert!(!workspace.contains("self.release_session_view();"));
