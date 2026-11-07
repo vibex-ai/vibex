@@ -1575,6 +1575,9 @@ fn command_label() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The crate imports `OsStr` for Linux alone, while the environment
+    // assertions below run on every platform.
+    use std::ffi::OsStr;
 
     #[cfg(unix)]
     #[test]

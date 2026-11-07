@@ -1,4 +1,6 @@
+#[cfg(target_os = "linux")]
 use std::ffi::OsString;
+#[cfg(target_os = "linux")]
 use std::path::{Path, PathBuf};
 use std::process::Command;
 

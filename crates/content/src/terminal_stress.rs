@@ -4,8 +4,9 @@
 //! surface. It deliberately keeps output transient: reports contain only
 //! counts, hashes, timings, and process-resource observations.
 
+#[cfg(target_os = "linux")]
+use std::collections::BTreeSet;
 use std::{
-    collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
     thread,
@@ -883,6 +884,8 @@ fn resource_report(
 }
 
 fn wait_for_no_children(expected: Option<usize>) {
+    #[cfg(not(target_os = "linux"))]
+    let _ = expected;
     #[cfg(target_os = "linux")]
     {
         let deadline = Instant::now() + Duration::from_secs(5);

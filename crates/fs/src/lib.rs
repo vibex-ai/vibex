@@ -1189,6 +1189,8 @@ fn replace_file(source: &Path, destination: &Path) -> std::io::Result<()> {
 }
 
 fn sync_parent(path: &Path) -> std::io::Result<()> {
+    #[cfg(not(unix))]
+    let _ = path;
     #[cfg(unix)]
     if let Some(parent) = path.parent() {
         File::open(parent)?.sync_all()?;

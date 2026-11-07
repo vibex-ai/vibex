@@ -92,7 +92,7 @@ impl Installation {
             let store = app_root
                 .as_deref()
                 .is_some_and(|root| root.join("Contents/_MASReceipt/receipt").exists());
-            return Self {
+            Self {
                 kind: if store {
                     InstallationKind::MacAppStore
                 } else {
@@ -100,12 +100,12 @@ impl Installation {
                 },
                 package: if store { "mac_app_store" } else { "app" }.to_string(),
                 target_path: app_root,
-            };
+            }
         }
         #[cfg(target_os = "windows")]
         {
             let store = std::env::var_os("APPX_PACKAGE_FAMILY_NAME").is_some();
-            return Self {
+            Self {
                 kind: if store {
                     InstallationKind::WindowsStore
                 } else {
@@ -113,25 +113,28 @@ impl Installation {
                 },
                 package: if store { "windows_store" } else { "nsis" }.to_string(),
                 target_path: std::env::current_exe().ok(),
-            };
+            }
         }
         #[cfg(target_os = "android")]
-        let installation = Self {
+        {
             // Vibex ships the Android build as a directly installed APK from the
             // signed GitHub Release, so the package format is the install
             // identity. A store-distributed build would need its own marker
             // here, and the store would own the replacement.
-            kind: InstallationKind::AndroidApk,
-            package: "apk".to_string(),
-            target_path: None,
-        };
-        #[cfg(not(target_os = "android"))]
-        let installation = Self {
-            kind: InstallationKind::Unmanaged,
-            package: "unmanaged".to_string(),
-            target_path: std::env::current_exe().ok(),
-        };
-        installation
+            Self {
+                kind: InstallationKind::AndroidApk,
+                package: "apk".to_string(),
+                target_path: None,
+            }
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "android")))]
+        {
+            Self {
+                kind: InstallationKind::Unmanaged,
+                package: "unmanaged".to_string(),
+                target_path: std::env::current_exe().ok(),
+            }
+        }
     }
 
     pub fn supports(&self, install_mode: InstallMode) -> bool {
@@ -506,6 +509,8 @@ fn sync_file(path: &Path) -> AppUpdateResult<()> {
 }
 
 fn sync_directory(path: &Path) -> AppUpdateResult<()> {
+    #[cfg(not(unix))]
+    let _ = path;
     #[cfg(unix)]
     {
         OpenOptions::new()
