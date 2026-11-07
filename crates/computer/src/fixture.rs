@@ -47,6 +47,8 @@ pub struct FixtureEngine {
     pub released_keys: AtomicBool,
     /// Counts actions, so a test can prove a queued action never ran.
     pub action_count: AtomicU64,
+    /// Counts the times the helper asked the engine to release idle resources.
+    pub idle_releases: AtomicU64,
     /// The generation the fixture reports; tests bump it to simulate a rerender.
     pub generation: AtomicU64,
     /// The last delivery mode a click used, so foreground escalation is
@@ -95,6 +97,7 @@ impl Default for FixtureEngine {
             degraded_tree: AtomicBool::new(false),
             released_keys: AtomicBool::new(false),
             action_count: AtomicU64::new(0),
+            idle_releases: AtomicU64::new(0),
             generation: AtomicU64::new(1),
             last_delivery: Mutex::new(None),
             apps: vec![notes, mail, vibex],
@@ -396,6 +399,11 @@ impl ComputerEngine for FixtureEngine {
     async fn kill_app(&self, _app_id: &str) -> ComputerResult<()> {
         self.guard_available()?;
         Ok(())
+    }
+
+    async fn release_idle_resources(&self) -> ComputerResult<bool> {
+        self.idle_releases.fetch_add(1, Ordering::SeqCst);
+        Ok(true)
     }
 }
 

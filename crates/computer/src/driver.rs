@@ -44,6 +44,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -78,6 +79,8 @@ pub const DRIVER_PROBE_TIMEOUT_MS: u64 = 5_000;
 /// be addressed from a stale id, and the directory is one extra driver call
 /// when it does expire.
 const DRIVER_DIRECTORY_TTL: Duration = Duration::from_secs(2);
+/// How long a daemon asked to stop is given before the child is killed.
+const DAEMON_STOP_GRACE: Duration = Duration::from_secs(2);
 /// `CREATE_NO_WINDOW`, the creation flag that keeps a console program from
 /// being given a console window it would show over the reader's desktop.
 #[cfg(windows)]
@@ -109,6 +112,9 @@ pub struct CuaDriverCli {
     directory: tokio::sync::Mutex<Option<Directory>>,
     /// The element handles of the last observation of each application+window.
     tokens: tokio::sync::Mutex<Vec<TokenSnapshot>>,
+    /// Set once an idle release stopped the daemon: the handles it had issued
+    /// died with it, and an action naming one must be told to observe again.
+    handles_released: AtomicBool,
     /// Serializes the Wayland measurement, whose two probes bind fixed paths.
     wayland_measure: tokio::sync::Mutex<()>,
 }
@@ -127,6 +133,7 @@ impl Clone for CuaDriverCli {
             // observations would hand out handles it does not own.
             directory: tokio::sync::Mutex::new(None),
             tokens: tokio::sync::Mutex::new(Vec::new()),
+            handles_released: AtomicBool::new(false),
             wayland_measure: tokio::sync::Mutex::new(()),
         }
     }
@@ -187,6 +194,7 @@ impl CuaDriverCli {
             daemon: tokio::sync::Mutex::new(None),
             directory: tokio::sync::Mutex::new(None),
             tokens: tokio::sync::Mutex::new(Vec::new()),
+            handles_released: AtomicBool::new(false),
             wayland_measure: tokio::sync::Mutex::new(()),
         }
     }
@@ -317,6 +325,50 @@ impl CuaDriverCli {
         ))
     }
 
+    /// Stops the daemon this client started, when it started one.
+    ///
+    /// The daemon is the engine's largest resident cost — a few hundred
+    /// megabytes once it has captured the desktop, kept for as long as it runs
+    /// — and the next tool call starts it again on its own, so a helper with no
+    /// work gives it back. A daemon this client did not start is someone
+    /// else's: one already listening on the driver's default socket when the
+    /// first call came is reused and never stopped here.
+    ///
+    /// The handles the daemon issued die with it. They are forgotten here, and
+    /// an action that names one is told to observe again rather than handed a
+    /// token the next daemon would not know.
+    ///
+    /// Returns whether a running daemon was stopped.
+    pub async fn release_idle_daemon(&self) -> bool {
+        let mut guard = self.daemon.lock().await;
+        let Some(mut child) = guard.take() else {
+            return false;
+        };
+        let running = matches!(child.try_wait(), Ok(None));
+        if running {
+            // Asked first, so the daemon removes its own socket; the child is
+            // killed only when it does not leave on its own.
+            if let Err(error) = self.stop_daemon().await {
+                tracing::debug!(
+                    target: "vibex_computer",
+                    code = %error.code,
+                    "the idle desktop driver daemon did not stop when asked"
+                );
+            }
+            if tokio::time::timeout(DAEMON_STOP_GRACE, child.wait())
+                .await
+                .is_err()
+            {
+                let _ = child.kill().await;
+            }
+        }
+        drop(guard);
+        self.tokens.lock().await.clear();
+        *self.directory.lock().await = None;
+        self.handles_released.store(true, Ordering::Release);
+        running
+    }
+
     /// Reads the driver's own permission report (macOS).
     ///
     /// Read-only: the probe never prompts, because a permission dialog belongs
@@ -329,7 +381,7 @@ impl CuaDriverCli {
             .arg("--json")
             .stdin(Stdio::null())
             .kill_on_drop(true);
-        let output = tokio::time::timeout(DRIVER_PROBE_TIMEOUT_DURATION, command.output())
+        let output = output_within(command, DRIVER_PROBE_TIMEOUT_DURATION)
             .await
             .ok()?
             .ok()?;
@@ -347,8 +399,7 @@ impl CuaDriverCli {
             .args(self.socket_args())
             .stdin(Stdio::null())
             .kill_on_drop(true);
-        let Ok(output) = tokio::time::timeout(Duration::from_secs(5), command.output()).await
-        else {
+        let Ok(output) = output_within(command, Duration::from_secs(5)).await else {
             return false;
         };
         let Ok(output) = output else { return false };
@@ -404,7 +455,7 @@ impl CuaDriverCli {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        let output = tokio::time::timeout(DRIVER_PROBE_TIMEOUT_DURATION, command.output())
+        let output = output_within(command, DRIVER_PROBE_TIMEOUT_DURATION)
             .await
             .map_err(|_| {
                 ComputerError::process(
@@ -474,7 +525,7 @@ impl CuaDriverCli {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        let output = tokio::time::timeout(Duration::from_millis(timeout_ms), command.output())
+        let output = output_within(command, Duration::from_millis(timeout_ms))
             .await
             .map_err(|_| {
                 ComputerError::process(
@@ -523,7 +574,7 @@ impl CuaDriverCli {
             .arg("list-tools")
             .stdin(Stdio::null())
             .kill_on_drop(true);
-        let output = tokio::time::timeout(DRIVER_PROBE_TIMEOUT_DURATION, command.output())
+        let output = output_within(command, DRIVER_PROBE_TIMEOUT_DURATION)
             .await
             .map_err(|_| {
                 ComputerError::process(
@@ -761,8 +812,23 @@ impl CuaDriverCli {
         if let Some(token) = self.token_for(app_id, window_key, index).await {
             return Ok(token);
         }
-        let addressed = self.has_element_handles(app_id, window_key).await;
-        let error = if addressed {
+        let observed = self.observed_handles(app_id, window_key).await;
+        if observed.is_none() && self.handles_released.load(Ordering::Acquire) {
+            // The observation was held by a daemon that has since been stopped
+            // while idle. Observing again is exactly the fix here, which is
+            // what tells this apart from a window the engine cannot prove.
+            return Err(ComputerError::validation(
+                codes::STALE_REFERENCE,
+                "the desktop driver was restarted after a period without work, and the element \
+                 handles of the earlier observation went with it",
+            )
+            .with_recovery_hint(
+                "Observe the window again with computer_get_app_state and use the references it \
+                 returns.",
+            )
+            .with_diagnostic("app", app_id.to_string()));
+        }
+        let error = if observed == Some(true) {
             ComputerError::validation(
                 codes::ELEMENT_NOT_ADDRESSABLE,
                 format!(
@@ -787,8 +853,8 @@ impl CuaDriverCli {
     }
 
     /// Whether the last observation of this application carried any element
-    /// handles at all.
-    async fn has_element_handles(&self, app_id: &str, window_key: Option<&str>) -> bool {
+    /// handles at all, or `None` when no observation of it is held.
+    async fn observed_handles(&self, app_id: &str, window_key: Option<&str>) -> Option<bool> {
         let guard = self.tokens.lock().await;
         guard
             .iter()
@@ -803,7 +869,6 @@ impl CuaDriverCli {
                     .find(|snapshot| snapshot.app_id == app_id)
             })
             .map(|snapshot| !snapshot.tokens.is_empty())
-            .unwrap_or(false)
     }
 
     /// Measures what this Wayland session shows with and without the driver's
@@ -1417,6 +1482,10 @@ impl ComputerEngine for CuaDriverCli {
             .await
             .map(|_| ())
     }
+
+    async fn release_idle_resources(&self) -> ComputerResult<bool> {
+        Ok(self.release_idle_daemon().await)
+    }
 }
 
 /// What the driver's own readiness report said.
@@ -1439,7 +1508,7 @@ impl CuaDriverCli {
             .arg("--json")
             .stdin(Stdio::null())
             .kill_on_drop(true);
-        let output = tokio::time::timeout(DRIVER_PROBE_TIMEOUT_DURATION, command.output())
+        let output = output_within(command, DRIVER_PROBE_TIMEOUT_DURATION)
             .await
             .map_err(|_| {
                 ComputerError::process(
@@ -1708,6 +1777,79 @@ fn driver_failure(tool: &str, output: &std::process::Output) -> ComputerError {
         error = error.with_recovery_hint(hint);
     }
     error
+}
+
+/// Runs one short-lived driver invocation to completion or its deadline.
+///
+/// The driver's front binary starts the pinned release as a child of its own
+/// for a subcommand, so the process this client spawns is not the one doing
+/// the work. Each invocation therefore leads its own process group, and one
+/// that misses its deadline has the whole group killed: killing only the front
+/// process left the release binary orphaned, still waiting on the daemon, for
+/// minutes after every timeout.
+///
+/// Both streams are captured, as `Command::output` does.
+async fn output_within(
+    mut command: Command,
+    deadline: Duration,
+) -> Result<std::io::Result<std::process::Output>, tokio::time::error::Elapsed> {
+    use tokio::io::AsyncReadExt;
+
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    #[cfg(unix)]
+    command.process_group(0);
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => return Ok(Err(error)),
+    };
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let collected = tokio::time::timeout(deadline, async {
+        let read_stdout = async {
+            let mut bytes = Vec::new();
+            if let Some(mut stream) = stdout {
+                stream.read_to_end(&mut bytes).await?;
+            }
+            Ok::<_, std::io::Error>(bytes)
+        };
+        let read_stderr = async {
+            let mut bytes = Vec::new();
+            if let Some(mut stream) = stderr {
+                stream.read_to_end(&mut bytes).await?;
+            }
+            Ok::<_, std::io::Error>(bytes)
+        };
+        let (status, stdout, stderr) = tokio::try_join!(child.wait(), read_stdout, read_stderr)?;
+        Ok(std::process::Output {
+            status,
+            stdout,
+            stderr,
+        })
+    })
+    .await;
+    // The leader has not been reaped when the deadline passes — nothing waited
+    // it to completion — so the group id it lends still names this group.
+    #[cfg(unix)]
+    if collected.is_err()
+        && let Some(leader) = child.id()
+    {
+        kill_process_group(leader);
+    }
+    collected
+}
+
+/// Kills every process left in a group this client started.
+#[cfg(unix)]
+fn kill_process_group(leader: u32) {
+    let Ok(group) = libc::pid_t::try_from(leader) else {
+        return;
+    };
+    // SAFETY: `killpg` only sends a signal. The id belongs to the unreaped
+    // leader of a group this client created with `process_group(0)`, so it
+    // cannot have been reused for anything else.
+    unsafe {
+        libc::killpg(group, libc::SIGKILL);
+    }
 }
 
 /// Whether a non-zero exit still carried a usable document.
@@ -3228,5 +3370,135 @@ mod tests {
         )
         .unwrap();
         assert!(!not_asked.degraded);
+    }
+
+    /// Whether a pid names a process that is still running. A zombie is not:
+    /// it holds no memory and is only waiting to be reaped.
+    #[cfg(target_os = "linux")]
+    fn process_is_running(pid: u32) -> bool {
+        std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|stat| {
+                stat.rsplit_once(')')
+                    .map(|(_, rest)| rest.trim_start().starts_with('Z'))
+            })
+            .is_some_and(|zombie| !zombie)
+    }
+
+    /// The front binary of the real driver runs the release as a child of its
+    /// own. A call that times out must not leave that child behind: before
+    /// calls ran in their own process group, every timed-out capture orphaned
+    /// one, and a stuck daemon piled them up.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_call_past_its_deadline_takes_the_whole_invocation_with_it() {
+        let temporary = tempfile::tempdir().unwrap();
+        let pid_file = temporary.path().join("worker.pid");
+        let (_script_dir, driver) = fake_script_driver(format!(
+            "#!/bin/sh\n\
+             if [ \"$1\" = call ]; then\n\
+               sleep 30 &\n\
+               echo $! > '{}'\n\
+               wait\n\
+             fi\n\
+             exit 0\n",
+            pid_file.display()
+        ));
+        let error = driver
+            .invoke_with_timeout("get_desktop_state", &json!({}), 300)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "computer_driver_timeout");
+        let worker: u32 = std::fs::read_to_string(&pid_file)
+            .expect("the fake driver recorded its worker")
+            .trim()
+            .parse()
+            .unwrap();
+        let mut running = process_is_running(worker);
+        for _ in 0..100 {
+            if !running {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            running = process_is_running(worker);
+        }
+        assert!(
+            !running,
+            "the timed-out call's worker {worker} was left running"
+        );
+    }
+
+    /// A fake driver whose daemon is a real child process: `serve` runs until
+    /// `stop` removes its marker, and `status` reports whether it is up.
+    #[cfg(unix)]
+    fn fake_daemon_driver() -> (tempfile::TempDir, tempfile::TempDir, CuaDriverCli) {
+        let state = tempfile::tempdir().unwrap();
+        let marker = state.path().join("running");
+        let (script_dir, driver) = fake_script_driver(format!(
+            "#!/bin/sh\n\
+             case \"$1\" in\n\
+             status) if [ -f '{marker}' ]; then echo 'Cua Driver daemon is running'; \
+             else echo 'Cua Driver daemon is not running'; fi; exit 0;;\n\
+             serve) touch '{marker}'; while [ -f '{marker}' ]; do sleep 0.05; done; exit 0;;\n\
+             stop) rm -f '{marker}'; echo stopped; exit 0;;\n\
+             esac\n\
+             exit 0\n",
+            marker = marker.display()
+        ));
+        (state, script_dir, driver)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_idle_release_stops_the_daemon_this_client_started_and_forgets_its_handles() {
+        let (_state, _script_dir, driver) = fake_daemon_driver();
+        driver.tokens.lock().await.push(TokenSnapshot {
+            app_id: "notes".to_string(),
+            window_key: None,
+            tokens: std::collections::HashMap::from([(0, "token-0".to_string())]),
+        });
+        assert_eq!(
+            driver.required_token("notes", None, 0).await.unwrap(),
+            "token-0"
+        );
+        assert!(
+            !driver.release_idle_daemon().await,
+            "no daemon was started, so there is nothing to stop"
+        );
+
+        driver.ensure_daemon().await.unwrap();
+        assert!(driver.daemon_is_running().await);
+        assert!(driver.release_idle_daemon().await);
+        assert!(!driver.daemon_is_running().await);
+        assert!(
+            driver.daemon.lock().await.is_none(),
+            "the stopped child is no longer held"
+        );
+
+        // The handles died with the daemon. Observing again is the fix, so the
+        // refusal must say so rather than call the window unprovable.
+        let error = driver.required_token("notes", None, 0).await.unwrap_err();
+        assert_eq!(error.code, codes::STALE_REFERENCE);
+        assert!(!driver.release_idle_daemon().await);
+
+        // The next call starts a daemon again, and it is this client's to stop.
+        driver.ensure_daemon().await.unwrap();
+        assert!(driver.daemon_is_running().await);
+        assert!(driver.release_idle_daemon().await);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_idle_release_leaves_a_daemon_someone_else_started() {
+        let (state, _script_dir, driver) = fake_daemon_driver();
+        // A daemon already listening when the first call came is reused, so
+        // `ensure_daemon` starts nothing and the release has nothing of its own.
+        std::fs::write(state.path().join("running"), b"").unwrap();
+        driver.ensure_daemon().await.unwrap();
+        assert!(!driver.release_idle_daemon().await);
+        assert!(
+            driver.daemon_is_running().await,
+            "a daemon this client did not start keeps running"
+        );
     }
 }

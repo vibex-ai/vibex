@@ -337,6 +337,9 @@ struct CachedObservation {
 /// How long a cached observation may be reused for reference validation.
 const OBSERVATION_TTL_MS: i64 = 120_000;
 
+/// The longest a frame pump waits between captures that keep failing.
+const FRAME_PUMP_MAX_BACKOFF: Duration = Duration::from_secs(10);
+
 /// Live state for one session.
 struct SessionRuntime {
     session: ComputerSession,
@@ -844,18 +847,55 @@ impl ComputerService {
         let pump_session = session_id.clone();
         let task = tokio::spawn(async move {
             let interval = Duration::from_millis(service.inner.config.frame_interval_ms.max(100));
+            let mut delay = interval;
             loop {
-                tokio::time::sleep(interval).await;
+                tokio::time::sleep(delay).await;
+                if !service.frame_pump_has_viewers(&pump_session).await {
+                    return;
+                }
                 let Ok(engine) = service.engine() else {
                     return;
                 };
-                let Ok(Some(shot)) = engine.screenshot(None, None).await else {
-                    continue;
-                };
-                service.publish_frame(&pump_session, shot).await;
+                match engine.screenshot(None, None).await {
+                    Ok(Some(shot)) => {
+                        delay = interval;
+                        service.publish_frame(&pump_session, shot).await;
+                    }
+                    // A capture that fails is retried, but not at the frame
+                    // rate: a driver that cannot answer would otherwise be asked
+                    // again every interval for as long as the panel is open.
+                    _ => {
+                        delay = delay
+                            .saturating_mul(2)
+                            .clamp(interval, FRAME_PUMP_MAX_BACKOFF)
+                    }
+                }
             }
         });
         tasks.insert(session_id, task);
+    }
+
+    /// Whether anyone still watches a session's frames, retiring its pump when
+    /// nobody does.
+    ///
+    /// A pump captures the whole desktop every interval, and a panel that has
+    /// closed is not coming back for this channel: the next one subscribes and
+    /// starts a pump of its own. The check and the retirement happen under both
+    /// locks, taken in the order `shutdown` takes them, so a panel subscribing
+    /// meanwhile either keeps this pump or finds none and starts its own —
+    /// never a channel with no pump behind it.
+    async fn frame_pump_has_viewers(&self, session_id: &ComputerSessionId) -> bool {
+        let mut tasks = self.inner.frame_tasks.lock().await;
+        let mut frames = self.inner.frames.lock().await;
+        if frames
+            .get(session_id)
+            .is_some_and(|sender| sender.receiver_count() > 0)
+        {
+            return true;
+        }
+        frames.remove(session_id);
+        tasks.remove(session_id);
+        false
     }
 
     async fn publish_frame(&self, session_id: &ComputerSessionId, shot: ComputerScreenshot) {
@@ -2733,14 +2773,18 @@ mod tests {
             Some(context.session_id.clone())
         );
         assert_eq!(
-            service.session_for_agent(&context.agent_session_id.clone().unwrap()).await,
+            service
+                .session_for_agent(&context.agent_session_id.clone().unwrap())
+                .await,
             Some(context.session_id.clone())
         );
 
         service.stop("the user pressed stop").await.unwrap();
         assert_eq!(service.latest_agent_session().await, None);
         assert_eq!(
-            service.session_for_agent(&context.agent_session_id.clone().unwrap()).await,
+            service
+                .session_for_agent(&context.agent_session_id.clone().unwrap())
+                .await,
             Some(context.session_id.clone()),
             "the Agent's own panel still needs the stopped session"
         );
@@ -2819,5 +2863,71 @@ mod tests {
             .await;
         assert!(refused.is_err());
         assert!(collect_announcements(&mut events).await.is_empty());
+    }
+
+    /// Whether a frame pump is registered for the session.
+    async fn pump_running(service: &ComputerService, session_id: &ComputerSessionId) -> bool {
+        service
+            .inner
+            .frame_tasks
+            .lock()
+            .await
+            .get(session_id)
+            .is_some_and(|task| !task.is_finished())
+    }
+
+    #[tokio::test]
+    async fn a_frame_pump_retires_when_its_last_viewer_leaves() {
+        // A pump captures the whole desktop every interval. A panel that
+        // closed is not watching any more, and capturing for nobody kept the
+        // driver busy — and its memory up — for the rest of the runtime.
+        let home = tempfile::tempdir().expect("a temporary runtime home");
+        let mut config = ComputerServiceConfig::new(home.path());
+        config.frame_interval_ms = 100;
+        let service = ComputerService::new(config);
+        service.install_engine(Arc::new(FixtureEngine::default()));
+        let session_id = service
+            .ensure_session(ComputerSessionKey::Panel, None, ComputerToolTier::Visual)
+            .await
+            .expect("a panel session");
+
+        let mut first = service.subscribe_frames(&session_id).await;
+        let mut second = service.subscribe_frames(&session_id).await;
+        tokio::time::timeout(Duration::from_secs(5), first.changed())
+            .await
+            .expect("the pump delivers a frame")
+            .unwrap();
+
+        // One viewer leaving is not the last one leaving.
+        drop(first);
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        assert!(pump_running(&service, &session_id).await);
+        tokio::time::timeout(Duration::from_secs(5), second.changed())
+            .await
+            .expect("the remaining viewer still gets frames")
+            .unwrap();
+
+        drop(second);
+        let mut retired = false;
+        for _ in 0..50 {
+            if !pump_running(&service, &session_id).await {
+                retired = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(retired, "the pump stopped once nobody watched");
+        assert!(
+            !service.inner.frames.lock().await.contains_key(&session_id),
+            "the channel went with it"
+        );
+
+        // A panel that opens later gets a pump of its own.
+        let mut later = service.subscribe_frames(&session_id).await;
+        tokio::time::timeout(Duration::from_secs(5), later.changed())
+            .await
+            .expect("a new viewer starts a new pump")
+            .unwrap();
+        assert!(pump_running(&service, &session_id).await);
     }
 }

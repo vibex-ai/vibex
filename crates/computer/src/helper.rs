@@ -54,6 +54,11 @@ pub const HELPER_AUTH_DEADLINE: Duration = Duration::from_secs(30);
 const HELPER_WATCHDOG_INTERVAL: Duration = Duration::from_millis(500);
 /// Deadline for one helper request on the client side.
 pub const HELPER_REQUEST_TIMEOUT: Duration = Duration::from_secs(25);
+/// How long the helper goes without work before the engine gives back what it
+/// can rebuild — the driver daemon above all, which holds a few hundred
+/// megabytes for as long as it runs. Long enough that a model thinking between
+/// an observation and the action on it does not lose the observation.
+pub const HELPER_IDLE_RELEASE_AFTER: Duration = Duration::from_secs(5 * 60);
 /// How many times the client restarts a helper that died mid-session.
 const HELPER_RESTART_ATTEMPTS: usize = 1;
 
@@ -516,6 +521,7 @@ where
         queue_rx,
         reply_tx.clone(),
         Arc::clone(&stopped),
+        HELPER_IDLE_RELEASE_AFTER,
     ));
     let mut watchdog = tokio::time::interval(HELPER_WATCHDOG_INTERVAL);
     watchdog.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -675,13 +681,41 @@ where
 }
 
 /// Runs queued actions one at a time, stopping the moment the flag is set.
+///
+/// The worker is also the engine's idle clock. Every engine call goes through
+/// it one at a time, so once `idle_after` passes with no request, nothing is in
+/// flight and the engine can give back what it would rebuild on the next call.
+/// A probe does not count as work: it never needs the daemon, and a settings
+/// page that keeps asking must not keep one alive.
 async fn action_worker(
     engine: Arc<dyn ComputerEngine>,
     mut queue: tokio::sync::mpsc::Receiver<HelperRequest>,
     replies: tokio::sync::mpsc::Sender<HelperReply>,
     stopped: Arc<std::sync::atomic::AtomicBool>,
+    idle_after: Duration,
 ) {
-    while let Some(request) = queue.recv().await {
+    let mut release_due: Option<tokio::time::Instant> = None;
+    loop {
+        let next = match release_due {
+            Some(deadline) => tokio::select! {
+                request = queue.recv() => request,
+                () = tokio::time::sleep_until(deadline) => {
+                    release_due = None;
+                    if let Err(error) = engine.release_idle_resources().await {
+                        tracing::debug!(
+                            target: "vibex_computer",
+                            code = %error.code,
+                            "the engine could not release its idle resources"
+                        );
+                    }
+                    continue;
+                }
+            },
+            None => queue.recv().await,
+        };
+        let Some(request) = next else {
+            return;
+        };
         if stopped.load(std::sync::atomic::Ordering::SeqCst) {
             let _ = replies
                 .send(HelperReply::error(
@@ -694,7 +728,11 @@ async fn action_worker(
                 .await;
             continue;
         }
+        let counts_as_work = request.method != methods::PROBE;
         let reply = handle_helper_request(engine.as_ref(), request).await;
+        if counts_as_work {
+            release_due = Some(tokio::time::Instant::now() + idle_after);
+        }
         if replies.send(reply).await.is_err() {
             return;
         }
@@ -1740,5 +1778,83 @@ mod tests {
         drop(reader);
         drop(client_write);
         helper.await.unwrap().unwrap();
+    }
+
+    /// Waits until the fixture has been asked to release idle resources
+    /// `expected` times, or the deadline passes.
+    async fn wait_for_idle_releases(engine: &FixtureEngine, expected: u64) -> u64 {
+        for _ in 0..100 {
+            let seen = engine
+                .idle_releases
+                .load(std::sync::atomic::Ordering::SeqCst);
+            if seen >= expected {
+                return seen;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        engine
+            .idle_releases
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[tokio::test]
+    async fn the_worker_releases_idle_engine_resources_once_work_stops() {
+        let engine = Arc::new(FixtureEngine::default());
+        let (queue, queue_rx) = tokio::sync::mpsc::channel(8);
+        let (reply_tx, mut replies) = tokio::sync::mpsc::channel(8);
+        let worker = tokio::spawn(action_worker(
+            engine.clone(),
+            queue_rx,
+            reply_tx,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            Duration::from_millis(60),
+        ));
+        let request = |id: u64, method: &str| HelperRequest {
+            id,
+            method: method.to_string(),
+            params: Value::Null,
+        };
+
+        // A probe never needs the daemon, so it does not keep one alive.
+        queue.send(request(1, methods::PROBE)).await.unwrap();
+        assert_eq!(replies.recv().await.unwrap().id, 1);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            engine
+                .idle_releases
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a probe is not work"
+        );
+
+        // Work arms the clock, and the clock fires once per quiet period.
+        queue.send(request(2, methods::LIST_APPS)).await.unwrap();
+        assert_eq!(replies.recv().await.unwrap().id, 2);
+        assert_eq!(wait_for_idle_releases(&engine, 1).await, 1);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            engine
+                .idle_releases
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a release is not repeated while nothing new arrives"
+        );
+
+        // Work that keeps arriving inside the window keeps the engine warm.
+        for id in 3..8 {
+            queue.send(request(id, methods::LIST_APPS)).await.unwrap();
+            assert_eq!(replies.recv().await.unwrap().id, id);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            engine
+                .idle_releases
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(wait_for_idle_releases(&engine, 2).await, 2);
+
+        drop(queue);
+        worker.await.unwrap();
     }
 }

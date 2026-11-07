@@ -257,6 +257,15 @@ pub trait ComputerEngine: Send + Sync + 'static {
 
     /// Terminates an application.
     async fn kill_app(&self, app_id: &str) -> ComputerResult<()>;
+
+    /// Gives back what the engine can rebuild on its next call, once the
+    /// helper has had no work for a while.
+    ///
+    /// Answers whether anything was released. An engine holding nothing worth
+    /// releasing keeps this default; the next call must work either way.
+    async fn release_idle_resources(&self) -> ComputerResult<bool> {
+        Ok(false)
+    }
 }
 
 #[cfg(test)]

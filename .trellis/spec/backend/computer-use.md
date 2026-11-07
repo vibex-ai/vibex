@@ -212,6 +212,26 @@ The fallback is what keeps a viewer honest: attaching it to a stopped Agent
 would freeze it on a session that will never move again, while attaching it to
 its own viewer keeps the desktop and the stop available.
 
+### Live frames
+
+`ComputerService::subscribe_frames` starts one frame pump per session, and the
+pump captures the whole desktop every `frame_interval_ms`. It runs only while
+somebody watches:
+
+- before each capture the pump checks the channel's receivers, and when the
+  last one is gone — the panel window closed, or the panel moved to another
+  session — it removes the channel and its own task entry and exits. The next
+  subscriber starts a pump of its own. Both are removed under the task and
+  channel locks, taken in the order `shutdown` takes them, so a subscriber never
+  finds a channel with no pump behind it;
+- a capture that fails is retried with a doubling delay capped at ten seconds,
+  not at the frame rate, so a driver that cannot answer is not asked again
+  every interval for as long as a panel stays open.
+
+A pump that outlives its panel is the failure this prevents: it kept the driver
+capturing for nobody, and the driver's memory climbing, until the runtime
+exited.
+
 ## The emergency stop
 
 One press reaches a terminal state, in this order:
@@ -330,6 +350,28 @@ Three consequences the implementation lives with:
    instead of paraphrasing a log. `list-tools` and `doctor` are what tell a real
    driver apart from a file with the right name: both are read-only, need no
    daemon, and touch no desktop.
+4. **A daemon this client started is released when the helper is idle.** The
+   helper's action worker runs every engine call one at a time, so it is also
+   the idle clock: after `HELPER_IDLE_RELEASE_AFTER` (five minutes) with no
+   request other than a probe, it calls `ComputerEngine::release_idle_resources`.
+   The driver adapter stops the daemon it spawned — `stop` first, so the daemon
+   removes its own socket, then the child is killed if it does not leave — and
+   forgets the element handles that daemon issued. An action that names one is
+   refused with `computer_element_reference_stale`, because observing again is
+   the fix; it is never reported as `computer_element_not_addressable`. A daemon
+   that was already listening when the first call came is not this client's and
+   is never stopped. The next tool call starts a new daemon through point 1. The
+   window is deliberately longer than the service's two-minute observation
+   lifetime, so a model thinking between an observation and its action does not
+   lose the observation to a release.
+5. **Every short-lived subcommand runs in its own process group.** The driver's
+   front binary runs the pinned release as a child of its own, so killing the
+   process this client spawned leaves the release behind. `call`, `status`,
+   `stop`, `doctor`, `list-tools` and `permissions status` therefore each lead a
+   group, and one that misses its deadline has the whole group killed. Without
+   that, every timed-out capture left an orphaned `call` waiting on the daemon
+   for minutes. `serve` is the exception: the daemon is the helper's own child,
+   as point 1 requires.
 
 The engine's permission model is macOS-specific: `permissions status --json`
 answers with the daemon's own TCC identity, so it is read there and reported as
@@ -605,7 +647,10 @@ human's stop button is the only thing that ends a loop.
 `crates/computer` carries the unit tests for the parts that fail silently or
 dangerously: the risk model, the reference lifecycle, the stop and disconnect
 contracts, the helper protocol and its lifecycle, the loop heuristics, the
-screenshot budget and the target-resolution rules. `crates/desktop-runtime`
+screenshot budget and the target-resolution rules. The resource lifecycle is
+pinned the same way: the idle release (once per quiet period, never for a probe,
+never for a daemon this client did not start), a timed-out call leaving no
+process behind, and a frame pump retiring with its last viewer. `crates/desktop-runtime`
 pins the spawn policy, the audit projection and the delivery matrix, and
 `crates/db` pins that the ledger round-trips and that an expired grant is not
 live.
