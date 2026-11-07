@@ -14063,7 +14063,7 @@ mod tests {
     #[tokio::test]
     async fn a_claude_terminal_session_gets_the_provider_settings_tier() {
         let (manager, launcher, dir) = terminal_manager();
-        let service = ProviderConfigService::new(&dir.join("vibex.db"));
+        let service = ProviderConfigService::new(dir.join("vibex.db"));
         let shared = service
             .create_model_provider_profile(vibex_core::ModelProviderProfileCreateRequest {
                 display_name: "Claude Terminal".to_string(),
@@ -14175,7 +14175,7 @@ mod tests {
         )
         .unwrap();
         drop(conn);
-        let service = ProviderConfigService::new(&dir.join("vibex.db"));
+        let service = ProviderConfigService::new(dir.join("vibex.db"));
         let shared = service
             .create_model_provider_profile(vibex_core::ModelProviderProfileCreateRequest {
                 display_name: "OpenCode Terminal".to_string(),
@@ -14221,7 +14221,21 @@ mod tests {
             "--model".to_string(),
             "acme-anthropic/claude-opus-4-6".to_string(),
         ];
-        assert_eq!(launcher.launches()[0].argv, expected);
+        // OpenCode's TUI has no `--model`, so the launch carries the projected
+        // id in its config document instead of on the command line.
+        let configured_model = |launch: &vibex_core::TerminalSessionLaunchSpec| {
+            let content = launch
+                .env
+                .iter()
+                .rev()
+                .find(|(key, _)| key == "OPENCODE_CONFIG_CONTENT")
+                .map(|(_, value)| value.clone())
+                .expect("the projection supplies OpenCode's config document");
+            serde_json::from_str::<serde_json::Value>(&content).unwrap()["model"].clone()
+        };
+        let first = launcher.launches().remove(0);
+        assert_eq!(first.argv, vec!["opencode".to_string()]);
+        assert_eq!(configured_model(&first), "acme-anthropic/claude-opus-4-6");
 
         // The recorded argv is what a restart replays, so it has to carry the
         // same projected spelling.
@@ -14244,16 +14258,20 @@ mod tests {
 
         launcher.kill(&launcher.watched()[0].0).unwrap();
         manager.restart_terminal_session(&session.id).await.unwrap();
-        let mut resumed = expected;
-        resumed.push("--continue".to_string());
+        let restarted = launcher.launches().pop().expect("the restart launched");
         assert_eq!(
-            launcher
-                .launches()
-                .last()
-                .expect("the restart launched")
-                .argv,
-            resumed
+            restarted.argv,
+            vec!["opencode".to_string(), "--continue".to_string()]
         );
+        assert_eq!(
+            configured_model(&restarted),
+            "acme-anthropic/claude-opus-4-6"
+        );
+        let conn = open_database(&dir.join("vibex.db")).unwrap();
+        let record = vibex_db::SessionTerminalRepository::get(&conn, &session.id)
+            .unwrap()
+            .expect("the session must record its terminal");
+        assert_eq!(record.argv, expected);
     }
 
     /// Archiving a terminal session stops its PTY.
