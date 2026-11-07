@@ -19734,6 +19734,13 @@ impl AcpClient for AcpRuntimeClient {
                 .await?;
             return match response.get("outcome").and_then(Value::as_str) {
                 Some("injected") => Ok(AcpSteerOutcome::Injected),
+                // `queued` and `startedNewTurn` are the accepted-but-not-injected
+                // answers the same extension grew later: ZCode's bridge queues
+                // the text behind a turn that cannot take live injection, and
+                // both bridges start a new turn themselves when the liveness
+                // check lost its race. The Agent owns the text in every case, so
+                // reporting `PromptRequired` would submit it a second time.
+                Some("queued" | "startedNewTurn") => Ok(AcpSteerOutcome::Injected),
                 Some("promptRequired") => Ok(AcpSteerOutcome::PromptRequired),
                 _ => Err(VibexError::process(
                     "acp_steering_response_invalid",
@@ -22101,14 +22108,14 @@ mod tests {
         assert_eq!(identity.event_enricher, AgentEventEnricherKind::Claude);
 
         let codex = test_acp_config("/managed/node", vec!["/managed/codex-acp.js".to_string()]);
-        persist_managed_runtime(&conn, "codex", "codex-acp", "2.2.2", &codex);
+        persist_managed_runtime(&conn, "codex", "codex-acp", "2.5.0", &codex);
         let identity = client
             .effective_adapter_identity(&AgentId::parse("codex").unwrap(), &codex)
             .unwrap();
-        assert_eq!(identity.adapter_version, "2.2.2");
+        assert_eq!(identity.adapter_version, "2.5.0");
         assert_eq!(
             identity.compatibility_identity,
-            "adapter=codex-acp@2.2.2;runtime=@openai/codex@0.160.1"
+            "adapter=codex-acp@2.5.0;runtime=@openai/codex@0.165.0"
         );
         assert!(identity.exact_descriptor);
         assert_eq!(identity.event_enricher, AgentEventEnricherKind::Codex);
@@ -26988,8 +26995,9 @@ for line in sys.stdin:
                 },
             })
     elif method == "_session/steering":
-        if control_value("steering_mode", "promptRequired") == "injected":
-            send({"jsonrpc": "2.0", "id": mid, "result": {"outcome": "injected"}})
+        steering_mode = control_value("steering_mode", "promptRequired")
+        if steering_mode in ("injected", "queued", "startedNewTurn"):
+            send({"jsonrpc": "2.0", "id": mid, "result": {"outcome": steering_mode}})
         else:
             send({"jsonrpc": "2.0", "id": mid, "result": {"outcome": "promptRequired", "reason": "noRunningTurn"}})
     elif method == "_session/goal":
@@ -37921,6 +37929,26 @@ for line in sys.stdin:
             .await
             .unwrap();
         assert_eq!(outcome, AcpSteerOutcome::Injected);
+
+        // `queued` and `startedNewTurn` are the other accepted answers: the
+        // Agent owns the text either way, so neither may submit it again.
+        for accepted in ["queued", "startedNewTurn"] {
+            fixture.set_control_value("steering_mode", accepted);
+            let outcome = client
+                .steer_turn(AcpSteerTurnRequest {
+                    session_id: session_id.clone(),
+                    text: "focus on the failing test".to_string(),
+                    attachments: Vec::new(),
+                    binding: binding.clone(),
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                outcome,
+                AcpSteerOutcome::Injected,
+                "{accepted} must not be treated as promptRequired"
+            );
+        }
 
         client.close_session(&binding).await.unwrap();
         fixture.cleanup();

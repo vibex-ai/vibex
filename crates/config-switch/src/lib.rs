@@ -5716,16 +5716,16 @@ fn claude_acp_preset() -> AcpProviderCatalogPreset {
     let mut preset = acp_catalog_preset(
         "claude-agent-acp",
         "Claude Code (ACP)",
-        "Claude Code through the fixed @agentclientprotocol/claude-agent-acp@0.93.0 Adapter managed by the Compatibility Registry.",
+        "Claude Code through the fixed @agentclientprotocol/claude-agent-acp@0.101.0 Adapter managed by the Compatibility Registry.",
         "claude-agent-acp",
         &[],
         &["local", "acp", "claude"],
     );
-    // Session modes the pinned adapter advertises unconditionally; gated
-    // modes (bypassPermissions) are discovered live by the runtime
-    // option catalog probe instead of being promised here. `auto` is part of
-    // the 0.93.0 catalog, which advertises the same ids as 0.71.0 did; the
-    // bridge clamps it per-model.
+    // Session modes the pinned adapter advertises whenever the CLI settings
+    // leave them enabled; gated modes (bypassPermissions, and `auto` when
+    // `disableAutoMode` is set) are discovered live by the runtime option
+    // catalog probe instead of being promised here. `auto` keeps the same id
+    // through 0.101.0, and the bridge still clamps it per-model.
     preset.default_config.modes = ["default", "acceptEdits", "plan", "auto"]
         .into_iter()
         .map(ToString::to_string)
@@ -5737,7 +5737,7 @@ fn codex_acp_preset() -> AcpProviderCatalogPreset {
     let mut preset = acp_catalog_preset(
         "codex-acp",
         "Codex (ACP)",
-        "Codex through the fixed @agentclientprotocol/codex-acp@2.0.1 Adapter managed by the Compatibility Registry.",
+        "Codex through the fixed @agentclientprotocol/codex-acp@2.5.0 Adapter managed by the Compatibility Registry.",
         "codex-acp",
         &[],
         &["local", "acp", "codex"],
@@ -5753,7 +5753,7 @@ fn zcode_acp_preset() -> AcpProviderCatalogPreset {
     acp_catalog_preset(
         "zcode-acp-server",
         "ZCode (ACP)",
-        "ZCode through the fixed zcode-acp-server@0.72.0 Adapter managed by the Compatibility Registry.",
+        "ZCode through the fixed zcode-acp-server@0.82.3 Adapter managed by the Compatibility Registry.",
         "zcode-acp-server",
         &[],
         &["local", "acp", "zcode"],
@@ -9728,7 +9728,7 @@ mod tests {
             (
                 "gemini",
                 "npx",
-                &["-y", "@google/gemini-cli@0.64.0", "--acp"][..],
+                &["-y", "@google/gemini-cli@0.67.0", "--acp"][..],
             ),
             (
                 "qwen-code",

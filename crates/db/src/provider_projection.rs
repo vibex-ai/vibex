@@ -1879,7 +1879,7 @@ fn legacy_runtime_identity(
             {
                 (
                     "claude-agent-acp",
-                    Some("0.93.0".to_string()),
+                    Some("0.101.0".to_string()),
                     None,
                     BTreeMap::new(),
                     AgentVersionSource::Managed,
@@ -1887,15 +1887,15 @@ fn legacy_runtime_identity(
             }
             ("codex", None) if looks_managed_adapter_command(command, args, "codex-acp") => (
                 "codex-acp",
-                Some("2.2.2".to_string()),
-                Some("0.160.1".to_string()),
-                BTreeMap::from([("@openai/codex".to_string(), "0.160.1".to_string())]),
+                Some("2.5.0".to_string()),
+                Some("0.165.0".to_string()),
+                BTreeMap::from([("@openai/codex".to_string(), "0.165.0".to_string())]),
                 AgentVersionSource::Managed,
             ),
             ("zcode", None) if looks_managed_adapter_command(command, args, "zcode-acp-server") => {
                 (
                     "zcode-acp-server",
-                    Some("0.72.0".to_string()),
+                    Some("0.82.3".to_string()),
                     None,
                     BTreeMap::new(),
                     AgentVersionSource::Managed,

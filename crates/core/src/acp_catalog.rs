@@ -81,7 +81,9 @@ const ACP_AGENT_CATALOG: &[AcpAgentCatalogEntry] = &[
         // results, and launch the same `agy_acp_server.par --uid=`. Only the
         // release archive changed its name at 1.2.0, which does not reach Vibex
         // because the archive URL comes from the Registry rather than a template.
-        "1.4.0",
+        // 1.4.5 is still launched as `agy_acp_server.par` from a Registry
+        // archive, so the launch shape and the floor are unchanged.
+        "1.4.5",
         "https://antigravity.google/docs/ide/extensions",
         &["agy_acp_server"],
     )
@@ -114,10 +116,11 @@ const ACP_AGENT_CATALOG: &[AcpAgentCatalogEntry] = &[
         // available inside a running Agent: an id outside the selected
         // provider's catalogue is silently replaced by the provider default
         // from 3.0.49 onward, and the runtime now reads the reported
-        // `currentModelId` back instead of trusting `CLINE_MODEL`.
-        "3.0.73",
+        // `currentModelId` back instead of trusting `CLINE_MODEL`. 3.0.74 only
+        // fixes retries, compaction and `ask_question` answers.
+        "3.0.74",
         "https://cline.bot/cli",
-        &["npx", "-y", "cline@3.0.73", "--acp"],
+        &["npx", "-y", "cline@3.0.74", "--acp"],
     )
     .with_compatible_version("3.0.29"),
     AcpAgentCatalogEntry::new(
@@ -126,8 +129,12 @@ const ACP_AGENT_CATALOG: &[AcpAgentCatalogEntry] = &[
         "GitHub Copilot CLI agent connected through ACP",
         // 1.0.93 made `~/.copilot/settings.json` the only user-settings file;
         // keys in `config.json` are ignored. The ACP handshake and the
-        // `mode`/`allow_all` options did not move.
-        "1.0.98",
+        // `mode`/`allow_all` options did not move. Through 1.0.107 the ACP
+        // changes are fixes: `session/cancel` stops only the active turn and
+        // leaves background shells running, `--agent` and
+        // `includeCoAuthoredBy: false` are honored, and an autopilot session can
+        // be switched back out.
+        "1.0.107",
         "https://docs.github.com/en/copilot/concepts/agents/about-copilot-cli",
         &["copilot", "--acp"],
     )
@@ -142,12 +149,19 @@ const ACP_AGENT_CATALOG: &[AcpAgentCatalogEntry] = &[
         // `CODEBUDDY_SESSION_HISTORY_CLEANUP` (the old name is no longer read).
         // `CODEBUDDY_BASE_URL`/`_API_KEY`/`_MODEL` are unchanged, so the
         // projection floor stays at 2.109.0.
-        "2.168.2",
+        //
+        // 2.173.0 removed `delegate` from the ACP permission modes (delegation
+        // is now a session config option) and 2.181.0 renamed plugin MCP
+        // servers and plugin option variables. Vibex reads the mode list the
+        // Agent advertises, delivers session MCP servers on the wire, and the
+        // CLI still accepts every `--permission-mode` value the terminal launch
+        // writes, so none of those reaches a Vibex surface.
+        "2.181.0",
         "https://www.codebuddy.cn/cli/",
         &[
             "npx",
             "-y",
-            "@tencent-ai/codebuddy-code@2.168.2",
+            "@tencent-ai/codebuddy-code@2.181.0",
             "--acp",
         ],
     )
@@ -172,14 +186,15 @@ const ACP_AGENT_CATALOG: &[AcpAgentCatalogEntry] = &[
         "cursor",
         "Cursor",
         "Cursor's coding agent",
-        // The Registry's `2026.10.14` build resolves to a real artifact under
-        // `2026.10.14-941492e`; Cursor publishes no release note for that
-        // specific build, but the ACP extension surface it added
-        // (`subagents`, watched-shell wakeups) is documented. The catalog
-        // records the Registry's base version, and the installer compares
-        // release builds by their core triple so the `-<commit>` suffix can
-        // neither sort a build below its own base nor hide an update.
-        "2026.10.14",
+        // The Registry's `2026.11.05` build resolves to a real artifact under
+        // `2026.11.05-86047df`; Cursor publishes no release note for that
+        // specific build. Its `cursor/*` extension methods are the same set
+        // 2026.10.22 shipped, including the blocking `cursor/ask_question` and
+        // `cursor/create_plan` the runtime answers. The catalog records the
+        // Registry's base version, and the installer compares release builds
+        // by their core triple so the `-<commit>` suffix can neither sort a
+        // build below its own base nor hide an update.
+        "2026.11.05",
         "https://docs.cursor.com/en/cli/overview",
         &["cursor-agent", "acp"],
     ),
@@ -195,13 +210,22 @@ const ACP_AGENT_CATALOG: &[AcpAgentCatalogEntry] = &[
         "deepseek-harness",
         "DeepSeek Harness",
         "DeepSeek Harness coding agent connected through the deepseek-harness-acp bridge.",
-        // 0.4.38 still bundles Harness runtime `0.2.0-rc.2`, so no runtime
-        // behavior moves with this pin. The release makes the packaged runtime
-        // the only default and gates every explicit `--dsh-path`/`DSH_PATH`/
-        // `DSH_ACP_HOST` against `0.1.7-rc.2 || 0.2.0-rc.1 || 0.2.0-rc.2`
-        // instead of falling back to it, and it advertises only the auth
-        // methods the client declared. Vibex therefore leaves `DSH_PATH` unset
-        // for a managed launch and re-reads the method list per initialize.
+        // 0.4.40 bundles Harness runtime `0.2.1-rc.2`, and 0.4.39 turned the
+        // `DSH_PATH` gate into a minimum floor (`engines.dsh`). Its new RFD
+        // subagent sessions are opt-in, and `ask_user_question` now reaches a
+        // generic form client without the synthetic "Other" choice or a
+        // `minItems` a skippable question could never satisfy, which is the
+        // shape Vibex's elicitation form renders.
+        //
+        // 0.4.38 had kept Harness runtime `0.2.0-rc.2`. That release made the
+        // packaged runtime the only default and gated every explicit
+        // `--dsh-path`/`DSH_PATH`/`DSH_ACP_HOST` against
+        // `0.1.7-rc.2 || 0.2.0-rc.1 || 0.2.0-rc.2` instead of falling back to
+        // it, and it advertises only the auth methods the client declared.
+        // Vibex therefore leaves `DSH_PATH` unset for a managed launch and
+        // re-reads the method list per initialize. 0.4.39 turned that exact
+        // list into a `>=0.1.7-rc.2` floor, so the managed launch keeps
+        // leaving it unset.
         //
         // 0.4.37 had bundled Harness runtime `0.2.0-rc.2` (0.4.35 bundled
         // `0.1.7-rc.2`). The runtime move changed three behaviors Vibex reads:
@@ -220,19 +244,19 @@ const ACP_AGENT_CATALOG: &[AcpAgentCatalogEntry] = &[
         // accepts `mistral-conversations`. The release's moves to the Messages
         // API and its shrunken default catalogue apply to the official
         // `deepseek-official` route, which the projected route does not use.
-        "0.4.38",
+        "0.4.40",
         "https://github.com/openma-ai/deepseek-harness-acp",
         &[
             "npx",
             "-y",
-            "@openma/deepseek-harness-acp@0.4.38",
+            "@openma/deepseek-harness-acp@0.4.40",
         ],
     )
     // 0.4.33 qualifies every ACP model option id as `route::model`; Vibex keeps
     // the bare id on the wire and reads the qualified spelling back as an alias
     // so 0.4.32 keeps working. The projection floor therefore stays on 0.4.32
     // even though the pin moved past it; that qualification is byte-identical
-    // through 0.4.38, so the floor still describes a release the alias covers.
+    // through 0.4.40, so the floor still describes a release the alias covers.
     .with_compatible_version("0.4.32"),
     AcpAgentCatalogEntry::new(
         "devin",
@@ -287,9 +311,11 @@ const ACP_AGENT_CATALOG: &[AcpAgentCatalogEntry] = &[
         // `session/prompt` gains a `usage` block plus `usage_update`
         // notifications. A client that ignores them is not refused, so the
         // floor stays on the release the projection was first verified at.
-        "0.64.0",
+        // 0.65 through 0.67 only fix the CLI; the ACP permission request gains
+        // MCP server and tool metadata.
+        "0.67.0",
         "https://geminicli.com",
-        &["npx", "-y", "@google/gemini-cli@0.64.0", "--acp"],
+        &["npx", "-y", "@google/gemini-cli@0.67.0", "--acp"],
     )
     .with_compatible_version("0.47.0"),
     AcpAgentCatalogEntry::new(
@@ -312,12 +338,12 @@ const ACP_AGENT_CATALOG: &[AcpAgentCatalogEntry] = &[
         "grok",
         "Grok Build",
         "xAI's Grok Build agentic coding CLI with plan mode and parallel subagents. Requires a SuperGrok or X Premium+ subscription.",
-        // 1.0.62 is the newest `latest` build; 1.0.63 is published only on the
-        // alpha channel, so it is not eligible for a verified pin. The ACP
-        // surface is unchanged from 1.0.44 through 1.0.62: same protocol
+        // The ACP surface is unchanged from 1.0.44 through 1.0.78: same protocol
         // version, auth methods, session capabilities, model state and
-        // `reasoningEfforts`, with only a CLI `--allowed-tools` alias added.
-        "1.0.62",
+        // `reasoningEfforts`, and the `_x.ai/ask_user_question` and
+        // `_x.ai/exit_plan_mode` requests the runtime answers. 1.0.78 only adds
+        // `promptCapabilities.image`.
+        "1.0.78",
         "https://docs.x.ai/build/overview",
         // xAI's guidance for ACP and headless use is to skip background update
         // checks, because a self-update can swap the binary a live session is
@@ -378,21 +404,28 @@ const ACP_AGENT_CATALOG: &[AcpAgentCatalogEntry] = &[
         // tables but renames the state root to `KIMI_CODE_HOME` and respells two
         // provider types.
         //
-        // No compatibility floor is declared, and that is deliberate. The
-        // projection now writes the successor's vocabulary, so the archived CLI
-        // could not read what Vibex writes: leaving 1.49.0 as the floor would
-        // advertise a credential and model surface that does not work. A runtime
+        // The floor is the successor's own first verified release, `2.2.0`,
+        // never the archived CLI. The projection writes the successor's
+        // vocabulary, so 1.49.0 could not read what Vibex writes: a runtime
         // still on the old CLI collapses to the conservative surface instead,
         // which is the honest answer, and the managed install moves it forward.
         // 2.2.0 is additive over 2.1.1: the ACP handshake, config option ids
         // and the `config.toml` provider/model tables are unchanged, and the
         // release's only new launch surface is `KIMI_CODE_TRUST_WORKSPACE`,
         // which Vibex sets itself because it already owns the workspace.
-        "2.2.0",
+        //
+        // 2.5.2 still reads `KIMI_CODE_TRUST_WORKSPACE` (2.5.0 adds the
+        // equivalent `[workspace] require_trust` key) and keeps the handshake
+        // and config option ids. Plan and swarm modes now start only when the
+        // user turns them on, and `[secondary_model] force` is ignored; the
+        // projection writes neither. The floor is 2.2.0, the release the trust
+        // variable first verified at, which still excludes the archived CLI.
+        "2.5.2",
         "https://github.com/MoonshotAI/kimi-code",
         &["kimi", "acp"],
     )
-    .with_preset_id("kimi-cli"),
+    .with_preset_id("kimi-cli")
+    .with_compatible_version("2.2.0"),
     AcpAgentCatalogEntry::new(
         "minion-code",
         "Minion Code",
@@ -519,9 +552,11 @@ pub const ACP_AGENT_MANUAL_VERSION: &str = "manual";
 /// inside the same Agent, Grok's `xai.api_key`, Gemini's `gemini-api-key`, Codex's
 /// `api-key` and Cursor's API-key surface answer with an immediate error when the
 /// variable is unset, while Gemini's `vertex-ai`/`gateway` return an empty `{}`;
-/// none of them opens anything. `zcode`'s `zcode-credentials` is not even
-/// implemented (`-32601 Method not found`), and `glm-acp-agent` documents an
-/// empty result.
+/// none of them opens anything. `zcode`'s `zcode-credentials` reached
+/// `-32601 Method not found` through 0.72.0; 0.82.x implements it as a
+/// readiness check that answers `{}` when the desktop credential is present
+/// and an error when it is not, so it still opens no browser. `glm-acp-agent`
+/// documents an empty result.
 ///
 /// This is deliberately a table and not a heuristic on the method name or kind:
 /// an Agent that later changes behaviour must fail visibly here rather than
@@ -681,7 +716,7 @@ mod tests {
             .iter()
             .find(|entry| entry.id == "antigravity")
             .unwrap();
-        assert_eq!(antigravity.version, "1.4.0");
+        assert_eq!(antigravity.version, "1.4.5");
         assert_eq!(antigravity.command, &["agy_acp_server"]);
         assert_eq!(antigravity.compatible_version, Some("1.0.0"));
         assert_eq!(
@@ -700,11 +735,11 @@ mod tests {
             .iter()
             .find(|entry| entry.id == "deepseek-harness")
             .unwrap();
-        assert_eq!(deepseek.version, "0.4.38");
+        assert_eq!(deepseek.version, "0.4.40");
         assert_eq!(deepseek.compatible_version, Some("0.4.32"));
         assert_eq!(
             deepseek.command,
-            &["npx", "-y", "@openma/deepseek-harness-acp@0.4.38"]
+            &["npx", "-y", "@openma/deepseek-harness-acp@0.4.40"]
         );
         assert!(!entries.iter().any(|entry| entry.id == "corust-agent"));
     }
@@ -713,9 +748,9 @@ mod tests {
     fn verified_versions_skip_agents_vibex_does_not_pin() {
         assert_eq!(
             acp_agent_verified_version("deepseek-harness"),
-            Some("0.4.38")
+            Some("0.4.40")
         );
-        assert_eq!(acp_agent_verified_version("gemini"), Some("0.64.0"));
+        assert_eq!(acp_agent_verified_version("gemini"), Some("0.67.0"));
         assert_eq!(acp_agent_verified_version("devin"), None);
         assert_eq!(acp_agent_verified_version("kiro"), None);
         assert_eq!(acp_agent_verified_version("not-a-catalog-agent"), None);
@@ -732,12 +767,14 @@ mod tests {
     #[test]
     fn moved_pins_keep_their_compatibility_floor() {
         for (agent_id, pin, floor) in [
-            ("antigravity", "1.4.0", "1.0.0"),
-            ("cline", "3.0.73", "3.0.29"),
-            ("codebuddy-code", "2.168.2", "2.109.0"),
-            ("copilot", "1.0.98", "1.0.78"),
-            ("gemini", "0.64.0", "0.47.0"),
-            ("grok", "1.0.62", "1.0.8"),
+            ("antigravity", "1.4.5", "1.0.0"),
+            ("cline", "3.0.74", "3.0.29"),
+            ("codebuddy-code", "2.181.0", "2.109.0"),
+            ("copilot", "1.0.107", "1.0.78"),
+            ("deepseek-harness", "0.4.40", "0.4.32"),
+            ("gemini", "0.67.0", "0.47.0"),
+            ("grok", "1.0.78", "1.0.8"),
+            ("kimi", "2.5.2", "2.2.0"),
             ("pi", "0.0.34", "0.0.33"),
         ] {
             let entry = acp_agent_catalog_entries()

@@ -2064,7 +2064,9 @@ impl fmt::Debug for AcpSteerTurnRequest {
 /// Outcome reported by a native steering attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AcpSteerOutcome {
-    /// The message joined the running turn.
+    /// The Agent accepted the message: it joined the running turn, was queued
+    /// behind it, or started the next turn itself. The caller must not submit
+    /// the text again.
     Injected,
     /// The turn ended before injection; the caller must submit normally.
     PromptRequired,

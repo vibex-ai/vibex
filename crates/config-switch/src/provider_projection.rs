@@ -9659,8 +9659,8 @@ mod tests {
         let runtime_request = |agent_id: &str, adapter_id: &str, adapter_version: &str| {
             let mut runtime_dependencies = BTreeMap::new();
             let agent_version = if agent_id == "codex" {
-                runtime_dependencies.insert("@openai/codex".to_string(), "0.160.1".to_string());
-                Some("0.160.1".to_string())
+                runtime_dependencies.insert("@openai/codex".to_string(), "0.165.0".to_string());
+                Some("0.165.0".to_string())
             } else {
                 None
             };
@@ -9698,7 +9698,7 @@ mod tests {
             .create_agent_runtime_profile(runtime_request("claude", "claude-agent-acp", "0.71.0"))
             .unwrap();
         let codex_runtime = service
-            .create_agent_runtime_profile(runtime_request("codex", "codex-acp", "2.2.2"))
+            .create_agent_runtime_profile(runtime_request("codex", "codex-acp", "2.5.0"))
             .unwrap();
         for (agent_id, runtime, descriptor_id, endpoint_id) in [
             (

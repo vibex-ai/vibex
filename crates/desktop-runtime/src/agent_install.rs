@@ -35,7 +35,7 @@ use vibex_db::{
 };
 
 const ZCODE_ACP_PACKAGE: &str = "zcode-acp-server";
-const ZCODE_ACP_VERSION: &str = "0.72.0";
+const ZCODE_ACP_VERSION: &str = "0.82.3";
 const ZCODE_MINIMUM_NODE_VERSION: semver::Version = semver::Version::new(22, 0, 0);
 
 const ACP_REGISTRY_URL: &str =
@@ -3189,8 +3189,9 @@ fn npm_companion_environment(agent_id: &AgentId) -> Option<&'static str> {
         "pi" => Some("PI_ACP_PI_COMMAND"),
         // DeepSeek Harness deliberately has no companion environment entry:
         // 0.4.38 makes an explicit `DSH_PATH` a semver-gated override that is
-        // refused instead of falling back to the Adapter's bundled runtime, so
-        // a managed launch must leave it unset.
+        // refused instead of falling back to the Adapter's bundled runtime, and
+        // 0.4.39 turned that gate into an `engines.dsh` minimum floor, so a
+        // managed launch must leave it unset.
         _ => None,
     }
 }
@@ -6514,7 +6515,7 @@ mod tests {
 
         let pinned = pin_entry_to_target(&agent, entry.clone(), ManagedInstallTarget::Verified)
             .expect("the catalog pins this Agent");
-        assert_eq!(pinned.version, "0.4.38");
+        assert_eq!(pinned.version, "0.4.40");
         assert_eq!(
             pinned
                 .distribution
@@ -6522,7 +6523,7 @@ mod tests {
                 .as_ref()
                 .expect("npm distribution survives")
                 .package,
-            "@openma/deepseek-harness-acp@0.4.38"
+            "@openma/deepseek-harness-acp@0.4.40"
         );
         assert_eq!(
             parse_exact_npm_spec(
@@ -6530,7 +6531,7 @@ mod tests {
                 &pinned.version
             )
             .unwrap(),
-            ("@openma/deepseek-harness-acp", "0.4.38")
+            ("@openma/deepseek-harness-acp", "0.4.40")
         );
 
         let unchanged = pin_entry_to_target(&agent, entry, ManagedInstallTarget::Latest).unwrap();
