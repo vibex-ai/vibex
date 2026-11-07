@@ -471,7 +471,12 @@ jobs:
     if: ${{ always() && needs.release-meta.result == 'success' && needs.desktop.result == 'success' && needs.server-linux.result == 'success' && needs.server-macos.result == 'success' && needs.mobile-android.result == 'success' && needs.mobile-ios.result == 'success' }}
     runs-on: ubuntu-24.04
     steps:
+      # The release body compares the published tag against the previous one and
+      # falls back to the commit log when a range carries no merged pull
+      # requests, so this job needs the tags and the history behind them.
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: "*-*-${{ github.sha }}"
@@ -504,6 +509,10 @@ jobs:
             echo "${notes} has no English section" >&2
             exit 1
           fi
+          # Both language sections and a real body: a scaffold that was never
+          # written carries only comments, and the composer strips those, which
+          # would leave the release page with no changelog at all.
+          node scripts/release-notes.mjs --version "${version}" --check
           cp "${notes}" target/publish/vibex-release-notes.md
       - name: Generate and sign updater manifest when configured
         if: vars.VIBEX_UPDATE_SIGNING_ENABLED == 'true'
@@ -602,6 +611,52 @@ jobs:
               sort -z |
               xargs -0 -n1 sha256sum
           ) > target/publish/SHA256SUMS
+      # The release page carries the tagged notes, a Downloads table built from
+      # the assets this run publishes, and the changelog. GitHub generates the
+      # changelog from merged pull requests; a range that only carries direct
+      # commits returns an empty list, so the composer falls back to the commit
+      # log instead of shipping a body with a bare comparison link.
+      - name: Generate changelog
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target/release-body
+          tag="${GITHUB_REF_NAME}"
+          previous="$(git describe --tags --abbrev=0 "${tag}^" 2>/dev/null || true)"
+          if [[ -z "${previous}" ]]; then
+            echo "no previous tag reaches ${tag}; the composer will list the commit log"
+            : > target/release-body/generated-changelog.md
+            exit 0
+          fi
+          echo "generating notes for ${previous}...${tag}"
+          # A generation failure must not withhold the release: the composer
+          # reads an empty file as "fall back to the commit log".
+          gh api "repos/${GITHUB_REPOSITORY}/releases/generate-notes" \
+            -f tag_name="${tag}" \
+            -f previous_tag_name="${previous}" \
+            --jq .body > target/release-body/generated-changelog.md || \
+            : > target/release-body/generated-changelog.md
+      - name: Compose release body
+        shell: bash
+        run: |
+          set -euo pipefail
+          body="target/release-body/vibex-release-body.md"
+          node scripts/release-body.mjs \
+            --version "${{ needs.release-meta.outputs.version }}" \
+            --tag "${GITHUB_REF_NAME}" \
+            --notes "docs/operations/release-notes-v${{ needs.release-meta.outputs.version }}.md" \
+            --assets target/publish \
+            --changelog target/release-body/generated-changelog.md \
+            --output "${body}"
+          # A body that lost a section would publish a page readers cannot use,
+          # so every part has to be present before the release is created.
+          grep -qxF '## English' "${body}"
+          grep -qxF '## Downloads' "${body}"
+          grep -qxF "## What's Changed" "${body}"
+          grep -qE '^## (简体中文|簡體中文|中文|繁體中文|繁体中文)$' "${body}"
+          grep -qF '**Full Changelog**' "${body}"
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -609,7 +664,11 @@ jobs:
         run: |
           set -euo pipefail
           tag="${GITHUB_REF_NAME}"
-          release_flags=(--verify-tag --generate-notes --title "Vibex ${{ needs.release-meta.outputs.version }}")
+          release_flags=(
+            --verify-tag
+            --title "Vibex ${{ needs.release-meta.outputs.version }}"
+            --notes-file target/release-body/vibex-release-body.md
+          )
           if [[ "${{ needs.release-meta.outputs.channel }}" != "stable" ]]; then
             release_flags+=(--prerelease)
           fi

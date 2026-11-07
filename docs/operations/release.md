@@ -89,6 +89,49 @@ release may ship fewer sections than the interface offers. The notes asset is
 informational and is not covered by the manifest signature: never move install
 instructions, artifact hashes, or anything the updater must trust into it.
 
+### Release page
+
+The GitHub Release page is composed by the publish job from three inputs, in
+this order:
+
+1. **English**, then the Chinese section when the document carries one — the
+   tagged notes, unchanged.
+2. **Downloads** — an English table of the desktop client and headless server
+   package for every platform, plus the Android and iOS packages. Each row is
+   rendered from the assets the run actually publishes, so a platform whose job
+   failed drops out instead of leaving a dead link, and a missing server tarball
+   renders as `—`.
+3. **What's Changed**, **New Contributors** and **Full Changelog** — English
+   only. The job asks GitHub to generate them from merged pull requests; a range
+   that carries only direct commits generates no entries, so the composer falls
+   back to the commit log between the previous tag and this one.
+
+`scripts/release-body.mjs` builds the body and `scripts/release-body.test.mjs`
+pins its rules. A local draft needs the tagged notes and, optionally, the asset
+directory and a generated changelog:
+
+```bash
+gh api "repos/vibex-ai/vibex/releases/generate-notes" \
+  -f tag_name=v0.1.0-rc.9 -f previous_tag_name=v0.1.0-rc.8 --jq .body \
+  > target/release-body/generated-changelog.md
+
+node scripts/release-body.mjs \
+  --version 0.1.0-rc.9 \
+  --notes docs/operations/release-notes-v0.1.0-rc.9.md \
+  --assets target/publish \
+  --changelog target/release-body/generated-changelog.md \
+  --output target/release-body/vibex-release-body.md
+```
+
+Without `--assets` the Downloads table is omitted, and an empty or missing
+`--changelog` selects the commit-log fallback. The publish job reads the file
+through `gh release create --notes-file`, so the page and the notes asset always
+describe the same release.
+
+The Downloads table is a convenience for readers. The updater never reads it:
+artifact trust stays with the signed `vibex-update.json`, and every link is
+built from the verified tag.
+
 ## Mobile
 
 Android and iOS are built independently from the desktop package. Tagged

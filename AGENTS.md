@@ -257,6 +257,27 @@ what you touched.
 `smoke:pty`, `smoke:codex`, `smoke:claude`, `smoke:relay:local`); `e2e:*` and
 `package:*` cover regression harnesses and Linux packaging.
 
+### Release notes
+
+A release publishes one page with three parts: the bilingual notes (English
+first, then Chinese), an English Downloads table built from the assets that run
+publishes, and the English `What's Changed` / `New Contributors` changelog.
+
+```bash
+node scripts/release-notes.mjs --version <version> --context target/release-notes/context.md
+node scripts/release-notes.mjs --version <version> --scaffold
+node scripts/release-notes.mjs --version <version> --check
+
+node scripts/release-body.mjs --version <version> \
+  --notes docs/operations/release-notes-v<version>.md --output <file>
+```
+
+The notes are authored prose grouped by product area, not a commit dump; the
+brief lists the range, the grouped commits, the changed areas and the previous
+release's structure. `--check` rejects a document that lost a language section or
+still carries only comments, and the publish job runs it before uploading. See
+[the release runbook](docs/operations/release.md#release-page).
+
 Layer guidelines live in `.trellis/spec/backend/index.md` and
 `.trellis/spec/frontend/index.md`. Read the relevant index — and its
 Pre-Development Checklist and Quality Check sections — before writing code in

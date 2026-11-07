@@ -10,7 +10,7 @@
     "check": "pnpm check:rust && pnpm check:frontend && pnpm check:licenses",
     "check:mobile-native": "cargo check -p vibex-mobile --locked && node scripts/check-mobile-native.mjs && node scripts/check-mobile-native.mjs --self-test",
     "check:frontend": "pnpm -r --if-present typecheck && pnpm lint",
-    "check:release": "node scripts/check-release.mjs",
+    "check:release": "node scripts/check-release.mjs && node scripts/release-body.test.mjs",
     "check:licenses": "node scripts/check-licenses.mjs",
     "check:native-content-package": "node scripts/check-native-content-package.mjs",
     "check:rust": "node scripts/check-rust-quality.mjs",

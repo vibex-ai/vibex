@@ -256,6 +256,30 @@ function validatePackaging() {
     releaseWorkflow.includes("has no English section"),
     "publish workflow does not require an English release-notes section"
   );
+  // The release page itself is composed from three inputs: the tagged notes, a
+  // Downloads table built from the assets this run publishes, and the
+  // changelog. Losing any of them ships a page without the part readers came
+  // for, and `--generate-notes` alone would drop the first two.
+  for (const required of [
+    "fetch-depth: 0",
+    "releases/generate-notes",
+    "scripts/release-body.mjs",
+    "--notes-file target/release-body/vibex-release-body.md"
+  ]) {
+    assert(
+      releaseWorkflow.includes(required),
+      `publish workflow does not compose the release body: ${required}`
+    );
+  }
+  assert(
+    !releaseWorkflow.includes("--generate-notes"),
+    "publish workflow still lets GitHub generate the whole body, which drops the notes and the Downloads table"
+  );
+  assert(existsSync(path("scripts/release-body.mjs")), "release body composer is missing");
+  assert(
+    existsSync(path("scripts/release-body.test.mjs")),
+    "release body composer self-test is missing"
+  );
   // Container images publish from their own tag/branch-triggered workflow.
   // Keep the registry, the build inputs, the architecture coverage, and the
   // "latest only points at a stable release" guarantee under contract.
@@ -551,6 +575,16 @@ function validateCurrentReleaseDocs() {
       runbook.includes("vibex-release-notes.md"),
     "runbook does not document the localized release-notes asset"
   );
+  // The runbook is where a release owner learns what the Release page will
+  // carry, so the three composed parts have to stay documented next to it.
+  for (const required of [
+    "scripts/release-body.mjs",
+    "--notes-file",
+    "What's Changed",
+    "Downloads"
+  ]) {
+    assert(runbook.includes(required), `runbook does not document the release page: ${required}`);
+  }
 }
 
 function validateDependencyAndSupplyChain() {

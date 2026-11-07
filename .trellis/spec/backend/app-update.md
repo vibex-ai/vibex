@@ -34,9 +34,22 @@ confirm that the signing key derives the public key embedded by the build.
 
 `vibex-release-notes.md` is copied from the tagged commit's
 `docs/operations/release-notes-v<version>.md`, and the publish job fails the
-release when that document is missing or carries no `## English` section. It is
-informational: the manifest signature does not cover it, and it never
-influences update decisions.
+release when that document is missing, carries no `## English` section, or no
+longer has a real body in either language. It is informational: the manifest
+signature does not cover it, and it never influences update decisions.
+
+The public release page is composed from that same document, so the notes the
+About page renders and the notes a browser reads cannot disagree:
+
+- English, then the Chinese section, verbatim from the document;
+- a Downloads table naming every desktop and server artifact the run published,
+  plus the mobile packages, linked through the verified tag;
+- the English changelog GitHub generates from merged pull requests, or the
+  commit log of the release range when a range carries none.
+
+The Downloads table is presentation only. Artifact trust stays with the signed
+manifest, and the page is rebuilt from the published asset list on every run
+rather than stored in the repository.
 
 The signed manifest binds:
 
