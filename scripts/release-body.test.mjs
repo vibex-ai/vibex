@@ -120,6 +120,7 @@ const fallback = renderCommitChangelog({
     { sha: "a".repeat(40), subject: "feat(tui): add a button legend" },
     { sha: "b".repeat(40), subject: "fix(desktop): keep the caret visible" },
     { sha: "c".repeat(40), subject: "chore(release): prepare the v0.2.0 release" },
+    { sha: "e".repeat(40), subject: "chore: update 0.2.0" },
     { sha: "d".repeat(40), subject: "update" }
   ],
   newContributors: ["Ada"]
@@ -129,6 +130,7 @@ assert.ok(fallback.includes("### Features"), "the fallback lost its feature grou
 assert.ok(fallback.includes("### Fixes"), "the fallback lost its fix group");
 assert.ok(fallback.includes("### Other changes"), "an unconventioned subject belongs in other changes");
 assert.ok(!fallback.includes("prepare the v0.2.0 release"), "a release preparation commit reached the changelog");
+assert.ok(!fallback.includes("chore: update 0.2.0"), "a bare version bump reached the changelog");
 assert.ok(fallback.includes("* Ada made their first contribution"), "new contributors were dropped");
 assert.ok(
   fallback.trimEnd().endsWith(

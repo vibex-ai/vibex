@@ -265,11 +265,17 @@ function changelogGroup(subject) {
 }
 
 // Release preparation commits describe the version bump, not a change a reader
-// of the release notes can use, so they stay out of the changelog.
+// of the release notes can use, so they stay out of the changelog. Older
+// releases wrote `chore: update <version>` before `chore(release): prepare ...`
+// became the convention, and both forms have to stay out.
+const VERSION_BUMP =
+  /^chore(?:\([^)]*\))?:[ \t]+(?:update|bump)[ \t]+(?:to[ \t]+)?v?\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:[ \t].*)?$/u;
+
 function isChangeEntry(subject) {
   const trimmed = subject.trim();
   if (trimmed === "") return false;
   if (/^chore\(release\):/u.test(trimmed)) return false;
+  if (VERSION_BUMP.test(trimmed)) return false;
   if (/^Merge[ \t]/u.test(trimmed)) return false;
   return true;
 }
