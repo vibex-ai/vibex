@@ -422,20 +422,26 @@ Rules that keep the pattern consistent:
   pushing, and give each hint family its own private zero-sized id type so
   unrelated hints do not replace each other.
 - One failure is one card. When the same failure reaches the workbench along
-  several paths — a failed turn is the error item on its timeline and, for a new
-  session, also the submission its initial message was waiting on — every report
-  pushes the same hint, keyed to its subject with `.id_for::<T>(key)`
-  (`agent_failure_hint` keys to the session). A different session's failure keeps
-  its own card.
+  several paths — a failed turn is the error item on its timeline and also the
+  send that was waiting on it — every report pushes the same hint, keyed to its
+  subject with `.id_for::<T>(key)` (`agent_failure_hint` keys to the session). A
+  different session's failure keeps its own card.
+- A failed send reports where its account belongs (`report_send_failure`). The
+  runtime records a failed turn in one step — the error item and the session's
+  move to `AgentSessionState::Error` — so the snapshot read after the send says
+  whether it ended a turn: `Error` with a newer `updated_at_ms`. Such a failure
+  joins the card and never also writes the composer's error strip. A send refused
+  before it became a turn left no record, so the strip keeps the reason readable
+  until it is dismissed. A new session's first message always lands on the card,
+  because the reader may have left the session by then, and that card only turns
+  autohide off when the message never became a turn.
 - A card may summarize something longer. `.copy_text(details)` hands the
   diagnostics to the copy button, whose label then says it copies details, so the
   card stays one readable line and the raw error can still leave the app. A hint
   that replaces a mounted one with the same id merges what the older one could
   copy, line by line and in arrival order: the reports need not know the same
   things — only the timeline holds the provider's own words — and they need not
-  arrive in a fixed order. The merged card hides itself if either report may: a
-  failure that left nothing on the timeline turns autohide off, because that card
-  is its only account.
+  arrive in a fixed order.
 - Pick the type from the meaning, not the page: `success` for a completed action,
   `error` for one that failed, `info` for a neutral result, `warning` for one the
   user should look at. Do not paint a failure with a success tone.

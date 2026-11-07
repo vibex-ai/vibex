@@ -323,17 +323,16 @@ impl HintList {
     /// Mounts a hint, replacing the mounted hint with the same id.
     ///
     /// Replacing keeps a repeated report to one card, but the reports need not
-    /// know the same things and need not arrive in a fixed order. A hint with
-    /// copy text therefore takes over what the one it replaces could copy, and
-    /// hides itself if either report may: a report only stays on screen because
-    /// it believes it is the sole account of what happened.
+    /// know the same things and need not arrive in a fixed order, so a hint with
+    /// copy text takes over what the one it replaces could copy as well.
     fn push(&mut self, mut hint: Hint, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(previous) = self.hints.get(&hint.id)
-            && let Some(known) = previous.copy_text.as_deref()
+        if let Some(previous) = self
+            .hints
+            .get(&hint.id)
+            .and_then(|previous| previous.copy_text.as_deref())
             && let Some(next) = hint.copy_text.as_deref()
         {
-            hint.copy_text = Some(merged_copy_text(known, next).into());
-            hint.autohide |= previous.autohide;
+            hint.copy_text = Some(merged_copy_text(previous, next).into());
         }
         let timeout = hint.autohide.then_some(HINT_AUTOHIDE);
         self.hints.push(

@@ -355,9 +355,9 @@ struct NewSessionErrorNotification;
 /// Replace-by-id marker for one session's Agent failure hint.
 ///
 /// One failed turn reaches the workbench more than once: as the error item on
-/// its timeline and, for a new session, as the submission its initial message
-/// was waiting on. Keying every report to the session makes them one card, while
-/// a failure in another session keeps a card of its own.
+/// its timeline and as the send that was waiting on it. Keying every report to
+/// the session makes them one card, while a failure in another session keeps a
+/// card of its own.
 struct AgentFailureNotification;
 
 /// The tone a settings operation result is announced with.
@@ -2515,6 +2515,24 @@ fn initial_message_failure_note(error: &vibex_core::VibexError) -> Option<String
     ))
 }
 
+/// Whether a send that came back with an error ended a turn.
+///
+/// The runtime records a failed turn in one step, before the send returns: the
+/// error item on the timeline and the session's move to `Error`. A send refused
+/// before it became a turn writes neither. The session can still read `Error`
+/// from an earlier turn, which its unchanged `updated_at_ms` gives away, so the
+/// snapshot alone cannot answer this. With no snapshot nothing says the failure
+/// was recorded, so the answer is no and the failure keeps a report of its own.
+fn send_failure_ended_a_turn(
+    updated_at_ms_before_send: Option<i64>,
+    session_after_send: Option<&AgentSession>,
+) -> bool {
+    session_after_send.is_some_and(|session| {
+        session.state == AgentSessionState::Error
+            && updated_at_ms_before_send != Some(session.updated_at_ms)
+    })
+}
+
 fn initial_message_interrupted_error() -> vibex_core::VibexError {
     vibex_core::VibexError::conflict(
         "message_submission_interrupted_before_dispatch",
@@ -3470,28 +3488,17 @@ impl VibexWorkbench {
         });
     }
 
-    /// Announces an Agent failure that did not arrive as a timeline item.
-    ///
-    /// It lands on the same per-session card `notify_for_timeline_events` raises
-    /// for the failure's error item, so the two reports stay one card whichever
-    /// comes first. The notification preferences do not gate it: the caller is
-    /// answering an action the user just took, not a turn running on its own.
-    ///
-    /// A message that never reached the provider leaves no error item, which
-    /// makes this card the only account of the failure, so it does not hide
-    /// itself. When an error item does report the failure, that report lets it.
-    fn present_agent_failure(
-        &self,
-        session_id: &VibexSessionId,
-        detail: String,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let agent_label = self.session_agent_label(session_id.as_str());
-        let hint = agent_failure_hint(session_id.as_str(), &agent_label, detail).autohide(false);
+    /// Hands the queued Agent failures to the window's hint layer.
+    fn present_agent_failure_hints(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.pending_agent_failure_hints.is_empty() {
+            return;
+        }
+        let hints = std::mem::take(&mut self.pending_agent_failure_hints);
         window.defer(cx, move |window, cx| {
             Theme::global_mut(cx).notification.placement = Anchor::TopCenter;
-            hint_layer::push(window, hint, cx);
+            for hint in hints {
+                hint_layer::push(window, hint, cx);
+            }
         });
     }
 }
@@ -10726,6 +10733,8 @@ pub struct VibexWorkbench {
     /// looks like it is still making progress.
     pending_user_request_ids: BTreeMap<String, BTreeSet<String>>,
     notification_suppressed_session_ids: BTreeSet<String>,
+    /// Agent failures waiting for the next frame to reach the hint layer.
+    pending_agent_failure_hints: Vec<hint_layer::Hint>,
     /// The highest timeline sequence already announced for each session.
     ///
     /// The same committed item reaches the workbench twice: once over the live
@@ -12289,6 +12298,7 @@ impl VibexWorkbench {
             unread_completion_watermarks: BTreeMap::new(),
             pending_user_request_ids: BTreeMap::new(),
             notification_suppressed_session_ids: BTreeSet::new(),
+            pending_agent_failure_hints: Vec::new(),
             notified_timeline_sequences: BTreeMap::new(),
             auto_continue_enabled_by_default,
             auto_continue_default_project_ids,
@@ -29011,6 +29021,59 @@ impl VibexWorkbench {
             .unwrap_or_else(|| "Agent".to_string())
     }
 
+    /// When the session last changed, as far as this workbench has heard.
+    fn session_updated_at_ms(&self, session_id: &str) -> Option<i64> {
+        self.registered_session(session_id)
+            .map(|session| session.updated_at_ms)
+    }
+
+    /// Queues an Agent failure that did not arrive as a timeline item.
+    ///
+    /// It lands on the same per-session card `notify_for_timeline_events` raises
+    /// for the failure's error item, so the reports stay one card whichever comes
+    /// first. The notification preferences do not gate it: the caller is
+    /// answering an action the user just took, not a turn running on its own.
+    /// Several of these paths have no `Window`, so the hint waits for the frame
+    /// the caller's `cx.notify()` asks for.
+    fn queue_agent_failure_hint(
+        &mut self,
+        session_id: &VibexSessionId,
+        detail: String,
+        autohide: bool,
+    ) {
+        let agent_label = self.session_agent_label(session_id.as_str());
+        self.pending_agent_failure_hints
+            .push(agent_failure_hint(session_id.as_str(), &agent_label, detail).autohide(autohide));
+    }
+
+    /// Reports a send that came back with an error.
+    ///
+    /// A failed turn is already on the timeline and already raises its card, so
+    /// writing the composer's error strip as well would report it twice: it joins
+    /// the card instead. A send refused before it became a turn left no record
+    /// anywhere, so the strip is its only account and keeps the reason readable
+    /// until it is dismissed.
+    fn report_send_failure(
+        &mut self,
+        session_id: &VibexSessionId,
+        updated_at_ms_before_send: Option<i64>,
+        session_after_send: Option<&AgentSession>,
+        detail: String,
+    ) {
+        if !send_failure_ended_a_turn(updated_at_ms_before_send, session_after_send) {
+            self.agent_error = Some(detail);
+            return;
+        }
+        // A turn the user interrupted may end in an error, and that is not news
+        // to them: the timeline path holds its card back for the same reason.
+        if !self
+            .notification_suppressed_session_ids
+            .contains(session_id.as_str())
+        {
+            self.queue_agent_failure_hint(session_id, detail, true);
+        }
+    }
+
     fn notify_for_timeline_events(&mut self, events: &[TimelineLiveEvent], cx: &mut Context<Self>) {
         let Some(session_id) = events.first().map(|event| event.session_id.as_str()) else {
             return;
@@ -32791,6 +32854,7 @@ impl VibexWorkbench {
         }
         cx.notify();
         let submit_key = idempotency_key.clone();
+        let updated_at_ms_before_send = self.session_updated_at_ms(session_id.as_str());
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
             let outcome = backend
                 .agent()
@@ -32844,8 +32908,13 @@ impl VibexWorkbench {
                 if active {
                     match &outcome {
                         Ok((Ok(_), _)) => this.refresh_selected_agent_timeline(cx),
-                        Ok((Err(error), _)) => {
-                            this.agent_error = Some(format!("{}: {}", error.code, error.message));
+                        Ok((Err(error), session)) => {
+                            this.report_send_failure(
+                                &submitted_session_id,
+                                updated_at_ms_before_send,
+                                session.as_ref(),
+                                format!("{}: {}", error.code, error.message),
+                            );
                         }
                         Err(error) => {
                             this.agent_error = Some(format!("Agent action failed: {error}"));
@@ -33027,6 +33096,7 @@ impl VibexWorkbench {
             self.start_submission_poll(window, cx);
         }
         let submit_key = idempotency_key.clone();
+        let updated_at_ms_before_send = self.session_updated_at_ms(session_id.as_str());
         let reasoning_effort = selection.reasoning_effort.clone();
         let message_backend = self.backend.clone();
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
@@ -33127,8 +33197,13 @@ impl VibexWorkbench {
                             // The submission poll owns this presentation so the same
                             // delivery issue does not also become a persistent error row.
                         }
-                        Ok((Err(error), _)) => {
-                            this.agent_error = Some(format!("{}: {}", error.code, error.message));
+                        Ok((Err(error), session)) => {
+                            this.report_send_failure(
+                                &submitted_session_id,
+                                updated_at_ms_before_send,
+                                session.as_ref(),
+                                format!("{}: {}", error.code, error.message),
+                            );
                         }
                         Err(error) => {
                             this.agent_error = Some(format!(
@@ -37849,8 +37924,13 @@ impl VibexWorkbench {
                     }
                     match outcome {
                         Ok((Ok(_), _)) => this.refresh_selected_agent_timeline(cx),
-                        Ok((Err(error), _)) => {
-                            this.agent_error = Some(format!("{}: {}", error.code, error.message));
+                        Ok((Err(error), session)) => {
+                            this.report_send_failure(
+                                &continued_session_id,
+                                Some(turn_updated_at_ms),
+                                session.as_ref(),
+                                format!("{}: {}", error.code, error.message),
+                            );
                         }
                         Err(error) => {
                             this.agent_error = Some(format!("Agent action failed: {error}"));
@@ -38287,6 +38367,7 @@ impl VibexWorkbench {
         cx.notify();
         let generation = self.session_generation;
         let selected_source_session_id = source_session_id.clone();
+        let updated_at_ms_before_send = self.session_updated_at_ms(source_session_id.as_str());
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
             let selection = backend
                 .agent()
@@ -38339,14 +38420,18 @@ impl VibexWorkbench {
                     this.rebuild_timeline_sizes();
                     match outcome {
                         Ok((result, session)) => {
+                            if let Err(error) = result {
+                                this.report_send_failure(
+                                    &selected_source_session_id,
+                                    updated_at_ms_before_send,
+                                    session.as_ref(),
+                                    format!("{}: {}", error.code, error.message),
+                                );
+                            }
                             if let Some(session) = session {
                                 this.upsert_session_snapshot(session);
                                 this.reconcile_sidebar_state();
                                 this.publish_sidebar_invalidation();
-                            }
-                            if let Err(error) = result {
-                                this.agent_error =
-                                    Some(format!("{}: {}", error.code, error.message));
                             }
                         }
                         Err(error) => {
@@ -40158,6 +40243,8 @@ impl VibexWorkbench {
                     ))) => {
                         let initial_message_completed =
                             initial_message_sent && initial_message_error.is_none();
+                        let initial_turn_failed =
+                            send_failure_ended_a_turn(None, refreshed_session.as_ref());
                         if let Some(session) = refreshed_session {
                             this.upsert_session_snapshot(session);
                         }
@@ -40176,7 +40263,11 @@ impl VibexWorkbench {
                         if let Some(error) = initial_message_error
                             && let Some(note) = initial_message_failure_note(&error)
                         {
-                            this.present_agent_failure(&session_id, note, window, cx);
+                            // The reader may have left this session already, so
+                            // the card reports it either way. A message that
+                            // never became a turn left no other record, which is
+                            // why that card waits to be dismissed.
+                            this.queue_agent_failure_hint(&session_id, note, initial_turn_failed);
                         }
                         this.reconcile_sidebar_state();
                         this.publish_sidebar_invalidation();
@@ -93690,6 +93781,7 @@ impl Render for VibexWorkbench {
         self.present_settings_operation_notice(window, cx);
         self.present_runtime_registry_error(window, cx);
         self.present_runtime_note_error(window, cx);
+        self.present_agent_failure_hints(window, cx);
         self.present_new_session_error(window, cx);
         if self.initial_new_session_setup_pending {
             self.initial_new_session_setup_pending = false;
@@ -96595,6 +96687,114 @@ mod tests {
         assert!(needs_input.starts_with("Claude Code "));
         assert!(failed.starts_with("Codex "));
         assert_eq!(timeline_notification_body(None, "Codex"), None);
+    }
+
+    #[test]
+    fn a_send_failure_only_ended_a_turn_when_the_session_says_so() {
+        let session_id = VibexSessionId::new();
+        let mut failed = child_agent_session(&session_id, AgentSessionState::Error);
+        failed.updated_at_ms = 200;
+        let mut idle = failed.clone();
+        idle.state = AgentSessionState::Idle;
+
+        assert!(send_failure_ended_a_turn(Some(100), Some(&failed)));
+        // A brand-new session has no earlier turn to have left `Error` behind.
+        assert!(send_failure_ended_a_turn(None, Some(&failed)));
+
+        // `Error` left over from the last turn, and this send was refused.
+        assert!(!send_failure_ended_a_turn(Some(200), Some(&failed)));
+        assert!(!send_failure_ended_a_turn(Some(100), Some(&idle)));
+        // The snapshot read failed: nothing says the failure was recorded.
+        assert!(!send_failure_ended_a_turn(Some(100), None));
+    }
+
+    /// A failed send is reported once, on the surface that fits what the runtime
+    /// recorded about it, and the queued card really reaches the hint layer.
+    #[gpui::test]
+    fn a_failed_send_is_reported_once_where_its_account_belongs(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        cx.update(hint_layer::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let workbench = Rc::new(RefCell::new(None));
+        let slot = workbench.clone();
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            let mut ui_state = DesktopUiStateV1::default();
+            ui_state.appearance.locale = LocaleMode::En;
+            let view =
+                cx.new(|cx| VibexWorkbench::with_initial_state(None, ui_state, None, window, cx));
+            *slot.borrow_mut() = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let workbench = workbench
+            .borrow()
+            .clone()
+            .expect("the window should have built the workbench");
+        let session_id = VibexSessionId::new();
+        let mut failed = child_agent_session(&session_id, AgentSessionState::Error);
+        failed.updated_at_ms = 200;
+
+        // Refused before it became a turn: the strip is the only account.
+        workbench.update(cx, |this, _| {
+            this.report_send_failure(
+                &session_id,
+                Some(200),
+                Some(&failed),
+                "refused: reason".into(),
+            );
+            assert_eq!(this.agent_error.as_deref(), Some("refused: reason"));
+            assert!(this.pending_agent_failure_hints.is_empty());
+            this.agent_error = None;
+        });
+
+        // The user interrupted the turn: the timeline's row is enough.
+        workbench.update(cx, |this, _| {
+            this.notification_suppressed_session_ids
+                .insert(session_id.as_str().to_string());
+            this.report_send_failure(&session_id, Some(100), Some(&failed), "code: text".into());
+            assert_eq!(this.agent_error, None);
+            assert!(this.pending_agent_failure_hints.is_empty());
+            this.notification_suppressed_session_ids
+                .remove(session_id.as_str());
+        });
+
+        // A failed turn joins its card and never also writes the strip.
+        workbench.update(cx, |this, _| {
+            this.report_send_failure(&session_id, Some(100), Some(&failed), "code: text".into());
+            assert_eq!(this.agent_error, None);
+            assert_eq!(this.pending_agent_failure_hints.len(), 1);
+        });
+        settle_hints(cx);
+        assert_eq!(mounted_hint_count(cx), 1, "the frame delivers the card");
+        workbench.read_with(cx, |this, _| {
+            assert!(this.pending_agent_failure_hints.is_empty());
+        });
+    }
+
+    /// Every send that runs a turn reports its failure through the one path, so
+    /// a failed turn cannot come back as a second report beside its card.
+    #[test]
+    fn every_turn_running_send_reports_its_failure_through_one_path() {
+        let source = include_str!("app.rs");
+        for send in [
+            "dispatch_composer_message_remote",
+            "dispatch_admitted_composer_message",
+            "continue_session_by_id",
+            "replace_latest_user_message",
+        ] {
+            let body = source
+                .split_once(&format!("    fn {send}("))
+                .and_then(|(_, tail)| tail.split_once("\n    fn "))
+                .map(|(body, _)| body)
+                .unwrap_or_else(|| panic!("{send} should remain inspectable"));
+            assert!(
+                body.contains("this.report_send_failure("),
+                "{send} should report through report_send_failure"
+            );
+            assert!(
+                !body.contains("Some(format!(\"{}: {}\", error.code, error.message))"),
+                "{send} must not write a failed turn to the composer's error strip"
+            );
+        }
     }
 
     #[test]
@@ -110610,8 +110810,8 @@ mod tests {
         );
     }
 
-    /// One failed initial message reaches the layer twice: as its timeline error
-    /// and as its failed submission. Both have to end up on one card that names
+    /// One failed send reaches the layer twice: as its timeline error and as the
+    /// failure the send came back with. Both have to end up on one card that names
     /// the Agent, and that card has to copy what each report knew: only the
     /// timeline holds the provider's own words.
     #[gpui::test]
@@ -110655,19 +110855,18 @@ mod tests {
     }
 
     /// A failed turn stays on the session's timeline, so its card may hide
-    /// itself even after the submission's report took it over. A message that
-    /// never reached the provider has no timeline item: its card is the only
-    /// account of the failure, and hiding it would take the details with it.
+    /// itself, including after a second report took it over. A message that never
+    /// reached the provider has no timeline item: its card is the only account of
+    /// the failure, and hiding it would take the details with it.
     #[gpui::test]
     fn only_a_failure_the_timeline_keeps_hides_its_card(cx: &mut TestAppContext) {
-        let submission = |session: &str| {
-            agent_failure_hint(session, "Codex", "note".to_string()).autohide(false)
+        let report = |session: &str, detail: &str, ended_a_turn: bool| {
+            agent_failure_hint(session, "Codex", detail.to_string()).autohide(ended_a_turn)
         };
-        let (cx, _) = hint_window_with(submission("never-dispatched"), cx);
+        let (cx, _) = hint_window_with(report("never-dispatched", "note", false), cx);
         cx.update(|window, cx| {
-            let timeline = agent_failure_hint("failed-turn", "Codex", "item".to_string());
-            hint_layer::push(window, timeline, cx);
-            hint_layer::push(window, submission("failed-turn"), cx);
+            hint_layer::push(window, report("failed-turn", "item", true), cx);
+            hint_layer::push(window, report("failed-turn", "note", true), cx);
         });
         settle_hints(cx);
         assert_eq!(mounted_hint_count(cx), 2);
@@ -112283,7 +112482,7 @@ mod tests {
             .map(|(body, _)| body)
             .expect("initial-message failure handling should remain inspectable");
         assert!(
-            initial_message_failure.contains("this.present_agent_failure("),
+            initial_message_failure.contains("this.queue_agent_failure_hint("),
             "an initial-turn failure joins the session's one failure hint"
         );
         assert!(
