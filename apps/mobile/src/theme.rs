@@ -1232,7 +1232,16 @@ pub fn apply_component_theme(window: Option<&mut Window>, cx: &mut App) {
     );
 
     let token = |name: &str| semantic_color(name, dark);
+    // A blinking caret is motion the Reduce Motion switch has to reach: the
+    // kit reads this policy from its theme global and copies it to the base
+    // layer that paints every input and the file editor.
+    let cursor_blink = if reduce_motion() {
+        gpui_base::input::CursorBlink::steady()
+    } else {
+        gpui_base::input::CursorBlink::default()
+    };
     Theme::update(cx, |theme| {
+        theme.cursor_blink = cursor_blink;
         // The kit's base is the same rem the ladder is written against, so a
         // kit control and the hand-built row beside it resolve to one scale.
         // Crucially it carries the reader's text-size step too: the kit's
@@ -1343,14 +1352,17 @@ fn shared_highlight_theme(mode: GpuiThemeMode) -> Arc<HighlightTheme> {
             serde_json::from_str::<HighlightThemeStyle>(default_theme(mode).highlight_json)
         })
         .expect("built-in syntax highlight tokens must be valid");
-    Arc::new(HighlightTheme {
-        name: definition.name.to_string(),
-        appearance: match mode {
-            GpuiThemeMode::Light => ComponentThemeMode::Light,
-            GpuiThemeMode::Dark => ComponentThemeMode::Dark,
-        },
-        style,
-    })
+    // `HighlightTheme` is `#[non_exhaustive]`: start from the kit's theme for
+    // the appearance so a field it adds later keeps that appearance's default.
+    let (mut theme, appearance) = match mode {
+        GpuiThemeMode::Light => (HighlightTheme::default_light(), ComponentThemeMode::Light),
+        GpuiThemeMode::Dark => (HighlightTheme::default_dark(), ComponentThemeMode::Dark),
+    };
+    let highlight = Arc::make_mut(&mut theme);
+    highlight.name = definition.name.to_string();
+    highlight.appearance = appearance;
+    highlight.style = style;
+    theme
 }
 
 /// Points the kit's notification layer at the phone's own corner.
@@ -1375,7 +1387,7 @@ fn shared_highlight_theme(mode: GpuiThemeMode) -> Arc<HighlightTheme> {
 /// actually moved, and the layer renders after the view, so it reads the new
 /// values in the same frame.
 pub fn sync_notification_metrics(window: &Window, cx: &mut App) {
-    let insets = window.insets().effective();
+    let insets = window.safe_insets().effective();
     let viewport = window.viewport_size();
     let usable = f32::from(viewport.width)
         - f32::from(insets.left)

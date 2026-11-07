@@ -42,7 +42,10 @@ pub fn is_backgrounded() -> bool {
 
 fn transition(backgrounded: &mut bool, phase: AppLifecyclePhase) -> Option<MobileLifecycleEvent> {
     match phase {
-        AppLifecyclePhase::Background if !*backgrounded => {
+        // A disconnected scene is not on screen either. It may reconnect, and
+        // a reconnection comes back through `Foreground`/`Active`, which is
+        // what resumes the streams.
+        AppLifecyclePhase::Background | AppLifecyclePhase::Disconnected if !*backgrounded => {
             *backgrounded = true;
             Some(MobileLifecycleEvent::Backgrounded)
         }
@@ -53,7 +56,8 @@ fn transition(backgrounded: &mut bool, phase: AppLifecyclePhase) -> Option<Mobil
         AppLifecyclePhase::Active
         | AppLifecyclePhase::Inactive
         | AppLifecyclePhase::Background
-        | AppLifecyclePhase::Foreground => None,
+        | AppLifecyclePhase::Foreground
+        | AppLifecyclePhase::Disconnected => None,
     }
 }
 
@@ -124,5 +128,28 @@ mod tests {
             Some(MobileLifecycleEvent::Resumed)
         );
         assert!(!backgrounded);
+    }
+
+    #[test]
+    fn a_disconnected_scene_backgrounds_once_and_resumes_on_reconnection() {
+        let mut backgrounded = false;
+
+        assert_eq!(
+            transition(&mut backgrounded, AppLifecyclePhase::Disconnected),
+            Some(MobileLifecycleEvent::Backgrounded)
+        );
+        assert_eq!(
+            transition(&mut backgrounded, AppLifecyclePhase::Background),
+            None,
+            "a background after the disconnect must not suspend twice"
+        );
+        assert_eq!(
+            transition(&mut backgrounded, AppLifecyclePhase::Disconnected),
+            None
+        );
+        assert_eq!(
+            transition(&mut backgrounded, AppLifecyclePhase::Active),
+            Some(MobileLifecycleEvent::Resumed)
+        );
     }
 }

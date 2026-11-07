@@ -2116,7 +2116,7 @@ impl BrowserSurface {
                 this.probe_select_hint(x, y, cx);
                 this.probe_cursor(x, y, cx);
             }))
-            .on_scroll_wheel(cx.listener(|this, event: &gpui::ScrollWheelEvent, _, cx| {
+            .on_scroll(cx.listener(|this, event: &gpui::ScrollEvent, _, cx| {
                 let Some((x, y)) = this.to_viewport_point(event.position) else {
                     return;
                 };

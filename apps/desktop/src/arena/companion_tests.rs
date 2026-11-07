@@ -44,7 +44,7 @@ fn double_click(cx: &mut VisualTestContext, id: &'static str) {
     });
     draw(cx);
 }
-fn press(cx: &mut VisualTestContext, name: &str) {
+fn press(cx: &mut VisualTestContext, name: &'static str) {
     let keystroke = Keystroke::parse(name).unwrap();
     cx.simulate_event(KeyDownEvent {
         keystroke: keystroke.clone(),

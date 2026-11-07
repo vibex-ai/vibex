@@ -6,9 +6,9 @@ use std::time::Duration;
 use gpui::{
     Bounds, ClipboardItem, Context, DispatchPhase, Entity, FontWeight, Image, ImageFormat,
     IntoElement, LongPressEvent, MouseButton, MouseUpEvent, ObjectFit, ParentElement as _,
-    PathBuilder, Pixels, Point, Render, ScrollDelta, ScrollHandle, ScrollWheelEvent, Styled as _,
-    Task, TouchDragEvent, TouchPhase, WeakEntity, Window, canvas, div, img, point, prelude::*, px,
-    rgb, svg,
+    PathBuilder, Pixels, Point, Render, ScrollDelta, ScrollEvent, ScrollHandle, Styled as _, Task,
+    TouchDragEvent, TouchPhase, WeakEntity, Window, canvas, div, img, point, prelude::*, px, rgb,
+    svg,
 };
 use vibex_backend::{
     BackendError, BackendOperation, BackendResult, GitBackend as _, MutationRequest,
@@ -2096,7 +2096,7 @@ impl MobileWorkbench {
     fn pull_sheet(
         &mut self,
         key: SheetKey,
-        event: &ScrollWheelEvent,
+        event: &ScrollEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -3458,7 +3458,7 @@ impl MobileWorkbench {
         };
         // The pane's height up to the chrome that never moves with a keyboard:
         // whatever resized the window, this is what the rows have to fill.
-        let insets = window.insets();
+        let insets = window.safe_insets();
         let height = f32::from(window.viewport_size().height) - insets.top - insets.bottom;
         terminal_grid_hold(rows, height, &mut self.terminal_grid_rows)
     }
@@ -3695,12 +3695,7 @@ impl MobileWorkbench {
     /// Scroll-back for the terminal grid. Wheel deltas move the shared render
     /// model's viewport; a downward scroll past the history stops at the live
     /// bottom, mirroring the desktop surface.
-    fn scroll_terminal(
-        &mut self,
-        event: &ScrollWheelEvent,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn scroll_terminal(&mut self, event: &ScrollEvent, _: &mut Window, cx: &mut Context<Self>) {
         let (lines, columns) = match event.delta {
             ScrollDelta::Lines(point) => (point.y * 3.0, point.x * 3.0),
             ScrollDelta::Pixels(point) => (
@@ -3771,7 +3766,7 @@ impl MobileWorkbench {
     /// A pan reports the position it started at together with the distance
     /// moved since the previous step, never the finger's live position, so the
     /// cell under the finger is the start point plus the distance travelled.
-    fn drag_terminal_mouse(&mut self, event: &ScrollWheelEvent, cx: &mut Context<Self>) {
+    fn drag_terminal_mouse(&mut self, event: &ScrollEvent, cx: &mut Context<Self>) {
         let ScrollDelta::Pixels(delta) = event.delta else {
             // Touch pans are always reported in pixels; a line-based delta
             // comes from a wheel, which has no drag to give.
@@ -8157,7 +8152,7 @@ impl MobileWorkbench {
             // sink below is the terminal's one focus target, and
             // `focus_terminal` hands it the tap.
             .on_mouse_down(MouseButton::Left, cx.listener(Self::focus_terminal))
-            .on_scroll_wheel(cx.listener(Self::scroll_terminal))
+            .on_scroll(cx.listener(Self::scroll_terminal))
             // The IME sink: invisible, unfocusable by tap, but the destination
             // the platform keyboard commits into while the grid holds the
             // user's attention.

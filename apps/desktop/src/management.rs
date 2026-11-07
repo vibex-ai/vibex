@@ -18,7 +18,7 @@ use gpui::{
     AccessibleAction, Anchor, AnyElement, App, Bounds, ClickEvent, Context, DragMoveEvent, Empty,
     Entity, EventEmitter, FocusHandle, Focusable as _, FontWeight, HitboxBehavior, Hsla,
     IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, Orientation, PathBuilder, Pixels, Rems,
-    Render, Role, ScrollAnchor, ScrollDelta, ScrollHandle, ScrollWheelEvent, SharedString,
+    Render, Role, ScrollAnchor, ScrollDelta, ScrollEvent, ScrollHandle, SharedString,
     Size as GpuiSize, StatefulInteractiveElement as _, Subscription, Task, Toggled, WeakEntity,
     Window, canvas, div, point, prelude::*, px, rems, size as gpui_size,
 };
@@ -2209,7 +2209,7 @@ fn precise_wheel_scroll(handle: &ScrollHandle) -> impl IntoElement {
         |bounds, window, _| window.insert_hitbox(bounds, HitboxBehavior::Normal).id,
         move |_, hitbox_id, window, _cx| {
             let view = window.current_view();
-            window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
+            window.on_mouse_event(move |event: &ScrollEvent, phase, window, cx| {
                 if !phase.capture() || !hitbox_id.should_handle_scroll(window) {
                     return;
                 }
@@ -45935,15 +45935,13 @@ fn save(cx: &mut Context<Self>) {
             "the probe strip has to overflow before a wheel can move it"
         );
 
-        // Built field by field so the probe does not depend on which scroll
-        // fields this gpui revision carries.
-        let wheel = |delta: ScrollDelta| {
-            let mut event = ScrollWheelEvent::default();
-            event.position = point(px(20.0), px(20.0));
-            event.delta = delta;
-            event.modifiers = Default::default();
-            event.touch_phase = gpui::TouchPhase::Moved;
-            event
+        // The remaining fields come from `Default`, so the probe does not
+        // depend on which scroll fields this gpui revision carries.
+        let wheel = |delta: ScrollDelta| ScrollEvent {
+            position: point(px(20.0), px(20.0)),
+            delta,
+            touch_phase: gpui::TouchPhase::Moved,
+            ..Default::default()
         };
 
         // macOS sends a vertical trackpad swipe as precise pixels; over a

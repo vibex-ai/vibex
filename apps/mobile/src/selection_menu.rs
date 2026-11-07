@@ -15,9 +15,8 @@ use gpui::prelude::FluentBuilder as _;
 use gpui::{
     AnyElement, App, Bounds, BoxShadow, Context, Entity, EntityInputHandler as _, Focusable as _,
     InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent,
-    ParentElement as _, Pixels, Point, Render, ScrollWheelEvent, Size,
-    StatefulInteractiveElement as _, Styled as _, Subscription, TouchPhase, Window, anchored, div,
-    point, px, size,
+    ParentElement as _, Pixels, Point, Render, ScrollEvent, Size, StatefulInteractiveElement as _,
+    Styled as _, Subscription, TouchPhase, Window, anchored, div, point, px, size,
 };
 use gpui_component::input::{
     Copy as CopyAction, Cut as CutAction, Paste as PasteAction, RopeExt as _,
@@ -337,7 +336,7 @@ impl SelectionMenu {
     /// Take a touch drag out of the scroll stream, or let it scroll.
     fn on_touch_scroll(
         &mut self,
-        event: &ScrollWheelEvent,
+        event: &ScrollEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -540,7 +539,7 @@ impl Render for SelectionMenu {
                             }
                         }),
                     )
-                    .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, window, cx| {
+                    .on_scroll(cx.listener(|this, event: &ScrollEvent, window, cx| {
                         this.on_touch_scroll(event, window, cx)
                     })),
             )
@@ -738,23 +737,26 @@ mod tests {
     /// The stream the platform reports for a finger that travels from one point
     /// to another: a scroll gesture, not mouse moves.
     fn drag(cx: &mut VisualTestContext, from: Point<Pixels>, to: Point<Pixels>) {
-        cx.simulate_event(ScrollWheelEvent {
+        cx.simulate_event(ScrollEvent {
             position: from,
             delta: ScrollDelta::Pixels(point(px(0.0), px(0.0))),
             modifiers: Default::default(),
             touch_phase: TouchPhase::Started,
+            ..Default::default()
         });
-        cx.simulate_event(ScrollWheelEvent {
+        cx.simulate_event(ScrollEvent {
             position: to,
             delta: ScrollDelta::Pixels(to - from),
             modifiers: Default::default(),
             touch_phase: TouchPhase::Moved,
+            ..Default::default()
         });
-        cx.simulate_event(ScrollWheelEvent {
+        cx.simulate_event(ScrollEvent {
             position: to,
             delta: ScrollDelta::Pixels(point(px(0.0), px(0.0))),
             modifiers: Default::default(),
             touch_phase: TouchPhase::Ended,
+            ..Default::default()
         });
     }
 

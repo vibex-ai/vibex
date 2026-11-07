@@ -23,9 +23,10 @@ use gpui::{
     ClipboardItem, ClipboardReadError, CursorStyle, DevicePixels, Font, FontFallbacks, FontId,
     FontMetrics, FontRun, ForegroundExecutor, GlyphId, Hsla, Keymap, LineLayout, Menu, MenuItem,
     OwnedMenu, PathPromptOptions, Pixels, Platform, PlatformDisplay, PlatformGestures,
-    PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTextSystem, PlatformWindow,
-    RenderGlyphParams, ScreenCaptureSource, Size, SystemNotification, SystemNotificationResponse,
-    Task, TextRenderingMode, ThermalState, WindowAppearance, WindowButtonLayout, WindowParams,
+    PlatformInfo, PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTextSystem,
+    PlatformWindow, PowerMode, RenderGlyphParams, ScreenCaptureSource, Size, SystemNotification,
+    SystemNotificationResponse, Task, TextRenderingMode, ThermalState, WindowAppearance,
+    WindowButtonLayout, WindowParams,
 };
 use gpui_wgpu::CosmicTextSystem;
 use smallvec::SmallVec;
@@ -140,6 +141,13 @@ struct BoundedFontPlatform {
 }
 
 impl Platform for BoundedFontPlatform {
+    /// The host identity GPUI reads its keyboard conventions from — which key
+    /// is "secondary", how a keystroke is spelled — so it must be the real
+    /// platform's, not a guess made here.
+    fn platform_info(&self) -> PlatformInfo {
+        self.inner.platform_info()
+    }
+
     fn background_executor(&self) -> BackgroundExecutor {
         self.inner.background_executor()
     }
@@ -349,6 +357,18 @@ impl Platform for BoundedFontPlatform {
 
     fn prevent_idle_sleep(&self, reason: &str) -> Task<Result<ActivityGuard>> {
         self.inner.prevent_idle_sleep(reason)
+    }
+
+    /// Forwarded rather than left to the trait default: the Linux platform reads
+    /// the power profile from power-profiles-daemon, and GPUI's low-power frame
+    /// limit only engages when this reports `LowPower`. The default would answer
+    /// `Unknown` for the life of the process.
+    fn power_mode(&self) -> PowerMode {
+        self.inner.power_mode()
+    }
+
+    fn on_power_mode_change(&self, callback: Box<dyn FnMut()>) {
+        self.inner.on_power_mode_change(callback)
     }
 
     fn set_app_identity(&self, identifier: &str, name: &str) {

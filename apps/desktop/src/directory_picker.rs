@@ -1311,8 +1311,10 @@ impl gpui::Render for DirectoryPickerDialog {
                 match event.keystroke.key.as_str() {
                     "up" if !event.keystroke.modifiers.modified() => this.move_active(-1, cx),
                     "down" if !event.keystroke.modifiers.modified() => this.move_active(1, cx),
-                    "d" if event.keystroke.modifiers.secondary() => this.toggle_active_favorite(cx),
-                    "enter" if event.keystroke.modifiers.secondary() => {
+                    "d" if event.keystroke.modifiers.secondary(cx) => {
+                        this.toggle_active_favorite(cx)
+                    }
+                    "enter" if event.keystroke.modifiers.secondary(cx) => {
                         if this.confirm(window, cx) {
                             window.close_dialog(cx);
                         }

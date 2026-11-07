@@ -1256,7 +1256,7 @@ impl Render for RouteStage {
             .min_w_0()
             .overflow_x_scroll()
             .track_scroll(&self.map_scroll)
-            .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+            .on_scroll(|_, _, cx| cx.stop_propagation())
             .child(
                 div()
                     .relative()
@@ -2425,7 +2425,7 @@ mod tests {
     /// travel. The map takes the wheel itself, so the page never moves.
     #[gpui::test]
     fn the_map_takes_the_wheel_so_the_page_never_scrolls(cx: &mut gpui::TestAppContext) {
-        use gpui::{ParentElement as _, ScrollDelta, ScrollWheelEvent, point};
+        use gpui::{ParentElement as _, ScrollDelta, ScrollEvent, point};
 
         struct Page {
             stage: gpui::Entity<RouteStage>,
@@ -2478,11 +2478,12 @@ mod tests {
         assert_eq!(page_probe.offset().y, px(0.0));
 
         // A plain wheel: vertical lines, as a mouse sends them.
-        let wheel = |delta: ScrollDelta| ScrollWheelEvent {
+        let wheel = |delta: ScrollDelta| ScrollEvent {
             position: map.center(),
             delta,
             modifiers: Default::default(),
             touch_phase: gpui::TouchPhase::Moved,
+            ..Default::default()
         };
         cx.simulate_event(wheel(ScrollDelta::Lines(point(0.0, -3.0))));
         cx.update(|window, cx| {

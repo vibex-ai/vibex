@@ -40,8 +40,9 @@ use gpui_component::{
     h_flex,
     input::{
         Editor, EditorState, Input, InputEvent, InputGroup, InputGroupAddon,
-        InputGroupAddonAlignment, InputGroupButton, InputGroupInput, InputState, Position, Replace,
-        Search, TextDecoration, TextDecorationCollection, Textarea, TextareaState,
+        InputGroupAddonAlignment, InputGroupButton, InputGroupInput, InputState,
+        OverviewRulerDecoration, OverviewRulerDecorationCollection, OverviewRulerLane, Position,
+        Replace, Search, TextDecoration, TextDecorationCollection, Textarea, TextareaState,
     },
     menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem},
     notification::NotificationType,
@@ -766,6 +767,13 @@ struct EditorBinding {
     /// Mirrors the selection while the editor is unfocused; see
     /// [`editor_selection_mirror`].
     selection_mirror: TextDecorationCollection,
+    /// The find bar's hits, marked on the editor's scrollbar track.
+    ///
+    /// The bar's count says how many matches there are; the ruler says where.
+    /// It draws on the scrollbar rather than in the text, so an empty
+    /// collection costs no layout and the file does not shift when a find
+    /// opens or closes.
+    find_ruler: OverviewRulerDecorationCollection,
 }
 
 struct GotoLineOverlay {
@@ -2501,6 +2509,7 @@ impl CodeWorkbench {
             return;
         };
         find.input.update(cx, |input, cx| input.close_search(cx));
+        self.clear_editor_find_ruler(&find.path, cx);
         let focus = find.input.read(cx).focus_handle(cx);
         focus.focus(window, cx);
         cx.notify();
@@ -2534,6 +2543,7 @@ impl CodeWorkbench {
                 input.set_search_query(query, true, cx);
             }
         });
+        self.sync_editor_find_ruler(path, cx);
         cx.notify();
     }
 
@@ -2550,7 +2560,40 @@ impl CodeWorkbench {
                 input.next_search_match(cx);
             }
         });
+        self.sync_editor_find_ruler(path, cx);
         cx.notify();
+    }
+
+    /// Mark the find bar's hits on the file's scrollbar track.
+    ///
+    /// The count in the bar says how many hits there are; the ruler is what
+    /// says where they sit in a file taller than the viewport. It is a view of
+    /// the session's own matches rather than a second search, so it cannot
+    /// drift from what Enter steps through. Closing the bar clears it: the
+    /// marks belong to the find, not to the document.
+    fn sync_editor_find_ruler(&mut self, path: &str, cx: &mut Context<Self>) {
+        let Some(binding) = self.editor_bindings.get(path) else {
+            return;
+        };
+        let ruler = binding.find_ruler.clone();
+        let input = binding.input.clone();
+        let decorations = input
+            .read(cx)
+            .search_session()
+            .matcher
+            .matched_ranges()
+            .iter()
+            .cloned()
+            .map(|range| OverviewRulerDecoration::new(range).with_lane(OverviewRulerLane::Center))
+            .collect::<Vec<_>>();
+        ruler.set(decorations, cx);
+    }
+
+    /// Clear the ruler marks a closed find bar left on `path`.
+    fn clear_editor_find_ruler(&mut self, path: &str, cx: &mut App) {
+        if let Some(binding) = self.editor_bindings.get(path) {
+            binding.find_ruler.clear(cx);
+        }
     }
 
     /// Replaces the current hit with the row's text and steps to the next one.
@@ -2581,6 +2624,9 @@ impl CodeWorkbench {
                 input.previous_search_match(cx);
             }
         });
+        // A replace moves the text under the marks and the session has already
+        // re-anchored them; the ruler has to follow before the next frame.
+        self.sync_editor_find_ruler(path, cx);
         cx.notify();
     }
 
@@ -6684,6 +6730,9 @@ impl CodeWorkbench {
         let selection_mirror = input.update(cx, |state, cx| {
             state.create_decorations_collection(Vec::new(), cx)
         });
+        let find_ruler = input.update(cx, |state, cx| {
+            state.create_overview_ruler_decorations_collection(Vec::new(), cx)
+        });
         self.editor_subscriptions
             .push(cx.observe(&input, |_, _, cx| cx.notify()));
         let subscription =
@@ -6728,6 +6777,7 @@ impl CodeWorkbench {
                 id: binding_id,
                 input: input.clone(),
                 selection_mirror,
+                find_ruler,
             },
         );
         input
@@ -14786,7 +14836,7 @@ impl CodeRightRail {
             .items_start()
             .track_scroll(scroll)
             .overflow_scroll()
-            .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+            .on_scroll(|_, _, cx| cx.stop_propagation())
             .child(scroll_content);
         div()
             .size_full()
@@ -17502,7 +17552,7 @@ impl CodeRightRail {
             }
         } else {
             div()
-                .on_scroll_wheel(cx.listener(move |this, _, _, cx| {
+                .on_scroll(cx.listener(move |this, _, _, cx| {
                     if history_has_more
                         && git_history_is_near_bottom(
                             &history_scroll,
@@ -22814,11 +22864,12 @@ mod tests {
             .origin
             .y;
 
-        cx.simulate_event(gpui::ScrollWheelEvent {
+        cx.simulate_event(gpui::ScrollEvent {
             position: point(px(20.0), px(20.0)),
             delta: gpui::ScrollDelta::Pixels(point(px(0.0), px(-120.0))),
             modifiers: Default::default(),
             touch_phase: gpui::TouchPhase::Moved,
+            ..Default::default()
         });
         cx.run_until_parked();
         cx.update(|window, cx| {
@@ -22837,11 +22888,12 @@ mod tests {
         assert!(observed_scroll.offset().y < px(0.0));
         assert_eq!(observed_scroll.offset().x, px(0.0));
 
-        cx.simulate_event(gpui::ScrollWheelEvent {
+        cx.simulate_event(gpui::ScrollEvent {
             position: point(px(20.0), px(20.0)),
             delta: gpui::ScrollDelta::Pixels(point(px(-120.0), px(0.0))),
             modifiers: Default::default(),
             touch_phase: gpui::TouchPhase::Moved,
+            ..Default::default()
         });
         cx.run_until_parked();
         assert!(observed_scroll.offset().x < px(0.0));
@@ -23649,6 +23701,66 @@ mod tests {
             "replacing rewrites exactly one occurrence in the file's buffer"
         );
         assert!(after.contains("Replaced"), "the replacement text lands");
+    }
+
+    /// The find bar's hits are marked on the file's scrollbar track.
+    ///
+    /// The count in the bar says how many hits there are, but a file taller
+    /// than its viewport hides where they sit. The ruler is drawn from the
+    /// session's own matches, so it cannot drift from what Enter steps
+    /// through, and closing the bar has to take the marks away with it.
+    #[gpui::test]
+    fn the_file_find_bar_marks_its_hits_on_the_scrollbar(cx: &mut gpui::TestAppContext) {
+        let (workbench, input, cx) = fixture_editor_input(cx);
+        workbench.update(cx, |this, cx| {
+            this.toggle_markdown_source("README.md".to_string(), cx);
+            this.set_preview_visible(true, cx);
+        });
+        draw_window(cx);
+        cx.update(|window, cx| {
+            input.update(cx, |input, cx| input.focus(window, cx));
+        });
+        draw_window(cx);
+
+        assert!(cx.update(|window, cx| {
+            workbench.update(cx, |this, cx| this.open_focused_editor_find(window, cx))
+        }));
+        draw_window(cx);
+        cx.simulate_input("Vibex");
+        cx.run_until_parked();
+        draw_window(cx);
+
+        let (ruler_len, matcher_len) = workbench.read_with(cx, |this, cx| {
+            let find = this.editor_find.as_ref().expect("the bar is open");
+            let ruler = this.editor_bindings["README.md"].find_ruler.get_ranges(cx);
+            (
+                ruler.len(),
+                find.input.read(cx).search_session().matcher.len(),
+            )
+        });
+        assert!(
+            matcher_len >= 2,
+            "the fixture repeats the term, so there is more than one mark"
+        );
+        assert_eq!(
+            ruler_len, matcher_len,
+            "every hit the bar counts is a mark on the track, once"
+        );
+
+        // A closed bar leaves no marks: they belong to the search, not to the
+        // document, and a stale mark would point at a hit nobody is on.
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        workbench.read_with(cx, |this, cx| {
+            assert!(this.editor_find.is_none(), "escape closes the bar");
+            assert!(
+                this.editor_bindings["README.md"]
+                    .find_ruler
+                    .get_ranges(cx)
+                    .is_empty(),
+                "the closed bar's marks go with it"
+            );
+        });
     }
 
     /// The workbench's find chord reaches the focused editor and nobody else.

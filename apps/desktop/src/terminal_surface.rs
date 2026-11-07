@@ -15,10 +15,9 @@ use gpui::{
     AnyElement, App, BackgroundExecutor, BorderStyle, Bounds, ClipboardItem, ContentMask, Context,
     ElementInputHandler, Entity, EntityInputHandler, FocusHandle, Font, FontFallbacks,
     FontFeatures, FontStyle, FontWeight, Hsla, IntoElement, KeyBinding, KeyDownEvent, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, ScrollDelta,
-    ScrollWheelEvent, ShapedLine, Subscription, Task, TextAlign, TextRun, UTF16Selection,
-    WeakEntity, Window, actions, canvas, div, fill, font, outline, point, prelude::*, px, rgb,
-    size,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, ScrollDelta, ScrollEvent,
+    ShapedLine, Subscription, Task, TextAlign, TextRun, UTF16Selection, WeakEntity, Window,
+    actions, canvas, div, fill, font, outline, point, prelude::*, px, rgb, size,
 };
 use gpui_component::{
     ActiveTheme as _, Disableable as _, ElementExt as _, Icon, IconName, Selectable as _,
@@ -1935,7 +1934,7 @@ impl TerminalSurface {
             // A cell's own `OSC 8` hyperlink wins over a URL detected in its
             // text: the program chose that target explicitly.
             let link = hyperlink.or_else(|| self.link_at(point).map(|link| link.url));
-            if event.modifiers.secondary() && link.is_some() {
+            if event.modifiers.secondary(cx) && link.is_some() {
                 self.active_hyperlink = link;
                 self.open_hyperlink(cx);
             } else if self.selection_anchor == Some(point) {
@@ -2020,7 +2019,7 @@ impl TerminalSurface {
         }
     }
 
-    fn on_scroll(&mut self, event: &ScrollWheelEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn on_scroll(&mut self, event: &ScrollEvent, _: &mut Window, cx: &mut Context<Self>) {
         let lines = self.scroll_delta_lines(event);
         if lines == 0.0 {
             return;
@@ -2080,7 +2079,7 @@ impl TerminalSurface {
     /// A line-granularity event already says how many lines it means; a pixel
     /// event is divided by the measured cell height so a trackpad's sub-row
     /// deltas add up to the number of rows actually travelled.
-    fn scroll_delta_lines(&self, event: &ScrollWheelEvent) -> f32 {
+    fn scroll_delta_lines(&self, event: &ScrollEvent) -> f32 {
         match event.delta {
             ScrollDelta::Lines(point) => point.y,
             ScrollDelta::Pixels(point) => {
@@ -2624,7 +2623,7 @@ impl TerminalSurface {
             .text_size(cx.theme().mono_font_size)
             .line_height(px(cell_metrics.cell_height))
             .font_weight(code_font_weight(cx))
-            .on_scroll_wheel(cx.listener(Self::on_scroll))
+            .on_scroll(cx.listener(Self::on_scroll))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, event: &MouseDownEvent, window, cx| {
@@ -4878,11 +4877,12 @@ mod tests {
             )
         };
         let wheel = |cx: &mut VisualTestContext, position, lines: f32| {
-            cx.simulate_event(gpui::ScrollWheelEvent {
+            cx.simulate_event(gpui::ScrollEvent {
                 position,
                 delta: ScrollDelta::Lines(point(0.0, lines)),
                 modifiers: Default::default(),
                 touch_phase: gpui::TouchPhase::Moved,
+                ..Default::default()
             });
             cx.run_until_parked();
         };
@@ -5552,11 +5552,12 @@ mod tests {
         let origin = surface.read_with(&cx, |surface, _| {
             surface.grid_bounds.expect("grid bounds").origin
         });
-        cx.simulate_event(gpui::ScrollWheelEvent {
+        cx.simulate_event(gpui::ScrollEvent {
             position: point(origin.x + px(20.0), origin.y + px(20.0)),
             delta: ScrollDelta::Lines(point(0.0, 3.0)),
             modifiers: Default::default(),
             touch_phase: gpui::TouchPhase::Moved,
+            ..Default::default()
         });
         cx.run_until_parked();
 

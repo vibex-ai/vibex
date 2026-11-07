@@ -756,11 +756,12 @@ mod tests {
                 .origin
                 .y;
 
-            cx.simulate_event(gpui::ScrollWheelEvent {
+            cx.simulate_event(gpui::ScrollEvent {
                 position: gpui::point(px(40.0), px(40.0)),
                 delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.0), px(-120.0))),
                 modifiers: Default::default(),
                 touch_phase: gpui::TouchPhase::Moved,
+                ..Default::default()
             });
             cx.run_until_parked();
             cx.update(|window, cx| {
@@ -851,11 +852,12 @@ mod tests {
                 "the pinned region should still own its bar"
             );
 
-            cx.simulate_event(gpui::ScrollWheelEvent {
+            cx.simulate_event(gpui::ScrollEvent {
                 position: gpui::point(px(40.0), px(40.0)),
                 delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.0), px(-120.0))),
                 modifiers: Default::default(),
                 touch_phase: gpui::TouchPhase::Moved,
+                ..Default::default()
             });
             cx.run_until_parked();
             cx.update(|window, cx| {
