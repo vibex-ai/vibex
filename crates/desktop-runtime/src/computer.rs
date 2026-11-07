@@ -1455,6 +1455,31 @@ impl ComputerRuntime {
         Some((session_id, frames))
     }
 
+    /// The live frame channel for a session that already exists.
+    ///
+    /// The panel attaches to the *Agent's* session when there is one: its own
+    /// viewer session has no actions to show, while the Agent's carries the
+    /// target, the ledger and the state the stop has to reach.
+    pub async fn subscribe_session_frames(
+        &self,
+        session_id: &vibex_core::ComputerSessionId,
+    ) -> tokio::sync::watch::Receiver<Option<vibex_core::ComputerFrame>> {
+        self.service.subscribe_frames(session_id).await
+    }
+
+    /// The session one Agent session is driving, if it has one.
+    pub async fn session_for_agent(
+        &self,
+        agent_session_id: &VibexSessionId,
+    ) -> Option<vibex_core::ComputerSessionId> {
+        self.service.session_for_agent(agent_session_id).await
+    }
+
+    /// The most recently started Agent session, if any Agent is driving.
+    pub async fn latest_agent_session(&self) -> Option<vibex_core::ComputerSessionId> {
+        self.service.latest_agent_session().await
+    }
+
     /// The emergency stop, exposed for the panel.
     pub async fn stop(&self, reason: &str) -> VibexResult<()> {
         self.service.stop(reason).await.map_err(VibexError::from)

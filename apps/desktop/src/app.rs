@@ -115,6 +115,7 @@ use vibex_backend::{
     AgentBackend as _, BackendError, BackendEvent, BackendEventStream, BackendFacade,
     BackendOperation, BackendProjection, BackendResult, MutationRequest, NativeBackend,
 };
+use vibex_computer::ComputerServiceEvent;
 use vibex_core::{
     AgentAuthCatalog, AgentAuthContext, AgentAuthContextAuthenticateRequest,
     AgentAuthContextStatus, AgentAuthContextVerifyRequest, AgentAuthMethodEffect,
@@ -9888,6 +9889,10 @@ pub struct VibexWorkbench {
     /// The Tokio handle the computer service lives on; the panel polls it from
     /// GPUI's executor, which has no reactor of its own.
     computer_tokio: Option<tokio::runtime::Handle>,
+    /// The stream that raises the panel when an Agent starts driving the
+    /// desktop. Attached with the local runtime and dropped with it, so a shell
+    /// driving a remote runtime never pops a panel for the machine underneath.
+    computer_attention_task: Option<Task<()>>,
     /// The computer-use readiness the settings page shows. Refreshed when the
     /// page opens and after every install or check, never on a repaint: it
     /// spawns a process.
@@ -9897,6 +9902,14 @@ pub struct VibexWorkbench {
     /// The open computer-use panel window, so a mode change can replace it
     /// rather than stack a second panel beside the first.
     computer_panel_window: Option<AnyWindowHandle>,
+    /// The shell the open panel is actually in.
+    ///
+    /// The saved preference and the open shell differ on purpose: the automatic
+    /// panel always opens floating, so a reader whose preference is a window
+    /// would have a floating panel on screen while the settings say "Window".
+    /// The shell toggle reads this, not the preference, or choosing the shell
+    /// the preference already names would do nothing.
+    computer_panel_open_mode: Option<ComputerPanelMode>,
     /// The subscription that notices the panel window going away, so the
     /// workbench's handle is dropped with it.
     _computer_panel_closed_subscription: Option<Subscription>,
@@ -11887,9 +11900,11 @@ impl VibexWorkbench {
             runtime: None,
             computer_runtime: None,
             computer_tokio: None,
+            computer_attention_task: None,
             computer_status: None,
             computer_driver_task: None,
             computer_panel_window: None,
+            computer_panel_open_mode: None,
             _computer_panel_closed_subscription: Some(computer_panel_closed_subscription),
             backend: None,
             shared_workflow: None,
@@ -12443,7 +12458,47 @@ impl VibexWorkbench {
     /// open is raised instead of duplicated, and a shell change replaces the
     /// window rather than leaving two panels showing the same session.
     pub(crate) fn open_computer_panel(&mut self, cx: &mut Context<Self>) {
-        self.open_computer_panel_in(self.computer_panel_mode(), false, cx);
+        self.open_computer_panel_in(self.computer_panel_mode(), false, None, cx);
+    }
+
+    /// Opens the panel because an Agent started driving the desktop.
+    ///
+    /// Two differences from the reader's own "Open panel" action, both of them
+    /// the point of the feature:
+    ///
+    /// * the panel is opened in the **floating** shell whatever the saved shell
+    ///   is, because the Agent is working in the applications behind it and a
+    ///   full window would hide the thing the reader came to watch;
+    /// * it asks not to take the keyboard. The window is created without
+    ///   focus, so an Agent that starts acting while the reader is typing does
+    ///   not move their cursor or steal their keystrokes where the platform
+    ///   honors the request (macOS and Windows do; the Linux backends open the
+    ///   window and let the compositor decide). Clicking it focuses it, and the
+    ///   shell toggle still switches to the full window.
+    ///
+    /// Opening is skipped when the reader has turned the automatic panel off,
+    /// and when a panel is already on screen — the reader's own panel is never
+    /// replaced under them. The bridge only attached here, so a shell driving a
+    /// paired remote runtime never opens a panel for the machine underneath.
+    pub(crate) fn open_computer_panel_for_agent(
+        &mut self,
+        agent_session_id: VibexSessionId,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.ui_state.computer.auto_open_panel {
+            return;
+        }
+        if self.computer_panel_window.is_some() {
+            return;
+        }
+        // The announcement carries the Agent, so the panel can show that
+        // Agent's ledger and target from its first frame.
+        self.open_computer_panel_in(
+            ComputerPanelMode::Floating,
+            false,
+            Some(agent_session_id),
+            cx,
+        );
     }
 
     /// The shell the panel should open in.
@@ -12451,17 +12506,27 @@ impl VibexWorkbench {
         self.ui_state.computer.panel_mode
     }
 
-    /// Stores the reader's shell choice and moves an open panel into it.
+    /// Switches the open panel's shell and remembers it as the reader's choice.
+    ///
+    /// The two are separate decisions: the saved choice is where the reader
+    /// wants *their* panel, while an automatic panel always opens floating.
+    /// The panel is reopened when its actual shell differs from the requested
+    /// one, so the toggle keeps working even while the two disagree. The panel
+    /// itself calls this, which is why a shell request is also a preference:
+    /// dragging the floating strip into a full window is the reader saying
+    /// where the panel belongs.
     fn set_computer_panel_mode(&mut self, mode: ComputerPanelMode, cx: &mut Context<Self>) {
-        if self.ui_state.computer.panel_mode == mode {
-            return;
+        let preference_changed = self.ui_state.computer.panel_mode != mode;
+        if preference_changed {
+            self.ui_state.computer.panel_mode = mode;
+            self.queue_ui_state();
         }
-        self.ui_state.computer.panel_mode = mode;
-        self.queue_ui_state();
-        if self.computer_panel_window.is_some() {
-            self.open_computer_panel_in(mode, true, cx);
+        if self.computer_panel_window.is_some() && self.computer_panel_open_mode != Some(mode) {
+            self.open_computer_panel_in(mode, true, None, cx);
         }
-        cx.notify();
+        if preference_changed {
+            cx.notify();
+        }
     }
 
     /// Opens the panel, optionally replacing a window that is already open.
@@ -12469,6 +12534,7 @@ impl VibexWorkbench {
         &mut self,
         mode: ComputerPanelMode,
         replace_open: bool,
+        agent_session_id: Option<VibexSessionId>,
         cx: &mut Context<Self>,
     ) {
         let (Some(runtime), Some(tokio)) =
@@ -12480,12 +12546,18 @@ impl VibexWorkbench {
         if let Some(handle) = existing {
             if !replace_open {
                 // Already open: raise it rather than stacking a second panel.
+                // An automatic raise leaves the keyboard where it was, so an
+                // Agent beginning work never interrupts typing.
                 self.computer_panel_window = Some(handle);
-                let _ = handle.update(cx, |_, window, cx| {
-                    window.activate_window();
-                    cx.activate(true);
-                    window.refresh();
-                });
+                if agent_session_id.is_some() {
+                    let _ = handle.update(cx, |_, window, _| window.refresh());
+                } else {
+                    let _ = handle.update(cx, |_, window, cx| {
+                        window.activate_window();
+                        cx.activate(true);
+                        window.refresh();
+                    });
+                }
                 return;
             }
             // A shell change is a replacement, so the old window is dropped
@@ -12527,6 +12599,16 @@ impl VibexWorkbench {
                 ..Default::default()
             }
         };
+        // An automatic open must not take the keyboard: the reader may be
+        // typing into the Agent's session when the Agent starts acting.
+        let options = if agent_session_id.is_some() {
+            WindowOptions {
+                focus: false,
+                ..options
+            }
+        } else {
+            options
+        };
         let appearance = self.ui_state.appearance.clone();
         let backdrop = self.backdrop();
         let workbench = cx.weak_entity();
@@ -12535,7 +12617,15 @@ impl VibexWorkbench {
             // last applied, or it would repaint every other window's palette.
             theme::apply_appearance(&appearance, backdrop, Some(window), cx);
             let surface = cx.new(|cx| {
-                crate::computer_surface::ComputerSurface::new_in(runtime, tokio, mode, cx)
+                crate::computer_surface::ComputerSurface::new_in(
+                    runtime,
+                    tokio,
+                    mode,
+                    // A panel the reader opened watches its own session; one
+                    // raised for an Agent attaches to that Agent's session.
+                    agent_session_id.clone(),
+                    cx,
+                )
             });
             // The shell toggle lives in the panel, but the shell is a window
             // property, so the panel asks the workbench to reopen it.
@@ -12559,8 +12649,12 @@ impl VibexWorkbench {
         match opened {
             Ok(handle) => {
                 self.computer_panel_window = Some(handle.into());
+                self.computer_panel_open_mode = Some(mode);
             }
             Err(error) => {
+                // The old window is gone and no new one replaced it, so the
+                // recorded shell must not claim a panel is on screen.
+                self.computer_panel_open_mode = None;
                 let message = format!("failed to open the computer-use panel: {error}");
                 eprintln!("{message}");
                 if let Some(handle) = self.window_handle {
@@ -12580,6 +12674,7 @@ impl VibexWorkbench {
     fn handle_computer_panel_closed(&mut self, window_id: WindowId, cx: &mut Context<Self>) {
         if self.computer_panel_window.map(|handle| handle.window_id()) == Some(window_id) {
             self.computer_panel_window = None;
+            self.computer_panel_open_mode = None;
             cx.notify();
         }
     }
@@ -16540,12 +16635,69 @@ impl VibexWorkbench {
         }
         self.computer_runtime = Some(runtime.computer());
         self.computer_tokio = Some(gpui_tokio::Tokio::handle(cx));
+        self.start_computer_attention_bridge(runtime.clone(), cx);
         // The persisted per-Agent tool answers belong to this authority: a
         // session created from here on has to see the same list the Config
         // Center is rendering.
         self.apply_agent_tool_preferences(cx);
         self.apply_computer_settings(cx);
         cx.notify();
+    }
+
+    /// Raises the computer panel the first time an Agent drives the desktop.
+    ///
+    /// The transport is the computer service's own event stream rather than the
+    /// desktop event stream: the computer layer already owns the one signal
+    /// that matters here — an Agent's first tool call — and routing it through
+    /// the runtime would mean a second hop and a second copy of the state.
+    ///
+    /// A panel that is already on screen is never replaced or re-raised, and a
+    /// reader who closes it stays closed: the announcement is sent once per
+    /// computer session, so the next thing that can reopen a panel is the next
+    /// Agent that starts driving the desktop.
+    fn start_computer_attention_bridge(
+        &mut self,
+        runtime: Arc<DesktopRuntime>,
+        cx: &mut Context<Self>,
+    ) {
+        self.computer_attention_task = None;
+        let service = runtime.computer().service().clone();
+        let mut events = service.subscribe();
+        self.computer_attention_task = Some(cx.spawn(
+            async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                loop {
+                    let event = match events.recv().await {
+                        Ok(event) => event,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                            // The stream is advisory: a missed announcement only
+                            // means a panel stays shut, never that an action
+                            // ran unreported.
+                            tracing::debug!(
+                                target: "vibex_computer",
+                                skipped,
+                                "the computer-use event stream lagged for the panel bridge"
+                            );
+                            continue;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                    };
+                    let ComputerServiceEvent::AgentSessionStarted {
+                        agent_session_id, ..
+                    } = event
+                    else {
+                        continue;
+                    };
+                    if entity
+                        .update(cx, |this, cx| {
+                            this.open_computer_panel_for_agent(agent_session_id, cx)
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            },
+        ));
     }
 
     /// Reads the embedded runtime's published name off the UI thread.
@@ -16581,6 +16733,7 @@ impl VibexWorkbench {
     /// keeps serving its own paired devices, and the bridge now answers them
     /// from the parked embedded arrangement instead of the displayed one.
     fn park_local_runtime(&mut self, cx: &mut Context<Self>) {
+        self.computer_attention_task = None;
         self.agent_poll_task = None;
         self.runtime_heartbeat_task = None;
         self.agent_load_task = None;
@@ -16788,6 +16941,7 @@ impl VibexWorkbench {
     /// the runtime down explicitly releases the lock even while other clones
     /// are still alive.
     fn retire_local_runtime(&mut self, cx: &mut Context<Self>) {
+        self.computer_attention_task = None;
         self.agent_poll_task = None;
         self.runtime_heartbeat_task = None;
         self.agent_load_task = None;
@@ -46253,6 +46407,17 @@ impl VibexWorkbench {
         self.ui_state.computer.approval_policy = policy;
         self.queue_ui_state();
         self.apply_computer_settings(cx);
+    }
+
+    /// Stores whether the panel may open by itself when an Agent starts.
+    ///
+    /// The preference is read at the moment of the event, so this needs no
+    /// round trip to the runtime: it decides whether this shell opens a
+    /// window, and the runtime has no say in that.
+    fn set_computer_auto_open_panel(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.ui_state.computer.auto_open_panel = enabled;
+        self.queue_ui_state();
+        cx.notify();
     }
 
     fn set_computer_allow_self_target(&mut self, allowed: bool, cx: &mut Context<Self>) {
@@ -91426,7 +91591,9 @@ impl FoundationSettings {
         // the feature on is also where the reader opens it and decides how it
         // is hosted. Opening is offered whenever the feature is on, even before
         // the driver answers, because the panel is also where the reason it
-        // cannot run is spelled out.
+        // cannot run is spelled out. The shell choice applies to a panel the
+        // reader opens; the automatic one always opens floating, because the
+        // Agent is working behind it.
         let panel_row = setting_row(
             locale::text("Panel", "面板", "面板"),
             locale::text(
@@ -91473,6 +91640,32 @@ impl FoundationSettings {
                         ),
                     ],
                 )),
+            stacked,
+            cx,
+        );
+
+        // Opening by itself is what makes the panel a safety surface rather
+        // than a viewer someone remembers to start. It is a switch of its own,
+        // not a side effect of the master switch: a reader who wants computer
+        // use without a window appearing commits to watching for it.
+        let auto_open_row = setting_row(
+            locale::text("Open automatically", "自动打开", "自動開啟"),
+            locale::text(
+                "Open the panel as a floating window when an Agent starts using computer use, \
+                 without taking the keyboard. Closing it keeps it closed until the next Agent \
+                 starts.",
+                "Agent 开始使用电脑操作时，自动以浮动窗口打开面板，且不会抢走键盘。关闭面板后，直到下一个 Agent 开始前都不会再自动打开。",
+                "Agent 開始使用電腦操作時，自動以浮動視窗開啟面板，且不會搶走鍵盤。關閉面板後，直到下一個 Agent 開始前都不會再自動開啟。",
+            ),
+            Switch::new("computer-auto-open-panel")
+                .small()
+                .checked(settings.auto_open_panel)
+                .on_click(cx.listener(|this, enabled, _, cx| {
+                    let enabled = *enabled;
+                    let _ = this.workbench.update(cx, |workbench, cx| {
+                        workbench.set_computer_auto_open_panel(enabled, cx)
+                    });
+                })),
             stacked,
             cx,
         );
@@ -91557,7 +91750,10 @@ impl FoundationSettings {
             ),
             vec![
                 SettingsGroup::unlabeled(vec![master, driver_row, permissions_row]),
-                SettingsGroup::new(locale::text("Panel", "面板", "面板"), vec![panel_row]),
+                SettingsGroup::new(
+                    locale::text("Panel", "面板", "面板"),
+                    vec![panel_row, auto_open_row],
+                ),
                 SettingsGroup::new(
                     locale::text("Approval", "审批", "審批"),
                     vec![approval_row, self_row],
@@ -103795,9 +103991,7 @@ mod tests {
             .expect("agent overview should remain inspectable");
         let catalog = source
             .split_once("    fn load_agent_runtime_catalog(")
-            .and_then(|(_, tail)| {
-                tail.split_once("\n    fn reconcile_new_session_runtime_selection(")
-            })
+            .and_then(|(_, tail)| tail.split_once("\n    fn reconcile_new_session_runtime_selection("))
             .map(|(body, _)| body)
             .expect("runtime catalog loader should remain inspectable");
         let timeline = source
@@ -107077,9 +107271,7 @@ mod tests {
         let page = source
             .split_once("    fn render_session_terminal_body(")
             .and_then(|(_, tail)| {
-                tail.split_once(
-                    "\n    /// What the page shows when the session has no running PTY.",
-                )
+                tail.split_once("\n    /// What the page shows when the session has no running PTY.")
             })
             .map(|(body, _)| body)
             .expect("the terminal page body should remain inspectable");
@@ -107322,9 +107514,7 @@ mod tests {
         let page = source
             .split_once("    fn render_session_terminal_body(")
             .and_then(|(_, tail)| {
-                tail.split_once(
-                    "\n    /// What the page shows when the session has no running PTY.",
-                )
+                tail.split_once("\n    /// What the page shows when the session has no running PTY.")
             })
             .map(|(body, _)| body)
             .expect("the terminal page body should remain inspectable");
@@ -116561,6 +116751,75 @@ mod tests {
         assert!(
             !handler.contains("has_active_dialog"),
             "an active-dialog guard here swallows the click: settings is a dialog"
+        );
+    }
+
+    /// The automatic panel is a decision on the page, not a side effect of the
+    /// master switch, and its row says what it will and will not do.
+    ///
+    /// Three properties are load-bearing: the switch exists at all (a reader
+    /// must be able to keep computer use without a window appearing), the row
+    /// lives in the panel group rather than with approval, and the automatic
+    /// open never inherits the saved shell — it is a floating strip whatever
+    /// the reader chose for their own opens, because the Agent works behind it.
+    #[test]
+    fn the_automatic_panel_is_its_own_switch_inside_the_panel_group() {
+        let source = include_str!("app.rs");
+        let page = source
+            .split_once("    fn render_computer_page(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_browser_page("))
+            .map(|(body, _)| body)
+            .expect("the computer settings page should remain inspectable");
+        assert!(page.contains("Switch::new(\"computer-auto-open-panel\")"));
+        assert!(page.contains(".checked(settings.auto_open_panel)"));
+        assert!(page.contains("set_computer_auto_open_panel"));
+        assert!(
+            page.contains("vec![panel_row, auto_open_row]"),
+            "the automatic switch belongs beside the panel it opens"
+        );
+        let panel_group = page
+            .split_once("SettingsGroup::new(\n                    locale::text(\"Panel\", \"面板\", \"面板\"),")
+            .and_then(|(_, tail)| tail.split_once("),"))
+            .map(|(body, _)| body)
+            .expect("the panel group should be one inspectable list");
+        assert!(
+            panel_group.contains("panel_row") && panel_group.contains("auto_open_row"),
+            "the automatic switch belongs beside the panel it opens"
+        );
+        assert!(
+            !panel_group.contains("approval_row"),
+            "opening a window is not an approval decision"
+        );
+
+        let opener = source
+            .split_once("    pub(crate) fn open_computer_panel_for_agent(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// The shell the panel should open in."))
+            .map(|(body, _)| body)
+            .expect("the automatic opener should remain inspectable");
+        assert!(opener.contains("self.ui_state.computer.auto_open_panel"));
+        assert!(opener.contains("ComputerPanelMode::Floating"));
+        assert!(
+            !opener.contains("self.computer_panel_mode()"),
+            "the automatic open must not follow the saved shell"
+        );
+        assert!(
+            opener.contains("agent_session_id"),
+            "the panel has to know which Agent it was raised for"
+        );
+
+        // Because the automatic shell and the saved shell disagree by design,
+        // the toggle has to compare against the shell on screen. Comparing the
+        // preference made "open the full window" a no-op on a floating
+        // automatic panel whose preference was already Window.
+        let toggle = source
+            .split_once("    fn set_computer_panel_mode(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// Opens the panel, optionally replacing"))
+            .map(|(body, _)| body)
+            .expect("the shell toggle should remain inspectable");
+        assert!(toggle.contains("self.computer_panel_open_mode != Some(mode)"));
+        assert!(
+            !toggle.contains("if self.ui_state.computer.panel_mode == mode {\n            return;"),
+            "the toggle must not early-return on the preference"
         );
     }
 

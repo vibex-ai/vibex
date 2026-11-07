@@ -2,10 +2,11 @@
 //!
 //! These are the user's decisions, not the runtime's state: whether the feature
 //! may run at all, how much approval the Agent needs, whether it may drive
-//! Vibex's own window, how long one desktop call may take, and whether the
-//! driver's experimental Wayland backend is used. They live in the desktop UI
-//! state because they are edited in the settings and read at startup — the
-//! runtime is handed the answer rather than owning it.
+//! Vibex's own window, whether the floating panel opens when an Agent starts,
+//! how long one desktop call may take, and whether the driver's experimental
+//! Wayland backend is used. They live in the desktop UI state because they are
+//! edited in the settings and read at startup — the runtime is handed the
+//! answer rather than owning it.
 //!
 //! Everything here has a conservative default. The feature ships **off**, the
 //! policy ships as "ask", and driving Vibex's own window ships disabled,
@@ -68,6 +69,16 @@ pub struct ComputerUiState {
     /// window is a feedback loop, not an over-permissioned action.
     #[serde(default)]
     pub allow_self_target: bool,
+    /// Whether the floating panel opens by itself when an Agent starts using
+    /// computer use. Default `true`.
+    ///
+    /// The panel is the human's half of the feature: it shows what the Agent is
+    /// doing and carries the emergency stop. An Agent acting on the real
+    /// desktop should not begin unseen, so the default is on. It is still the
+    /// reader's decision, and a closed panel stays closed for the rest of that
+    /// Agent session so the window never fights the reader.
+    #[serde(default = "default_auto_open_panel")]
+    pub auto_open_panel: bool,
     /// How long one desktop call may take, in milliseconds.
     #[serde(default = "default_call_timeout_ms")]
     pub call_timeout_ms: u64,
@@ -86,6 +97,10 @@ fn default_call_timeout_ms() -> u64 {
     COMPUTER_CALL_TIMEOUT_DEFAULT_MS
 }
 
+fn default_auto_open_panel() -> bool {
+    true
+}
+
 impl Default for ComputerUiState {
     fn default() -> Self {
         Self {
@@ -93,6 +108,7 @@ impl Default for ComputerUiState {
             panel_mode: ComputerPanelMode::Window,
             approval_policy: ComputerApprovalPolicy::Ask,
             allow_self_target: false,
+            auto_open_panel: true,
             call_timeout_ms: COMPUTER_CALL_TIMEOUT_DEFAULT_MS,
             wayland_opt_in: None,
         }
@@ -136,6 +152,17 @@ mod tests {
     }
 
     #[test]
+    fn the_panel_auto_opens_by_default_and_survives_a_missing_field() {
+        // Auto-open is a convenience, not a security decision: it does not
+        // grant the Agent anything, and the emergency stop is more useful when
+        // the panel is already on screen. A file written before the switch
+        // existed must still get it.
+        assert!(ComputerUiState::default().auto_open_panel);
+        let from_disk: ComputerUiState = serde_json::from_str("{}").unwrap();
+        assert!(from_disk.auto_open_panel);
+    }
+
+    #[test]
     fn a_file_without_the_field_reads_as_the_defaults() {
         let state: ComputerUiState = serde_json::from_str("{}").unwrap();
         assert_eq!(state, ComputerUiState::default());
@@ -170,6 +197,7 @@ mod tests {
             panel_mode: ComputerPanelMode::Floating,
             approval_policy: ComputerApprovalPolicy::Allow,
             allow_self_target: true,
+            auto_open_panel: false,
             call_timeout_ms: 120_000,
             wayland_opt_in: Some(false),
         };
@@ -179,6 +207,7 @@ mod tests {
         assert_eq!(state.policy_label(), "allow");
         assert_eq!(state.panel_mode.as_str(), "floating");
         assert!(state.panel_mode.is_floating());
+        assert!(!decoded.auto_open_panel);
     }
 
     #[test]

@@ -284,6 +284,19 @@ pub struct ComputerApprovalRequest {
 #[derive(Debug, Clone)]
 pub enum ComputerServiceEvent {
     SessionChanged(Box<ComputerSession>),
+    /// An Agent used computer use for the first time in its session.
+    ///
+    /// Emitted from the tool-call path, not when the session row is created:
+    /// the runtime resolves a token on every MCP request — including the
+    /// `initialize` and `tools/list` a client sends before it does anything —
+    /// and a panel that opened on those would be raised by a handshake. A
+    /// client uses this to surface the session (the desktop panel does); it
+    /// carries no authority, because whether an action may run is still decided
+    /// per call.
+    AgentSessionStarted {
+        session_id: ComputerSessionId,
+        agent_session_id: VibexSessionId,
+    },
     Action(Box<ComputerActionRecord>),
     Frame(Box<ComputerFrame>),
     Availability(Box<ComputerAvailability>),
@@ -335,6 +348,10 @@ struct SessionRuntime {
     /// wait a whole interval.
     last_frame: Option<ComputerFrame>,
     frame_sequence: u64,
+    /// Whether this session has already told clients an Agent is driving. The
+    /// announcement belongs to the first tool call, so the flag rides the
+    /// session rather than the event stream.
+    agent_announced: bool,
 }
 
 impl SessionRuntime {
@@ -347,6 +364,7 @@ impl SessionRuntime {
             loop_guard: LoopGuard::new(),
             last_frame: None,
             frame_sequence: 0,
+            agent_announced: false,
         }
     }
 
@@ -712,6 +730,62 @@ impl ComputerService {
             .map(|runtime| runtime.session.clone())
     }
 
+    /// The session one Agent session is driving, once it has one.
+    ///
+    /// A human-facing viewer needs this to show the Agent's own ledger and
+    /// target: the panel's own session records only what the human did, so a
+    /// panel that reads its own session reports "no actions" while an Agent is
+    /// working.
+    pub async fn session_for_agent(
+        &self,
+        agent_session_id: &VibexSessionId,
+    ) -> Option<ComputerSessionId> {
+        self.inner
+            .sessions
+            .lock()
+            .await
+            .values()
+            .find(|runtime| runtime.session.agent_session_id.as_ref() == Some(agent_session_id))
+            .map(|runtime| runtime.session.session_id.clone())
+    }
+
+    /// The most recently started Agent session that may still act.
+    ///
+    /// A viewer that was opened before an Agent started has no Agent to attach
+    /// to; it takes the newest live one rather than showing an empty ledger
+    /// while the desktop is being driven. A stopped or paused Agent is
+    /// deliberately not chosen: the reader's own panel reverting to its viewer
+    /// session once the drive ends is better than it freezing on a session that
+    /// will never move again. A panel raised *for* an Agent uses
+    /// [`Self::session_for_agent`] instead, which does show a stopped session —
+    /// that is where the reader re-enables it.
+    ///
+    /// The tie-break is the session id, so two Agents announced in the same
+    /// millisecond still resolve deterministically.
+    pub async fn latest_agent_session(&self) -> Option<ComputerSessionId> {
+        self.inner
+            .sessions
+            .lock()
+            .await
+            .values()
+            .filter(|runtime| {
+                runtime.session.agent_session_id.is_some()
+                    && runtime.session.state.accepts_actions()
+            })
+            .max_by(|left, right| {
+                left.session
+                    .started_at_ms
+                    .cmp(&right.session.started_at_ms)
+                    .then_with(|| {
+                        left.session
+                            .session_id
+                            .as_str()
+                            .cmp(right.session.session_id.as_str())
+                    })
+            })
+            .map(|runtime| runtime.session.session_id.clone())
+    }
+
     /// The full live state for the panel.
     pub async fn session_snapshot(
         &self,
@@ -1019,6 +1093,44 @@ impl ComputerService {
         self.inner.frames.lock().await.clear();
     }
 
+    /// Announces an Agent the first time it actually drives the desktop.
+    ///
+    /// The session row exists from token resolution, which happens on the MCP
+    /// handshake too; a client that opened a panel on that would be raising a
+    /// window for `tools/list`. The announcement therefore belongs here, and a
+    /// refused call never reaches it — a stopped session must not pop anything
+    /// up. A panel-driven session is not an Agent and stays silent.
+    ///
+    /// Two calls are deliberately not announcements: `computer_permissions` is
+    /// a readiness probe an Agent may make and then decide not to act on, and
+    /// anything at all with no engine installed is a request that cannot touch
+    /// the desktop — the timeline already says why.
+    async fn announce_agent_session(&self, context: &ComputerToolContext, name: &str) {
+        let Some(agent_session_id) = context.agent_session_id.clone() else {
+            return;
+        };
+        if name == tools::NAMES_PERMISSIONS || !self.has_engine() {
+            return;
+        }
+        let mut sessions = self.inner.sessions.lock().await;
+        let Some(runtime) = sessions.get_mut(&context.session_id) else {
+            return;
+        };
+        if runtime.agent_announced {
+            return;
+        }
+        runtime.agent_announced = true;
+        let session_id = context.session_id.clone();
+        drop(sessions);
+        let _ = self
+            .inner
+            .events
+            .send(ComputerServiceEvent::AgentSessionStarted {
+                session_id,
+                agent_session_id,
+            });
+    }
+
     /// Handles one tool call.
     pub async fn call_tool_checked(
         &self,
@@ -1042,6 +1154,7 @@ impl ComputerService {
         if self.inner.stopped.load(Ordering::SeqCst) {
             return Err(state_error(ComputerSessionState::StoppedByUser, name));
         }
+        self.announce_agent_session(context, name).await;
         match name {
             tools::NAMES_LIST_APPS => self.tool_list_apps(context).await,
             tools::NAMES_LAUNCH_APP => self.tool_launch_app(context, arguments).await,
@@ -2510,5 +2623,201 @@ impl CanonicalDisplay for ComputerApplication {
             Some(path) => format!("{} ({path})", self.display_name),
             None => format!("{} [{}]", self.display_name, self.app_id),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fixture::FixtureEngine;
+    use std::sync::Arc;
+
+    async fn agent_context(
+        agent_session_id: VibexSessionId,
+    ) -> (tempfile::TempDir, ComputerService, ComputerToolContext) {
+        let home = tempfile::tempdir().expect("a temporary runtime home");
+        let service = ComputerService::new(ComputerServiceConfig::new(home.path()));
+        service.install_engine(Arc::new(FixtureEngine::default()));
+        let session_id = service
+            .ensure_session(
+                ComputerSessionKey::Agent(agent_session_id.clone()),
+                None,
+                ComputerToolTier::Structured,
+            )
+            .await
+            .expect("a session for the Agent");
+        let mut context = ComputerToolContext::new(session_id, ComputerToolTier::Structured);
+        context.agent_session_id = Some(agent_session_id);
+        (home, service, context)
+    }
+
+    /// Drains the stream and counts the announcements it carried.
+    async fn collect_announcements(
+        events: &mut tokio::sync::broadcast::Receiver<ComputerServiceEvent>,
+    ) -> Vec<ComputerSessionId> {
+        let mut announced = Vec::new();
+        for _ in 0..8 {
+            match tokio::time::timeout(Duration::from_millis(50), events.recv()).await {
+                Ok(Ok(ComputerServiceEvent::AgentSessionStarted { session_id, .. })) => {
+                    announced.push(session_id);
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => panic!("the event stream closed: {error}"),
+                Err(_) => break,
+            }
+        }
+        announced
+    }
+
+    #[tokio::test]
+    async fn resolving_a_token_does_not_announce_an_agent() {
+        // The runtime resolves a token on the MCP handshake as well as on a
+        // tool call. Only the call may raise the panel, so creating the session
+        // must stay silent.
+        let home = tempfile::tempdir().expect("a temporary runtime home");
+        let service = ComputerService::new(ComputerServiceConfig::new(home.path()));
+        let mut events = service.subscribe();
+        service
+            .ensure_session(
+                ComputerSessionKey::Agent(VibexSessionId::new()),
+                None,
+                ComputerToolTier::Structured,
+            )
+            .await
+            .unwrap();
+        assert!(collect_announcements(&mut events).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_agent_session_announces_itself_once_on_its_first_tool_call() {
+        let (_home, service, context) = agent_context(VibexSessionId::new()).await;
+        let mut events = service.subscribe();
+        service
+            .call_tool_checked(&context, tools::NAMES_LIST_APPS, &Value::Null)
+            .await
+            .expect("the fixture lists its applications");
+        // The runtime resolves the token on every tool call; only the first one
+        // may announce the Agent.
+        service
+            .call_tool_checked(&context, tools::NAMES_LIST_APPS, &Value::Null)
+            .await
+            .expect("the fixture lists its applications twice");
+        assert_eq!(
+            collect_announcements(&mut events).await,
+            vec![context.session_id.clone()],
+            "a session announces itself exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_viewer_finds_a_live_agent_and_ignores_a_stopped_one() {
+        // The reader's own panel attaches to an Agent that is driving. Once the
+        // drive ends — a stop, a pause, a disconnect — it must fall back to its
+        // own viewer session rather than freezing on a session that will not
+        // move again. A panel raised for the Agent does not use this lookup, so
+        // it can still show the stopped session and its Re-enable button.
+        let (_home, service, context) = agent_context(VibexSessionId::new()).await;
+        // The session row exists from token resolution; the viewer may attach
+        // to it before the first action, which is what makes the panel show
+        // "connecting" rather than an unrelated viewer session.
+        assert_eq!(
+            service.latest_agent_session().await,
+            Some(context.session_id.clone())
+        );
+        service
+            .call_tool_checked(&context, tools::NAMES_LIST_APPS, &Value::Null)
+            .await
+            .expect("the fixture lists its applications");
+        assert_eq!(
+            service.latest_agent_session().await,
+            Some(context.session_id.clone())
+        );
+        assert_eq!(
+            service.session_for_agent(&context.agent_session_id.clone().unwrap()).await,
+            Some(context.session_id.clone())
+        );
+
+        service.stop("the user pressed stop").await.unwrap();
+        assert_eq!(service.latest_agent_session().await, None);
+        assert_eq!(
+            service.session_for_agent(&context.agent_session_id.clone().unwrap()).await,
+            Some(context.session_id.clone()),
+            "the Agent's own panel still needs the stopped session"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_panel_session_never_announces_itself() {
+        // The panel drives the same service as a human, so it must not be
+        // reported as an Agent starting.
+        let home = tempfile::tempdir().expect("a temporary runtime home");
+        let service = ComputerService::new(ComputerServiceConfig::new(home.path()));
+        service.install_engine(Arc::new(FixtureEngine::default()));
+        let session_id = service
+            .ensure_session(ComputerSessionKey::Panel, None, ComputerToolTier::Visual)
+            .await
+            .unwrap();
+        let context = ComputerToolContext::new(session_id, ComputerToolTier::Visual);
+        let mut events = service.subscribe();
+        service
+            .call_tool_checked(&context, tools::NAMES_LIST_APPS, &Value::Null)
+            .await
+            .expect("the fixture lists its applications");
+        assert!(collect_announcements(&mut events).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_permissions_probe_does_not_announce_itself() {
+        // `computer_permissions` is the readiness probe an Agent makes before
+        // deciding whether to act. Opening a window for that would be raising
+        // one for a question.
+        let (_home, service, context) = agent_context(VibexSessionId::new()).await;
+        let mut events = service.subscribe();
+        service
+            .call_tool_checked(&context, tools::NAMES_PERMISSIONS, &Value::Null)
+            .await
+            .expect("the fixture reports its permissions");
+        assert!(collect_announcements(&mut events).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_missing_engine_does_not_announce_itself() {
+        // Without an engine the call cannot reach the desktop, and the
+        // timeline already carries the named reason. There is nothing to watch.
+        let home = tempfile::tempdir().expect("a temporary runtime home");
+        let service = ComputerService::new(ComputerServiceConfig::new(home.path()));
+        let agent_session_id = VibexSessionId::new();
+        let session_id = service
+            .ensure_session(
+                ComputerSessionKey::Agent(agent_session_id.clone()),
+                None,
+                ComputerToolTier::Structured,
+            )
+            .await
+            .unwrap();
+        let mut context = ComputerToolContext::new(session_id, ComputerToolTier::Structured);
+        context.agent_session_id = Some(agent_session_id);
+        let mut events = service.subscribe();
+        assert!(
+            service
+                .call_tool_checked(&context, tools::NAMES_LIST_APPS, &Value::Null)
+                .await
+                .is_err()
+        );
+        assert!(collect_announcements(&mut events).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_stopped_session_does_not_announce_itself() {
+        // A stop is terminal until a human re-enables it, and the Agent's next
+        // call is refused. Refusing must not also raise a panel.
+        let (_home, service, context) = agent_context(VibexSessionId::new()).await;
+        service.stop("the user pressed stop").await.unwrap();
+        let mut events = service.subscribe();
+        let refused = service
+            .call_tool_checked(&context, tools::NAMES_LIST_APPS, &Value::Null)
+            .await;
+        assert!(refused.is_err());
+        assert!(collect_announcements(&mut events).await.is_empty());
     }
 }

@@ -176,6 +176,42 @@ The computer layer carries its **own approval TTL**: pending permissions have no
 global expiry in this runtime, so an unanswered card would hold an agent tool
 call for the whole prompt budget.
 
+## The announcement signal
+
+The runtime emits `ComputerServiceEvent::AgentSessionStarted` **once per
+computer session, from the tool-call path** — never from `ensure_session`. Token
+resolution runs on every MCP request, including the `initialize` and
+`tools/list` a client sends before it does anything, so a signal sent from there
+would be raised by handshakes and by probes. The first tool call is the first
+evidence an Agent is actually driving the desktop.
+
+The signal carries `session_id` and `agent_session_id` and **no authority**:
+whether an action may run is still decided per call. A refused call (a stopped,
+paused or disconnected session) never reaches it, so an emergency stop cannot
+also pop a panel open. A panel-driven session has no Agent id and stays silent.
+So do two calls that do not read as "the Agent is driving": a
+`computer_permissions` probe — an Agent may check readiness and then decide not
+to act — and any call with no engine installed, which cannot reach the desktop
+at all.
+
+A client uses it to surface the session — the desktop workbench opens the
+floating panel, subject to the setting above — and to attach the panel to the
+Agent's own session rather than the viewer session it would otherwise create:
+the Agent's session is where the target, the ledger and the state the stop has
+to reach live. `ComputerService::session_for_agent` and `latest_agent_session`
+are the two reads a viewer needs; neither grants anything.
+
+The two are deliberately different:
+
+| read | answers | used by |
+| --- | --- | --- |
+| `session_for_agent` | that Agent's session, in whatever state | a panel raised for an Agent — a stopped session is where Re-enable lives |
+| `latest_agent_session` | the newest **live** Agent session | a panel the reader opened by hand, which falls back to its own viewer session once the drive ends |
+
+The fallback is what keeps a viewer honest: attaching it to a stopped Agent
+would freeze it on a session that will never move again, while attaching it to
+its own viewer keeps the desktop and the stop available.
+
 ## The emergency stop
 
 One press reaches a terminal state, in this order:
@@ -366,7 +402,7 @@ nothing held.
 The settings page is the product's front door for this feature. Nothing about
 setup requires a terminal, and nothing happens on its own. It is built from the
 same rows and groups as every other settings page — no wizard, no modal — and it
-says four things:
+says five things:
 
 - **The switch.** One row turns the feature on and off, and the change is live:
   turning it on starts the helper and the endpoint, turning it off releases the
@@ -436,6 +472,20 @@ says four things:
 - **The system permissions.** A read-only line with the three states the
   operating system reports, because Vibex cannot consent on the user's behalf
   and a permission that needs a restart must not look like a denial.
+- **Opening by itself.** The panel group carries its own switch, on by
+  default, for raising the floating panel when an Agent starts using computer
+  use. It is a separate decision from the master switch because a reader may
+  want the capability without a window appearing. The panel is opened **once
+  per Agent computer session**, in the floating shell whatever shell the reader
+  saved for their own opens, and **asking not to take the keyboard** (the window
+  is created unfocused; macOS and Windows honor it, the Linux backends leave the
+  decision to the compositor), so an Agent that starts acting while someone is
+  typing does not steal their keystrokes. A panel already on screen is left
+  alone, and one the reader closes stays closed until the next Agent starts.
+  Because the automatic shell and the saved shell are separate decisions, the
+  workbench tracks the shell the panel is actually in and reopens it when the
+  reader asks for the other one — otherwise a toggle request naming the saved
+  shell would be a no-op on a floating automatic panel.
 - **Approval, calls and this platform.** The approval policy (allow / ask /
   deny), the switch that permits operating Vibex's own windows, the call
   timeout, and one row per capability family so a platform that cannot do

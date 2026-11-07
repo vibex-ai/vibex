@@ -44,7 +44,7 @@ use image::Frame;
 use vibex_core::{
     ComputerActionKind, ComputerActionRecord, ComputerAvailability, ComputerExecutionSource,
     ComputerFrame, ComputerOperationStatus, ComputerPlatform, ComputerSession, ComputerSessionId,
-    ComputerSessionState, ComputerUnavailableReason, unix_timestamp_ms,
+    ComputerSessionState, ComputerUnavailableReason, VibexSessionId, unix_timestamp_ms,
 };
 use vibex_desktop_model::ComputerPanelMode;
 use vibex_desktop_runtime::ComputerRuntime;
@@ -84,6 +84,13 @@ pub struct ComputerSurface {
     /// The shell this instance draws. The window owns the choice; the panel
     /// only renders it.
     mode: ComputerPanelMode,
+    /// The Agent session this panel was opened for, when it was opened for one.
+    ///
+    /// A panel opened by the reader watches the panel's own session; a panel
+    /// raised because an Agent started driving watches that Agent's session,
+    /// because that is where the target, the ledger and the state the stop has
+    /// to reach live.
+    agent_session_id: Option<VibexSessionId>,
     session_id: Option<ComputerSessionId>,
     session: Option<ComputerSession>,
     availability: Option<ComputerAvailability>,
@@ -110,20 +117,25 @@ impl ComputerSurface {
         tokio: tokio::runtime::Handle,
         cx: &mut Context<Self>,
     ) -> Self {
-        Self::new_in(runtime, tokio, ComputerPanelMode::Window, cx)
+        Self::new_in(runtime, tokio, ComputerPanelMode::Window, None, cx)
     }
 
     /// Builds the panel in the requested shell and starts its subscriptions.
+    ///
+    /// `agent_session_id` is the Agent the panel was raised for. `None` is a
+    /// panel the reader opened themselves, which watches its own session.
     pub fn new_in(
         runtime: Arc<ComputerRuntime>,
         tokio: tokio::runtime::Handle,
         mode: ComputerPanelMode,
+        agent_session_id: Option<VibexSessionId>,
         cx: &mut Context<Self>,
     ) -> Self {
         let mut surface = Self {
             runtime,
             tokio,
             mode,
+            agent_session_id,
             session_id: None,
             session: None,
             availability: None,
@@ -189,12 +201,35 @@ impl ComputerSurface {
     /// Reloads availability, the session and the ledger.
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
         let availability = self.run(self.runtime.availability());
-        let subscribe = self
-            .runtime
-            .subscribe_frames(None, computer_tier_for_panel());
-        let (session_id, frames) = match self.run(subscribe) {
-            Some(pair) => (Some(pair.0), Some(pair.1)),
-            None => (None, None),
+        // When this panel was raised for an Agent, the Agent's session is the
+        // one worth rendering: its ledger, its target and its state are what
+        // the reader came to see and what the stop has to reach. A panel the
+        // reader opened by hand keeps its own viewer session until an Agent
+        // starts driving, at which point showing that Agent beats an empty
+        // viewer.
+        //
+        // The pinned Agent is a preference, not a lock: a session that has gone
+        // away falls back to whichever Agent started last, so a panel left open
+        // across Agent sessions never keeps rendering a finished one.
+        let agent_session = self
+            .agent_session_id
+            .clone()
+            .and_then(|agent_session_id| {
+                self.run(self.runtime.session_for_agent(&agent_session_id))
+            })
+            .or_else(|| self.run(self.runtime.latest_agent_session()));
+        let (session_id, frames) = match agent_session {
+            Some(session_id) => {
+                let frames = self.run(self.runtime.subscribe_session_frames(&session_id));
+                (Some(session_id), Some(frames))
+            }
+            None => match self.run(
+                self.runtime
+                    .subscribe_frames(None, computer_tier_for_panel()),
+            ) {
+                Some(pair) => (Some(pair.0), Some(pair.1)),
+                None => (None, None),
+            },
         };
         self.session_id = session_id.clone();
         if let Some(session_id) = &session_id {
