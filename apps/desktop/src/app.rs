@@ -39,7 +39,7 @@ use gpui::{
     GlobalElementId, HighlightStyle, Hsla, Image, ImageFormat, InspectorElementId, IntoElement,
     KeyBinding, KeyDownEvent, Keystroke, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent,
     ObjectFit, Orientation, ParentElement as _, Pixels, Point, Render, Rgba, Role, ScrollAnchor,
-    ScrollDelta, ScrollHandle, ScrollStrategy, ScrollWheelEvent, SharedString, Size, Stateful,
+    ScrollDelta, ScrollEvent, ScrollHandle, ScrollStrategy, SharedString, Size, Stateful,
     StatefulInteractiveElement as _, StyleRefinement, Styled as _, StyledImage as _, StyledText,
     Subscription, SystemNotification, Task, TitlebarOptions, Unbind, WeakEntity, Window,
     WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowControls, WindowDecorations,
@@ -30791,7 +30791,7 @@ impl VibexWorkbench {
         true
     }
 
-    fn handle_timeline_scroll_wheel(&mut self, event: &ScrollWheelEvent, cx: &mut Context<Self>) {
+    fn handle_timeline_scroll_wheel(&mut self, event: &ScrollEvent, cx: &mut Context<Self>) {
         let delta_y = match event.delta {
             ScrollDelta::Lines(point) => point.y,
             ScrollDelta::Pixels(point) => f32::from(point.y),
@@ -58528,7 +58528,7 @@ impl VibexWorkbench {
             .h(px(project_menu_placement.height))
             .min_h_0()
             .overflow_x_hidden()
-            .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+            .on_scroll(|_, _, cx| cx.stop_propagation())
             .rounded(px(8.0))
             .bg(popover_color)
             .text_color(popover_foreground)
@@ -60346,14 +60346,14 @@ impl VibexWorkbench {
                                 this.finish_timeline_scrollbar_interaction(cx)
                             }),
                         )
-                        .on_scroll_wheel(cx.listener({
+                        .on_scroll(cx.listener({
                             // The wheel is routed to the pane under the pointer,
                             // so the follow state it clears has to be that
                             // pane's: writing it into the borrowed view left the
                             // scrolled pane still following its own stream, and
                             // it snapped back to the bottom on the next chunk.
                             let scroll_session_id = timeline_render_session_id.clone();
-                            move |this, event: &ScrollWheelEvent, _, cx| {
+                            move |this, event: &ScrollEvent, _, cx| {
                                 this.with_session_view_for_render(
                                     scroll_session_id.as_ref(),
                                     |this| this.handle_timeline_scroll_wheel(event, cx),
@@ -62399,7 +62399,7 @@ impl VibexWorkbench {
                     }
                 }),
             )
-            .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
+            .on_scroll(cx.listener(|this, event: &ScrollEvent, _, cx| {
                 let y = match event.delta {
                     ScrollDelta::Lines(point) => point.y,
                     ScrollDelta::Pixels(point) => f32::from(point.y),
@@ -75390,7 +75390,7 @@ fn render_agent_file_diff_scroll_area(
                         // line's trailing glyphs and the horizontal one the
                         // last row, so both lanes are kept clear.
                         .scroll_gutter_both()
-                        .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+                        .on_scroll(|_, _, cx| cx.stop_propagation())
                         .children(rows)
                         .pinned_scrollbar(scroll, ScrollbarAxis::Both),
                 ),
@@ -83050,14 +83050,15 @@ fn rebind_foundation_action(
     }
     let mut bindings = Vec::new();
     if let Some(previous) = previous {
-        bindings.push(KeyBinding::new(
+        push_shortcut_binding(
+            &mut bindings,
             previous,
-            Unbind(action_name(action).into()),
-            None,
-        ));
+            Box::new(Unbind(action_name(action).into())),
+            cx,
+        );
     }
     if let Some(current) = current {
-        bind_action(&mut bindings, current, action, false);
+        bind_action(&mut bindings, current, action, false, cx);
     }
     cx.bind_keys(bindings);
 }
@@ -87448,7 +87449,8 @@ impl FoundationSettings {
                         })
                 });
                 let valid = default.is_some()
-                    && (keystroke.is_empty() || shortcut_is_valid(&keystroke))
+                    && (keystroke.is_empty()
+                        || shortcut_is_valid(&keystroke, cx.platform_info().os))
                     && !conflicts;
                 if valid {
                     if keystroke.is_empty() {
@@ -92400,7 +92402,7 @@ impl FoundationSettings {
                         locale::text("Change shortcut", "更改快捷键", "變更快速鍵"),
                         shortcut_action_label(action, strings),
                     ));
-            edit_button = match Keystroke::parse(&current) {
+            edit_button = match Keystroke::parse_with_os(&current, cx.platform_info().os) {
                 Ok(keystroke) => edit_button.child(Kbd::new(keystroke).outline()),
                 Err(_) => edit_button.label(current),
             };
@@ -93233,7 +93235,7 @@ impl FoundationSettings {
                             .max_h(px(320.0))
                             .track_scroll(&notes_scroll)
                             .overflow_y_scroll()
-                            .on_scroll_wheel({
+                            .on_scroll({
                                 let notes_scroll = notes_scroll.clone();
                                 move |_, _, cx: &mut App| {
                                     // The settings page is a scroll container
@@ -93672,12 +93674,14 @@ fn session_removal_opens_new_session_home(active_tab: &str) -> bool {
     active_tab == "agent"
 }
 
-fn shortcut_is_valid(value: &str) -> bool {
+/// Whether `value` is a single chord gpui can bind on `os`, which is what
+/// resolves a `secondary-` modifier to Command or Control.
+fn shortcut_is_valid(value: &str, os: gpui::OperatingSystem) -> bool {
     !value.is_empty()
         && value.len() <= 80
         && !value.chars().any(char::is_whitespace)
         && !value.chars().any(char::is_control)
-        && Keystroke::parse(value).is_ok()
+        && Keystroke::parse_with_os(value, os).is_ok()
 }
 
 /// The new-session page's sentence, with the Agent that will answer it inside
@@ -94250,20 +94254,42 @@ pub fn bind_foundation_keys(cx: &mut App) {
             .map(String::as_str)
             .unwrap_or(*default);
         if overrides.contains_key(*action) {
-            bind_action(&mut bindings, default, action_name(action), true);
+            bind_action(&mut bindings, default, action_name(action), true, cx);
         }
-        bind_action(&mut bindings, effective, action, false);
+        bind_action(&mut bindings, effective, action, false, cx);
     }
     cx.bind_keys(bindings);
 }
 
-fn bind_action(bindings: &mut Vec<KeyBinding>, keystroke: &str, action: &str, unbind: bool) {
+/// Shortcut text is user data — the overrides the settings page persists, which
+/// a hand-edited state file can still corrupt — so it is parsed against the
+/// running platform, and a chord that does not parse is left unbound instead of
+/// panicking the keymap the way a static `KeyBinding::new` would.
+fn push_shortcut_binding(
+    bindings: &mut Vec<KeyBinding>,
+    keystroke: &str,
+    action: Box<dyn gpui::Action>,
+    cx: &App,
+) {
+    match KeyBinding::load(keystroke, action, None, false, None, cx) {
+        Ok(binding) => bindings.push(binding),
+        Err(error) => tracing::warn!(keystroke, "shortcut left unbound: {error}"),
+    }
+}
+
+fn bind_action(
+    bindings: &mut Vec<KeyBinding>,
+    keystroke: &str,
+    action: &str,
+    unbind: bool,
+    cx: &App,
+) {
     macro_rules! push {
         ($value:expr, $name:expr) => {
             if unbind {
-                bindings.push(KeyBinding::new(keystroke, Unbind($name.into()), None));
+                push_shortcut_binding(bindings, keystroke, Box::new(Unbind($name.into())), cx);
             } else {
-                bindings.push(KeyBinding::new(keystroke, $value, None));
+                push_shortcut_binding(bindings, keystroke, Box::new($value), cx);
             }
         };
     }
@@ -96985,11 +97011,23 @@ mod tests {
 
     #[test]
     fn shortcut_validation_uses_gpui_native_keystroke_parsing() {
-        assert!(shortcut_is_valid("cmd-shift-p"));
-        assert!(shortcut_is_valid("cmd-shift-t"));
-        assert!(shortcut_is_valid("ctrl-alt-left"));
-        assert!(!shortcut_is_valid(""));
-        assert!(!shortcut_is_valid("not a shortcut"));
+        assert!(shortcut_is_valid(
+            "cmd-shift-p",
+            gpui::OperatingSystem::Linux
+        ));
+        assert!(shortcut_is_valid(
+            "cmd-shift-t",
+            gpui::OperatingSystem::Linux
+        ));
+        assert!(shortcut_is_valid(
+            "ctrl-alt-left",
+            gpui::OperatingSystem::Linux
+        ));
+        assert!(!shortcut_is_valid("", gpui::OperatingSystem::Linux));
+        assert!(!shortcut_is_valid(
+            "not a shortcut",
+            gpui::OperatingSystem::Linux
+        ));
 
         let mut overrides = BTreeMap::new();
         assert_eq!(
@@ -101467,11 +101505,12 @@ mod tests {
             .origin
             .y;
 
-        cx.simulate_event(ScrollWheelEvent {
+        cx.simulate_event(ScrollEvent {
             position: point(px(20.0), px(20.0)),
             delta: ScrollDelta::Pixels(point(px(0.0), px(-120.0))),
             modifiers: Default::default(),
             touch_phase: gpui::TouchPhase::Moved,
+            ..Default::default()
         });
         cx.run_until_parked();
         cx.update(|window, cx| {
@@ -108496,7 +108535,7 @@ mod tests {
             .map(|(body, _)| body)
             .expect("the timeline surface should remain inspectable");
         let wheel = timeline
-            .find(".on_scroll_wheel(cx.listener({")
+            .find(".on_scroll(cx.listener({")
             .expect("the timeline should handle the wheel");
         let borrow = timeline[wheel..]
             .find("this.with_session_view_for_render(")
@@ -114406,11 +114445,12 @@ mod tests {
         cx.update(|window, cx| {
             let _ = window.draw(cx);
         });
-        cx.simulate_event(ScrollWheelEvent {
+        cx.simulate_event(ScrollEvent {
             position: point(px(80.0), px(20.0)),
             delta: ScrollDelta::Pixels(point(px(0.0), px(-120.0))),
             modifiers: Default::default(),
             touch_phase: gpui::TouchPhase::Moved,
+            ..Default::default()
         });
         cx.run_until_parked();
 
@@ -116101,10 +116141,18 @@ mod tests {
         }
     }
 
-    #[test]
-    fn image_edit_shortcuts_bind_undo_and_redo_without_stealing_text_input_chords() {
-        assert!(shortcut_is_valid(UNDO_IMAGE_EDIT_SHORTCUT));
-        assert!(shortcut_is_valid(REDO_IMAGE_EDIT_SHORTCUT));
+    #[gpui::test]
+    fn image_edit_shortcuts_bind_undo_and_redo_without_stealing_text_input_chords(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        assert!(shortcut_is_valid(
+            UNDO_IMAGE_EDIT_SHORTCUT,
+            gpui::OperatingSystem::Linux
+        ));
+        assert!(shortcut_is_valid(
+            REDO_IMAGE_EDIT_SHORTCUT,
+            gpui::OperatingSystem::Linux
+        ));
 
         let mut keystrokes: Vec<&str> = FOUNDATION_SHORTCUTS.iter().map(|(_, key)| *key).collect();
         let total = keystrokes.len();
@@ -116126,7 +116174,7 @@ mod tests {
             assert_ne!(shortcut_action_label(action, english), "Shortcut");
             assert_ne!(shortcut_action_group(action, english), "Vibex");
             let mut bindings = Vec::new();
-            bind_action(&mut bindings, "ctrl-z", action, false);
+            cx.update(|cx| bind_action(&mut bindings, "ctrl-z", action, false, cx));
             assert_eq!(bindings.len(), 1, "{action} must resolve to a key binding");
         }
 
@@ -116715,7 +116763,7 @@ mod tests {
         let page_viewport = &settings[page_scroll..];
         assert!(page_viewport.contains(".h_full()"));
         assert!(page_viewport.contains(".overflow_y_scroll()"));
-        assert!(!page_viewport.contains(".on_scroll_wheel(|_, _, cx| cx.stop_propagation()"));
+        assert!(!page_viewport.contains(".on_scroll(|_, _, cx| cx.stop_propagation()"));
         assert!(!page_viewport.contains(".overflow_y_scrollbar()"));
         assert!(page_viewport.contains(".track_scroll(&self.settings_render_context.scroll)"));
         // GPUI only clips children to a square, so every settings surface that
@@ -124208,11 +124256,12 @@ mod tests {
             .origin
             .y;
 
-        cx.simulate_event(ScrollWheelEvent {
+        cx.simulate_event(ScrollEvent {
             position: point(px(20.0), px(20.0)),
             delta: ScrollDelta::Pixels(point(px(0.0), px(-120.0))),
             modifiers: Default::default(),
             touch_phase: gpui::TouchPhase::Moved,
+            ..Default::default()
         });
         cx.run_until_parked();
         cx.update(|window, cx| {
@@ -124231,11 +124280,12 @@ mod tests {
         assert!(observed_scroll.offset().y < px(0.0));
         assert_eq!(observed_parent_scroll.offset().y, px(0.0));
 
-        cx.simulate_event(ScrollWheelEvent {
+        cx.simulate_event(ScrollEvent {
             position: point(px(20.0), px(20.0)),
             delta: ScrollDelta::Pixels(point(px(-120.0), px(0.0))),
             modifiers: Default::default(),
             touch_phase: gpui::TouchPhase::Moved,
+            ..Default::default()
         });
         cx.run_until_parked();
         assert!(observed_scroll.offset().x < px(0.0));

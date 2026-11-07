@@ -190,14 +190,18 @@ fn shared_highlight_theme(mode: GpuiThemeMode) -> Arc<HighlightTheme> {
             serde_json::from_str::<HighlightThemeStyle>(default_theme(mode).highlight_json)
         })
         .expect("built-in syntax highlight tokens must be valid");
-    Arc::new(HighlightTheme {
-        name: definition.name.to_string(),
-        appearance: match mode {
-            GpuiThemeMode::Light => ComponentThemeMode::Light,
-            GpuiThemeMode::Dark => ComponentThemeMode::Dark,
-        },
-        style,
-    })
+    // `HighlightTheme` is `#[non_exhaustive]`, so it is built from the kit's own
+    // theme for the appearance and then given ours; a field the kit adds later
+    // keeps that appearance's default instead of breaking this constructor.
+    let (mut theme, appearance) = match mode {
+        GpuiThemeMode::Light => (HighlightTheme::default_light(), ComponentThemeMode::Light),
+        GpuiThemeMode::Dark => (HighlightTheme::default_dark(), ComponentThemeMode::Dark),
+    };
+    let highlight = Arc::make_mut(&mut theme);
+    highlight.name = definition.name.to_string();
+    highlight.appearance = appearance;
+    highlight.style = style;
+    theme
 }
 
 fn apply_semantic_popover_colors(theme: &mut Theme, is_dark: bool) {

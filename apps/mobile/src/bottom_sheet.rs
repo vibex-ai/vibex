@@ -39,8 +39,8 @@ use std::time::{Duration, Instant};
 
 use gpui::{
     Animation, AnimationExt as _, AnyElement, App, ElementId, IntoElement, MouseButton,
-    MouseUpEvent, Pixels, ScrollDelta, ScrollHandle, ScrollWheelEvent, Styled as _, TouchPhase,
-    Window, div, prelude::*, px,
+    MouseUpEvent, Pixels, ScrollDelta, ScrollEvent, ScrollHandle, Styled as _, TouchPhase, Window,
+    div, prelude::*, px,
 };
 
 use crate::platform::WindowInsetsExt as _;
@@ -132,7 +132,7 @@ impl SheetSize {
 /// the page's edges in sight on a phone with tall insets.
 pub fn sheet_size(window: &Window) -> SheetSize {
     let viewport = f32::from(window.viewport_size().height);
-    let insets = window.insets().effective();
+    let insets = window.safe_insets().effective();
     let page = (viewport - f32::from(insets.top) - f32::from(insets.bottom)).max(1.0);
     let resting = viewport * theme::SHEET_HEIGHT_RATIO;
     let expanded = page * theme::SHEET_EXPANDED_HEIGHT_RATIO;
@@ -388,7 +388,7 @@ pub enum SheetPull {
 ///
 /// Mobile platforms report a finger drag as a scroll wheel carrying a touch
 /// phase; a mouse wheel carries none, and never pulls a sheet.
-pub fn sheet_pan(event: &ScrollWheelEvent) -> Option<SheetPan> {
+pub fn sheet_pan(event: &ScrollEvent) -> Option<SheetPan> {
     let movement = |delta: ScrollDelta| match delta {
         ScrollDelta::Pixels(delta) => Some((f32::from(delta.x), f32::from(delta.y))),
         ScrollDelta::Lines(_) => None,
@@ -1003,7 +1003,7 @@ impl Pull {
 type DismissListener = Box<dyn Fn(&MouseUpEvent, &mut Window, &mut App)>;
 
 /// What the platform's pan stream does while a finger is on a sheet's panel.
-type PanListener = Box<dyn Fn(&ScrollWheelEvent, &mut Window, &mut App)>;
+type PanListener = Box<dyn Fn(&ScrollEvent, &mut Window, &mut App)>;
 
 /// The shell every bottom sheet is drawn in: the scrim, the panel, and the
 /// finger that pulls it.
@@ -1048,10 +1048,7 @@ impl BottomSheetShell {
     /// The listener is installed in the capture phase, ahead of the lists
     /// inside the sheet: a pull the sheet claims has to reach it before the
     /// body under the finger has scrolled with the same gesture.
-    pub fn on_pan(
-        mut self,
-        pan: impl Fn(&ScrollWheelEvent, &mut Window, &mut App) + 'static,
-    ) -> Self {
+    pub fn on_pan(mut self, pan: impl Fn(&ScrollEvent, &mut Window, &mut App) + 'static) -> Self {
         self.pan = Some(Box::new(pan));
         self
     }

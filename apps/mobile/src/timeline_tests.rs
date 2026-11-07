@@ -249,7 +249,7 @@ fn click(cx: &mut VisualTestContext, selector: &str) {
     draw(cx);
 }
 
-fn press(cx: &mut VisualTestContext, key: &str) {
+fn press(cx: &mut VisualTestContext, key: &'static str) {
     let keystroke = Keystroke::parse(key).unwrap();
     cx.simulate_event(KeyDownEvent {
         keystroke: keystroke.clone(),
@@ -387,11 +387,12 @@ fn scrolling_under_a_selection_keeps_it(cx: &mut TestAppContext) {
         gpui::TouchPhase::Moved,
         gpui::TouchPhase::Ended,
     ] {
-        cx.simulate_event(gpui::ScrollWheelEvent {
+        cx.simulate_event(gpui::ScrollEvent {
             position: over_the_text,
             delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.0), px(-40.0))),
             modifiers: Modifiers::none(),
             touch_phase: phase,
+            ..Default::default()
         });
         draw(cx);
     }
@@ -1119,11 +1120,12 @@ fn scrolling_up_inside_the_live_turn_stops_following(cx: &mut TestAppContext) {
         "a fresh timeline follows the live end"
     );
 
-    cx.simulate_event(gpui::ScrollWheelEvent {
+    cx.simulate_event(gpui::ScrollEvent {
         position: list.viewport_bounds().center(),
         delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.0), px(30.0))),
         modifiers: Modifiers::none(),
         touch_phase: gpui::TouchPhase::Moved,
+        ..Default::default()
     });
     draw(cx);
     assert!(

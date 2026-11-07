@@ -19,9 +19,9 @@ use gpui::{
     DispatchPhase, Edges, ElementId, Entity, FocusHandle, Focusable, FollowMode, FontWeight, Hsla,
     Image, ImageFormat, IntoElement, KeyBinding, ListAlignment, ListOffset, ListState,
     LongPressEvent, MouseButton, MouseUpEvent, ObjectFit, ParentElement as _, Pixels, Point,
-    Render, ScrollDelta, ScrollHandle, ScrollWheelEvent, Styled as _, Task, TouchDragEvent,
-    TouchPhase, Transformation, UniformListScrollHandle, WeakEntity, Window, div, ease_in_out,
-    ease_out_quint, img, list, percentage, point, prelude::*, px, relative, rgb, svg, uniform_list,
+    Render, ScrollDelta, ScrollEvent, ScrollHandle, Styled as _, Task, TouchDragEvent, TouchPhase,
+    Transformation, UniformListScrollHandle, WeakEntity, Window, div, ease_in_out, ease_out_quint,
+    img, list, percentage, point, prelude::*, px, relative, rgb, svg, uniform_list,
 };
 use vibex_app_update::{UpdateSnapshot, UpdateState};
 use vibex_backend::{
@@ -14328,12 +14328,7 @@ impl MobileApp {
     /// Drives the full-page side drawers from the platform touch-pan stream.
     /// Android and iOS synthesize a finger drag as `ScrollWheel` events carrying
     /// a `TouchPhase`; mouse-move events only ever describe a tap.
-    fn drawer_pan(
-        &mut self,
-        event: &ScrollWheelEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn drawer_pan(&mut self, event: &ScrollEvent, window: &mut Window, cx: &mut Context<Self>) {
         let now = Instant::now();
         match drawer_pan_input(event) {
             DrawerPanInput::Started { delta_x, delta_y } => {
@@ -14420,7 +14415,7 @@ impl MobileApp {
     /// before the lists inside it consume the gesture.
     fn overlay_swipe_back(
         &mut self,
-        event: &ScrollWheelEvent,
+        event: &ScrollEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -14550,12 +14545,7 @@ impl MobileApp {
 
     /// The GPUI scroll element updates its handle before bubble listeners run.
     /// Consume the event here so the overlaid timeline cannot scroll in parallel.
-    fn consume_drawer_scroll(
-        &mut self,
-        _: &ScrollWheelEvent,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn consume_drawer_scroll(&mut self, _: &ScrollEvent, _: &mut Window, cx: &mut Context<Self>) {
         cx.stop_propagation();
     }
 
@@ -14581,7 +14571,7 @@ impl MobileApp {
     fn pull_sheet(
         &mut self,
         key: SheetKey,
-        event: &ScrollWheelEvent,
+        event: &ScrollEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -16054,7 +16044,7 @@ impl MobileApp {
         // The window's insets are the band a side page brings into view with
         // itself, and the band is measured per frame while the drawer moves, so
         // the drawer branch below reads them as well as the root.
-        let insets = window.insets().effective();
+        let insets = window.safe_insets().effective();
         let workbench = self.workbench.clone();
         let session_action = self.session_action.clone();
         let row_menu = self.sidebar_row_menu.clone();
@@ -16270,7 +16260,7 @@ impl MobileApp {
                         // Keep the root gesture host in the scroll hit chain while the
                         // moving page is on top. Ordinary taps remain blocked below.
                         .block_mouse_except_scroll()
-                        .on_scroll_wheel(cx.listener(Self::consume_drawer_scroll))
+                        .on_scroll(cx.listener(Self::consume_drawer_scroll))
                         .on_mouse_up(
                             MouseButton::Left,
                             cx.listener(Self::close_drawer_from_backdrop),
@@ -27540,7 +27530,7 @@ impl MobileApp {
                                     restrict_scroll_to_axis: Some(true),
                                     ..Default::default()
                                 })
-                                .on_scroll_wheel(cx.listener(Self::consume_drawer_scroll))
+                                .on_scroll(cx.listener(Self::consume_drawer_scroll))
                                 .size_full()
                                 .py(px(2.0)),
                             ),
@@ -28201,7 +28191,7 @@ impl MobileApp {
                     .min_h_0()
                     .overflow_y_scroll()
                     .restrict_scroll_to_axis()
-                    .on_scroll_wheel(cx.listener(Self::consume_drawer_scroll))
+                    .on_scroll(cx.listener(Self::consume_drawer_scroll))
                     .px(px(theme::SPACING_LG))
                     .py(px(theme::SPACING_MD))
                     .child(host_detail_field(
@@ -28412,7 +28402,7 @@ impl Render for MobileApp {
         if window.focused(cx).is_none() {
             self.root_focus.focus(window, cx);
         }
-        let insets = window.insets().effective();
+        let insets = window.safe_insets().effective();
         let page_width = workspace_page_width(window);
         let visible_mode = if self.is_pairing_visible() {
             RootMode::Pairing
@@ -28495,7 +28485,7 @@ fn pairing_runtimes_max_height(window: &Window, first_screen: bool) -> Pixels {
 
 fn workspace_page_width(window: &Window) -> f32 {
     let viewport = window.viewport_size();
-    let insets = window.insets().effective();
+    let insets = window.safe_insets().effective();
     (f32::from(viewport.width) - f32::from(insets.left) - f32::from(insets.right)).max(1.0)
 }
 
@@ -31303,7 +31293,7 @@ impl MobileApp {
                     .track_scroll(&self.settings_scroll)
                     .overflow_y_scroll()
                     .restrict_scroll_to_axis()
-                    .on_scroll_wheel(cx.listener(Self::consume_drawer_scroll))
+                    .on_scroll(cx.listener(Self::consume_drawer_scroll))
                     .px(px(theme::SPACING_LG))
                     .pt(px(theme::SPACING_XL))
                     .pb(px(theme::SPACING_LG))
@@ -32272,7 +32262,7 @@ enum DrawerPanInput {
     Ignore,
 }
 
-fn drawer_pan_input(event: &ScrollWheelEvent) -> DrawerPanInput {
+fn drawer_pan_input(event: &ScrollEvent) -> DrawerPanInput {
     match event.touch_phase {
         TouchPhase::Ended => DrawerPanInput::Ended,
         TouchPhase::Cancelled => DrawerPanInput::Cancelled,
@@ -38505,7 +38495,7 @@ mod tests {
                                     .collect::<Vec<_>>()
                             })
                             .track_scroll(&self.drawer_scroll)
-                            .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+                            .on_scroll(|_, _, cx| cx.stop_propagation())
                             .size_full(),
                         ),
                 )
@@ -38569,11 +38559,12 @@ mod tests {
             (240.0, point(px(240.0), px(120.0))),
         ] {
             let _ = x;
-            cx.simulate_event(ScrollWheelEvent {
+            cx.simulate_event(ScrollEvent {
                 position,
                 delta: ScrollDelta::Pixels(point(px(-60.0), px(0.0))),
                 modifiers: Default::default(),
                 touch_phase: TouchPhase::Moved,
+                ..Default::default()
             });
         }
         cx.run_until_parked();
@@ -38600,11 +38591,12 @@ mod tests {
 
     #[test]
     fn drawer_terminal_phases_do_not_depend_on_pixel_delta() {
-        let mut event = ScrollWheelEvent {
+        let mut event = ScrollEvent {
             position: point(px(0.0), px(0.0)),
             delta: ScrollDelta::Lines(point(0.0, 0.0)),
             modifiers: gpui::Modifiers::default(),
             touch_phase: TouchPhase::Ended,
+            ..Default::default()
         };
         assert!(matches!(drawer_pan_input(&event), DrawerPanInput::Ended));
 
@@ -38926,23 +38918,26 @@ mod tests {
     /// synthesize a touch pan as scroll events carrying a `TouchPhase`.
     fn drag_finger(cx: &mut gpui::VisualTestContext, dx: f32, dy: f32) {
         let position = point(px(60.0), px(200.0));
-        cx.simulate_event(ScrollWheelEvent {
+        cx.simulate_event(ScrollEvent {
             position,
             delta: ScrollDelta::Pixels(point(px(dx * 0.25), px(dy * 0.25))),
             modifiers: Default::default(),
             touch_phase: TouchPhase::Started,
+            ..Default::default()
         });
-        cx.simulate_event(ScrollWheelEvent {
+        cx.simulate_event(ScrollEvent {
             position,
             delta: ScrollDelta::Pixels(point(px(dx * 0.75), px(dy * 0.75))),
             modifiers: Default::default(),
             touch_phase: TouchPhase::Moved,
+            ..Default::default()
         });
-        cx.simulate_event(ScrollWheelEvent {
+        cx.simulate_event(ScrollEvent {
             position,
             delta: ScrollDelta::Lines(point(0.0, 0.0)),
             modifiers: Default::default(),
             touch_phase: TouchPhase::Ended,
+            ..Default::default()
         });
         cx.run_until_parked();
     }
@@ -40374,7 +40369,7 @@ mod tests {
             actions.size
         );
 
-        cx.simulate_event(ScrollWheelEvent {
+        cx.simulate_event(ScrollEvent {
             position: point(
                 list.origin.x + list.size.width / 2.0,
                 list.origin.y + list.size.height / 2.0,
@@ -40382,6 +40377,7 @@ mod tests {
             delta: ScrollDelta::Pixels(point(px(0.0), px(-120.0))),
             modifiers: Default::default(),
             touch_phase: TouchPhase::Moved,
+            ..Default::default()
         });
         cx.run_until_parked();
         assert!(
@@ -41171,11 +41167,12 @@ mod tests {
         // worst case a listener that travelled with the panel could survive.
         let touch = point(resting.center().x, resting.origin.y + px(24.0));
         for (phase, dy) in [(TouchPhase::Started, -40.0), (TouchPhase::Moved, -400.0)] {
-            cx.simulate_event(ScrollWheelEvent {
+            cx.simulate_event(ScrollEvent {
                 position: touch,
                 delta: ScrollDelta::Pixels(point(px(0.0), px(dy))),
                 modifiers: Default::default(),
                 touch_phase: phase,
+                ..Default::default()
             });
             cx.update(|window, cx| {
                 let _ = window.draw(cx);
@@ -41264,11 +41261,12 @@ mod tests {
             (TouchPhase::Moved, 40.0),
             (TouchPhase::Moved, 40.0),
         ] {
-            cx.simulate_event(ScrollWheelEvent {
+            cx.simulate_event(ScrollEvent {
                 position: touch,
                 delta: ScrollDelta::Pixels(point(px(0.0), px(dy))),
                 modifiers: Default::default(),
                 touch_phase: phase,
+                ..Default::default()
             });
             cx.update(|window, cx| {
                 let _ = window.draw(cx);
@@ -41283,11 +41281,12 @@ mod tests {
         );
 
         // Letting go that far takes the sheet with it.
-        cx.simulate_event(ScrollWheelEvent {
+        cx.simulate_event(ScrollEvent {
             position: touch,
             delta: ScrollDelta::Pixels(point(px(0.0), px(0.0))),
             modifiers: Default::default(),
             touch_phase: TouchPhase::Ended,
+            ..Default::default()
         });
         settle_sheet(&app, cx);
         assert!(
@@ -41333,11 +41332,12 @@ mod tests {
             (TouchPhase::Moved, 90.0, 10.0),
             (TouchPhase::Moved, 90.0, 10.0),
         ] {
-            cx.simulate_event(ScrollWheelEvent {
+            cx.simulate_event(ScrollEvent {
                 position: touch,
                 delta: ScrollDelta::Pixels(point(px(dx), px(dy))),
                 modifiers: Default::default(),
                 touch_phase: phase,
+                ..Default::default()
             });
             cx.update(|window, cx| {
                 let _ = window.draw(cx);
@@ -41351,11 +41351,12 @@ mod tests {
             "the panel must not have travelled under the finger"
         );
 
-        cx.simulate_event(ScrollWheelEvent {
+        cx.simulate_event(ScrollEvent {
             position: touch,
             delta: ScrollDelta::Pixels(point(px(0.0), px(0.0))),
             modifiers: Default::default(),
             touch_phase: TouchPhase::Ended,
+            ..Default::default()
         });
         settle_sheet(&app, cx);
         assert!(
@@ -41472,21 +41473,23 @@ mod tests {
         // a dismissal asks for.
         let touch = point(panel.center().x, panel.origin.y - px(12.0));
         for (phase, dy) in [(TouchPhase::Started, 20.0), (TouchPhase::Moved, 140.0)] {
-            cx.simulate_event(ScrollWheelEvent {
+            cx.simulate_event(ScrollEvent {
                 position: touch,
                 delta: ScrollDelta::Pixels(point(px(0.0), px(dy))),
                 modifiers: Default::default(),
                 touch_phase: phase,
+                ..Default::default()
             });
             cx.update(|window, cx| {
                 let _ = window.draw(cx);
             });
         }
-        cx.simulate_event(ScrollWheelEvent {
+        cx.simulate_event(ScrollEvent {
             position: touch,
             delta: ScrollDelta::Pixels(point(px(0.0), px(0.0))),
             modifiers: Default::default(),
             touch_phase: TouchPhase::Ended,
+            ..Default::default()
         });
         settle_sheet(&app, cx);
         assert!(
@@ -41557,11 +41560,12 @@ mod tests {
 
         let position = point(px(120.0), px(120.0));
         for (phase, dx) in [(TouchPhase::Started, 24.0), (TouchPhase::Moved, 80.0)] {
-            cx.simulate_event(ScrollWheelEvent {
+            cx.simulate_event(ScrollEvent {
                 position,
                 delta: ScrollDelta::Pixels(point(px(dx), px(0.0))),
                 modifiers: Default::default(),
                 touch_phase: phase,
+                ..Default::default()
             });
         }
         assert_eq!(
@@ -41569,11 +41573,12 @@ mod tests {
             0.0,
             "a swipe over the open panel must not move the page behind it"
         );
-        cx.simulate_event(ScrollWheelEvent {
+        cx.simulate_event(ScrollEvent {
             position,
             delta: ScrollDelta::Lines(point(0.0, 0.0)),
             modifiers: Default::default(),
             touch_phase: TouchPhase::Ended,
+            ..Default::default()
         });
         cx.run_until_parked();
         assert!(
@@ -41671,17 +41676,19 @@ mod tests {
 
         let page_width = cx.update(|window, _| workspace_page_width(window));
         let position = point(px(120.0), px(120.0));
-        cx.simulate_event(ScrollWheelEvent {
+        cx.simulate_event(ScrollEvent {
             position,
             delta: ScrollDelta::Pixels(point(px(24.0), px(0.0))),
             modifiers: Default::default(),
             touch_phase: TouchPhase::Started,
+            ..Default::default()
         });
-        cx.simulate_event(ScrollWheelEvent {
+        cx.simulate_event(ScrollEvent {
             position,
             delta: ScrollDelta::Pixels(point(px(80.0), px(0.0))),
             modifiers: Default::default(),
             touch_phase: TouchPhase::Moved,
+            ..Default::default()
         });
 
         let offset_after_move = app.read_with(cx, |app, _| app.drawer_offset);
@@ -41695,11 +41702,12 @@ mod tests {
                 && app.drawer_snap.is_none()
         }));
 
-        cx.simulate_event(ScrollWheelEvent {
+        cx.simulate_event(ScrollEvent {
             position,
             delta: ScrollDelta::Lines(point(0.0, 0.0)),
             modifiers: Default::default(),
             touch_phase: TouchPhase::Ended,
+            ..Default::default()
         });
         cx.run_until_parked();
 
@@ -41744,11 +41752,12 @@ mod tests {
             (px(-24.0), TouchPhase::Started),
             (px(-120.0), TouchPhase::Moved),
         ] {
-            cx.simulate_event(ScrollWheelEvent {
+            cx.simulate_event(ScrollEvent {
                 position,
                 delta: ScrollDelta::Pixels(point(delta, px(0.0))),
                 modifiers: Default::default(),
                 touch_phase,
+                ..Default::default()
             });
         }
         assert!(app.read_with(cx, |app, _| {
@@ -41761,11 +41770,12 @@ mod tests {
             )
         }));
 
-        cx.simulate_event(ScrollWheelEvent {
+        cx.simulate_event(ScrollEvent {
             position,
             delta: ScrollDelta::Pixels(point(px(-120.0), px(0.0))),
             modifiers: Default::default(),
             touch_phase: TouchPhase::Ended,
+            ..Default::default()
         });
         cx.run_until_parked();
         let snapped_offset = app.read_with(cx, |app, _| app.drawer_offset);
@@ -41776,11 +41786,12 @@ mod tests {
 
         // The momentum that follows the release is the drawer's, so it neither
         // moves the page nor outlives its own terminal event.
-        cx.simulate_event(ScrollWheelEvent {
+        cx.simulate_event(ScrollEvent {
             position,
             delta: ScrollDelta::Pixels(point(px(-90.0), px(0.0))),
             modifiers: Default::default(),
             touch_phase: TouchPhase::Moved,
+            ..Default::default()
         });
         assert_eq!(
             app.read_with(cx, |app, _| app.drawer_offset),
@@ -41788,11 +41799,12 @@ mod tests {
         );
         assert!(app.read_with(cx, |app, _| app.drawer_fling_owned));
 
-        cx.simulate_event(ScrollWheelEvent {
+        cx.simulate_event(ScrollEvent {
             position,
             delta: ScrollDelta::Pixels(point(px(0.0), px(0.0))),
             modifiers: Default::default(),
             touch_phase: TouchPhase::Ended,
+            ..Default::default()
         });
         assert!(!app.read_with(cx, |app, _| app.drawer_fling_owned));
     }
@@ -41814,25 +41826,28 @@ mod tests {
         });
 
         let position = point(px(300.0), px(200.0));
-        cx.simulate_event(ScrollWheelEvent {
+        cx.simulate_event(ScrollEvent {
             position,
             delta: ScrollDelta::Pixels(point(px(4.0), px(-40.0))),
             modifiers: Default::default(),
             touch_phase: TouchPhase::Started,
+            ..Default::default()
         });
-        cx.simulate_event(ScrollWheelEvent {
+        cx.simulate_event(ScrollEvent {
             position,
             delta: ScrollDelta::Pixels(point(px(0.0), px(-120.0))),
             modifiers: Default::default(),
             touch_phase: TouchPhase::Moved,
+            ..Default::default()
         });
         assert!(app.read_with(cx, |app, _| app.drawer_gesture.is_none()));
 
-        cx.simulate_event(ScrollWheelEvent {
+        cx.simulate_event(ScrollEvent {
             position,
             delta: ScrollDelta::Pixels(point(px(0.0), px(-120.0))),
             modifiers: Default::default(),
             touch_phase: TouchPhase::Ended,
+            ..Default::default()
         });
         cx.run_until_parked();
         assert!(!app.read_with(cx, |app, _| app.drawer_fling_owned));
@@ -42493,11 +42508,12 @@ mod tests {
         assert!(observed_drawer_scroll.max_offset().y > px(0.0));
         assert!(observed_timeline_scroll.max_offset().y > px(0.0));
 
-        cx.simulate_event(ScrollWheelEvent {
+        cx.simulate_event(ScrollEvent {
             position: point(px(40.0), px(120.0)),
             delta: ScrollDelta::Pixels(point(px(0.0), px(-160.0))),
             modifiers: Default::default(),
             touch_phase: TouchPhase::Moved,
+            ..Default::default()
         });
         cx.run_until_parked();
 
@@ -42753,7 +42769,7 @@ fn session_opened(cx: &mut Context<Self>) {
         assert!(listener.contains("bounds.contains(&event.position)"));
         assert!(listener.contains("on_sidebar_row_long_press"));
         assert!(
-            drawer.contains(".on_scroll_wheel(cx.listener(Self::consume_drawer_scroll))"),
+            drawer.contains(".on_scroll(cx.listener(Self::consume_drawer_scroll))"),
             "a pan over the list is a scroll, never the start of a row move"
         );
 

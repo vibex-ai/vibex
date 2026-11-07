@@ -440,7 +440,7 @@ struct ActivityProbe {
     target_color: Option<Rc<Cell<Hsla>>>,
 }
 
-fn press(cx: &mut VisualTestContext, key: &str) {
+fn press(cx: &mut VisualTestContext, key: &'static str) {
     let keystroke = Keystroke::parse(key).unwrap();
     cx.simulate_event(KeyDownEvent {
         keystroke: keystroke.clone(),

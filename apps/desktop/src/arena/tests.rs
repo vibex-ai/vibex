@@ -17,7 +17,7 @@ fn draw(cx: &mut VisualTestContext) {
         window.simulate_next_frame(cx);
     });
 }
-fn key(cx: &mut VisualTestContext, name: &str, down: bool) {
+fn key(cx: &mut VisualTestContext, name: &'static str, down: bool) {
     let keystroke = Keystroke::parse(name).unwrap();
     if down {
         cx.simulate_event(KeyDownEvent {
@@ -30,7 +30,7 @@ fn key(cx: &mut VisualTestContext, name: &str, down: bool) {
     }
     draw(cx);
 }
-fn press(cx: &mut VisualTestContext, name: &str) {
+fn press(cx: &mut VisualTestContext, name: &'static str) {
     key(cx, name, true);
     key(cx, name, false);
 }

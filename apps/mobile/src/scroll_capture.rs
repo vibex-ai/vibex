@@ -10,10 +10,10 @@ use std::rc::Rc;
 
 use gpui::{
     AnyElement, App, Bounds, DispatchPhase, Element, ElementId, GlobalElementId, Hitbox,
-    HitboxBehavior, InspectorElementId, IntoElement, LayoutId, ScrollWheelEvent, Window,
+    HitboxBehavior, InspectorElementId, IntoElement, LayoutId, ScrollEvent, Window,
 };
 
-type CaptureScrollWheelListener = Rc<dyn Fn(&ScrollWheelEvent, &mut Window, &mut App)>;
+type CaptureScrollWheelListener = Rc<dyn Fn(&ScrollEvent, &mut Window, &mut App)>;
 
 /// Wraps `child` and reports scroll-wheel events in the capture phase.
 ///
@@ -30,7 +30,7 @@ pub struct CaptureScrollWheel {
 pub fn capture_scroll_wheel(
     id: impl Into<ElementId>,
     child: impl IntoElement,
-    listener: impl Fn(&ScrollWheelEvent, &mut Window, &mut App) + 'static,
+    listener: impl Fn(&ScrollEvent, &mut Window, &mut App) + 'static,
 ) -> CaptureScrollWheel {
     CaptureScrollWheel {
         id: id.into(),
@@ -87,7 +87,7 @@ impl Element for CaptureScrollWheel {
         let hitbox_id = hitbox.id;
         window.on_mouse_event({
             let listener = self.listener.clone();
-            move |event: &ScrollWheelEvent, phase, window, cx| {
+            move |event: &ScrollEvent, phase, window, cx| {
                 if phase != DispatchPhase::Capture {
                     return;
                 }

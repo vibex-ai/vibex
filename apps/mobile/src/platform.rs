@@ -376,14 +376,20 @@ pub fn feedbacks() -> usize {
 /// The window-inset API the rest of the app uses.
 ///
 /// Implemented for `Window` so call sites read like the desktop ones
-/// (`window.insets().effective()`), keeping the platform difference in one
-/// place.
+/// (`window.safe_insets().effective()`), keeping the platform difference in
+/// one place.
+///
+/// The method is deliberately not called `insets`: gpui 0.3.10 added an
+/// inherent `Window::insets`, and an inherent method always wins over a trait
+/// method of the same name. `gpui-pre-mobile` leaves `PlatformWindow::insets`
+/// at its default of zero, so a call that resolved to gpui's method would lay
+/// the phone out under the status bar and the keyboard without any error.
 pub trait WindowInsetsExt {
-    fn insets(&self) -> WindowInsets;
+    fn safe_insets(&self) -> WindowInsets;
 }
 
 impl WindowInsetsExt for Window {
-    fn insets(&self) -> WindowInsets {
+    fn safe_insets(&self) -> WindowInsets {
         insets(self)
     }
 }

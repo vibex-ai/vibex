@@ -14786,7 +14786,7 @@ impl CodeRightRail {
             .items_start()
             .track_scroll(scroll)
             .overflow_scroll()
-            .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+            .on_scroll(|_, _, cx| cx.stop_propagation())
             .child(scroll_content);
         div()
             .size_full()
@@ -17502,7 +17502,7 @@ impl CodeRightRail {
             }
         } else {
             div()
-                .on_scroll_wheel(cx.listener(move |this, _, _, cx| {
+                .on_scroll(cx.listener(move |this, _, _, cx| {
                     if history_has_more
                         && git_history_is_near_bottom(
                             &history_scroll,
@@ -22814,11 +22814,12 @@ mod tests {
             .origin
             .y;
 
-        cx.simulate_event(gpui::ScrollWheelEvent {
+        cx.simulate_event(gpui::ScrollEvent {
             position: point(px(20.0), px(20.0)),
             delta: gpui::ScrollDelta::Pixels(point(px(0.0), px(-120.0))),
             modifiers: Default::default(),
             touch_phase: gpui::TouchPhase::Moved,
+            ..Default::default()
         });
         cx.run_until_parked();
         cx.update(|window, cx| {
@@ -22837,11 +22838,12 @@ mod tests {
         assert!(observed_scroll.offset().y < px(0.0));
         assert_eq!(observed_scroll.offset().x, px(0.0));
 
-        cx.simulate_event(gpui::ScrollWheelEvent {
+        cx.simulate_event(gpui::ScrollEvent {
             position: point(px(20.0), px(20.0)),
             delta: gpui::ScrollDelta::Pixels(point(px(-120.0), px(0.0))),
             modifiers: Default::default(),
             touch_phase: gpui::TouchPhase::Moved,
+            ..Default::default()
         });
         cx.run_until_parked();
         assert!(observed_scroll.offset().x < px(0.0));
