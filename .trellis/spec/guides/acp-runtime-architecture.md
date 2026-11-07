@@ -167,6 +167,38 @@ handle concurrent prompts. When a pooled process exits, every attached session
 must receive a recoverable error — pending requests failed, pending permissions
 cancelled, pool entry removed.
 
+### Detached Agent daemons
+
+Every managed ACP process leads its own process group, and stopping it kills
+the group. Some Agent CLIs still start a background service of their own and
+detach it with `setsid` — observed with OpenCode's `serve --service` and Cline's
+hub daemon — which takes it out of the group and, once its parent exits, out of
+the runtime's process tree. The idle sweep never sees such a process, and it
+survives runtime restarts.
+
+`crates/desktop-runtime/src/agent_daemons.rs` reclaims them:
+
+- a process is a candidate when it was adopted by init or by the user's
+  `systemd --user` manager and its command line names a file under the managed
+  install root, `<home>/acp-agents/agents/<agent>/`; the directory under that
+  root is its Agent. Nothing outside the root is ever touched, so a dev server
+  an Agent started stays. A child of the runtime itself is never a candidate,
+  which also makes a runtime running as pid 1 — a container's init, adopting
+  every orphan itself — find nothing rather than end its own Agents;
+- it is ended only when no attached process of the same Agent remains anywhere
+  — one the runtime runs, ACP or terminal mode, or one run from a shell — and
+  only after that has held for two minutes. The sweep runs every minute, and
+  its first pass at startup is what clears daemons a previous run left behind;
+- at shutdown, after the Agent runtime has stopped, one more pass skips the
+  grace period;
+- every due daemon and the processes below it get `SIGTERM` together, then
+  `SIGKILL` after one second; every signal is preceded by a check of the pid's
+  start time, so a reused pid is never hit;
+- the command line is never logged, because an Agent's arguments can carry
+  credentials.
+
+The scan reads `/proc`, so it runs on Linux only.
+
 ## Agent Import And Replay Compatibility
 
 Online sessions use ACP. Provider-specific Claude and Codex crates retain only

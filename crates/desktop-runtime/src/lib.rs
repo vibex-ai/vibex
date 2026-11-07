@@ -2,6 +2,7 @@
 
 mod acp_terminal;
 mod agent_auth_context;
+mod agent_daemons;
 mod agent_install;
 mod auth_catalog;
 mod browser;
@@ -3683,6 +3684,9 @@ impl DesktopRuntime {
         startup_stage("terminal_observation_spawn", || {
             runtime.spawn_terminal_observation_sweep()
         })?;
+        startup_stage("agent_daemon_sweep_spawn", || {
+            runtime.spawn_agent_daemon_sweep()
+        })?;
         let bootstrap_started = Instant::now();
         eprintln!("vibex-startup: stage-begin stage=managed_agent_bootstrap_spawn");
         let bootstrap = (|| {
@@ -3759,6 +3763,37 @@ impl DesktopRuntime {
             let _ = self.agent.runtime_lifecycle.stop().await;
             return Err(error);
         }
+        Ok(())
+    }
+
+    /// Ends managed Agent daemons that detached from the runtime's process
+    /// tree once no Agent uses them. The first pass runs at startup, which is
+    /// what clears daemons a previous run left behind; see `agent_daemons`.
+    fn spawn_agent_daemon_sweep(self: &Arc<Self>) -> VibexResult<()> {
+        let mut tasks = self.tasks.lock().map_err(|_| {
+            VibexError::process(
+                "desktop_runtime_task_lock_failed",
+                "desktop runtime task ownership is unavailable",
+            )
+        })?;
+        let reclaimer = Arc::new(Mutex::new(agent_daemons::AgentDaemonReclaimer::new(
+            &self.config.home_dir,
+        )));
+        tasks.push(tokio::spawn(async move {
+            let mut interval = tokio::time::interval(agent_daemons::AGENT_DAEMON_SWEEP_INTERVAL);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                interval.tick().await;
+                let reclaimer = Arc::clone(&reclaimer);
+                // The scan reads `/proc` and waits on the processes it signals.
+                let _ = tokio::task::spawn_blocking(move || {
+                    if let Ok(mut reclaimer) = reclaimer.lock() {
+                        reclaimer.sweep(false);
+                    }
+                })
+                .await;
+            }
+        }));
         Ok(())
     }
 
@@ -5118,6 +5153,17 @@ impl DesktopRuntime {
         if let Err(error) = self.agent.runtime_lifecycle.stop().await {
             record_shutdown_error(&mut first_error, error);
         }
+        // A daemon an Agent detached from its process group outlives every
+        // group stopped above. With none of the runtime's Agents left, the ones
+        // nothing else uses are ended now rather than left for the next start.
+        let home_dir = self.config.home_dir.clone();
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            tokio::task::spawn_blocking(move || {
+                agent_daemons::AgentDaemonReclaimer::new(&home_dir).sweep(true)
+            }),
+        )
+        .await;
         let _ = self.events.send(DesktopEvent::Shutdown);
         let tasks = match self.tasks.lock() {
             Ok(mut tasks) => tasks.drain(..).collect::<Vec<_>>(),
