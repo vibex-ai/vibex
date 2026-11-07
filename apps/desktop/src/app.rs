@@ -9366,7 +9366,12 @@ struct SidebarOrganizationDropTarget {
 #[derive(Clone)]
 struct SidebarProjectMenuTarget {
     project_id: ProjectId,
+    /// The name the menu shows, which is the reader's language for the
+    /// temporary session project.
     project_name: String,
+    /// The project's own recorded name, used where a filesystem name is what is
+    /// being matched — the history importer's search field is seeded with it.
+    project_search_name: String,
     import_workspace: (String, WorkspaceMode),
     auto_continue_enabled: bool,
 }
@@ -37260,7 +37265,11 @@ impl VibexWorkbench {
                             .workspaces
                             .iter()
                             .all(|(project, _)| project.id != project_id);
-                        if is_new_project {
+                        // A new project is given an accent so neighbouring rows
+                        // differ at a glance. The temporary session project is
+                        // left alone: its own default is already meaningful, and
+                        // a stored pick would outrank it forever.
+                        if is_new_project && !summary.project.is_temporary() {
                             this.store_sidebar_project_appearance(
                                 project_id.as_str().to_string(),
                                 SidebarProjectAppearance {
@@ -43498,8 +43507,10 @@ impl VibexWorkbench {
                     .workspaces
                     .iter()
                     .find(|(_, workspace)| workspace.id == session.workspace_id)
-                    .map(|(project, _)| project.name.clone())
-                    .unwrap_or_else(|| workspace_display_name(&session.workspace_root));
+                    .map(|(project, _)| self.sidebar_project_display_name(project))
+                    .unwrap_or_else(|| {
+                        project_name_from_root(self.resolved_locale(), &session.workspace_root)
+                    });
                 SessionSearchScanSession {
                     session_id: session.id.clone(),
                     agent_id,
@@ -44698,13 +44709,34 @@ impl VibexWorkbench {
         }
     }
 
+    /// The appearance a project row draws with.
+    ///
+    /// A stored choice always wins. With none, the temporary session project
+    /// starts on its own mark — the green sparkle — because that row is not a
+    /// directory the reader picked and should not look like one. Both the row
+    /// and the appearance popover read through here, so the picker shows the
+    /// same default the row is drawing.
     fn sidebar_project_appearance(&self, project_id: &str) -> SidebarProjectAppearance {
-        self.ui_state
-            .sidebar
-            .project_appearances
-            .get(project_id)
-            .cloned()
+        if let Some(appearance) = self.ui_state.sidebar.project_appearances.get(project_id) {
+            return appearance.clone();
+        }
+        self.default_sidebar_project_appearance(project_id)
+    }
+
+    /// The appearance a project row falls back to while the reader has not
+    /// chosen one.
+    fn default_sidebar_project_appearance(&self, project_id: &str) -> SidebarProjectAppearance {
+        self.workspaces
+            .iter()
+            .find(|(project, _)| project.id.as_str() == project_id)
+            .map(|(project, _)| sidebar_project_default_appearance(project))
             .unwrap_or_default()
+    }
+
+    /// The name a project row shows: the reader's language for the temporary
+    /// session project, and the project's own name for everything else.
+    fn sidebar_project_display_name(&self, project: &ProjectRecord) -> String {
+        project_display_name(self.resolved_locale(), project)
     }
 
     fn store_sidebar_project_appearance(
@@ -44713,7 +44745,10 @@ impl VibexWorkbench {
         appearance: SidebarProjectAppearance,
         cx: &mut Context<Self>,
     ) {
-        if appearance == SidebarProjectAppearance::default() {
+        // Storing the default forgets the entry, so the row keeps following
+        // whatever that project's own default is — which is not the same value
+        // for every project: the temporary session project has its own mark.
+        if appearance == self.default_sidebar_project_appearance(&project_id) {
             self.ui_state
                 .sidebar
                 .project_appearances
@@ -49698,7 +49733,7 @@ impl VibexWorkbench {
         let auto_continue_project_id = target.project_id.clone();
         let new_folder_project_id = target.project_id.clone();
         let import_workspace = target.import_workspace.clone();
-        let import_project_name = target.project_name.clone();
+        let import_project_name = target.project_search_name.clone();
         let delete_project_id = target.project_id;
         let delete_project_name = target.project_name.clone();
         let auto_continue_enabled = target.auto_continue_enabled;
@@ -53353,7 +53388,7 @@ impl VibexWorkbench {
         let group = &groups[project_index];
         let project_id = group.project.id.clone();
         let project_id_string = project_id.as_str().to_string();
-        let project_name = group.project.name.clone();
+        let project_name = self.sidebar_project_display_name(&group.project);
         // The badge next to the project title reports the project's total
         // session count, summed across every workspace (worktree) it owns.
         // Per-workspace summaries ignore the active search filter, so the
@@ -53447,6 +53482,7 @@ impl VibexWorkbench {
         let project_menu_target = SidebarProjectMenuTarget {
             project_id: project_id.clone(),
             project_name: project_name.clone(),
+            project_search_name: group.project.name.clone(),
             import_workspace: (current_workspace.root_path.clone(), current_workspace.mode),
             auto_continue_enabled: self.project_auto_continue_enabled(&project_id),
         };
@@ -58399,7 +58435,7 @@ impl VibexWorkbench {
                 self.workspaces
                     .iter()
                     .find(|(project, _)| project.id == *project_id)
-                    .map(|(project, _)| project.name.clone())
+                    .map(|(project, _)| self.sidebar_project_display_name(project))
             })
             .unwrap_or_else(|| strings.new_session_working_in.to_string());
         let project_query = self
@@ -58412,7 +58448,7 @@ impl VibexWorkbench {
         let project_rows = project_groups
             .iter()
             .map(|projection| {
-                let project_name = projection.project.name.clone();
+                let project_name = self.sidebar_project_display_name(&projection.project);
                 let project_id = projection.project.id.clone();
                 let project_id_string = project_id.as_str().to_string();
                 let selected = active_project_id.as_ref() == Some(&project_id);
@@ -82042,6 +82078,16 @@ fn project_workspace_matches_search(
             .any(|value| value.to_lowercase().contains(normalized_query))
 }
 
+/// The project a root belongs to, when the project row itself is not loaded
+/// yet and only the session's root can name it.
+fn project_name_from_root(locale: locale::ResolvedLocale, workspace_root: &str) -> String {
+    if vibex_core::workspace::is_temporary_session_root(std::path::Path::new(workspace_root)) {
+        temporary_project_display_name(locale)
+    } else {
+        workspace_display_name(workspace_root)
+    }
+}
+
 fn workspace_display_name(workspace_root: &str) -> String {
     std::path::Path::new(workspace_root)
         .file_name()
@@ -82049,6 +82095,37 @@ fn workspace_display_name(workspace_root: &str) -> String {
         .filter(|name| !name.is_empty())
         .unwrap_or(workspace_root)
         .to_string()
+}
+
+/// What the temporary session project is called in the reader's language.
+///
+/// The authority names that project after its root directory, which is
+/// `sessions` — a filesystem detail, not a name the reader chose. Every surface
+/// that names the project says this instead, and it is deliberately the same
+/// wording the new-session page's own temporary row uses, so the picker and the
+/// sidebar agree on what the row is.
+fn temporary_project_display_name(locale: locale::ResolvedLocale) -> String {
+    locale::text_for(locale, "Temporary session", "临时会话", "臨時會話").to_string()
+}
+
+/// The name a project is shown under.
+///
+/// Everything except the temporary session project is named by the reader's own
+/// directory and is shown exactly as the authority recorded it.
+fn project_display_name(locale: locale::ResolvedLocale, project: &ProjectRecord) -> String {
+    if project.is_temporary() {
+        temporary_project_display_name(locale)
+    } else {
+        project.name.clone()
+    }
+}
+
+/// The appearance a project draws with until the reader chooses one.
+///
+/// The rule itself lives beside the appearance type so the phone applies the
+/// same one; the desktop only has to resolve which project the row is.
+fn sidebar_project_default_appearance(project: &ProjectRecord) -> SidebarProjectAppearance {
+    SidebarProjectAppearance::default_for(project)
 }
 
 /// A caption button a client-side-decorated window can draw in its title bar.
@@ -102772,7 +102849,10 @@ mod tests {
             .map(|(body, _)| body)
             .expect("project menu should remain inspectable");
 
-        assert!(menu.contains("let import_project_name = target.project_name.clone();"));
+        // The imported-history search must match the project as the importer
+        // lists it, which is the directory name — not the localized label the
+        // menu itself shows.
+        assert!(menu.contains("let import_project_name = target.project_search_name.clone();"));
         assert!(menu.contains("Some(import_project_name.clone())"));
     }
 
@@ -102841,7 +102921,10 @@ mod tests {
             .expect("new project selection should remain inspectable");
 
         assert!(chooser.contains("let is_new_project = this"));
-        assert!(chooser.contains("if is_new_project {"));
+        // The temporary session project is the one new project that must not be
+        // given a random accent: its own default mark and colour would be
+        // outranked by the stored pick.
+        assert!(chooser.contains("if is_new_project && !summary.project.is_temporary() {"));
         assert!(chooser.contains("logo: SidebarProjectLogo::default()"));
         assert!(chooser.contains("sidebar_project_logo_color_for_new_project(&project_id)"));
 
@@ -119663,6 +119746,60 @@ mod tests {
     fn title_bar_uses_the_workspace_leaf_name() {
         assert_eq!(workspace_display_name("/home/user/code/vibex"), "vibex");
         assert_eq!(workspace_display_name("/home/user/code/vibex/"), "vibex");
+    }
+
+    /// The project the authority creates for a session that belongs to no
+    /// project is named after its directory, which is `sessions`. The sidebar
+    /// says what that row is instead, in the reader's language, and gives it the
+    /// green sparkle rather than the neutral mark a checkout starts on.
+    #[test]
+    fn the_temporary_session_project_is_named_and_drawn_as_what_it_is() {
+        let temporary = ProjectRecord {
+            id: ProjectId::new(),
+            name: "sessions".into(),
+            root_path: "/tmp/vibex/sessions".into(),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        };
+        let checkout = ProjectRecord {
+            id: ProjectId::new(),
+            name: "vibex".into(),
+            root_path: "/home/reader/code/vibex".into(),
+            created_at_ms: 2,
+            updated_at_ms: 2,
+        };
+
+        for (locale, expected) in [
+            (locale::ResolvedLocale::En, "Temporary session"),
+            (locale::ResolvedLocale::ZhCn, "临时会话"),
+            (locale::ResolvedLocale::ZhTw, "臨時會話"),
+        ] {
+            assert_eq!(project_display_name(locale, &temporary), expected);
+            assert_eq!(project_display_name(locale, &checkout), "vibex");
+        }
+
+        assert_eq!(
+            sidebar_project_default_appearance(&temporary),
+            SidebarProjectAppearance {
+                logo: SidebarProjectLogo::Sparkles,
+                color: SidebarProjectLogoColor::Green,
+                custom_logo_file: None,
+            }
+        );
+        // An ordinary project keeps the default every checkout has always had,
+        // and a directory the reader happens to call `sessions` is ordinary.
+        assert_eq!(
+            sidebar_project_default_appearance(&checkout),
+            SidebarProjectAppearance::default()
+        );
+        let coincidental = ProjectRecord {
+            root_path: "/home/reader/sessions".into(),
+            ..temporary.clone()
+        };
+        assert_eq!(
+            sidebar_project_default_appearance(&coincidental),
+            SidebarProjectAppearance::default()
+        );
     }
 
     #[test]

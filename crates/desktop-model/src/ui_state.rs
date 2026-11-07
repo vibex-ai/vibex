@@ -350,6 +350,28 @@ pub struct SidebarProjectAppearance {
     pub custom_logo_file: Option<String>,
 }
 
+impl SidebarProjectAppearance {
+    /// The appearance a project row draws with until the reader chooses one.
+    ///
+    /// The temporary session project is the one project that is not a directory
+    /// the reader picked as a project, so its row opens on its own mark — the
+    /// green sparkle — instead of the neutral default a checkout starts on. A
+    /// stored appearance always outranks this, which is why it is resolved here
+    /// rather than written into the stored map: a write would freeze the
+    /// default and a later choice could never fall back to it again.
+    pub fn default_for(project: &vibex_core::ProjectRecord) -> Self {
+        if project.is_temporary() {
+            Self {
+                logo: SidebarProjectLogo::Sparkles,
+                color: SidebarProjectLogoColor::Green,
+                custom_logo_file: None,
+            }
+        } else {
+            Self::default()
+        }
+    }
+}
+
 pub fn sidebar_project_custom_logo_file_is_valid(file_name: &str) -> bool {
     let Some(digest) = file_name.strip_suffix(".png") else {
         return false;

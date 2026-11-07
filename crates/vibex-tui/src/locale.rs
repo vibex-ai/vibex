@@ -237,6 +237,9 @@ strings! {
         "临时会话（不使用项目）",
         "臨時工作階段（不使用專案）"
     },
+    // The project the runtime keeps for sessions that belong to none. Its
+    // stored name is the directory it lives in, so the list says what it is.
+    temporary_project => { "Temporary session", "临时会话", "臨時工作階段" },
     // Detail-card field labels. Kept to one word each so the label column can
     // stay narrow enough for the value beside it.
     session_card_id => { "ID", "ID", "ID" },

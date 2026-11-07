@@ -55,8 +55,8 @@ use vibex_core::{
 use vibex_desktop_model::{
     ActiveGoal, NewSessionLocation, ReasoningDisplayMode, RuntimeCascadeChoice,
     RuntimeCascadeProjection, SidebarHierarchyMode, SidebarOrganizationItem,
-    SidebarOrganizationView, SidebarProjectLogo, SidebarProjectLogoColor, SidebarState,
-    ThemeSelection, TimelineAnchorSpan, TimelineConversationTurn, TimelineModel,
+    SidebarOrganizationView, SidebarProjectAppearance, SidebarProjectLogo, SidebarProjectLogoColor,
+    SidebarState, ThemeSelection, TimelineAnchorSpan, TimelineConversationTurn, TimelineModel,
     TimelineProcessActivityGroup, TimelineRow, TimelineRowKind, WorktreeLifecycleDisplayState,
     is_runtime_model_favorite, record_runtime_selection_use, runtime_auth_source_use_count,
     runtime_selection_use_count, toggle_runtime_model_favorite,
@@ -7253,7 +7253,12 @@ impl MobileApp {
             .get(workspace_id.as_str())
             .cloned()
             .unwrap_or_else(|| workspace_label(&summary.workspace.root_path).to_string());
-        let mut parts = vec![summary.project.name.clone(), worktree];
+        let project_label = if summary.project.is_temporary() {
+            temporary_project_label()
+        } else {
+            summary.project.name.clone()
+        };
+        let mut parts = vec![project_label, worktree];
         if let Some(branch) = summary
             .git_branch
             .as_deref()
@@ -9721,10 +9726,13 @@ impl MobileApp {
             .iter()
             .filter_map(|summary| {
                 let id = summary.project.id.as_str().to_string();
-                seen.insert(id.clone()).then(|| SidebarProject {
-                    id,
-                    label: summary.project.name.clone(),
-                })
+                let label = if summary.project.is_temporary() {
+                    temporary_project_label()
+                } else {
+                    summary.project.name.clone()
+                };
+                seen.insert(id.clone())
+                    .then(|| SidebarProject { id, label })
             })
             .collect::<Vec<_>>();
         // A session can outlive the workspace listing the phone last fetched;
@@ -9732,10 +9740,14 @@ impl MobileApp {
         for session in self.sessions() {
             let id = session.project_id.as_str().to_string();
             if seen.insert(id.clone()) {
-                projects.push(SidebarProject {
-                    id,
-                    label: workspace_label(&session.workspace_root).to_string(),
-                });
+                let label = if vibex_core::workspace::is_temporary_session_root(
+                    std::path::Path::new(&session.workspace_root),
+                ) {
+                    temporary_project_label()
+                } else {
+                    workspace_label(&session.workspace_root).to_string()
+                };
+                projects.push(SidebarProject { id, label });
             }
         }
         projects
@@ -25775,12 +25787,22 @@ impl MobileApp {
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let project_id = row.id().to_string();
+        // A stored choice wins; otherwise the project's own default applies, so
+        // the temporary session project opens on its green sparkle rather than
+        // the neutral mark every checkout starts on. The rule itself is shared
+        // with the desktop, which draws the same row.
         let project_appearance = self
             .sidebar_view
             .project_appearances
             .get(&project_id)
             .cloned()
-            .unwrap_or_default();
+            .unwrap_or_else(|| {
+                self.workspace_summaries
+                    .iter()
+                    .find(|summary| summary.project.id.as_str() == project_id)
+                    .map(|summary| SidebarProjectAppearance::default_for(&summary.project))
+                    .unwrap_or_default()
+            });
         let project_icon_path = sidebar_project_icon_path(&project_appearance);
         let project_icon_color = sidebar_project_icon_color(project_appearance.color);
         let new_session_project_id = project_id.clone();
@@ -30151,7 +30173,7 @@ impl MobileApp {
         // session has no project, and saying so is more use than leaving the
         // chip on "Choose project" while the session is ready to start.
         let project_label = if self.new_session_temporary {
-            locale::text("Temporary session", "临时会话", "臨時工作階段").to_string()
+            temporary_project_label()
         } else {
             self.new_session_project_id
                 .as_deref()
@@ -34767,6 +34789,16 @@ fn composer_session_entry<'a>(
             saved_at_ms: now,
             ..StoredComposerSession::default()
         })
+}
+
+/// What the temporary session project is called on the phone.
+///
+/// The authority keeps that project in a directory called `sessions` and names
+/// the project after it, so the phone would otherwise show a filesystem name
+/// for the one project nobody chose. The wording is the one the new-session
+/// page's own temporary row already uses.
+fn temporary_project_label() -> String {
+    locale::text("Temporary session", "临时会话", "臨時工作階段").to_string()
 }
 
 fn workspace_label(root: &str) -> &str {

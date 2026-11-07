@@ -200,6 +200,14 @@ import_sidebar_project_logo(source: &Path, home: &Path) -> Result<String, String
 - A missing home, malformed file name, or missing stored file renders the
   built-in logo. The sidebar must not render an empty project-logo slot.
 - Legacy appearance JSON without `customLogoFile` decodes with `None`.
+- A project's appearance is resolved, never written ahead of the reader's
+  choice: a stored entry wins, otherwise the project's own default applies.
+  `SidebarProjectAppearance::default_for(project)` is that rule — the temporary
+  session project opens on `Sparkles` in `Green`, every other project on
+  `SidebarProjectAppearance::default()`. Storing a value equal to the project's
+  default removes the entry rather than persisting it, so a later explicit
+  choice is not frozen out of the fallback. The phone draws this row too, which
+  is why the rule lives in `vibex-desktop-model` rather than in either app.
 
 ### 4. Validation & Error Matrix
 
@@ -230,6 +238,9 @@ import_sidebar_project_logo(source: &Path, home: &Path) -> Result<String, String
   `256x256` PNG and stable content-addressed name, rejects invalid SVG and
   traversal-like stored names, and keeps project/session rows on the shared
   logo-size constant.
+- `vibex-desktop` asserts the temporary session project is named in each
+  language and that `default_for` leaves an ordinary project — including one
+  whose directory is coincidentally named `sessions` — on the neutral default.
 - Run `cargo test -p vibex-desktop-model --locked`, targeted sidebar tests, and
   `cargo fmt --all -- --check` before commit.
 
@@ -2938,6 +2949,12 @@ CreateAgentSessionRequest.workspaceMode -> WorkspaceMode
   error in the form.
 - User selects a project path -> use that path directly and do not request a
   temporary root.
+- Temporary root becomes a project row -> resolve it to the reader's language
+  ("Temporary session" / 临时会话), never to the directory name `sessions`, and
+  draw it with the green sparkle default. Detection is
+  `ProjectRecord::is_temporary()`, which matches the authority's
+  `<temp>/vibex/sessions` root shape — never the project's stored name, because a
+  reader's own `~/sessions` is an ordinary project.
 
 ### 5. Good/Base/Bad Cases
 
@@ -2957,6 +2974,9 @@ CreateAgentSessionRequest.workspaceMode -> WorkspaceMode
 - Run `pnpm check:frontend` after sidebar or new-session form changes.
 - Run `cargo check -p vibex-desktop` when adding or changing the Tauri temporary
   root command.
+- `vibex-core` covers the root-shape predicate (authority root true; `~/sessions`
+  and a sibling `sessions-2024` false), and `vibex-tui` covers the localized
+  project label including the ordinary-project case.
 
 ### 7. Wrong vs Correct
 

@@ -975,20 +975,41 @@ pub fn workspace_label(root: &str) -> String {
         .to_string()
 }
 
+/// What the temporary session project is called in the reader's language.
+///
+/// The runtime names that project after the directory it keeps it in, which is
+/// `sessions`. The list says what the row is instead, in this client's own
+/// wording for a session.
+fn temporary_project_label(locale: vibex_ui::locale::Locale) -> String {
+    crate::locale::Strings::for_locale(locale)
+        .temporary_project()
+        .to_string()
+}
+
 /// Project entries for the list: the runtime's projects, plus any project a
 /// loaded session names that the workspace listing has not caught up with.
+///
+/// The temporary session project is named in `locale` rather than after the
+/// directory the authority keeps it in: `sessions` is a filesystem detail, and
+/// the reader did not choose that directory as a project.
 pub fn project_entries(
     workspaces: &[vibex_backend::WorkspaceSummary],
     sessions: &[AgentSession],
+    locale: vibex_ui::locale::Locale,
 ) -> Vec<ProjectEntry> {
     let mut entries = Vec::new();
     let mut seen = BTreeSet::new();
     for summary in workspaces {
         let id = summary.project.id.as_str().to_string();
         if seen.insert(id.clone()) {
+            let label = if summary.project.is_temporary() {
+                temporary_project_label(locale)
+            } else {
+                summary.project.name.clone()
+            };
             entries.push(ProjectEntry {
                 id,
-                label: summary.project.name.clone(),
+                label,
                 created_at_ms: summary.project.created_at_ms,
                 has_workspace: true,
             });
@@ -997,8 +1018,15 @@ pub fn project_entries(
     for session in sessions {
         let id = session.project_id.as_str().to_string();
         if seen.insert(id) {
+            let label = if vibex_core::workspace::is_temporary_session_root(std::path::Path::new(
+                &session.workspace_root,
+            )) {
+                temporary_project_label(locale)
+            } else {
+                workspace_label(&session.workspace_root)
+            };
             entries.push(ProjectEntry {
-                label: workspace_label(&session.workspace_root),
+                label,
                 created_at_ms: session.created_at_ms,
                 id: session.project_id.as_str().to_string(),
                 has_workspace: false,
@@ -1456,6 +1484,57 @@ mod tests {
         // The project names the session's own root, so the session is not lost
         // behind a listing that has not caught up.
         assert_eq!(labels(&rows), vec!["project-gone", "orphan"], "{rows:#?}");
+    }
+
+    /// The authority keeps the temporary session project in a directory called
+    /// `sessions` and names the project after it. That is the one project whose
+    /// stored name is a filesystem detail rather than a name the reader chose,
+    /// so the list says what it is instead.
+    #[test]
+    fn the_temporary_project_is_named_in_the_readers_language() {
+        let project_id = ProjectId::parse("project_temporary1").expect("valid project id");
+        let summary = vibex_backend::WorkspaceSummary {
+            project: vibex_core::ProjectRecord {
+                id: project_id.clone(),
+                name: "sessions".to_string(),
+                root_path: "/tmp/vibex/sessions".to_string(),
+                created_at_ms: 1,
+                updated_at_ms: 1,
+            },
+            workspace: vibex_core::WorkspaceRecord {
+                id: WorkspaceId::new(),
+                project_id,
+                root_path: "/tmp/vibex/sessions".to_string(),
+                mode: WorkspaceMode::CurrentCheckout,
+                created_at_ms: 1,
+                updated_at_ms: 1,
+            },
+            git_branch: None,
+        };
+        for (locale, expected) in [
+            (vibex_ui::locale::Locale::En, "Temporary session"),
+            (vibex_ui::locale::Locale::ZhCn, "临时会话"),
+            (vibex_ui::locale::Locale::ZhTw, "臨時工作階段"),
+        ] {
+            let entries = project_entries(std::slice::from_ref(&summary), &[], locale);
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].label, expected, "locale {locale:?}");
+        }
+        // An ordinary project next to it keeps the name the authority recorded,
+        // even when that name is also `sessions`.
+        let ordinary = vibex_backend::WorkspaceSummary {
+            project: vibex_core::ProjectRecord {
+                id: ProjectId::parse("project_ordinary1").expect("valid project id"),
+                name: "sessions".to_string(),
+                root_path: "/home/reader/sessions".to_string(),
+                created_at_ms: 1,
+                updated_at_ms: 1,
+            },
+            workspace: summary.workspace.clone(),
+            git_branch: None,
+        };
+        let entries = project_entries(&[ordinary], &[], vibex_ui::locale::Locale::ZhCn);
+        assert_eq!(entries[0].label, "sessions");
     }
 
     /// An ownership page: `nodes` name the children, `sessions` name them for

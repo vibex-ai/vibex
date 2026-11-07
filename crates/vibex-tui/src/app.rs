@@ -3131,7 +3131,11 @@ impl App {
                 crate::sessions::session_list_rows(&crate::sessions::SessionListInput {
                     view,
                     sessions,
-                    projects: &crate::sessions::project_entries(&self.workspace_rows, sessions),
+                    projects: &crate::sessions::project_entries(
+                        &self.workspace_rows,
+                        sessions,
+                        self.strings.locale,
+                    ),
                     unread_session_ids: &self.unread_sessions,
                     children: &self.children,
                     query: &self.filter,
