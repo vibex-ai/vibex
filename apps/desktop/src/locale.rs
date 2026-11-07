@@ -324,7 +324,7 @@ static STRINGS_EN: Strings = Strings {
     open_workspace: "Open a workspace",
     no_preview: "No preview",
     no_workspace_files: "No workspace files",
-    message_agent: "Type / for commands, @ for workspace files, $ for skills, ↑/↓ for history",
+    message_agent: "Type / for commands or quick phrases, @ to reference files and sessions or delegate to an Agent, $ for skills, ↑/↓ to fill from history",
     agent_loading_session: "Loading session...",
     agent_start_conversation: "Start a conversation",
     agent_select_session: "Create or select a session",
@@ -529,7 +529,7 @@ static STRINGS_ZH_CN: Strings = Strings {
     open_workspace: "打开工作区",
     no_preview: "暂无预览",
     no_workspace_files: "暂无工作区文件",
-    message_agent: "输入 / 唤出命令，@ 引用工作区文件，$ 调用 Skill，↑/↓ 调取历史消息",
+    message_agent: "输入 / 唤出命令或快捷短语，@ 文件与会话引用或 Agent 委派，$ 调用 Skill，↑/↓ 填充历史消息",
     agent_loading_session: "正在加载会话...",
     agent_start_conversation: "开始对话",
     agent_select_session: "创建或选择会话",
@@ -734,7 +734,7 @@ static STRINGS_ZH_TW: Strings = Strings {
     open_workspace: "開啟工作區",
     no_preview: "暫無預覽",
     no_workspace_files: "暫無工作區檔案",
-    message_agent: "輸入 / 喚出命令，@ 引用工作區檔案，$ 呼叫 Skill，↑/↓ 調取歷史訊息",
+    message_agent: "輸入 / 喚出命令或快捷短語，@ 檔案與會話引用或 Agent 委派，$ 呼叫 Skill，↑/↓ 填充歷史訊息",
     agent_loading_session: "正在載入會話...",
     agent_start_conversation: "開始對話",
     agent_select_session: "建立或選擇會話",
@@ -1880,11 +1880,11 @@ mod tests {
         assert_eq!(strings(ResolvedLocale::ZhTw).undo_changes, "撤銷變更");
         assert_eq!(
             strings(ResolvedLocale::ZhCn).message_agent,
-            "输入 / 唤出命令，@ 引用工作区文件，$ 调用 Skill，↑/↓ 调取历史消息"
+            "输入 / 唤出命令或快捷短语，@ 文件与会话引用或 Agent 委派，$ 调用 Skill，↑/↓ 填充历史消息"
         );
         assert_eq!(
             strings(ResolvedLocale::En).message_agent,
-            "Type / for commands, @ for workspace files, $ for skills, ↑/↓ for history"
+            "Type / for commands or quick phrases, @ to reference files and sessions or delegate to an Agent, $ for skills, ↑/↓ to fill from history"
         );
         assert_eq!(strings(ResolvedLocale::ZhTw).appearance, "外觀");
         assert_eq!(strings(ResolvedLocale::ZhCn).session_settings, "会话");
