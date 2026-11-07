@@ -116396,6 +116396,30 @@ mod tests {
         assert_eq!(adjust_u16(100, -100, 100, 900), 100);
     }
 
+    #[gpui::test]
+    fn settings_number_stepper_renders_without_hover_panic(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        struct StepperProbe;
+        impl Render for StepperProbe {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                settings_number_stepper(
+                    "test-stepper",
+                    100,
+                    Some("%"),
+                    50,
+                    200,
+                    |_, _, _| {},
+                    |_, _, _| {},
+                    "decrease",
+                    "increase",
+                    cx,
+                )
+            }
+        }
+        let (_, cx) = cx.add_window_view(|_, _| StepperProbe);
+        cx.run_until_parked();
+    }
+
     #[test]
     fn settings_control_sync_uses_parent_owned_state_snapshots() {
         let source = include_str!("app.rs");
@@ -125509,29 +125533,5 @@ mod route_picker_tests {
             group.choices[0].label, "deepseek-chat",
             "the model is named, not its storage id"
         );
-    }
-
-    #[gpui::test]
-    fn settings_number_stepper_renders_without_hover_panic(cx: &mut gpui::TestAppContext) {
-        cx.update(gpui_component::init);
-        struct StepperProbe;
-        impl Render for StepperProbe {
-            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-                settings_number_stepper(
-                    "test-stepper",
-                    100,
-                    Some("%"),
-                    50,
-                    200,
-                    |_, _, _| {},
-                    |_, _, _| {},
-                    "decrease",
-                    "increase",
-                    cx,
-                )
-            }
-        }
-        let (_, cx) = cx.add_window_view(|_, _| StepperProbe);
-        cx.run_until_parked();
     }
 }
