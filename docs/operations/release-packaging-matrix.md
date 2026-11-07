@@ -9,7 +9,7 @@ embeds the other product's assets.
 | Desktop Preview | Linux `.deb`/AppImage | `pnpm package:preview` | Source, Cargo lock, PDFium lock | `pnpm check:release`, package smoke, native content gates |
 | Desktop RC/Stable Linux x86_64 | `.deb`/AppImage | `pnpm package:rc` / `pnpm package:stable` | Source, Cargo lock, release channel, reviewed Linux PDFium | Release runbook, signing, install and rollback evidence |
 | Desktop RC/Stable Linux aarch64 | `.deb` (cross-built, no PDFium payload) | `node scripts/package-desktop-release.mjs --platform linux --arch aarch64` | Source, Cargo lock, release channel, cross toolchain | Package existence and checksum; native validation deferred with the PDFium review |
-| Desktop RC/Stable macOS aarch64/x86_64 | `.dmg` | `node scripts/package-desktop-release.mjs --platform macos --arch aarch64\|x86_64` | Source, Cargo lock, native macOS runner | Package existence and checksum; signing/notarization when credentials exist |
+| Desktop RC/Stable macOS aarch64/x86_64 | `.dmg` | `node scripts/package-desktop-release.mjs --platform macos --arch aarch64\|x86_64` | Source, Cargo lock, native macOS runner | Package existence and checksum; ad-hoc bundle signature read back from the dmg; Developer ID signing and notarization when credentials exist |
 | Desktop RC/Stable Windows x86_64/aarch64 | NSIS `.exe` | `node scripts/package-desktop-release.mjs --platform windows --arch x86_64\|aarch64` | Source, Cargo lock, native Windows runner (aarch64 via cross-compile) | Package existence and checksum; Authenticode when credentials exist |
 | Android mobile | Signed native GPUI APK + AAB | `pnpm package:mobile:android` locally; tagged workflow signs before upload | Rust source, Cargo lock, pinned gpui-pre/gpui-pre-mobile revisions, Gradle wrapper, Android API 35/NDK, release key | `pnpm check:mobile-native`, `apksigner`/`jarsigner` verification, APK/AAB checksum, device validation |
 | iOS mobile | Unsigned simulator app + unsigned device IPA + XCFramework | `pnpm build:mobile:ios` and `pnpm package:mobile:ios` on macOS | Rust source, Cargo lock, pinned gpui-pre/gpui-pre-mobile revisions, XcodeGen project | `pnpm check:mobile-native`, simulator/device validation; the installer re-signs the IPA, see [Installing the Unsigned iOS Build](./ios-unsigned-install.md) |
@@ -108,6 +108,28 @@ embeds the other product's assets.
 - Regenerating the `icon-macos-*.png` renditions from a new master icon is part
   of the artwork change, not a packaging step: the checked-in files are reviewed
   and audited like every other reviewed asset input.
+
+## macOS Bundle Signing Rules
+
+- The app bundle is ad-hoc signed before it is packed into the dmg. Apple
+  Silicon runs only signed code, so the linker signs each arm64 executable by
+  itself, but that signature binds no Info.plist and seals no resources.
+  Gatekeeper reports a downloaded bundle that carries only it as "damaged",
+  with no way to open it. A sealed bundle gets the ordinary unidentified
+  developer prompt instead, which the user allows once.
+- `scripts/sign-macos-app.mjs` runs as cargo-packager's
+  `beforeEachPackageCommand`. The packager therefore names both formats,
+  `app,dmg`: in a dmg-only run the bundle is built after the dmg's hook, and
+  ships unsigned.
+- Nested executables are signed first, under `<bundle identifier>.<file name>`,
+  then the bundle. The packager reads the signature back from the mounted dmg
+  and fails unless it verifies strictly, names the bundle identifier, binds the
+  Info.plist, and seals the resources.
+- The ad-hoc signature carries no hardened runtime and no secure timestamp,
+  because cargo-packager's own signing adds both and they have not run on a
+  Mac. Developer ID signing and notarization stay deferred until those
+  credentials exist, and the hardened runtime has to land with them, since
+  notarization requires it.
 
 ## Mobile Packaging Rules
 

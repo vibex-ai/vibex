@@ -13,6 +13,7 @@ import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { compressDebPackage } from "./compress-deb.mjs";
+import { verifyMacosDmg } from "./sign-macos-app.mjs";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const PLATFORMS = new Set(["linux", "macos", "windows"]);
@@ -124,7 +125,27 @@ function withoutResources(source) {
   return source.replace(pattern, "");
 }
 
-function writePlatformConfig(platform, arch, channel, triple, cross) {
+function shellQuoted(value) {
+  return `'${value.split("'").join("'\\''")}'`;
+}
+
+// cargo-packager signs a bundle only for a configured signing identity, and
+// that signing always adds the hardened runtime and a secure timestamp. Until a
+// Developer ID certificate exists, the bundle is ad-hoc signed by a hook
+// instead: the hook runs ahead of every format, and ahead of the dmg format the
+// finished app bundle is waiting to be packed into it.
+function withMacosBundleSigning(source, appBundle) {
+  if (/^beforeEachPackageCommand\s*=/m.test(source)) {
+    fail("generic Packager configuration already sets beforeEachPackageCommand");
+  }
+  const hook = [process.execPath, join(ROOT, "scripts", "sign-macos-app.mjs"), appBundle]
+    .map(shellQuoted)
+    .join(" ");
+  // A top-level key has to precede the first table header.
+  return `beforeEachPackageCommand = ${JSON.stringify(hook)}\n${source}`;
+}
+
+function writePlatformConfig(platform, arch, channel, triple, cross, packageDirectory) {
   let config;
   if (platform === "linux") {
     // The Linux ARM64 deb omits the PDFium resource payload: its distribution
@@ -139,6 +160,8 @@ function writePlatformConfig(platform, arch, channel, triple, cross) {
     if (platform === "macos") {
       config = withIcons(config, MACOS_ICON_INPUTS);
       config = config.replace(/\n\[nsis\][\s\S]*$/, "\n");
+      const appBundle = join(packageDirectory, `${fieldValue(channelConfig, "productName")}.app`);
+      config = withMacosBundleSigning(config, appBundle);
     }
   }
   if (cross) {
@@ -235,7 +258,8 @@ function main() {
   const triple = TARGET_TRIPLES[`${platform}-${arch}`];
   if (!triple) fail(`unsupported platform/architecture combination: ${platform}-${arch}`);
   const cross = arch !== hostArchitecture();
-  const configuredVersion = fieldValue(read(`apps/desktop/Packager.${channel}.toml`), "version");
+  const channelConfig = read(`apps/desktop/Packager.${channel}.toml`);
+  const configuredVersion = fieldValue(channelConfig, "version");
   if (configuredVersion !== version) {
     fail(`--version ${version} does not match Packager.${channel}.toml ${configuredVersion}`);
   }
@@ -268,13 +292,15 @@ function main() {
   const generatedConfig =
     platform === "linux" && arch === "x86_64"
       ? null
-      : writePlatformConfig(platform, arch, channel, triple, cross);
+      : writePlatformConfig(platform, arch, channel, triple, cross, packageDirectory);
   try {
     const config = generatedConfig ?? join(ROOT, "apps", "desktop", `Packager.${channel}.toml`);
+    // macOS names the app format too: a dmg-only run builds the bundle after
+    // the dmg hook has already run, which leaves the bundle unsigned.
     const formats =
       platform === "linux" && arch === "aarch64"
         ? "deb"
-        : { linux: "deb,appimage", macos: "dmg", windows: "nsis" }[platform];
+        : { linux: "deb,appimage", macos: "app,dmg", windows: "nsis" }[platform];
     run(
       "cargo",
       [
@@ -302,6 +328,15 @@ function main() {
     }
   } finally {
     if (generatedConfig) rmSync(generatedConfig, { force: true });
+  }
+
+  // The signature is checked inside the dmg, where it is what users download.
+  if (platform === "macos") {
+    const dmg = exactlyOne(
+      filesUnder(packageDirectory).filter((path) => path.toLowerCase().endsWith(".dmg")),
+      "macOS dmg"
+    );
+    verifyMacosDmg(dmg, `${fieldValue(channelConfig, "productName")}.app`);
   }
 
   const artifacts = normalizedArtifacts(platform, arch, version, packageDirectory).map((artifact) => {

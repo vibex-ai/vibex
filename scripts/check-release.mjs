@@ -497,6 +497,30 @@ function validatePackaging() {
     !desktopReleaseScript.includes("assets/app-icons/icon-16.png"),
     "macOS release packaging must not fall back to the full-bleed icon renditions"
   );
+  // Gatekeeper reports a downloaded bundle that carries only the linker's
+  // signature as damaged, with no way to open it, so the bundle is sealed
+  // before the dmg is packed and the signature is read back from the dmg.
+  assert(
+    desktopReleaseScript.includes("withMacosBundleSigning(config, appBundle)") &&
+      desktopReleaseScript.includes('macos: "app,dmg"'),
+    "macOS release packaging must sign the app bundle before the dmg is assembled"
+  );
+  assert(
+    desktopReleaseScript.includes("verifyMacosDmg(dmg,"),
+    "macOS release packaging must verify the app signature inside the dmg"
+  );
+  const macosSigningScript = source("scripts/sign-macos-app.mjs");
+  for (const required of [
+    '"--sign", "-"',
+    '"--strict"',
+    "Info\\.plist entries=",
+    "Sealed Resources version="
+  ]) {
+    assert(
+      macosSigningScript.includes(required),
+      `macOS bundle signing is missing ${required}`
+    );
+  }
   assert(
     desktopReleaseScript.includes("--formats"),
     "desktop release packager must select an explicit platform format"

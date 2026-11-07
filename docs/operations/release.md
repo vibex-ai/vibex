@@ -41,6 +41,12 @@ The PDFium distribution approval covers linux-x86_64 only. The Linux aarch64
 deb and the macOS and Windows packages are built and packaged without the
 embedded PDFium runtime until their native runtime review completes.
 
+Each macOS app bundle is ad-hoc signed before it is packed into the dmg, and the
+job reads the signature back from the dmg before uploading it; see
+[macOS Bundle Signing Rules](./release-packaging-matrix.md#macos-bundle-signing-rules).
+The packages are not notarized, so Gatekeeper still asks the user to allow the
+first launch.
+
 The local equivalent for a single desktop target is:
 
 ```bash
