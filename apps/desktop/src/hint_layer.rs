@@ -117,12 +117,15 @@ pub fn init(cx: &mut App) {
 ///
 /// Built by [`hint_notification`]: the tone and the message are the whole
 /// payload, because the card that paints them — the copy button included — is
-/// owned by the layer, not by the caller.
+/// owned by the layer, not by the caller. The one thing a caller may add to what
+/// that button copies is [`Hint::copy_text`].
 #[derive(Clone)]
 pub struct Hint {
     id: HintId,
     tone: NotificationType,
     message: SharedString,
+    /// What the copy button copies when that is more than the card says.
+    copy_text: Option<SharedString>,
     autohide: bool,
     on_click: Option<Rc<HintClickHandler>>,
 }
@@ -135,6 +138,7 @@ impl Hint {
             id: HintId::Loose(NEXT_HINT_SERIAL.fetch_add(1, Ordering::Relaxed)),
             tone,
             message: message.into(),
+            copy_text: None,
             autohide: true,
             on_click: None,
         }
@@ -147,6 +151,31 @@ impl Hint {
     pub fn id<T: Sized + 'static>(mut self) -> Self {
         self.id = HintId::Family(TypeId::of::<T>());
         self
+    }
+
+    /// Replace the previous hint of `T`'s family for the same `key` only.
+    ///
+    /// For a family with one hint per subject: one session's failure is one card
+    /// however many paths report it, and another session's failure is its own.
+    pub fn id_for<T: Sized + 'static>(mut self, key: impl Into<SharedString>) -> Self {
+        self.id = HintId::Keyed(TypeId::of::<T>(), key.into());
+        self
+    }
+
+    /// What the copy button copies instead of the message.
+    ///
+    /// For a card that says what happened in one line while the diagnostics a
+    /// reader would paste somewhere else are longer. A newer hint that replaces
+    /// a mounted one keeps what the older one could copy; see [`HintList::push`].
+    pub fn copy_text(mut self, copy_text: impl Into<SharedString>) -> Self {
+        self.copy_text = Some(copy_text.into());
+        self
+    }
+
+    /// The line the card paints.
+    #[cfg(test)]
+    pub fn message(&self) -> &str {
+        &self.message
     }
 
     /// Whether the hint hides itself after [`HINT_AUTOHIDE`]. Default: true.
@@ -177,6 +206,8 @@ impl Hint {
 enum HintId {
     /// One family of hints: a newer push replaces the older one.
     Family(TypeId),
+    /// One subject inside a family: a newer push for it replaces the older one.
+    Keyed(TypeId, SharedString),
     /// A hint pushed without an id, alone in its own entry.
     Loose(u64),
 }
@@ -188,7 +219,8 @@ enum HintId {
 /// layer can reach, and a drag across a line that is already fading is a poor
 /// way to ask for the error text a user most often needs to paste somewhere
 /// else. The message therefore travels as the card's content, with one icon
-/// button beside it that puts the message on the clipboard whole.
+/// button beside it that puts the message on the clipboard whole — or the longer
+/// account the hint carries in [`Hint::copy_text`], when its message is a summary.
 ///
 /// The message is never also painted by a second path: every hint the workbench
 /// pushes is delivered in-app, so there is no system notification body that
@@ -288,7 +320,21 @@ impl HintList {
         self.hints.iter().map(|(_, hint, _)| hint).collect()
     }
 
-    fn push(&mut self, hint: Hint, window: &mut Window, cx: &mut Context<Self>) {
+    /// Mounts a hint, replacing the mounted hint with the same id.
+    ///
+    /// Replacing keeps a repeated report to one card, but the reports need not
+    /// know the same things and need not arrive in a fixed order. A hint with
+    /// copy text therefore takes over what the one it replaces could copy, and
+    /// hides itself if either report may: a report only stays on screen because
+    /// it believes it is the sole account of what happened.
+    fn push(&mut self, mut hint: Hint, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(previous) = self.hints.get(&hint.id)
+            && let Some(known) = previous.copy_text.as_deref()
+            && let Some(next) = hint.copy_text.as_deref()
+        {
+            hint.copy_text = Some(merged_copy_text(known, next).into());
+            hint.autohide |= previous.autohide;
+        }
         let timeout = hint.autohide.then_some(HINT_AUTOHIDE);
         self.hints.push(
             hint.id.clone(),
@@ -449,6 +495,19 @@ impl Render for HintList {
     }
 }
 
+/// What a card copies once `next` has replaced `previous`: both, in the order
+/// they arrived, without repeating a line either already holds.
+fn merged_copy_text(previous: &str, next: &str) -> String {
+    let mut merged = previous.to_string();
+    for line in next.lines() {
+        if !previous.lines().any(|known| known == line) {
+            merged.push('\n');
+            merged.push_str(line);
+        }
+    }
+    merged
+}
+
 /// The element id one placement's stack renders under.
 ///
 /// Keyed by the placement rather than by position among the mounted stacks: a
@@ -502,8 +561,15 @@ fn hint_card(
         }
         NotificationType::Error => Icon::new(IconName::CircleX).text_color(cx.theme().danger),
     };
-    let copy_value = hint.message.clone();
-    let copy_label = locale::text("Copy message", "复制消息", "複製訊息");
+    let copy_label = if hint.copy_text.is_some() {
+        locale::text("Copy details", "复制详情", "複製詳情")
+    } else {
+        locale::text("Copy message", "复制消息", "複製訊息")
+    };
+    let copy_value = hint
+        .copy_text
+        .clone()
+        .unwrap_or_else(|| hint.message.clone());
     // What a press on the card does, wherever it lands: a hint answers every
     // press the same way, and only the copy button below is excluded.
     let dismiss: Rc<HintDismissHandler> = {

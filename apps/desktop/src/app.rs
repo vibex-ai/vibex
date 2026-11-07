@@ -352,6 +352,14 @@ struct RuntimeNoteErrorNotification;
 /// instead of stacking a queue of them.
 struct NewSessionErrorNotification;
 
+/// Replace-by-id marker for one session's Agent failure hint.
+///
+/// One failed turn reaches the workbench more than once: as the error item on
+/// its timeline and, for a new session, as the submission its initial message
+/// was waiting on. Keying every report to the session makes them one card, while
+/// a failure in another session keeps a card of its own.
+struct AgentFailureNotification;
+
 /// The tone a settings operation result is announced with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SettingsOperationTone {
@@ -3459,6 +3467,31 @@ impl VibexWorkbench {
                     .autohide(true),
                 cx,
             );
+        });
+    }
+
+    /// Announces an Agent failure that did not arrive as a timeline item.
+    ///
+    /// It lands on the same per-session card `notify_for_timeline_events` raises
+    /// for the failure's error item, so the two reports stay one card whichever
+    /// comes first. The notification preferences do not gate it: the caller is
+    /// answering an action the user just took, not a turn running on its own.
+    ///
+    /// A message that never reached the provider leaves no error item, which
+    /// makes this card the only account of the failure, so it does not hide
+    /// itself. When an error item does report the failure, that report lets it.
+    fn present_agent_failure(
+        &self,
+        session_id: &VibexSessionId,
+        detail: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let agent_label = self.session_agent_label(session_id.as_str());
+        let hint = agent_failure_hint(session_id.as_str(), &agent_label, detail).autohide(false);
+        window.defer(cx, move |window, cx| {
+            Theme::global_mut(cx).notification.placement = Anchor::TopCenter;
+            hint_layer::push(window, hint, cx);
         });
     }
 }
@@ -28971,6 +29004,13 @@ impl VibexWorkbench {
         self.load_session_group_view(session_id, true, cx);
     }
 
+    /// The name a session's notifications call its Agent by.
+    fn session_agent_label(&self, session_id: &str) -> String {
+        self.registered_session(session_id)
+            .map(|session| runtime_agent_label(&self.agent_snapshots, &session.agent_id))
+            .unwrap_or_else(|| "Agent".to_string())
+    }
+
     fn notify_for_timeline_events(&mut self, events: &[TimelineLiveEvent], cx: &mut Context<Self>) {
         let Some(session_id) = events.first().map(|event| event.session_id.as_str()) else {
             return;
@@ -28998,12 +29038,7 @@ impl VibexWorkbench {
         {
             return;
         }
-        let agent_id = self
-            .registered_session(session_id.as_str())
-            .map(|session| &session.agent_id);
-        let agent_label = agent_id
-            .map(|agent_id| runtime_agent_label(&self.agent_snapshots, agent_id))
-            .unwrap_or_else(|| "Agent".to_string());
+        let agent_label = self.session_agent_label(session_id.as_str());
         let kind = timeline_notification_kind(&fresh, &self.ui_state.desktop_behavior);
         let Some(body) = timeline_notification_body(kind, &agent_label) else {
             return;
@@ -29016,11 +29051,15 @@ impl VibexWorkbench {
         if let Some(kind) = kind
             && let Some(handle) = cx.active_window()
         {
-            let tone = timeline_notification_tone(kind);
-            let message = SharedString::from(body.clone());
+            let failure_detail = timeline_failure_detail(&fresh)
+                .filter(|_| matches!(kind, NotificationKind::Failed));
+            let hint = match failure_detail {
+                Some(detail) => agent_failure_hint(session_id.as_str(), &agent_label, detail),
+                None => hint_notification(timeline_notification_tone(kind), body.clone()),
+            };
             let delivered = cx
                 .update_window(handle, move |_, window, cx| {
-                    hint_layer::push(window, hint_notification(tone, message), cx);
+                    hint_layer::push(window, hint, cx);
                 })
                 .is_ok();
             if delivered {
@@ -40137,7 +40176,7 @@ impl VibexWorkbench {
                         if let Some(error) = initial_message_error
                             && let Some(note) = initial_message_failure_note(&error)
                         {
-                            this.runtime_note_error = Some(note);
+                            this.present_agent_failure(&session_id, note, window, cx);
                         }
                         this.reconcile_sidebar_state();
                         this.publish_sidebar_invalidation();
@@ -82550,14 +82589,44 @@ fn timeline_notification_tone(kind: NotificationKind) -> NotificationType {
     }
 }
 
+fn agent_failure_body(agent_label: &str) -> String {
+    match locale::current_locale() {
+        locale::ResolvedLocale::En => format!("{agent_label} encountered an error"),
+        locale::ResolvedLocale::ZhCn => format!("{agent_label} 出现错误"),
+        locale::ResolvedLocale::ZhTw => format!("{agent_label} 出現錯誤"),
+    }
+}
+
+/// One session's Agent failure on the hint layer.
+///
+/// The card only says that the Agent failed. The diagnostics a reader would
+/// paste somewhere else ride the copy button instead of a longer card or a
+/// second one.
+fn agent_failure_hint(session_id: &str, agent_label: &str, detail: String) -> hint_layer::Hint {
+    hint_notification(NotificationType::Error, agent_failure_body(agent_label))
+        .id_for::<AgentFailureNotification>(session_id.to_string())
+        .copy_text(detail)
+}
+
+/// What a batch's error items say: the stable code and the provider's own words,
+/// one line per distinct error. `None` when the batch holds no error.
+fn timeline_failure_detail(events: &[&TimelineLiveEvent]) -> Option<String> {
+    let mut lines = Vec::new();
+    for event in events {
+        if let TimelinePayload::Error(error) = &event.item.payload {
+            let line = format!("{}: {}", error.code, error.message);
+            if !lines.contains(&line) {
+                lines.push(line);
+            }
+        }
+    }
+    (!lines.is_empty()).then(|| lines.join("\n"))
+}
+
 fn timeline_notification_body(kind: Option<NotificationKind>, agent_label: &str) -> Option<String> {
     let locale = locale::current_locale();
     match kind {
-        Some(NotificationKind::Failed) => Some(match locale {
-            locale::ResolvedLocale::En => format!("{agent_label} encountered an error"),
-            locale::ResolvedLocale::ZhCn => format!("{agent_label} 出现错误"),
-            locale::ResolvedLocale::ZhTw => format!("{agent_label} 出現錯誤"),
-        }),
+        Some(NotificationKind::Failed) => Some(agent_failure_body(agent_label)),
         Some(NotificationKind::NeedsInput) => Some(match locale {
             locale::ResolvedLocale::En => format!("{agent_label} needs your confirmation"),
             locale::ResolvedLocale::ZhCn => format!("{agent_label} 需要你确认内容"),
@@ -96529,6 +96598,39 @@ mod tests {
     }
 
     #[test]
+    fn timeline_failure_detail_keeps_each_errors_code_and_text() {
+        let session_id = VibexSessionId::new();
+        let error = |sequence: i64, code: &str, message: &str| TimelineLiveEvent {
+            session_id: session_id.clone(),
+            sequence,
+            item: timeline_item_with_payload(
+                &session_id,
+                sequence,
+                TimelineSource::Agent,
+                TimelinePayload::Error(vibex_core::TimelineErrorPayload {
+                    code: code.into(),
+                    message: message.into(),
+                    recoverable: true,
+                }),
+            ),
+        };
+        let capacity = error(1, "codex_error", "Selected model is at capacity.");
+        let repeated = error(2, "codex_error", "Selected model is at capacity.");
+        let sign_in = error(3, "auth_required", "Sign in first.");
+        let done = TimelineLiveEvent {
+            session_id: session_id.clone(),
+            sequence: 4,
+            item: indexed_timeline_item(&session_id, 4, "done"),
+        };
+
+        assert_eq!(
+            timeline_failure_detail(&[&capacity, &done, &repeated, &sign_in]).as_deref(),
+            Some("codex_error: Selected model is at capacity.\nauth_required: Sign in first.")
+        );
+        assert_eq!(timeline_failure_detail(&[&done]), None);
+    }
+
+    #[test]
     fn timeline_notification_tone_maps_each_kind() {
         assert!(matches!(
             timeline_notification_tone(NotificationKind::Completed),
@@ -110420,6 +110522,16 @@ mod tests {
         message: &'static str,
         cx: &'a mut TestAppContext,
     ) -> (&'a mut VisualTestContext, FocusHandle) {
+        hint_window_with(
+            hint_notification(NotificationType::Error, message).autohide(false),
+            cx,
+        )
+    }
+
+    fn hint_window_with(
+        hint: hint_layer::Hint,
+        cx: &mut TestAppContext,
+    ) -> (&mut VisualTestContext, FocusHandle) {
         cx.update(gpui_component::init);
         cx.update(hint_layer::init);
         cx.update(|cx| {
@@ -110436,19 +110548,19 @@ mod tests {
         });
         cx.update(|window, cx| {
             window.focus(&anchor_focus, cx);
-            hint_layer::push(
-                window,
-                hint_notification(NotificationType::Error, message).autohide(false),
-                cx,
-            );
+            hint_layer::push(window, hint, cx);
         });
+        settle_hints(cx);
+        (cx, anchor_focus)
+    }
+
+    fn settle_hints(cx: &mut VisualTestContext) {
         for _ in 0..3 {
             cx.update(|window, cx| {
                 let _ = window.draw(cx);
             });
             cx.run_until_parked();
         }
-        (cx, anchor_focus)
     }
 
     fn mounted_hint_count(cx: &mut VisualTestContext) -> usize {
@@ -110495,6 +110607,79 @@ mod tests {
         assert!(
             cx.update(|window, _| anchor_focus.is_focused(window)),
             "copying a hint must not take the focus the user is typing at"
+        );
+    }
+
+    /// One failed initial message reaches the layer twice: as its timeline error
+    /// and as its failed submission. Both have to end up on one card that names
+    /// the Agent, and that card has to copy what each report knew: only the
+    /// timeline holds the provider's own words.
+    #[gpui::test]
+    fn one_sessions_failure_reports_share_a_card_that_copies_every_detail(cx: &mut TestAppContext) {
+        let provider = "codex_error: Selected model is at capacity.";
+        let note = "Session created; initial message failed: codex_error: recoverable failure";
+        let failure = |session: &str, detail: &str| {
+            agent_failure_hint(session, "Codex", detail.to_string()).autohide(false)
+        };
+        let (cx, _) = hint_window_with(failure("session-a", provider), cx);
+
+        cx.update(|window, cx| hint_layer::push(window, failure("session-a", note), cx));
+        settle_hints(cx);
+        assert_eq!(mounted_hint_count(cx), 1, "one failure is one card");
+        let message = cx.update(|window, cx| {
+            let list = hint_layer::list(window, cx).expect("the hint layer should be mounted");
+            list.read(cx).hints()[0].message().to_string()
+        });
+        assert_eq!(message, agent_failure_body("Codex"));
+
+        // A report repeated word for word adds nothing to the clipboard.
+        cx.update(|window, cx| hint_layer::push(window, failure("session-a", provider), cx));
+        settle_hints(cx);
+        let bounds = cx
+            .debug_bounds("hint-message-copy")
+            .expect("the hint copy button should be laid out");
+        cx.simulate_click(bounds.center(), Modifiers::none());
+        assert_eq!(
+            cx.update(|_, cx| cx.read_from_clipboard().and_then(|item| item.text())),
+            Some(format!("{provider}\n{note}")),
+            "the copy button should hold what both reports knew"
+        );
+
+        cx.update(|window, cx| hint_layer::push(window, failure("session-b", note), cx));
+        settle_hints(cx);
+        assert_eq!(
+            mounted_hint_count(cx),
+            2,
+            "another session's failure is not the same failure"
+        );
+    }
+
+    /// A failed turn stays on the session's timeline, so its card may hide
+    /// itself even after the submission's report took it over. A message that
+    /// never reached the provider has no timeline item: its card is the only
+    /// account of the failure, and hiding it would take the details with it.
+    #[gpui::test]
+    fn only_a_failure_the_timeline_keeps_hides_its_card(cx: &mut TestAppContext) {
+        let submission = |session: &str| {
+            agent_failure_hint(session, "Codex", "note".to_string()).autohide(false)
+        };
+        let (cx, _) = hint_window_with(submission("never-dispatched"), cx);
+        cx.update(|window, cx| {
+            let timeline = agent_failure_hint("failed-turn", "Codex", "item".to_string());
+            hint_layer::push(window, timeline, cx);
+            hint_layer::push(window, submission("failed-turn"), cx);
+        });
+        settle_hints(cx);
+        assert_eq!(mounted_hint_count(cx), 2);
+
+        for _ in 0..8 {
+            cx.background_executor.advance_clock(Duration::from_secs(1));
+            settle_hints(cx);
+        }
+        assert_eq!(
+            mounted_hint_count(cx),
+            1,
+            "the failed turn's card hides itself and the sole account stays"
         );
     }
 
@@ -112097,7 +112282,14 @@ mod tests {
             .and_then(|(_, tail)| tail.split_once("this.reconcile_sidebar_state();"))
             .map(|(body, _)| body)
             .expect("initial-message failure handling should remain inspectable");
-        assert!(initial_message_failure.contains("this.runtime_note_error"));
+        assert!(
+            initial_message_failure.contains("this.present_agent_failure("),
+            "an initial-turn failure joins the session's one failure hint"
+        );
+        assert!(
+            !initial_message_failure.contains("this.runtime_note_error"),
+            "a hint of its own would report the same failure twice"
+        );
         assert!(
             !initial_message_failure.contains("this.runtime_note ="),
             "an initial-turn failure is a result, not manager progress"

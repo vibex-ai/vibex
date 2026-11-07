@@ -411,7 +411,8 @@ Rules that keep the pattern consistent:
 
 - Build every hint through `hint_layer::hint_notification`. It carries the
   message the card paints, and the card carries the one icon button that copies
-  that message whole. A hint built on the kit's `Notification` instead shows text
+  that message whole, or the hint's `.copy_text` when it has one. A hint built on
+  the kit's `Notification` instead shows text
   the kit paints as plain, unselectable, uncopyable content — including the error
   text the user most often needs to paste somewhere else — and brings back the
   close button the card deliberately does not have. A source contract in `app.rs`
@@ -420,6 +421,21 @@ Rules that keep the pattern consistent:
 - Set `Theme::global_mut(cx).notification.placement = Anchor::TopCenter` before
   pushing, and give each hint family its own private zero-sized id type so
   unrelated hints do not replace each other.
+- One failure is one card. When the same failure reaches the workbench along
+  several paths — a failed turn is the error item on its timeline and, for a new
+  session, also the submission its initial message was waiting on — every report
+  pushes the same hint, keyed to its subject with `.id_for::<T>(key)`
+  (`agent_failure_hint` keys to the session). A different session's failure keeps
+  its own card.
+- A card may summarize something longer. `.copy_text(details)` hands the
+  diagnostics to the copy button, whose label then says it copies details, so the
+  card stays one readable line and the raw error can still leave the app. A hint
+  that replaces a mounted one with the same id merges what the older one could
+  copy, line by line and in arrival order: the reports need not know the same
+  things — only the timeline holds the provider's own words — and they need not
+  arrive in a fixed order. The merged card hides itself if either report may: a
+  failure that left nothing on the timeline turns autohide off, because that card
+  is its only account.
 - Pick the type from the meaning, not the page: `success` for a completed action,
   `error` for one that failed, `info` for a neutral result, `warning` for one the
   user should look at. Do not paint a failure with a success tone.
