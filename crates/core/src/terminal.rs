@@ -324,6 +324,17 @@ pub struct CreateTerminalSessionRequest {
     /// Provider Profile whose credentials and endpoint the CLI should inherit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_profile_id: Option<ProviderProfileId>,
+    /// Built-in tool panels this session should run with.
+    ///
+    /// The same answer an ACP session records: the terminal launch hands the
+    /// resolved panels to the CLI through its MCP input, so a panel the reader
+    /// switched off on the new-session page must stay off here too. An absent
+    /// map follows the Agent's Config Center switches.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::SessionToolSettings::is_inherit"
+    )]
+    pub tools: crate::SessionToolSettings,
     pub rows: u16,
     pub cols: u16,
 }

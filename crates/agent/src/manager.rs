@@ -1409,7 +1409,7 @@ impl AgentManager {
             last_message_at_ms: now,
             archived_at_ms: None,
             deleted_at_ms: None,
-            tools: Default::default(),
+            tools: request.tools.clone(),
             transport: vibex_core::SessionTransport::Terminal,
             terminal: Some(Box::new(vibex_core::TerminalSessionFacts::default())),
         };
@@ -13719,6 +13719,7 @@ mod tests {
             args: Vec::new(),
             first_prompt: None,
             provider_profile_id: None,
+            tools: Default::default(),
             rows: 24,
             cols: 100,
         }

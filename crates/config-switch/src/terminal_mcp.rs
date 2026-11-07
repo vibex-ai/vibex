@@ -88,6 +88,20 @@ pub enum TerminalMcpChannel {
     Unavailable,
 }
 
+impl TerminalMcpChannel {
+    /// Whether this channel can hand an MCP server to the CLI.
+    ///
+    /// Product surfaces read this to decide whether a panel delivered as an MCP
+    /// server — the browser, and computer use for every Agent that has an MCP
+    /// client — can be offered to a terminal-mode session at all.
+    pub fn carries_mcp_servers(self) -> bool {
+        !matches!(
+            self,
+            TerminalMcpChannel::EnvironmentOnly | TerminalMcpChannel::Unavailable
+        )
+    }
+}
+
 /// The channel a terminal-mode session of `agent_id` uses.
 pub fn terminal_mcp_channel(agent_id: &str) -> TerminalMcpChannel {
     match agent_id {

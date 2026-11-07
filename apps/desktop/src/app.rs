@@ -39605,6 +39605,9 @@ impl VibexWorkbench {
             args,
             first_prompt: first_prompt_arg,
             provider_profile_id,
+            // The switches the reader saw: the terminal launch resolves them
+            // the same way an ACP session does, against the Agent's defaults.
+            tools: self.new_session_tools.clone(),
             rows: 24,
             cols: 100,
         };
@@ -46703,7 +46706,16 @@ impl VibexWorkbench {
                 "請先選擇 Agent",
             ));
         };
-        self.tool_availability_for(agent_id.as_str(), tool)
+        // The panel follows the transport the draft will be created with: a
+        // native terminal receives its servers through its CLI's own MCP input,
+        // which not every Agent has, so the switch must not offer a panel the
+        // terminal session could never run with.
+        let terminal = effective_new_session_transport(
+            self.ui_state.session.new_session_transport,
+            Some(agent_id),
+        )
+        .is_terminal();
+        self.tool_availability_for(agent_id.as_str(), tool, terminal)
     }
 
     /// Whether one panel can reach one Agent at all, and the reason when it
@@ -46711,12 +46723,18 @@ impl VibexWorkbench {
     ///
     /// The new-session toggles and a session's read-only surfaces both ask
     /// here, so the two can never disagree about an Agent that carries its own
-    /// computer use or cannot receive MCP servers.
+    /// computer use or cannot receive MCP servers. `terminal` selects the
+    /// native-terminal delivery table instead of the ACP one: the same Agent
+    /// can take a panel over ACP and still have no input for it in its own CLI.
     fn tool_availability_for(
         &self,
         agent_id: &str,
         tool: AgentBuiltinTool,
+        terminal: bool,
     ) -> SessionToolAvailability {
+        if terminal && let Some(reason) = terminal_tool_unavailable_reason(agent_id, tool) {
+            return SessionToolAvailability::Unavailable(reason);
+        }
         match tool {
             AgentBuiltinTool::Browser => {
                 if vibex_desktop_runtime::BrowserRuntime::delivery_for(agent_id)
@@ -47905,7 +47923,11 @@ impl VibexWorkbench {
                 // an Agent that carries its own computer use, or one no MCP
                 // server can reach, is not "off" and must not be painted as
                 // though the session could have turned it on.
-                availability: self.tool_availability_for(session.agent_id.as_str(), tool),
+                availability: self.tool_availability_for(
+                    session.agent_id.as_str(),
+                    tool,
+                    session.transport.is_terminal(),
+                ),
             })
             .collect()
     }
@@ -78688,6 +78710,44 @@ fn effective_new_session_transport(
         NewSessionTransport::Acp
     } else {
         stored
+    }
+}
+
+/// Why a panel cannot reach an Agent's native terminal, if it cannot.
+///
+/// A terminal session receives the browser and computer use through the MCP
+/// input its CLI reads at launch (`vibex_config_switch::terminal_mcp`). An
+/// Agent with no such input gets neither, except that pi's computer use is a
+/// Skill plus a command line, which only needs the process environment. `None`
+/// leaves the answer to the delivery rules every transport shares.
+fn terminal_tool_unavailable_reason(
+    agent_id: &str,
+    tool: AgentBuiltinTool,
+) -> Option<&'static str> {
+    use vibex_config_switch::terminal_mcp::{TerminalMcpChannel, terminal_mcp_channel};
+
+    let channel = terminal_mcp_channel(agent_id);
+    if channel.carries_mcp_servers() {
+        return None;
+    }
+    match tool {
+        AgentBuiltinTool::Browser => Some(locale::text(
+            "This Agent's native terminal cannot receive browser tools",
+            "该 Agent 的原生终端无法接收浏览器工具",
+            "該 Agent 的原生終端無法接收瀏覽器工具",
+        )),
+        AgentBuiltinTool::Computer
+            if channel == TerminalMcpChannel::EnvironmentOnly
+                && vibex_desktop_runtime::ComputerRuntime::use_delivery_for(agent_id)
+                    == vibex_core::ComputerUseDelivery::CliSkill =>
+        {
+            None
+        }
+        AgentBuiltinTool::Computer => Some(locale::text(
+            "This Agent's native terminal cannot receive computer use",
+            "该 Agent 的原生终端无法接收电脑操作",
+            "該 Agent 的原生終端無法接收電腦操作",
+        )),
     }
 }
 
@@ -111074,8 +111134,11 @@ mod tests {
             "the session's recorded answer must win over the Agent card"
         );
         assert!(
-            states.contains("self.tool_availability_for(session.agent_id.as_str(), tool)"),
-            "the pill must read the same delivery tables the new-session toggles use"
+            states.contains(
+                "self.tool_availability_for(\n                    session.agent_id.as_str(),\n                    tool,\n                    session.transport.is_terminal(),\n                )"
+            ),
+            "the pill must read the same delivery tables the new-session toggles use, \
+             for the transport the session actually runs on"
         );
 
         // The reported bug: a panel the Agent can never receive was painted as
@@ -111089,6 +111152,10 @@ mod tests {
         assert!(helper.contains("SessionToolAvailability::Unavailable"));
         assert!(helper.contains("NativeAgentFeature"));
         assert!(helper.contains("computer_tools_ready()"));
+        assert!(
+            helper.contains("terminal_tool_unavailable_reason(agent_id, tool)"),
+            "a native terminal must apply its own MCP input table before the shared rules"
+        );
         let toggle = source
             .split_once("    fn new_session_tool_availability(")
             .and_then(|(_, tail)| {
@@ -111097,8 +111164,48 @@ mod tests {
             .map(|(body, _)| body)
             .expect("the new-session availability shim should remain inspectable");
         assert!(
-            toggle.contains("self.tool_availability_for(agent_id.as_str(), tool)"),
+            toggle.contains("self.tool_availability_for(agent_id.as_str(), tool, terminal)"),
             "the new-session toggle must not keep a second copy of the rules"
+        );
+        assert!(
+            toggle.contains("effective_new_session_transport("),
+            "the new-session toggle must follow the transport the draft will be created with"
+        );
+    }
+
+    /// A native terminal offers a panel only when its CLI has an MCP input
+    /// Vibex can add to; pi's computer use needs only the environment.
+    #[test]
+    fn a_native_terminal_offers_panels_its_cli_can_receive() {
+        for agent in [
+            "claude",
+            "codex",
+            "codebuddy-code",
+            "copilot",
+            "opencode",
+            "hermes",
+            "cline",
+        ] {
+            for tool in AgentBuiltinTool::ALL {
+                assert_eq!(
+                    terminal_tool_unavailable_reason(agent, tool),
+                    None,
+                    "{agent}"
+                );
+            }
+        }
+        for agent in ["cursor", "gemini", "grok", "kimi", "devin"] {
+            for tool in AgentBuiltinTool::ALL {
+                assert!(
+                    terminal_tool_unavailable_reason(agent, tool).is_some(),
+                    "{agent} has no MCP input in its terminal"
+                );
+            }
+        }
+        assert!(terminal_tool_unavailable_reason("pi", AgentBuiltinTool::Browser).is_some());
+        assert_eq!(
+            terminal_tool_unavailable_reason("pi", AgentBuiltinTool::Computer),
+            None
         );
     }
 

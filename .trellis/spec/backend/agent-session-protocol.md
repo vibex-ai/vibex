@@ -473,6 +473,16 @@ Contracts:
 - Delivery is best effort: a failure is logged and the CLI still starts.
 - Server names match the ACP wire spelling (sanitized display name), and a
   built-in's HTTP descriptor wins over its stdio sidecar duplicate.
+- `CreateTerminalSessionRequest.tools` carries the new-session page's panel
+  switches and is stored on the session exactly like an ACP session's, so a
+  panel switched off on the page stays off in the terminal launch.
+- Product surfaces gate the browser and computer-use panels on the transport:
+  the new-session toggles follow the draft's effective transport, and a
+  session's capability pill and menus follow `session.transport`. In a native
+  terminal a panel is offered only when `TerminalMcpChannel::carries_mcp_servers`
+  holds, except pi's computer use, which is a Skill plus the process
+  environment. The desktop helper is `terminal_tool_unavailable_reason`, applied
+  before the delivery rules both transports share.
 
 ### Codex ACP model selection note
 
