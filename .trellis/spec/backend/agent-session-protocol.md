@@ -436,6 +436,44 @@ later occurrence would shadow the Provider the session was created with. Codex
 does not need this tier: `CODEX_HOME` already points at the projection's own
 `config.toml`.
 
+### Terminal-mode MCP delivery note
+
+A terminal-mode session receives the same resources an ACP session of its
+Agent would: `AgentManager::runtime_resources_for_session(.., Acp)` supplies the
+reader's enabled MCP servers, the Vibex-use delegation sidecar, the embedded
+browser, and computer use, plus pi's computer-use environment. There is no
+`session/new` to carry them, so `apply_terminal_session_mcp` hands them to the
+CLI through the launch input it reads, owned by
+`vibex_config_switch::terminal_mcp`:
+
+| Agent | Channel |
+| --- | --- |
+| Claude Code, CodeBuddy Code | `--mcp-config=<file>` (the `=` form: the option is variadic and the space form swallows a positional prompt) |
+| Copilot CLI | `--additional-mcp-config @<file>` |
+| Codex | `-c mcp_servers.<name>.<field>=…`; credentials only through `env_vars`, `bearer_token_env_var`, and `env_http_headers` |
+| OpenCode | `mcp` table merged into `OPENCODE_CONFIG_CONTENT` |
+| Hermes | `HERMES_MANAGED_DIR` layer, carrying any existing managed `config.yaml` / `.env` |
+| Cline | `CLINE_MCP_SETTINGS_PATH`, which replaces the file, so it restates the reader's servers first |
+| pi | process environment only |
+| Cursor, Gemini, Grok, Kimi Code, Devin | none — their only inputs are home/project files (Gemini's system tier requires root ownership) |
+
+Contracts:
+
+- Every channel is additive; Vibex never writes a file the reader owns. When a
+  Provider projection relocates the Agent home (`CODEX_HOME`, `COPILOT_HOME`,
+  `HERMES_HOME`, `CLINE_DATA_DIR`), the servers in the reader's real home are
+  restated alongside Vibex's so they are not lost.
+- Credentials never enter the argv. Files are 0600 under
+  `<vibex home>/terminal-mcp/<session id>/` (0700) and removed when the session
+  is deleted. A Codex stdio variable that would change a value the Codex
+  process already has is skipped rather than overwritten.
+- Only the launch argv/env change. Tokens are minted per launch, so create,
+  restart, and crash restore each call `apply_terminal_session_mcp`; the
+  recorded argv never contains the delivery.
+- Delivery is best effort: a failure is logged and the CLI still starts.
+- Server names match the ACP wire spelling (sanitized display name), and a
+  built-in's HTTP descriptor wins over its stdio sidecar duplicate.
+
 ### Codex ACP model selection note
 
 `codex-acp` applies a session's model through the Codex app-server, and it

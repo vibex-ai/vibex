@@ -92,6 +92,7 @@ pub use provider_projection::*;
 pub mod secrets;
 mod skill_bundle;
 pub mod skills;
+pub mod terminal_mcp;
 
 pub const CODEX_MODEL_PROVIDER_ID_OPTION_KEY: &str = "codexModelProviderId";
 pub const CODEX_MODEL_PROVIDER_CONFIG_TOML_OPTION_KEY: &str = "codexModelProviderConfigToml";

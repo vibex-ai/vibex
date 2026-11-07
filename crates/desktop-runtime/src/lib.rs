@@ -4830,12 +4830,21 @@ impl DesktopRuntime {
                     settings_path,
                 );
             }
+            // The MCP delivery is re-minted for this launch and stays out of
+            // the recorded argv, exactly as on create and restart.
+            let mut launch_argv = argv.clone();
+            let mut launch_env = environment.env;
+            self.agent.manager().apply_terminal_session_mcp(
+                &session,
+                &mut launch_argv,
+                &mut launch_env,
+            );
             let spec = vibex_core::TerminalSessionLaunchSpec {
                 agent_id: session.agent_id.clone(),
                 workspace_id: record.workspace_id.clone(),
                 workspace_root: session.workspace_root.clone(),
-                argv: argv.clone(),
-                env: environment.env,
+                argv: launch_argv,
+                env: launch_env,
                 title: session.title.clone(),
                 rows: 24,
                 cols: 100,

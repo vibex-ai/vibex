@@ -1455,6 +1455,9 @@ impl AgentManager {
                 settings_path,
             );
         }
+        // Applied to the launch only: the session tokens inside are minted per
+        // launch, and the recorded argv is what a restart replays.
+        self.apply_terminal_session_mcp(&session, &mut launch_argv, &mut environment.env);
         let spec = vibex_core::TerminalSessionLaunchSpec {
             agent_id: session.agent_id.clone(),
             workspace_id: workspace.id,
@@ -1598,6 +1601,153 @@ impl AgentManager {
             env,
             claude_settings_path,
         })
+    }
+
+    /// Adds the session's MCP servers and tool environment to one launch.
+    ///
+    /// A terminal-mode Agent has no `session/new` request to carry
+    /// `mcpServers`, so the same resources an ACP session of this Agent would
+    /// receive — the reader's MCP servers, Vibex-use delegation, the embedded
+    /// browser, and computer use — are handed to its CLI through whatever input
+    /// that CLI reads at launch (see `vibex_config_switch::terminal_mcp`).
+    ///
+    /// Only the launch copy changes. The recorded argv must not carry these
+    /// arguments: the session tokens are minted per launch, so a restart and a
+    /// crash restore call this again instead of replaying them.
+    ///
+    /// Delivery is best effort. A server that cannot be expressed, or a file
+    /// that cannot be written, is logged and the Agent still starts: a missing
+    /// tool is recoverable inside the session, a terminal that refused to open
+    /// is not.
+    pub fn apply_terminal_session_mcp(
+        &self,
+        session: &AgentSession,
+        argv: &mut Vec<String>,
+        env: &mut Vec<(String, String)>,
+    ) {
+        if let Err(error) = self.try_apply_terminal_session_mcp(session, argv, env) {
+            tracing::warn!(
+                target: "vibex_agent",
+                agent_id = %session.agent_id,
+                error_code = %error.code,
+                "terminal session MCP servers could not be delivered"
+            );
+        }
+    }
+
+    /// The private directory a terminal session's MCP files live in.
+    fn terminal_session_mcp_dir(&self, session_id: &VibexSessionId) -> PathBuf {
+        self.db_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("terminal-mcp")
+            .join(session_id.as_str())
+    }
+
+    fn try_apply_terminal_session_mcp(
+        &self,
+        session: &AgentSession,
+        argv: &mut Vec<String>,
+        env: &mut Vec<(String, String)>,
+    ) -> VibexResult<()> {
+        use vibex_config_switch::terminal_mcp::{
+            TerminalMcpRequest, TerminalMcpServer, TerminalMcpTransport,
+            prepare_terminal_mcp_launch, terminal_mcp_server_name,
+        };
+
+        if argv.is_empty() {
+            return Ok(());
+        }
+        let resources =
+            self.runtime_resources_for_session(&session.id, &session.agent_id, ProviderKind::Acp)?;
+        // A built-in server arrives as an HTTP descriptor followed by a stdio
+        // sidecar under the same id, for Agents that cannot speak HTTP. Every
+        // CLI with a terminal channel speaks HTTP, so the first one wins, as it
+        // does on the ACP wire.
+        let mut seen_ids = std::collections::BTreeSet::new();
+        let mut seen_names = std::collections::BTreeSet::new();
+        let mut servers = Vec::new();
+        for server in &resources.mcp_servers {
+            if !seen_ids.insert(server.id.clone()) {
+                continue;
+            }
+            let transport = match server.transport {
+                ProviderRuntimeMcpTransport::Stdio => {
+                    let Some(command) = server
+                        .command
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|command| !command.is_empty())
+                    else {
+                        continue;
+                    };
+                    TerminalMcpTransport::Stdio {
+                        command: command.to_string(),
+                        args: server.args.clone(),
+                        env: server.env.clone(),
+                    }
+                }
+                ProviderRuntimeMcpTransport::Http | ProviderRuntimeMcpTransport::Sse => {
+                    let Some(url) = server
+                        .url
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|url| !url.is_empty())
+                    else {
+                        continue;
+                    };
+                    if server.transport == ProviderRuntimeMcpTransport::Http {
+                        TerminalMcpTransport::Http {
+                            url: url.to_string(),
+                            headers: server.headers.clone(),
+                        }
+                    } else {
+                        TerminalMcpTransport::Sse {
+                            url: url.to_string(),
+                            headers: server.headers.clone(),
+                        }
+                    }
+                }
+            };
+            // Two servers with the same label would overwrite each other in a
+            // CLI's name-keyed map; the later one gets a suffix instead.
+            let base = terminal_mcp_server_name(&server.display_name, &server.id);
+            let mut name = base.clone();
+            let mut suffix = 2;
+            while !seen_names.insert(name.clone()) {
+                name = format!("{base}-{suffix}");
+                suffix += 1;
+            }
+            servers.push(TerminalMcpServer { name, transport });
+        }
+
+        let session_dir = self.terminal_session_mcp_dir(&session.id);
+        let host_env = |key: &str| std::env::var(key).ok();
+        let home_dir = dirs::home_dir();
+        let launch = prepare_terminal_mcp_launch(&TerminalMcpRequest {
+            agent_id: session.agent_id.as_str(),
+            servers: &servers,
+            session_dir: &session_dir,
+            launch_env: env,
+            host_env: &host_env,
+            home_dir: home_dir.as_deref(),
+            system_root: Path::new("/"),
+        })?;
+        for (server, reason) in &launch.skipped {
+            tracing::info!(
+                target: "vibex_agent",
+                agent_id = %session.agent_id,
+                server = %server,
+                reason = %reason,
+                "terminal session MCP server not delivered"
+            );
+        }
+        argv.splice(1..1, launch.args);
+        for (key, value) in launch.env.into_iter().chain(resources.env) {
+            env.retain(|(existing, _)| existing != &key);
+            env.push((key, value));
+        }
+        Ok(())
     }
 
     /// The model id spellings a Profile projects for its Agent's native CLI.
@@ -3301,6 +3451,7 @@ impl AgentManager {
             &projections,
             &session.agent_id,
         );
+        self.apply_terminal_session_mcp(&session, &mut argv, &mut environment.env);
         let spec = vibex_core::TerminalSessionLaunchSpec {
             agent_id: session.agent_id.clone(),
             workspace_id: record.workspace_id.clone(),
@@ -5888,11 +6039,16 @@ impl AgentManager {
         // account of the deletion a client drawing a session list can get.
         // Published after the commit, because until then the deletion can still
         // fail and a client told otherwise would drop a row that survives.
-        let _ = self.session_removals.send(removed_ids);
+        let _ = self.session_removals.send(removed_ids.clone());
         for runtime in runtimes {
             self.close_provider_session(Some(runtime)).await;
         }
         self.stop_session_terminals(&terminal_ids);
+        // The private MCP files hold the deleted sessions' tokens; nothing will
+        // launch them again.
+        for session_id in &removed_ids {
+            let _ = std::fs::remove_dir_all(self.terminal_session_mcp_dir(session_id));
+        }
         Ok(())
     }
 
@@ -13609,6 +13765,73 @@ mod tests {
                 "gpt-5".to_string()
             ]
         );
+    }
+
+    fn install_test_delegation_tool(manager: &AgentManager) {
+        manager
+            .install_delegation_tool(AgentDelegationToolConfig {
+                command: PathBuf::from("/opt/vibex/vibex-desktop"),
+                broker_endpoint: "127.0.0.1:43123".to_string(),
+                capability_token: "delegation-token-with-sufficient-entropy".to_string(),
+                authority: "authority_test".to_string(),
+                activation_revision: 1,
+            })
+            .unwrap();
+    }
+
+    /// A terminal-mode Claude receives the same Vibex-use server an ACP
+    /// session would, through a private `--mcp-config` file; the recorded argv
+    /// stays free of it so a restart mints a fresh token.
+    #[tokio::test]
+    async fn a_terminal_session_hands_its_cli_the_session_mcp_servers() {
+        let (manager, launcher, dir) = terminal_manager();
+        install_test_delegation_tool(&manager);
+        let session = manager
+            .create_terminal_session(terminal_request("claude", &dir))
+            .await
+            .unwrap();
+        let launch = launcher.launches().remove(0);
+        assert_eq!(launch.argv[0], "claude");
+        let path = launch.argv[1]
+            .strip_prefix("--mcp-config=")
+            .expect("the MCP file follows the executable");
+        assert!(path.contains(session.id.as_str()));
+        let document: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let delegation = &document["mcpServers"]["Agent-delegation"];
+        assert_eq!(delegation["command"], "/opt/vibex/vibex-desktop");
+        assert_eq!(
+            delegation["env"]["VIBEX_AGENT_DELEGATION_PARENT_SESSION"],
+            session.id.as_str()
+        );
+        let conn = open_database(&dir.join("vibex.db")).unwrap();
+        let link = vibex_db::SessionTerminalRepository::get(&conn, &session.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(link.argv, vec!["claude".to_string()]);
+    }
+
+    /// Codex has no file to load beside its own, so its servers ride `-c`
+    /// overrides and the credentials stay in the process environment.
+    #[tokio::test]
+    async fn a_terminal_codex_session_keeps_mcp_credentials_out_of_the_argv() {
+        let (manager, launcher, dir) = terminal_manager();
+        install_test_delegation_tool(&manager);
+        manager
+            .create_terminal_session(terminal_request("codex", &dir))
+            .await
+            .unwrap();
+        let launch = launcher.launches().remove(0);
+        assert!(launch.argv.contains(
+            &"mcp_servers.Agent-delegation.command=\"/opt/vibex/vibex-desktop\"".to_string()
+        ));
+        let token = launch
+            .env
+            .iter()
+            .find(|(key, _)| key == "VIBEX_AGENT_DELEGATION_TOKEN")
+            .map(|(_, value)| value.clone())
+            .expect("the delegation token is in the Codex environment");
+        assert!(launch.argv.iter().all(|arg| !arg.contains(&token)));
     }
 
     #[tokio::test]
