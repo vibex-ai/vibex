@@ -15,6 +15,22 @@ use vibex_ui::{
 
 use crate::motion::{mix, set_pause_inactive_animation, set_user_reduced_motion};
 
+/// How the kit's caret blinks.
+///
+/// The kit's default is a 500 ms blink with no idle timeout, which is the
+/// behavior every other desktop text field has; a reader who asked for reduced
+/// motion gets a steady caret instead, because a blinking one is motion that no
+/// setting can otherwise turn off. The kit reads this from its own theme global
+/// and copies it to the base layer, so the editor and every input follow.
+fn cursor_blink_policy(appearance: &AppearanceUiState) -> gpui_base::input::CursorBlink {
+    use gpui_base::input::CursorBlink;
+    if appearance.reduced_motion {
+        CursorBlink::steady()
+    } else {
+        CursorBlink::default()
+    }
+}
+
 pub use vibex_ui::{
     TOKEN_PRODUCT_VISUAL_SOURCE, TOKEN_SCHEMA_VERSION, TOKEN_SOURCE_PATH, TOKEN_SOURCE_SHA256,
 };
@@ -409,7 +425,12 @@ pub fn apply_appearance(
     // window keeps animating by default.
     set_user_reduced_motion(appearance.reduced_motion, cx);
     set_pause_inactive_animation(appearance.pause_inactive_animation, cx);
+    let cursor_blink = cursor_blink_policy(appearance);
     Theme::update(cx, |theme| {
+        // The caret is the one animation the user cannot see turned off
+        // anywhere else: every input draws it, so the reduce-motion preference
+        // has to reach the kit's own policy rather than the app's transitions.
+        theme.cursor_blink = cursor_blink;
         theme.font_family = appearance
             .interface_font
             .family
@@ -759,6 +780,51 @@ mod tests {
             pin < system,
             "the native appearance must be pinned before the mode is read"
         );
+    }
+
+    /// The caret is the one animation the appearance pass has to switch off
+    /// for a reader who asked for less motion.
+    ///
+    /// Every input in the app draws it, including the kit's own, and the kit
+    /// reads the policy from its theme global — so a pass that left the
+    /// default in place would keep blinking after the setting said not to.
+    /// That is also why it goes through `apply_appearance` rather than being
+    /// read at paint time: the policy is copied to the base layer when the
+    /// theme is written, not when the caret is drawn.
+    #[gpui::test]
+    fn reduced_motion_turns_the_caret_into_a_steady_line(cx: &mut gpui::TestAppContext) {
+        let _guard = slot_guard();
+        let _slots = SlotRestore::capture();
+        cx.update(gpui_component::init);
+
+        cx.update(|cx| {
+            let quiet = AppearanceUiState {
+                reduced_motion: true,
+                ..Default::default()
+            };
+            apply_appearance(&quiet, Backdrop::Theme, None, cx);
+            assert_eq!(
+                Theme::global(cx).cursor_blink,
+                gpui_base::input::CursorBlink::steady(),
+                "the caret holds still when the reader asked for less motion"
+            );
+            assert_eq!(
+                gpui_base::Theme::global(cx).cursor_blink,
+                gpui_base::input::CursorBlink::steady(),
+                "the base layer every input paints from gets the same policy"
+            );
+
+            let animated = AppearanceUiState::default();
+            apply_appearance(&animated, Backdrop::Theme, None, cx);
+            assert!(
+                !Theme::global(cx).cursor_blink.is_steady(),
+                "the default appearance keeps the caret blinking"
+            );
+            assert!(
+                !gpui_base::Theme::global(cx).cursor_blink.is_steady(),
+                "and the base layer follows it back"
+            );
+        });
     }
 
     /// A wallpaper is painted behind the workbench's surfaces, so the pass has

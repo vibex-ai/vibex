@@ -1232,7 +1232,16 @@ pub fn apply_component_theme(window: Option<&mut Window>, cx: &mut App) {
     );
 
     let token = |name: &str| semantic_color(name, dark);
+    // A blinking caret is motion the Reduce Motion switch has to reach: the
+    // kit reads this policy from its theme global and copies it to the base
+    // layer that paints every input and the file editor.
+    let cursor_blink = if reduce_motion() {
+        gpui_base::input::CursorBlink::steady()
+    } else {
+        gpui_base::input::CursorBlink::default()
+    };
     Theme::update(cx, |theme| {
+        theme.cursor_blink = cursor_blink;
         // The kit's base is the same rem the ladder is written against, so a
         // kit control and the hand-built row beside it resolve to one scale.
         // Crucially it carries the reader's text-size step too: the kit's

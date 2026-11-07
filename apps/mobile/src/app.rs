@@ -1511,6 +1511,10 @@ fn apply_app_settings(settings: &AppSettings, window: &mut Window, cx: &mut App)
     theme::set_system_dark(system_appearance_is_dark(cx));
     locale::set_preference(settings.language.unwrap_or_default());
     theme::set_reduce_motion(settings.reduce_motion);
+    // The same preference has to reach gpui itself: the kit's components ask
+    // `cx.reduce_motion()` rather than the phone's own flag, and the caret
+    // policy below is read from the theme the kit owns.
+    cx.set_reduce_motion(settings.reduce_motion);
     // Haptics are their own switch rather than a consequence of Reduce Motion:
     // a reader may want the transitions gone and the tick in their hand kept.
     crate::platform::set_haptics_enabled(settings.haptics);
@@ -31645,6 +31649,12 @@ impl MobileApp {
                         cx.listener(|this, _, _, cx| {
                             this.app_settings.reduce_motion = !this.app_settings.reduce_motion;
                             theme::set_reduce_motion(this.app_settings.reduce_motion);
+                            // The kit's components read the theme global, and
+                            // the caret blink policy lives there: without
+                            // reapplying it, the switch would leave every
+                            // input blinking until the next appearance change.
+                            cx.set_reduce_motion(this.app_settings.reduce_motion);
+                            theme::apply_component_theme(None, cx);
                             this.persist_app_settings(cx);
                         }),
                     ),
