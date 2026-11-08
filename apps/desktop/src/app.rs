@@ -122,37 +122,38 @@ use vibex_core::{
     AgentAuthMethodKind, AgentAuthenticationOperationId, AgentBuiltinTool,
     AgentCommandDiscoverRequest, AgentCommandEntry, AgentCommandExecuteRequest,
     AgentCommandExecutionBehavior, AgentCommandSelectionBehavior, AgentCommandSourceKind,
-    AgentCommandTrigger, AgentGoalControlRequest, AgentId, AgentListRequest, AgentMessagePhase,
-    AgentSession, AgentSessionRuntimeSelectionState, AgentSessionSafety, AgentSessionState,
-    AgentSnapshotEntry, AgentTimelineDisplaySettings, AgentTimelineReasoningDisplayMode,
-    AgentTokenUsage, AgentToolPreferences, AttachRuntimeRequest, BrowserCaptureQuality,
-    BrowserDataClearReport, BrowserLoginImportReport, BrowserLoginImportRequest,
-    BrowserProfileSource, CancelAgentSessionRuntimeSwitchRequest, ComputerAvailability,
-    ComputerUnavailableReason, ContinueAgentTurnRequest, CreateAgentSessionRequest,
-    DetachRuntimeRequest, ElicitationField, ElicitationFieldKind, ElicitationRequest,
-    ElicitationResolutionAction, FetchTimelineRequest, FileEntryKind, FileOperationKind,
-    FileOperationPatchFormat, ForkAgentSessionRequest, GetMessageSubmissionRequest,
-    GitProjectEligibilityState, GitProjectIneligibleReason, GitStatusSummary,
-    GitWorktreeAssistanceSessionRequest, GitWorktreeConflictKind, GitWorktreeDiscardRequest,
-    GitWorktreeOperationRecord, GitWorktreeOperationStatus, GoalAction, GoalPhase,
-    GroupPresentationCommand, GroupPresentationReply, MessageAttachment, MessageSubmissionState,
-    MessageSubmissionStatus, OpenWorkspaceRequest, PermissionResolution, PermissionResponseKind,
-    PlanStepStatus, PresentationActivationPolicy, PresentationState, ProjectId, ProjectRecord,
-    PromptId, PromptUsageRecordRequest, ProviderProfileSummary, RcImportPayload,
-    RenameAgentSessionRequest, ReplaceUserMessagePayload, RequestId, ResolvePermissionRequest,
-    RuntimeAuthSource, RuntimeAuthSourceAvailability, RuntimeAuthSourceKind,
-    RuntimeAuthSourceSummary, RuntimeClientId, RuntimeLeaseRole, RuntimeModelSelection,
-    RuntimeSelectionInteraction, SendAgentMessageRequest, SessionRuntimeFeature,
-    SessionRuntimeFeatureKind, SessionRuntimeOption, SessionRuntimeOptionCatalog,
-    SessionRuntimeSelection, SessionRuntimeSelectionStatus, SessionToolChoice, SessionToolSettings,
-    SessionTreeNode, SetDesiredAgentSessionRuntimeRequest, SteerAgentMessageRequest,
-    SteerMessageOutcome, TerminalCreateRequest, TerminalId, TerminalSession, TerminalStatus,
-    TerminalSwitchShellRequest, TimelineItem, TimelineItemId, TimelineLiveEvent, TimelinePage,
-    TimelinePayload, TimelineRedactionState, TimelineSource, TimelineTurnStart,
-    UserMessageDelivery, UserMessagePayload, VIBEX_USE_MAX_MENTIONS, VibexSessionId,
-    VibexUseMention, VibexUsePresentationCapability, VibexUseUnavailableReason, WorkspaceMode,
-    WorkspaceRecord, agent_session_turn_requires_continuation, latest_timeline_turn_ended_normally,
-    managed_worktree_name_slug, normalize_agent_session_title, unix_timestamp_ms,
+    AgentCommandTrigger, AgentGoalControlRequest, AgentId, AgentListRequest,
+    AgentManagedInstallStatus, AgentMessagePhase, AgentSession, AgentSessionRuntimeSelectionState,
+    AgentSessionSafety, AgentSessionState, AgentSnapshotEntry, AgentTimelineDisplaySettings,
+    AgentTimelineReasoningDisplayMode, AgentTokenUsage, AgentToolPreferences, AttachRuntimeRequest,
+    BrowserCaptureQuality, BrowserDataClearReport, BrowserLoginImportReport,
+    BrowserLoginImportRequest, BrowserProfileSource, CancelAgentSessionRuntimeSwitchRequest,
+    ComputerAvailability, ComputerUnavailableReason, ContinueAgentTurnRequest,
+    CreateAgentSessionRequest, DetachRuntimeRequest, ElicitationField, ElicitationFieldKind,
+    ElicitationRequest, ElicitationResolutionAction, FetchTimelineRequest, FileEntryKind,
+    FileOperationKind, FileOperationPatchFormat, ForkAgentSessionRequest,
+    GetMessageSubmissionRequest, GitProjectEligibilityState, GitProjectIneligibleReason,
+    GitStatusSummary, GitWorktreeAssistanceSessionRequest, GitWorktreeConflictKind,
+    GitWorktreeDiscardRequest, GitWorktreeOperationRecord, GitWorktreeOperationStatus, GoalAction,
+    GoalPhase, GroupPresentationCommand, GroupPresentationReply, MessageAttachment,
+    MessageSubmissionState, MessageSubmissionStatus, OpenWorkspaceRequest, PermissionResolution,
+    PermissionResponseKind, PlanStepStatus, PresentationActivationPolicy, PresentationState,
+    ProjectId, ProjectRecord, PromptId, PromptUsageRecordRequest, ProviderProfileSummary,
+    RcImportPayload, RenameAgentSessionRequest, ReplaceUserMessagePayload, RequestId,
+    ResolvePermissionRequest, RuntimeAuthSource, RuntimeAuthSourceAvailability,
+    RuntimeAuthSourceKind, RuntimeAuthSourceSummary, RuntimeClientId, RuntimeLeaseRole,
+    RuntimeModelSelection, RuntimeSelectionInteraction, SendAgentMessageRequest,
+    SessionRuntimeFeature, SessionRuntimeFeatureKind, SessionRuntimeOption,
+    SessionRuntimeOptionCatalog, SessionRuntimeSelection, SessionRuntimeSelectionStatus,
+    SessionToolChoice, SessionToolSettings, SessionTreeNode, SetDesiredAgentSessionRuntimeRequest,
+    SteerAgentMessageRequest, SteerMessageOutcome, TerminalCreateRequest, TerminalId,
+    TerminalSession, TerminalStatus, TerminalSwitchShellRequest, TimelineItem, TimelineItemId,
+    TimelineLiveEvent, TimelinePage, TimelinePayload, TimelineRedactionState, TimelineSource,
+    TimelineTurnStart, UserMessageDelivery, UserMessagePayload, VIBEX_USE_MAX_MENTIONS,
+    VibexSessionId, VibexUseMention, VibexUsePresentationCapability, VibexUseUnavailableReason,
+    WorkspaceMode, WorkspaceRecord, agent_session_turn_requires_continuation,
+    latest_timeline_turn_ended_normally, managed_worktree_name_slug, normalize_agent_session_title,
+    unix_timestamp_ms,
 };
 use vibex_desktop_model::{
     AgentOrderEntry, AgentOrdering, AgentPlanProjection, AgentSortStrategy, AppearanceUiState,
@@ -351,6 +352,14 @@ struct RuntimeNoteErrorNotification;
 /// One id for every reason the dialog reports keeps the newest one on screen
 /// instead of stacking a queue of them.
 struct NewSessionErrorNotification;
+
+/// Replace-by-id marker for the hint that stops a session being created on an
+/// Agent that is still downloading.
+///
+/// The card is a refusal, not a result: it names the Agent, says where the
+/// download can be watched, and leaves the draft where it was. One id keeps a
+/// reader pressing Enter on the same chip from stacking copies of it.
+struct NewSessionAgentDownloadingNotification;
 
 /// Replace-by-id marker for one session's Agent failure hint.
 ///
@@ -634,6 +643,12 @@ const NEW_SESSION_AGENT_MARK_SIZE: f32 = NEW_SESSION_SLOGAN_SIZE * 1.3;
 /// above: one mark's height is the shortest fall that does not leave the old
 /// face half-visible in the corner while the new one lands on top of it.
 const NEW_SESSION_LOGO_SWAP_TRAVEL: f32 = NEW_SESSION_AGENT_MARK_SIZE;
+/// The square an Agent chip's leading mark occupies, in pixels.
+///
+/// The same 16 px [`runtime_agent_icon`] paints every Agent logo at, so the
+/// mark a downloading Agent shows in its place — the session row's working
+/// pulse — lands in the logo's footprint rather than beside it.
+const NEW_SESSION_AGENT_CHIP_MARK_SIZE: f32 = 16.0;
 const NEW_SESSION_COMPACT_SELECTOR_MAX_WIDTH: u32 = 860;
 /// Width of the read-only panel behind a session's capability pill.
 const SESSION_CAPABILITIES_PANEL_WIDTH: f32 = 352.0;
@@ -839,6 +854,16 @@ const AUTO_CONTINUE_PROBE_RETRY_BACKOFF: Duration = Duration::from_secs(1);
 /// catalogue read. A short delay lets those settle instead of racing the same
 /// transient failure twice in the same frame.
 const AGENT_CATALOG_RETRY_BACKOFF: Duration = Duration::from_millis(400);
+/// How often the new-session page asks whether a downloading Agent has landed.
+///
+/// The bootstrap publishes a provider change after each Agent it prepares, and
+/// the page reloads its catalogue on that event, so this is a backstop rather
+/// than the normal path: an install that finishes while that event is lost —
+/// or while this client is reconnecting to a remote runtime — would otherwise
+/// leave the chip pulsing forever. It is deliberately slower than the Config
+/// Center's 500 ms install poll because it is not what the page watches; the
+/// provider event is.
+const NEW_SESSION_AGENT_DOWNLOAD_POLL: Duration = Duration::from_secs(2);
 /// Attempts one revision's completion probe gets before an answer that could
 /// not judge it is accepted as the verdict.
 ///
@@ -3500,6 +3525,46 @@ impl VibexWorkbench {
                 hint_layer::push(window, hint, cx);
             }
         });
+    }
+
+    /// Refuses a create-session attempt on an Agent that is still downloading.
+    ///
+    /// The chip for such an Agent is on the page — it is a real choice the
+    /// reader made, and hiding it was what made a first run look like the
+    /// default Agents had never been offered — so pressing it has to answer.
+    /// The answer is this card rather than a disabled button: a disabled
+    /// button explains nothing, while the card names the Agent and sends the
+    /// reader to Config Center, where the download's progress is.
+    ///
+    /// Nothing is cleared here. The draft, the attachments and the schedule
+    /// stay in the prompt, which is what lets the same button work the moment
+    /// the download lands. `false` means no guard fired and the caller may
+    /// create the session.
+    fn guard_new_session_agent_download(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(agent) = self
+            .new_session_agent_id
+            .as_ref()
+            .and_then(|agent_id| self.agent_snapshot(agent_id))
+            .filter(is_new_session_agent_downloading)
+        else {
+            return false;
+        };
+        let notice = new_session_agent_downloading_notice(&agent.label);
+        window.defer(cx, move |window, cx| {
+            Theme::global_mut(cx).notification.placement = Anchor::TopCenter;
+            hint_layer::push(
+                window,
+                hint_notification(NotificationType::Warning, notice)
+                    .id::<NewSessionAgentDownloadingNotification>()
+                    .autohide(true),
+                cx,
+            );
+        });
+        true
     }
 }
 
@@ -10790,6 +10855,10 @@ pub struct VibexWorkbench {
     /// feature — until the process restarts, which the reader sees as every
     /// Agent having lost its run options.
     agent_catalog_retry_task: Option<Task<()>>,
+    /// Polls for a downloading Agent's completion while the new-session page
+    /// waits on one, so the chip turns back into the Agent's brand mark even if
+    /// the provider event never arrives.
+    new_session_agent_download_task: Option<Task<()>>,
     /// Whether the one retry has already been scheduled for this chain of
     /// catalogue reads. It clears on success and on a fresh request, so a later
     /// failure is retried again, but one failed chain cannot loop.
@@ -12326,6 +12395,7 @@ impl VibexWorkbench {
             agent_overview_task: None,
             agent_catalog_task: None,
             agent_catalog_retry_task: None,
+            new_session_agent_download_task: None,
             agent_catalog_retry_pending: false,
             runtime_authentication_task: None,
             agent_overview_generation: 0,
@@ -18588,13 +18658,20 @@ impl VibexWorkbench {
         self.agent_catalog_generation = self.agent_catalog_generation.wrapping_add(1);
         let generation = self.agent_catalog_generation;
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            // The read asks for disabled rows as well, because the filter this
+            // catalogue needs is not the authority's "enabled and installed".
+            // A managed Agent that is downloading right now is neither, and it
+            // still belongs on the new-session page with the working pulse in
+            // place of its mark; `new_session_agent_snapshots` is what keeps
+            // every other uninstalled or disabled row out.
             let agents = backend
                 .management()
                 .list_agents(AgentListRequest {
-                    include_disabled: false,
+                    include_disabled: true,
                 })
                 .await?
                 .agents;
+            let agents = new_session_agent_snapshots(agents);
             let profiles = backend.management().list_profiles().await?;
             Ok::<_, vibex_backend::BackendError>((agents, profiles))
         });
@@ -18633,15 +18710,13 @@ impl VibexWorkbench {
                                     )));
                             }
                             this.runtime_provider_profiles = profiles;
-                            this.agent_snapshots = agents
-                                .into_iter()
-                                .filter(|agent| vibex_core::is_user_visible_agent(&agent.id))
-                                .collect();
+                            this.agent_snapshots = agents;
                             if this.reconcile_new_session_runtime_selection()
                                 && this.new_session_open
                             {
                                 this.refresh_active_suggestions(ComposerTarget::NewSession, cx);
                             }
+                            this.watch_new_session_agent_downloads(cx);
                             this.load_agent_runtime_catalog(cx);
                         }
                         Ok(Err(error)) => {
@@ -18701,10 +18776,10 @@ impl VibexWorkbench {
             let agents = backend
                 .management()
                 .list_agents(AgentListRequest {
-                    include_disabled: false,
+                    include_disabled: true,
                 })
                 .await
-                .map(|response| response.agents)
+                .map(|response| new_session_agent_snapshots(response.agents))
                 .unwrap_or_default();
             let profiles = backend.management().list_profiles().await?;
             Ok::<_, vibex_backend::BackendError>((sessions, workspaces, agents, profiles))
@@ -18818,10 +18893,8 @@ impl VibexWorkbench {
                                     )));
                             }
                             this.runtime_provider_profiles = profiles;
-                            this.agent_snapshots = agents
-                                .into_iter()
-                                .filter(|agent| vibex_core::is_user_visible_agent(&agent.id))
-                                .collect();
+                            this.agent_snapshots = agents;
+                            this.watch_new_session_agent_downloads(cx);
                             // Same rule the per-snapshot merge keeps: an
                             // authoritative list is one read, and a terminal
                             // session read without its link is not the
@@ -19222,6 +19295,62 @@ impl VibexWorkbench {
                 let _ = entity.update(cx, |this, cx| {
                     this.load_agent_runtime_catalog_inner(cx);
                 });
+            },
+        ));
+    }
+
+    /// Keeps the new-session page honest about a download it is waiting on.
+    ///
+    /// The bootstrap publishes a provider change after each Agent it prepares,
+    /// which reloads this catalogue; this loop is the backstop for the event
+    /// that never arrives. It runs only while the page is open and some visible
+    /// Agent is downloading, so a workbench that is not waiting on one pays
+    /// nothing, and it stops by itself the moment the wait is over.
+    fn watch_new_session_agent_downloads(&mut self, cx: &mut Context<Self>) {
+        if self.new_session_agent_download_task.is_some() {
+            return;
+        }
+        if !self.new_session_open
+            || !self
+                .agent_snapshots
+                .iter()
+                .any(is_new_session_agent_downloading)
+        {
+            return;
+        }
+        self.new_session_agent_download_task = Some(cx.spawn(
+            async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| loop {
+                cx.background_executor()
+                    .timer(NEW_SESSION_AGENT_DOWNLOAD_POLL)
+                    .await;
+                let Ok(waiting) = entity.update(cx, |this, cx| {
+                    if !this.new_session_open
+                        || !this
+                            .agent_snapshots
+                            .iter()
+                            .any(is_new_session_agent_downloading)
+                    {
+                        this.new_session_agent_download_task = None;
+                        return false;
+                    }
+                    // A read already on its way answers this tick, and starting
+                    // another would cancel it: the catalogue numbers its reads
+                    // and keeps only the newest answer, so a slow backend polled
+                    // on this cadence would restart its own read forever.
+                    let read_in_flight = this
+                        .agent_catalog_task
+                        .as_ref()
+                        .is_some_and(|task| !task.is_ready());
+                    if !read_in_flight {
+                        this.load_agent_configured_catalog(cx);
+                    }
+                    true
+                }) else {
+                    break;
+                };
+                if !waiting {
+                    break;
+                }
             },
         ));
     }
@@ -25713,7 +25842,7 @@ impl VibexWorkbench {
         let entries = self
             .agent_snapshots
             .iter()
-            .filter(|agent| is_new_session_agent_available(agent))
+            .filter(|agent| is_new_session_agent_offered(agent))
             .map(|agent| AgentOrderEntry {
                 id: agent.id.as_str().to_string(),
                 label: agent.label.clone(),
@@ -25745,10 +25874,19 @@ impl VibexWorkbench {
         .with_usage_counts(self.agent_usage_counts())
     }
 
-    /// Enabled Agents in the shared ordering, consumed by the new-session home
-    /// selector and the provider/model Agent row.
+    /// Enabled Agents in the shared ordering, consumed by the provider/model
+    /// Agent row.
+    ///
+    /// The row switches a live session's runtime, so an Agent that cannot carry
+    /// a session yet is not one of its choices.
     fn runtime_agent_choices(&self) -> Vec<AgentSnapshotEntry> {
         ordered_runtime_agent_choices(&self.agent_snapshots, &self.agent_ordering())
+    }
+
+    /// The new-session home's Agent chips: the row's Agents plus the ones whose
+    /// download is still running.
+    fn new_session_agent_choices(&self) -> Vec<AgentSnapshotEntry> {
+        ordered_new_session_agent_choices(&self.agent_snapshots, &self.agent_ordering())
     }
 
     fn agent_usage_counts(&self) -> BTreeMap<String, u64> {
@@ -38551,6 +38689,10 @@ impl VibexWorkbench {
             .update(cx, |input, cx| input.focus(window, cx));
         self.sync_composer_command_entry(ComposerTarget::NewSession, cx);
         self.refresh_active_suggestions(ComposerTarget::NewSession, cx);
+        // The page can open on an Agent whose download is already running —
+        // after a restart, or on a draft the reader came back to — so the wait
+        // is picked up here as well as when a catalogue read reports one.
+        self.watch_new_session_agent_downloads(cx);
         if primary_tab_changed {
             self.push_current_navigation_entry();
         }
@@ -39681,6 +39823,16 @@ impl VibexWorkbench {
         if self.new_session_input.update(cx, |input, cx| {
             EntityInputHandler::marked_text_range(input, window, cx).is_some()
         }) {
+            return;
+        }
+        // An Agent that is still downloading has no runtime to select yet, so
+        // the catalogue gate below would answer "no available Agent runtime is
+        // configured" — a sentence about configuration for a wait that needs
+        // none. The wait is reported for what it is, and the draft, the
+        // attachments and the schedule stay in the prompt: the same button
+        // works the moment the download lands.
+        if self.guard_new_session_agent_download(window, cx) {
+            cx.notify();
             return;
         }
         // Creation is an authority operation: the local runtime is not required
@@ -58104,7 +58256,7 @@ impl VibexWorkbench {
                 .as_ref()
                 .map(|catalog| RuntimeCascadeProjection::from_catalog(catalog, selection))
         });
-        let agent_choices = self.runtime_agent_choices();
+        let agent_choices = self.new_session_agent_choices();
         let agent_sort_manual_active = self
             .ui_state
             .agent_tab_order
@@ -58236,10 +58388,29 @@ impl VibexWorkbench {
                 .map(|agent| {
                     let brand_identity = agent_brand_identity(&agent);
                     let active = selected_agent_id.as_ref() == Some(&agent.id);
+                    let downloading = is_new_session_agent_downloading(&agent);
                     let agent_id = agent.id;
                     let agent_id_string = agent_id.as_str().to_string();
                     let agent_label = agent.label;
-                    let icon = runtime_agent_icon(&brand_identity);
+                    // The brand mark says which Agent this is; the pulse says
+                    // it is not ready yet. Both occupy the same 16 px square,
+                    // so the label beside them does not move when the download
+                    // lands and the pulse turns back into the logo.
+                    let icon = if downloading {
+                        ActivityIndicator::sidebar(format!(
+                            "new-session-agent-download-{agent_id_string}"
+                        ))
+                        .size(px(NEW_SESSION_AGENT_CHIP_MARK_SIZE))
+                        // The session rows walk this mark green when the
+                        // Agent keeps working by itself. A download does the
+                        // same: it needs no further press from the reader, so
+                        // it wears the color that says "still going on its
+                        // own" rather than the neutral working mark.
+                        .color(cx.theme().success)
+                        .into_any_element()
+                    } else {
+                        runtime_agent_icon(&brand_identity)
+                    };
                     let active_drop_after =
                         self.new_session_agent_drop_target
                             .as_ref()
@@ -58256,6 +58427,13 @@ impl VibexWorkbench {
                             .rounded(px(18.0))
                             .child(icon)
                             .child(agent_label.clone())
+                            .when(downloading, |this| {
+                                this.tooltip(locale::text(
+                                    "Downloading. Follow the progress in Config Center.",
+                                    "正在下载。请进入配置中心查看进度。",
+                                    "正在下載。請進入配置中心查看進度。",
+                                ))
+                            })
                             .text_color(if active {
                                 cx.theme().foreground
                             } else {
@@ -58271,7 +58449,15 @@ impl VibexWorkbench {
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.choose_new_session_agent(agent_id.clone(), window, cx)
                             })),
-                        agent_label.clone(),
+                        if downloading {
+                            SharedString::from(format!(
+                                "{}, {}",
+                                agent_label,
+                                locale::text("downloading", "正在下载", "正在下載")
+                            ))
+                        } else {
+                            SharedString::from(agent_label.clone())
+                        },
                     );
                     let drag_payload = NewSessionAgentDrag {
                         agent_id: agent_id_string.clone(),
@@ -59240,9 +59426,18 @@ impl VibexWorkbench {
                 && self.new_session_workspace.base_ref.is_some()
                 && !worktree_name_invalid
                 && !custom_path_invalid);
+        // A downloading Agent has no runtime selection yet, which would leave
+        // its create button dead: the press is the only way to hear that the
+        // Agent is still arriving, so the button stays live and the submit
+        // path answers with the download hint.
+        let selected_agent_downloading = self
+            .new_session_agent_id
+            .as_ref()
+            .and_then(|agent_id| self.agent_snapshot(agent_id))
+            .is_some_and(|agent| is_new_session_agent_downloading(&agent));
         let can_create = matches!(self.runtime_status, RuntimeStatus::Ready)
             && has_agent_choices
-            && self.new_session_runtime_selection.is_some()
+            && (self.new_session_runtime_selection.is_some() || selected_agent_downloading)
             && worktree_form_valid
             && self.new_session_draft_has_content(cx)
             && !self.agent_action_pending
@@ -78791,6 +78986,22 @@ fn default_new_session_agent_id(
     agents: &[AgentSnapshotEntry],
     preferred: Option<&AgentId>,
 ) -> Option<AgentId> {
+    // A download the reader is waiting on is still their choice. The page
+    // shows that Agent, so a catalogue reload — the provider event fires after
+    // every Agent the bootstrap prepares — must not quietly swap it for a
+    // different Agent that happens to be installed already.
+    let preferred = preferred.filter(|preferred| {
+        agents
+            .iter()
+            .any(|agent| &agent.id == *preferred && is_new_session_agent_offered(agent))
+    });
+    if let Some(preferred) = preferred
+        && agents
+            .iter()
+            .any(|agent| &agent.id == preferred && is_new_session_agent_downloading(agent))
+    {
+        return Some(preferred.clone());
+    }
     let mut enabled = agents
         .iter()
         .filter(|agent| is_new_session_agent_available(agent))
@@ -78809,6 +79020,18 @@ fn default_new_session_agent_id(
                 .map(|agent| agent.id.clone())
         })
         .or_else(|| enabled.first().map(|agent| agent.id.clone()))
+        // Nothing is installed yet, so there is no ready Agent to open on. The
+        // page still has the waiting ones, and landing on the first of them is
+        // what lets a first run press the button it was just shown instead of
+        // typing into a prompt with no Agent behind it at all.
+        .or_else(|| {
+            let mut waiting = agents
+                .iter()
+                .filter(|agent| is_new_session_agent_downloading(agent))
+                .collect::<Vec<_>>();
+            waiting.sort_by_key(|agent| agent.order_index);
+            waiting.first().map(|agent| agent.id.clone())
+        })
 }
 
 fn new_session_runtime_selection_for_agent(
@@ -78884,12 +79107,90 @@ fn persisted_runtime_selection(
     persisted
 }
 
-fn is_new_session_agent_available(agent: &AgentSnapshotEntry) -> bool {
+/// The rows the workbench keeps from an Agent read.
+///
+/// The read asks the authority for disabled rows, because the authority's own
+/// filter is "enabled and installed" and a managed Agent that is downloading
+/// right now is neither. This is the filter that replaces it: the Agents the
+/// workbench can actually offer, which is the installed ones plus the ones
+/// whose download is running. The downloaded-not-yet-installed row survives on
+/// purpose — the new-session page shows it with the working pulse while its
+/// Adapter arrives — and consumers that need "ready" ask
+/// [`is_new_session_agent_available`] instead of trusting the list.
+fn new_session_agent_snapshots(agents: Vec<AgentSnapshotEntry>) -> Vec<AgentSnapshotEntry> {
+    agents
+        .into_iter()
+        .filter(is_new_session_agent_offered)
+        .collect()
+}
+
+/// Whether the new-session home may offer this Agent at all.
+///
+/// Being offered is not the same as being ready: an Agent whose managed
+/// Adapter is still arriving is a choice the page shows, so the reader can
+/// see what it is waiting for, and [`is_new_session_agent_available`] is the
+/// narrower question of whether that choice can create a session today.
+fn is_new_session_agent_choice(agent: &AgentSnapshotEntry) -> bool {
     vibex_core::is_user_visible_agent(&agent.id)
         && agent.added
         && agent.enabled
-        && agent.installed
         && agent.deleted_at_ms.is_none()
+}
+
+fn is_new_session_agent_available(agent: &AgentSnapshotEntry) -> bool {
+    is_new_session_agent_choice(agent) && agent.installed
+}
+
+/// Whether the new-session home draws this Agent as one of its chips.
+///
+/// A downloading Agent is drawn because the reader asked for it; whether that
+/// chip can create a session is [`is_new_session_agent_available`]'s question,
+/// asked again when the chip is pressed.
+fn is_new_session_agent_offered(agent: &AgentSnapshotEntry) -> bool {
+    is_new_session_agent_available(agent) || is_new_session_agent_downloading(agent)
+}
+
+/// Whether this Agent is waiting on a download that leaves it unusable.
+///
+/// The chip stays on the page in this state — hiding it until the download
+/// finished was how an Agent that the reader had just enabled looked missing —
+/// but its brand mark is replaced by the working pulse the session rows walk,
+/// so the option reads as "on its way in" rather than as "ready".
+///
+/// The wait is "a download with nothing on disk yet", which is why
+/// [`AgentSnapshotEntry::installed`] is not the question. Discovery reports an
+/// Agent as installed when its own CLI is on the machine — the first-run shape
+/// this mark exists for, where `claude` was found but the Adapter Vibex runs is
+/// still arriving — so the chip would keep its logo in exactly the state that
+/// looks ready and is not. `installed_version` is the version the Adapter
+/// record carries: while a download has none, there is nothing to run, and once
+/// one exists the Agent can create a session even while a newer version is
+/// being written beside it.
+///
+/// `NotInstalled` is excluded because no download is running; a spinner for
+/// one that has not started would never stop.
+fn is_new_session_agent_downloading(agent: &AgentSnapshotEntry) -> bool {
+    is_new_session_agent_choice(agent)
+        && agent.managed_install.managed
+        && agent.managed_install.installed_version.is_none()
+        && matches!(
+            agent.managed_install.status,
+            AgentManagedInstallStatus::Installing | AgentManagedInstallStatus::Upgrading
+        )
+}
+
+/// What the page says when a session is asked for on a downloading Agent.
+///
+/// It names the Agent and points at Config Center, which is where the
+/// download's progress actually is. It does not say the draft was lost,
+/// because the draft is still in the prompt behind the hint.
+fn new_session_agent_downloading_notice(agent_label: &str) -> String {
+    locale::text(
+        "{agent} is still downloading. Follow the download in Config Center; you can create this session when it finishes.",
+        "{agent} 正在下载。请进入配置中心查看下载进度，下载完成后即可创建会话。",
+        "{agent} 正在下載。請進入配置中心查看下載進度，下載完成後即可建立會話。",
+    )
+    .replace("{agent}", agent_label)
 }
 
 /// Resolves a composer trigger through the authority.
@@ -80477,9 +80778,31 @@ fn ordered_runtime_agent_choices(
     agents: &[AgentSnapshotEntry],
     ordering: &AgentOrdering,
 ) -> Vec<AgentSnapshotEntry> {
+    ordered_agent_choices(agents, ordering, is_new_session_agent_available)
+}
+
+/// The new-session home's chips, in the same order as the Agent row.
+///
+/// The page is wider than that row on purpose: a row switches the runtime of a
+/// session that already exists, which an Agent still downloading cannot carry,
+/// while the page also shows the Agents whose download is running — the choices
+/// the reader made and is waiting on. Leaving those out is what made a first
+/// run look like the two default Agents had never been offered.
+fn ordered_new_session_agent_choices(
+    agents: &[AgentSnapshotEntry],
+    ordering: &AgentOrdering,
+) -> Vec<AgentSnapshotEntry> {
+    ordered_agent_choices(agents, ordering, is_new_session_agent_offered)
+}
+
+fn ordered_agent_choices(
+    agents: &[AgentSnapshotEntry],
+    ordering: &AgentOrdering,
+    offered: fn(&AgentSnapshotEntry) -> bool,
+) -> Vec<AgentSnapshotEntry> {
     let mut choices = agents
         .iter()
-        .filter(|agent| is_new_session_agent_available(agent))
+        .filter(|agent| offered(agent))
         .cloned()
         .collect::<Vec<_>>();
     let ordered_ids = ordered_agent_ids(
@@ -105469,6 +105792,191 @@ mod tests {
                 .unwrap()
                 .agent_id,
             claude
+        );
+    }
+
+    /// A managed Agent whose download is still running is a page choice but not
+    /// a creatable one.
+    ///
+    /// The two questions used to be one, which is why a first run showed neither
+    /// of the two Agents it had just enabled: the authority refuses to list an
+    /// Agent that is not installed yet, and the page drew whatever the authority
+    /// listed. The page now keeps the row — wearing the working pulse — and asks
+    /// the narrower question only when a session is asked for.
+    #[test]
+    fn a_downloading_agent_is_offered_but_not_creatable() {
+        let mut agents = vibex_core::builtin_agent_definitions()
+            .iter()
+            .filter(|definition| vibex_core::is_user_visible_agent(&definition.id))
+            .take(2)
+            .map(|definition| AgentSnapshotEntry::from_definition(definition, None, None))
+            .collect::<Vec<_>>();
+        assert_eq!(agents.len(), 2);
+        let downloading_id = agents[0].id.clone();
+        let ready_id = agents[1].id.clone();
+
+        agents[1].installed = true;
+        let mut installing = vibex_core::AgentManagedInstallState::not_installed();
+        installing.status = AgentManagedInstallStatus::Installing;
+        agents[0].managed_install = installing.clone();
+        agents[0].installed = false;
+
+        assert!(is_new_session_agent_choice(&agents[0]));
+        assert!(is_new_session_agent_downloading(&agents[0]));
+        assert!(is_new_session_agent_offered(&agents[0]));
+        assert!(
+            !is_new_session_agent_available(&agents[0]),
+            "a running download is not a usable installation"
+        );
+        assert!(is_new_session_agent_available(&agents[1]));
+        assert!(!is_new_session_agent_downloading(&agents[1]));
+
+        let offered = ordered_new_session_agent_choices(&agents, &AgentOrdering::default());
+        assert_eq!(offered.len(), 2, "both Agents stay on the page");
+        assert!(offered.iter().any(|agent| agent.id == downloading_id));
+        let row = ordered_runtime_agent_choices(&agents, &AgentOrdering::default());
+        assert_eq!(
+            row.len(),
+            1,
+            "the runtime row only switches to a ready Agent"
+        );
+        assert_eq!(row[0].id, ready_id);
+
+        // The page opened on the waiting Agent keeps it across the catalogue
+        // reloads the bootstrap's per-Agent provider events cause.
+        assert_eq!(
+            default_new_session_agent_id(&agents, Some(&downloading_id)),
+            Some(downloading_id.clone())
+        );
+
+        // A first run has nothing installed yet. The waiting Agent is then the
+        // page's choice, because it is the only one the page can offer and the
+        // press on it is what explains the wait.
+        agents[1].installed = false;
+        assert_eq!(
+            default_new_session_agent_id(&agents, None),
+            Some(downloading_id.clone())
+        );
+        agents[1].installed = true;
+
+        // An upgrade over a working installation is not a wait: the Agent can
+        // create a session, so it keeps its brand mark and its create button.
+        let mut upgrading = vibex_core::AgentManagedInstallState::not_installed();
+        upgrading.status = AgentManagedInstallStatus::Upgrading;
+        upgrading.installed_version = Some("1.0.0".into());
+        agents[1].managed_install = upgrading;
+        agents[1].installed = true;
+        assert!(!is_new_session_agent_downloading(&agents[1]));
+
+        // `installed` alone would not answer the first-run question: discovery
+        // reports an Agent installed as soon as its own CLI is on the machine,
+        // and that is the state where the page looked ready while the Adapter
+        // was still arriving. The version on disk is what settles it.
+        let mut cli_found = vibex_core::AgentManagedInstallState::not_installed();
+        cli_found.status = AgentManagedInstallStatus::Installing;
+        agents[0].installed = true;
+        agents[0].managed_install = cli_found.clone();
+        assert!(
+            is_new_session_agent_downloading(&agents[0]),
+            "a discovered CLI is not the Adapter Vibex runs"
+        );
+        cli_found.installed_version = Some("1.0.0".into());
+        agents[0].managed_install = cli_found;
+        assert!(!is_new_session_agent_downloading(&agents[0]));
+        agents[0].installed = false;
+        agents[0].managed_install = installing;
+
+        // The authority's own list filter is "enabled and installed", which
+        // would have dropped the waiting Agent before the page ever saw it, so
+        // both reads ask for the disabled rows and this filter decides.
+        let mut hidden = agents[0].clone();
+        hidden.enabled = false;
+        hidden.installed = false;
+        let kept = new_session_agent_snapshots(vec![agents[0].clone(), agents[1].clone(), hidden]);
+        assert_eq!(kept.len(), 2);
+        assert!(kept.iter().any(|agent| agent.id == downloading_id));
+        assert!(kept.iter().all(|agent| agent.enabled));
+
+        // So is a managed Agent that is enabled but has not started installing:
+        // a spinner for a download that is not running would never stop.
+        let mut idle = vibex_core::AgentManagedInstallState::not_installed();
+        idle.status = AgentManagedInstallStatus::NotInstalled;
+        agents[0].managed_install = idle;
+        assert!(!is_new_session_agent_downloading(&agents[0]));
+    }
+
+    /// The downloading chip wears the session row's own working mark, and the
+    /// press answers instead of creating the session.
+    #[test]
+    fn a_downloading_agent_chip_pulses_and_holds_the_draft() {
+        let source = include_str!("app.rs");
+        let panel = source
+            .split_once("    fn render_new_session_panel(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn show_turn_preview_rail("))
+            .map(|(body, _)| body)
+            .expect("the new-session panel should remain inspectable");
+        assert!(panel.contains("let agent_choices = self.new_session_agent_choices();"));
+        // Both catalogue reads have to ask for the rows the authority's
+        // "enabled and installed" filter would drop, or no chip can pulse.
+        for loader in [
+            "    fn load_agent_configured_catalog(",
+            "    fn load_agent_overview(",
+        ] {
+            let body = source
+                .split_once(loader)
+                .and_then(|(_, tail)| tail.split_once("\n    fn "))
+                .map(|(body, _)| body)
+                .unwrap_or_else(|| panic!("{loader} should remain inspectable"));
+            assert!(
+                body.contains("include_disabled: true"),
+                "{loader} must read the rows a download leaves unusable"
+            );
+            assert!(body.contains("new_session_agent_snapshots("));
+        }
+        assert!(panel.contains("let downloading = is_new_session_agent_downloading(&agent);"));
+        assert!(
+            panel.contains("ActivityIndicator::sidebar(format!("),
+            "the waiting chip wears the mark the session rows walk"
+        );
+        assert!(panel.contains(".size(px(NEW_SESSION_AGENT_CHIP_MARK_SIZE))"));
+        assert!(
+            panel.contains(".color(cx.theme().success)"),
+            "the green of a turn that keeps going on its own"
+        );
+        assert!(
+            panel.contains("runtime_agent_icon(&brand_identity)"),
+            "the brand mark is restored once the download lands"
+        );
+
+        let guard = source
+            .split_once("    fn guard_new_session_agent_download(")
+            .and_then(|(_, tail)| tail.split_once("\nfn runtime_status_banner_is_visible("))
+            .map(|(body, _)| body)
+            .expect("the download guard should remain inspectable");
+        assert!(guard.contains("hint_notification(NotificationType::Warning, notice)"));
+        assert!(guard.contains(".id::<NewSessionAgentDownloadingNotification>()"));
+        assert!(guard.contains(".autohide(true)"));
+        assert!(guard.contains("Anchor::TopCenter"));
+        assert!(
+            !guard.contains("clear_new_session_message_draft"),
+            "a refused attempt must leave the draft in the prompt"
+        );
+        assert!(guard.contains("return false;") && guard.contains("true"));
+
+        let submit = source
+            .split_once("    fn submit_new_session(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn choose_runtime_selection("))
+            .map(|(body, _)| body)
+            .expect("new-session submission should remain inspectable");
+        let refused = submit
+            .find("if self.guard_new_session_agent_download(window, cx) {")
+            .expect("submission should ask whether the Agent is still downloading");
+        let clear = submit
+            .find("self.clear_new_session_message_draft(window, cx);")
+            .expect("the submitted draft should still be consumed on success");
+        assert!(
+            refused < clear,
+            "the wait is reported before the draft is consumed"
         );
     }
 

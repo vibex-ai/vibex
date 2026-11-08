@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use gpui::{
     Animation, AnimationExt as _, App, Bounds, ElementId, Hsla, IntoElement, ParentElement as _,
-    RenderOnce, Styled as _, Window, canvas, div, fill, point, size,
+    Pixels, RenderOnce, Styled as _, Window, canvas, div, fill, point, size,
 };
 use gpui_component::ActiveTheme as _;
 use vibex_tui::glyphs::{self, GlyphTier};
@@ -74,6 +74,7 @@ pub(crate) struct ActivityIndicator {
     id: ElementId,
     style: ActivityStyle,
     color: Option<Hsla>,
+    size: Option<Pixels>,
 }
 
 impl ActivityIndicator {
@@ -82,6 +83,7 @@ impl ActivityIndicator {
             id: id.into(),
             style: ActivityStyle::Timeline,
             color: None,
+            size: None,
         }
     }
 
@@ -98,11 +100,27 @@ impl ActivityIndicator {
         self.color = Some(color);
         self
     }
+
+    /// The same mark in a box of the caller's own size.
+    ///
+    /// Surfaces that swap this mark with a logo — the new-session Agent chips
+    /// carry the mark while the Agent downloads and the brand mark once it is
+    /// ready — need both faces to occupy the same square, or the label beside
+    /// them would step sideways when the download completes.
+    pub(crate) fn size(mut self, size: Pixels) -> Self {
+        self.size = Some(size);
+        self
+    }
 }
 
 impl RenderOnce for ActivityIndicator {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
-        let Self { id, style, color } = self;
+        let Self {
+            id,
+            style,
+            color,
+            size,
+        } = self;
         let (slot, default_color, cycle, max_fps) = match style {
             ActivityStyle::Timeline => (
                 div().size_4(),
@@ -116,6 +134,10 @@ impl RenderOnce for ActivityIndicator {
                 sidebar_cycle(),
                 ACTIVITY_MAX_FPS,
             ),
+        };
+        let slot = match size {
+            Some(size) => slot.size(size),
+            None => slot,
         };
         let slot = slot.flex_none();
         let color = color.unwrap_or(default_color);
