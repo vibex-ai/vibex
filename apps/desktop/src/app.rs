@@ -57793,7 +57793,9 @@ impl VibexWorkbench {
     /// When it is drawn, the two modes are one control, so they read as a
     /// choice rather than as two unrelated buttons: one track, one raised
     /// segment for the active mode, and an icon pair that says "Vibex draws it"
-    /// against "the Agent draws it".
+    /// against "the Agent draws it". Each tooltip names what the mode gains and
+    /// what it gives up: the interface keeps Vibex's extensions, while the
+    /// Agent's own TUI cannot receive them.
     fn render_new_session_transport_switch(
         &self,
         agent_id: Option<&AgentId>,
@@ -57827,18 +57829,42 @@ impl VibexWorkbench {
         let selected_fg = cx.theme().foreground;
         let unselected = cx.theme().muted_foreground;
         let terminal_accent = theme::semantic_color("accent", is_dark);
+        // Each segment says what the reader gets and what they give up: the
+        // interface keeps Vibex's extensions, the Agent's own TUI is complete
+        // without them.
+        let vibex_interface_tooltip = crate::locale::text(
+            "Vibex renders GUI sessions and supports Vibex extensions.",
+            "由 Vibex 界面渲染 GUI 会话，支持 Vibex 提供的扩展功能。",
+            "由 Vibex 介面繪製 GUI 會話，支援 Vibex 提供的擴充功能。",
+        )
+        .to_string();
+        // The terminal's own description leads; the profile prerequisite
+        // follows on a line of its own, because it only applies while the page
+        // has no Provider Profile to hand the CLI.
+        let terminal_description = crate::locale::text(
+            "Uses the Agent TUI's native terminal session. Full-featured, but lacks Vibex extensions.",
+            "使用 Agent TUI 原生终端会话，功能完整，但缺少 Vibex 扩展能力。",
+            "使用 Agent TUI 原生終端會話，功能完整，但缺少 Vibex 擴充能力。",
+        );
+        let terminal_tooltip = if profile_backed {
+            terminal_description.to_string()
+        } else {
+            format!(
+                "{terminal_description}\n{}",
+                crate::locale::text(
+                    "Terminal mode can only receive credentials from a Provider Profile. Choose one here, or the CLI uses its own login.",
+                    "终端模式只能通过供应商配置注入凭据。请在本页选择一个，否则 CLI 会使用它自己的登录态。",
+                    "終端模式只能透過供應商設定注入憑證。請在本頁選擇一個，否則 CLI 會使用它自己的登入狀態。",
+                ),
+            )
+        };
         let options = [
             (
                 NewSessionTransport::Acp,
                 "new-session-transport-acp",
                 IconName::LayoutDashboard,
                 crate::locale::text("Vibex interface", "Vibex 界面", "Vibex 介面"),
-                crate::locale::text(
-                    "Vibex draws the conversation, approvals, and file changes.",
-                    "由 Vibex 绘制对话、审批和文件改动。",
-                    "由 Vibex 繪製對話、審批和檔案改動。",
-                )
-                .to_string(),
+                vibex_interface_tooltip,
                 cx.theme().foreground,
             ),
             (
@@ -57846,21 +57872,7 @@ impl VibexWorkbench {
                 "new-session-transport-terminal",
                 IconName::SquareTerminal,
                 crate::locale::text("Native terminal", "原生终端", "原生終端"),
-                if !profile_backed {
-                    crate::locale::text(
-                        "Terminal mode runs the Agent's own CLI, which can only be pointed at a Provider Profile. Choose one on this page, or the Agent will use the CLI's own login.",
-                        "终端模式运行 Agent 自己的 CLI，只能通过供应商配置注入凭据。请在本页选择一个供应商配置，否则 CLI 会使用它自己的登录态。",
-                        "終端模式執行 Agent 自己的 CLI，只能透過供應商設定注入憑證。請在本頁選擇一個供應商設定，否則 CLI 會使用它自己的登入狀態。",
-                    )
-                    .to_string()
-                } else {
-                    crate::locale::text(
-                        "The Agent runs its own interface in a terminal. Approvals and file changes happen there.",
-                        "Agent 在终端里运行自己的界面，审批和文件改动都在终端内完成。",
-                        "Agent 在終端裡執行自己的介面，審批和檔案改動都在終端內完成。",
-                    )
-                    .to_string()
-                },
+                terminal_tooltip,
                 terminal_accent,
             ),
         ];
