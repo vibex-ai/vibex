@@ -379,6 +379,30 @@ kit input entities for the lifetime of the app, so the failure is not a replaced
 entity but a sheet that opens with the caret nowhere: the first keystroke is lost
 and the user has to tap the field before the keyboard appears.
 
+### Mobile Terminal IME Sink
+
+The phone's keyboard only ever commits into a real text field, so the mobile
+terminal renders an invisible one behind the grid and forwards every edit to the
+PTY. Two rules keep that sink honest, and both were learned from a Backspace
+that deleted one character and stopped:
+
+- **Seed the sink, never empty it.** A Backspace is computed by the keyboard
+  from the document it is bound to. On an empty field the deletion removes no
+  character, no change is emitted, and the key never leaves the phone. The sink
+  therefore holds one space in front of the caret (`TERMINAL_SINK_SEED`), and
+  every keystroke is read as the difference between the value it held and the
+  value it holds: appended text is typed, a truncated value is one DEL per
+  removed character.
+- **Re-seed in the change handler, not on the next paint.** Refilling on paint
+  leaves the field holding the previous keystroke while the next one arrives; a
+  fast or held Backspace then edits text the terminal never saw, and the diff
+  drops it. `InputState::set_value` is the kit's silent write — it does not emit
+  `InputEvent::Change` — so re-seeding from inside the change handler cannot
+  re-enter it.
+
+The same applies to any field whose value is a transport for keystrokes rather
+than something the user reads back.
+
 ### Light Hints
 
 Transient feedback that answers an action the user just took — a link copied, a

@@ -2542,34 +2542,66 @@ impl MobileWorkbench {
                     .placeholder(locale::text("File content", "文件内容", "檔案內容"))
             }));
         }
-        if self.terminal_input.is_none() {
+        let sink_created = self.terminal_input.is_none();
+        if sink_created {
             self.terminal_input = Some(cx.new(|cx| TextareaState::new(window, cx).rows(1)));
-            // Every committed character is forwarded to the PTY as it lands, so
-            // the field never keeps a value the terminal has not already seen.
-            if let Some(sink) = self.terminal_input.clone() {
-                self.terminal_sink_subscription = Some(cx.subscribe_in(
-                    &sink,
-                    window,
-                    |this: &mut Self,
-                     _: &Entity<TextareaState>,
-                     event: &InputEvent,
-                     window: &mut Window,
-                     cx: &mut Context<Self>| {
-                        match event {
-                            InputEvent::Change => this.forward_terminal_sink(window, cx),
-                            InputEvent::PressEnter { .. } => this.send_terminal_value(
+        }
+        // The sink starts, and stays, on its seed (see [`TERMINAL_SINK_SEED`]),
+        // with the caret after it: every key the reader presses has text in
+        // front of it to be measured against. `terminal_clear_pending` is the
+        // paths without a window asking for the same thing at the next paint.
+        //
+        // This is not a "value differs from the seed" check: an IME's
+        // composition is a value that differs from it and that must survive the
+        // paint, and the change handler already re-seeds after every commit.
+        if sink_created || std::mem::take(&mut self.terminal_clear_pending) {
+            self.reseed_terminal_sink(window, cx);
+        }
+        if let Some(sink) = self.terminal_input.clone()
+            && self.terminal_sink_subscription.is_none()
+        {
+            // Every committed character is forwarded to the PTY as it lands,
+            // and the field is put back on its seed in the same breath, so the
+            // next key is measured against the document it will actually edit.
+            // Waiting for a paint to refill it meant a second Backspace arrived
+            // at an empty field, which the keyboard reads as an edit of nothing:
+            // that is how a held Backspace deleted one character and stopped.
+            self.terminal_sink_subscription = Some(cx.subscribe_in(
+                &sink,
+                window,
+                |this: &mut Self,
+                 _: &Entity<TextareaState>,
+                 event: &InputEvent,
+                 window: &mut Window,
+                 cx: &mut Context<Self>| {
+                    match event {
+                        InputEvent::Change => {
+                            let next = textarea_value(&this.terminal_input, cx).to_string();
+                            this.forward_terminal_sink(&next, cx);
+                            // `set_value` is silent, so this cannot re-enter
+                            // the event it is answering.
+                            this.reseed_terminal_sink(window, cx);
+                        }
+                        // The kit inserts the newline into the field silently
+                        // and announces the key here, so the field is put back
+                        // on its seed after the Enter: the newline left behind
+                        // would otherwise be forwarded again, as an Enter, with
+                        // the next character typed.
+                        InputEvent::PressEnter { .. } => {
+                            this.send_terminal_value(
                                 TerminalInput::Key(
                                     TerminalKey::Enter,
                                     TerminalKeyModifiers::default(),
                                 ),
                                 false,
                                 cx,
-                            ),
-                            _ => {}
+                            );
+                            this.reseed_terminal_sink(window, cx);
                         }
-                    },
-                ));
-            }
+                        _ => {}
+                    }
+                },
+            ));
         }
         if self.terminal_search_input.is_none() {
             self.terminal_search_input = Some(cx.new(|cx| {
@@ -2638,20 +2670,6 @@ impl MobileWorkbench {
             && let Some(input) = self.git_commit_input.clone()
         {
             input.update(cx, |input, cx| input.set_value("", window, cx));
-        }
-        if std::mem::take(&mut self.terminal_clear_pending) {
-            // The terminal's field is a scratch buffer: every committed
-            // character is forwarded and the field is emptied again. The diff
-            // that reduces the next edit to what the user typed reads the
-            // field's previous value, so emptying the field has to empty that
-            // memory with it. Leaving it behind made the next character look
-            // like a replacement of the last one, and the sink dropped it —
-            // which is why only the first character of a session ever reached
-            // the shell.
-            self.terminal_sink_previous.clear();
-            if let Some(input) = self.terminal_input.clone() {
-                input.update(cx, |input, cx| input.set_value("", window, cx));
-            }
         }
     }
 
@@ -3324,6 +3342,10 @@ impl MobileWorkbench {
     fn attach_terminal(&mut self, terminal_id: TerminalId, cx: &mut Context<Self>) {
         self.terminal_close_confirmation = None;
         self.reset_terminal_text_state();
+        // A keystroke half-typed into the previous terminal is not text for the
+        // next one: the field is emptied before it can be diffed against a
+        // buffer that belongs to a session the reader has left.
+        self.terminal_clear_pending = true;
         match self.terminal.attach(terminal_id.clone()) {
             Ok(()) => {
                 self.terminal_fit_error = None;
@@ -3539,31 +3561,44 @@ impl MobileWorkbench {
         cx.notify();
     }
 
+    /// Puts the sink back on its seed and re-bases the diff with it.
+    ///
+    /// The field is the terminal's keyboard, not its buffer: every keystroke is
+    /// forwarded and the field goes back to the one character the next key is
+    /// measured against. `set_value` is the kit's silent write — it replaces
+    /// the document without emitting `InputEvent::Change` — so this cannot
+    /// answer the change that called it, and the caret goes to the end because
+    /// that is the only place a key can be typed or deleted at.
+    fn reseed_terminal_sink(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(sink) = self.terminal_input.clone() {
+            sink.update(cx, |sink, cx| {
+                sink.set_value(TERMINAL_SINK_SEED, window, cx);
+                let caret = TERMINAL_SINK_SEED.len();
+                sink.set_selected_range(caret..caret, cx);
+            });
+        }
+        self.terminal_sink_previous = TERMINAL_SINK_SEED.to_string();
+    }
+
     /// The sink's value changed: forward only what the user just typed or
-    /// deleted, then empty the field again so the PTY stays the only buffer.
-    fn forward_terminal_sink(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        let next = textarea_value(&self.terminal_input, cx).to_string();
-        let previous = std::mem::replace(&mut self.terminal_sink_previous, next.clone());
-        if next == previous {
-            return;
-        }
-        self.terminal_clear_pending = true;
-        if let Some(typed) = next.strip_prefix(previous.as_str()) {
-            if !typed.is_empty() {
-                self.send_terminal_text(typed, cx);
+    /// deleted.
+    ///
+    /// `next` is the value the change fired for. Reading the field again from
+    /// the caller would turn a later keystroke into this one's text.
+    fn forward_terminal_sink(&mut self, next: &str, cx: &mut Context<Self>) {
+        let previous = std::mem::replace(&mut self.terminal_sink_previous, next.to_string());
+        match terminal_sink_edit(&previous, next) {
+            TerminalSinkEdit::Typed(typed) => self.send_terminal_text(&typed, cx),
+            // A deletion (backspace, or a selection replaced by nothing) is a
+            // shorter value; the PTY is told one DEL per removed character.
+            TerminalSinkEdit::Deleted(deletes) => {
+                self.send_terminal_value(TerminalInput::Text("\u{7f}".repeat(deletes)), false, cx)
             }
-            return;
+            // Anything else (an IME rewriting the whole buffer) is not a
+            // keystroke the PTY can be told about; dropping it beats
+            // duplicating input.
+            TerminalSinkEdit::Ignored => {}
         }
-        // A deletion (backspace, or a selection replaced by nothing) arrives as
-        // a shorter value; send one DEL per removed character.
-        if let Some(remaining) = previous.strip_prefix(next.as_str()) {
-            let deletes = remaining.chars().count().min(64);
-            if deletes > 0 {
-                self.send_terminal_value(TerminalInput::Text("\u{7f}".repeat(deletes)), false, cx);
-            }
-        }
-        // Anything else (an IME rewriting the whole buffer) is not a keystroke
-        // the PTY can be told about; drop it rather than duplicating input.
     }
 
     /// Forwards committed text, turning the newlines in it back into Enter.
@@ -8642,6 +8677,13 @@ fn file_editor_element(input: Option<&Entity<EditorState>>) -> gpui::AnyElement 
 /// sink and asks the platform for the keyboard in the same gesture. A frame
 /// around it that re-requested the keyboard on a tap would be a hook for a
 /// gesture the reader cannot make.
+///
+/// It always holds one space in front of the caret (see [`TERMINAL_SINK_SEED`]).
+/// The keyboard computes a deletion from the document it is bound to, so a
+/// field with nothing in it turns every Backspace into an edit of nothing — the
+/// change never reaches this app and the shell never hears the key. Every
+/// keystroke is read from the difference between what the field held and what
+/// it holds, and the field then goes straight back to that one space.
 fn terminal_sink_element(input: Option<&Entity<TextareaState>>) -> gpui::AnyElement {
     div()
         .absolute()
@@ -8655,6 +8697,59 @@ fn terminal_sink_element(input: Option<&Entity<TextareaState>>) -> gpui::AnyElem
             None => div().into_any_element(),
         })
         .into_any_element()
+}
+
+/// What the terminal's sink holds before the caret: one space nothing types
+/// into.
+///
+/// The keyboard computes a deletion from the document it is bound to, so a
+/// Backspace on an empty field is an edit of nothing: the kit has no character
+/// to remove, no change is emitted, and the key never leaves the phone. One
+/// character is the whole scratch document that fixes it, and one is the most
+/// a word-delete can then take — a longer run of spaces would let a keyboard
+/// that deletes words turn one key into a burst of deletes the reader never
+/// asked for.
+const TERMINAL_SINK_SEED: &str = " ";
+
+/// What one edit to the terminal's sink asks the PTY to do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TerminalSinkEdit {
+    /// Text was appended after what the sink held.
+    Typed(String),
+    /// That many characters were removed from the end.
+    Deleted(usize),
+    /// The edit is not a keystroke the PTY can be told about.
+    Ignored,
+}
+
+/// Reads one edit of the sink as the PTY input it stands for.
+///
+/// The sink is a scratch document, so the reader's key is the *difference*
+/// between what it held and what it holds: a longer value that starts with the
+/// old one is text typed, a shorter one that the old value starts with is a
+/// deletion, and anything else is an IME rewriting the document, which no
+/// keystroke can describe. The cap keeps one paste from becoming an unbounded
+/// write.
+fn terminal_sink_edit(previous: &str, next: &str) -> TerminalSinkEdit {
+    if next == previous {
+        return TerminalSinkEdit::Ignored;
+    }
+    if let Some(typed) = next.strip_prefix(previous) {
+        return if typed.is_empty() {
+            TerminalSinkEdit::Ignored
+        } else {
+            TerminalSinkEdit::Typed(typed.to_string())
+        };
+    }
+    if let Some(remaining) = previous.strip_prefix(next) {
+        let deletes = remaining.chars().count().min(64);
+        return if deletes == 0 {
+            TerminalSinkEdit::Ignored
+        } else {
+            TerminalSinkEdit::Deleted(deletes)
+        };
+    }
+    TerminalSinkEdit::Ignored
 }
 
 /// The text of a lazily-created kit input, or empty before the first paint.
@@ -10481,6 +10576,42 @@ index 3333333..4444444 100644
             terminal_mouse_report(TerminalMouseReport::Release, point, true),
             Some(TerminalInput::Text("\u{1b}[<3;1;1m".to_string()))
         );
+    }
+
+    /// Deleting must reach the shell from any state the sink can be in.
+    ///
+    /// A Backspace is the sink getting shorter, and the diff is what turns
+    /// that into DEL bytes. It has to work with the seed the field is put back
+    /// on between keystrokes, with an IME's committed run, and with a partial
+    /// delete after one — the states the field passes through, rather than
+    /// only the empty one it used to be emptied to.
+    #[test]
+    fn a_backspace_reaches_the_shell_from_the_sink_seed() {
+        // The seed is one character, so the first key deletes one.
+        assert_eq!(
+            terminal_sink_edit(TERMINAL_SINK_SEED, ""),
+            TerminalSinkEdit::Deleted(1)
+        );
+        // Typing extends the seed and is forwarded as the character typed.
+        assert_eq!(
+            terminal_sink_edit(TERMINAL_SINK_SEED, " l"),
+            TerminalSinkEdit::Typed("l".to_string())
+        );
+        // A committed run, then the Backspace that eats into it.
+        assert_eq!(
+            terminal_sink_edit(" ls", " l"),
+            TerminalSinkEdit::Deleted(1)
+        );
+        assert_eq!(terminal_sink_edit(" ls", " "), TerminalSinkEdit::Deleted(2));
+        // A selection replaced by nothing deletes every character it covered.
+        assert_eq!(
+            terminal_sink_edit("git status", "git "),
+            TerminalSinkEdit::Deleted(6)
+        );
+        // An edit that is neither an append nor a truncation — an IME
+        // rewriting the buffer — is dropped rather than guessed at.
+        assert_eq!(terminal_sink_edit("abc", "abd"), TerminalSinkEdit::Ignored);
+        assert_eq!(terminal_sink_edit("abc", "abc"), TerminalSinkEdit::Ignored);
     }
 
     /// A phone's Return key arrives as a newline in the sink, not as a key
