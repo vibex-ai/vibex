@@ -994,7 +994,7 @@ fn sort_value(aggregate: &AgentUsageAggregate, metric: AgentUsageSortMetric) -> 
 
 #[cfg(test)]
 mod tests {
-    use chrono::{TimeZone as _, Utc};
+    use chrono::Utc;
     use tempfile::tempdir;
     use vibex_core::{
         AgentId, AgentSession, AgentSessionSafety, AgentSessionState, AgentUsageCounterOrigin,

@@ -192,7 +192,6 @@ mod tests {
     use std::time::Duration;
 
     use gpui::{AppContext as _, Context, Render, TestAppContext, Window, div};
-    use gpui_component::WindowExt as _;
 
     use super::*;
 

@@ -80715,7 +80715,7 @@ fn rasterize_sidebar_project_svg(source: &Path) -> Result<image::RgbaImage, Stri
     resvg::render(&tree, transform, &mut pixmap.as_mut());
 
     let mut pixels = pixmap.take();
-    for pixel in pixels.chunks_exact_mut(4) {
+    for pixel in pixels.as_chunks_mut::<4>().0 {
         let alpha = u16::from(pixel[3]);
         for channel in &mut pixel[..3] {
             if let Some(channel_value) = (u16::from(*channel) * 255 + alpha / 2).checked_div(alpha)
@@ -93396,7 +93396,7 @@ impl FoundationSettings {
             channel,
             std::env::consts::OS,
             std::env::consts::ARCH,
-            option_env!("RUSTC_VERSION").unwrap_or("1.97.0")
+            option_env!("RUSTC_VERSION").unwrap_or("1.99.1")
         );
         let copy_summary = summary.clone();
         // The title stays at the page's left edge like every other settings

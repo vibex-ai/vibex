@@ -62,7 +62,7 @@ This inventory records source and license provenance. The corresponding license 
 | async-recursion | 1.1.1 | registry+https://github.com/rust-lang/crates.io-index | MIT OR Apache-2.0 | MIT | cargo-manifest |
 | async-signal | 0.2.14 | registry+https://github.com/rust-lang/crates.io-index | Apache-2.0 OR MIT | Apache-2.0 | cargo-manifest |
 | async-task | 4.7.1 | registry+https://github.com/rust-lang/crates.io-index | Apache-2.0 OR MIT | Apache-2.0 | cargo-manifest |
-| async-trait | 0.1.89 | registry+https://github.com/rust-lang/crates.io-index | MIT OR Apache-2.0 | MIT | cargo-manifest |
+| async-trait | 0.1.92 | registry+https://github.com/rust-lang/crates.io-index | MIT OR Apache-2.0 | MIT | cargo-manifest |
 | atk | 0.19.0 | registry+https://github.com/rust-lang/crates.io-index | MIT | MIT | cargo-manifest |
 | atk-sys | 0.19.0 | registry+https://github.com/rust-lang/crates.io-index | MIT | MIT | cargo-manifest |
 | atomic | 0.5.3 | registry+https://github.com/rust-lang/crates.io-index | Apache-2.0 OR MIT | Apache-2.0 | cargo-manifest |

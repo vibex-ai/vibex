@@ -391,7 +391,9 @@ fn render_page(
 fn sampled_unique_colors(rgba: &[u8]) -> usize {
     let pixels = rgba.len() / 4;
     let stride = (pixels / 50_000).max(1);
-    rgba.chunks_exact(4)
+    rgba.as_chunks::<4>()
+        .0
+        .iter()
         .step_by(stride)
         .map(|pixel| [pixel[0], pixel[1], pixel[2], pixel[3]])
         .collect::<HashSet<_>>()

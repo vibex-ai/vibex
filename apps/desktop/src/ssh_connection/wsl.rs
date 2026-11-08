@@ -342,7 +342,9 @@ pub fn list_distros(program: &Path) -> Result<Vec<String>, WslError> {
 pub fn parse_distro_output(bytes: &[u8]) -> Vec<String> {
     let text = if bytes.contains(&0) {
         bytes
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
             .filter_map(|unit| char::from_u32(u32::from(unit)))
             .collect::<String>()

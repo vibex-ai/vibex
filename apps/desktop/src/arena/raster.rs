@@ -209,7 +209,7 @@ impl Raster {
                 }
             }
             intersections.sort_unstable();
-            for pair in intersections.chunks_exact(2) {
+            for pair in intersections.as_chunks::<2>().0 {
                 self.rect(pair[0], y, pair[1] - pair[0] + 1, 1, ink);
             }
         }

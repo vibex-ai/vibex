@@ -1781,15 +1781,15 @@
     },
     {
       "type": "library",
-      "bom-ref": "cargo:async-trait@0.1.89:c19b7c6f923b580a",
+      "bom-ref": "cargo:async-trait@0.1.92:c19b7c6f923b580a",
       "name": "async-trait",
-      "version": "0.1.89",
+      "version": "0.1.92",
       "licenses": [
         {
           "expression": "MIT OR Apache-2.0"
         }
       ],
-      "purl": "pkg:cargo/async-trait@0.1.89",
+      "purl": "pkg:cargo/async-trait@0.1.92",
       "properties": [
         {
           "name": "vibex:cargo-source",
@@ -41060,11 +41060,11 @@
       "dependsOn": []
     },
     {
-      "ref": "cargo:async-trait@0.1.89:c19b7c6f923b580a",
+      "ref": "cargo:async-trait@0.1.92:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:proc-macro2@1.0.106:c19b7c6f923b580a",
         "cargo:quote@1.0.46:c19b7c6f923b580a",
-        "cargo:syn@2.0.118:c19b7c6f923b580a"
+        "cargo:syn@3.0.6:c19b7c6f923b580a"
       ]
     },
     {
@@ -41660,7 +41660,7 @@
     {
       "ref": "cargo:command-group@5.0.1:c19b7c6f923b580a",
       "dependsOn": [
-        "cargo:async-trait@0.1.89:c19b7c6f923b580a",
+        "cargo:async-trait@0.1.92:c19b7c6f923b580a",
         "cargo:nix@0.27.1:c19b7c6f923b580a",
         "cargo:tokio@1.52.3:c19b7c6f923b580a",
         "cargo:winapi@0.3.9:c19b7c6f923b580a"
@@ -48019,7 +48019,7 @@
       "ref": "cargo:vibex-agent-acp@0.1.0-rc.10:a2bd4049efbf7469",
       "dependsOn": [
         "cargo:agent-client-protocol-schema@1.6.0:c19b7c6f923b580a",
-        "cargo:async-trait@0.1.89:c19b7c6f923b580a",
+        "cargo:async-trait@0.1.92:c19b7c6f923b580a",
         "cargo:base64@0.22.1:c19b7c6f923b580a",
         "cargo:chrono@0.4.45:c19b7c6f923b580a",
         "cargo:command-group@5.0.1:c19b7c6f923b580a",
@@ -48042,7 +48042,7 @@
     {
       "ref": "cargo:vibex-agent@0.1.0-rc.10:1d51dd7c8fac44fa",
       "dependsOn": [
-        "cargo:async-trait@0.1.89:c19b7c6f923b580a",
+        "cargo:async-trait@0.1.92:c19b7c6f923b580a",
         "cargo:base64@0.22.1:c19b7c6f923b580a",
         "cargo:chrono@0.4.45:c19b7c6f923b580a",
         "cargo:dirs@6.0.0:c19b7c6f923b580a",
@@ -48061,7 +48061,7 @@
     {
       "ref": "cargo:vibex-app-update@0.1.0-rc.10:f60e76a96d343114",
       "dependsOn": [
-        "cargo:async-trait@0.1.89:c19b7c6f923b580a",
+        "cargo:async-trait@0.1.92:c19b7c6f923b580a",
         "cargo:base64@0.22.1:c19b7c6f923b580a",
         "cargo:ed25519-dalek@2.2.0:c19b7c6f923b580a",
         "cargo:futures-util@0.3.34:c19b7c6f923b580a",
@@ -48113,7 +48113,7 @@
     {
       "ref": "cargo:vibex-browser@0.1.0-rc.10:df2965b12b4b9031",
       "dependsOn": [
-        "cargo:async-trait@0.1.89:c19b7c6f923b580a",
+        "cargo:async-trait@0.1.92:c19b7c6f923b580a",
         "cargo:axum@0.8.9:c19b7c6f923b580a",
         "cargo:base64@0.22.1:c19b7c6f923b580a",
         "cargo:command-group@5.0.1:c19b7c6f923b580a",
@@ -48155,7 +48155,7 @@
     {
       "ref": "cargo:vibex-computer@0.1.0-rc.10:f31c18d8a1808a23",
       "dependsOn": [
-        "cargo:async-trait@0.1.89:c19b7c6f923b580a",
+        "cargo:async-trait@0.1.92:c19b7c6f923b580a",
         "cargo:axum@0.8.9:c19b7c6f923b580a",
         "cargo:base64@0.22.1:c19b7c6f923b580a",
         "cargo:command-group@5.0.1:c19b7c6f923b580a",
@@ -48246,7 +48246,7 @@
     {
       "ref": "cargo:vibex-desktop-runtime@0.1.0-rc.10:7b92bf06aa544433",
       "dependsOn": [
-        "cargo:async-trait@0.1.89:c19b7c6f923b580a",
+        "cargo:async-trait@0.1.92:c19b7c6f923b580a",
         "cargo:base64@0.22.1:c19b7c6f923b580a",
         "cargo:bzip2@0.6.1:c19b7c6f923b580a",
         "cargo:chrono@0.4.45:c19b7c6f923b580a",
@@ -48365,7 +48365,7 @@
     {
       "ref": "cargo:vibex-diagnostics@0.1.0-rc.10:f071779acd132fc6",
       "dependsOn": [
-        "cargo:async-trait@0.1.89:c19b7c6f923b580a",
+        "cargo:async-trait@0.1.92:c19b7c6f923b580a",
         "cargo:serde@1.0.228:c19b7c6f923b580a",
         "cargo:serde_json@1.0.150:c19b7c6f923b580a",
         "cargo:tokio@1.52.3:c19b7c6f923b580a",
@@ -48479,7 +48479,7 @@
     {
       "ref": "cargo:vibex-remote@0.1.0-rc.10:b2402acf3d0333d8",
       "dependsOn": [
-        "cargo:async-trait@0.1.89:c19b7c6f923b580a",
+        "cargo:async-trait@0.1.92:c19b7c6f923b580a",
         "cargo:axum-server@0.8.0:c19b7c6f923b580a",
         "cargo:axum@0.8.9:c19b7c6f923b580a",
         "cargo:base64@0.22.1:c19b7c6f923b580a",
@@ -49637,7 +49637,7 @@
         "cargo:async-broadcast@0.7.2:c19b7c6f923b580a",
         "cargo:async-process@2.5.0:c19b7c6f923b580a",
         "cargo:async-recursion@1.1.1:c19b7c6f923b580a",
-        "cargo:async-trait@0.1.89:c19b7c6f923b580a",
+        "cargo:async-trait@0.1.92:c19b7c6f923b580a",
         "cargo:enumflags2@0.7.12:c19b7c6f923b580a",
         "cargo:event-listener@5.4.1:c19b7c6f923b580a",
         "cargo:futures-core@0.3.34:c19b7c6f923b580a",
@@ -49670,7 +49670,7 @@
         "cargo:async-process@2.5.0:c19b7c6f923b580a",
         "cargo:async-recursion@1.1.1:c19b7c6f923b580a",
         "cargo:async-task@4.7.1:c19b7c6f923b580a",
-        "cargo:async-trait@0.1.89:c19b7c6f923b580a",
+        "cargo:async-trait@0.1.92:c19b7c6f923b580a",
         "cargo:blocking@1.6.2:c19b7c6f923b580a",
         "cargo:enumflags2@0.7.12:c19b7c6f923b580a",
         "cargo:event-listener@5.4.1:c19b7c6f923b580a",

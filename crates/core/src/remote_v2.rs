@@ -1248,7 +1248,9 @@ pub fn remote_lan_pairing_verification_code(
 pub fn remote_lan_pairing_device_fingerprint(device_identity_public_key: &str) -> String {
     let digest = Sha256::digest(device_identity_public_key.as_bytes());
     digest[..4]
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|chunk| format!("{:02X}{:02X}", chunk[0], chunk[1]))
         .collect::<Vec<_>>()
         .join("-")

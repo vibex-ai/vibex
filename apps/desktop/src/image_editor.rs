@@ -335,10 +335,10 @@ fn rasterize_text_overlay(
         &mut pixmap.as_mut(),
     );
     let mut pixels = pixmap.take();
-    if !pixels.chunks_exact(4).any(|pixel| pixel[3] != 0) {
+    if !pixels.as_chunks::<4>().0.iter().any(|pixel| pixel[3] != 0) {
         return None;
     }
-    for pixel in pixels.chunks_exact_mut(4) {
+    for pixel in pixels.as_chunks_mut::<4>().0 {
         let alpha = u16::from(pixel[3]);
         for channel in &mut pixel[..3] {
             if let Some(channel_value) = (u16::from(*channel) * 255 + alpha / 2).checked_div(alpha)

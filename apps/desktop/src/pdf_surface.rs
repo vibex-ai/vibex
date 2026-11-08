@@ -1243,7 +1243,7 @@ fn render_images(
 
 fn render_image(bitmap: PdfPageBitmap) -> Result<PdfRenderedPage, PdfSurfaceError> {
     let mut bgra = bitmap.rgba.to_vec();
-    for pixel in bgra.chunks_exact_mut(4) {
+    for pixel in bgra.as_chunks_mut::<4>().0 {
         pixel.swap(0, 2);
     }
     let buffer = RgbaImage::from_raw(bitmap.width, bitmap.height, bgra).ok_or_else(|| {

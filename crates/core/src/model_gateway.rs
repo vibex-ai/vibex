@@ -1555,7 +1555,7 @@ impl GatewayRequestSummary {
             status: log.status,
             latency_ms: log.latency_ms,
             outcome: log.outcome,
-            credential_name: log.credential_id.as_ref().and_then(&name_of),
+            credential_name: log.credential_id.as_ref().and_then(name_of),
             route,
             created_at_ms: log.created_at_ms,
         }

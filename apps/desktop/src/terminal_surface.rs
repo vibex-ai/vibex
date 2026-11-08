@@ -279,6 +279,10 @@ struct RowLayoutCache {
     rows: Vec<Arc<TerminalRowLayout>>,
 }
 
+/// One row's cached link scan: its row, the frame's byte count, the frame's
+/// column count, and the links found in that row.
+type RowLinksCache = std::cell::RefCell<Option<(u16, u64, u16, Vec<RowLink>)>>;
+
 /// The scrollbar's track and thumb in window space.
 #[derive(Clone, Copy)]
 struct TerminalScrollbarGeometry {
@@ -311,7 +315,7 @@ pub struct TerminalSurface {
     hovered_link: Option<(u16, RowLink)>,
     /// Per-row link scan for the row the pointer was last over, keyed by the
     /// frame's byte count so output invalidates it.
-    row_links: std::cell::RefCell<Option<(u16, u64, u16, Vec<RowLink>)>>,
+    row_links: RowLinksCache,
     /// Whether the scrollbar thumb is being dragged.
     scrollbar_drag: bool,
     focus: FocusHandle,
@@ -2693,7 +2697,7 @@ impl TerminalSurface {
                         // from the padding-box listener below — keeps pointer
                         // mapping and the scrollbar in the same space as the
                         // painted cells.
-                        let _ = prepaint_entity.update(cx, |surface, _| {
+                        prepaint_entity.update(cx, |surface, _| {
                             surface.grid_bounds = Some(bounds);
                         });
                         layout

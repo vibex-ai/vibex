@@ -3054,7 +3054,7 @@ fn decode_frame(bytes: &[u8]) -> Result<DecodedFrame, String> {
     let decoded = image::load_from_memory(bytes).map_err(|error| error.to_string())?;
     let (width, height) = (decoded.width(), decoded.height());
     let mut rgba = decoded.to_rgba8();
-    for pixel in rgba.chunks_exact_mut(4) {
+    for pixel in rgba.as_chunks_mut::<4>().0 {
         pixel.swap(0, 2);
     }
     Ok(DecodedFrame {
@@ -4893,7 +4893,7 @@ mod tests {
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let remaining_failures = self
                 .subscribe_failures
-                .fetch_update(
+                .try_update(
                     std::sync::atomic::Ordering::SeqCst,
                     std::sync::atomic::Ordering::SeqCst,
                     |failures| failures.checked_sub(1),

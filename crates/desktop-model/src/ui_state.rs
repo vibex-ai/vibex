@@ -3664,8 +3664,10 @@ mod tests {
         let encoded = serde_json::to_value(&default).unwrap();
         assert!(encoded.get("sessionSort").is_none());
 
-        let mut state = SidebarUiState::default();
-        state.session_sort = SidebarSessionSort::Updated;
+        let state = SidebarUiState {
+            session_sort: SidebarSessionSort::Updated,
+            ..Default::default()
+        };
         let encoded = serde_json::to_value(&state).unwrap();
         assert_eq!(encoded["sessionSort"], serde_json::json!("updated"));
         let restored: SidebarUiState = serde_json::from_value(encoded).unwrap();

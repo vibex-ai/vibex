@@ -1170,7 +1170,7 @@ fn reserve_queue_bytes(counter: &AtomicUsize, size: usize, limit: usize) -> bool
 }
 
 fn release_queue_bytes(counter: &AtomicUsize, size: usize) {
-    let _ = counter.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+    let _ = counter.try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
         Some(current.saturating_sub(size))
     });
 }

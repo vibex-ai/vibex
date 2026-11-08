@@ -8271,10 +8271,8 @@ impl App {
         let Some(row) = self.selected_config_row() else {
             return Outcome::quiet();
         };
-        for action in [ConfigAction::Toggle] {
-            if row.actions.contains(&action) {
-                return self.run_config_action(&row, action);
-            }
+        if row.actions.contains(&ConfigAction::Toggle) {
+            return self.run_config_action(&row, ConfigAction::Toggle);
         }
         Outcome::quiet()
     }
