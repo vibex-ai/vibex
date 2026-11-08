@@ -23252,6 +23252,41 @@ impl VibexWorkbench {
         }
     }
 
+    /// The session rows of one project, in the order the column painted them.
+    ///
+    /// A shift range has to span the rows that sit between its two ends *on
+    /// screen*, and the placement walk above does not describe that order. A
+    /// session band is painted through the reader's session order and split into
+    /// a pinned and an unpinned run, a group paints its members from the group
+    /// itself rather than from the band they are filed in, and a delegated child
+    /// is painted under its parent with no placement of its own. A range taken
+    /// from the placements therefore skipped rows the reader could see between
+    /// the anchor and the clicked row, which broke the selection into holes.
+    ///
+    /// The renderer records every session row it draws — including the rows a
+    /// long band virtualizes offscreen — in `sidebar_visible_session_ids`, in
+    /// paint order. That recording is the order a range reads here. Only rows
+    /// that can move with `target` survive: the recording is the whole column,
+    /// and a range never spans two projects. A project row keeps the placement
+    /// order, because the root column paints projects in exactly that order.
+    ///
+    /// A column that has not painted since it was cleared has no recording yet.
+    /// The placement order answers until it does, so the first click after a
+    /// switch of authority still spans a range instead of collapsing to one row.
+    fn sidebar_painted_move_order(
+        &self,
+        target: &SidebarOrganizationItem,
+        groups: &[SidebarProjectProjection],
+        project_scopes: &BTreeMap<String, SidebarRowScope>,
+    ) -> Vec<SidebarOrganizationItem> {
+        if !matches!(target, SidebarOrganizationItem::Session(_))
+            || self.sidebar_visible_session_ids.is_empty()
+        {
+            return self.sidebar_move_selection_order(target, groups, project_scopes);
+        }
+        sidebar_painted_session_order(&self.sidebar_visible_session_ids, target, project_scopes)
+    }
+
     /// Whether a move selection is on screen.
     ///
     /// The current session only joins a move while a selection exists: on its
@@ -23593,9 +23628,15 @@ impl VibexWorkbench {
         let compatible = anchor.as_ref().is_some_and(|anchor| {
             self.sidebar_move_selection_scope_matches(&project_scopes, anchor, &item)
         });
-        // Only a range that can span its anchor needs the sidebar order.
+        // Only a range that can span its anchor needs the painted order. It is
+        // read from the rows the column drew, not from a placement walk: a
+        // session band is sorted by the reader's session order and split into a
+        // pinned and an unpinned run, and a group paints members the placement
+        // tree does not order. A range taken from the placements therefore
+        // skipped rows that sat between its two ends on screen, which broke the
+        // selection into visible holes.
         let order = if shift && compatible {
-            self.sidebar_move_selection_order(&item, &groups, &project_scopes)
+            self.sidebar_painted_move_order(&item, &groups, &project_scopes)
         } else {
             Vec::new()
         };
@@ -77500,8 +77541,9 @@ struct SidebarMoveSelectionUpdate {
 /// A click without a modifier replaces the selection outright, a shift click
 /// replaces it with the range its anchor and the clicked row span, and a ctrl
 /// click toggles the clicked row. Shift and ctrl together keep the selection and
-/// add the range to it. `order` is the sidebar order the clicked row belongs to,
-/// and `compatible` says the anchor may form one selection with that row.
+/// add the range to it. `order` is the order the sidebar painted the clicked
+/// row's band in, and `compatible` says the anchor may form one selection with
+/// that row.
 fn sidebar_move_selection_after_click(
     mut selected: BTreeSet<SidebarOrganizationItem>,
     item: &SidebarOrganizationItem,
@@ -77580,6 +77622,40 @@ fn sidebar_items_share_move_scope(
         }
         _ => false,
     }
+}
+
+/// The session rows of `painted`, in the order the column drew them.
+///
+/// `painted` is the render pass's record of every session row it drew, in paint
+/// order — the rows a long band virtualizes offscreen included. A shift range
+/// has to span the rows that sit between its two ends *on screen*, so it reads
+/// this order rather than the placement tree: a band is sorted by the reader's
+/// session order and split into a pinned and an unpinned run, a group paints its
+/// members from the group, and a delegated child is painted under its parent
+/// with no placement of its own. A placement range therefore skipped rows the
+/// reader could see, which broke the selection into holes.
+///
+/// Only rows that can move with `target` survive, because the recording is the
+/// whole column and a range never spans two projects. The clicked row is kept
+/// even when the recording has not drawn it yet — a pass clears the recording,
+/// so the first click after a switch of authority would otherwise resolve to
+/// nothing.
+fn sidebar_painted_session_order(
+    painted: &[String],
+    target: &SidebarOrganizationItem,
+    project_scopes: &BTreeMap<String, SidebarRowScope>,
+) -> Vec<SidebarOrganizationItem> {
+    let mut seen = BTreeSet::new();
+    let mut ordered = painted
+        .iter()
+        .filter(|session_id| seen.insert((*session_id).clone()))
+        .map(|session_id| SidebarOrganizationItem::Session(session_id.clone()))
+        .filter(|item| sidebar_items_share_move_scope(project_scopes, target, item))
+        .collect::<Vec<_>>();
+    if !ordered.iter().any(|item| item == target) {
+        ordered.push(target.clone());
+    }
+    ordered
 }
 
 fn sidebar_selection_state(
@@ -125875,6 +125951,83 @@ mod tests {
         assert_eq!(update.anchor, Some(rows[3].clone()));
     }
 
+    /// A shift range spans the rows the column painted, not the order the
+    /// organization tree places them in.
+    ///
+    /// A session band is painted through the reader's session order and split
+    /// into a pinned and an unpinned run, and a group paints members the
+    /// placement tree does not order, so the two orders disagree. Reading the
+    /// placements left the rows that sat between the two ends on screen
+    /// unselected, which is the interrupted selection the range has to avoid.
+    #[test]
+    fn a_shift_range_follows_the_rows_the_column_painted() {
+        let project = ProjectId::new();
+        let scopes = ["a", "b", "c", "d"]
+            .into_iter()
+            .map(|id| {
+                (
+                    id.to_string(),
+                    SidebarRowScope {
+                        project_scope: Some(project.as_str().to_string()),
+                        project_id: project.clone(),
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        // Paint order: the band follows the reader's session order, which is not
+        // the placement order the organization tree walks.
+        let painted = ["d", "a", "c", "b"].map(str::to_string);
+
+        let rows = ["a", "b", "c", "d"].map(|id| SidebarOrganizationItem::Session(id.to_string()));
+        let order = sidebar_painted_session_order(&painted, &rows[1], &scopes);
+        assert_eq!(
+            order,
+            painted
+                .iter()
+                .cloned()
+                .map(SidebarOrganizationItem::Session)
+                .collect::<Vec<_>>()
+        );
+
+        let update = sidebar_move_selection_after_click(
+            sidebar_selection_rows(&["d"]),
+            &rows[1],
+            Some(&rows[0]),
+            &order,
+            true,
+            false,
+            true,
+        );
+        // Between "a" and "b" on screen sits "c", so the range is a, c, b in the
+        // order the column drew them — including the row the placement walk
+        // would have skipped.
+        assert_eq!(update.items, sidebar_selection_rows(&["a", "b", "c"]));
+
+        // A row the pass has not drawn keeps its own selection rather than
+        // resolving to an empty range.
+        let order = sidebar_painted_session_order(&[], &rows[1], &scopes);
+        assert_eq!(order, vec![rows[1].clone()]);
+
+        // The recording is the whole column, so a range must not reach into a
+        // project the clicked row does not belong to.
+        let other = ProjectId::new();
+        let mut scopes = scopes;
+        scopes.insert(
+            "other".to_string(),
+            SidebarRowScope {
+                project_scope: Some(other.as_str().to_string()),
+                project_id: other,
+            },
+        );
+        let painted = ["a", "other", "b"].map(str::to_string);
+        let order = sidebar_painted_session_order(&painted, &rows[1], &scopes);
+        assert_eq!(
+            order,
+            vec![rows[0].clone(), rows[1].clone()],
+            "a range never spans two projects"
+        );
+    }
+
     /// A ctrl click toggles one row of the selection the sidebar paints, so the
     /// two rows a user sees are the two a batch command acts on, and shift with
     /// ctrl adds the range instead of replacing what is selected.
@@ -125946,9 +126099,14 @@ mod tests {
         assert!(update.contains("let mut selected = self.sidebar_move_selected_items.clone();"));
         assert!(update.contains(".or_else(|| self.sidebar_current_session_item())"));
         assert!(update.contains("sidebar_move_selection_after_click("));
+        // The range follows the rows the column painted, not the placement
+        // tree: the two disagree once a band is sorted, pinned, grouped, or
+        // virtualized, and a placement range then leaves holes in the
+        // selection the reader sees.
         assert!(
-            update.contains("self.sidebar_move_selection_order(&item, &groups, &project_scopes)")
+            update.contains("self.sidebar_painted_move_order(&item, &groups, &project_scopes)")
         );
+        assert!(!update.contains("sidebar_move_selection_order(&item, &groups, &project_scopes)"));
 
         let batch = source
             .split_once("    fn sidebar_batch_selection(")
