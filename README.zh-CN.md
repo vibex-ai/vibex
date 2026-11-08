@@ -5,7 +5,7 @@
 <p align="center">
   <a href="https://github.com/vibex-ai/vibex"><img src="https://img.shields.io/github/stars/vibex-ai/vibex?style=flat&logo=github" alt="GitHub stars" /></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0--or--later-blue?style=flat" alt="许可证: AGPL-3.0 或更高版本" /></a>
-  <img src="https://img.shields.io/badge/Rust-1.97.0-black?style=flat&logo=rust&logoColor=white" alt="Rust 1.97.0" />
+  <img src="https://img.shields.io/badge/Rust-1.99.1-black?style=flat&logo=rust&logoColor=white" alt="Rust 1.99.1" />
   <img src="https://img.shields.io/badge/UI-GPUI-2563eb?style=flat" alt="GPUI" />
   <img src="https://img.shields.io/badge/platforms-macOS%20%7C%20Windows%20%7C%20Linux%20%7C%20iOS%20%7C%20Android-4493F8?style=flat" alt="支持平台: macOS、Windows、Linux、iOS 和 Android" />
   <img src="https://img.shields.io/badge/status-0.1.0--rc.10-f97316?style=flat" alt="发布状态: 0.1.0-rc.10" />
@@ -376,7 +376,7 @@ pnpm install --frozen-lockfile
 pnpm dev:desktop
 ```
 
-前置条件：支持子模块的 Git、Node.js 22、pnpm 11.3.0、Rust 1.97.0，以及带可用 Vulkan 驱动的图形会话。
+前置条件：支持子模块的 Git、Node.js 22、pnpm 11.3.0、Rust 1.99.1，以及带可用 Vulkan 驱动的图形会话。
 
 ---
 

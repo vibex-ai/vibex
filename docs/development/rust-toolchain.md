@@ -1,6 +1,6 @@
 # Rust Toolchain And Quality Gate
 
-Vibex development, CI, formatting, Clippy, and release builds use Rust `1.97.0`.
+Vibex development, CI, formatting, Clippy, and release builds use Rust `1.99.1`.
 The version is pinned in `rust-toolchain.toml`, the workspace `rust-version`, and
 the three-platform GitHub Actions matrix.
 

@@ -5,7 +5,7 @@
 <p align="center">
   <a href="https://github.com/vibex-ai/vibex"><img src="https://img.shields.io/github/stars/vibex-ai/vibex?style=flat&logo=github" alt="GitHub stars" /></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0--or--later-blue?style=flat" alt="License: AGPL-3.0-or-later" /></a>
-  <img src="https://img.shields.io/badge/Rust-1.97.0-black?style=flat&logo=rust&logoColor=white" alt="Rust 1.97.0" />
+  <img src="https://img.shields.io/badge/Rust-1.99.1-black?style=flat&logo=rust&logoColor=white" alt="Rust 1.99.1" />
   <img src="https://img.shields.io/badge/UI-GPUI-2563eb?style=flat" alt="GPUI" />
   <img src="https://img.shields.io/badge/platforms-macOS%20%7C%20Windows%20%7C%20Linux%20%7C%20iOS%20%7C%20Android-4493F8?style=flat" alt="Platforms: macOS, Windows, Linux, iOS, and Android" />
   <img src="https://img.shields.io/badge/status-0.1.0--rc.10-f97316?style=flat" alt="Release status: 0.1.0-rc.10" />
@@ -376,7 +376,7 @@ pnpm install --frozen-lockfile
 pnpm dev:desktop
 ```
 
-Prerequisites: Git with submodule support, Node.js 22, pnpm 11.3.0, Rust 1.97.0, and a graphical session with a working Vulkan driver.
+Prerequisites: Git with submodule support, Node.js 22, pnpm 11.3.0, Rust 1.99.1, and a graphical session with a working Vulkan driver.
 
 ---
 

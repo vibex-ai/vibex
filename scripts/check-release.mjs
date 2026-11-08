@@ -658,7 +658,7 @@ function validateServerRelease() {
     "server builder must pin the Debian 12 base image by digest"
   );
   assert(
-    dockerfile.includes("--default-toolchain 1.97.0"),
+    dockerfile.includes("--default-toolchain 1.99.1"),
     "server builder must pin the workspace Rust toolchain"
   );
   for (const required of [

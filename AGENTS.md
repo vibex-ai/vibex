@@ -227,7 +227,7 @@ desktop / mobile / remote:
 - There is no WebUI/PWA product. `apps/mobile` is a native GPUI client and Relay
   and Desktop packages never host mobile application assets.
 
-Toolchain: Rust 1.97.0 (pinned by `rust-toolchain.toml`), edition 2024,
+Toolchain: Rust 1.99.1 (pinned by `rust-toolchain.toml`), edition 2024,
 Node.js 22, pnpm 11.3.0 (pinned by `package.json`).
 
 ## 3. Development guide

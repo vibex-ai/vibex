@@ -4,7 +4,7 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const RUST_VERSION = "1.97.0";
+const RUST_VERSION = "1.99.1";
 const FUTURE_INCOMPAT_ALLOWLIST_PATH =
   "docs/development/rust-future-incompat-allowlist.json";
 
