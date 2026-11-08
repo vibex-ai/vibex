@@ -32,7 +32,7 @@
 </p>
 
 <p align="center">
-  <img src="docs/assets/showcase/desktop-en.png" alt="Vibex desktop workbench with Agent sessions, files, Git, and a terminal" width="960" />
+  <img src="docs/assets/showcase/cover-en.webp" alt="Vibex desktop workbench with Agent sessions, the editor, a terminal, and an embedded browser" width="960" />
 </p>
 
 Vibex brings Agent sessions, source code, Git, terminals, an embedded browser, desktop automation, and provider configuration into one focused workbench. The desktop runtime stays in control of Agent processes, session history, workspace files, Git, PTYs, providers, and permissions. A native mobile client and a terminal client let you monitor and steer those same sessions remotely, while an optional self-hosted Relay carries only encrypted frames.
@@ -53,7 +53,8 @@ Run Claude Code, Codex, ZCode, OpenCode, and any ACP-compatible Agent side by si
 
 </td>
 <td width="50%">
-  <!-- Add the Agents demo GIF here, for example docs/assets/features/agents.gif. -->
+  <img src="docs/assets/features/agents-home-en.webp" alt="Vibex home screen with the Agent picker, projects, and recent sessions" width="100%" /><br />
+  <img src="docs/assets/features/agents-config-en.webp" alt="Config Center listing installed Agents with their runtime and credential status" width="100%" />
 </td>
 </tr>
 <tr>
@@ -67,7 +68,7 @@ Delegate work to child Agents and keep the task open across rounds. Follow up in
 
 </td>
 <td width="50%">
-  <!-- Add the Agent teams demo GIF here. -->
+  <img src="docs/assets/features/agent-teams-en.webp" alt="A Task Team session with a child Agent, its tool calls, and a parallel worktree pane" width="100%" />
 </td>
 </tr>
 <tr>
@@ -81,7 +82,7 @@ Give every experiment its own isolated Git worktree. Review diffs, stage and com
 
 </td>
 <td width="50%">
-  <!-- Add the worktree and Git review demo GIF here. -->
+  <img src="docs/assets/features/git-review-en.webp" alt="Editor and Git review side by side, with a commit diff and the Changes and Commits lists" width="100%" />
 </td>
 </tr>
 <tr>
@@ -95,7 +96,8 @@ Configure a model Provider once and share it across Agents. Route groups fail ov
 
 </td>
 <td width="50%">
-  <!-- Add the Providers and gateway demo GIF here. -->
+  <img src="docs/assets/features/providers-en.webp" alt="New Provider picker with vendor, relay, local, and user-defined presets" width="100%" /><br />
+  <img src="docs/assets/features/gateway-en.webp" alt="Vibex Gateway route map and token-only request ledger" width="100%" />
 </td>
 </tr>
 <tr>
@@ -109,7 +111,7 @@ Use a native PTY with tabs, splits, search, and scrollback. Let an Agent drive a
 
 </td>
 <td width="50%">
-  <!-- Add the browser and computer-use demo GIF here. -->
+  <img src="docs/assets/features/terminal-browser-en.webp" alt="Editor, an embedded browser, and a native terminal sharing one Vibex window" width="100%" />
 </td>
 </tr>
 <tr>
@@ -123,7 +125,13 @@ Pair an iOS or Android client with the desktop runtime. Read the same timeline, 
 
 </td>
 <td width="50%">
-  <!-- Add the mobile companion demo GIF here. -->
+  <table>
+    <tr>
+      <td width="33%" valign="top"><img src="docs/assets/features/mobile-sessions-en.webp" alt="Android client listing the desktop sessions of one project" width="100%" /></td>
+      <td width="33%" valign="top"><img src="docs/assets/features/mobile-session-en.webp" alt="Android client streaming the same session timeline with an approval card and the composer" width="100%" /></td>
+      <td width="33%" valign="top"><img src="docs/assets/features/mobile-files-en.webp" alt="Android client browsing workspace files, changes, and the terminal" width="100%" /></td>
+    </tr>
+  </table>
 </td>
 </tr>
 <tr>
@@ -137,7 +145,8 @@ The whole workbench in a terminal: sessions, streaming Markdown, approvals, the 
 
 </td>
 <td width="50%">
-  <!-- Add the TUI demo GIF here. -->
+  <img src="docs/assets/features/tui-welcome-en.webp" alt="Vibex TUI welcome screen with the Agent, workspace, and session list" width="100%" /><br />
+  <img src="docs/assets/features/tui-session-en.webp" alt="Vibex TUI rendering a finished session with Markdown tables and tool results" width="100%" />
 </td>
 </tr>
 <tr>
@@ -151,21 +160,7 @@ Run the authoritative runtime on another machine over SSH or inside WSL2, or sel
 
 </td>
 <td width="50%">
-  <!-- Add the remote runtime demo GIF here. -->
-</td>
-</tr>
-<tr>
-<td width="50%" valign="middle">
-
-### Sessions that keep up
-
-Queue follow-ups, steer a running turn, schedule a send for later, or let auto-continue carry a turn to completion. Search every conversation, import local Agent history, and restore archived sessions with their full timeline.
-
-[Docs →](https://vibex.peatboy.com/docs/sessions)
-
-</td>
-<td width="50%">
-  <!-- Add the session queue and search demo GIF here. -->
+  <img src="docs/assets/features/remote-runtime-en.webp" alt="Remote instances settings for adding a runtime over SSH or WSL" width="100%" />
 </td>
 </tr>
 <tr>
@@ -179,7 +174,7 @@ Install MCP servers and Skills from in-app markets, write reusable Prompts, and 
 
 </td>
 <td width="50%">
-  <!-- Add the markets and previews demo GIF here. -->
+  <img src="docs/assets/features/mcp-market-en.webp" alt="MCP market listing registry servers with install actions, next to the Config Center" width="100%" />
 </td>
 </tr>
 </table>

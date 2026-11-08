@@ -32,7 +32,7 @@
 </p>
 
 <p align="center">
-  <img src="docs/assets/showcase/desktop-zh.png" alt="Vibex 桌面工作台：Agent 会话、文件、Git 与终端" width="960" />
+  <img src="docs/assets/showcase/cover-zh.webp" alt="Vibex 桌面工作台：Agent 会话、编辑器、终端与内嵌浏览器" width="960" />
 </p>
 
 Vibex 将 Agent 会话、源代码、Git、终端、内嵌浏览器、电脑操作和供应商配置整合到一个专注的工作台中。桌面运行时统一管理 Agent 进程、会话历史、工作区文件、Git、PTY、供应商和权限。原生移动端和终端客户端可以远程监控并操控相同的会话，可选的自托管 Relay 只承载加密帧。
@@ -53,7 +53,8 @@ Vibex 将 Agent 会话、源代码、Git、终端、内嵌浏览器、电脑操�
 
 </td>
 <td width="50%">
-  <!-- 在此加入 Agent 演示动图，例如 docs/assets/features/agents.gif。 -->
+  <img src="docs/assets/features/agents-home-zh.webp" alt="Vibex 首页：Agent 选择器、项目与最近会话" width="100%" /><br />
+  <img src="docs/assets/features/agents-config-zh.webp" alt="配置中心列出已安装 Agent 的运行时与登录状态" width="100%" />
 </td>
 </tr>
 <tr>
@@ -67,7 +68,7 @@ Vibex 将 Agent 会话、源代码、Git、终端、内嵌浏览器、电脑操�
 
 </td>
 <td width="50%">
-  <!-- 在此加入 Agent 团队演示动图。 -->
+  <img src="docs/assets/features/agent-teams-zh.webp" alt="Task Team 会话：子 Agent、工具调用与并行 worktree 面板" width="100%" />
 </td>
 </tr>
 <tr>
@@ -81,7 +82,7 @@ Vibex 将 Agent 会话、源代码、Git、终端、内嵌浏览器、电脑操�
 
 </td>
 <td width="50%">
-  <!-- 在此加入 Worktree 与 Git 审查演示动图。 -->
+  <img src="docs/assets/features/git-review-zh.webp" alt="编辑器与 Git 审查并排：提交差异、变更与提交列表" width="100%" />
 </td>
 </tr>
 <tr>
@@ -95,7 +96,8 @@ Vibex 将 Agent 会话、源代码、Git、终端、内嵌浏览器、电脑操�
 
 </td>
 <td width="50%">
-  <!-- 在此加入供应商与网关演示动图。 -->
+  <img src="docs/assets/features/providers-zh.webp" alt="新建供应商：厂商、中转、本地与自定义预设" width="100%" /><br />
+  <img src="docs/assets/features/gateway-zh.webp" alt="Vibex Gateway 路由图与仅含 token 的请求台账" width="100%" />
 </td>
 </tr>
 <tr>
@@ -109,7 +111,7 @@ Vibex 将 Agent 会话、源代码、Git、终端、内嵌浏览器、电脑操�
 
 </td>
 <td width="50%">
-  <!-- 在此加入浏览器与电脑操作演示动图。 -->
+  <img src="docs/assets/features/terminal-browser-zh.webp" alt="编辑器、内嵌浏览器与原生终端共用一个 Vibex 窗口" width="100%" />
 </td>
 </tr>
 <tr>
@@ -123,7 +125,13 @@ Vibex 将 Agent 会话、源代码、Git、终端、内嵌浏览器、电脑操�
 
 </td>
 <td width="50%">
-  <!-- 在此加入移动端演示动图。 -->
+  <table>
+    <tr>
+      <td width="33%" valign="top"><img src="docs/assets/features/mobile-sessions-zh.webp" alt="Android 客户端列出同一项目的桌面会话" width="100%" /></td>
+      <td width="33%" valign="top"><img src="docs/assets/features/mobile-session-zh.webp" alt="Android 客户端流式渲染同一条会话时间线，含审批卡片与输入框" width="100%" /></td>
+      <td width="33%" valign="top"><img src="docs/assets/features/mobile-files-zh.webp" alt="Android 客户端浏览工作区文件、变更与终端" width="100%" /></td>
+    </tr>
+  </table>
 </td>
 </tr>
 <tr>
@@ -137,7 +145,8 @@ Vibex 将 Agent 会话、源代码、Git、终端、内嵌浏览器、电脑操�
 
 </td>
 <td width="50%">
-  <!-- 在此加入 TUI 演示动图。 -->
+  <img src="docs/assets/features/tui-welcome-zh.webp" alt="Vibex TUI 欢迎界面：Agent、工作区与会话列表" width="100%" /><br />
+  <img src="docs/assets/features/tui-session-zh.webp" alt="Vibex TUI 渲染已完成的会话，含 Markdown 表格与工具结果" width="100%" />
 </td>
 </tr>
 <tr>
@@ -151,21 +160,7 @@ Vibex 将 Agent 会话、源代码、Git、终端、内嵌浏览器、电脑操�
 
 </td>
 <td width="50%">
-  <!-- 在此加入远程运行时演示动图。 -->
-</td>
-</tr>
-<tr>
-<td width="50%" valign="middle">
-
-### 跟得上的会话
-
-把后续消息排进队列、引导正在运行的回合、把发送安排到稍后，或让自动继续把回合推进到完成。搜索所有对话、导入本地 Agent 历史，并带着完整时间线恢复已归档会话。
-
-[文档 →](https://vibex.peatboy.com/docs/sessions)
-
-</td>
-<td width="50%">
-  <!-- 在此加入会话队列与搜索演示动图。 -->
+  <img src="docs/assets/features/remote-runtime-zh.webp" alt="远程实例设置：通过 SSH 或 WSL 添加运行时" width="100%" />
 </td>
 </tr>
 <tr>
@@ -179,7 +174,7 @@ Vibex 将 Agent 会话、源代码、Git、终端、内嵌浏览器、电脑操�
 
 </td>
 <td width="50%">
-  <!-- 在此加入市场与预览演示动图。 -->
+  <img src="docs/assets/features/mcp-market-zh.webp" alt="MCP 市场列出注册表服务器与安装入口，旁边是配置中心" width="100%" />
 </td>
 </tr>
 </table>
