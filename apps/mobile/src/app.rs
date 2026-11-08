@@ -7198,26 +7198,21 @@ impl MobileApp {
                             .into_iter()
                             .map(|summary| summary.workspace)
                             .collect();
+                        let selected = this
+                            .controller
+                            .as_ref()
+                            .and_then(|controller| controller.state.selected_session_id.clone());
                         let active_workspace = this
                             .controller
                             .as_ref()
                             .and_then(|controller| controller.state.active_session.value.as_ref())
+                            .filter(|session| selected.as_ref() == Some(&session.id))
                             .map(|session| session.workspace_id.clone());
-                        let target = active_workspace
-                            .filter(|workspace_id| {
-                                this.workspaces
-                                    .iter()
-                                    .any(|workspace| &workspace.id == workspace_id)
-                            })
-                            .or_else(|| {
-                                this.workspaces
-                                    .iter()
-                                    .find(|workspace| {
-                                        workspace.mode == WorkspaceMode::CurrentCheckout
-                                    })
-                                    .or_else(|| this.workspaces.first())
-                                    .map(|workspace| workspace.id.clone())
-                            });
+                        let target = workbench_target_workspace(
+                            selected.is_some(),
+                            active_workspace.as_ref(),
+                            &this.workspaces,
+                        );
                         if let Some(workspace_id) = target {
                             this.ensure_workbench(workspace_id, cx);
                         }
@@ -8610,6 +8605,23 @@ impl MobileApp {
             .unwrap_or_default();
         self.pending_input_writes
             .push((InputField::Composer, draft));
+        // The rail follows the conversation, not the read that fills its
+        // timeline. The session row already names the workspace, so the rail is
+        // pointed at it now — before the read is issued, and whether or not it
+        // ever answers. Retargeting only from the authoritative snapshot is how a
+        // session whose timeline failed kept showing the *previous*
+        // conversation's files, diffs, and terminals: a different project's
+        // workbench under this one's page. A session the list does not know yet
+        // keeps the rail where it is until its own read names a workspace.
+        let listed_workspace = sidebar_row_session(
+            self.sessions(),
+            &self.delegated_sessions,
+            session_id.as_str(),
+        )
+        .map(|session| session.workspace_id.clone());
+        if let Some(workspace_id) = listed_workspace {
+            self.ensure_workbench(workspace_id, cx);
+        }
         let Some(controller) = self.controller.as_mut() else {
             return;
         };
@@ -8738,6 +8750,20 @@ impl MobileApp {
             });
         });
         self.tasks.push(task);
+        cx.notify();
+    }
+
+    /// Re-reads the open conversation after a failed load.
+    ///
+    /// A failure used to leave the page saying the session had no messages,
+    /// which is the one thing it could not have been: the read never answered.
+    /// The retry is the reader's way back, and it goes through the ordinary
+    /// reload so the timeline's failed status is what the next read replaces.
+    fn retry_selected_session(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(controller) = self.controller.as_mut() {
+            controller.state.timeline_status.clear();
+        }
+        self.reload_selected_session(cx);
         cx.notify();
     }
 
@@ -9736,7 +9762,7 @@ impl MobileApp {
                     summary.project.name.clone()
                 };
                 seen.insert(id.clone())
-                    .then(|| SidebarProject { id, label })
+                    .then_some(SidebarProject { id, label })
             })
             .collect::<Vec<_>>();
         // A session can outlive the workspace listing the phone last fetched;
@@ -16038,6 +16064,21 @@ impl MobileApp {
         let timeline_loading = self.controller.as_ref().is_some_and(|controller| {
             controller.state.timeline_status.phase == AsyncPhase::Loading
         });
+        // A read that failed is not an empty conversation. The two used to paint
+        // the same "No messages yet", so a session the desktop could show read
+        // as one with nothing in it and offered the reader no way back. The
+        // failure is drawn with its own retry instead.
+        let timeline_error = self
+            .controller
+            .as_ref()
+            .filter(|controller| controller.state.timeline_status.phase == AsyncPhase::Failed)
+            .and_then(|controller| controller.state.timeline_status.error.as_ref())
+            .map(|error| error.message.clone());
+        let timeline_terminal = self
+            .controller
+            .as_ref()
+            .and_then(|controller| controller.state.active_session.value.as_ref())
+            .is_some_and(vibex_ui::agent::is_terminal_session);
         let turns = self.timeline_turns.clone();
         let no_selected_session = self
             .controller
@@ -16180,7 +16221,84 @@ impl MobileApp {
                                             .child(locale::common("Loading conversation...")),
                                     )
                                 })
-                                .when(!timeline_loading && turns.is_empty(), |timeline| {
+                                .when(
+                                    !timeline_loading && turns.is_empty() && timeline_terminal,
+                                    |timeline| {
+                                        // A terminal-mode session has no
+                                        // timeline at all: its Agent owns its
+                                        // own screen inside the PTY, and the
+                                        // rail is where that screen is. Saying
+                                        // "no messages yet" over a running
+                                        // Agent would be a lie about the
+                                        // session, not a description of it.
+                                        timeline.child(
+                                            div()
+                                                .py_8()
+                                                .text_size(theme::font_body())
+                                                .text_color(theme::text_muted())
+                                                .text_center()
+                                                .child(locale::text(
+                                                    "This conversation lives in its terminal — open the rail to watch it.",
+                                                    "此会话运行在终端中，打开右侧栏即可查看。",
+                                                    "此工作階段執行於終端機中，開啟右側欄即可檢視。",
+                                                )),
+                                        )
+                                    },
+                                )
+                                .when(
+                                    !timeline_loading
+                                        && turns.is_empty()
+                                        && !timeline_terminal
+                                        && timeline_error.is_some(),
+                                    |timeline| {
+                                        let message =
+                                            timeline_error.clone().unwrap_or_default();
+                                        timeline.child(
+                                            Empty::new()
+                                                .flex_none()
+                                                .gap_3()
+                                                .py_8()
+                                                .header(EmptyHeader::new().max_w_full().description(
+                                                    EmptyDescription::new()
+                                                        .text_size(theme::font_body())
+                                                        .text_color(theme::text_muted())
+                                                        .child(message),
+                                                ))
+                                                .content(EmptyContent::new().text_size(
+                                                    theme::font_body(),
+                                                ).child(
+                                                    div()
+                                                        .id("retry-conversation-load")
+                                                        .h(px(theme::TOUCH_TARGET))
+                                                        .px_4()
+                                                        .rounded(px(theme::RADIUS_CONTROL))
+                                                        .border_1()
+                                                        .border_color(theme::border_default())
+                                                        .flex()
+                                                        .items_center()
+                                                        .justify_center()
+                                                        .text_color(theme::text_secondary())
+                                                        .cursor_pointer()
+                                                        .active(|style| {
+                                                            style.bg(theme::row_pressed_bg())
+                                                        })
+                                                        .on_mouse_up(
+                                                            MouseButton::Left,
+                                                            cx.listener(
+                                                                Self::retry_selected_session,
+                                                            ),
+                                                        )
+                                                        .child(locale::common("Retry")),
+                                                )),
+                                        )
+                                    },
+                                )
+                                .when(
+                                    !timeline_loading
+                                        && turns.is_empty()
+                                        && !timeline_terminal
+                                        && timeline_error.is_none(),
+                                    |timeline| {
                                     timeline.child(
                                         Empty::new()
                                             .flex_none()
@@ -16225,7 +16343,8 @@ impl MobileApp {
                                                 },
                                             )),
                                     )
-                                })
+                                    },
+                                )
                                 .when(!turns.is_empty(), |timeline| {
                                     timeline.child(
                                         list(
@@ -34807,6 +34926,40 @@ fn workspace_label(root: &str) -> &str {
         .unwrap_or(root)
 }
 
+/// The workspace the right rail should show, given what the reader has open.
+///
+/// The rail is a view of *the open conversation's* workspace: its file tree,
+/// its changes, and its terminals. It used to fall back to "a current checkout,
+/// or the first workspace on the desktop" whenever the open session's workspace
+/// could not be matched, which is how a phone ended up browsing files, diffs,
+/// and terminals belonging to some other project while the conversation it was
+/// reading ran somewhere else.
+///
+/// So the rule is: an open session names its workspace, and that workspace is
+/// what the rail shows even when the workspace list has not answered or no
+/// longer carries it — asking for a missing workspace fails honestly instead of
+/// painting a neighbour's tree. Only a phone with no session open falls back to
+/// a default, which is the one case where there is no conversation to follow.
+fn workbench_target_workspace(
+    selected_session: bool,
+    session_workspace: Option<&vibex_core::WorkspaceId>,
+    workspaces: &[WorkspaceRecord],
+) -> Option<vibex_core::WorkspaceId> {
+    if let Some(workspace_id) = session_workspace {
+        return Some(workspace_id.clone());
+    }
+    if selected_session {
+        // A row is open but has not named a workspace yet: leave the rail where
+        // it is rather than retargeting it at another project's checkout.
+        return None;
+    }
+    workspaces
+        .iter()
+        .find(|workspace| workspace.mode == WorkspaceMode::CurrentCheckout)
+        .or_else(|| workspaces.first())
+        .map(|workspace| workspace.id.clone())
+}
+
 fn workspace_mode_label(mode: WorkspaceMode) -> &'static str {
     match mode {
         WorkspaceMode::CurrentCheckout => {
@@ -44301,6 +44454,96 @@ fn session_opened(cx: &mut Context<Self>) {
         assert!(
             sheet.contains("SetSessionAutoContinuePaused"),
             "which lifts the suspension on the authority"
+        );
+    }
+
+    /// The rail follows the open conversation's workspace and never guesses.
+    ///
+    /// The reported bug: a session opened onto another project's files, diffs,
+    /// and terminals. The rail used to retarget itself at "a current checkout,
+    /// or the first workspace" whenever the open session's workspace was not in
+    /// the list it had, so a read that failed or had not arrived left the
+    /// previous conversation's workbench under this one's page.
+    #[test]
+    fn the_rail_targets_the_open_conversations_workspace() {
+        fn workspace(id: &str, mode: WorkspaceMode) -> WorkspaceRecord {
+            WorkspaceRecord {
+                id: vibex_core::WorkspaceId::parse(id).expect("valid workspace id"),
+                project_id: vibex_core::ProjectId::parse("project_a").expect("valid project"),
+                root_path: format!("/tmp/{id}"),
+                mode,
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            }
+        }
+
+        let workspaces = vec![
+            workspace("workspace_default", WorkspaceMode::CurrentCheckout),
+            workspace("workspace_other", WorkspaceMode::VibexWorktree),
+        ];
+        let other = vibex_core::WorkspaceId::parse("workspace_other").expect("valid workspace id");
+
+        // An open session names its own workspace, and that is what the rail
+        // shows — even when a default checkout is on offer.
+        assert_eq!(
+            workbench_target_workspace(true, Some(&other), &workspaces),
+            Some(other.clone())
+        );
+        // A workspace the list no longer carries is still the answer: the read
+        // then fails honestly instead of painting a neighbour's tree.
+        let gone = vibex_core::WorkspaceId::parse("workspace_gone").expect("valid workspace id");
+        assert_eq!(
+            workbench_target_workspace(true, Some(&gone), &workspaces),
+            Some(gone)
+        );
+        // A session row that has not named a workspace leaves the rail alone.
+        assert_eq!(
+            workbench_target_workspace(true, None, &workspaces),
+            None,
+            "a selected conversation never retargets the rail at another project"
+        );
+        // Only a phone with no conversation open falls back to a default.
+        assert_eq!(
+            workbench_target_workspace(false, None, &workspaces),
+            Some(vibex_core::WorkspaceId::parse("workspace_default").expect("valid workspace id"))
+        );
+
+        // Opening a session points the rail at that session's workspace from
+        // the list it already holds, before the snapshot answers — the read is
+        // what can fail, and the rail must not wait for it. A failure is drawn
+        // as a failure with a retry, never as an empty conversation.
+        let source = include_str!("app.rs");
+        let source = source
+            .split("\nmod tests {")
+            .next()
+            .expect("the module has production code");
+        let open = source
+            .split_once("    fn open_session(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn retry_selected_session("))
+            .map(|(body, _)| body)
+            .expect("opening a session should remain inspectable");
+        let rail = open
+            .find("let listed_workspace =")
+            .expect("opening a session reads the row's workspace");
+        assert!(
+            open[rail..].contains("self.ensure_workbench(workspace_id, cx);"),
+            "the rail is pointed at the session's own workspace while it opens"
+        );
+        assert!(
+            open.find("let listed_workspace =").unwrap()
+                < open
+                    .find("controller.begin_session_load(")
+                    .expect("the session load is issued while opening"),
+            "the rail is retargeted before the read that could fail"
+        );
+        let page = source
+            .split_once("    fn render_workspace(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_sidebar_row_menu("))
+            .map(|(body, _)| body)
+            .expect("the conversation page should remain inspectable");
+        assert!(
+            page.contains("Self::retry_selected_session"),
+            "a conversation that failed to load offers a retry"
         );
     }
 

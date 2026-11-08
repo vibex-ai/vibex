@@ -576,6 +576,35 @@ expanded. Never key these decisions on `!turn.complete` alone; use the shared
 finished-for-display predicate (desktop: `timeline_turn_finished`), which also
 bounds range-based lookups such as the generation compaction count.
 
+### Convention: A window that skipped stored rows is re-read contiguously
+
+Opening a running session reads a turn-banded window: the newest rows of the
+live turn plus the whole turns above it. When the tail cap has to cut the live
+turn, the page declares the range it skipped through `TimelinePage::omitted`.
+Such a page is not a projection of the conversation — `has_older` can be false
+while rows are missing — so the shared read refuses it and **immediately asks
+again with `max_turns: None`**, which reads the same span row by row and cannot
+omit anything. This retry belongs to `vibex_ui::load_timeline_window`, not to
+each shell: the desktop and TUI used to carry their own recovery, and the phone
+had none, so a session the authority had in full opened onto an empty timeline
+there. A client must never paint a failed read as an empty conversation:
+loading, failure (with a retry affordance), and a genuinely empty conversation
+are three different screens.
+
+### Convention: The right rail follows the open conversation's workspace
+
+A rail's file tree, diff list, and terminal list are a view of *one* workspace:
+the one the open session runs in. Point it at that workspace from the session
+record the client already holds, before the session snapshot answers — the
+snapshot read is exactly what can fail. Only a client with no conversation open
+may fall back to a default workspace, and a selected session that has not named
+a workspace yet must leave the rail where it is rather than retargeting at a
+neighbour. A fallback chain of "the open session's workspace, else a current
+checkout, else the first workspace" silently paints one project's files and
+terminals under another project's conversation whenever the open session is
+missing from the list; a workspace the list does not carry is still the correct
+answer, because a failing read is honest and a wrong tree is not.
+
 ### Convention: User-message delivery is durable timeline data
 
 `UserMessageDelivery` on `UserMessagePayload` records how a user message

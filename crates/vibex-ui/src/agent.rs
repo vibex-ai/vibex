@@ -1050,6 +1050,11 @@ impl AgentWorkflowController {
                     "the backend returned a different Agent session",
                 ));
             }
+            // The window read repeats a banded page without its turn band when
+            // that page reported a hole, so a running session whose live turn
+            // had to be cut still opens onto its conversation instead of onto an
+            // empty timeline — which is what a reader on a phone saw while the
+            // desktop showed the same session in full.
             let (timeline, timeline_has_older) = match ticket.load {
                 // A cold open reads the newest window only. Older history is
                 // a reader gesture, not part of opening a session.
@@ -2022,22 +2027,65 @@ impl AgentWorkflowController {
 /// whole archive in 500-item chunks, which made the wait proportional to the
 /// session's history; the window is what makes it constant, and older history
 /// is a reader gesture from here on.
+///
+/// A banded window can cut the middle of the turn being written and says so
+/// through `omitted`. Refusing it and asking again without a turn band is part
+/// of this read rather than of each client: the alternative was a client that
+/// refused the page and installed nothing, which is a conversation that looks
+/// empty while the desktop is showing it.
 pub async fn load_timeline_window(
     backend: &dyn AgentBackend,
     session_id: &VibexSessionId,
 ) -> BackendResult<TimelinePage> {
-    let page = backend
+    match fetch_timeline_window(backend, session_id, false).await {
+        Ok(page) => match validate_timeline_window(session_id, &page) {
+            Ok(()) => Ok(page),
+            Err(error) if error.code == "agent_timeline_page_incomplete" => {
+                let page = fetch_timeline_window(backend, session_id, true).await?;
+                validate_timeline_window(session_id, &page)?;
+                Ok(page)
+            }
+            Err(error) => Err(error),
+        },
+        Err(error) => Err(error),
+    }
+}
+
+/// Fetches a window that cannot skip stored rows.
+///
+/// The twin of [`load_timeline_window`] for the session that just reported a
+/// banded page: a window assembled from a live turn can cut that turn's middle
+/// and declares the range it skipped through `omitted`. Asking again without a
+/// turn band reads the same span row by row, so the answer is contiguous by
+/// construction and a client that refuses the banded page still opens the
+/// conversation.
+pub async fn load_timeline_contiguous_window(
+    backend: &dyn AgentBackend,
+    session_id: &VibexSessionId,
+) -> BackendResult<TimelinePage> {
+    let page = fetch_timeline_window(backend, session_id, true).await?;
+    validate_timeline_window(session_id, &page)?;
+    Ok(page)
+}
+
+async fn fetch_timeline_window(
+    backend: &dyn AgentBackend,
+    session_id: &VibexSessionId,
+    contiguous: bool,
+) -> BackendResult<TimelinePage> {
+    backend
         .fetch_timeline(FetchTimelineRequest {
             session_id: session_id.clone(),
             after_sequence: None,
             before_sequence: None,
             limit: AGENT_TIMELINE_PAGE_LIMIT,
-            max_turns: Some(AGENT_TIMELINE_TURN_LIMIT),
+            // A banded window is what opens a running session onto its history
+            // in one round trip; dropping the turn band is what makes the same
+            // span contiguous for a caller that refused the banded answer.
+            max_turns: (!contiguous).then_some(AGENT_TIMELINE_TURN_LIMIT),
             max_bytes: Some(AGENT_TIMELINE_PAGE_BYTES),
         })
-        .await?;
-    validate_timeline_window(session_id, &page)?;
-    Ok(page)
+        .await
 }
 
 /// Fetches only what arrived above a restored prefix.
@@ -2291,6 +2339,11 @@ mod tests {
         /// Models a backend built before the `before` cursor existed: it drops
         /// the unknown field and answers with the newest page.
         ignores_before_cursor: bool,
+        /// Models the banded read of a session whose newest turn is still being
+        /// written: a turn-banded window that cut the live turn declares the
+        /// range it skipped, while a read without a turn band pages the same
+        /// span contiguously.
+        omits_live_turn_middle: bool,
     }
 
     impl MockAgentBackend {
@@ -2301,11 +2354,17 @@ mod tests {
                 permission_resolution: Arc::new(Mutex::new(None)),
                 elicitation_resolution: Arc::new(Mutex::new(None)),
                 ignores_before_cursor: false,
+                omits_live_turn_middle: false,
             }
         }
 
         fn ignoring_before_cursor(mut self) -> Self {
             self.ignores_before_cursor = true;
+            self
+        }
+
+        fn omitting_live_turn_middle(mut self) -> Self {
+            self.omits_live_turn_middle = true;
             self
         }
     }
@@ -2358,6 +2417,7 @@ mod tests {
         fn fetch_timeline(&self, request: FetchTimelineRequest) -> BackendFuture<'_, TimelinePage> {
             let timeline = self.timeline.clone();
             let ignores_before_cursor = self.ignores_before_cursor;
+            let omits_live_turn_middle = self.omits_live_turn_middle;
             Box::pin(async move {
                 let limit = request.limit as usize;
                 let items = timeline
@@ -2386,22 +2446,38 @@ mod tests {
                     });
                 }
                 let after = request.after_sequence.unwrap_or_default();
-                let page = items
+                let mut page = items
                     .iter()
                     .filter(|item| item.sequence > after)
                     .take(limit)
                     .cloned()
                     .collect::<Vec<_>>();
                 let total_after = items.iter().filter(|item| item.sequence > after).count();
+                // A turn-banded read of a session that is still writing its
+                // newest turn hands over the newest rows and drops the middle
+                // of that turn, which is exactly the page a client must refuse.
+                // A read without a turn band carries the same span whole.
+                let omitted = (omits_live_turn_middle
+                    && after == 0
+                    && request.max_turns.is_some()
+                    && page.len() > 2)
+                    .then(|| {
+                        let dropped = page.remove(1);
+                        vibex_core::TimelineSequenceGap {
+                            after: dropped.sequence.saturating_sub(1),
+                            before: dropped.sequence.saturating_add(1),
+                        }
+                    })
+                    .filter(|gap| !gap.is_empty());
                 Ok(TimelinePage {
                     session_id: request.session_id,
                     start_sequence: page.first().map(|item| item.sequence),
                     end_sequence: page.last().map(|item| item.sequence),
-                    has_older: false,
+                    has_older: omitted.is_some(),
                     has_newer: total_after > page.len(),
                     starts_at_turn_start: true,
                     leading_turn_start: None,
-                    omitted: None,
+                    omitted,
                     items: page,
                 })
             })
@@ -2703,6 +2779,50 @@ mod tests {
             snapshot.timeline.len() < beyond_resume as usize,
             "the resume was abandoned rather than walked to the end"
         );
+    }
+
+    /// A banded window that cut the live turn is re-read without a turn band.
+    ///
+    /// Opening a running session reads a turn-banded window, and that window can
+    /// declare a hole in the middle of the turn being written. The controller
+    /// used to install nothing in that case, so the conversation opened onto an
+    /// empty timeline — the reported phone bug, where the desktop had the
+    /// conversation and the phone said there were no messages. The retry asks
+    /// for the same span without a turn band, which cannot skip stored rows.
+    #[tokio::test]
+    async fn a_banded_window_that_skipped_rows_is_read_again_contiguously() {
+        let session = session();
+        let mut items = sequenced_items(&session.id, 1..=6);
+        // A user message starts the turn, so the projection reads the page as a
+        // conversation rather than as unattached activity.
+        items[2].payload = TimelinePayload::UserMessage(UserMessagePayload {
+            text: "keep going".into(),
+            attachments: Vec::new(),
+            ..Default::default()
+        });
+        items[2].kind = items[2].payload.kind();
+        let backend = Arc::new(
+            MockAgentBackend::new(session.clone(), items.clone()).omitting_live_turn_middle(),
+        );
+        let mut controller = AgentWorkflowController::new(backend, capabilities());
+
+        let ticket = controller.begin_session_load(session.id.clone()).unwrap();
+        let snapshot = controller.load_session(ticket.clone()).await.unwrap();
+        assert!(controller.apply_session_snapshot(&ticket, Ok(snapshot)));
+
+        // The banded answer dropped a row and the retry carried the span whole:
+        // every stored row is on screen, in order.
+        assert_eq!(
+            controller
+                .state
+                .timeline
+                .items
+                .iter()
+                .map(|item| item.sequence)
+                .collect::<Vec<_>>(),
+            items.iter().map(|item| item.sequence).collect::<Vec<_>>(),
+        );
+        assert!(controller.state.timeline.session_id.is_some());
     }
 
     #[tokio::test]
