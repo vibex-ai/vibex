@@ -121,6 +121,22 @@ const PAGE_ENTRANCE_MS: u64 = 200;
 const TIMELINE_OLDER_PREFETCH_SCREENS: f32 = 1.5;
 const TIMELINE_LIST_OVERDRAW_PX: f32 = 800.0;
 const TIMELINE_TURN_ESTIMATED_HEIGHT_PX: f32 = 180.0;
+/// How close to the rendered end counts as the reader being back at the live
+/// edge.
+///
+/// The list's own resume test is one pixel, and matching it keeps a drag that
+/// ends on the end following while one that ends a hair above it stays the
+/// reader's.
+const TIMELINE_TAIL_SLACK_PX: f32 = 1.0;
+/// How many frames a held reading position is re-asserted after the item table
+/// or a measured height changed under the reader.
+///
+/// `ListState` resolves an offset only while it lays the table out, so a height
+/// that changed after this frame's layout first means something to the next
+/// one: the first pass puts the anchor back, the second sees the new extents
+/// and can clamp an offset the turn no longer holds, and the third is the
+/// settle. More passes than that would start fighting the reader's own gesture.
+const TIMELINE_ANCHOR_HOLD_FRAMES: u8 = 3;
 const TIMELINE_ACTION_BUTTON_SIZE_PX: f32 = 32.0;
 const TIMELINE_EVENT_BATCH_LIMIT: usize = 256;
 const TIMELINE_EVENT_COALESCE_DELAY: Duration = Duration::from_millis(16);
@@ -287,6 +303,11 @@ fn install_timeline_scroll_handler(state: &ListState, owner: WeakEntity<MobileAp
         };
         let _ = owner.update(cx, |app, cx| {
             app.timeline_viewport = Some(viewport);
+            // The gesture itself is the reader's decision about the follow. A
+            // hold left over from the last rebuild would re-state its anchor on
+            // the next frame and undo the scroll that just happened, so the
+            // hold ends where the reader's own gesture begins.
+            app.timeline_anchor_hold = None;
             app.prefetch_older_history_if_near_top(cx);
         });
     });
@@ -346,6 +367,25 @@ struct TimelineScrollAnchor {
     offset_in_item: i32,
 }
 
+/// A reading position the view keeps putting back for a few frames.
+///
+/// Rebuilding the turns and re-measuring a row both change the table the list
+/// lays out, and the list resolves an offset against that table as it lays it
+/// out. One `scroll_to` is therefore a vote cast before the count is known: the
+/// layout that follows can clamp the offset to a turn that no longer measures
+/// what it did, put the reader on a different turn's boundary, and — because
+/// the list's own "back at the bottom" test counts unmeasured turns at the
+/// 180px hint rather than at what they really are — resume following the live
+/// end from a position that was never the end. Holding the same turn and offset
+/// across the frames that settle the table is what makes the position stick.
+#[derive(Clone, Debug)]
+struct TimelineAnchorHold {
+    /// The turn and offset to keep under the viewport top.
+    anchor: TimelineScrollAnchor,
+    /// The frames still allowed to re-assert it.
+    frames_left: u8,
+}
+
 /// The sequences one turn covers, as the desktop model defines a span.
 ///
 /// Derived from the rows the turn already renders: the anchor needs the same
@@ -371,6 +411,18 @@ fn timeline_turn_anchor_span(turn: &TimelineConversationTurn) -> Option<Timeline
         });
     }
     span
+}
+
+/// The answer a turn has to show, when it has one.
+///
+/// Desktop parity: `timeline_turn_conclusion_row`. A projected conclusion with
+/// no body is not an answer yet — a turn that has started streaming its final
+/// message but not its text renders nothing there — so both the fold decision
+/// and the turn's own layout read the same row here.
+fn timeline_turn_conclusion_row(turn: &TimelineConversationTurn) -> Option<&TimelineRow> {
+    turn.conclusion_row
+        .as_ref()
+        .filter(|row| !row.body.trim().is_empty())
 }
 
 /// The row an anchor names in the table that is current now.
@@ -406,6 +458,40 @@ fn timeline_anchor_row_index(
 /// costs a page that the reader was about to want anyway.
 fn timeline_viewport_is_near_top(first_visible: usize, visible: usize) -> bool {
     visible > 0 && first_visible as f32 <= visible as f32 * TIMELINE_OLDER_PREFETCH_SCREENS
+}
+
+/// Whether the reader is looking at the true end of the conversation.
+///
+/// This cannot be answered from the list's own extent. `ListState` measures the
+/// rows it has laid out and carries every row it has not reached at the 180px
+/// hint, while a real turn is 900–2600px: for a reader parked above a handful
+/// of unmeasured turns the hinted total is far shorter than what is really
+/// there, and "the viewport plus the offset reaches the total" says they are at
+/// the bottom when they are screens away from it. That is the test the list
+/// itself re-follows on.
+///
+/// So the answer is taken from measured geometry instead: the last turn's
+/// measured bottom has to be on screen. That one comparison covers both ends of
+/// the question — a turn measured below the viewport has a bottom past it, so a
+/// reader parked earlier in the conversation never passes — and an unmeasured
+/// turn has no bounds at all, which is the right answer there: the reader
+/// cannot be at the end of a turn the list has never seen.
+fn timeline_is_at_rendered_end(list: &ListState) -> bool {
+    let count = list.item_count();
+    if count == 0 {
+        return false;
+    }
+    if list.logical_scroll_top().item_ix >= count {
+        // Parked past the last item, which is the state `scroll_to_end` leaves
+        // behind and the one a following list is laid out from.
+        return true;
+    }
+    let viewport = list.viewport_bounds();
+    if viewport.size.height <= px(0.) {
+        return false;
+    }
+    list.bounds_for_item(count - 1)
+        .is_some_and(|last| last.bottom() <= viewport.bottom() + px(TIMELINE_TAIL_SLACK_PX))
 }
 
 fn should_present_agent_notification(
@@ -1753,6 +1839,28 @@ pub struct MobileApp {
     timeline_display_settings_overrides: BTreeMap<String, MobileTimelineDisplaySettingsOverride>,
     timeline_display_settings_sync_busy: bool,
     timeline_list: ListState,
+    /// The reading position a rebuild has to put back, and how many frames are
+    /// left to keep putting it back.
+    ///
+    /// One restore is not enough. The list resolves an offset against the table
+    /// it lays out, and both the table and its measured heights change after
+    /// the frame that asked: a turn that finishes folds its process away, which
+    /// can only be seen once the shorter turn has been measured. Re-stating the
+    /// same turn and offset on the frames that follow is what keeps the reader
+    /// on it while that settles, instead of the next layout dropping them at a
+    /// turn boundary the summary put them on.
+    timeline_anchor_hold: Option<TimelineAnchorHold>,
+    /// Whether a turn the reader is reading owns the screen.
+    ///
+    /// The list's own follow flag is not enough to decide this. Its "back at
+    /// the bottom" test adds the height summary to the viewport, and that
+    /// summary weighs every turn it has not measured at the 180px hint while a
+    /// real turn is many times that. A reader who scrolled up one screen inside
+    /// the live turn is therefore "at the bottom" again on the next layout, and
+    /// the list re-follows and drops them at the end. This flag is the view's
+    /// own answer, kept until the reader is demonstrably at the rendered end
+    /// again or sends a message of their own.
+    timeline_reader_holds_screen: bool,
     /// The window read from disk, drawn until the controller's projection has
     /// a session to draw instead.
     ///
@@ -4032,6 +4140,8 @@ impl MobileApp {
                 install_timeline_scroll_handler(&state, cx.weak_entity());
                 state
             },
+            timeline_anchor_hold: None,
+            timeline_reader_holds_screen: false,
             timeline_cache_timeline: None,
             timeline_viewport: None,
             timeline_detail_ready: BTreeSet::new(),
@@ -5598,6 +5708,11 @@ impl MobileApp {
             self.rebuild_timeline_turns();
             let turn_count = self.timeline_turns.len();
             if turn_count > 0 {
+                // Only the last turn is new; re-measuring it is what lets the
+                // rest of the table keep every height it already has. The
+                // rebuild above has already paused the follow and taken the
+                // reader's position, so this measurement cannot carry them to
+                // the end with it.
                 self.timeline_list
                     .remeasure_items(turn_count - 1..turn_count);
             }
@@ -8030,6 +8145,7 @@ impl MobileApp {
                             this.pending_user_message = None;
                             this.timeline_turns = Arc::new(Vec::new());
                             this.timeline_list.reset(0);
+                            this.forget_timeline_hold();
                             let previous_session_id = pending.previous_session_id.clone();
                             this.restore_new_session_page(pending, cx);
                             if let Some(previous_session_id) = previous_session_id {
@@ -8151,6 +8267,7 @@ impl MobileApp {
                             this.attachment_preview = None;
                             this.attachment_preview_loading = None;
                             this.timeline_list.reset(0);
+                            this.forget_timeline_hold();
                         }
                         this.session_action = None;
                         this.hint(
@@ -8360,7 +8477,10 @@ impl MobileApp {
         self.timeline_cache_timeline = None;
         self.timeline_metadata_tip = None;
         self.rebuild_timeline_turns();
-        self.timeline_list.set_follow_mode(FollowMode::Tail);
+        // A new session opens on its own first turn. There is no earlier
+        // conversation for the reader to have been reading, so the old screen's
+        // hold is not carried into this one.
+        self.resume_timeline_follow();
         cx.notify();
     }
 
@@ -8656,7 +8776,10 @@ impl MobileApp {
             None
         };
         self.reset_drawers();
-        self.timeline_list.set_follow_mode(FollowMode::Tail);
+        // Opening a session is a jump to that conversation's live end, so no
+        // reading position of the last screen survives it. Both the follow and
+        // the hold belong to the conversation that is leaving.
+        self.resume_timeline_follow();
         self.token_usage = None;
         // A terminal-mode session's conversation lives in its PTY, so opening
         // it is what attaches the rail to that terminal. The snapshot already
@@ -8697,8 +8820,11 @@ impl MobileApp {
         if restored_from_cache {
             self.timeline_cache_timeline = None;
             self.rebuild_timeline_turns();
-            self.timeline_list.scroll_to_end();
+            self.settle_timeline_on_live_end();
         } else {
+            // The follow was set to the tail above, and the reset below drops
+            // the old table's offset with it: opening a session is a jump to
+            // that conversation's live end, the way the desktop opens one.
             self.timeline_cache_timeline = None;
             self.timeline_turns = Arc::new(Vec::new());
             self.timeline_list.reset(0);
@@ -8717,7 +8843,7 @@ impl MobileApp {
             .is_some_and(|pending| pending.session_id == session_id)
         {
             self.rebuild_timeline_turns();
-            self.timeline_list.scroll_to_end();
+            self.settle_timeline_on_live_end();
         }
         if let Some(workspace_id) = restored_workspace_id {
             self.ensure_workbench(workspace_id, cx);
@@ -8734,7 +8860,7 @@ impl MobileApp {
                     // cached window is only ever a stand-in for it.
                     this.timeline_cache_timeline = None;
                     this.rebuild_timeline_turns();
-                    this.timeline_list.scroll_to_end();
+                    this.settle_timeline_on_live_end();
                     this.timeline_viewport = None;
                     this.persist_active_session_timeline();
                     let workspace_id = this
@@ -8860,7 +8986,7 @@ impl MobileApp {
             ..Default::default()
         });
         self.rebuild_timeline_turns();
-        self.timeline_list.scroll_to_end();
+        self.settle_timeline_on_live_end();
     }
 
     /// Turns the stored composer record back into the three maps the composer
@@ -11855,6 +11981,7 @@ impl MobileApp {
         self.attachment_preview = None;
         self.attachment_preview_loading = None;
         self.timeline_list.reset(0);
+        self.forget_timeline_hold();
         self.clear_overlay();
         self.desktop_timeline_display_settings = AgentTimelineDisplaySettings::default();
         self.timeline_display_settings_sync_busy = false;
@@ -12744,7 +12871,7 @@ impl MobileApp {
         self.mark_composer_state_dirty(cx);
         self.operation_busy = true;
         self.rebuild_timeline_turns();
-        self.timeline_list.set_follow_mode(FollowMode::Tail);
+        self.resume_timeline_follow();
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
             (backend.replace_user_message(request).await, session_id)
         });
@@ -13202,7 +13329,7 @@ impl MobileApp {
         // authority would refuse.
         self.turn_submissions_in_flight += 1;
         self.rebuild_timeline_turns();
-        self.timeline_list.set_follow_mode(FollowMode::Tail);
+        self.resume_timeline_follow();
         let runner = gpui_tokio::Tokio::spawn(cx, future);
         let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             let outcome = flatten_join(runner.await);
@@ -13754,11 +13881,18 @@ impl MobileApp {
         }
     }
 
+    /// Whether a turn's process activity is on screen.
+    ///
+    /// Desktop parity: `timeline_turn_process_expanded` folds the steps away
+    /// once the turn has an answer to show, and keeps them while it is still
+    /// working — or when it was superseded, where the work it already did is
+    /// the only record of what the queued message replaced. The answer is the
+    /// conclusion row *with a body*: a projected empty one is not something to
+    /// fold the steps for.
     fn timeline_process_expanded(&self, turn: &TimelineConversationTurn) -> bool {
-        self.expanded_process
-            .get(&turn.id)
-            .copied()
-            .unwrap_or(!turn.complete || turn.superseded)
+        self.expanded_process.get(&turn.id).copied().unwrap_or(
+            timeline_turn_conclusion_row(turn).is_none() && (!turn.complete || turn.superseded),
+        )
     }
 
     fn effective_timeline_display_settings(&self) -> AgentTimelineDisplaySettings {
@@ -13948,7 +14082,13 @@ impl MobileApp {
     }
 
     fn toggle_process(&mut self, id: String, expanded: bool, cx: &mut Context<Self>) {
+        // Opening or folding a turn's steps is the reader taking charge of the
+        // screen, the way a scroll is. Desktop parity:
+        // `prepare_timeline_disclosure` holds the follow for a finished turn,
+        // so the row's new height cannot drag the screen down and lift it out
+        // of view.
         self.expanded_process.insert(id, !expanded);
+        self.hold_timeline_position_for_gesture();
         // Expanded process rows change a turn's measured height. Re-measure the
         // virtual list immediately so the following turns keep their anchors.
         self.remeasure_timeline();
@@ -13973,6 +14113,11 @@ impl MobileApp {
         if expanded {
             self.ensure_timeline_row_detail(&id, cx);
         }
+        // A row's new height is the reader's change, not the live end's. The
+        // hold keeps the row where they tapped it while the list measures the
+        // body that just opened. Desktop parity:
+        // `hold_timeline_for_disclosure`.
+        self.hold_timeline_position_for_gesture();
         self.remeasure_timeline();
         cx.notify();
     }
@@ -14100,6 +14245,202 @@ impl MobileApp {
         self.timeline_list.remeasure_items(0..count);
     }
 
+    /// Takes the screen away from the live end and remembers where the reader
+    /// was, for every frame the change needs to settle.
+    ///
+    /// The list decides two things from heights that are not known yet when the
+    /// turns change. It re-measures the rows it lays out, and each of those
+    /// measurements can move the extent the next layout resolves offsets
+    /// against. And it re-follows the tail whenever the viewport plus the
+    /// offset reaches the summary height — a summary that counts every turn the
+    /// list has not measured at the 180px hint while a real turn is 900–2600px.
+    /// A reader one screen up inside the live turn therefore satisfies the test
+    /// on the next layout and is carried to the end, and a turn that completes
+    /// and folds its process away (2600px to 900px is one turn's process
+    /// disappearing) shortens the table under them by the same trick.
+    ///
+    /// Pausing is half the answer: `scroll_to` stops following too, but the
+    /// layout that follows can re-enter it before the anchor has been applied.
+    /// The hold re-states the same turn and offset on the frames after this
+    /// one, so the position survives every re-measure in between.
+    fn hold_timeline_position(&mut self) -> Option<TimelineScrollAnchor> {
+        // A reader who is following the live end is watching the turn arrive,
+        // and that is where a rebuild should leave them. The hold exists for
+        // the reader who scrolled away from it.
+        if self.timeline_list.is_following_tail() {
+            return None;
+        }
+        // Nothing to hold: the reader is at the end the list has measured, so
+        // the follow is theirs and resuming it costs nothing. Saying so here
+        // rather than leaving the list paused matters, because a paused tail is
+        // only resumed by a layout that finds the bottom, and a table carried on
+        // hints may never satisfy that test.
+        if self.timeline_list_following_rendered_end() {
+            self.forget_timeline_hold();
+            self.timeline_list.set_follow_mode(FollowMode::Tail);
+            return None;
+        }
+        self.capture_timeline_hold()
+    }
+
+    /// The same, for a change the reader just asked for.
+    ///
+    /// A tap away from the live end is an instruction about that row, so the
+    /// screen is held where it is while the row measures. A tap at the live end
+    /// is the opposite: the reader is watching the turn arrive, and the follow
+    /// is what keeps the end of it in view as the row opens. Pausing is all that
+    /// one needs — the list picks the follow back up on the next layout, since
+    /// the reader's offset is the end. Desktop parity:
+    /// `hold_timeline_for_disclosure`.
+    fn hold_timeline_position_for_gesture(&mut self) {
+        if self.timeline_list.is_following_tail() {
+            self.timeline_list.pause_following_tail();
+            return;
+        }
+        self.capture_timeline_hold();
+    }
+
+    /// Remembers the reader's position and the frames left to re-state it.
+    ///
+    /// No position means there is nothing to hold, and the list keeps whatever
+    /// follow it had: claiming the screen without an anchor to put back would
+    /// leave the follow off for a reading position nobody is on.
+    fn capture_timeline_hold(&mut self) -> Option<TimelineScrollAnchor> {
+        let anchor = self.timeline_scroll_anchor()?;
+        // Pausing is not enough on its own. `pause_following_tail` leaves the
+        // list in `Tail { is_following: false }`, and the very next layout
+        // re-enters the follow whenever the viewport plus the offset reaches
+        // the summary height — the summary that carries unmeasured turns at
+        // the hint. `Normal` is the state in which layout resolves the anchor
+        // instead of the tail, so that test cannot override the reader's place
+        // before the re-asserted offset has even been applied.
+        self.timeline_list.set_follow_mode(FollowMode::Normal);
+        self.timeline_reader_holds_screen = true;
+        self.timeline_anchor_hold = Some(TimelineAnchorHold {
+            anchor: anchor.clone(),
+            frames_left: TIMELINE_ANCHOR_HOLD_FRAMES,
+        });
+        Some(anchor)
+    }
+
+    /// Whether the list is at the end of the conversation it has actually
+    /// measured, which is the only end a reader can see.
+    fn timeline_list_following_rendered_end(&self) -> bool {
+        timeline_is_at_rendered_end(&self.timeline_list)
+    }
+
+    /// Puts the held position back, one frame at a time.
+    ///
+    /// Called from the render pass: the list lays its items out while the view
+    /// builds its element tree, so an offset set here is resolved by the very
+    /// layout that is about to run, against the table that layout has already
+    /// built. That is the difference between this and the restore inside a
+    /// rebuild, which votes before anything has been measured.
+    fn reassert_held_timeline_anchor(&mut self) {
+        let Some(hold) = self.timeline_anchor_hold.clone() else {
+            // Nothing is being re-stated, so a follow a gesture paused is the
+            // reader's to get back by reaching the end.
+            self.release_timeline_hold_at_end();
+            return;
+        };
+        if !self.timeline_reader_holds_screen {
+            self.timeline_anchor_hold = None;
+            return;
+        }
+        if hold.frames_left < TIMELINE_ANCHOR_HOLD_FRAMES {
+            // Only once the frame after the change has been laid out does the
+            // geometry on screen describe the new table. Asking on the frame
+            // the change was taken on would answer about the one it replaced —
+            // a reader who tapped a row at the bottom was "at the end" until
+            // the row opened — and hand the follow straight back.
+            self.release_timeline_hold_at_end();
+            if self.timeline_anchor_hold.is_none() {
+                return;
+            }
+        }
+        if hold.frames_left == 0 {
+            // The table has settled. The reader still owns the screen — that
+            // stays true until they return to the end themselves — but there
+            // is nothing left to re-state.
+            self.timeline_anchor_hold = None;
+            return;
+        }
+        // `Normal` rather than a paused tail: the paused tail is re-entered by
+        // the next layout as soon as the hinted summary says the viewport is
+        // at the bottom, which is exactly the bug this hold exists for.
+        self.timeline_list.set_follow_mode(FollowMode::Normal);
+        if self
+            .restore_timeline_scroll_anchor(Some(hold.anchor.clone()))
+            .is_some()
+        {
+            self.timeline_anchor_hold = Some(TimelineAnchorHold {
+                anchor: hold.anchor,
+                frames_left: hold.frames_left - 1,
+            });
+        } else {
+            // The turn is not in this window at all. Nothing is scrolled — the
+            // list keeps the offset it holds — and holding a turn the table
+            // cannot name would only keep the follow off for a position nobody
+            // is on.
+            self.timeline_anchor_hold = None;
+        }
+    }
+
+    /// Hands the follow back once the reader is demonstrably at the end.
+    ///
+    /// The hold exists to keep a rebuild from re-entering the follow from a
+    /// hinted bottom. The reader can still reach the real end themselves, and
+    /// that gesture is the one thing that should turn following back on —
+    /// otherwise the next turn to arrive would stream in below the viewport
+    /// with nobody watching it.
+    fn release_timeline_hold_at_end(&mut self) {
+        if !self.timeline_reader_holds_screen {
+            return;
+        }
+        if !self.timeline_list_following_rendered_end() {
+            return;
+        }
+        self.timeline_reader_holds_screen = false;
+        self.timeline_anchor_hold = None;
+        self.timeline_list.set_follow_mode(FollowMode::Tail);
+    }
+
+    /// Forgets a held position, for when the screen itself is going away.
+    ///
+    /// A closed session, a deleted one, and a fresh window all replace the
+    /// conversation rather than move inside it. Keeping the hold across that
+    /// would re-assert a turn of the previous conversation against the next
+    /// one's table, which is the very jump the hold exists to prevent.
+    fn forget_timeline_hold(&mut self) {
+        self.timeline_anchor_hold = None;
+        self.timeline_reader_holds_screen = false;
+    }
+
+    /// Puts the timeline back on the live end, at the reader's request.
+    ///
+    /// Sending a prompt, editing one, opening a session, and starting a new one
+    /// are all the reader asking to watch what happens next. A hold left over
+    /// from the screen before would re-state the old turn on the frames that
+    /// follow and pull them back off the turn they just started, so the hold
+    /// goes with the follow it replaces.
+    fn resume_timeline_follow(&mut self) {
+        self.forget_timeline_hold();
+        self.timeline_list.set_follow_mode(FollowMode::Tail);
+    }
+
+    /// Puts the conversation that has just been shown on its live end.
+    ///
+    /// Opening a session lands on its end, and the follow is what keeps it
+    /// there while the read that answers paints the window. A reader who has
+    /// taken the screen in the meantime is left where they are: the rebuild
+    /// already put them back on their turn, and jumping would undo it.
+    fn settle_timeline_on_live_end(&mut self) {
+        if self.timeline_reader_holds_screen {
+            return;
+        }
+        self.resume_timeline_follow();
+    }
+
     /// Whether the reader is close enough to the top to want history above it.
     fn timeline_is_near_top(&self) -> bool {
         self.timeline_viewport.is_some_and(|viewport| {
@@ -14202,7 +14543,13 @@ impl MobileApp {
     /// nothing to it.
     fn prepend_timeline_turns(&mut self) {
         let previous_count = self.timeline_turns.len();
-        let anchor = self.timeline_scroll_anchor();
+        // A page lands above the reader, which moves every row's offset in the
+        // table. The splice keeps the measured heights, but the offset that
+        // describes where the reader is has to be translated — and the layout
+        // that follows is the one that decides how tall the prepended rows
+        // really are, so the position is held rather than voted once.
+        let held = self.hold_timeline_position();
+        let anchor = held.or_else(|| self.timeline_scroll_anchor());
         let turns = self.build_timeline_turns();
         let turn_count = turns.len();
         let added = turn_count.saturating_sub(previous_count);
@@ -14334,7 +14681,16 @@ impl MobileApp {
         // now, and re-applied against the one this rebuild installs: the reader
         // is on a turn of the outgoing projection, which is the only table the
         // list's current logical offset describes.
-        let anchor = self.timeline_scroll_anchor();
+        //
+        // The hold is what makes that anchor stick past the first layout. A
+        // rebuild routinely makes a turn taller or shorter — a turn that
+        // completes folds its process away, an authoritative refetch replaces
+        // the whole window — and the list resolves the offset against heights
+        // it is still measuring. Pausing the follow here and re-stating the
+        // anchor over the next frames is what keeps the reader on their turn
+        // instead of at the boundary the hinted summary put them on.
+        let held = self.hold_timeline_position();
+        let anchor = held.or_else(|| self.timeline_scroll_anchor());
         let turns = self.build_timeline_turns();
         self.timeline_turns = Arc::new(turns);
         let turn_count = self.timeline_turns.len();
@@ -21020,10 +21376,7 @@ impl MobileApp {
     ) -> impl IntoElement {
         let expanded = self.timeline_process_expanded(turn);
         let display_settings = self.effective_timeline_display_settings();
-        let conclusion_row = turn
-            .conclusion_row
-            .as_ref()
-            .filter(|row| !row.body.trim().is_empty());
+        let conclusion_row = timeline_turn_conclusion_row(turn);
         div()
             .id(format!("timeline-turn:{}", turn.id))
             .w_full()
@@ -28413,9 +28766,19 @@ impl Render for MobileApp {
         // moment it is not.
         self.runtime_agent_strip_frame.set(None);
         if let Some(turn_id) = self.timeline_find_scroll_pending.take() {
+            // A search jump or a history recall names a turn outright. It is a
+            // deliberate place to land, so a hold left from the last rebuild
+            // must not pull the reader back off it on the frames that follow.
+            self.forget_timeline_hold();
+            self.timeline_list.pause_following_tail();
             self.remeasure_timeline();
             self.scroll_to_timeline_turn(&turn_id, cx);
         }
+        // This runs before the list lays its table out, so the offset set here
+        // is the one that layout resolves — against the measured rows, not the
+        // hinted extents the rebuild that moved them started from. See
+        // [`Self::hold_timeline_position`].
+        self.reassert_held_timeline_anchor();
         for hint in std::mem::take(&mut self.pending_hints) {
             let on_action: Option<toast::HintHandler> = hint.action.as_ref().map(|action| {
                 let entity = cx.weak_entity();

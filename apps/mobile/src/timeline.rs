@@ -29,8 +29,9 @@ impl MobileApp {
         // The reader's own tap on a row is them taking charge of the screen, the
         // way a scroll is. Leaving the list following the live end would drag it
         // back down as the row's height changes, lifting the row they just
-        // opened out of view — the same rule the scroll handler applies.
-        self.timeline_list.pause_following_tail();
+        // opened out of view — the same rule the scroll handler applies. The
+        // hold keeps the row under their finger while the list measures the
+        // body that just opened.
         if expanded {
             self.collapsed_timeline_rows.remove(&id);
             self.expanded_timeline_rows.insert(id.clone());
@@ -41,6 +42,7 @@ impl MobileApp {
             self.expanded_timeline_rows.remove(&id);
             self.collapsed_timeline_rows.insert(id);
         }
+        self.hold_timeline_position_for_gesture();
         self.remeasure_timeline();
         cx.notify();
     }
@@ -240,6 +242,14 @@ impl MobileApp {
                                     )
                                 })
                                 .on_click(cx.listener(move |this, _, _, cx| {
+                                    // The full thought is taller than its
+                                    // window, and swapping one for the other is
+                                    // the reader's own instruction about this
+                                    // row. Hold the screen for the height that
+                                    // changes, or the list re-follows from its
+                                    // hinted bottom and the opening rows leave
+                                    // the viewport.
+                                    this.hold_timeline_position_for_gesture();
                                     if windowed {
                                         this.full_reasoning_rows.insert(full_id.clone());
                                     } else {

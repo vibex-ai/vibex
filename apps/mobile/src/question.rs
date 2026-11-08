@@ -529,6 +529,11 @@ impl MobileApp {
         if !self.expanded_settled_questions.insert(id.clone()) {
             self.expanded_settled_questions.remove(&id);
         }
+        // What the record unfolds is the reader's own change to the turn's
+        // height. Hold the screen for it the way an opening row is held, or the
+        // list re-follows from its hinted bottom and the answers they just
+        // opened leave the viewport.
+        self.hold_timeline_position_for_gesture();
         self.remeasure_timeline();
         cx.notify();
     }

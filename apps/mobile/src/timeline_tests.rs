@@ -1486,6 +1486,11 @@ fn opening_a_row_stops_the_list_following_the_live_end(cx: &mut TestAppContext) 
     draw(cx);
     let follow = app.read_with(cx, |app, _| app.timeline_list.is_following_tail());
     assert!(!follow, "opening a row hands the screen to the reader");
+    draw(cx);
+    assert!(
+        !app.read_with(cx, |app, _| app.timeline_list.is_following_tail()),
+        "and a second frame does not hand it back"
+    );
     let after = cx
         .debug_bounds(header.clone().leak())
         .expect("the row's header is still on screen")
@@ -1494,4 +1499,213 @@ fn opening_a_row_stops_the_list_following_the_live_end(cx: &mut TestAppContext) 
         (f32::from(after) - f32::from(before)).abs() <= 2.0,
         "and the row stays where the reader found it: {before:?} then {after:?}"
     );
+}
+
+/// A held position is re-stated for the frames a rebuild needs, and the
+/// follow comes back only when the reader is at the end again.
+///
+/// The list's own resume test runs during layout and measures against the hint
+/// sum, so it can re-enter the follow before the anchor this view restored has
+/// been applied. The hold is what survives that: the same turn and offset are
+/// put back on the next frames, and the follow is handed back only when the
+/// measured table says the reader is at the end.
+#[gpui::test]
+fn a_held_position_survives_the_frames_a_rebuild_takes(cx: &mut TestAppContext) {
+    let data_dir = tempfile::tempdir().unwrap();
+    let (app, _, cx) = open_timeline(
+        cx,
+        data_dir.path(),
+        vec![TimelinePayload::AgentMessage(
+            vibex_core::AgentMessagePayload {
+                // A turn taller than the phone, so an offset inside it is a
+                // reading position rather than the whole of its content.
+                text: "a paragraph the reader is partway through. ".repeat(80),
+                is_final: true,
+            },
+        )],
+    );
+    let turn_id = app.read_with(cx, |app, _| app.timeline_turns[0].id.clone());
+    app.update(cx, |app, cx| {
+        // The reader parks partway down the turn, which is the position a
+        // rebuild has to keep.
+        app.timeline_list.scroll_to(ListOffset {
+            item_ix: 0,
+            offset_in_item: px(120.0),
+        });
+        app.rebuild_timeline_turns();
+        assert!(
+            !app.timeline_list.is_following_tail(),
+            "a rebuild does not hand the reader back to the live end"
+        );
+        assert!(
+            app.timeline_reader_holds_screen,
+            "the view has taken the screen for the reader"
+        );
+        let hold = app.timeline_anchor_hold.clone().expect("a held anchor");
+        assert_eq!(hold.anchor.turn_id, turn_id);
+        assert_eq!(hold.anchor.offset_in_item, 120);
+        assert_eq!(hold.frames_left, TIMELINE_ANCHOR_HOLD_FRAMES);
+
+        // Each frame the view runs re-states it, and the count runs out rather
+        // than re-asserting for ever.
+        for left in (0..TIMELINE_ANCHOR_HOLD_FRAMES).rev() {
+            app.reassert_held_timeline_anchor();
+            let hold = app.timeline_anchor_hold.clone().expect("still held");
+            assert_eq!(hold.frames_left, left);
+            assert_eq!(
+                app.timeline_list.logical_scroll_top().offset_in_item,
+                px(120.0),
+                "the reader's offset is the one put back"
+            );
+        }
+        app.reassert_held_timeline_anchor();
+        assert!(app.timeline_anchor_hold.is_none(), "the table has settled");
+        assert!(
+            app.timeline_reader_holds_screen,
+            "the screen stays the reader's until they return to the end"
+        );
+
+        // A rebuild while the table is settled still does not resume the
+        // follow: nothing about the hinted bottom says the reader is at the
+        // end.
+        app.rebuild_timeline_turns();
+        assert!(!app.timeline_list.is_following_tail());
+        assert!(
+            !app.timeline_list_following_rendered_end(),
+            "and the measured geometry agrees with it"
+        );
+
+        // The reader's own scroll ends the hold before it reaches the list —
+        // the scroll handler drops it — and the first frame after that hands
+        // the follow back, because the rows now say they are at the end.
+        app.timeline_anchor_hold = None;
+        app.timeline_list.scroll_to_end();
+        app.reassert_held_timeline_anchor();
+        assert!(
+            app.timeline_list.is_following_tail(),
+            "the reader at the end is handed the follow again"
+        );
+        assert!(!app.timeline_reader_holds_screen);
+        cx.notify();
+    });
+    draw(cx);
+}
+
+/// An answer that has not streamed its text yet does not fold the steps.
+///
+/// Desktop parity: `timeline_turn_process_expanded`. The fold exists to make
+/// room for the answer, so it counts the conclusion row the reader can actually
+/// read. A final message that has arrived without its body is an empty row on
+/// screen, and folding for it would collapse the steps of a turn that is still
+/// running and leave the reader with nothing to watch.
+#[gpui::test]
+fn a_running_turn_does_not_fold_for_an_answer_with_no_text_yet(cx: &mut TestAppContext) {
+    let data_dir = tempfile::tempdir().unwrap();
+    let (app, _, cx) = open_timeline(
+        cx,
+        data_dir.path(),
+        vec![TimelinePayload::AgentMessage(
+            vibex_core::AgentMessagePayload {
+                text: "the answer".into(),
+                is_final: true,
+            },
+        )],
+    );
+    let (running, answered) = app.read_with(cx, |app, _| {
+        let turn = app.timeline_turns[0].clone();
+        assert!(turn.complete, "the final message completes the turn");
+        assert!(
+            !app.timeline_process_expanded(&turn),
+            "a finished turn with an answer folds its steps away"
+        );
+        // The same turn while it runs: the final message has a row, but no text
+        // has streamed into it.
+        let mut running = turn.clone();
+        running.complete = false;
+        if let Some(row) = running.conclusion_row.as_mut() {
+            row.body = "   ".into();
+        }
+        assert!(
+            app.timeline_process_expanded(&running),
+            "the steps stay on screen while the answer has nothing in it"
+        );
+        // The text arriving is what folds them.
+        if let Some(row) = running.conclusion_row.as_mut() {
+            row.body = "the answer".into();
+        }
+        assert!(
+            !app.timeline_process_expanded(&running),
+            "an answer with text is what the steps make room for"
+        );
+        (running, turn)
+    });
+    app.update(cx, |app, _| {
+        // An explicit choice still wins over the default, in both directions.
+        let id = answered.id.clone();
+        app.expanded_process.insert(id.clone(), true);
+        assert!(app.timeline_process_expanded(&answered));
+        app.expanded_process.insert(id, false);
+        assert!(!app.timeline_process_expanded(&running));
+    });
+    draw(cx);
+}
+
+/// Folding a turn's steps leaves the reader where they were reading.
+///
+/// This is the 2600px-to-900px change in the report: a turn that finishes folds
+/// its process away, and the table under the reader gets shorter by more than a
+/// screen. Re-measuring alone resolves that against the stale anchor, so the
+/// hold has to take the reader's position first and put it back while the rows
+/// settle.
+#[gpui::test]
+fn folding_the_steps_keeps_the_reader_where_they_were(cx: &mut TestAppContext) {
+    let data_dir = tempfile::tempdir().unwrap();
+    let (app, _, cx) = open_timeline(
+        cx,
+        data_dir.path(),
+        vec![read(
+            "src/a-long-file.rs",
+            ToolCallStatus::Completed,
+            &"first line\n  indented line\n".repeat(120),
+        )],
+    );
+    let turn_id = app.read_with(cx, |app, _| app.timeline_turns[0].id.clone());
+    app.update(cx, |app, cx| {
+        assert!(
+            app.timeline_process_expanded(&app.timeline_turns[0].clone()),
+            "a running turn shows its steps"
+        );
+        // The reader is partway down the turn the steps belong to.
+        app.timeline_list.scroll_to(ListOffset {
+            item_ix: 0,
+            offset_in_item: px(240.0),
+        });
+        app.toggle_process(turn_id.clone(), true, cx);
+        let hold = app
+            .timeline_anchor_hold
+            .clone()
+            .expect("folding holds the reader's place");
+        assert_eq!(hold.anchor.turn_id, turn_id);
+        assert_eq!(hold.anchor.offset_in_item, 240);
+        assert!(
+            app.timeline_reader_holds_screen,
+            "the tap hands the screen to the reader"
+        );
+
+        // The frames that follow put the same offset back rather than letting
+        // the shorter table resolve it into a turn boundary.
+        for _ in 0..TIMELINE_ANCHOR_HOLD_FRAMES {
+            app.reassert_held_timeline_anchor();
+            assert_eq!(
+                app.timeline_list.logical_scroll_top().offset_in_item,
+                px(240.0),
+                "the reader keeps the line they were on"
+            );
+        }
+        assert!(
+            !app.timeline_list.is_following_tail(),
+            "and the fold does not resume the follow behind their back"
+        );
+    });
+    draw(cx);
 }
