@@ -28,10 +28,17 @@ The tag-triggered GitHub Actions release uses standard GitHub-hosted runners and
 keeps one native job per desktop platform and architecture. Linux x86_64
 produces the reviewed PDFium backed `.deb` and AppImage; Linux aarch64 produces
 a `.deb` cross-built on the x86_64 runner; macOS produces `.dmg` images for
-aarch64 and x86_64; Windows produces NSIS installers for x86_64 and aarch64.
+aarch64 and x86_64 on the arm64 `macos-15` image; Windows produces NSIS
+installers for x86_64 and aarch64.
 Each job normalizes its filenames, writes SHA-256 sidecars, and uploads an
 immutable artifact. A final Ubuntu job collects the matrix before creating the
 GitHub Release, so a partial platform build can never be published.
+
+Every macOS job pins `macos-15`: GitHub retired all macOS 14 runner images on
+2026-11-02, and a workflow that still asks for one is rejected while the job is
+being provisioned with "The configuration 'macos-14-arm64-us-default' is not
+supported" before any step runs. Both macOS architectures stay on the arm64
+image; the x86_64 packages are cross-built there.
 
 AppImage packaging stays x86_64-only: the AppImage tooling (linuxdeploy) cannot
 process cross-architecture binaries, so an aarch64 AppImage would require a

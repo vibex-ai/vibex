@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -177,8 +177,8 @@ function validatePackaging() {
   const releaseMatrix = [
     ["linux", "x86_64", "ubuntu-24.04", "x86_64-unknown-linux-gnu"],
     ["linux", "aarch64", "ubuntu-24.04", "aarch64-unknown-linux-gnu"],
-    ["macos", "x86_64", "macos-14", "x86_64-apple-darwin"],
-    ["macos", "aarch64", "macos-14", "aarch64-apple-darwin"],
+    ["macos", "x86_64", "macos-15", "x86_64-apple-darwin"],
+    ["macos", "aarch64", "macos-15", "aarch64-apple-darwin"],
     ["windows", "x86_64", "windows-2022", "x86_64-pc-windows-msvc"],
     ["windows", "aarch64", "windows-2022", "aarch64-pc-windows-msvc"]
   ];
@@ -187,6 +187,18 @@ function validatePackaging() {
     assert(
       releaseWorkflow.includes(matrixEntry),
       `publish workflow is missing the ${platform}-${arch} release matrix entry`
+    );
+  }
+  // GitHub retired every macOS 14 runner image on 2026-11-02. A job that still
+  // asks for one dies during provisioning with "The configuration
+  // 'macos-14-arm64-us-default' is not supported" before a single step runs, so
+  // no workflow may name that label again.
+  for (const workflowPath of readdirSync(path(".github/workflows"))) {
+    if (!workflowPath.endsWith(".yml") && !workflowPath.endsWith(".yaml")) continue;
+    const workflow = workflowSource(`.github/workflows/${workflowPath}`);
+    assert(
+      !/^\s*(?:runs-on|runner):\s*macos-1[0-4]\S*\s*$/mu.test(workflow),
+      `.github/workflows/${workflowPath} requests a retired macOS runner image; macOS jobs must pin macos-15 or newer`
     );
   }
   assert(

@@ -29,7 +29,8 @@ env:
 jobs:
   ios-unsigned-ipa:
     name: Unsigned iOS IPA
-    runs-on: macos-14
+    # macOS 14 images no longer exist; macOS 15 ships the Xcode 16 SDK.
+    runs-on: macos-15
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
