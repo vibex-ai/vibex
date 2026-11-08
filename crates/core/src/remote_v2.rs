@@ -2649,7 +2649,7 @@ mod tests {
         let encoded = serde_json::json!({
             "serverId": "server-a",
             "serverIdentityPublicKey": "server-public-a",
-            "desktopVersion": "0.1.0-rc.9",
+            "desktopVersion": "0.1.0-rc.10",
             "protocolRange": { "min": { "major": 2, "minor": 0 }, "max": { "major": 2, "minor": 0 } },
             "selectedProtocol": { "major": 2, "minor": 0 },
             "serverEphemeralPublicKey": "ephemeral-a",

@@ -144,7 +144,7 @@
     {
       "id": "vibex-desktop-reviewed-icons",
       "name": "Vibex Desktop GPUI reviewed icon bundle",
-      "version": "0.1.0-rc.9",
+      "version": "0.1.0-rc.10",
       "ownerPackage": "vibex-desktop",
       "root": "apps/desktop/assets/icons",
       "extensions": [
@@ -221,7 +221,7 @@
     {
       "id": "vibex-desktop-application-icons",
       "name": "Vibex desktop application and tray icons",
-      "version": "0.1.0-rc.9",
+      "version": "0.1.0-rc.10",
       "ownerPackage": "vibex-desktop",
       "root": "apps/desktop/assets/app-icons",
       "extensions": [
@@ -237,7 +237,7 @@
     {
       "id": "vibex-mobile-brand-marks",
       "name": "Vibex native mobile brand mark",
-      "version": "0.1.0-rc.9",
+      "version": "0.1.0-rc.10",
       "ownerPackage": "vibex-ui",
       "root": "apps/mobile/assets/brand",
       "extensions": [
@@ -251,7 +251,7 @@
     {
       "id": "vibex-mobile-application-icons",
       "name": "Vibex native mobile application icons",
-      "version": "0.1.0-rc.9",
+      "version": "0.1.0-rc.10",
       "ownerPackage": "vibex-ui",
       "root": "apps/mobile/ios/Vibex/Assets.xcassets/AppIcon.appiconset",
       "extensions": [
@@ -266,7 +266,7 @@
     {
       "id": "vibex-mobile-native-icons",
       "name": "Vibex native mobile Lucide controls",
-      "version": "0.1.0-rc.9",
+      "version": "0.1.0-rc.10",
       "ownerPackage": "vibex-ui",
       "root": "apps/mobile/assets/icons",
       "extensions": [
@@ -347,6 +347,26 @@
       "licenseExpression": "OFL-1.1",
       "source": "https://github.com/googlefonts/noto-emoji",
       "licenseEvidence": "Noto Color Emoji 2.042 in its CBDT/CBLC bitmap build, the only colour-emoji format swash can rasterize. gpui-mobile's Android platform reads this exact APK asset path when the system emoji font is COLR v1 (Android 13+) and otherwise logs \"no compatible emoji font loaded - emoji glyphs may not render\". Copyright 2022 Google Inc.; the complete SIL Open Font License 1.1 text ships beside the font. The reviewed binary is the asset carried by the gpui-mobile example pack, unchanged across the revisions this workspace pins (`7548ebc` and the `0.3.11` bump built on it); its embedded name table identifies noto-emoji 20231129 and its SHA-256 is c2f19f6a404baa7da7a710b018c2892d7b51386983ddca146811f76aea0b6861."
+    },
+    {
+      "id": "vibex-desktop-nerd-symbols",
+      "name": "Nerd Fonts symbols-only terminal font",
+      "version": "3.3.0",
+      "ownerPackage": "vibex-desktop",
+      "root": "apps/desktop/assets/fonts/nerd-symbols",
+      "files": [
+        "LICENSE",
+        "SymbolsNerdFontMono-Regular.ttf"
+      ],
+      "extensions": [
+        "",
+        ".ttf"
+      ],
+      "expectedFileCount": 2,
+      "treeSha256": "39f44d7c7f96f6464d158926feae6fe9a9828e747af502fc23161ce24093064a",
+      "licenseExpression": "MIT",
+      "source": "https://github.com/ryanoasis/nerd-fonts/releases/tag/v3.3.0",
+      "licenseEvidence": "Symbols Nerd Font Mono 3.3.0, the symbols-only build. Agent TUIs draw status marks, file icons and arrows from the private-use area, which no text font covers; the desktop embeds this face so those cells paint a glyph instead of the missing-glyph box, and it is symbols-only so it cannot take ordinary text from the code font. The reviewed binary's name table identifies 'Symbols Nerd Font Mono 3.3.0' and it ships with the complete MIT license text (Copyright (c) 2014 Ryan L McIntyre)."
     }
   ],
   "nativeInputs": [

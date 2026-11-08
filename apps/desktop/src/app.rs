@@ -99428,7 +99428,7 @@ mod tests {
         });
         let workbench = probe.read_with(cx, |probe, _| probe.workbench.clone());
         let state = workbench.update(cx, |workbench, cx| {
-            let state = cx.new(|cx| TextViewState::markdown("alpha beta".into(), cx));
+            let state = cx.new(|cx| TextViewState::markdown("alpha beta", cx));
             let observed = cx.observe(&state, |_, _, _| {});
             workbench.markdown_text_states.insert(
                 "find-highlight-probe".to_owned(),
@@ -102793,7 +102793,7 @@ mod tests {
             .find("self.ui_state.workbench.active_tab = \"agent\".to_string();")
             .expect("session navigation should restore the agent workbench");
         let session_load = selection
-            .find("self.select_session_with_history(session_id, !primary_tab_changed, cx);")
+            .find("self.select_session_with_history(session_id.clone(), !primary_tab_changed, cx);")
             .expect("session navigation should load the selected session");
         let history_push = selection
             .find("self.push_current_navigation_entry();")
@@ -116988,9 +116988,21 @@ mod tests {
             .and_then(|(_, tail)| tail.split_once("\n    fn build_sidebar_toolbar_more_menu("))
             .map(|(body, _)| body)
             .expect("sidebar renderer should remain inspectable");
+        // The multi-select filter moved into a popover surface of its own, so
+        // the toolbar row names the popover and the button lives one function
+        // away. Both are what the reader sees, so both are pinned here.
         let filter = sidebar
-            .find("Button::new(\"sidebar-session-filter\")")
+            .find("self.render_sidebar_session_filter_popover(")
             .expect("session filter control should exist");
+        let filter_surface = source
+            .split_once("    fn render_sidebar_session_filter_popover(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_agent_sidebar("))
+            .map(|(body, _)| body)
+            .expect("session filter surface should remain inspectable");
+        assert!(
+            filter_surface.contains("Button::new(\"sidebar-session-filter\")"),
+            "the filter popover should carry the toolbar button"
+        );
         let collapse = sidebar
             .find("Button::new(\"sidebar-collapse-all\")")
             .expect("collapse control should exist");
