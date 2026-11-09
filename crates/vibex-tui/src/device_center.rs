@@ -62,7 +62,7 @@ impl DeviceTab {
         }
     }
 
-    pub const fn label(self, strings: Strings) -> &'static str {
+    pub fn label(self, strings: Strings) -> &'static str {
         match self {
             Self::Pair => strings.devices_tab_pair(),
             Self::Devices => strings.devices_title(),
@@ -94,7 +94,7 @@ impl PairMethod {
     }
 
     /// The row's title: the reader's action, not the mechanism.
-    pub const fn label(self, strings: Strings) -> &'static str {
+    pub fn label(self, strings: Strings) -> &'static str {
         match self {
             Self::QrCode => strings.devices_pair_qr(),
             Self::LocalNetwork => strings.devices_pair_lan(),
@@ -103,7 +103,7 @@ impl PairMethod {
     }
 
     /// What the row is for: who can use it, and what they need.
-    pub const fn scope(self, strings: Strings) -> &'static str {
+    pub fn scope(self, strings: Strings) -> &'static str {
         match self {
             Self::QrCode => strings.devices_pair_qr_scope(),
             Self::LocalNetwork => strings.devices_pair_lan_scope(),

@@ -1115,6 +1115,7 @@ impl RemoteAccessPairing {
             locale::ResolvedLocale::En => format!("Rename \"{device_name}\"?"),
             locale::ResolvedLocale::ZhCn => format!("重命名“{device_name}”？"),
             locale::ResolvedLocale::ZhTw => format!("重新命名「{device_name}」？"),
+            _ => format!("Rename \"{device_name}\"?"),
         };
         // Keep the input outside the dialog builder. A builder is evaluated
         // again on every repaint, so an input created inside one would be
@@ -1225,11 +1226,18 @@ impl RemoteAccessPairing {
             (locale::ResolvedLocale::ZhTw, false) => format!(
                 "「{device_name}」仍持有存取授權：刪除會先撤銷授權並中斷連線，然後移除記錄。稽核記錄會保留。"
             ),
+            (_, true) => {
+                format!("\"{device_name}\" is removed from this list. Its audit history is kept.")
+            }
+            (_, false) => format!(
+                "\"{device_name}\" still holds access: deleting revokes the grant, disconnects it, and then removes it. Its audit history is kept."
+            ),
         };
         let title = match locale::current_locale() {
             locale::ResolvedLocale::En => format!("Delete \"{device_name}\"?"),
             locale::ResolvedLocale::ZhCn => format!("删除“{device_name}”？"),
             locale::ResolvedLocale::ZhTw => format!("刪除「{device_name}」？"),
+            _ => format!("Delete \"{device_name}\"?"),
         };
         window.open_dialog(cx, move |dialog, _, _| {
             let entity = entity.clone();
@@ -1291,11 +1299,15 @@ impl RemoteAccessPairing {
             locale::ResolvedLocale::ZhTw => {
                 format!("「{device_name}」無需重新配對，用已有憑證即可再次連線。")
             }
+            _ => format!(
+                "\"{device_name}\" can connect again with the credential it already holds, without pairing again."
+            ),
         };
         let title = match locale::current_locale() {
             locale::ResolvedLocale::En => format!("Restore access for \"{device_name}\"?"),
             locale::ResolvedLocale::ZhCn => format!("恢复“{device_name}”的访问权限？"),
             locale::ResolvedLocale::ZhTw => format!("恢復「{device_name}」的存取權限？"),
+            _ => format!("Restore access for \"{device_name}\"?"),
         };
         window.open_dialog(cx, move |dialog, _, _| {
             let entity = entity.clone();
@@ -1351,6 +1363,9 @@ impl RemoteAccessPairing {
             locale::ResolvedLocale::ZhTw => {
                 format!("「{device_name}」將立即失去存取權限並中斷連線。此操作會寫入稽核記錄。")
             }
+            _ => format!(
+                "\"{device_name}\" loses access immediately and is disconnected. This action is audited."
+            ),
         };
         window.open_dialog(cx, move |dialog, _, _| {
             let entity = entity.clone();
@@ -2208,6 +2223,11 @@ impl RemoteAccessPairing {
             locale::ResolvedLocale::ZhTw => {
                 format!("連接埠 443 已被占用。是否在 {origin} 發布 Vibex，並保留現有路由？")
             }
+            _ => {
+                format!(
+                    "Port 443 is already in use. Publish Vibex at {origin} without changing the existing route?"
+                )
+            }
         };
         window.open_alert_dialog(cx, move |alert, _, _| {
             let entity = entity.clone();
@@ -2292,6 +2312,7 @@ impl RemoteAccessPairing {
                 locale::ResolvedLocale::En => format!("{online} online"),
                 locale::ResolvedLocale::ZhCn => format!("{online} 项在线"),
                 locale::ResolvedLocale::ZhTw => format!("{online} 項上線"),
+                _ => format!("{online} online"),
             };
             return (label.into(), ColorName::Green);
         }
@@ -2372,6 +2393,7 @@ impl RemoteAccessPairing {
             locale::ResolvedLocale::En => format!("Paired devices ({paired})"),
             locale::ResolvedLocale::ZhCn => format!("已配对设备 ({paired})"),
             locale::ResolvedLocale::ZhTw => format!("已配對裝置 ({paired})"),
+            _ => format!("Paired devices ({paired})"),
         };
         let selected_index = match self.state.page {
             RemoteAccessPage::Devices => 1,
@@ -2531,6 +2553,7 @@ impl RemoteAccessPairing {
             locale::ResolvedLocale::En => format!("{first}–{last} of {total}"),
             locale::ResolvedLocale::ZhCn => format!("第 {first}–{last} 台，共 {total} 台"),
             locale::ResolvedLocale::ZhTw => format!("第 {first}–{last} 台，共 {total} 台"),
+            _ => format!("{first}–{last} of {total}"),
         };
         let entity = cx.weak_entity();
         h_flex()
@@ -4606,6 +4629,7 @@ fn countdown_label(seconds: i64) -> String {
         locale::ResolvedLocale::ZhCn | locale::ResolvedLocale::ZhTw => {
             format!("{seconds} 秒")
         }
+        _ => format!("{seconds}s"),
     }
 }
 
@@ -4840,6 +4864,9 @@ fn device_management_summary(
         }
         locale::ResolvedLocale::ZhTw => {
             format!("{paired} 台已配對 · {revoked} 台已撤銷 · {audit} 條稽核記錄")
+        }
+        _ => {
+            format!("{paired} paired · {revoked} revoked · {audit} audit records")
         }
     }
 }

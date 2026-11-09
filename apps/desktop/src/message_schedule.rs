@@ -79,6 +79,7 @@ impl MessageSchedule {
                     locale::ResolvedLocale::En => format!("Send in {duration}"),
                     locale::ResolvedLocale::ZhCn => format!("{duration} 后发送"),
                     locale::ResolvedLocale::ZhTw => format!("{duration} 後傳送"),
+                    _ => format!("Send in {duration}"),
                 }
             }
         }

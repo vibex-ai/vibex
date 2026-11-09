@@ -3602,6 +3602,7 @@ fn composer_plan_progress_label(
         locale::ResolvedLocale::En => format!("Step {current_step} / {total_steps}"),
         locale::ResolvedLocale::ZhCn => format!("步骤 {current_step} / {total_steps}"),
         locale::ResolvedLocale::ZhTw => format!("步驟 {current_step} / {total_steps}"),
+        _ => format!("Step {current_step} / {total_steps}"),
     }
 }
 
@@ -3614,6 +3615,7 @@ fn composer_plan_completed_steps_label(
         locale::ResolvedLocale::En => format!("{completed_steps} of {total_steps} completed"),
         locale::ResolvedLocale::ZhCn => format!("已完成 {completed_steps} / {total_steps}"),
         locale::ResolvedLocale::ZhTw => format!("已完成 {completed_steps} / {total_steps}"),
+        _ => format!("{completed_steps} of {total_steps} completed"),
     }
 }
 
@@ -7734,6 +7736,16 @@ fn agent_generation_phase_label(
         }
         (AgentGenerationPhase::WaitingForApproval, locale::ResolvedLocale::ZhCn) => "等待确认",
         (AgentGenerationPhase::WaitingForApproval, locale::ResolvedLocale::ZhTw) => "等待確認",
+        // The added languages read the English phase name; the sentence is in
+        // the catalogue under exactly that text, so a translated phase label
+        // can be wired in without touching this match again.
+        (phase, _) => match phase {
+            AgentGenerationPhase::Preparing => "Preparing",
+            AgentGenerationPhase::Thinking => "Thinking",
+            AgentGenerationPhase::CallingTool => "Calling tool",
+            AgentGenerationPhase::Generating => "Generating",
+            AgentGenerationPhase::WaitingForApproval => "Waiting for approval",
+        },
     }
 }
 
@@ -8766,6 +8778,9 @@ fn failover_prompt_label(
         locale::ResolvedLocale::ZhTw => format!(
             "供應商 {from_name} 請求異常，{remaining_seconds} 秒後將 {model} 切換到 {to_name}。"
         ),
+        _ => format!(
+            "Provider {from_name} failed. Switching {model} to {to_name} in {remaining_seconds}s."
+        ),
     }
 }
 
@@ -8785,6 +8800,9 @@ fn failover_switched_label(
         }
         locale::ResolvedLocale::ZhTw => {
             format!("路由組已將 {model} 從 {from_name} 切換到 {to_name}。")
+        },
+        _ => {
+            format!("Route group switched {model} from {from_name} to {to_name}.")
         }
     }
 }
@@ -8794,6 +8812,7 @@ fn auto_continue_countdown_label(locale: locale::ResolvedLocale, remaining_secon
         locale::ResolvedLocale::En => format!("Continue ({remaining_seconds}s)"),
         locale::ResolvedLocale::ZhCn => format!("继续（{remaining_seconds} 秒）"),
         locale::ResolvedLocale::ZhTw => format!("繼續（{remaining_seconds} 秒）"),
+        _ => format!("Continue ({remaining_seconds}s)"),
     }
 }
 
@@ -13041,7 +13060,11 @@ impl VibexWorkbench {
                                         "已從 {} 暫存 RC 資料，正在重新啟動執行階段",
                                         outcome.source_home
                                     )
-                                }
+                                },
+                                _ => format!(
+                                    "RC data staged from {}; restarting the runtime",
+                                    outcome.source_home
+                                ),
                             };
                             this.queue_settings_operation_notice(
                                 SettingsOperationNotice::success(message),
@@ -18288,6 +18311,11 @@ impl VibexWorkbench {
             locale::ResolvedLocale::ZhCn => format!("移除“{label}”？"),
             locale::ResolvedLocale::ZhTw => format!("移除「{label}」？"),
             locale::ResolvedLocale::En => format!("Remove \u{201c}{label}\u{201d}?"),
+            locale => vibex_ui::locale_copy::fill(
+                locale.shared(),
+                "Remove \u{201c}{label}\u{201d}?",
+                &[("label", label.to_string())],
+            ),
         }
     }
 
@@ -26866,6 +26894,7 @@ impl VibexWorkbench {
             locale::ResolvedLocale::En => format!("{tool_count} tool calls"),
             locale::ResolvedLocale::ZhCn => format!("{tool_count} 次工具调用"),
             locale::ResolvedLocale::ZhTw => format!("{tool_count} 次工具呼叫"),
+            _ => format!("{tool_count} tool calls"),
         };
         let compaction_label = match locale {
             locale::ResolvedLocale::En => format!(
@@ -26878,6 +26907,14 @@ impl VibexWorkbench {
             ),
             locale::ResolvedLocale::ZhCn => format!("{compaction_count} 次压缩"),
             locale::ResolvedLocale::ZhTw => format!("{compaction_count} 次壓縮"),
+            _ => format!(
+                "{compaction_count} {}",
+                if compaction_count == 1 {
+                    "compaction"
+                } else {
+                    "compactions"
+                }
+            ),
         };
         let tokens_per_second = tokens_per_second.map(|speed| format!("{speed:.1} t/s"));
         let (input_tokens, output_tokens, cache_rate) = self.agent_token_usage_metrics();
@@ -34451,6 +34488,9 @@ impl VibexWorkbench {
                                 }
                                 locale::ResolvedLocale::ZhTw => {
                                     format!("已排隊，目標為 {runtime_label}")
+                                },
+                                _ => {
+                                    format!("Queued for {runtime_label}")
                                 }
                             }
                         }
@@ -41624,6 +41664,7 @@ impl VibexWorkbench {
             locale::ResolvedLocale::En => format!("Delete '{folder_name}'?"),
             locale::ResolvedLocale::ZhCn => format!("删除“{folder_name}”？"),
             locale::ResolvedLocale::ZhTw => format!("刪除「{folder_name}」？"),
+            _ => format!("Delete '{folder_name}'?"),
         };
         let description = locale::text(
             "Projects and sessions inside will return to their default locations. Nested folders will also be deleted.",
@@ -60074,6 +60115,7 @@ impl VibexWorkbench {
             locale::ResolvedLocale::En => "Empty message",
             locale::ResolvedLocale::ZhCn => "空消息",
             locale::ResolvedLocale::ZhTw => "空訊息",
+            _ => "Empty message",
         };
 
         // The rail only builds its entries while it is on screen, so a revealed
@@ -60127,6 +60169,9 @@ impl VibexWorkbench {
                     }
                     locale::ResolvedLocale::ZhTw => {
                         format!("跳轉到第 {turn_number} 輪：{title}")
+                    },
+                    _ => {
+                        format!("Jump to turn {turn_number}: {title}")
                     }
                 };
                 let hovered = active_index == Some(preview_index);
@@ -60337,6 +60382,7 @@ impl VibexWorkbench {
             locale::ResolvedLocale::En => "Conversation turn preview",
             locale::ResolvedLocale::ZhCn => "对话轮次预览",
             locale::ResolvedLocale::ZhTw => "對話輪次預覽",
+            _ => "Conversation turn preview",
         };
 
         div()
@@ -60751,6 +60797,9 @@ impl VibexWorkbench {
                     }
                     locale::ResolvedLocale::ZhTw => {
                         format!("{} 條新訊息", self.timeline_follow.unread_count)
+                    },
+                    _ => {
+                        format!("{} new", self.timeline_follow.unread_count)
                     }
                 })
             } else {
@@ -60760,6 +60809,7 @@ impl VibexWorkbench {
                         locale::ResolvedLocale::En => "Scroll to conversation bottom",
                         locale::ResolvedLocale::ZhCn => "滚动到会话底部",
                         locale::ResolvedLocale::ZhTw => "捲動到會話底部",
+                        _ => "Scroll to conversation bottom",
                     })
             };
             let control = h_flex()
@@ -63549,6 +63599,9 @@ impl VibexWorkbench {
                     }
                     locale::ResolvedLocale::ZhTw => {
                         format!("再顯示 {remaining_count} 個檔案")
+                    },
+                    _ => {
+                        format!("Show {remaining_count} more files")
                     }
                 }
             };
@@ -71849,6 +71902,9 @@ impl VibexWorkbench {
                                     }
                                     locale::ResolvedLocale::ZhTw => {
                                         format!("{attachment_count} 個附件")
+                                    },
+                                    _ => {
+                                        format!("{attachment_count} attachment(s)")
                                     }
                                 }),
                         )
@@ -75243,7 +75299,8 @@ fn format_timeline_hover_time(timestamp_ms: i64, locale: locale::ResolvedLocale)
         locale::ResolvedLocale::En => timestamp.format("%m/%d/%Y, %H:%M:%S").to_string(),
         locale::ResolvedLocale::ZhCn | locale::ResolvedLocale::ZhTw => {
             timestamp.format("%Y/%m/%d %H:%M:%S").to_string()
-        }
+        },
+        _ => timestamp.format("%m/%d/%Y, %H:%M:%S").to_string()
     }
 }
 
@@ -78611,6 +78668,7 @@ fn new_session_worktree_unavailable_reason(
         locale::ResolvedLocale::En => en.to_string(),
         locale::ResolvedLocale::ZhCn => zh_cn.to_string(),
         locale::ResolvedLocale::ZhTw => zh_tw.to_string(),
+        _ => en.to_string(),
     };
     if !mutation_supported {
         return Some(localized(
@@ -80562,6 +80620,13 @@ fn sidebar_auto_archive_days_label(days: u8, locale: locale::ResolvedLocale) -> 
         }
         locale::ResolvedLocale::ZhCn => format!("{days}天后"),
         locale::ResolvedLocale::ZhTw => format!("{days}天後"),
+        _ => {
+            if days == 1 {
+                "After 1 day".to_string()
+            } else {
+                format!("After {days} days")
+            }
+        },
     }
 }
 
@@ -81651,6 +81716,7 @@ fn runtime_route_subtitle(sources: usize, model_count: usize) -> String {
             locale::ResolvedLocale::En => format!("{sources} sources · {models}"),
             locale::ResolvedLocale::ZhCn => format!("{sources} 个来源 · {models}"),
             locale::ResolvedLocale::ZhTw => format!("{sources} 個來源 · {models}"),
+            _ => format!("{sources} sources · {models}"),
         }
     } else {
         models
@@ -81883,6 +81949,7 @@ fn runtime_profile_count_label(count: usize) -> String {
         locale::ResolvedLocale::En => format!("{count} profiles"),
         locale::ResolvedLocale::ZhCn => format!("{count} 个配置"),
         locale::ResolvedLocale::ZhTw => format!("{count} 個設定"),
+        _ => format!("{count} profiles"),
     }
 }
 
@@ -81891,6 +81958,7 @@ fn runtime_model_count_label(count: usize) -> String {
         locale::ResolvedLocale::En => format!("{count} models"),
         locale::ResolvedLocale::ZhCn => format!("{count} 个模型"),
         locale::ResolvedLocale::ZhTw => format!("{count} 個模型"),
+        _ => format!("{count} models"),
     }
 }
 
@@ -81926,7 +81994,8 @@ fn sidebar_selected_count_label(
         locale::ResolvedLocale::En => format!("{selected}/{total} selected"),
         locale::ResolvedLocale::ZhCn | locale::ResolvedLocale::ZhTw => {
             format!("已选 {selected}/{total}")
-        }
+        },
+        _ => format!("{selected}/{total} selected")
     }
 }
 
@@ -81955,7 +82024,8 @@ fn sidebar_batch_menu_label(
         locale::ResolvedLocale::En => format!("{label} ({count})"),
         locale::ResolvedLocale::ZhCn | locale::ResolvedLocale::ZhTw => {
             format!("{label}（{count}）")
-        }
+        },
+        _ => format!("{label} ({count})")
     }
 }
 
@@ -81964,6 +82034,7 @@ fn sidebar_project_actions_label(locale: locale::ResolvedLocale, project_name: &
         locale::ResolvedLocale::En => format!("Project actions for {project_name}"),
         locale::ResolvedLocale::ZhCn => format!("{project_name} 的项目操作"),
         locale::ResolvedLocale::ZhTw => format!("{project_name} 的專案操作"),
+        _ => format!("Project actions for {project_name}"),
     }
 }
 
@@ -81975,6 +82046,7 @@ fn sidebar_new_session_for_project_label(
         locale::ResolvedLocale::En => format!("New chat in {project_name}"),
         locale::ResolvedLocale::ZhCn => format!("在「{project_name}」中新建会话"),
         locale::ResolvedLocale::ZhTw => format!("在「{project_name}」中建立會話"),
+        _ => format!("New chat in {project_name}"),
     }
 }
 
@@ -81986,6 +82058,7 @@ fn sidebar_new_session_for_folder_label(
         locale::ResolvedLocale::En => format!("New chat in folder {folder_name}"),
         locale::ResolvedLocale::ZhCn => format!("在「{folder_name}」文件夹中新建会话"),
         locale::ResolvedLocale::ZhTw => format!("在「{folder_name}」資料夾中建立會話"),
+        _ => format!("New chat in folder {folder_name}"),
     }
 }
 
@@ -81996,6 +82069,9 @@ fn sidebar_delete_session_description(locale: locale::ResolvedLocale, title: &st
         }
         locale::ResolvedLocale::ZhCn => format!("删除「{title}」？此操作无法撤销。"),
         locale::ResolvedLocale::ZhTw => format!("刪除「{title}」？此操作無法復原。"),
+        _ => {
+            format!("Delete \"{title}\"? This action cannot be undone.")
+        },
     }
 }
 
@@ -82081,7 +82157,10 @@ fn sidebar_delete_group_description(locale: locale::ResolvedLocale, count: usize
         }
         locale::ResolvedLocale::ZhTw => {
             format!("將刪除該會話組及其中的 {count} 個會話，此操作無法復原。")
-        }
+        },
+        _ => format!(
+            "Delete this session group and its {count} sessions? This action cannot be undone."
+        )
     }
 }
 
@@ -82090,6 +82169,7 @@ fn sidebar_delete_sessions_title(locale: locale::ResolvedLocale, count: usize) -
         locale::ResolvedLocale::En => format!("Delete {count} selected sessions?"),
         locale::ResolvedLocale::ZhCn => format!("删除选中的 {count} 个会话？"),
         locale::ResolvedLocale::ZhTw => format!("刪除選中的 {count} 個會話？"),
+        _ => format!("Delete {count} selected sessions?"),
     }
 }
 
@@ -82103,6 +82183,9 @@ fn sidebar_delete_sessions_description(locale: locale::ResolvedLocale, count: us
         }
         locale::ResolvedLocale::ZhTw => {
             format!("將刪除選中的 {count} 個會話，此操作無法復原。")
+        },
+        _ => {
+            format!("Delete {count} selected sessions? This action cannot be undone.")
         }
     }
 }
@@ -82120,6 +82203,9 @@ fn sidebar_delete_project_description(
         ),
         locale::ResolvedLocale::ZhTw => format!(
             "從 Vibex 中移除「{project_name}」？不會刪除磁碟上的專案檔案，關聯的 Vibex 會話會從側欄移除。"
+        ),
+        _ => format!(
+            "Remove \"{project_name}\" from Vibex? Project files stay on disk, and associated Vibex sessions are removed from the sidebar."
         ),
     }
 }
@@ -82218,6 +82304,7 @@ fn sidebar_hidden_branch_summary(
             locale::ResolvedLocale::En => counts,
             locale::ResolvedLocale::ZhCn => format!("子会话：{counts}"),
             locale::ResolvedLocale::ZhTw => format!("子會話：{counts}"),
+            _ => counts,
         },
         asks_for_user: blocked_descendants > 0,
     })
@@ -82464,6 +82551,7 @@ fn format_sidebar_session_time_at(
             locale::ResolvedLocale::En => format!("{days} days ago"),
             locale::ResolvedLocale::ZhCn => format!("{days} 天前"),
             locale::ResolvedLocale::ZhTw => format!("{days} 天前"),
+            _ => format!("{days} days ago"),
         };
     }
     if days < 30 {
@@ -82472,6 +82560,7 @@ fn format_sidebar_session_time_at(
             locale::ResolvedLocale::En => format!("{weeks} weeks ago"),
             locale::ResolvedLocale::ZhCn => format!("{weeks} 周前"),
             locale::ResolvedLocale::ZhTw => format!("{weeks} 週前"),
+            _ => format!("{weeks} weeks ago"),
         };
     }
     local_time.format("%m/%d").to_string()
@@ -82904,6 +82993,12 @@ fn render_cache_token_ring(usage: Option<&AgentTokenUsage>, cx: &mut App) -> Any
                 format_compact_tokens(used),
                 format_compact_tokens(size)
             ),
+            _ => format!(
+                "Context {}% · {} / {}",
+                token_usage_percent(fraction),
+                format_compact_tokens(used),
+                format_compact_tokens(size)
+            ),
         },
         None => locale::text(
             "Context window not reported",
@@ -82947,6 +83042,15 @@ fn render_cache_token_ring(usage: Option<&AgentTokenUsage>, cx: &mut App) -> Any
                 ),
                 (locale::ResolvedLocale::ZhTw, None) => format!(
                     "快取 {hit_prefix}讀取 {}",
+                    format_compact_tokens(cached_read)
+                ),
+                (_, Some(written)) => format!(
+                    "Cache {hit_prefix}{} read · {} written",
+                    format_compact_tokens(cached_read),
+                    format_compact_tokens(written)
+                ),
+                (_, None) => format!(
+                    "Cache {hit_prefix}{} read",
                     format_compact_tokens(cached_read)
                 ),
             }
@@ -83233,6 +83337,7 @@ fn agent_failure_body(agent_label: &str) -> String {
         locale::ResolvedLocale::En => format!("{agent_label} encountered an error"),
         locale::ResolvedLocale::ZhCn => format!("{agent_label} 出现错误"),
         locale::ResolvedLocale::ZhTw => format!("{agent_label} 出現錯誤"),
+        _ => format!("{agent_label} encountered an error"),
     }
 }
 
@@ -83270,12 +83375,14 @@ fn timeline_notification_body(kind: Option<NotificationKind>, agent_label: &str)
             locale::ResolvedLocale::En => format!("{agent_label} needs your confirmation"),
             locale::ResolvedLocale::ZhCn => format!("{agent_label} 需要你确认内容"),
             locale::ResolvedLocale::ZhTw => format!("{agent_label} 需要你確認內容"),
+            _ => format!("{agent_label} needs your confirmation"),
         }),
         Some(NotificationKind::Completed) => Some(match locale {
             locale::ResolvedLocale::En => format!("{agent_label} completed work"),
             locale::ResolvedLocale::ZhCn | locale::ResolvedLocale::ZhTw => {
                 format!("{agent_label} 工作完成")
             }
+            _ => format!("{agent_label} completed work"),
         }),
         None => None,
     }
@@ -89554,6 +89661,11 @@ impl FoundationSettings {
                 locale::ResolvedLocale::En => format!(
                     "The saved settings for \u{201c}{profile_name}\u{201d} are deleted. This machine's pairing credential and tunnel go with them; the remote runtime and workspace files are left alone."
                 ),
+                locale => vibex_ui::locale_copy::fill(
+                    locale.shared(),
+                    "The saved settings for \u{201c}{profile_name}\u{201d} are deleted. This machine's pairing credential and tunnel go with them; the remote runtime and workspace files are left alone.",
+                    &[("profile_name", profile_name.clone())],
+                ),
             };
             dialog
                 .title(title)
@@ -93963,25 +94075,31 @@ impl Render for FoundationSettings {
     }
 }
 
+/// The languages the picker offers, in the order it lists them.
+///
+/// Each name is written the way the language names itself, so a reader can find
+/// their own language without first reading the interface in another one.
 fn locale_choices(strings: &'static Strings) -> Vec<LocaleChoice> {
-    vec![
-        LocaleChoice {
-            label: strings.system_default.into(),
-            mode: LocaleMode::System,
-        },
-        LocaleChoice {
-            label: strings.simplified_chinese.into(),
-            mode: LocaleMode::ZhCn,
-        },
-        LocaleChoice {
-            label: strings.traditional_chinese.into(),
-            mode: LocaleMode::ZhTw,
-        },
-        LocaleChoice {
-            label: strings.english.into(),
-            mode: LocaleMode::En,
-        },
-    ]
+    let labels = [
+        (LocaleMode::System, strings.system_default),
+        (LocaleMode::En, strings.english),
+        (LocaleMode::ZhCn, strings.simplified_chinese),
+        (LocaleMode::ZhTw, strings.traditional_chinese),
+        (LocaleMode::Ja, strings.japanese),
+        (LocaleMode::Ko, strings.korean),
+        (LocaleMode::De, strings.german),
+        (LocaleMode::Fr, strings.french),
+        (LocaleMode::Es, strings.spanish),
+        (LocaleMode::PtBr, strings.brazilian_portuguese),
+        (LocaleMode::Ru, strings.russian),
+    ];
+    labels
+        .into_iter()
+        .map(|(mode, label)| LocaleChoice {
+            label: label.into(),
+            mode,
+        })
+        .collect()
 }
 
 fn session_content_width_choices(strings: &'static Strings) -> Vec<SessionContentWidthChoice> {

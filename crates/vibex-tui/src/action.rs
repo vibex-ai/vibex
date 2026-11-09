@@ -40,12 +40,12 @@ macro_rules! intents {
             /// The words live in the locale table rather than beside the action,
             /// so the three languages cannot drift and a new action is a compile
             /// error until all of them name it.
-            pub const fn label(self, strings: Strings) -> &'static str {
+            pub fn label(self, strings: Strings) -> &'static str {
                 match self { $( Intent::$variant => strings.$label() ),* }
             }
 
             /// One-line explanation shown in `?` help, in the reader's language.
-            pub const fn help(self, strings: Strings) -> &'static str {
+            pub fn help(self, strings: Strings) -> &'static str {
                 match self { $( Intent::$variant => strings.$help() ),* }
             }
 

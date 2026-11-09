@@ -60,7 +60,7 @@ pub enum SeatKind {
 }
 
 impl SeatKind {
-    pub const fn label(self, strings: Strings) -> &'static str {
+    pub fn label(self, strings: Strings) -> &'static str {
         match self {
             SeatKind::Authority => strings.seat_authority(),
             SeatKind::Remote => strings.seat_remote(),

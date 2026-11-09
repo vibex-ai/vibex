@@ -1569,7 +1569,7 @@ impl DockSection {
         Self::Queue,
     ];
 
-    pub const fn label(self, strings: Strings) -> &'static str {
+    pub fn label(self, strings: Strings) -> &'static str {
         match self {
             DockSection::Children => strings.dock_children(),
             DockSection::Team => strings.locale.text("Team", "团队", "團隊"),

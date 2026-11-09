@@ -64,7 +64,7 @@ impl ConfigModule {
         }
     }
 
-    pub const fn label(self, strings: Strings) -> &'static str {
+    pub fn label(self, strings: Strings) -> &'static str {
         match self {
             Self::Agent => strings.config_module_agent(),
             Self::Mcp => strings.config_module_mcp(),
@@ -136,7 +136,7 @@ impl ConfigSection {
         }
     }
 
-    pub const fn label(self, strings: Strings) -> &'static str {
+    pub fn label(self, strings: Strings) -> &'static str {
         match self {
             Self::Agents => strings.config_section_agents(),
             Self::Providers => strings.config_section_providers(),
@@ -149,7 +149,7 @@ impl ConfigSection {
     }
 
     /// The hint under the rail entry: what the area is for.
-    pub const fn hint(self, strings: Strings) -> &'static str {
+    pub fn hint(self, strings: Strings) -> &'static str {
         match self {
             Self::Agents => strings.config_hint_agents(),
             Self::Providers => strings.config_hint_providers(),
@@ -192,7 +192,7 @@ impl ConfigZone {
     }
 
     /// What the pane is called, for the one line that names the focus.
-    pub const fn label(self, strings: Strings) -> &'static str {
+    pub fn label(self, strings: Strings) -> &'static str {
         match self {
             Self::Modules => strings.config_pane_modules(),
             Self::Rail => strings.config_pane_areas(),
@@ -278,7 +278,7 @@ pub enum ConfigAction {
 }
 
 impl ConfigAction {
-    pub const fn label(self, strings: Strings) -> &'static str {
+    pub fn label(self, strings: Strings) -> &'static str {
         match self {
             Self::Install => strings.config_action_install(),
             Self::Rollback => strings.config_action_rollback(),
@@ -610,7 +610,7 @@ impl McpServerTransportFilter {
     /// first.
     pub const ALL: [Option<Self>; 3] = [None, Some(Self::Local), Some(Self::Remote)];
 
-    pub const fn label(self, strings: Strings) -> &'static str {
+    pub fn label(self, strings: Strings) -> &'static str {
         match self {
             Self::Local => strings.config_registry_transport_local(),
             Self::Remote => strings.config_registry_transport_remote(),
@@ -641,7 +641,7 @@ pub enum SkillMarketSortKind {
 impl SkillMarketSortKind {
     pub const ALL: [Self; 2] = [Self::Recommended, Self::Installs];
 
-    pub const fn label(self, strings: Strings) -> &'static str {
+    pub fn label(self, strings: Strings) -> &'static str {
         match self {
             Self::Recommended => strings.config_registry_sort_recommended(),
             Self::Installs => strings.config_registry_sort_installs(),
@@ -851,7 +851,7 @@ pub enum ConfigVerb {
 
 impl ConfigVerb {
     /// What is happening, while it happens.
-    pub const fn running(self, strings: Strings) -> &'static str {
+    pub fn running(self, strings: Strings) -> &'static str {
         match self {
             Self::Install => strings.config_running_install(),
             Self::Rollback => strings.config_running_rollback(),
@@ -879,7 +879,7 @@ impl ConfigVerb {
     }
 
     /// What was done, once it is done.
-    pub const fn done(self, strings: Strings) -> &'static str {
+    pub fn done(self, strings: Strings) -> &'static str {
         match self {
             Self::Install => strings.config_done_install(),
             Self::Rollback => strings.config_done_rollback(),
@@ -914,7 +914,7 @@ impl ConfigVerb {
     /// success reads as a mistake on failure. The noun is the phrase the reader
     /// used when they pressed the key, so the sentence that names the failure
     /// names the thing they asked for.
-    pub const fn noun(self, strings: Strings) -> &'static str {
+    pub fn noun(self, strings: Strings) -> &'static str {
         match self {
             Self::Install => strings.config_noun_install(),
             Self::Rollback => strings.config_noun_rollback(),
@@ -4076,7 +4076,7 @@ pub fn native_import_rows(
 }
 
 /// What a native source is called on screen.
-pub const fn import_source_label(
+pub fn import_source_label(
     source: vibex_core::ProviderNativeImportSource,
     strings: Strings,
 ) -> &'static str {

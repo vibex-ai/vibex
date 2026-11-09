@@ -379,6 +379,9 @@ impl ManagementCenter {
                     ResolvedLocale::ZhTw => {
                         format!("該路由組是 {kept} 個 Agent 唯一的模型來源，無法移除。")
                     }
+                    _ => format!(
+                        "This route group is the only model source for {kept} Agent(s), so it cannot be removed."
+                    ),
                 });
                 cx.notify();
             }
@@ -462,6 +465,13 @@ impl ManagementCenter {
                                 format!("已為 {applied} 個 Agent 取消")
                             }
                         }
+                        _ => {
+                            if enabled {
+                                format!("Enabled for {applied} Agent(s)")
+                            } else {
+                                format!("Disabled for {applied} Agent(s)")
+                            }
+                        }
                     };
                     if kept > 0 {
                         let suffix = match active_locale {
@@ -473,6 +483,9 @@ impl ManagementCenter {
                             }
                             ResolvedLocale::ZhTw => {
                                 format!("；{kept} 個 Agent 保留，因為這是它們唯一的模型來源。")
+                            }
+                            _ => {
+                                format!("; {kept} kept because this is their only model source.")
                             }
                         };
                         message.push_str(&suffix);

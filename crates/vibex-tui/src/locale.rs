@@ -34,11 +34,14 @@ macro_rules! strings {
 
             $(
                 #[allow(missing_docs)]
-                pub const fn $key(&self) -> &'static str {
+                pub fn $key(&self) -> &'static str {
                     match self.locale {
                         $crate::locale::Locale::En => $en,
                         $crate::locale::Locale::ZhCn => $cn,
                         $crate::locale::Locale::ZhTw => $tw,
+                        // A language with no column in this table falls back to
+                        // the shared catalogue, keyed by the English sentence.
+                        other => other.localized($en),
                     }
                 }
             )*
@@ -2619,13 +2622,40 @@ mod tests {
         assert_eq!(strings.locale, Locale::ZhTw);
     }
 
+    /// A language Vibex does not ship still falls back to English; French used
+    /// to stand for that case and is now one of the supported languages.
     #[test]
     fn unsupported_languages_fall_back_to_english() {
         let strings = Strings::detect_from(|key| match key {
-            "LANG" => Some("fr_FR.UTF-8".to_string()),
+            "LANG" => Some("th_TH.UTF-8".to_string()),
             _ => None,
         })
         .unwrap();
         assert_eq!(strings.locale, Locale::En);
+    }
+
+    /// Every language Vibex ships resolves from its own system tag, so a reader
+    /// whose machine is in one of them never lands on English by accident.
+    #[test]
+    fn every_shipped_language_resolves_from_its_system_tag() {
+        for (tag, expected) in [
+            ("en_US.UTF-8", Locale::En),
+            ("zh_CN.UTF-8", Locale::ZhCn),
+            ("zh_TW.UTF-8", Locale::ZhTw),
+            ("ja_JP.UTF-8", Locale::Ja),
+            ("ko_KR.UTF-8", Locale::Ko),
+            ("de_DE.UTF-8", Locale::De),
+            ("fr_FR.UTF-8", Locale::Fr),
+            ("es_ES.UTF-8", Locale::Es),
+            ("pt_BR.UTF-8", Locale::PtBr),
+            ("ru_RU.UTF-8", Locale::Ru),
+        ] {
+            let strings = Strings::detect_from(|key| match key {
+                "LANG" => Some(tag.to_string()),
+                _ => None,
+            })
+            .unwrap();
+            assert_eq!(strings.locale, expected, "LANG={tag}");
+        }
     }
 }

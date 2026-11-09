@@ -48,7 +48,7 @@ pub enum SidebarRowAction {
 
 impl SidebarRowAction {
     /// What the menu row says.
-    pub const fn label(self, strings: Strings) -> &'static str {
+    pub fn label(self, strings: Strings) -> &'static str {
         match self {
             Self::NewSession => strings.sidebar_action_new_session(),
             Self::NewFolder => strings.sidebar_action_new_folder(),

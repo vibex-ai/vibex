@@ -1169,6 +1169,7 @@ pub(super) fn said(locale: ResolvedLocale, en: String, zh_cn: String, zh_tw: Str
         ResolvedLocale::En => en,
         ResolvedLocale::ZhCn => zh_cn,
         ResolvedLocale::ZhTw => zh_tw,
+        _ => en,
     }
 }
 

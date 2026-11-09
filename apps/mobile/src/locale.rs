@@ -15,15 +15,30 @@ pub enum LanguagePreference {
     En,
     ZhCn,
     ZhTw,
+    Ja,
+    Ko,
+    De,
+    Fr,
+    Es,
+    PtBr,
+    Ru,
 }
 
 impl LanguagePreference {
-    pub fn all() -> [LanguagePreference; 4] {
-        [
+    /// Every choice the picker offers, in the order it lists them.
+    pub fn all() -> Vec<LanguagePreference> {
+        vec![
             LanguagePreference::System,
             LanguagePreference::En,
             LanguagePreference::ZhCn,
             LanguagePreference::ZhTw,
+            LanguagePreference::Ja,
+            LanguagePreference::Ko,
+            LanguagePreference::De,
+            LanguagePreference::Fr,
+            LanguagePreference::Es,
+            LanguagePreference::PtBr,
+            LanguagePreference::Ru,
         ]
     }
 
@@ -33,6 +48,13 @@ impl LanguagePreference {
             LanguagePreference::En => "English",
             LanguagePreference::ZhCn => "简体中文",
             LanguagePreference::ZhTw => "繁體中文",
+            LanguagePreference::Ja => "日本語",
+            LanguagePreference::Ko => "한국어",
+            LanguagePreference::De => "Deutsch",
+            LanguagePreference::Fr => "Français",
+            LanguagePreference::Es => "Español",
+            LanguagePreference::PtBr => "Português (Brasil)",
+            LanguagePreference::Ru => "Русский",
         }
     }
 
@@ -42,6 +64,13 @@ impl LanguagePreference {
             "en" => Some(LanguagePreference::En),
             "zh-cn" => Some(LanguagePreference::ZhCn),
             "zh-tw" => Some(LanguagePreference::ZhTw),
+            "ja" => Some(LanguagePreference::Ja),
+            "ko" => Some(LanguagePreference::Ko),
+            "de" => Some(LanguagePreference::De),
+            "fr" => Some(LanguagePreference::Fr),
+            "es" => Some(LanguagePreference::Es),
+            "pt-br" => Some(LanguagePreference::PtBr),
+            "ru" => Some(LanguagePreference::Ru),
             _ => None,
         }
     }
@@ -52,6 +81,13 @@ impl LanguagePreference {
             LanguagePreference::En => "en",
             LanguagePreference::ZhCn => "zh-cn",
             LanguagePreference::ZhTw => "zh-tw",
+            LanguagePreference::Ja => "ja",
+            LanguagePreference::Ko => "ko",
+            LanguagePreference::De => "de",
+            LanguagePreference::Fr => "fr",
+            LanguagePreference::Es => "es",
+            LanguagePreference::PtBr => "pt-br",
+            LanguagePreference::Ru => "ru",
         }
     }
 
@@ -61,6 +97,13 @@ impl LanguagePreference {
             LanguagePreference::En => Locale::En,
             LanguagePreference::ZhCn => Locale::ZhCn,
             LanguagePreference::ZhTw => Locale::ZhTw,
+            LanguagePreference::Ja => Locale::Ja,
+            LanguagePreference::Ko => Locale::Ko,
+            LanguagePreference::De => Locale::De,
+            LanguagePreference::Fr => Locale::Fr,
+            LanguagePreference::Es => Locale::Es,
+            LanguagePreference::PtBr => Locale::PtBr,
+            LanguagePreference::Ru => Locale::Ru,
         }
     }
 }
@@ -70,6 +113,13 @@ const PREFERENCE_SYSTEM: u8 = 0;
 const PREFERENCE_EN: u8 = 1;
 const PREFERENCE_ZH_CN: u8 = 2;
 const PREFERENCE_ZH_TW: u8 = 3;
+const PREFERENCE_JA: u8 = 4;
+const PREFERENCE_KO: u8 = 5;
+const PREFERENCE_DE: u8 = 6;
+const PREFERENCE_FR: u8 = 7;
+const PREFERENCE_ES: u8 = 8;
+const PREFERENCE_PT_BR: u8 = 9;
+const PREFERENCE_RU: u8 = 10;
 
 static OVERRIDE: AtomicU8 = AtomicU8::new(PREFERENCE_SYSTEM);
 
@@ -93,6 +143,13 @@ fn encode(preference: LanguagePreference) -> u8 {
         LanguagePreference::En => PREFERENCE_EN,
         LanguagePreference::ZhCn => PREFERENCE_ZH_CN,
         LanguagePreference::ZhTw => PREFERENCE_ZH_TW,
+        LanguagePreference::Ja => PREFERENCE_JA,
+        LanguagePreference::Ko => PREFERENCE_KO,
+        LanguagePreference::De => PREFERENCE_DE,
+        LanguagePreference::Fr => PREFERENCE_FR,
+        LanguagePreference::Es => PREFERENCE_ES,
+        LanguagePreference::PtBr => PREFERENCE_PT_BR,
+        LanguagePreference::Ru => PREFERENCE_RU,
     }
 }
 
@@ -101,6 +158,13 @@ pub fn preference() -> LanguagePreference {
         PREFERENCE_EN => LanguagePreference::En,
         PREFERENCE_ZH_CN => LanguagePreference::ZhCn,
         PREFERENCE_ZH_TW => LanguagePreference::ZhTw,
+        PREFERENCE_JA => LanguagePreference::Ja,
+        PREFERENCE_KO => LanguagePreference::Ko,
+        PREFERENCE_DE => LanguagePreference::De,
+        PREFERENCE_FR => LanguagePreference::Fr,
+        PREFERENCE_ES => LanguagePreference::Es,
+        PREFERENCE_PT_BR => LanguagePreference::PtBr,
+        PREFERENCE_RU => LanguagePreference::Ru,
         _ => LanguagePreference::System,
     }
 }
@@ -128,13 +192,20 @@ fn apply_kit_locale(locale: Locale) {
         Locale::En => PREFERENCE_EN,
         Locale::ZhCn => PREFERENCE_ZH_CN,
         Locale::ZhTw => PREFERENCE_ZH_TW,
+        Locale::Ja => PREFERENCE_JA,
+        Locale::Ko => PREFERENCE_KO,
+        Locale::De => PREFERENCE_DE,
+        Locale::Fr => PREFERENCE_FR,
+        Locale::Es => PREFERENCE_ES,
+        Locale::PtBr => PREFERENCE_PT_BR,
+        Locale::Ru => PREFERENCE_RU,
     };
     if KIT_LOCALE.swap(encoded, Ordering::Relaxed) != encoded {
         gpui_component::set_locale(locale.tag());
     }
 }
 
-pub const fn text_for(
+pub fn text_for(
     locale: Locale,
     en: &'static str,
     zh_cn: &'static str,
@@ -144,6 +215,9 @@ pub const fn text_for(
         Locale::En => en,
         Locale::ZhCn => zh_cn,
         Locale::ZhTw => zh_tw,
+        // The added languages carry no argument at the call site: their copy is
+        // keyed by the English sentence in the shared table.
+        other => other.localized(en),
     }
 }
 

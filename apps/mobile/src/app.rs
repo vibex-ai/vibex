@@ -1435,6 +1435,9 @@ impl RuntimeStatus {
                 }
                 vibex_ui::locale::Locale::ZhTw => {
                     format!("正在重新連線（第 {reconnect_attempt} 次）")
+                },
+                _ => {
+                    format!("Reconnecting (attempt {reconnect_attempt})")
                 }
             },
             Self::Reconnecting => {
@@ -3926,12 +3929,11 @@ impl MobileApp {
     /// Cycles the language from a settings row, which has no window to give.
     fn cycle_language_setting(&mut self, cx: &mut Context<Self>) {
         let current = self.app_settings.language.unwrap_or_default();
-        let next = match current {
-            locale::LanguagePreference::System => locale::LanguagePreference::En,
-            locale::LanguagePreference::En => locale::LanguagePreference::ZhCn,
-            locale::LanguagePreference::ZhCn => locale::LanguagePreference::ZhTw,
-            locale::LanguagePreference::ZhTw => locale::LanguagePreference::System,
-        };
+        // The cycle walks `LanguagePreference::all`, so a language added to the
+        // picker joins the rotation without this row learning its name.
+        let all = locale::LanguagePreference::all();
+        let index = all.iter().position(|choice| *choice == current).unwrap_or(0);
+        let next = all[(index + 1) % all.len()];
         self.app_settings.language = Some(next);
         locale::set_preference(next);
         self.persist_app_settings(cx);
@@ -28553,6 +28555,7 @@ impl MobileApp {
             vibex_ui::locale::Locale::En => format!("Remove \"{}\"?", host.display_label()),
             vibex_ui::locale::Locale::ZhCn => format!("移除“{}”？", host.display_label()),
             vibex_ui::locale::Locale::ZhTw => format!("移除「{}」？", host.display_label()),
+            _ => format!("Remove \"{}\"?", host.display_label()),
         };
         div()
             .absolute()
@@ -31391,12 +31394,9 @@ impl MobileApp {
     /// Cycles through the language preference: System → English → 简体中文 → 繁體中文.
     fn cycle_language(&mut self, _: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
         let current = self.app_settings.language.unwrap_or_default();
-        let next = match current {
-            locale::LanguagePreference::System => locale::LanguagePreference::En,
-            locale::LanguagePreference::En => locale::LanguagePreference::ZhCn,
-            locale::LanguagePreference::ZhCn => locale::LanguagePreference::ZhTw,
-            locale::LanguagePreference::ZhTw => locale::LanguagePreference::System,
-        };
+        let all = locale::LanguagePreference::all();
+        let index = all.iter().position(|choice| *choice == current).unwrap_or(0);
+        let next = all[(index + 1) % all.len()];
         self.update_language(next, window, cx);
     }
 
@@ -34418,6 +34418,7 @@ fn runtime_model_count_label(count: usize) -> String {
         vibex_ui::locale::Locale::En => format!("{count} models"),
         vibex_ui::locale::Locale::ZhCn => format!("{count} 个模型"),
         vibex_ui::locale::Locale::ZhTw => format!("{count} 個模型"),
+        _ => format!("{count} models"),
     }
 }
 
@@ -34675,6 +34676,7 @@ fn host_last_connected_label(timestamp_ms: i64) -> String {
             vibex_ui::locale::Locale::En => format!("Last connected {minutes}m ago"),
             vibex_ui::locale::Locale::ZhCn => format!("上次连接：{minutes} 分钟前"),
             vibex_ui::locale::Locale::ZhTw => format!("上次連線：{minutes} 分鐘前"),
+            _ => format!("Last connected {minutes}m ago"),
         };
     }
     if seconds < 86_400 {
@@ -34683,6 +34685,7 @@ fn host_last_connected_label(timestamp_ms: i64) -> String {
             vibex_ui::locale::Locale::En => format!("Last connected {hours}h ago"),
             vibex_ui::locale::Locale::ZhCn => format!("上次连接：{hours} 小时前"),
             vibex_ui::locale::Locale::ZhTw => format!("上次連線：{hours} 小時前"),
+            _ => format!("Last connected {hours}h ago"),
         };
     }
     let days = seconds / 86_400;
@@ -34690,6 +34693,7 @@ fn host_last_connected_label(timestamp_ms: i64) -> String {
         vibex_ui::locale::Locale::En => format!("Last connected {days}d ago"),
         vibex_ui::locale::Locale::ZhCn => format!("上次连接：{days} 天前"),
         vibex_ui::locale::Locale::ZhTw => format!("上次連線：{days} 天前"),
+        _ => format!("Last connected {days}d ago"),
     }
 }
 
@@ -34792,6 +34796,7 @@ fn mobile_new_session_in_folder_label(folder_name: &str) -> String {
         Locale::En => format!("New chat in folder {folder_name}"),
         Locale::ZhCn => format!("在「{folder_name}」文件夹中新建会话"),
         Locale::ZhTw => format!("在「{folder_name}」資料夾中建立會話"),
+        _ => format!("New chat in folder {folder_name}"),
     }
 }
 
@@ -34954,6 +34959,7 @@ fn mobile_absolute_deadline_label(day_offset: u8, typed: &str) -> String {
     match locale::current() {
         Locale::En => format!("Send at {time} {day}"),
         Locale::ZhCn | Locale::ZhTw => format!("在{day} {time} 发送"),
+        _ => format!("Send at {time} {day}"),
     }
 }
 
@@ -34992,6 +34998,16 @@ fn mobile_reschedule_label(seconds: i64) -> String {
                 _ => "天",
             };
             format!("{value} {unit}後")
+        }
+        // The added languages read the English sentence; a translated one is a
+        // row in the shared catalogue keyed by this text.
+        other => {
+            let _ = other;
+            if value == 1 {
+                format!("In an {unit}")
+            } else {
+                format!("In {value} {unit}s")
+            }
         }
     }
 }
@@ -35041,6 +35057,13 @@ fn mobile_folder_archive_label(days: Option<u8>) -> String {
         }
         Locale::ZhCn => format!("{days}天后"),
         Locale::ZhTw => format!("{days}天後"),
+        _ => {
+            if days == 1 {
+                "After 1 day".to_string()
+            } else {
+                format!("After {days} days")
+            }
+        },
     }
 }
 
@@ -35054,6 +35077,7 @@ fn mobile_join_session_group_label(group_name: &str) -> String {
         Locale::En => format!("Add to {group_name}"),
         Locale::ZhCn => format!("加入「{group_name}」"),
         Locale::ZhTw => format!("加入「{group_name}」"),
+        _ => format!("Add to {group_name}"),
     }
 }
 
@@ -35181,6 +35205,7 @@ fn mobile_hidden_branch_summary(
             Locale::En => counts,
             Locale::ZhCn => format!("子会话：{counts}"),
             Locale::ZhTw => format!("子會話：{counts}"),
+            _ => counts,
         },
         asks_for_user: blocked_descendants > 0,
     })
@@ -36767,7 +36792,8 @@ fn session_sidebar_time_label_at(
             vibex_ui::locale::Locale::En => format!("{days} days ago"),
             vibex_ui::locale::Locale::ZhCn | vibex_ui::locale::Locale::ZhTw => {
                 format!("{days} 天前")
-            }
+            },
+            _ => format!("{days} days ago")
         };
     }
     if days < 30 {
@@ -36776,6 +36802,7 @@ fn session_sidebar_time_label_at(
             vibex_ui::locale::Locale::En => format!("{weeks} weeks ago"),
             vibex_ui::locale::Locale::ZhCn => format!("{weeks} 周前"),
             vibex_ui::locale::Locale::ZhTw => format!("{weeks} 週前"),
+            _ => format!("{weeks} weeks ago"),
         };
     }
     local_time.format("%m/%d").to_string()

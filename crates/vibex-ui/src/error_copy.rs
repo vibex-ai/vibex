@@ -368,6 +368,11 @@ fn formatted_error(locale: Locale, code: &str, message: &str) -> Option<String> 
                 Locale::En => unreachable!(),
                 Locale::ZhCn => format!("Codex 模型流在 {attempts} 次重连后失败"),
                 Locale::ZhTw => format!("Codex 模型串流在 {attempts} 次重新連線後失敗"),
+                other => crate::locale_copy::fill(
+                    other,
+                    "Codex model stream failed after {attempts} reconnect attempts",
+                    &[("attempts", attempts.to_string())],
+                ),
             };
             if detail.is_empty() {
                 Some(body)
@@ -419,6 +424,11 @@ fn retry_exhausted(locale: Locale, message: &str, subject: &str) -> Option<Strin
         Locale::En => unreachable!(),
         Locale::ZhCn => format!("{subject} 重试次数已耗尽"),
         Locale::ZhTw => format!("{subject} 重試次數已耗盡"),
+        other => crate::locale_copy::fill(
+            other,
+            "{subject} retry attempts exhausted",
+            &[("subject", subject.to_string())],
+        ),
     };
     if rest.is_empty() {
         return Some(body);
@@ -437,6 +447,14 @@ fn retry_exhausted(locale: Locale, message: &str, subject: &str) -> Option<Strin
                 Locale::En => unreachable!(),
                 Locale::ZhCn => format!("{body}（已尝试 {attempt} 次）"),
                 Locale::ZhTw => format!("{body}（已嘗試 {attempt} 次）"),
+                other => {
+                    let suffix = crate::locale_copy::fill(
+                        other,
+                        "(attempted {attempt} times)",
+                        &[("attempt", attempt.to_string())],
+                    );
+                    format!("{body}{suffix}")
+                }
             });
         }
     }

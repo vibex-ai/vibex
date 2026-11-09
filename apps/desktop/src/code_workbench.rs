@@ -10795,6 +10795,9 @@ impl CodeWorkbench {
                             locale::ResolvedLocale::ZhTw => {
                                 format!("終端機 {terminal_id} 已中斷連線")
                             }
+                            _ => {
+                                format!("Terminal {terminal_id} is no longer attached")
+                            }
                         },
                         cx,
                     )
@@ -13029,6 +13032,10 @@ impl Render for CodeWorkbench {
                                     "存在未儲存的緩衝區，編輯器仍停留在目前工作區；等待切換到 {}",
                                     pending.root.display()
                                 ),
+                                _ => format!(
+                                    "Dirty buffers keep the editor on the current workspace; pending {}",
+                                    pending.root.display()
+                                ),
                             },
                         ))
                         .child(
@@ -13842,6 +13849,7 @@ impl CodeRightRail {
                 locale::ResolvedLocale::En => format!("{destination} already exists"),
                 locale::ResolvedLocale::ZhCn => format!("{destination} 已存在"),
                 locale::ResolvedLocale::ZhTw => format!("{destination} 已存在"),
+                _ => format!("{destination} already exists"),
             });
             self.defer_inline_path_input_focus(window, cx);
             cx.notify();
@@ -13959,6 +13967,9 @@ impl CodeRightRail {
                     ),
                     locale::ResolvedLocale::ZhTw => format!(
                         "刪除 {path}？未儲存的編輯器內容仍可復原，不會被靜默關閉。"
+                    ),
+                    _ => format!(
+                        "Delete {path}? Dirty editor content remains recoverable and is not silently closed."
                     ),
                 })
                 .footer(
@@ -14887,6 +14898,7 @@ impl CodeRightRail {
             (FileSearchMode::Name, locale::ResolvedLocale::ZhTw) => {
                 format!("{} 個符合項目", results.len())
             }
+            (FileSearchMode::Name, _) => format!("{} matching items", results.len()),
             (FileSearchMode::Content, locale::ResolvedLocale::En) => {
                 format!("{} results in {} files", results.len(), file_count)
             }
@@ -14895,6 +14907,9 @@ impl CodeRightRail {
             }
             (FileSearchMode::Content, locale::ResolvedLocale::ZhTw) => {
                 format!("{} 個結果，位於 {} 個檔案中", results.len(), file_count)
+            }
+            (FileSearchMode::Content, _) => {
+                format!("{} results in {} files", results.len(), file_count)
             }
         };
         let mut rows = Vec::new();
@@ -15087,6 +15102,7 @@ impl CodeRightRail {
                             locale::ResolvedLocale::En => format!("Matching \"{typeahead}\""),
                             locale::ResolvedLocale::ZhCn => format!("匹配“{typeahead}”"),
                             locale::ResolvedLocale::ZhTw => format!("匹配「{typeahead}」"),
+                            _ => format!("Matching \"{typeahead}\""),
                         };
                         this.child(
                             div()
@@ -16869,6 +16885,9 @@ impl CodeRightRail {
                                                 }
                                                 locale::ResolvedLocale::ZhTw => {
                                                     format!("（{change_count} 個檔案）")
+                                                },
+                                                _ => {
+                                                    format!("({change_count} files)")
                                                 }
                                             }),
                                     ),
@@ -17208,6 +17227,7 @@ impl CodeRightRail {
                     locale::ResolvedLocale::En => format!("Select {path}"),
                     locale::ResolvedLocale::ZhCn => format!("选择 {path}"),
                     locale::ResolvedLocale::ZhTw => format!("選擇 {path}"),
+                    _ => format!("Select {path}"),
                 })
                 .child(git_selection_indicator(state, cx))
                 .on_click(cx.listener(move |this, _, _, cx| {
@@ -18227,6 +18247,9 @@ impl CodeRightRail {
                                     }
                                     locale::ResolvedLocale::ZhTw => {
                                         format!("還有 {} 個檔案", total_rows - 200)
+                                    },
+                                    _ => {
+                                        format!("{} more files", total_rows - 200)
                                     }
                                 }),
                         )
@@ -18977,6 +19000,7 @@ fn git_history_relative_time_at(
         return match resolved_locale {
             locale::ResolvedLocale::En => "Unknown",
             locale::ResolvedLocale::ZhCn | locale::ResolvedLocale::ZhTw => "未知",
+            _ => "Unknown",
         }
         .to_string();
     };
@@ -18991,7 +19015,8 @@ fn git_history_relative_time_at(
             locale::ResolvedLocale::En => format!("{seconds}s ago"),
             locale::ResolvedLocale::ZhCn | locale::ResolvedLocale::ZhTw => {
                 format!("{seconds}秒前")
-            }
+            },
+            _ => format!("{seconds}s ago")
         }
     } else if seconds < 3_600 {
         let minutes = seconds / 60;
@@ -18999,7 +19024,8 @@ fn git_history_relative_time_at(
             locale::ResolvedLocale::En => format!("{minutes}m ago"),
             locale::ResolvedLocale::ZhCn | locale::ResolvedLocale::ZhTw => {
                 format!("{minutes}分钟前")
-            }
+            },
+            _ => format!("{minutes}m ago")
         }
     } else if seconds < 6 * 3_600 {
         let hours = seconds / 3_600;
@@ -19007,18 +19033,21 @@ fn git_history_relative_time_at(
             locale::ResolvedLocale::En => format!("{hours}h ago"),
             locale::ResolvedLocale::ZhCn | locale::ResolvedLocale::ZhTw => {
                 format!("{hours}小时前")
-            }
+            },
+            _ => format!("{hours}h ago")
         }
     } else if day_delta == 0 {
         let relative = match resolved_locale {
             locale::ResolvedLocale::En => "today",
             locale::ResolvedLocale::ZhCn | locale::ResolvedLocale::ZhTw => "今天",
+            _ => "today",
         };
         format!("{relative} {}", timestamp.format("%H:%M"))
     } else if day_delta == 1 {
         let relative = match resolved_locale {
             locale::ResolvedLocale::En => "yesterday",
             locale::ResolvedLocale::ZhCn | locale::ResolvedLocale::ZhTw => "昨天",
+            _ => "yesterday",
         };
         format!("{relative} {}", timestamp.format("%H:%M"))
     } else {
@@ -19112,7 +19141,8 @@ fn git_history_date_label(
         locale::ResolvedLocale::En => timestamp.format("%Y-%m-%d").to_string(),
         locale::ResolvedLocale::ZhCn | locale::ResolvedLocale::ZhTw => {
             timestamp.format("%Y年%-m月%-d日").to_string()
-        }
+        },
+        _ => timestamp.format("%Y-%m-%d").to_string()
     }
 }
 
@@ -19127,7 +19157,8 @@ fn git_commit_authored_at(authored_at_ms: Option<i64>) -> String {
         locale::ResolvedLocale::En => timestamp.format("%b %-d, %Y, %H:%M").to_string(),
         locale::ResolvedLocale::ZhCn | locale::ResolvedLocale::ZhTw => {
             timestamp.format("%Y年%-m月%-d日 %H:%M").to_string()
-        }
+        },
+        _ => timestamp.format("%b %-d, %Y, %H:%M").to_string()
     }
 }
 
@@ -20107,6 +20138,13 @@ fn commit_file_count_label(file_count: usize) -> String {
         }
         locale::ResolvedLocale::ZhCn => format!("此提交中 {file_count} 个文件变更"),
         locale::ResolvedLocale::ZhTw => format!("此提交中 {file_count} 個檔案變更"),
+        _ => {
+            if file_count == 1 {
+                "1 changed file in this commit".to_string()
+            } else {
+                format!("{file_count} changed files in this commit")
+            }
+        },
     }
 }
 
@@ -20948,6 +20986,7 @@ fn localized_merge_action_label(target: &str) -> String {
         locale::ResolvedLocale::En => format!("Merge to {}", bounded_ref_label(target)),
         locale::ResolvedLocale::ZhCn => format!("合并到 {}", bounded_ref_label(target)),
         locale::ResolvedLocale::ZhTw => format!("合併到 {}", bounded_ref_label(target)),
+        _ => format!("Merge to {}", bounded_ref_label(target)),
     }
 }
 
@@ -20960,7 +20999,8 @@ fn localized_integration_action_label(target: &str, strategy: GitWorktreeMergeSt
             }
             locale::ResolvedLocale::ZhTw => {
                 format!("Rebase 到 {}", bounded_ref_label(target))
-            }
+            },
+            _ => format!("Rebase into {}", bounded_ref_label(target))
         };
     }
     localized_merge_action_label(target)
@@ -20990,12 +21030,14 @@ fn localized_conflict_title(source: &str, target: &str, rebase: bool) -> String 
             locale::ResolvedLocale::En => format!("Rebase paused: {source} -> {target}"),
             locale::ResolvedLocale::ZhCn => format!("Rebase 已暂停：{source} -> {target}"),
             locale::ResolvedLocale::ZhTw => format!("Rebase 已暫停：{source} -> {target}"),
+            _ => format!("Rebase paused: {source} -> {target}"),
         };
     }
     match locale::current_locale() {
         locale::ResolvedLocale::En => format!("Merge paused: {source} -> {target}"),
         locale::ResolvedLocale::ZhCn => format!("合并已暂停：{source} -> {target}"),
         locale::ResolvedLocale::ZhTw => format!("合併已暫停：{source} -> {target}"),
+        _ => format!("Merge paused: {source} -> {target}"),
     }
 }
 
@@ -21004,6 +21046,7 @@ fn localized_attention_title(source: &str, target: &str) -> String {
         locale::ResolvedLocale::En => format!("Merge needs attention: {source} -> {target}"),
         locale::ResolvedLocale::ZhCn => format!("合并需要处理：{source} -> {target}"),
         locale::ResolvedLocale::ZhTw => format!("合併需要處理：{source} -> {target}"),
+        _ => format!("Merge needs attention: {source} -> {target}"),
     }
 }
 
@@ -21012,6 +21055,7 @@ fn localized_conflict_count(count: usize) -> String {
         locale::ResolvedLocale::En => format!("{count} unresolved conflict(s)"),
         locale::ResolvedLocale::ZhCn => format!("{count} 个冲突未解决"),
         locale::ResolvedLocale::ZhTw => format!("{count} 個衝突未解決"),
+        _ => format!("{count} unresolved conflict(s)"),
     }
 }
 
@@ -21022,6 +21066,9 @@ fn localized_source_delta(count: u32) -> String {
         }
         locale::ResolvedLocale::ZhCn => format!("源分支新增 {count} 个提交，不包含在本次合并中"),
         locale::ResolvedLocale::ZhTw => format!("來源分支新增 {count} 個提交，不包含在本次合併中"),
+        _ => {
+            format!("{count} new source commit(s) are excluded from this merge")
+        },
     }
 }
 
@@ -21032,6 +21079,9 @@ fn localized_conflict_render_limit(limit: usize, total: usize) -> String {
         }
         locale::ResolvedLocale::ZhCn => format!("显示 {total} 个冲突中的前 {limit} 个"),
         locale::ResolvedLocale::ZhTw => format!("顯示 {total} 個衝突中的前 {limit} 個"),
+        _ => {
+            format!("Showing the first {limit} of {total} conflicts")
+        },
     }
 }
 
@@ -21041,6 +21091,7 @@ fn localized_use_version_label(branch: &str) -> String {
         locale::ResolvedLocale::En => format!("Use {branch}"),
         locale::ResolvedLocale::ZhCn => format!("使用 {branch}"),
         locale::ResolvedLocale::ZhTw => format!("使用 {branch}"),
+        _ => format!("Use {branch}"),
     }
 }
 
@@ -21111,6 +21162,18 @@ fn worktree_confirmation_copy(
                 ),
                 locale::ResolvedLocale::ZhTw => format!(
                     "{} -> {}，依固定提交整合。{} 個提交、{} 個檔案、+{} / -{}。{} 個 Agent 和 {} 個終端機保持獨立執行。{}",
+                    plan.source_branch,
+                    plan.target_branch,
+                    plan.summary.commit_count,
+                    plan.summary.file_count,
+                    plan.summary.additions,
+                    plan.summary.deletions,
+                    plan.running_consumers.agent_count,
+                    plan.running_consumers.terminal_count,
+                    merge_strategy_summary(*strategy),
+                ),
+                _ => format!(
+                    "{} -> {} at exact heads. {} commit(s), {} file(s), +{} / -{}. {} Agent(s) and {} terminal(s) remain independent. {}",
                     plan.source_branch,
                     plan.target_branch,
                     plan.summary.commit_count,

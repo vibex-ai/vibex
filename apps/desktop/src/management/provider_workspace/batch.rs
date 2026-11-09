@@ -166,6 +166,7 @@ impl ManagementCenter {
                             ResolvedLocale::En => format!("{count} selected"),
                             ResolvedLocale::ZhCn => format!("已选择 {count} 条"),
                             ResolvedLocale::ZhTw => format!("已選取 {count} 筆"),
+                            _ => format!("{count} selected"),
                         },
                     }),
             )
@@ -240,6 +241,7 @@ impl ManagementCenter {
                     ResolvedLocale::En => format!("Delete {count} selected records?"),
                     ResolvedLocale::ZhCn => format!("删除选中的 {count} 条记录？"),
                     ResolvedLocale::ZhTw => format!("刪除選取的 {count} 筆記錄？"),
+                    _ => format!("Delete {count} selected records?"),
                 })
                 .description(management_locale_text_for(
                     active_locale,
@@ -387,6 +389,9 @@ impl ManagementCenter {
                                     ResolvedLocale::ZhTw => {
                                         format!("{code}：{message}（已修改 {changed}/{total} 筆）")
                                     }
+                                    _ => {
+                                        format!("{code}: {message} ({changed} of {total} changed)")
+                                    }
                                 });
                             }
                             None => {
@@ -400,6 +405,7 @@ impl ManagementCenter {
                                     ResolvedLocale::ZhTw => {
                                         format!("已更新 {changed} 筆記錄")
                                     }
+                                    _ => format!("Updated {changed} record(s)"),
                                 });
                             }
                         }
@@ -461,6 +467,9 @@ impl ManagementCenter {
                                     ResolvedLocale::ZhTw => {
                                         format!("{code}：{message}（已刪除 {changed}/{total} 筆）")
                                     }
+                                    _ => {
+                                        format!("{code}: {message} ({changed} of {total} deleted)")
+                                    }
                                 });
                             }
                             None => {
@@ -474,6 +483,7 @@ impl ManagementCenter {
                                     ResolvedLocale::ZhTw => {
                                         format!("已刪除 {changed} 筆記錄")
                                     }
+                                    _ => format!("Deleted {changed} record(s)"),
                                 });
                             }
                         }

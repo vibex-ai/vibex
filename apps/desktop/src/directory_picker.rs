@@ -202,6 +202,209 @@ fn text(locale: ResolvedLocale, selection: PickerSelection) -> PickerText {
                 "No folders match"
             },
         },
+        ResolvedLocale::Ja => PickerText {
+            search_placeholder: if files {
+                "ファイルをフィルタリングするか、パスを入力して Enter キーを押します"
+            } else {
+                "フォルダーをフィルターするか、パスを入力して Enter キーを押します"
+            },
+            go_up: "上",
+            open_path: "このパスを開く",
+            places: "場所",
+            starred: "スター付き",
+            star_folder: "このフォルダにスターを付けます",
+            unstar_folder: "スター付きから削除",
+            home: "家",
+            choose_here: "開く",
+            choose_file: "ファイルを選択してください",
+            cancel: "キャンセル",
+            retry: "再試行",
+            loading: "読み込み中…",
+            empty: if files {
+                "ここにはファイルがありません"
+            } else {
+                "ここにはフォルダーがありません"
+            },
+            no_matches: if files {
+                "一致するファイルはありません"
+            } else {
+                "一致するフォルダーはありません"
+            },
+        },
+        ResolvedLocale::Ko => PickerText {
+            search_placeholder: if files {
+                "파일을 필터링하거나 경로를 입력하고 Enter를 누르세요."
+            } else {
+                "폴더를 필터링하거나 경로를 입력하고 Enter를 누르세요."
+            },
+            go_up: "위로",
+            open_path: "이 길을 열어주세요",
+            places: "장소",
+            starred: "별표 표시됨",
+            star_folder: "이 폴더에 별표 표시",
+            unstar_folder: "별표표시에서 삭제",
+            home: "집",
+            choose_here: "열기",
+            choose_file: "파일을 선택하세요",
+            cancel: "취소",
+            retry: "재시도",
+            loading: "로드 중…",
+            empty: if files {
+                "여기에는 파일이 없습니다"
+            } else {
+                "여기에는 폴더가 없습니다."
+            },
+            no_matches: if files {
+                "일치하는 파일이 없습니다."
+            } else {
+                "일치하는 폴더가 없습니다."
+            },
+        },
+        ResolvedLocale::De => PickerText {
+            search_placeholder: if files {
+                "Filtern Sie Dateien oder geben Sie einen Pfad ein und drücken Sie die Eingabetaste"
+            } else {
+                "Filtern Sie Ordner oder geben Sie einen Pfad ein und drücken Sie die Eingabetaste"
+            },
+            go_up: "Hoch",
+            open_path: "Öffnen Sie diesen Pfad",
+            places: "Orte",
+            starred: "Mit einem Stern versehen",
+            star_folder: "Markieren Sie diesen Ordner",
+            unstar_folder: "Aus der Markierung entfernen",
+            home: "Heim",
+            choose_here: "Offen",
+            choose_file: "Wählen Sie eine Datei",
+            cancel: "Abbrechen",
+            retry: "Versuchen Sie es noch einmal",
+            loading: "Laden…",
+            empty: if files {
+                "Keine Dateien hier"
+            } else {
+                "Keine Ordner hier"
+            },
+            no_matches: if files {
+                "Es stimmen keine Dateien überein"
+            } else {
+                "Es stimmen keine Ordner überein"
+            },
+        },
+        ResolvedLocale::Fr => PickerText {
+            search_placeholder: if files {
+                "Filtrez les fichiers ou saisissez un chemin et appuyez sur Entrée"
+            } else {
+                "Filtrez les dossiers ou saisissez un chemin et appuyez sur Entrée"
+            },
+            go_up: "En haut",
+            open_path: "Ouvrir ce chemin",
+            places: "Lieux",
+            starred: "Favoris",
+            star_folder: "Star ce dossier",
+            unstar_folder: "Supprimer des favoris",
+            home: "Maison",
+            choose_here: "Ouvert",
+            choose_file: "Choisissez un fichier",
+            cancel: "Annuler",
+            retry: "Réessayer",
+            loading: "Chargement…",
+            empty: if files {
+                "Aucun fichier ici"
+            } else {
+                "Aucun dossier ici"
+            },
+            no_matches: if files {
+                "Aucun fichier ne correspond"
+            } else {
+                "Aucun dossier ne correspond"
+            },
+        },
+        ResolvedLocale::Es => PickerText {
+            search_placeholder: if files {
+                "Filtrar archivos o escribir una ruta y presionar Enter"
+            } else {
+                "Filtrar carpetas o escribir una ruta y presionar Enter"
+            },
+            go_up: "Arriba",
+            open_path: "Abre este camino",
+            places: "Lugares",
+            starred: "Destacado",
+            star_folder: "Destacar esta carpeta",
+            unstar_folder: "Quitar de destacados",
+            home: "Hogar",
+            choose_here: "Abierto",
+            choose_file: "Elige un archivo",
+            cancel: "Cancelar",
+            retry: "Reintentar",
+            loading: "Cargando…",
+            empty: if files {
+                "No hay archivos aquí"
+            } else {
+                "No hay carpetas aquí"
+            },
+            no_matches: if files {
+                "Ningún archivo coincide"
+            } else {
+                "Ninguna carpeta coincide"
+            },
+        },
+        ResolvedLocale::PtBr => PickerText {
+            search_placeholder: if files {
+                "Filtre os arquivos ou digite um caminho e pressione Enter"
+            } else {
+                "Filtre as pastas ou digite um caminho e pressione Enter"
+            },
+            go_up: "Acima",
+            open_path: "Abra este caminho",
+            places: "Lugares",
+            starred: "Com estrela",
+            star_folder: "Marque esta pasta com estrela",
+            unstar_folder: "Remover da estrela",
+            home: "Lar",
+            choose_here: "Abrir",
+            choose_file: "Escolha um arquivo",
+            cancel: "Cancelar",
+            retry: "Tentar novamente",
+            loading: "Carregando…",
+            empty: if files {
+                "Nenhum arquivo aqui"
+            } else {
+                "Não há pastas aqui"
+            },
+            no_matches: if files {
+                "Nenhum arquivo corresponde"
+            } else {
+                "Nenhuma pasta corresponde"
+            },
+        },
+        ResolvedLocale::Ru => PickerText {
+            search_placeholder: if files {
+                "Отфильтруйте файлы или введите путь и нажмите Enter."
+            } else {
+                "Отфильтруйте папки или введите путь и нажмите Enter."
+            },
+            go_up: "Вверх",
+            open_path: "Открыть этот путь",
+            places: "Места",
+            starred: "Помечено",
+            star_folder: "Пометить эту папку",
+            unstar_folder: "Удалить из избранного",
+            home: "Дом",
+            choose_here: "Открыть",
+            choose_file: "Выберите файл",
+            cancel: "Отмена",
+            retry: "Повторить попытку",
+            loading: "Загрузка…",
+            empty: if files {
+                "Здесь нет файлов"
+            } else {
+                "Здесь нет папок"
+            },
+            no_matches: if files {
+                "Ни один файл не соответствует"
+            } else {
+                "Ни одна папка не соответствует"
+            },
+        },
         ResolvedLocale::ZhCn => PickerText {
             search_placeholder: if files {
                 "筛选文件，或输入路径后按 Enter"

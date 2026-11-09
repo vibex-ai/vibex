@@ -741,6 +741,132 @@ fn management_copy() -> ManagementCopy {
             import_mcp: "匯入已有 MCP",
             import_skill: "匯入已有 Skill",
         },
+        ResolvedLocale::Ja => ManagementCopy {
+            agents: "エージェント",
+            mcp: "MCP",
+            skills: "スキル",
+            prompts: "プロンプト",
+            providers: "プロバイダー",
+            search_agents: "検索エージェント",
+            search_mcp: "MCPを検索",
+            search_skills: "検索スキル",
+            search_prompts: "検索プロンプト",
+            add_configuration: "構成の追加",
+            import_configuration: "既存の構成をインポートする",
+            provider_configuration: "モデルプロバイダーの構成",
+            no_agents: "エージェントは追加されていません",
+            no_agents_description: "リストからエージェントを追加します。",
+            import_mcp: "既存の MCP をインポート",
+            import_skill: "既存のスキルをインポートする",
+        },
+        ResolvedLocale::Ko => ManagementCopy {
+            agents: "대리인",
+            mcp: "MCP",
+            skills: "기술",
+            prompts: "프롬프트",
+            providers: "공급자",
+            search_agents: "검색 에이전트",
+            search_mcp: "MCP 검색",
+            search_skills: "검색 기술",
+            search_prompts: "검색 프롬프트",
+            add_configuration: "구성 추가",
+            import_configuration: "기존 구성 가져오기",
+            provider_configuration: "모델 제공자 구성",
+            no_agents: "추가된 에이전트 없음",
+            no_agents_description: "목록에서 에이전트를 추가합니다.",
+            import_mcp: "기존 MCP 가져오기",
+            import_skill: "기존 기술 가져오기",
+        },
+        ResolvedLocale::De => ManagementCopy {
+            agents: "Agent",
+            mcp: "MCP",
+            skills: "Fähigkeiten",
+            prompts: "Prompt",
+            providers: "Anbieter",
+            search_agents: "Suchagent",
+            search_mcp: "Suchen Sie nach MCP",
+            search_skills: "Suchfähigkeiten",
+            search_prompts: "Suchaufforderungen",
+            add_configuration: "Konfiguration hinzufügen",
+            import_configuration: "Vorhandene Konfiguration importieren",
+            provider_configuration: "Konfiguration des Modellanbieters",
+            no_agents: "Kein Agent hinzugefügt",
+            no_agents_description: "Fügen Sie einen Agenten aus der Liste hinzu.",
+            import_mcp: "Vorhandenes MCP importieren",
+            import_skill: "Vorhandene Fähigkeiten importieren",
+        },
+        ResolvedLocale::Fr => ManagementCopy {
+            agents: "Agent",
+            mcp: "PCM",
+            skills: "Compétences",
+            prompts: "Invite",
+            providers: "Fournisseurs",
+            search_agents: "Agent de recherche",
+            search_mcp: "Rechercher MCP",
+            search_skills: "Compétences de recherche",
+            search_prompts: "Invites de recherche",
+            add_configuration: "Ajouter une configuration",
+            import_configuration: "Importer la configuration existante",
+            provider_configuration: "Configuration du fournisseur de modèles",
+            no_agents: "Aucun agent ajouté",
+            no_agents_description: "Ajoutez un agent dans la liste.",
+            import_mcp: "Importer un MCP existant",
+            import_skill: "Importer des compétences existantes",
+        },
+        ResolvedLocale::Es => ManagementCopy {
+            agents: "Agente",
+            mcp: "MCP",
+            skills: "Habilidades",
+            prompts: "rápido",
+            providers: "Proveedores",
+            search_agents: "Agente de búsqueda",
+            search_mcp: "Buscar MCP",
+            search_skills: "Habilidades de búsqueda",
+            search_prompts: "Mensajes de búsqueda",
+            add_configuration: "Agregar configuración",
+            import_configuration: "Importar configuración existente",
+            provider_configuration: "Configuración del proveedor de modelos",
+            no_agents: "No se agregó ningún agente",
+            no_agents_description: "Agregue un agente de la lista.",
+            import_mcp: "Importar MCP existente",
+            import_skill: "Importar habilidades existentes",
+        },
+        ResolvedLocale::PtBr => ManagementCopy {
+            agents: "Agente",
+            mcp: "PCM",
+            skills: "Habilidades",
+            prompts: "Alerta",
+            providers: "Provedores",
+            search_agents: "Agente de pesquisa",
+            search_mcp: "Pesquisar MCP",
+            search_skills: "Habilidades de pesquisa",
+            search_prompts: "Solicitações de pesquisa",
+            add_configuration: "Adicionar configuração",
+            import_configuration: "Importar configuração existente",
+            provider_configuration: "Configuração do provedor de modelo",
+            no_agents: "Nenhum agente adicionado",
+            no_agents_description: "Adicione um agente da lista.",
+            import_mcp: "Importar MCP Existente",
+            import_skill: "Importar habilidades existentes",
+        },
+        ResolvedLocale::Ru => ManagementCopy {
+            agents: "Агент",
+            mcp: "МКП",
+            skills: "Навыки",
+            prompts: "Подскажите",
+            providers: "Провайдеры",
+            search_agents: "Поисковый агент",
+            search_mcp: "Поиск MCP",
+            search_skills: "Навыки поиска",
+            search_prompts: "Поисковые запросы",
+            add_configuration: "Добавить конфигурацию",
+            import_configuration: "Импортировать существующую конфигурацию",
+            provider_configuration: "Конфигурация поставщика модели",
+            no_agents: "Агент не добавлен",
+            no_agents_description: "Добавьте агента из списка.",
+            import_mcp: "Импортировать существующий MCP",
+            import_skill: "Импортировать существующие навыки",
+        },
     }
 }
 
@@ -5463,6 +5589,7 @@ impl ManagementCenter {
             ResolvedLocale::En => format!("Discard unsaved {current} changes?"),
             ResolvedLocale::ZhCn => format!("放弃未保存的{current}修改？"),
             ResolvedLocale::ZhTw => format!("放棄未儲存的{current}修改？"),
+            _ => format!("Discard unsaved {current} changes?"),
         };
         window.open_dialog(cx, move |dialog, _, _| {
             let entity = entity.clone();
@@ -7949,6 +8076,7 @@ impl ManagementCenter {
             ResolvedLocale::En => format!("{} copy", profile.display_name),
             ResolvedLocale::ZhCn => format!("{} 副本", profile.display_name),
             ResolvedLocale::ZhTw => format!("{} 副本", profile.display_name),
+            _ => format!("{} copy", profile.display_name),
         };
         self.begin_simple_task(ManagementMutation::ProfileCreate, cx, async move {
             let agent_id = profile.agent_id.clone();
@@ -7983,6 +8111,9 @@ impl ManagementCenter {
                 }
                 ResolvedLocale::ZhTw => {
                     format!("已複製供應商配置 {}", created.display_name)
+                }
+                _ => {
+                    format!("Duplicated provider configuration {}", created.display_name)
                 }
             };
             Ok(message)
@@ -8690,6 +8821,9 @@ impl ManagementCenter {
                         ResolvedLocale::ZhTw => {
                             format!("已完成 {} 項健康檢查", result.results.len())
                         }
+                        _ => {
+                            format!("Completed {} health probe(s)", result.results.len())
+                        }
                     })
             },
         );
@@ -8723,6 +8857,9 @@ impl ManagementCenter {
                         }
                         ResolvedLocale::ZhTw => {
                             format!("已完成 {} 項能力檢查", result.results.len())
+                        }
+                        _ => {
+                            format!("Completed {} capability probe(s)", result.results.len())
                         }
                     })
             },
@@ -9066,6 +9203,7 @@ impl ManagementCenter {
                     ResolvedLocale::En => format!("Fetched {count} model(s)"),
                     ResolvedLocale::ZhCn => format!("已拉取 {count} 个模型"),
                     ResolvedLocale::ZhTw => format!("已擷取 {count} 個模型"),
+                    _ => format!("Fetched {count} model(s)"),
                 });
             }
             Ok(Err(error)) => {
@@ -9086,12 +9224,11 @@ impl ManagementCenter {
                         ResolvedLocale::ZhTw => {
                             format!("廠商清單不可用，已顯示目錄中的 {catalogue_count} 個模型")
                         }
+                        _ => format!(
+                            "The vendor list was unavailable; showing {catalogue_count} model(s) from the catalogue"
+                        ),
                     });
-                    self.navigation.mark_dirty(ManagementSection::Agents, true);
-                    cx.notify();
-                    return;
                 }
-                // A catalogue fetch answers the button the user just pressed,
                 // so its failure rides the dialog's failure lane — the light
                 // hint `present_feedback` puts above the dialog — rather than a
                 // band the dialog has to remember to clear. An automatic fetch
@@ -9376,6 +9513,10 @@ impl ManagementCenter {
             (ResolvedLocale::En, false) => format!("Delete {label}?"),
             (ResolvedLocale::ZhCn, false) => format!("删除“{label}”？"),
             (ResolvedLocale::ZhTw, false) => format!("刪除「{label}」？"),
+            // A language added after this dialog was written reads the English
+            // question; the catalogue carries the text under that key.
+            (_, true) => format!("Uninstall {label}?"),
+            (_, false) => format!("Delete {label}?"),
         };
         window.open_dialog(cx, move |dialog, _, _| {
             let entity = entity.clone();
@@ -10039,6 +10180,9 @@ impl ManagementCenter {
                         }
                         ResolvedLocale::ZhCn => format!("；已检测到 {count} 种认证方式"),
                         ResolvedLocale::ZhTw => format!("；已偵測到 {count} 種驗證方式"),
+                        _ => {
+                            format!("; {count} authentication method(s) detected")
+                        }
                     });
                 }
                 Err(error) => {
@@ -10051,6 +10195,9 @@ impl ManagementCenter {
                         }
                         ResolvedLocale::ZhTw => {
                             format!("；驗證方式待重新偵測（{}）", error.code)
+                        }
+                        _ => {
+                            format!("; authentication detection pending ({})", error.code)
                         }
                     });
                 }
@@ -10252,6 +10399,8 @@ impl ManagementCenter {
                 (ResolvedLocale::ZhTw, count) => {
                     format!("已發現並啟用 {count} 個本機 Agent CLI")
                 }
+                (_, 0) => "No installed local Agent CLI was found".to_string(),
+                (_, count) => format!("Found and enabled {count} local Agent CLI(s)"),
             };
             let message =
                 management_append_runtime_option_probe(message, Ok(option_refresh), active_locale);
@@ -10268,6 +10417,9 @@ impl ManagementCenter {
                             format!("{option_refresh_errors} 个 Agent 的运行选项探测失败"),
                         ResolvedLocale::ZhTw =>
                             format!("{option_refresh_errors} 個 Agent 的執行選項探測失敗"),
+                        _ => format!(
+                            "runtime option probing failed for {option_refresh_errors} Agent(s)"
+                        ),
                     }
                 ))
             }
@@ -10327,6 +10479,9 @@ impl ManagementCenter {
                         ResolvedLocale::ZhTw => {
                             format!("已檢測到並啟用 {}", response.agent.label)
                         }
+                        _ => {
+                            format!("{} was detected and enabled", response.agent.label)
+                        }
                     };
                     let refresh = backend
                         .agent()
@@ -10357,6 +10512,10 @@ impl ManagementCenter {
                         ResolvedLocale::ZhTw => {
                             format!("尚未安裝 {}，已開啟安裝頁面", response.agent.label)
                         }
+                        _ => format!(
+                            "{} is not installed; the installation page was opened",
+                            response.agent.label
+                        ),
                     });
                 }
                 Ok(match active_locale {
@@ -10368,6 +10527,9 @@ impl ManagementCenter {
                     }
                     ResolvedLocale::ZhTw => {
                         format!("未在此裝置上檢測到 {}", response.agent.label)
+                    }
+                    _ => {
+                        format!("{} was not found on this device", response.agent.label)
                     }
                 })
             },
@@ -11659,6 +11821,10 @@ impl ManagementCenter {
                             ResolvedLocale::ZhTw => {
                                 format!("發現 {} 個 MCP 候選項", discovery.discoveries.len())
                             }
+                            _ => format!(
+                                "Discovered {} MCP candidate(s)",
+                                discovery.discoveries.len()
+                            ),
                         });
                         this.mcp_discovery = Some(discovery);
                     }
@@ -12101,6 +12267,15 @@ impl ManagementCenter {
                                     String::new()
                                 } else {
                                     format!("，跳過 {skipped} 個無法接收 MCP 的 Agent")
+                                }
+                            ),
+                            _ => format!(
+                                "Installed {display_name} for {} Agent(s){}",
+                                result.enabled_agent_ids.len(),
+                                if skipped == 0 {
+                                    String::new()
+                                } else {
+                                    format!(", skipped {skipped} that cannot receive MCP")
                                 }
                             ),
                         });
@@ -12556,6 +12731,10 @@ impl ManagementCenter {
                                 "已為 {} 個 Agent 安裝 Skill {display_name}",
                                 result.enabled_agent_ids.len()
                             ),
+                            _ => format!(
+                                "Installed Skill {display_name} for {} Agent(s)",
+                                result.enabled_agent_ids.len()
+                            ),
                         });
                         this.refresh(cx);
                     }
@@ -12634,6 +12813,10 @@ impl ManagementCenter {
                             ),
                             ResolvedLocale::ZhTw => format!(
                                 "已匯入 {} 個 MCP 服務，更新 {} 個",
+                                result.created_count, result.updated_count
+                            ),
+                            _ => format!(
+                                "Imported {} MCP server(s), updated {}",
                                 result.created_count, result.updated_count
                             ),
                         });
@@ -12918,6 +13101,10 @@ impl ManagementCenter {
                             ResolvedLocale::ZhTw => {
                                 format!("發現 {} 個 Skill 候選項", discovery.discoveries.len())
                             }
+                            _ => format!(
+                                "Discovered {} Skill candidate(s)",
+                                discovery.discoveries.len()
+                            ),
                         });
                         this.skill_discovery = Some(discovery);
                     }
@@ -12997,6 +13184,10 @@ impl ManagementCenter {
                             ),
                             ResolvedLocale::ZhTw => format!(
                                 "已匯入 {} 個 Skill，更新 {} 個",
+                                result.created_count, result.updated_count
+                            ),
+                            _ => format!(
+                                "Imported {} Skill(s), updated {}",
                                 result.created_count, result.updated_count
                             ),
                         });
@@ -13282,6 +13473,9 @@ impl ManagementCenter {
                                 ResolvedLocale::ZhTw => {
                                     format!("已儲存提示詞 {}", prompt.display_name)
                                 }
+                                _ => {
+                                    format!("Saved Prompt {}", prompt.display_name)
+                                }
                             };
                             ManagementTaskSuccess::with_prompt(message, prompt)
                         })
@@ -13316,6 +13510,9 @@ impl ManagementCenter {
                                 }
                                 ResolvedLocale::ZhTw => {
                                     format!("已建立提示詞 {}", prompt.display_name)
+                                }
+                                _ => {
+                                    format!("Created Prompt {}", prompt.display_name)
                                 }
                             };
                             ManagementTaskSuccess::with_prompt(message, prompt)
@@ -13436,6 +13633,10 @@ impl ManagementCenter {
                         format!("已啟用 {}", prompt.display_name)
                     }
                     (ResolvedLocale::ZhTw, _) => format!("已停用 {}", prompt.display_name),
+                    (_, vibex_core::PromptStatus::Enabled) => {
+                        format!("Enabled {}", prompt.display_name)
+                    }
+                    (_, _) => format!("Disabled {}", prompt.display_name),
                 };
                 Ok(ManagementTaskSuccess::with_prompt(message, prompt))
             },
@@ -13480,6 +13681,7 @@ impl ManagementCenter {
                         ResolvedLocale::En => format!("Created Hook {}", hook.display_name),
                         ResolvedLocale::ZhCn => format!("已创建 Hook {}", hook.display_name),
                         ResolvedLocale::ZhTw => format!("已建立 Hook {}", hook.display_name),
+                        _ => format!("Created Hook {}", hook.display_name),
                     })
             },
         );
@@ -13734,6 +13936,9 @@ impl ManagementCenter {
                             ResolvedLocale::ZhTw => {
                                 format!("自動化圖已儲存為版本 {}", graph.version)
                             }
+                            _ => {
+                                format!("Saved graph at revision {}", graph.version)
+                            }
                         });
                         this.refresh(cx);
                     }
@@ -13884,6 +14089,7 @@ impl ManagementCenter {
                             ResolvedLocale::En => format!("Created graph {}", graph.title),
                             ResolvedLocale::ZhCn => format!("已创建自动化图 {}", graph.title),
                             ResolvedLocale::ZhTw => format!("已建立自動化圖 {}", graph.title),
+                            _ => format!("Created graph {}", graph.title),
                         });
                         this.refresh(cx);
                     }
@@ -13930,6 +14136,7 @@ impl ManagementCenter {
                         ResolvedLocale::En => format!("Automation run is {:?}", run.status),
                         ResolvedLocale::ZhCn => format!("自动化运行状态：{:?}", run.status),
                         ResolvedLocale::ZhTw => format!("自動化執行狀態：{:?}", run.status),
+                        _ => format!("Automation run is {:?}", run.status),
                     })
             },
         );
@@ -13959,6 +14166,7 @@ impl ManagementCenter {
                         ResolvedLocale::En => format!("Automation run is {:?}", run.status),
                         ResolvedLocale::ZhCn => format!("自动化运行状态：{:?}", run.status),
                         ResolvedLocale::ZhTw => format!("自動化執行狀態：{:?}", run.status),
+                        _ => format!("Automation run is {:?}", run.status),
                     })
             },
         );
@@ -13980,6 +14188,7 @@ impl ManagementCenter {
                 ResolvedLocale::En => format!("Archive automation graph {graph_title}?"),
                 ResolvedLocale::ZhCn => format!("归档自动化图“{graph_title}”？"),
                 ResolvedLocale::ZhTw => format!("封存自動化圖「{graph_title}」？"),
+                _ => format!("Archive automation graph {graph_title}?"),
             };
             dialog
                 .title(title)
@@ -14376,6 +14585,9 @@ impl ManagementCenter {
                         ResolvedLocale::ZhTw => {
                             format!("{code}：{message}（已匯入 {imported} 個）")
                         }
+                        _ => {
+                            format!("{code}: {message} (imported {imported})")
+                        }
                     });
                 }
                 if imported > 0 {
@@ -14396,6 +14608,10 @@ impl ManagementCenter {
                         (ResolvedLocale::ZhTw, missing) => format!(
                             "已匯入 {imported} 個供應商設定，其中 {missing} 個需要補充 API Key"
                         ),
+                        (_, 0) => format!("Imported {imported} configuration(s)"),
+                        (_, missing) => {
+                            format!("Imported {imported} configuration(s); {missing} need API Keys")
+                        }
                     });
                     this.apply_provider_profile_success(&imported_profiles);
                 }
@@ -14529,6 +14745,12 @@ impl ManagementCenter {
                                     preview.files.len(),
                                     preview.diagnostics.len()
                                 ),
+                                _ => format!(
+                                    "Export preview {}: {} file(s), {} diagnostic(s)",
+                                    preview.export_id,
+                                    preview.files.len(),
+                                    preview.diagnostics.len()
+                                ),
                             });
                             this.native_export_preview = Some(preview);
                         }
@@ -14578,6 +14800,7 @@ impl ManagementCenter {
                         ResolvedLocale::En => format!("Native export {:?}", result.status),
                         ResolvedLocale::ZhCn => format!("原生配置导出：{:?}", result.status),
                         ResolvedLocale::ZhTw => format!("原生配置匯出：{:?}", result.status),
+                        _ => format!("Native export {:?}", result.status),
                     })
             },
         );
@@ -14607,6 +14830,7 @@ impl ManagementCenter {
                         ResolvedLocale::En => format!("Native rollback {:?}", result.status),
                         ResolvedLocale::ZhCn => format!("原生配置回滚：{:?}", result.status),
                         ResolvedLocale::ZhTw => format!("原生配置回復：{:?}", result.status),
+                        _ => format!("Native rollback {:?}", result.status),
                     })
             },
         );
@@ -15883,6 +16107,7 @@ impl ManagementCenter {
             ResolvedLocale::En => format!("Delete {label}?"),
             ResolvedLocale::ZhCn => format!("删除“{label}”？"),
             ResolvedLocale::ZhTw => format!("刪除「{label}」？"),
+            _ => format!("Delete {label}?"),
         };
         window.open_alert_dialog(cx, move |alert, _, _| {
             let entity = entity.clone();
@@ -16041,6 +16266,7 @@ impl ManagementCenter {
                 ResolvedLocale::En => format!("Remove the default source {label}?"),
                 ResolvedLocale::ZhCn => format!("移除默认模型来源“{label}”？"),
                 ResolvedLocale::ZhTw => format!("移除預設模型來源「{label}」？"),
+                _ => format!("Remove the default source {label}?"),
             };
             let agent = agent_id.as_str().to_string();
             window.open_dialog(cx, move |dialog, _, _| {
@@ -16460,6 +16686,7 @@ impl ManagementCenter {
             ResolvedLocale::En => format!("Removed the {} template", preset.display_name),
             ResolvedLocale::ZhCn => format!("已移除“{}”模板", preset.display_name),
             ResolvedLocale::ZhTw => format!("已移除「{}」範本", preset.display_name),
+            _ => format!("Removed the {} template", preset.display_name),
         });
         cx.notify();
     }
@@ -16480,6 +16707,7 @@ impl ManagementCenter {
             ResolvedLocale::En => format!("Remove the {} template?", preset.display_name),
             ResolvedLocale::ZhCn => format!("移除“{}”模板？", preset.display_name),
             ResolvedLocale::ZhTw => format!("移除「{}」範本？", preset.display_name),
+            _ => format!("Remove the {} template?", preset.display_name),
         };
         window.open_alert_dialog(cx, move |alert, _, _| {
             let entity = entity.clone();
@@ -25917,6 +26145,7 @@ impl ManagementCenter {
             ResolvedLocale::En => format!("Using the {} preset", preset.display_name),
             ResolvedLocale::ZhCn => format!("已使用 {} 预设", preset.display_name),
             ResolvedLocale::ZhTw => format!("已使用 {} 預設", preset.display_name),
+            _ => format!("Using the {} preset", preset.display_name),
         });
         self.navigation.mark_dirty(ManagementSection::Agents, true);
         // The preset itself never fetches; the debounce becomes relevant once
@@ -29436,6 +29665,9 @@ impl ManagementCenter {
                     ResolvedLocale::ZhTw => format!(
                         "將移除「{label}」，所有使用它的 Agent 都會失去這些模型。"
                     ),
+                    _ => format!(
+                        "\u{201c}{label}\u{201d} will be removed, and every Agent using it loses these models."
+                    ),
                 })
                 .confirm()
                 .ok_text(management_locale_text_for(
@@ -32781,6 +33013,9 @@ impl ManagementCenter {
                 ResolvedLocale::ZhTw => {
                     format!("已更新 ACP 配置 {}", profile.display_name)
                 }
+                _ => {
+                    format!("Updated ACP configuration {}", profile.display_name)
+                }
             };
             Ok(message)
         });
@@ -33099,6 +33334,7 @@ impl ManagementCenter {
                             ResolvedLocale::En => format!("Process pool fallback: {fallback}"),
                             ResolvedLocale::ZhCn => format!("进程池回退：{fallback}"),
                             ResolvedLocale::ZhTw => format!("程序池回退：{fallback}"),
+                            _ => format!("Process pool fallback: {fallback}"),
                         },
                         false,
                         cx,
@@ -33412,6 +33648,10 @@ impl ManagementCenter {
                                         ),
                                         ResolvedLocale::ZhTw => format!(
                                             "{} 個檔案 · {} 個被阻止",
+                                            record.file_count, record.blocked_count
+                                        ),
+                                        _ => format!(
+                                            "{} file(s) · {} blocked",
                                             record.file_count, record.blocked_count
                                         ),
                                     }),
@@ -34065,6 +34305,7 @@ impl ManagementCenter {
                     ResolvedLocale::En => format!("Updated scheduled task {}", task.title),
                     ResolvedLocale::ZhCn => format!("已更新定时任务 {}", task.title),
                     ResolvedLocale::ZhTw => format!("已更新排程任務 {}", task.title),
+                    _ => format!("Updated scheduled task {}", task.title),
                 })
         });
     }
@@ -34166,6 +34407,9 @@ impl ManagementCenter {
                             }
                             ResolvedLocale::ZhTw => {
                                 format!("已建立排程任務 {}", task.title)
+                            }
+                            _ => {
+                                format!("Created scheduled task {}", task.title)
                             }
                         });
                         this.refresh(cx);
@@ -34480,6 +34724,12 @@ impl ManagementCenter {
                                     graph.version,
                                     graph.nodes.len()
                                 ),
+                                _ => format!(
+                                    "{:?} · v{} · {} node(s)",
+                                    graph.status,
+                                    graph.version,
+                                    graph.nodes.len()
+                                ),
                             }),
                     ),
             );
@@ -34717,6 +34967,7 @@ impl ManagementCenter {
                             ResolvedLocale::En => format!("Draft: {}", draft.title),
                             ResolvedLocale::ZhCn => format!("草稿：{}", draft.title),
                             ResolvedLocale::ZhTw => format!("草稿：{}", draft.title),
+                            _ => format!("Draft: {}", draft.title),
                         }),
                 )
                 .child(
@@ -34738,6 +34989,12 @@ impl ManagementCenter {
                             ),
                             ResolvedLocale::ZhTw => format!(
                                 "{} 個節點、{} 條連線，基礎版本 {:?}",
+                                draft.nodes.len(),
+                                draft.edges.len(),
+                                draft.base_version
+                            ),
+                            _ => format!(
+                                "{} node(s), {} edge(s), base revision {:?}",
                                 draft.nodes.len(),
                                 draft.edges.len(),
                                 draft.base_version
@@ -34787,6 +35044,15 @@ impl ManagementCenter {
                             ),
                             ResolvedLocale::ZhTw => format!(
                                 "{} 個驗證問題：{}",
+                                issues.len(),
+                                issues
+                                    .iter()
+                                    .map(|issue| issue.code)
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            ),
+                            _ => format!(
+                                "{} validation issue(s): {}",
                                 issues.len(),
                                 issues
                                     .iter()
@@ -34981,6 +35247,9 @@ impl ManagementCenter {
                                                         ResolvedLocale::ZhTw => {
                                                             format!("執行 {} 已啟動", run.id)
                                                         }
+                                                        _ => {
+                                                            format!("Run {} started", run.id)
+                                                        }
                                                     })
                                             },
                                         );
@@ -35014,6 +35283,9 @@ impl ManagementCenter {
                             }
                             ResolvedLocale::ZhTw => {
                                 format!("自動化圖狀態 {:?} 無法啟動新執行", graph.status)
+                            }
+                            _ => {
+                                format!("Graph status {:?} cannot start a new run", graph.status)
                             }
                         },
                         false,
@@ -35112,6 +35384,7 @@ impl ManagementCenter {
                 ResolvedLocale::En => format!("Backup created at {}", outcome.backup_dir),
                 ResolvedLocale::ZhCn => format!("备份已创建：{}", outcome.backup_dir),
                 ResolvedLocale::ZhTw => format!("備份已建立：{}", outcome.backup_dir),
+                _ => format!("Backup created at {}", outcome.backup_dir),
             };
             Ok(ManagementTaskSuccess::with_recovery_destination(
                 message,
@@ -35155,6 +35428,10 @@ impl ManagementCenter {
                     "備份驗證通過：資料庫結構版本 {}，{:?}",
                     outcome.database_schema_version, outcome.migration_compatibility
                 ),
+                _ => format!(
+                    "Backup verified: schema {}, {:?}",
+                    outcome.database_schema_version, outcome.migration_compatibility
+                ),
             };
             Ok(ManagementTaskSuccess::with_recovery_destination(
                 message,
@@ -35191,6 +35468,7 @@ impl ManagementCenter {
                 ResolvedLocale::En => format!("Backup restored: {:?}", outcome.status),
                 ResolvedLocale::ZhCn => format!("备份已恢复：{:?}", outcome.status),
                 ResolvedLocale::ZhTw => format!("備份已復原：{:?}", outcome.status),
+                _ => format!("Backup restored: {:?}", outcome.status),
             };
             Ok(ManagementTaskSuccess::with_recovery_destination(
                 message,
@@ -35440,6 +35718,7 @@ impl ManagementCenter {
                     ResolvedLocale::En => format!("Recovery error: {code}"),
                     ResolvedLocale::ZhCn => format!("恢复错误：{code}"),
                     ResolvedLocale::ZhTw => format!("復原錯誤：{code}"),
+                    _ => format!("Recovery error: {code}"),
                 },
                 true,
                 cx,
@@ -36381,6 +36660,7 @@ fn management_locale_text_for(
         ResolvedLocale::En => en,
         ResolvedLocale::ZhCn => zh_cn,
         ResolvedLocale::ZhTw => zh_tw,
+        _ => en,
     }
 }
 
@@ -36650,6 +36930,7 @@ fn declared_reasoning_efforts_error(reason: &str) -> String {
         ResolvedLocale::En => format!("Thinking levels were not saved: {reason}"),
         ResolvedLocale::ZhCn => format!("思考档位没有写入：{reason}"),
         ResolvedLocale::ZhTw => format!("思考檔位沒有寫入：{reason}"),
+        _ => format!("Thinking levels were not saved: {reason}"),
     }
 }
 
@@ -36690,6 +36971,7 @@ fn protocol_override_count(count: usize) -> String {
         ResolvedLocale::En => format!("{count} set"),
         ResolvedLocale::ZhCn => format!("已设置 {count} 项"),
         ResolvedLocale::ZhTw => format!("已設定 {count} 項"),
+        _ => format!("{count} set"),
     }
 }
 
@@ -36725,6 +37007,7 @@ fn profile_model_limits_label(
                 parts.push(match locale::current_locale() {
                     ResolvedLocale::En => format!("{context} context"),
                     ResolvedLocale::ZhCn | ResolvedLocale::ZhTw => format!("上下文 {context}"),
+                    _ => format!("{context} context"),
                 });
             }
             if let Some(output) = output {
@@ -36732,6 +37015,7 @@ fn profile_model_limits_label(
                     ResolvedLocale::En => format!("{output} output"),
                     ResolvedLocale::ZhCn => format!("输出 {output}"),
                     ResolvedLocale::ZhTw => format!("輸出 {output}"),
+                    _ => format!("{output} output"),
                 });
             }
             Some(parts.join(" · "))
@@ -37277,6 +37561,7 @@ fn native_import_empty_reason(
                     }
                     ResolvedLocale::ZhCn => "未找到 CC Switch 数据库，无法导入配置".to_string(),
                     ResolvedLocale::ZhTw => "未找到 CC Switch 資料庫，無法匯入設定".to_string(),
+                    _ => "The CC Switch provider database was not found".to_string(),
                 },
             };
         }
@@ -37287,6 +37572,9 @@ fn native_import_empty_reason(
                 }
                 ResolvedLocale::ZhCn => format!("CC Switch 中没有 {label} 的供应商配置"),
                 ResolvedLocale::ZhTw => format!("CC Switch 中沒有 {label} 的供應商設定"),
+                _ => {
+                    format!("CC Switch has no provider configuration for {label}")
+                }
             },
         };
     }
@@ -37302,6 +37590,9 @@ fn native_import_empty_reason(
                 }
                 ResolvedLocale::ZhCn => format!("{label} 的 CC Switch 供应商配置已全部导入"),
                 ResolvedLocale::ZhTw => format!("{label} 的 CC Switch 供應商設定已全部匯入"),
+                _ => {
+                    format!("Every {label} provider in CC Switch is already imported")
+                }
             },
         };
     }
@@ -37316,6 +37607,9 @@ fn native_import_empty_reason(
             }
             ResolvedLocale::ZhTw => {
                 format!("{label} 在 CC Switch 中的供應商設定存在解析錯誤，無法匯入")
+            }
+            _ => {
+                format!("Every {label} provider in CC Switch is blocked by a parse error")
             }
         },
     }
@@ -39225,6 +39519,7 @@ fn market_installs_label(installs: u64) -> String {
         ResolvedLocale::En => format!("{compact} installs"),
         ResolvedLocale::ZhCn => format!("{compact} 次安装"),
         ResolvedLocale::ZhTw => format!("{compact} 次安裝"),
+        _ => format!("{compact} installs"),
     }
 }
 
@@ -39304,6 +39599,8 @@ fn market_entry_env_summary(entry: &vibex_core::McpMarketEntry) -> Option<String
         (ResolvedLocale::ZhTw, required) => format!("{total} 個變數，其中 {required} 個必填"),
         (ResolvedLocale::En, 0) => format!("{total} optional variables"),
         (ResolvedLocale::En, required) => format!("{required} of {total} variables required"),
+        (_, 0) => format!("{total} optional variables"),
+        (_, required) => format!("{required} of {total} variables required"),
     })
 }
 
@@ -40067,6 +40364,7 @@ fn management_market_result_count(shown: usize, total: usize) -> String {
         ResolvedLocale::En => format!("Showing {shown} of {total}"),
         ResolvedLocale::ZhCn => format!("已显示 {shown} / {total}"),
         ResolvedLocale::ZhTw => format!("已顯示 {shown} / {total}"),
+        _ => format!("Showing {shown} of {total}"),
     }
 }
 
@@ -41026,6 +41324,7 @@ fn provider_protocol_url_override_label(wire_api: vibex_core::ProviderModelWireA
         ResolvedLocale::En => format!("{protocol} URL override"),
         ResolvedLocale::ZhCn => format!("{protocol} URL 覆盖"),
         ResolvedLocale::ZhTw => format!("{protocol} URL 覆寫"),
+        _ => format!("{protocol} URL override"),
     }
 }
 
@@ -42232,6 +42531,7 @@ fn management_route_group_model_count(count: usize) -> String {
         ResolvedLocale::En => format!("{count} model{}", if count == 1 { "" } else { "s" }),
         ResolvedLocale::ZhCn => format!("{count} 个模型"),
         ResolvedLocale::ZhTw => format!("{count} 個模型"),
+        _ => format!("{count} model{}", if count == 1 { "" } else { "s" }),
     }
 }
 
@@ -42280,6 +42580,7 @@ fn management_route_group_member_count(count: usize) -> String {
         ResolvedLocale::En => format!("{count} member{}", if count == 1 { "" } else { "s" }),
         ResolvedLocale::ZhCn => format!("{count} 个成员"),
         ResolvedLocale::ZhTw => format!("{count} 個成員"),
+        _ => format!("{count} member{}", if count == 1 { "" } else { "s" }),
     }
 }
 
@@ -42310,6 +42611,7 @@ fn management_route_group_users_label(count: usize) -> String {
         ResolvedLocale::En => format!("{count} Agents"),
         ResolvedLocale::ZhCn => format!("{count} 个 Agent 在用"),
         ResolvedLocale::ZhTw => format!("{count} 個 Agent 在用"),
+        _ => format!("{count} Agents"),
     }
 }
 
@@ -42324,6 +42626,7 @@ fn management_catalog_age_label(fetched_at_ms: i64) -> String {
             ResolvedLocale::En => format!("{minutes}m ago"),
             ResolvedLocale::ZhCn => format!("{minutes} 分钟前"),
             ResolvedLocale::ZhTw => format!("{minutes} 分鐘前"),
+            _ => format!("{minutes}m ago"),
         }
     } else if minutes < 24 * 60 {
         let hours = minutes / 60;
@@ -42331,6 +42634,7 @@ fn management_catalog_age_label(fetched_at_ms: i64) -> String {
             ResolvedLocale::En => format!("{hours}h ago"),
             ResolvedLocale::ZhCn => format!("{hours} 小时前"),
             ResolvedLocale::ZhTw => format!("{hours} 小時前"),
+            _ => format!("{hours}h ago"),
         }
     } else {
         let days = minutes / (24 * 60);
@@ -42338,6 +42642,7 @@ fn management_catalog_age_label(fetched_at_ms: i64) -> String {
             ResolvedLocale::En => format!("{days}d ago"),
             ResolvedLocale::ZhCn => format!("{days} 天前"),
             ResolvedLocale::ZhTw => format!("{days} 天前"),
+            _ => format!("{days}d ago"),
         }
     }
 }
@@ -42410,6 +42715,17 @@ fn management_route_strategy_label(strategy: vibex_core::RouteStrategy) -> Strin
         (vibex_core::RouteStrategy::Manual, ResolvedLocale::En) => "Manual",
         (vibex_core::RouteStrategy::Manual, ResolvedLocale::ZhCn) => "手动",
         (vibex_core::RouteStrategy::Manual, ResolvedLocale::ZhTw) => "手動",
+        // A language added after these names were written reads the English
+        // name; the catalogue carries each one under exactly that text.
+        (strategy, _) => match strategy {
+            vibex_core::RouteStrategy::Ordered => "In order",
+            vibex_core::RouteStrategy::RoundRobin => "Rotate",
+            vibex_core::RouteStrategy::LeastUsed => "Least used",
+            vibex_core::RouteStrategy::Smart => "Smart",
+            vibex_core::RouteStrategy::LowestLatency => "Lowest latency",
+            vibex_core::RouteStrategy::Weighted => "By weight",
+            vibex_core::RouteStrategy::Manual => "Manual",
+        },
     };
     label.to_string()
 }
@@ -42464,6 +42780,21 @@ fn management_route_strategy_guidance(strategy: vibex_core::RouteStrategy) -> St
         }
         (vibex_core::RouteStrategy::Manual, ResolvedLocale::ZhCn) => "始终使用你选中的那一个成员。",
         (vibex_core::RouteStrategy::Manual, ResolvedLocale::ZhTw) => "始終使用你選中的那一個成員。",
+        (strategy, _) => match strategy {
+            vibex_core::RouteStrategy::Ordered => "Try members in the order you arranged them.",
+            vibex_core::RouteStrategy::RoundRobin => "Spread requests across members turn by turn.",
+            vibex_core::RouteStrategy::LeastUsed => {
+                "Prefer the member that has carried the fewest tokens."
+            }
+            vibex_core::RouteStrategy::Smart => {
+                "Prefer healthy members, then the recently fastest, then the least busy."
+            }
+            vibex_core::RouteStrategy::LowestLatency => {
+                "Prefer the member with the lowest observed latency."
+            }
+            vibex_core::RouteStrategy::Weighted => "Share requests by each member's weight.",
+            vibex_core::RouteStrategy::Manual => "Always use the one member you pick.",
+        },
     }
     .to_string()
 }
@@ -42473,6 +42804,7 @@ fn management_profile_count(count: usize) -> String {
         ResolvedLocale::En => format!("{count} configuration(s)"),
         ResolvedLocale::ZhCn => format!("{count} 个配置"),
         ResolvedLocale::ZhTw => format!("{count} 個配置"),
+        _ => format!("{count} configuration(s)"),
     }
 }
 
@@ -42481,6 +42813,7 @@ fn management_enabled_agent_count(count: usize) -> String {
         ResolvedLocale::En => format!("{count} enabled agents"),
         ResolvedLocale::ZhCn => format!("{count} 个已启用 Agent"),
         ResolvedLocale::ZhTw => format!("{count} 個已啟用 Agent"),
+        _ => format!("{count} enabled agents"),
     }
 }
 
@@ -43164,6 +43497,7 @@ fn management_model_count(count: usize) -> String {
         ResolvedLocale::En => format!("{count} model(s)"),
         ResolvedLocale::ZhCn => format!("{count} 个模型"),
         ResolvedLocale::ZhTw => format!("{count} 個模型"),
+        _ => format!("{count} model(s)"),
     }
 }
 
@@ -43278,6 +43612,16 @@ fn management_runtime_option_probe_message(
         }
         (ResolvedLocale::ZhTw, detected, failed, cached) => {
             format!("Agent 執行選項：{detected} 個已探測，{cached} 個已快取，{failed} 個失敗")
+        }
+        // The added languages read the English probe report.
+        (_, 0, 0, 0) => "Agent runtime option probe was not started".into(),
+        (_, detected, 0, 0) => {
+            format!("Detected and cached runtime options for {detected} Agent(s)")
+        }
+        (_, 0, 0, cached) => format!("Using cached runtime options for {cached} Agent(s)"),
+        (_, 0, failed, 0) => format!("Runtime option probing failed for {failed} Agent(s)"),
+        (_, detected, failed, cached) => {
+            format!("Agent runtime options: {detected} detected, {cached} cached, {failed} failed")
         }
     }
 }

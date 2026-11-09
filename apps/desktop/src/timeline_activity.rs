@@ -35,11 +35,10 @@ pub(super) fn row_duration(
 }
 
 pub(super) fn current_locale() -> vibex_ui::locale::Locale {
-    match locale::current_locale() {
-        locale::ResolvedLocale::En => vibex_ui::locale::Locale::En,
-        locale::ResolvedLocale::ZhCn => vibex_ui::locale::Locale::ZhCn,
-        locale::ResolvedLocale::ZhTw => vibex_ui::locale::Locale::ZhTw,
-    }
+    // The shared projection reads the same catalogue as the rest of the
+    // interface, so the bridge must pass the resolved locale through instead of
+    // collapsing everything but the three shipped languages to English.
+    locale::current_locale().shared()
 }
 
 pub(super) fn project(row: &TimelineRow, payload: Option<&TimelinePayload>) -> Activity {

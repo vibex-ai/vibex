@@ -607,6 +607,7 @@ impl UsageView {
             locale::ResolvedLocale::En => format!("All {label}"),
             locale::ResolvedLocale::ZhCn => format!("全部{label}"),
             locale::ResolvedLocale::ZhTw => format!("全部{label}"),
+            _ => format!("All {label}"),
         };
         let entity = cx.weak_entity();
         Button::new(SharedString::from(format!("usage-filter-{kind:?}")))
@@ -1688,6 +1689,11 @@ fn month_label(month: u32) -> String {
             .unwrap_or_default()
             .to_string(),
         locale::ResolvedLocale::ZhCn | locale::ResolvedLocale::ZhTw => format!("{month}月"),
+        _ => ENGLISH
+            .get(month.saturating_sub(1) as usize)
+            .copied()
+            .unwrap_or_default()
+            .to_string(),
     }
 }
 
@@ -2625,6 +2631,13 @@ fn metric_detail(metric: &AgentUsageMetricValue) -> String {
                 metric.known_requests,
                 metric.derived_requests
             ),
+            _ => format!(
+                "{}; known for {} of {} requests, including {} derived from input + output",
+                metric_coverage_label(metric.coverage),
+                metric.known_requests,
+                metric.total_requests,
+                metric.derived_requests
+            ),
         };
     }
     match locale::current_locale() {
@@ -2645,6 +2658,12 @@ fn metric_detail(metric: &AgentUsageMetricValue) -> String {
             metric_coverage_label(metric.coverage),
             metric.total_requests,
             metric.known_requests
+        ),
+        _ => format!(
+            "{}; reported for {} of {} requests",
+            metric_coverage_label(metric.coverage),
+            metric.known_requests,
+            metric.total_requests
         ),
     }
 }
@@ -2672,6 +2691,14 @@ fn cache_hit_detail(rate: &vibex_core::AgentUsageCacheHitRate) -> String {
             metric_coverage_label(rate.coverage),
             rate.total_requests,
             rate.eligible_requests,
+            format_full_number(rate.cached_read_tokens),
+            format_full_number(rate.denominator_tokens)
+        ),
+        _ => format!(
+            "{}; {} of {} requests eligible; {} cached read tokens / {} input + cached read tokens",
+            metric_coverage_label(rate.coverage),
+            rate.eligible_requests,
+            rate.total_requests,
             format_full_number(rate.cached_read_tokens),
             format_full_number(rate.denominator_tokens)
         ),
@@ -2713,6 +2740,14 @@ fn coverage_detail(aggregate: &AgentUsageAggregate) -> String {
         ),
         locale::ResolvedLocale::ZhTw => format!(
             "回報覆蓋：{} 完整，{} 部分，{} 僅基線，{} 未回報，{} 不支援",
+            coverage.complete_requests,
+            coverage.partial_requests,
+            coverage.baseline_only_requests,
+            coverage.unreported_requests,
+            coverage.unsupported_requests
+        ),
+        _ => format!(
+            "Reporting: {} complete, {} partial, {} baseline only, {} unreported, {} unsupported",
             coverage.complete_requests,
             coverage.partial_requests,
             coverage.baseline_only_requests,

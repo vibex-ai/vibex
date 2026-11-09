@@ -697,6 +697,10 @@ fn format_clock_at<Tz: chrono::TimeZone>(local: chrono::DateTime<Tz>, locale: Lo
             format!("{hour}:{minute:02} {meridiem}")
         }
         Locale::ZhCn | Locale::ZhTw => format!("{hour:02}:{minute:02}"),
+        // The added languages read a 24-hour clock; an English AM/PM label
+        // would be the one thing on the line that is neither translated nor
+        // the local convention.
+        _ => format!("{hour:02}:{minute:02}"),
     }
 }
 

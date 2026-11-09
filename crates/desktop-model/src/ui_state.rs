@@ -85,6 +85,13 @@ pub enum LocaleMode {
     En,
     ZhCn,
     ZhTw,
+    Ja,
+    Ko,
+    De,
+    Fr,
+    Es,
+    PtBr,
+    Ru,
     #[default]
     System,
 }

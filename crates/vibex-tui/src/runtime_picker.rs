@@ -141,7 +141,7 @@ pub enum RuntimePickerSection {
 impl RuntimePickerSection {
     pub const ALL: [Self; 2] = [Self::Recent, Self::Favorites];
 
-    pub const fn label(self, strings: &Strings) -> &'static str {
+    pub fn label(self, strings: &Strings) -> &'static str {
         match self {
             Self::Recent => strings.runtime_recent(),
             Self::Favorites => strings.runtime_favorites(),
@@ -177,7 +177,7 @@ impl RuntimeEntryStatus {
     }
 
     /// The words for it, or nothing when the row speaks for itself.
-    pub const fn label(self, strings: &Strings) -> Option<&'static str> {
+    pub fn label(self, strings: &Strings) -> Option<&'static str> {
         match self {
             Self::Ready => None,
             Self::Switching => Some(strings.runtime_switching()),
