@@ -125,13 +125,7 @@ Vibex 将 Agent 会话、源代码、Git、终端、内嵌浏览器、电脑操�
 
 </td>
 <td width="50%">
-  <table>
-    <tr>
-      <td width="33%" valign="top"><img src="docs/assets/features/mobile-sessions-zh.webp" alt="Android 客户端列出同一项目的桌面会话" width="100%" /></td>
-      <td width="33%" valign="top"><img src="docs/assets/features/mobile-session-zh.webp" alt="Android 客户端流式渲染同一条会话时间线，含审批卡片与输入框" width="100%" /></td>
-      <td width="33%" valign="top"><img src="docs/assets/features/mobile-files-zh.webp" alt="Android 客户端浏览工作区文件、变更与终端" width="100%" /></td>
-    </tr>
-  </table>
+  <img src="docs/assets/features/mobile-sessions-zh.webp" alt="Android 客户端列出同一项目的桌面会话" width="32%" /> <img src="docs/assets/features/mobile-session-zh.webp" alt="Android 客户端流式渲染同一条会话时间线，含审批卡片与输入框" width="32%" /> <img src="docs/assets/features/mobile-files-zh.webp" alt="Android 客户端浏览工作区文件、变更与终端" width="32%" />
 </td>
 </tr>
 <tr>

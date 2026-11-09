@@ -125,13 +125,7 @@ Pair an iOS or Android client with the desktop runtime. Read the same timeline, 
 
 </td>
 <td width="50%">
-  <table>
-    <tr>
-      <td width="33%" valign="top"><img src="docs/assets/features/mobile-sessions-en.webp" alt="Android client listing the desktop sessions of one project" width="100%" /></td>
-      <td width="33%" valign="top"><img src="docs/assets/features/mobile-session-en.webp" alt="Android client streaming the same session timeline with an approval card and the composer" width="100%" /></td>
-      <td width="33%" valign="top"><img src="docs/assets/features/mobile-files-en.webp" alt="Android client browsing workspace files, changes, and the terminal" width="100%" /></td>
-    </tr>
-  </table>
+  <img src="docs/assets/features/mobile-sessions-en.webp" alt="Android client listing the desktop sessions of one project" width="32%" /> <img src="docs/assets/features/mobile-session-en.webp" alt="Android client streaming the same session timeline with an approval card and the composer" width="32%" /> <img src="docs/assets/features/mobile-files-en.webp" alt="Android client browsing workspace files, changes, and the terminal" width="32%" />
 </td>
 </tr>
 <tr>
