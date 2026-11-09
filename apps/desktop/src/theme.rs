@@ -155,9 +155,13 @@ pub fn set_active_selection(selection: &ThemeSelection) {
     }
 }
 
-fn shared_code_font_family() -> &'static str {
+pub fn default_mono_font_family() -> gpui::SharedString {
+    gpui_base::TypographyTokens::default().mono
+}
+
+fn shared_code_font_family() -> gpui::SharedString {
     match CODE_TYPOGRAPHY.family {
-        "platform_monospace" => crate::platform::default_code_font_family(),
+        "platform_monospace" => default_mono_font_family(),
         unsupported => panic!("unsupported shared GPUI code-font policy: {unsupported}"),
     }
 }
@@ -446,9 +450,8 @@ pub fn apply_appearance(
             .code_font
             .family
             .as_deref()
-            .unwrap_or(shared_code_font_family())
-            .to_string()
-            .into();
+            .map(gpui::SharedString::from)
+            .unwrap_or_else(shared_code_font_family);
         theme.mono_font_size =
             scaled_font_size(appearance.code_font.size, appearance.window_scale_percent);
         theme.radius = px(RADII.control_px);
