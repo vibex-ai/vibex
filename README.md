@@ -398,6 +398,8 @@ The main ownership boundaries are:
 
 Read the [UI architecture boundary](docs/architecture/ui-boundary.md), [platform support matrix](docs/platform/support-matrix.md), [Remote Protocol v2](docs/remote/protocol-v2.md), and [SSH Remote Runtime](docs/remote/ssh-runtime.md) for the detailed contracts.
 
+---
+
 ## Privacy and Control
 
 - **Local-first storage:** session timelines, workspace metadata, provider profiles, browser profiles, and runtime state are owned by the runtime and stored locally.
@@ -405,6 +407,8 @@ Read the [UI architecture boundary](docs/architecture/ui-boundary.md), [platform
 - **Encrypted remote access:** Direct, Tailnet, and Relay routes use typed handshakes and encrypted transport. Relay forwards frames but cannot decrypt business payloads.
 - **Scoped provider configuration:** Vibex does not rewrite real Agent home configuration by default. Export is an explicit user action with preview and rollback boundaries.
 - **Redacted diagnostics:** tokens, private keys, prompts, file contents, browser cookies, and terminal bytes are excluded from logs and diagnostic artifacts.
+
+---
 
 ## Development
 
@@ -418,6 +422,8 @@ pnpm check:mobile-native   # mobile crate and native project contract
 
 Use the smallest relevant gate while iterating. Packaging, mobile, Relay, and release instructions live in the [developer guide](https://vibex.peatboy.com/docs/developer) and [docs/operations/release.md](docs/operations/release.md).
 
+---
+
 ## Contributing
 
 Thanks to every developer who has helped Vibex. If you run into a problem, open an Issue or a Pull Request.
@@ -426,12 +432,16 @@ Thanks to every developer who has helped Vibex. If you run into a problem, open 
   <img src="https://contrib.rocks/image?repo=vibex-ai/vibex" alt="Developers who contribute to Vibex" />
 </a>
 
+---
+
 ## Thanks
 
 - [Agent Client Protocol](https://agentclientprotocol.com) — Vibex implements its Agent communication on top of ACP.
 - [GPUI GPUI-KIT](https://gpui-kit.com/) — the GPUI core and the GPUI-KIT component library render the Vibex desktop and mobile apps.
 - [Cua](http://cua.ai/) — Vibex builds computer use on top of Cua.
 - [Linux.do](https://linux.do/) — Linux.do gives Vibex a place to spread the word and talk with users.
+
+---
 
 ## License
 

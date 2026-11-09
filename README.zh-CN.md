@@ -398,6 +398,8 @@ DesktopRuntime / vibex-server
 
 详细契约请阅读 [UI 架构边界](docs/architecture/ui-boundary.md)、[平台支持矩阵](docs/platform/support-matrix.md)、[Remote Protocol v2](docs/remote/protocol-v2.md)，以及 [SSH Remote Runtime](docs/remote/ssh-runtime.md)。
 
+---
+
 ## 隐私与控制
 
 - **本地优先存储：** 会话时间线、工作区元数据、供应商配置、浏览器配置和运行时状态由运行时持有并存储在本地。
@@ -405,6 +407,8 @@ DesktopRuntime / vibex-server
 - **加密远程访问：** Direct、Tailnet 和 Relay 路由都使用类型化握手与加密传输。Relay 只转发帧，无法解密业务载荷。
 - **有作用域的供应商配置：** 默认情况下 Vibex 不会改写真实 Agent home 配置。导出操作需要用户明确触发，并提供预览和回滚边界。
 - **脱敏诊断：** token、私钥、提示词、文件内容、浏览器 Cookie 和终端字节不会写入日志和诊断产物。
+
+---
 
 ## 开发
 
@@ -418,6 +422,8 @@ pnpm check:mobile-native   # 移动端 crate 与原生项目契约
 
 迭代时运行与改动相关的最小检查集。打包、移动端、Relay 和发布说明见[开发者指南](https://vibex.peatboy.com/docs/developer)与 [docs/operations/release.md](docs/operations/release.md)。
 
+---
+
 ## 参与贡献
 感谢每一位为 Vibex 提供帮助的开发者，使用中存在问题时欢迎提交 Issue 和 Pull Request
 
@@ -425,12 +431,15 @@ pnpm check:mobile-native   # 移动端 crate 与原生项目契约
   <img src="https://contrib.rocks/image?repo=vibex-ai/vibex" alt="参与 Vibex 贡献的开发者" />
 </a>
 
+---
 
 ## 感谢
 - [Agent Client Protocol](https://agentclientprotocol.com) — Vibex 基于 ACP 协议实现与各类 Agent 通信
 - [GPUI GPUI-KIT](https://gpui-kit.com/) — GPUI 内核与 GPUI-KIT 组件库提供了对 Vibex 桌面端与移动端的渲染
 - [Cua](http://cua.ai/) —  Vibex 借助 Cua 实现了电脑操作
 - [Linux.do](https://linux.do/) — Linux.do 为 Vibex 提供了宣发与交流的平台
+
+---
 
 ## 许可证
 
