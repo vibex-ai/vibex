@@ -138,10 +138,19 @@ pnpm build:mobile:ios
   `gpui-mobile` reads when the system emoji font is COLR v1 (Android 13+) and
   swash cannot rasterize it; dropping the asset leaves every emoji on those
   devices at `.notdef`. The WenQuanYi TTC under `apps/mobile/assets/fonts` is
-  desktop input only. Both stay registered in the license gate. Naming a family
-  the build does not carry is a defect: GPUI falls through to its own cascade
-  and lands on the proportional UI face, which silently breaks the terminal
-  grid.
+  desktop input only, and it is a **patched** upstream payload: its
+  `MODIFICATIONS.txt` records that 11,390 full-width glyphs — every modern
+  Hangul syllable plus the covered extension-A and compatibility ideographs —
+  carried a 1/8 em advance against full-em outlines upstream, which collapses
+  Korean text into a smear once HarfBuzz honours the advance. Any CJK face a
+  build treats as text coverage owes every full-width character — Han, kana,
+  Hangul, fullwidth forms, CJK punctuation — an em advance; advances and
+  outlines that disagree are not "a bit tight", they are unreadable Korean, and
+  no layout code downstream can repair them. Both fonts stay registered in the
+  license gate, whose provenance digest and evidence text change whenever a
+  payload is modified. Naming a family the build does not carry is a defect:
+  GPUI falls through to its own cascade and lands on the proportional UI face,
+  which silently breaks the terminal grid.
 - `Window::insets()` is the only safe-area/IME geometry source. GPUI refreshes
   the window when platform insets change, and the root composition applies the
   effective top/right/bottom/left padding.

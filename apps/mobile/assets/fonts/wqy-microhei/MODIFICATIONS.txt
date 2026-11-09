@@ -1,0 +1,31 @@
+WenQuanYi Micro Hei 0.2.0-beta — changes made for the Vibex bundle
+==================================================================
+
+Upstream: https://sourceforge.net/projects/wqy/files/wqy-microhei/0.2.0-beta/
+Upstream payload SHA-256:
+    e4bca8df123ce01b104780f576ea1a58b9a5ff1662a91124b6d3180cb6c88212
+
+Modification (both faces of the collection, "WenQuanYi Micro Hei" and
+"WenQuanYi Micro Hei Mono"):
+
+  The upstream `hmtx` table declares a horizontal advance of 256 units
+  (1/8 em) for 11,390 glyphs whose outlines are a full em wide: 11,170 of
+  the Hangul syllables (U+AC00..U+D7A3; two already carried the right
+  advance), the two covered CJK extension A ideographs, and 218 CJK
+  compatibility ideographs (U+F900..U+FA2D). HarfBuzz honours the advance,
+  so Korean text shaped with this face draws each syllable on top of the
+  next and the whole line collapses into a smear.
+
+  Those 11,390 entries were rewritten to 2048 units (1 em, the advance the
+  same face already gives every Han ideograph and kana). No outline, cmap,
+  name or vertical metric was touched. The rewrite was made in place, so
+  table offsets and the file length are unchanged; only `hmtx` bytes, the
+  per-face table checksums in the collection directory and each face's
+  `head.checkSumAdjustment` differ from upstream.
+
+  The 24 "small form" punctuation glyphs (U+FE50..U+FE6B) keep their
+  intentional 1024-unit advance.
+
+This notice is required by section 4(b) of the Apache License 2.0, under
+which the font is distributed. The unmodified license text is in
+APACHE-2.0.txt beside this file.

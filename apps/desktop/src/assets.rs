@@ -3477,4 +3477,83 @@ mod tests {
         assert_eq!(report.notice_sha256.len(), 64);
         assert!(INTER_OFL_NOTICE.contains("SIL OPEN FONT LICENSE"));
     }
+
+    /// Every full-width character the CJK face covers advances a full em.
+    ///
+    /// Upstream WenQuanYi Micro Hei 0.2.0-beta declares 256/2048 em for 11,390
+    /// glyphs whose outlines are an em wide: every modern Hangul syllable, the
+    /// covered extension-A ideographs and 218 compatibility ideographs.
+    /// HarfBuzz honours the advance, so Korean text drawn with that face lays
+    /// every syllable on top of the next — the whole label becomes one smear,
+    /// and no layout work downstream can see it, because the glyphs are placed
+    /// exactly where the font says. The bundled TTC is patched for that (see
+    /// its `MODIFICATIONS.txt`); this keeps a font refresh from silently
+    /// reinstating the defect.
+    ///
+    /// The scan is by character class rather than by outline width on purpose:
+    /// a wide outline at a proportional advance is correct for a Greek letter
+    /// with a diacritic, while every code point in these ranges is a character
+    /// that must occupy one em in any CJK face.
+    #[test]
+    fn every_full_width_character_advances_a_full_em() {
+        let faces = ttf_parser::fonts_in_collection(WQY_MICROHEI).unwrap_or(1);
+        assert_eq!(faces, 2, "the CJK asset is the two-face Micro Hei TTC");
+        for index in 0..faces {
+            let face = ttf_parser::Face::parse(WQY_MICROHEI, index)
+                .unwrap_or_else(|error| panic!("face {index} does not parse: {error}"));
+            let em = f32::from(face.units_per_em());
+            let mut checked = 0;
+            for (first, last) in [
+                (0x3000, 0x303F), // CJK symbols and punctuation
+                (0x3041, 0x30FA), // hiragana and katakana
+                (0x3400, 0x4DBF), // CJK extension A
+                (0x4E00, 0x9FFF), // CJK unified ideographs
+                (0xAC00, 0xD7A3), // Hangul syllables
+                (0xF900, 0xFAFF), // CJK compatibility ideographs
+                (0xFF01, 0xFF60), // fullwidth forms
+            ] {
+                for code_point in first..=last {
+                    let character = char::from_u32(code_point).unwrap();
+                    let Some(glyph) = face.glyph_index(character) else {
+                        continue;
+                    };
+                    let advance = face.glyph_hor_advance(glyph).unwrap_or(0);
+                    assert_eq!(
+                        f32::from(advance),
+                        em,
+                        "face {index} renders U+{code_point:04X} ({character}) at {advance} of \
+                         {em}; full-width characters must advance a full em"
+                    );
+                    checked += 1;
+                }
+            }
+            assert!(
+                checked > 30_000,
+                "face {index} only covers {checked} full-width characters; the CJK coverage is gone"
+            );
+        }
+    }
+
+    /// The Korean syllables the UI actually renders land on whole-em advances.
+    ///
+    /// The scan above works per code point; this names the characters a Korean
+    /// reader sees first, so a face that kept its outlines but lost the Hangul
+    /// mapping still fails.
+    #[test]
+    fn korean_syllables_resolve_to_full_width_advances() {
+        let face = ttf_parser::Face::parse(WQY_MICROHEI, 0).expect("the CJK face parses");
+        let em = f32::from(face.units_per_em());
+        for syllable in ["한", "국", "어", "설", "정", "변", "경", "취", "소"] {
+            let character = syllable.chars().next().unwrap();
+            let glyph = face
+                .glyph_index(character)
+                .unwrap_or_else(|| panic!("the CJK face has no glyph for {syllable}"));
+            let advance = face.glyph_hor_advance(glyph).unwrap();
+            assert_eq!(
+                f32::from(advance),
+                em,
+                "{syllable} advances {advance} of {em}; Korean text would overlap"
+            );
+        }
+    }
 }

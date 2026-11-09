@@ -322,11 +322,11 @@
         ".ttc",
         ".txt"
       ],
-      "expectedFileCount": 2,
-      "treeSha256": "a3f978f28b2b2efa4b59976274ff5da74c6d1e981ef2a46ded9e3533aa4f09f9",
+      "expectedFileCount": 3,
+      "treeSha256": "915679390077996520e0ee7e7d048cd5ee7475d28bd406c0e9fa1e9c31cc7b86",
       "licenseExpression": "Apache-2.0",
       "source": "https://sourceforge.net/projects/wqy/files/wqy-microhei/0.2.0-beta/",
-      "licenseEvidence": "The reviewed TTC payload has SHA-256 e4bca8df123ce01b104780f576ea1a58b9a5ff1662a91124b6d3180cb6c88212 and is accompanied by the complete Apache-2.0 license. It is embedded by the desktop shell and its image editor; the native mobile client draws CJK from the platform's own fonts and no longer carries it."
+      "licenseEvidence": "Upstream 0.2.0-beta (SHA-256 e4bca8df123ce01b104780f576ea1a58b9a5ff1662a91124b6d3180cb6c88212), accompanied by the complete Apache-2.0 license. Every full-width glyph in the upstream TTC declares a 256/2048 em advance while drawing full-em ink, which draws all Korean syllables on top of each other; the payload here carries a repaired hmtx that gives all 11,390 of those glyphs their em advance (Hangul syllables, CJK compatibility ideographs, CJK extension A). No outlines, cmap or naming data changed. It is embedded by the desktop shell and its image editor; the native mobile client draws CJK from the platform's own fonts and no longer carries it."
     },
     {
       "id": "vibex-mobile-android-emoji",

@@ -1136,7 +1136,7 @@ This inventory records source and license provenance. The corresponding license 
 | Vibex native mobile Lucide controls | 40 | https://github.com/lucide-icons/lucide | ISC | ISC |
 | IBM Plex Sans desktop interface fonts | 5 | https://github.com/zed-industries/zed/tree/49d9758/assets/fonts/ibm-plex-sans | OFL-1.1 | OFL-1.1 |
 | Lilex desktop code fonts | 5 | https://github.com/zed-industries/zed/tree/49d9758/assets/fonts/lilex | OFL-1.1 | OFL-1.1 |
-| WenQuanYi Micro Hei desktop CJK fallback | 2 | https://sourceforge.net/projects/wqy/files/wqy-microhei/0.2.0-beta/ | Apache-2.0 | Apache-2.0 |
+| WenQuanYi Micro Hei desktop CJK fallback | 3 | https://sourceforge.net/projects/wqy/files/wqy-microhei/0.2.0-beta/ | Apache-2.0 | Apache-2.0 |
 | Noto Color Emoji CBDT bitmap font for the native Android client | 2 | https://github.com/googlefonts/noto-emoji | OFL-1.1 | OFL-1.1 |
 | Nerd Fonts symbols-only terminal font | 2 | https://github.com/ryanoasis/nerd-fonts/releases/tag/v3.3.0 | MIT | MIT |
 

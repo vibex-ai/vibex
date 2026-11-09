@@ -40305,7 +40305,7 @@
     },
     {
       "type": "file",
-      "bom-ref": "font:vibex-desktop-wqy-microhei:a3f978f28b2b2efa",
+      "bom-ref": "font:vibex-desktop-wqy-microhei:9156793900779965",
       "name": "WenQuanYi Micro Hei desktop CJK fallback",
       "version": "0.2.0-beta",
       "licenses": [
@@ -40316,7 +40316,7 @@
       "hashes": [
         {
           "alg": "SHA-256",
-          "content": "a3f978f28b2b2efa4b59976274ff5da74c6d1e981ef2a46ded9e3533aa4f09f9"
+          "content": "915679390077996520e0ee7e7d048cd5ee7475d28bd406c0e9fa1e9c31cc7b86"
         }
       ],
       "externalReferences": [
@@ -40336,7 +40336,7 @@
         },
         {
           "name": "vibex:file-count",
-          "value": "2"
+          "value": "3"
         },
         {
           "name": "vibex:selected-license",
@@ -48354,7 +48354,7 @@
         "font:vibex-desktop-ibm-plex-sans:550b0b7d6dee90b4",
         "font:vibex-desktop-lilex:8e69f85c04197d91",
         "font:vibex-desktop-nerd-symbols:39f44d7c7f96f646",
-        "font:vibex-desktop-wqy-microhei:a3f978f28b2b2efa",
+        "font:vibex-desktop-wqy-microhei:9156793900779965",
         "installer:cargo-packager:9aa0f5056c419100",
         "installer:nsis-application-id:1c2772b0edfb0f96",
         "installer:nsis-tauri-utils:0eed48313a7f904d",
@@ -50003,7 +50003,7 @@
       "dependsOn": []
     },
     {
-      "ref": "font:vibex-desktop-wqy-microhei:a3f978f28b2b2efa",
+      "ref": "font:vibex-desktop-wqy-microhei:9156793900779965",
       "dependsOn": []
     },
     {
