@@ -3382,8 +3382,11 @@ impl AgentManager {
     /// what makes it the same: a resume id or a model flag is not recoverable
     /// from anything else.
     ///
-    /// A session whose process is still running is left alone — pressing restart
-    /// twice must not start a second Agent beside the first.
+    /// A session that has not ended is left alone while its process runs —
+    /// pressing restart twice must not start a second Agent beside the first.
+    /// A session that *has* ended keeps its process only because the CLI waits
+    /// behind its own exit notice; that process is stopped here first, so the
+    /// restart replaces it instead of declining to act.
     pub async fn restart_terminal_session(
         &self,
         session_id: &VibexSessionId,
@@ -3413,8 +3416,64 @@ impl AgentManager {
                 "the session has no recorded terminal to restart",
             )
         })?;
+        // A session whose Agent already ended can still have a live process:
+        // Codex and Claude print an exit notice and then sit behind the prompt
+        // waiting for a second interrupt, and the screen rule retires the
+        // session while that process keeps running. Answering "already running"
+        // to a restart of *that* session is the silent no-op that made the
+        // button look broken — the caller got the same closed row back and
+        // repainted the same placeholder. The process is what has to be
+        // replaced; only a session that has not ended is left alone.
+        let ended = matches!(
+            session.state,
+            AgentSessionState::Closed | AgentSessionState::Error
+        );
         if launcher.is_running(&record.terminal_id) {
-            return Ok(session);
+            if !ended {
+                return Ok(session);
+            }
+            // Stopping the stranded process blocks for as long as the child
+            // takes to die, so it goes to a blocking worker rather than stalling
+            // the runtime thread this call is running on.
+            let stopper = Arc::clone(&launcher);
+            let stranded = record.terminal_id.clone();
+            let stop_failure = match tokio::task::spawn_blocking(move || -> VibexResult<()> {
+                // Stop watching before killing: the bytes the dying CLI prints
+                // are the exit notice the retired session already acted on, and
+                // reading them again would publish a second exit for a row that
+                // is being replaced.
+                stopper.unwatch_session(&stranded);
+                stopper.kill(&stranded)?;
+                // A kill that returns without the process being gone would let
+                // the restore reuse it, which is the same silent no-op reached
+                // by another path.
+                if stopper.is_running(&stranded) {
+                    return Err(VibexError::process(
+                        "terminal_session_restart_stop_failed",
+                        "the ended Agent's terminal is still running",
+                    )
+                    .with_diagnostic("terminalId", stranded.as_str()));
+                }
+                Ok(())
+            })
+            .await
+            {
+                Ok(result) => result.err(),
+                Err(error) => Some(
+                    VibexError::process(
+                        "terminal_session_restart_stop_worker_failed",
+                        "the ended Agent's terminal could not be stopped",
+                    )
+                    .with_diagnostic("error", error.to_string()),
+                ),
+            };
+            if let Some(error) = stop_failure {
+                // Launching beside a process that would not die leaves two
+                // Agents on one link row, so this fails loudly instead.
+                return Err(error.with_recovery_hint(
+                    "Quit the Agent's terminal or restart Vibex, then restart the session again.",
+                ));
+            }
         }
         // The environment is re-resolved from the Profile rather than kept: the
         // credentials never touched the database, so this is the only way the
@@ -3524,7 +3583,7 @@ impl AgentManager {
         session_id: &VibexSessionId,
         native_session_id: Option<&str>,
     ) -> VibexResult<()> {
-        let conn = self.open_migrated()?;
+        let mut conn = self.open_migrated()?;
         let Some(session) = SessionRepository::get(&conn, session_id)? else {
             return Ok(());
         };
@@ -3541,13 +3600,47 @@ impl AgentManager {
         if !session.transport.is_terminal() || session.state == AgentSessionState::Closed {
             return Ok(());
         }
-        SessionRepository::update_state(&conn, session_id, AgentSessionState::Closed)?;
-        self.record_terminal_observation(
-            session_id,
-            vibex_core::TerminalActivity::Unknown,
-            vibex_core::TerminalActivitySource::Process,
-            vibex_core::unix_timestamp_ms(),
-        )?;
+        // The state and the facts it explains are one write. Split across two
+        // connections they could disagree, and a `closed` row whose activity
+        // still claimed to be observed was exactly that: the state committed,
+        // the facts write failed on its own connection, and nothing recorded the
+        // difference because it only reached a `tracing` subscriber that no
+        // build installs.
+        {
+            let tx = conn.transaction().map_err(|error| {
+                VibexError::storage(
+                    "terminal_session_retire_transaction_failed",
+                    "failed to start the terminal retirement transaction",
+                )
+                .with_diagnostic("error", error.to_string())
+            })?;
+            SessionRepository::update_state(&tx, session_id, AgentSessionState::Closed)?;
+            if let Some(record) = SessionTerminalRepository::get(&tx, session_id)? {
+                let observed_at_ms = vibex_core::unix_timestamp_ms();
+                let facts = vibex_core::TerminalSessionFacts {
+                    terminal_id: Some(record.terminal_id.clone()),
+                    activity: vibex_core::TerminalActivity::Unknown,
+                    source: vibex_core::TerminalActivitySource::Process,
+                    observed_at_ms,
+                    confirmations: record.facts.confirmations,
+                    cli_title: record.facts.cli_title.clone(),
+                    cli_cwd: record.facts.cli_cwd.clone(),
+                    native_session_id: record.facts.native_session_id.clone(),
+                    // The Agent is gone, so nothing is waiting on the reader and
+                    // no turn is in flight any more.
+                    waiting_since_ms: None,
+                    completed_at_ms: record.facts.completed_at_ms,
+                };
+                SessionTerminalRepository::update_facts(&tx, session_id, &facts)?;
+            }
+            tx.commit().map_err(|error| {
+                VibexError::storage(
+                    "terminal_session_retire_commit_failed",
+                    "failed to commit the terminal retirement",
+                )
+                .with_diagnostic("error", error.to_string())
+            })?;
+        }
         if let Some(closed) = self.client_session_snapshot(&conn, session_id)? {
             self.publish_root_session_update(&conn, closed);
         }
@@ -14463,6 +14556,39 @@ mod tests {
         );
     }
 
+    /// Retiring a session records what ended it in the same write as the state.
+    ///
+    /// The two rows used to be written on separate connections, so a failed
+    /// facts write left a `closed` session whose activity still looked freshly
+    /// observed. Nothing could see that afterwards: the failure only reached a
+    /// `tracing` subscriber, and this crate installs none.
+    #[tokio::test]
+    async fn retiring_a_terminal_session_records_the_process_as_what_ended_it() {
+        let (manager, launcher, dir) = terminal_manager();
+        let session = manager
+            .create_terminal_session(terminal_request("claude", &dir))
+            .await
+            .unwrap();
+        let terminal_id = launcher.watched()[0].0.clone();
+        launcher.kill(&terminal_id).unwrap();
+
+        manager
+            .mark_session_terminal_ended(&session.id, None)
+            .unwrap();
+
+        let conn = open_database(&dir.join("vibex.db")).unwrap();
+        let record = vibex_db::SessionTerminalRepository::get(&conn, &session.id)
+            .unwrap()
+            .expect("the link survives the retirement");
+        assert_eq!(record.facts.activity, vibex_core::TerminalActivity::Unknown);
+        assert_eq!(
+            record.facts.source,
+            vibex_core::TerminalActivitySource::Process,
+            "the ended process is what retired the session, and the row has to say so"
+        );
+        assert_eq!(record.facts.waiting_since_ms, None);
+    }
+
     /// A session whose Agent quit can be started again, with the same command.
     ///
     /// The row and the link survive a quit on purpose, so restarting is the same
@@ -14502,6 +14628,59 @@ mod tests {
         let watched = launcher.watched();
         assert_eq!(
             watched.last().expect("the restart is watched").1,
+            session.id.as_str()
+        );
+    }
+
+    /// A restart replaces the process of a session whose CLI printed its exit
+    /// notice but stayed alive behind the prompt.
+    ///
+    /// This is the state the screen rule leaves behind: Codex and Claude end the
+    /// session on their own notice while the process keeps running, waiting for a
+    /// second interrupt. The restart used to answer "already running" with the
+    /// still-closed row, so the page repainted the same placeholder and the
+    /// button looked dead.
+    #[tokio::test]
+    async fn a_closed_terminal_session_whose_process_outlived_the_notice_restarts() {
+        let (manager, launcher, dir) = terminal_manager();
+        let session = manager
+            .create_terminal_session(terminal_request("claude", &dir))
+            .await
+            .unwrap();
+        let stranded_terminal = launcher.watched()[0].0.clone();
+
+        // The screen said the Agent ended; the process is still there behind the
+        // exit prompt, exactly as the retirement sweep finds it.
+        manager
+            .mark_session_terminal_ended(&session.id, None)
+            .unwrap();
+        assert_eq!(
+            manager.get_session(&session.id).await.unwrap().state,
+            AgentSessionState::Closed
+        );
+        assert!(
+            launcher.is_running(&stranded_terminal),
+            "the fixture has to keep the process alive or it is not this bug"
+        );
+
+        let restarted = manager.restart_terminal_session(&session.id).await.unwrap();
+
+        assert_eq!(restarted.state, AgentSessionState::Idle);
+        assert!(
+            !launcher.is_running(&stranded_terminal),
+            "the process behind the exit notice has to be replaced, not reused"
+        );
+        let launched = launcher.launches().pop().expect("the restart launched");
+        assert_eq!(
+            launched.argv,
+            vec!["claude", "--continue"]
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>(),
+            "a restart still resumes the conversation instead of starting over"
+        );
+        assert_eq!(
+            launcher.watched().last().expect("the restart is watched").1,
             session.id.as_str()
         );
     }

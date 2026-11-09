@@ -3835,16 +3835,23 @@ impl DesktopRuntime {
                         // only witness — a liveness check would keep the session
                         // open forever behind a prompt nobody can answer.
                         if update.exited {
-                            runtime.unwatch_session_terminal(&update.terminal_id);
-                            if let Err(error) = runtime.agent.manager().mark_session_terminal_ended(
+                            // Stopped watching only once the retirement is
+                            // written: a failed write leaves the session open,
+                            // and a session nobody watches is one nothing can
+                            // ever close again. The exit is published once, so
+                            // staying watched does not repeat it.
+                            match runtime.agent.manager().mark_session_terminal_ended(
                                 &session_id,
                                 update.native_session_id.as_deref(),
                             ) {
-                                tracing::warn!(
-                                    target: "vibex_desktop",
-                                    error_code = %error.code,
-                                    "terminal session retirement failed"
-                                );
+                                Ok(()) => runtime.unwatch_session_terminal(&update.terminal_id),
+                                Err(error) => {
+                                    tracing::warn!(
+                                        target: "vibex_desktop",
+                                        error_code = %error.code,
+                                        "terminal session retirement failed"
+                                    );
+                                }
                             }
                             continue;
                         }
@@ -4823,6 +4830,14 @@ impl DesktopRuntime {
                 continue;
             };
             if !session.transport.is_terminal() {
+                continue;
+            }
+            // A closed session keeps its link so a restart can offer the same
+            // command, but it must not get a process back: nothing can reach the
+            // PTY (the page draws the "Agent has exited" placeholder for this
+            // state), and a live process beside a closed row is what made the
+            // restart button answer "already running" and do nothing.
+            if session.state == vibex_core::AgentSessionState::Closed {
                 continue;
             }
             // Already running: the caller restored it earlier in this process.
@@ -6069,6 +6084,85 @@ mod tests {
                 .manager()
                 .raw_snapshot(&stored.id)
                 .is_ok()
+        );
+        runtime.shutdown().await.unwrap();
+    }
+
+    /// A closed terminal session is not given a process back at startup.
+    ///
+    /// Its link row survives a quit so a restart can offer the same command, but
+    /// the page draws the "Agent has exited" placeholder for this state and can
+    /// never attach to a PTY. Rebuilding one left a live process behind a closed
+    /// row, and the restart then answered "already running" and did nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restoring_session_terminals_leaves_a_closed_session_without_a_process() {
+        let home = tempfile::tempdir().unwrap();
+        let runtime = DesktopRuntime::start(DesktopRuntimeConfig::isolated_test(home.path()))
+            .await
+            .unwrap();
+        let connection = open_database(&runtime.config.database_path).unwrap();
+        let (project, workspace) = WorkspaceRepository::ensure(
+            &connection,
+            home.path(),
+            vibex_core::WorkspaceMode::CurrentCheckout,
+        )
+        .unwrap();
+        let now = vibex_core::unix_timestamp_ms();
+        let session = AgentSession {
+            id: vibex_core::VibexSessionId::new(),
+            title: "codex tui".to_string(),
+            project_id: project.id,
+            workspace_id: workspace.id.clone(),
+            workspace_root: workspace.root_path.clone(),
+            workspace_mode: workspace.mode,
+            agent_id: vibex_core::AgentId::parse("codex").unwrap(),
+            state: AgentSessionState::Closed,
+            safety: vibex_core::AgentSessionSafety::workspace_write_ask_on_risk(),
+            created_at_ms: now,
+            updated_at_ms: now,
+            last_message_at_ms: now,
+            archived_at_ms: None,
+            deleted_at_ms: None,
+            tools: Default::default(),
+            transport: vibex_core::SessionTransport::Terminal,
+            terminal: None,
+        };
+        SessionRepository::insert(&connection, &session).unwrap();
+        let terminal_id = TerminalId::new();
+        vibex_db::SessionTerminalRepository::upsert_with_profile(
+            &connection,
+            &session.id,
+            &terminal_id,
+            &workspace.id,
+            &["codex".to_string()],
+            &session.workspace_root,
+            None,
+        )
+        .unwrap();
+        drop(connection);
+
+        let restored = runtime.restore_session_terminals().unwrap();
+
+        assert!(
+            restored.is_empty(),
+            "a closed session must not be announced as restored"
+        );
+        assert!(
+            runtime
+                .terminals()
+                .manager()
+                .raw_snapshot(&terminal_id)
+                .is_err(),
+            "a closed session must not get a process nothing can attach to"
+        );
+        let connection = open_database(&runtime.config.database_path).unwrap();
+        assert_eq!(
+            SessionRepository::get(&connection, &session.id)
+                .unwrap()
+                .expect("the row survives the startup")
+                .state,
+            AgentSessionState::Closed,
+            "skipping the restore must not change the session's state"
         );
         runtime.shutdown().await.unwrap();
     }
