@@ -47,7 +47,7 @@ Vibex 将 Agent 会话、源代码、Git、终端、内嵌浏览器、电脑操�
 
 ### 所有 Agent，一个工作台
 
-并排运行 Claude Code、Codex、ZCode、OpenCode，以及任何兼容 ACP 的 Agent。Vibex 负责安装、升级、登录和按 Agent 隔离运行时，再把所有会话收进同一条时间线。
+并排运行 Claude Code、Codex、ZCode、OpenCode，以及任何兼容 ACP 的 Agent。Vibex 负责安装、升级、登录和按 Agent 隔离运行时，再把所有会话收进同一条时间线。你可以在 Vibex 中自由使用 GUI 或 TUI 模式创建 Agent 会话。 
 
 [文档 →](https://vibex.peatboy.com/docs/agents-and-providers)
 
@@ -62,7 +62,7 @@ Vibex 将 Agent 会话、源代码、Git、终端、内嵌浏览器、电脑操�
 
 ### Agent 团队与目标
 
-把任务委派给子 Agent，并让任务跨回合保持打开。在同一个子会话里追加跟进，接受或取消结果；所有权树会显示工作推进到了哪里，目标则让长回合始终对准最终结果。
+主 Agent 可以自主将任务委派给子 Agent，或在你的引导下在必要时刻委派指定的子 Agent。Vibex 中支持的所有类型的 Agent Harness 都是可选对象，实现跨 Agent 委派。
 
 [文档 →](https://vibex.peatboy.com/docs/sessions)
 
@@ -76,7 +76,7 @@ Vibex 将 Agent 会话、源代码、Git、终端、内嵌浏览器、电脑操�
 
 ### 并行 Worktree 与 Git 审查
 
-让每个实验都有自己的隔离 Git worktree。查看差异、暂存与提交、合并或 rebase、逐文件解决冲突，最后丢弃落选分支，而不碰你的主检出。
+每一个会话都能拥有自己的 Worktree，并发 Agent 开发时互不影响，Vibex 同时提供常用的 变更 与 提交 管理功能，可以清晰明了的看见实时的 Agent 变更。
 
 [文档 →](https://vibex.peatboy.com/docs/git)
 
@@ -90,7 +90,7 @@ Vibex 将 Agent 会话、源代码、Git、终端、内嵌浏览器、电脑操�
 
 ### 共享供应商与本地网关
 
-模型供应商只需配置一次，就能供多个 Agent 使用。路由组在供应商或模型之间故障转移，在 OpenAI Chat、OpenAI Responses、Anthropic Messages 与 Gemini 之间转换协议，并记录只含 token 的请求台账——全部收在一个回环端点后面。
+模型供应商只需配置一次，就能供多个 Agent 使用。路由组能同时配置多个模型供应商，并在供应商或模型之间故障转移，在 OpenAI Chat、OpenAI Responses、Anthropic Messages 与 Gemini 之间转换协议，实现只支持自有协议的 Agent 也能同时接入其他协议的模型。
 
 [文档 →](https://vibex.peatboy.com/docs/providers-and-gateway)
 
@@ -105,7 +105,7 @@ Vibex 将 Agent 会话、源代码、Git、终端、内嵌浏览器、电脑操�
 
 ### 终端、浏览器与电脑操作
 
-使用带标签、分屏、搜索和回滚缓冲的原生 PTY。让 Agent 驱动一个隔离的内嵌浏览器，或者在你批准之后操作真实桌面——你可以从专用面板观看、批准并随时停止。
+Vibex 中的编辑器中可以同时打开文件，终端，浏览器进行阅读与编辑，Agent 也可以操作 Vibex 中的浏览器浏览网页，同时也支持通过电脑操作控制电脑——你可以从专用面板观看、批准并随时停止。
 
 [文档 →](https://vibex.peatboy.com/docs/browser)
 
@@ -119,7 +119,7 @@ Vibex 将 Agent 会话、源代码、Git、终端、内嵌浏览器、电脑操�
 
 ### 手机，同一个会话
 
-把 iOS 或 Android 客户端与桌面运行时配对。查看同一条时间线、处理审批与提问、发送后续消息、浏览文件和差异，并使用终端——无需启动第二个后端。
+将 Android 或 iOS 客户端（未上架商店）与桌面或远程实例配对。查看同一条时间线、处理审批与提问、发送后续消息、浏览文件和差异，并使用终端——随时随地 Vibe coding。
 
 [文档 →](https://vibex.peatboy.com/docs/remote-mobile)
 
@@ -148,7 +148,7 @@ Vibex 将 Agent 会话、源代码、Git、终端、内嵌浏览器、电脑操�
 
 ### 远程运行时，由你决定
 
-通过 SSH 或 WSL2 在另一台机器上运行权威运行时，或把 `vibex-server` 自托管在 HTTPS、Tailnet 或自己的 Relay 后面。桌面端、手机和 TUI 始终是客户端；运行时始终是唯一真相。
+通过 SSH 或 WSL2 在另一台机器上运行 Vibex 远程实例，或把 `vibex-server` 自托管在 HTTPS、Tailnet 或自己的 Relay 后面。桌面端、手机和 TUI 始终是客户端；远程实例服务一切。
 
 [文档 →](https://vibex.peatboy.com/docs/ssh-runtime)
 
@@ -179,15 +179,15 @@ Vibex 将 Agent 会话、源代码、Git、终端、内嵌浏览器、电脑操�
 - **[用量统计](https://vibex.peatboy.com/docs/usage)** —— 按 Agent、项目、供应商、模型和时间范围查看 token 与成本。
 - **[通知与未读状态](https://vibex.peatboy.com/docs/sessions#通知与未读)** —— Agent 完成、失败或需要输入时及时知道。
 - **[会话归档](https://vibex.peatboy.com/docs/sessions)** —— 把完成的工作移出侧栏，同时保留完整时间线。
-- **[签名自动更新](https://vibex.peatboy.com/docs/install#升级)** —— 默认开启，更新清单经过签名校验。
+- **[自动更新](https://vibex.peatboy.com/docs/install#升级)** —— 默认开启，更新清单经过签名校验。
 - **[主题与工作台背景](https://vibex.peatboy.com/docs/settings#外观)** —— 二十套内置主题、自定义 JSON 主题，以及静态或动态背景。
-- **还有更多，每周都在发布** —— [更新日志](https://github.com/vibex-ai/vibex/releases)才是真正的功能清单。
+- **还有更多，每周都在发布** —— [更新日志](https://github.com/vibex-ai/vibex/releases)。
 
 ---
 
 ## 支持的 Agent
 
-Vibex 使用 [Agent Client Protocol](https://agentclientprotocol.com/)（ACP）作为在线 Agent 传输协议。Agent 的身份和能力与连接它所使用的协议彼此分离。兼容 **任何 ACP Agent**——只要说 ACP，就能在 Vibex 中运行。
+Vibex 使用 [Agent Client Protocol](https://agentclientprotocol.com/)（ACP）作为在线 Agent 传输协议。Agent 的身份和能力与连接它所使用的协议彼此分离。兼容 **任何 ACP Agent**——只要说 ACP，就能在 Vibex 中运行。另外部分拥有 TUI 的 Agent，也支持在 Vibex 中直接使用它的原生终端模式。
 
 <div align="center">
   <table>
@@ -419,12 +419,18 @@ pnpm check:mobile-native   # 移动端 crate 与原生项目契约
 迭代时运行与改动相关的最小检查集。打包、移动端、Relay 和发布说明见[开发者指南](https://vibex.peatboy.com/docs/developer)与 [docs/operations/release.md](docs/operations/release.md)。
 
 ## 参与贡献
+感谢每一位为 Vibex 提供帮助的开发者，使用中存在问题时欢迎提交 Issue 和 Pull Request
 
-欢迎提交 Issue 和 Pull Request。提交变更前请注意：
+<a href="https://github.com/vibex-ai/vibex/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=vibex-ai/vibex" alt="参与 Vibex 贡献的开发者" />
+</a>
 
-- 保持 `DesktopRuntime` 为唯一权威状态所有者，客户端行为必须通过类型化后端和远程契约路由。
-- 迭代时运行与改动相关的最小检查集，涉及跨层改动时再运行 `pnpm check`。
-- 用户可见行为变化时，同步更新三个语言的用户文档。
+
+## 感谢
+- [Agent Client Protocol](https://agentclientprotocol.com) — Vibex 基于 ACP 协议实现与各类 Agent 通信
+- [GPUI GPUI-KIT](https://gpui-kit.com/) — GPUI 内核与 GPUI-KIT 组件库提供了对 Vibex 桌面端与移动端的渲染
+- [Cua](http://cua.ai/) —  Vibex 借助 Cua 实现了电脑操作
+- [Linux.do](https://linux.do/) — Linux.do 为 Vibex 提供了宣发与交流的平台
 
 ## 许可证
 

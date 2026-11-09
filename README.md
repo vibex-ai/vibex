@@ -47,7 +47,7 @@ No Vibex-hosted workspace is required. Your repository, credentials, and durable
 
 ### Every Agent, one workbench
 
-Run Claude Code, Codex, ZCode, OpenCode, and any ACP-compatible Agent side by side. Vibex installs, updates, authenticates, and scopes each runtime, then keeps every session in the same timeline.
+Run Claude Code, Codex, ZCode, OpenCode, and any ACP-compatible Agent side by side. Vibex installs, updates, authenticates, and scopes each runtime, then keeps every session in the same timeline. You can create Agent sessions in Vibex in GUI or TUI mode, whichever you prefer.
 
 [Docs →](https://vibex.peatboy.com/docs/agents-and-providers)
 
@@ -62,7 +62,7 @@ Run Claude Code, Codex, ZCode, OpenCode, and any ACP-compatible Agent side by si
 
 ### Agent teams and goals
 
-Delegate work to child Agents and keep the task open across rounds. Follow up in the same session, accept or cancel the result, and watch the ownership tree while goals keep a long-running turn pointed at the outcome.
+The main Agent can delegate work to child Agents on its own, or hand a task to a specific child Agent at the right moment under your guidance. Any Agent Harness that Vibex supports can be a delegation target, which makes cross-Agent delegation possible.
 
 [Docs →](https://vibex.peatboy.com/docs/sessions)
 
@@ -76,7 +76,7 @@ Delegate work to child Agents and keep the task open across rounds. Follow up in
 
 ### Parallel worktrees and Git review
 
-Give every experiment its own isolated Git worktree. Review diffs, stage and commit, merge or rebase, resolve conflicts file by file, and discard the losing branch without touching your main checkout.
+Every session can have its own worktree, so concurrent Agents never get in each other's way. Vibex also ships the everyday Changes and Commits workflow, so you can see what an Agent changed in real time at a glance.
 
 [Docs →](https://vibex.peatboy.com/docs/git)
 
@@ -90,7 +90,7 @@ Give every experiment its own isolated Git worktree. Review diffs, stage and com
 
 ### Shared Providers and a local gateway
 
-Configure a model Provider once and share it across Agents. Route groups fail over between Providers or models, translate between OpenAI Chat, OpenAI Responses, Anthropic Messages, and Gemini, and keep a token-only request ledger — all behind one loopback endpoint.
+Configure a model Provider once and share it across Agents. A route group can hold several model Providers at once, fail over between Providers or models, and translate between OpenAI Chat, OpenAI Responses, Anthropic Messages, and Gemini — so an Agent that only speaks its own protocol can still reach models from other protocols.
 
 [Docs →](https://vibex.peatboy.com/docs/providers-and-gateway)
 
@@ -105,7 +105,7 @@ Configure a model Provider once and share it across Agents. Route groups fail ov
 
 ### Terminal, browser, and computer use
 
-Use a native PTY with tabs, splits, search, and scrollback. Let an Agent drive an isolated embedded browser, or — with your approval — act on the desktop itself while you watch, approve, and stop it from a dedicated panel.
+The Vibex editor can hold files, the terminal, and the browser at once for reading and editing. Agents can also drive the Vibex browser to browse the web, and computer use lets them control the machine — while you watch, approve, and stop them from a dedicated panel.
 
 [Docs →](https://vibex.peatboy.com/docs/browser)
 
@@ -119,7 +119,7 @@ Use a native PTY with tabs, splits, search, and scrollback. Let an Agent drive a
 
 ### Your phone, same session
 
-Pair an iOS or Android client with the desktop runtime. Read the same timeline, answer approvals and questions, send follow-ups, browse files and diffs, and use the terminal — without starting a second backend.
+Pair an Android or iOS client (neither is on the app stores yet) with the desktop or a remote instance. Read the same timeline, answer approvals and questions, send follow-ups, browse files and diffs, and use the terminal — vibe coding from anywhere.
 
 [Docs →](https://vibex.peatboy.com/docs/remote-mobile)
 
@@ -148,7 +148,7 @@ The whole workbench in a terminal: sessions, streaming Markdown, approvals, the 
 
 ### Remote runtimes, your rules
 
-Run the authoritative runtime on another machine over SSH or inside WSL2, or self-host `vibex-server` behind HTTPS, a Tailnet, or your own Relay. The desktop, phone, and TUI stay clients; the runtime stays the only source of truth.
+Run Vibex as a remote instance on another machine over SSH or inside WSL2, or self-host `vibex-server` behind HTTPS, a Tailnet, or your own Relay. The desktop, phone, and TUI stay clients; the remote instance serves everything.
 
 [Docs →](https://vibex.peatboy.com/docs/ssh-runtime)
 
@@ -179,15 +179,15 @@ Install MCP servers and Skills from in-app markets, write reusable Prompts, and 
 - **[Usage statistics](https://vibex.peatboy.com/docs/usage)** — tokens and cost by Agent, project, provider, model, and time range.
 - **[Notifications and unread state](https://vibex.peatboy.com/docs/sessions#notifications-and-unread-state)** — know when an Agent finishes, fails, or needs input.
 - **[Session archive](https://vibex.peatboy.com/docs/sessions)** — keep finished work out of the sidebar without losing its timeline.
-- **[Signed auto-updates](https://vibex.peatboy.com/docs/install#upgrade)** — on by default, verified against a signed release manifest.
+- **[Auto-updates](https://vibex.peatboy.com/docs/install#upgrade)** — on by default, verified against a signed release manifest.
 - **[Themes and workbench backgrounds](https://vibex.peatboy.com/docs/settings#appearance)** — twenty built-in themes, custom JSON themes, and still or animated backgrounds.
-- **And more shipping every week** — the [changelog](https://github.com/vibex-ai/vibex/releases) is the real feature list.
+- **And more shipping every week** — the [changelog](https://github.com/vibex-ai/vibex/releases).
 
 ---
 
 ## Supported Agents
 
-Vibex uses the [Agent Client Protocol](https://agentclientprotocol.com/) (ACP) as the online Agent transport. An Agent's identity and capabilities stay separate from the protocol used to connect it. Works with **any ACP-compatible agent** — if it speaks ACP, it runs in Vibex.
+Vibex uses the [Agent Client Protocol](https://agentclientprotocol.com/) (ACP) as the online Agent transport. An Agent's identity and capabilities stay separate from the protocol used to connect it. Works with **any ACP-compatible agent** — if it speaks ACP, it runs in Vibex. Agents that ship their own TUI can also run in their native terminal mode directly inside Vibex.
 
 <div align="center">
   <table>
@@ -420,11 +420,18 @@ Use the smallest relevant gate while iterating. Packaging, mobile, Relay, and re
 
 ## Contributing
 
-Issues and pull requests are welcome. Before opening a change:
+Thanks to every developer who has helped Vibex. If you run into a problem, open an Issue or a Pull Request.
 
-- Keep `DesktopRuntime` as the only authority and route client behavior through typed backend and remote contracts.
-- Run the smallest relevant gate while iterating, then run `pnpm check` for cross-layer changes.
-- Update the user guide in all three documentation locales when behavior changes.
+<a href="https://github.com/vibex-ai/vibex/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=vibex-ai/vibex" alt="Developers who contribute to Vibex" />
+</a>
+
+## Thanks
+
+- [Agent Client Protocol](https://agentclientprotocol.com) — Vibex implements its Agent communication on top of ACP.
+- [GPUI GPUI-KIT](https://gpui-kit.com/) — the GPUI core and the GPUI-KIT component library render the Vibex desktop and mobile apps.
+- [Cua](http://cua.ai/) — Vibex builds computer use on top of Cua.
+- [Linux.do](https://linux.do/) — Linux.do gives Vibex a place to spread the word and talk with users.
 
 ## License
 
