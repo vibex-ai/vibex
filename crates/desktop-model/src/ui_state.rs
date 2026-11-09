@@ -4,7 +4,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use vibex_core::{
@@ -95,6 +95,64 @@ pub enum StartupDestination {
     #[default]
     RestoreWorkbench,
     NewSession,
+}
+
+/// What closing Vibex's main window does.
+///
+/// The two behaviours are a product decision rather than a boolean accident:
+/// the window either goes away while the Agent keeps running in the system
+/// tray, or closing it ends the application. Older state files spelled this
+/// preference as a `closeToTray` boolean, which [`CloseBehavior`] still
+/// decodes, so an explicit "quit directly" choice survives the rename.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CloseBehavior {
+    /// Closing the window hides it; Vibex keeps running in the system tray.
+    #[default]
+    RunInBackground,
+    /// Closing the window ends the application.
+    Quit,
+}
+
+impl CloseBehavior {
+    pub const fn runs_in_background(self) -> bool {
+        matches!(self, Self::RunInBackground)
+    }
+
+    pub const fn quits_on_close(self) -> bool {
+        matches!(self, Self::Quit)
+    }
+}
+
+impl<'de> Deserialize<'de> for CloseBehavior {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Wire {
+            Legacy(bool),
+            Named(Named),
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        enum Named {
+            RunInBackground,
+            Quit,
+        }
+        Ok(match Wire::deserialize(deserializer)? {
+            Wire::Legacy(close_to_tray) => {
+                if close_to_tray {
+                    Self::RunInBackground
+                } else {
+                    Self::Quit
+                }
+            }
+            Wire::Named(Named::RunInBackground) => Self::RunInBackground,
+            Wire::Named(Named::Quit) => Self::Quit,
+        })
+    }
 }
 
 /// Where the multi-tab preview panel opens.
@@ -1714,8 +1772,10 @@ const fn default_enhanced_file_operation_display() -> bool {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DesktopBehaviorUiState {
-    #[serde(default = "default_close_to_tray")]
-    pub close_to_tray: bool,
+    /// What the window's close control does. Decoded from the legacy
+    /// `closeToTray` boolean as well, so an existing explicit choice is kept.
+    #[serde(default, alias = "closeToTray")]
+    pub close_behavior: CloseBehavior,
     #[serde(default)]
     pub startup_destination: StartupDestination,
     #[serde(default)]
@@ -1737,7 +1797,7 @@ pub struct DesktopBehaviorUiState {
 impl Default for DesktopBehaviorUiState {
     fn default() -> Self {
         Self {
-            close_to_tray: default_close_to_tray(),
+            close_behavior: CloseBehavior::default(),
             startup_destination: StartupDestination::RestoreWorkbench,
             launch_at_login: false,
             notifications_enabled: default_notifications_enabled(),
@@ -1748,10 +1808,6 @@ impl Default for DesktopBehaviorUiState {
             auto_update: default_auto_update_enabled(),
         }
     }
-}
-
-const fn default_close_to_tray() -> bool {
-    true
 }
 
 const fn default_notifications_enabled() -> bool {
@@ -3857,14 +3913,63 @@ mod tests {
         assert!(!round_tripped.session.auto_continue_enabled_by_default);
     }
 
+    /// Closing the window keeps Vibex running in the system tray unless the
+    /// reader chose otherwise, so a state file with neither the current field
+    /// nor its legacy boolean decodes to the background default.
     #[test]
-    fn desktop_behavior_defaults_to_close_to_tray_for_legacy_state() {
+    fn desktop_behavior_defaults_to_running_in_the_background_for_legacy_state() {
         let mut value = serde_json::to_value(DesktopUiStateV1::default()).unwrap();
         value.as_object_mut().unwrap().remove("desktopBehavior");
 
         let decoded = decode_and_migrate(&serde_json::to_vec(&value).unwrap()).unwrap();
 
-        assert!(decoded.desktop_behavior.close_to_tray);
+        assert_eq!(
+            decoded.desktop_behavior.close_behavior,
+            CloseBehavior::RunInBackground
+        );
+        assert!(decoded.desktop_behavior.close_behavior.runs_in_background());
+        assert!(!decoded.desktop_behavior.close_behavior.quits_on_close());
+        assert_eq!(CloseBehavior::default(), CloseBehavior::RunInBackground);
+    }
+
+    /// State written before the close behaviour was a choice stored it as a
+    /// `closeToTray` boolean. "Keep running" is the background behaviour and
+    /// "quit on close" is the explicit exit, so a reader who turned the old
+    /// switch off must not be quietly opted back into the tray.
+    #[test]
+    fn legacy_close_to_tray_boolean_decodes_into_the_close_behavior() {
+        for (close_to_tray, expected) in [
+            (true, CloseBehavior::RunInBackground),
+            (false, CloseBehavior::Quit),
+        ] {
+            let mut value = serde_json::to_value(DesktopUiStateV1::default()).unwrap();
+            let behavior = value
+                .get_mut("desktopBehavior")
+                .and_then(serde_json::Value::as_object_mut)
+                .unwrap();
+            behavior.remove("closeBehavior");
+            behavior.insert("closeToTray".into(), serde_json::Value::Bool(close_to_tray));
+
+            let decoded = decode_and_migrate(&serde_json::to_vec(&value).unwrap()).unwrap();
+
+            assert_eq!(decoded.desktop_behavior.close_behavior, expected);
+        }
+    }
+
+    #[test]
+    fn close_behavior_round_trips_and_is_written_by_name() {
+        let mut state = DesktopUiStateV1::default();
+        state.desktop_behavior.close_behavior = CloseBehavior::Quit;
+
+        let value = serde_json::to_value(&state).unwrap();
+        assert_eq!(
+            value["desktopBehavior"]["closeBehavior"],
+            serde_json::Value::String("quit".into())
+        );
+        assert!(value["desktopBehavior"].get("closeToTray").is_none());
+
+        let decoded = decode_and_migrate(&serde_json::to_vec(&state).unwrap()).unwrap();
+        assert_eq!(decoded.desktop_behavior.close_behavior, CloseBehavior::Quit);
     }
 
     /// Both update preferences ship on, so a fresh installation and one that
@@ -3978,13 +4083,13 @@ mod tests {
     }
 
     #[test]
-    fn desktop_behavior_round_trips_an_explicit_exit_on_close_preference() {
+    fn desktop_behavior_round_trips_an_explicit_quit_on_close_preference() {
         let mut state = DesktopUiStateV1::default();
-        state.desktop_behavior.close_to_tray = false;
+        state.desktop_behavior.close_behavior = CloseBehavior::Quit;
 
         let decoded = decode_and_migrate(&serde_json::to_vec(&state).unwrap()).unwrap();
 
-        assert!(!decoded.desktop_behavior.close_to_tray);
+        assert_eq!(decoded.desktop_behavior.close_behavior, CloseBehavior::Quit);
     }
 
     #[test]

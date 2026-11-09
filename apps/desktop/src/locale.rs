@@ -134,8 +134,8 @@ pub struct Strings {
     pub undo_changes: &'static str,
     pub general: &'static str,
     pub general_description: &'static str,
-    pub close_to_tray: &'static str,
-    pub close_to_tray_description: &'static str,
+    pub close_behavior: &'static str,
+    pub close_behavior_description: &'static str,
     pub network_proxy: &'static str,
     pub network_proxy_description: &'static str,
     pub network_proxy_url: &'static str,
@@ -368,8 +368,8 @@ static STRINGS_EN: Strings = Strings {
     undo_changes: "Undo changes",
     general: "General",
     general_description: "Configure default behavior for the desktop shell.",
-    close_to_tray: "Keep running after closing the window",
-    close_to_tray_description: "Keep Vibex available in the system tray when the main window is closed.",
+    close_behavior: "When closing Vibex",
+    close_behavior_description: "Choose whether closing the main window keeps Vibex running in the system tray or quits it.",
     network_proxy: "Proxy",
     network_proxy_description: "Choose how Vibex reaches the network: Agent requests, Git and terminal commands, Agent installs, and updates.",
     network_proxy_url: "Proxy URL",
@@ -573,8 +573,8 @@ static STRINGS_ZH_CN: Strings = Strings {
     undo_changes: "撤销更改",
     general: "常规",
     general_description: "配置桌面端的默认行为。",
-    close_to_tray: "关闭窗口后继续运行",
-    close_to_tray_description: "关闭主窗口后，让 Vibex 继续在系统托盘中运行。",
+    close_behavior: "关闭 Vibex 时",
+    close_behavior_description: "选择关闭主窗口后让 Vibex 继续在系统托盘中后台运行，还是直接退出。",
     network_proxy: "代理",
     network_proxy_description: "选择 Vibex 访问网络的方式：Agent 请求、Git 与终端命令、Agent 安装和更新。",
     network_proxy_url: "代理 URL",
@@ -778,8 +778,8 @@ static STRINGS_ZH_TW: Strings = Strings {
     undo_changes: "撤銷變更",
     general: "一般",
     general_description: "設定桌面端的預設行為。",
-    close_to_tray: "關閉視窗後繼續執行",
-    close_to_tray_description: "關閉主視窗後，讓 Vibex 繼續在系統匣中執行。",
+    close_behavior: "關閉 Vibex 時",
+    close_behavior_description: "選擇關閉主視窗後讓 Vibex 繼續在系統匣中背景執行，還是直接結束。",
     network_proxy: "代理",
     network_proxy_description: "選擇 Vibex 存取網路的方式：Agent 請求、Git 與終端機命令、Agent 安裝與更新。",
     network_proxy_url: "代理 URL",
@@ -1907,6 +1907,20 @@ mod tests {
             "Type / for commands or quick phrases, @ to reference files and sessions or delegate to an Agent, $ for skills, ↑/↓ to fill from history"
         );
         assert_eq!(strings(ResolvedLocale::ZhTw).appearance, "外觀");
+        // Closing Vibex is a choice between two named outcomes in every
+        // language, so the row title asks about the moment, not about a switch.
+        assert_eq!(
+            strings(ResolvedLocale::En).close_behavior,
+            "When closing Vibex"
+        );
+        assert_eq!(
+            strings(ResolvedLocale::ZhCn).close_behavior,
+            "关闭 Vibex 时"
+        );
+        assert_eq!(
+            strings(ResolvedLocale::ZhTw).close_behavior,
+            "關閉 Vibex 時"
+        );
         assert_eq!(strings(ResolvedLocale::ZhCn).session_settings, "会话");
         assert_eq!(
             strings(ResolvedLocale::ZhCn).session_turn_preview_rail,

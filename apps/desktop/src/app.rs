@@ -159,7 +159,7 @@ use vibex_desktop_model::{
     AgentOrderEntry, AgentOrdering, AgentPlanProjection, AgentSortStrategy, AppearanceUiState,
     BACKGROUND_IMAGE_EXTENSIONS, BACKGROUND_IMAGE_MAX_DIM_PERCENT,
     BACKGROUND_IMAGE_MIN_DIM_PERCENT, BackgroundImageFit, BrowserSearchEngine, BrowserStartPage,
-    BrowserUiState, ComposerAttachment, ComposerQueueCommand, ComposerQueueEntry,
+    BrowserUiState, CloseBehavior, ComposerAttachment, ComposerQueueCommand, ComposerQueueEntry,
     ComposerQueueSendMode, ComposerSuggestionSelection, ComposerTrigger, ComputerPanelMode,
     ComputerUiState, DEFAULT_EDITOR_AUTOSAVE_DELAY_MS, DEFAULT_NETWORK_PROXY_BYPASS,
     DesktopBehaviorUiState, DesktopUiStateV1, DeveloperUiState, EditorAutosaveMode,
@@ -46357,8 +46357,8 @@ impl VibexWorkbench {
         });
     }
 
-    fn set_close_to_tray(&mut self, enabled: bool, cx: &mut Context<Self>) {
-        self.ui_state.desktop_behavior.close_to_tray = enabled;
+    fn set_close_behavior(&mut self, behavior: CloseBehavior, cx: &mut Context<Self>) {
+        self.ui_state.desktop_behavior.close_behavior = behavior;
         self.queue_ui_state();
         cx.notify();
     }
@@ -83496,6 +83496,20 @@ fn settings_section_for_query(query: &str) -> Option<SettingsSection> {
         "startup",
         "notification",
         "language",
+        // The close behaviour and the per-Agent notification switches both
+        // live on General, so a reader looking for either by the window or the
+        // tray it involves is sent there too. "background" is deliberately
+        // absent here: the appearance page owns the background image, and its
+        // own candidates already answer that query.
+        "close",
+        "quit",
+        "tray",
+        "关闭",
+        "退出",
+        "托盘",
+        "關閉",
+        "結束",
+        "系統匣",
         // The same-machine client switch lives on General, so a reader looking
         // for it by the client it serves is sent there too.
         "tui",
@@ -83679,9 +83693,22 @@ fn settings_search_candidates(strings: &'static Strings) -> Vec<SettingsSearchCa
         ),
         settings_search_candidate(
             SettingsSection::General,
-            strings.close_to_tray,
-            strings.close_to_tray_description,
-            &["tray", "close", "托盘", "托盤"],
+            strings.close_behavior,
+            strings.close_behavior_description,
+            &[
+                "tray",
+                "close",
+                "background",
+                "quit",
+                "exit",
+                "托盘",
+                "托盤",
+                "后台",
+                "背景",
+                "退出",
+                "结束",
+                "結束",
+            ],
         ),
         settings_search_candidate(
             SettingsSection::General,
@@ -87417,10 +87444,10 @@ impl FoundationSettings {
         cx.notify();
     }
 
-    fn set_close_to_tray(&mut self, enabled: bool, cx: &mut Context<Self>) {
+    fn set_close_behavior(&mut self, behavior: CloseBehavior, cx: &mut Context<Self>) {
         let _ = self
             .workbench
-            .update(cx, |this, cx| this.set_close_to_tray(enabled, cx));
+            .update(cx, |this, cx| this.set_close_behavior(behavior, cx));
         cx.notify();
     }
 
@@ -88357,11 +88384,26 @@ impl FoundationSettings {
             Some(strings.system_default),
             cx,
         );
-        let close_to_tray_switch = Switch::new("close-to-tray")
-            .small()
-            .checked(desktop_behavior.close_to_tray)
-            .tooltip(strings.close_to_tray)
-            .on_click(cx.listener(|this, enabled, _, cx| this.set_close_to_tray(*enabled, cx)));
+        // Closing the window either leaves the Agent running in the system
+        // tray or ends the application, so the row offers both outcomes by name
+        // instead of asking the reader to interpret a switch's polarity.
+        let close_behavior_control = settings_segmented_control(
+            "close-behavior",
+            vec![
+                settings_segmented_option(
+                    locale::text("Run in background", "后台运行", "背景執行"),
+                    desktop_behavior.close_behavior.runs_in_background(),
+                    cx.listener(|this, _, _, cx| {
+                        this.set_close_behavior(CloseBehavior::RunInBackground, cx)
+                    }),
+                ),
+                settings_segmented_option(
+                    locale::text("Quit", "直接退出", "直接結束"),
+                    desktop_behavior.close_behavior.quits_on_close(),
+                    cx.listener(|this, _, _, cx| this.set_close_behavior(CloseBehavior::Quit, cx)),
+                ),
+            ],
+        );
         let local_clients_control = self.render_local_clients_control(cx);
         let custom_proxy = network_proxy.mode == NetworkProxyMode::Custom;
         let proxy_value = self.proxy_input.read(cx).value().to_string();
@@ -88496,9 +88538,9 @@ impl FoundationSettings {
                             cx,
                         ),
                         setting_row(
-                            strings.close_to_tray,
-                            strings.close_to_tray_description,
-                            close_to_tray_switch,
+                            strings.close_behavior,
+                            strings.close_behavior_description,
+                            close_behavior_control,
                             stacked,
                             cx,
                         ),
@@ -119076,6 +119118,61 @@ mod tests {
     }
 
     #[test]
+    fn general_settings_offer_the_close_behavior_as_two_named_outcomes() {
+        let source = include_str!("app.rs");
+        let general = source
+            .split_once("    fn render_general_page(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_appearance_page("))
+            .map(|(body, _)| body)
+            .expect("general settings should remain inspectable");
+
+        // Closing the window is a choice between two named outcomes, not a
+        // switch whose polarity the reader has to infer; the old boolean
+        // control is gone.
+        assert!(general.contains("\"close-behavior\""));
+        assert!(general.contains("CloseBehavior::RunInBackground"));
+        assert!(general.contains("CloseBehavior::Quit"));
+        assert!(!general.contains("Switch::new(\"close-to-tray\")"));
+
+        // Both segments come from the stored preference, so the page always
+        // shows what the window's close control will actually do.
+        assert!(general.contains("desktop_behavior.close_behavior.runs_in_background()"));
+        assert!(general.contains("desktop_behavior.close_behavior.quits_on_close()"));
+        assert!(general.contains("set_close_behavior(CloseBehavior::RunInBackground"));
+        assert!(general.contains("set_close_behavior(CloseBehavior::Quit"));
+
+        let setter = source
+            .split_once(
+                "    fn set_close_behavior(&mut self, behavior: CloseBehavior, cx: &mut Context<Self>) {\n        let _ = self",
+            )
+            .and_then(|(_, tail)| tail.split_once("fn set_network_proxy_mode(&mut self"))
+            .map(|(body, _)| body)
+            .expect("the close behaviour setter should remain inspectable");
+        assert!(setter.contains(".workbench"));
+        assert!(setter.contains("set_close_behavior(behavior, cx)"));
+
+        // The choice is discoverable from settings search and the palette.
+        let english = locale::strings(locale::ResolvedLocale::En);
+        assert!(
+            settings_search_candidates_for_query("tray", english)
+                .iter()
+                .any(|candidate| {
+                    candidate.section == SettingsSection::General
+                        && candidate.title == english.close_behavior
+                })
+        );
+        assert_eq!(
+            settings_section_for_query("background"),
+            None,
+            "the background image keeps that query on the appearance page"
+        );
+        assert_eq!(
+            settings_section_for_query("托盘"),
+            Some(SettingsSection::General)
+        );
+    }
+
+    #[test]
     fn network_proxy_settings_offer_system_direct_and_custom_modes() {
         let source = include_str!("app.rs");
         let general = source
@@ -119614,7 +119711,9 @@ mod tests {
             .expect("command display setter should remain inspectable");
         let file_operation_display = source
             .split_once("    fn set_enhanced_file_operation_display(")
-            .and_then(|(_, tail)| tail.split_once("\n    fn set_close_to_tray("))
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    fn sync_timeline_display_settings_to_runtime(")
+            })
             .map(|(body, _)| body)
             .expect("file operation display setter should remain inspectable");
         let invalidation = source

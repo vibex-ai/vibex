@@ -125,13 +125,14 @@ impl SystemTray {
             return true;
         }
 
-        let close_to_tray = self
+        let run_in_background = self
             .workbench
             .read(cx)
             .ui_state()
             .desktop_behavior
-            .close_to_tray;
-        if !close_to_tray {
+            .close_behavior
+            .runs_in_background();
+        if !run_in_background {
             cx.set_quit_mode(QuitMode::LastWindowClosed);
             self.quitting = true;
             return true;

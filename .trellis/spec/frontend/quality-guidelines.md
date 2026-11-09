@@ -698,15 +698,18 @@ vibex-foundation: runtime-stopped
 ### 3. Contracts
 
 - Linux title-bar/window close callbacks must not call `cx.quit()`: GPUI's X11 close
-  path can re-enter window removal and panic. When close-to-tray is enabled, the
-  tray global retains the existing workbench entity under `QuitMode::Explicit` while
-  the application has zero windows; this must not rely on `WindowOptions::show`
-  because GPUI's Linux backend maps every newly created window. Restoring creates one
-  visible window and must recover from a stale tracked window handle. When disabled,
-  the callback switches to `LastWindowClosed` and lets window removal initiate
-  application quit. The app-level quit hook is the single owner of final cleanup:
-  queue and synchronously flush the current UI state, spawn and await shared runtime
-  shutdown, then allow process exit.
+  path can re-enter window removal and panic. The General settings page exposes the
+  close behaviour as a two-way choice (`DesktopBehaviorUiState::close_behavior`:
+  `run_in_background` or `quit`), not as a switch whose polarity the reader has to
+  infer; `run_in_background` is the shipped default. When the window is closed in the
+  background behaviour, the tray global retains the existing workbench entity under
+  `QuitMode::Explicit` while the application has zero windows; this must not rely on
+  `WindowOptions::show` because GPUI's Linux backend maps every newly created window.
+  Restoring creates one visible window and must recover from a stale tracked window
+  handle. In the `quit` behaviour, the callback switches to `LastWindowClosed` and
+  lets window removal initiate application quit. The app-level quit hook is the single
+  owner of final cleanup: queue and synchronously flush the current UI state, spawn
+  and await shared runtime shutdown, then allow process exit.
 - `DesktopRuntime` owns the process/home lock. A second shell must fail while the
   workbench is live, and the same external lock probe must succeed only after awaited
   shutdown and process exit. Cleanup that is merely spawned and abandoned is invalid.
