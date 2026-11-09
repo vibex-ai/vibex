@@ -989,6 +989,12 @@ impl ComputerRuntime {
         installer
             .args(&command.args)
             .stdin(std::process::Stdio::null());
+        // The vendor script downloads and installs a host binary, so the mount
+        // it would otherwise inherit is not part of the install: the packages
+        // and the `python` it may use are the machine's own.
+        vibex_core::process_environment::sanitize_inherited_appimage_environment(
+            installer.as_std_mut(),
+        );
         // The installer is a console program and Vibex is a GUI one, so without
         // this the whole install — minutes of it — runs behind a black window
         // on the reader's desktop.

@@ -220,6 +220,16 @@ impl CuaDriverCli {
 
     /// One `cua-driver` invocation, carrying the environment this client holds.
     ///
+    /// **The driver is a host binary, so it must not inherit an AppImage
+    /// mount.** The AppImage launcher exports `APPDIR`, `APPIMAGE` and a
+    /// `LD_LIBRARY_PATH` pointing inside `/tmp/.mount_*`; a driver started with
+    /// that environment loads the bundle's `libglib`/`libdbus`/`libatspi`
+    /// instead of the host's, and the mixed GLib stack fails with a symbol
+    /// lookup error before it can reach `org.a11y.Bus`. The settings page then
+    /// reports `AccessibilityBridgeMissing` for a driver it can see and run.
+    /// The mount is stripped here, once, for every subcommand — probe, daemon
+    /// and tool call alike.
+    ///
     /// The engine is a console program and Vibex is a GUI one, so a spawn with
     /// no creation flags hands it a console window of its own: a black window
     /// over the reader's desktop for every probe, every `status` and every tool
@@ -228,6 +238,12 @@ impl CuaDriverCli {
     /// pipes each caller sets, which is where the driver's answers are read.
     fn command(&self) -> Command {
         let mut command = Command::new(&self.executable);
+        // Inherited values first, then this client's own overrides: an explicit
+        // `with_env` value stays authoritative even when it looks like a path
+        // list.
+        vibex_core::process_environment::sanitize_inherited_appimage_environment(
+            command.as_std_mut(),
+        );
         for (key, value) in &self.extra_env {
             command.env(key, value);
         }
@@ -2799,6 +2815,84 @@ mod tests {
             Some(value) => unsafe { std::env::set_var(DRIVER_PATH_ENV, value) },
             None => unsafe { std::env::remove_var(DRIVER_PATH_ENV) },
         }
+    }
+
+    /// The driver is a host binary: an AppImage mount must not reach it.
+    ///
+    /// A driver launched with the bundle's `LD_LIBRARY_PATH` loads the mount's
+    /// `libglib`/`libdbus` against the host's D-Bus session, and the symbol
+    /// mismatch stops it before `org.a11y.Bus` — reported as
+    /// `AccessibilityBridgeMissing` for a driver that is installed and runs.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn driver_invocations_do_not_inherit_the_appimage_mount() {
+        let _guard = environment_lock();
+        let (_temporary, driver) = fake_driver("{}", "", 0);
+        // SAFETY: the test sets and restores these variables around one
+        // command build, under the lock that serializes such tests.
+        let previous_app_dir = std::env::var_os("APPDIR");
+        let previous_library_path = std::env::var_os("LD_LIBRARY_PATH");
+        unsafe {
+            std::env::set_var("APPDIR", "/tmp/.mount_vibex-test");
+            std::env::set_var(
+                "LD_LIBRARY_PATH",
+                "/tmp/.mount_vibex-test/usr/lib:/opt/host/lib",
+            );
+        }
+
+        let command = driver.command();
+
+        match previous_app_dir {
+            Some(value) => unsafe { std::env::set_var("APPDIR", value) },
+            None => unsafe { std::env::remove_var("APPDIR") },
+        }
+        match previous_library_path {
+            Some(value) => unsafe { std::env::set_var("LD_LIBRARY_PATH", value) },
+            None => unsafe { std::env::remove_var("LD_LIBRARY_PATH") },
+        }
+
+        let overrides = command
+            .as_std()
+            .get_envs()
+            .map(|(key, value)| (key.to_os_string(), value.map(std::ffi::OsStr::to_os_string)))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(
+            overrides.get(std::ffi::OsStr::new("APPDIR")),
+            Some(&None),
+            "the launcher marker must not reach the driver"
+        );
+        assert_eq!(
+            overrides.get(std::ffi::OsStr::new("LD_LIBRARY_PATH")),
+            Some(&Some(std::ffi::OsString::from("/opt/host/lib"))),
+            "only host library paths may reach the driver"
+        );
+    }
+
+    /// An explicit `with_env` value is applied after sanitation, so the
+    /// Wayland opt-in the runtime passes through still arrives.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn explicit_environment_overrides_survive_sanitation() {
+        let (_temporary, driver) = fake_driver("{}", "", 0);
+        let driver = driver.with_env("VIBEX_DRIVER_TEST_FLAG", "1");
+
+        let command = driver.command();
+
+        assert_eq!(
+            command
+                .as_std()
+                .get_envs()
+                .find(|(key, _)| *key == std::ffi::OsStr::new("VIBEX_DRIVER_TEST_FLAG"))
+                .map(|(_, value)| value.map(std::ffi::OsStr::to_os_string)),
+            Some(Some(std::ffi::OsString::from("1")))
+        );
+    }
+
+    /// Serializes the tests that set process-wide environment variables.
+    #[cfg(target_os = "linux")]
+    fn environment_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Runs one fake driver: a script that prints `stdout` and/or `stderr`

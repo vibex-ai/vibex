@@ -28,6 +28,8 @@ pub mod model_gateway;
 pub mod model_route;
 pub mod pairing_code_link;
 pub mod permission;
+#[cfg(not(target_family = "wasm"))]
+pub mod process_environment;
 pub mod provider;
 pub mod provider_presets;
 pub mod provider_projection;

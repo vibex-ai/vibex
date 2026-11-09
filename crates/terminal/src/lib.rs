@@ -1362,28 +1362,15 @@ fn sanitize_terminal_environment(command: &mut CommandBuilder) {
     // overrides to the application process. They are required by the desktop
     // binary, but leaking them into an interactive PTY makes host programs use
     // the AppImage runtime (for example Python then cannot import `encodings`).
-    for key in [
-        "PATH",
-        "LD_LIBRARY_PATH",
-        "GSETTINGS_SCHEMA_DIR",
-        "GST_PLUGIN_SYSTEM_PATH",
-        "GST_PLUGIN_SYSTEM_PATH_1_0",
-        "PERLLIB",
-        "PYTHONHOME",
-        "PYTHONPATH",
-        "QT_PLUGIN_PATH",
-        "XDG_DATA_DIRS",
-    ] {
+    //
+    // The key lists and the filter are `vibex_core::process_environment`'s: the
+    // ACP and computer-use children strip the same mount, and one policy for
+    // all of them is what keeps a new key from being handled in only one place.
+    for key in vibex_core::process_environment::APPIMAGE_PATH_LIST_KEYS {
         filter_app_dir_paths(command, key, &app_dir);
     }
 
-    for key in [
-        "APPDIR",
-        "APPIMAGE",
-        "ARGV0",
-        "OWD",
-        "PYTHONDONTWRITEBYTECODE",
-    ] {
+    for key in vibex_core::process_environment::APPIMAGE_LAUNCHER_KEYS {
         command.env_remove(key);
     }
 }
@@ -1427,18 +1414,17 @@ fn filter_app_dir_paths(command: &mut CommandBuilder, key: &str, app_dir: &Path)
     let Some(value) = command.get_env(key).map(OsStr::to_os_string) else {
         return;
     };
-    let paths = std::env::split_paths(&value).collect::<Vec<_>>();
-    let retained = paths
-        .iter()
-        .filter(|path| !path.starts_with(app_dir))
-        .cloned()
-        .collect::<Vec<_>>();
-    if retained.len() == paths.len() {
-        return;
-    }
-    match std::env::join_paths(retained) {
-        Ok(value) if !value.is_empty() => command.env(key, value),
-        _ => command.env_remove(key),
+    match vibex_core::process_environment::retain_host_paths(&value, app_dir) {
+        // Nothing mount-local: the inherited value stays exactly as it was.
+        None => {}
+        // Every entry was mount-local: an empty path list would resolve to the
+        // current directory, so the variable goes instead.
+        Some(retained) if retained.is_empty() => {
+            command.env_remove(key);
+        }
+        Some(retained) => {
+            command.env(key, retained);
+        }
     }
 }
 
