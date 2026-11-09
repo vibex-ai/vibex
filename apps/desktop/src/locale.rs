@@ -1331,6 +1331,16 @@ const ERROR_MESSAGES: &[MessageTranslation] = &[
         zh_tw: "所選 Agent 執行環境設定無法使用。",
     },
     MessageTranslation {
+        en: "Restore or reopen the project, or start the session in another workspace.",
+        zh_cn: "请恢复或重新打开该项目，或在其他工作区中启动会话。",
+        zh_tw: "請恢復或重新開啟該專案，或在其他工作區中啟動工作階段。",
+    },
+    MessageTranslation {
+        en: "Restore the configured working directory, then retry the session.",
+        zh_cn: "请恢复已配置的工作子目录，然后重试该会话。",
+        zh_tw: "請恢復已設定的工作子目錄，然後重試該工作階段。",
+    },
+    MessageTranslation {
         en: "Review the selected Agent profile and model, then retry.",
         zh_cn: "请检查所选 Agent 配置和模型，然后重试。",
         zh_tw: "請檢查所選 Agent 設定和模型，然後重試。",
@@ -1392,6 +1402,16 @@ const ERROR_PREFIXES: &[MessageTranslation] = &[
         en: "message submission failed: ",
         zh_cn: "消息发送失败：",
         zh_tw: "訊息傳送失敗：",
+    },
+    MessageTranslation {
+        en: "The Agent session workspace is missing: ",
+        zh_cn: "Agent 会话的工作目录已不存在：",
+        zh_tw: "Agent 工作階段的工作目錄已不存在：",
+    },
+    MessageTranslation {
+        en: "The Agent session working directory is missing: ",
+        zh_cn: "Agent 会话的工作子目录已不存在：",
+        zh_tw: "Agent 工作階段的工作子目錄已不存在：",
     },
     MessageTranslation {
         en: "clipboard image capture failed: ",

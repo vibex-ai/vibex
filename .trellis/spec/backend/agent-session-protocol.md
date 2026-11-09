@@ -2116,6 +2116,20 @@ Normal single-session Agent operation must continue with a capability warning.
   value remains authoritative. In particular, AppImage `PYTHONHOME` and
   `PYTHONPATH` must never prevent host Python from importing its standard
   library in an Agent shell.
+- The AppImage policy is `vibex_core::process_environment`, not an adapter-local
+  rule, and it applies to every host binary the runtime launches — the ACP
+  adapter, the terminal-shell child, the managed install, and the computer-use
+  helper and `cua-driver` it starts. A driver that inherits the mount's
+  `LD_LIBRARY_PATH` loads the bundle's `libglib`/`libdbus` against the host's
+  D-Bus session and fails with `AccessibilityBridgeMissing` before reaching
+  `org.a11y.Bus`. New spawn sites call the shared entry point instead of
+  copying the key lists.
+- A launch failure caused by a missing workspace must not be reported as
+  `runtime_switch_configuration_unavailable`: that sentence sends the reader to
+  the settings page for a problem that lives on disk. `resolve_workspace_cwd`
+  raises `agent_workspace_missing` with the path in the message, and the
+  temporary session root is recreated before resolution because its row
+  outlives a `/tmp` sweep. A reader project directory is never recreated.
 - ACP-native handles live in durable `RuntimeBinding` records and in-memory
   attachment state. Adapter-local `ProviderBinding` values may be synthesized
   from that exact current fence, but are never persisted as session authority.

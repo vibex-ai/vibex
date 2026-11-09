@@ -1381,6 +1381,10 @@ impl AgentManager {
         }
 
         let conn = self.open_migrated()?;
+        // The temporary session root lives under `/tmp`, so its row can outlive
+        // the directory. A terminal session runs the CLI with the root as its
+        // cwd, so the directory has to exist before the row is even written.
+        vibex_core::workspace::restore_temporary_session_root(&request.workspace_root)?;
         let (project, workspace) =
             WorkspaceRepository::ensure(&conn, &request.workspace_root, request.workspace_mode)?;
         let now = unix_timestamp_ms();
@@ -1958,6 +1962,11 @@ impl AgentManager {
         desired.reasoning_effort = normalize_reasoning_effort(desired.reasoning_effort.as_deref())?;
 
         let mut conn = self.open_migrated()?;
+        // A temporary session root lives under `/tmp`, so a reboot or a sweep
+        // removes it while the project and workspace rows survive. Recreating
+        // it here means the session is never persisted against a directory the
+        // Agent launch is about to reject.
+        vibex_core::workspace::restore_temporary_session_root(&request.workspace_root)?;
         let (_project, workspace) =
             WorkspaceRepository::ensure(&conn, &request.workspace_root, request.workspace_mode)?;
         match &desired.auth_source {

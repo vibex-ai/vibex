@@ -377,8 +377,39 @@ fn formatted_error(locale: Locale, code: &str, message: &str) -> Option<String> 
         }
         "acp_retry_exhausted" => retry_exhausted(locale, message, "ACP"),
         "agent_retry_exhausted" => retry_exhausted(locale, message, "Agent"),
+        "agent_workspace_missing" => workspace_missing(locale, message),
         _ => None,
     }
+}
+
+/// A session whose persisted workspace is gone.
+///
+/// The sentence carries the path the reader has to look at, so only the
+/// sentence is translated: the path is evidence and stays exactly as recorded.
+fn workspace_missing(locale: Locale, message: &str) -> Option<String> {
+    for (prefix, translated) in [
+        (
+            "The Agent session workspace is missing: ",
+            locale.text(
+                "The Agent session workspace is missing: ",
+                "Agent 会话的工作目录已不存在：",
+                "Agent 工作階段的工作目錄已不存在：",
+            ),
+        ),
+        (
+            "The Agent session working directory is missing: ",
+            locale.text(
+                "The Agent session working directory is missing: ",
+                "Agent 会话的工作子目录已不存在：",
+                "Agent 工作階段的工作子目錄已不存在：",
+            ),
+        ),
+    ] {
+        if let Some(path) = message.strip_prefix(prefix) {
+            return Some(format!("{translated}{path}"));
+        }
+    }
+    None
 }
 
 fn retry_exhausted(locale: Locale, message: &str, subject: &str) -> Option<String> {
@@ -521,6 +552,32 @@ mod tests {
                 "Codex model stream failed after 4 reconnect attempts: connection reset",
             ),
             "Codex 模型流在 4 次重连后失败：connection reset"
+        );
+    }
+
+    #[test]
+    fn a_missing_workspace_keeps_its_path_in_every_language() {
+        assert_eq!(
+            timeline_error_message(
+                Locale::ZhCn,
+                "agent_workspace_missing",
+                "The Agent session workspace is missing: /tmp/vibex/sessions",
+            ),
+            "Agent 会话的工作目录已不存在：/tmp/vibex/sessions"
+        );
+        assert_eq!(
+            timeline_error_message(
+                Locale::ZhTw,
+                "agent_workspace_missing",
+                "The Agent session workspace is missing: /tmp/vibex/sessions",
+            ),
+            "Agent 工作階段的工作目錄已不存在：/tmp/vibex/sessions"
+        );
+        // English and any sentence this formatter does not own pass through.
+        let message = "The Agent session workspace is missing: /home/reader/project";
+        assert_eq!(
+            timeline_error_message(Locale::En, "agent_workspace_missing", message),
+            message
         );
     }
 

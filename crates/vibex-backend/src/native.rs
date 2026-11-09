@@ -1554,24 +1554,7 @@ impl WorkspaceBackend for NativeBackend {
 /// Creates and resolves the authority's temporary session root.
 fn temporary_session_root() -> vibex_core::VibexResult<String> {
     let root = std::env::temp_dir().join("vibex").join("sessions");
-    std::fs::create_dir_all(&root).map_err(|error| {
-        vibex_core::VibexError::storage(
-            "temporary_workspace_create_failed",
-            "failed to create temporary session workspace",
-        )
-        .with_diagnostic("path", root.display().to_string())
-        .with_diagnostic("error", error.to_string())
-    })?;
-    root.canonicalize()
-        .map(|path| path.to_string_lossy().into_owned())
-        .map_err(|error| {
-            vibex_core::VibexError::storage(
-                "temporary_workspace_canonicalize_failed",
-                "failed to resolve temporary session workspace",
-            )
-            .with_diagnostic("path", root.display().to_string())
-            .with_diagnostic("error", error.to_string())
-        })
+    vibex_core::workspace::ensure_temporary_session_root(&root)
 }
 
 impl FileBackend for NativeBackend {

@@ -950,6 +950,10 @@ fn actionable_error_for_code(code: &str) -> VibexResult<RuntimeSelectionActionab
             "The selected Agent runtime configuration is unavailable.",
             "Review the selected Agent profile and model, then retry.",
         ),
+        "agent_workspace_missing" => (
+            "The Agent session workspace is missing.",
+            "Restore or reopen the project, or start the session in another workspace.",
+        ),
         "runtime_switch_claim_retry_exhausted" => (
             "Vibex could not reserve local runtime state because the database stayed busy.",
             "Retry initialization shortly; no Agent work was started.",

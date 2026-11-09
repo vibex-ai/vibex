@@ -8232,7 +8232,7 @@ impl AcpRuntimeSwitchBridge {
             selection.model_id(),
         );
         let cwd = AcpRuntimeClient::resolve_workspace_cwd(&config, &session.workspace_root)
-            .map_err(|error| runtime_configuration_unavailable(&error.code))?;
+            .map_err(|error| workspace_launch_failure(error, &session.workspace_root))?;
         let (process_strategy_effective, pool_fallback_reason) = self
             .client
             .pool_decision_for_agent(&selection.agent_id, &config)?;
@@ -10335,6 +10335,36 @@ fn runtime_configuration_unavailable(cause_code: &str) -> VibexError {
         "causeCode",
         safe_runtime_configuration_cause_code(cause_code),
     )
+}
+
+/// The reader-facing sentence for a launch failure that is not about the
+/// runtime configuration at all.
+///
+/// `runtime_switch_configuration_unavailable` is the identity of every failure
+/// raised while a switch prepares a target, and its own sentence is accurate
+/// only for the configuration ones. A workspace that disappeared is neither a
+/// Profile nor a model, and saying so sent readers to the settings page for a
+/// problem that lives on disk — the `causeCode` stayed in diagnostics, which no
+/// client shows. A missing workspace keeps the path in the sentence instead.
+fn workspace_launch_failure(error: VibexError, workspace_root: &str) -> VibexError {
+    let (directory, hint) = match error.code.as_str() {
+        "acp_workspace_missing" => (
+            "The Agent session workspace is missing",
+            "Restore or reopen the project, or start the session in another workspace.",
+        ),
+        "acp_cwd_missing" => (
+            "The Agent session working directory is missing",
+            "Restore the configured working directory, then retry the session.",
+        ),
+        _ => return error,
+    };
+    VibexError::validation(
+        "agent_workspace_missing",
+        format!("{directory}: {workspace_root}"),
+    )
+    .with_recovery_hint(hint)
+    .with_diagnostic("workspaceRoot", workspace_root)
+    .with_diagnostic("causeCode", error.code)
 }
 
 /// Whether the model a Pi session selected carries reasoning.
@@ -13307,6 +13337,19 @@ impl AcpRuntimeClient {
             .flatten()
     }
 
+    /// The directory the Agent is launched in, resolved from the persisted
+    /// workspace root.
+    ///
+    /// A temporary session's root lives under the operating system's temporary
+    /// directory, so a reboot or a `/tmp` sweep removes it while the session
+    /// row keeps pointing at it. The root is recreated here rather than only at
+    /// the moment a project is first created: a session started weeks ago, a
+    /// forked session and a runtime switch all resolve through this function
+    /// with a workspace root nobody just created.
+    ///
+    /// Only the temporary root is recreated. A reader's own project that
+    /// disappeared is reported instead, because starting the Agent in an empty
+    /// directory where the project used to be would hide the real problem.
     fn resolve_workspace_cwd(
         config: &AcpProviderConfig,
         workspace_root: &str,
@@ -13319,6 +13362,7 @@ impl AcpRuntimeClient {
             )
             .with_diagnostic("workspaceRoot", workspace_root));
         }
+        vibex_core::workspace::restore_temporary_session_root(workspace_root)?;
         let workspace = raw.canonicalize().map_err(|err| {
             VibexError::validation(
                 "acp_workspace_missing",
@@ -15758,7 +15802,8 @@ impl AcpRuntimeClient {
             agent_id.as_str(),
             selected_model_from_binding(binding).as_deref(),
         );
-        let cwd = Self::resolve_workspace_cwd(&config, workspace_root)?;
+        let cwd = Self::resolve_workspace_cwd(&config, workspace_root)
+            .map_err(|error| workspace_launch_failure(error, workspace_root))?;
         let (process_strategy_effective, pool_fallback_reason) =
             self.pool_decision_for_agent(&agent_id, &config)?;
         Ok(BindingLaunchContext {
@@ -19197,7 +19242,8 @@ impl AcpClient for AcpRuntimeClient {
             &auth_source,
             profile.launch_revision(),
         )?;
-        let cwd = Self::resolve_workspace_cwd(&config, &request.workspace_root)?;
+        let cwd = Self::resolve_workspace_cwd(&config, &request.workspace_root)
+            .map_err(|error| workspace_launch_failure(error, &request.workspace_root))?;
         let (effective_strategy, fallback_reason) =
             self.pool_decision(&request.provider_profile_id, &config)?;
         let env_unsets = Vec::new();
@@ -38175,6 +38221,86 @@ for line in sys.stdin:
 
         client.close_session(&binding).await.unwrap();
         fixture.cleanup();
+    }
+
+    /// A session whose temporary root was swept out of `/tmp` is started in a
+    /// recreated root instead of failing with a configuration error.
+    ///
+    /// The report this exists for: a project row pointed at `/tmp/vibex/
+    /// sessions`, the directory was gone after a reboot, and every new session
+    /// there failed ~100 ms later with `runtime_switch_configuration_unavailable`
+    /// before any ACP handshake. The root is the authority's own scratch space,
+    /// so recreating it is the correct answer.
+    #[test]
+    fn a_missing_temporary_session_root_is_recreated_before_launch() {
+        let parent = std::env::temp_dir().join(format!(
+            "vibex-acp-temp-root-{}",
+            vibex_core::RequestId::new().as_str()
+        ));
+        let root = parent.join("vibex").join("sessions");
+        let root_text = root.to_string_lossy().into_owned();
+        let config = AcpProviderConfig {
+            command: "true".to_string(),
+            args: Vec::new(),
+            env: Vec::new(),
+            cwd_template: None,
+            process_strategy: vibex_core::AcpProcessStrategy::default(),
+            terminal_tools: false,
+            terminal_auth: false,
+            models: Vec::new(),
+            modes: Vec::new(),
+            features: Vec::new(),
+            disabled_tools: Vec::new(),
+        };
+        assert!(!root.exists());
+
+        let cwd = AcpRuntimeClient::resolve_workspace_cwd(&config, &root_text).unwrap();
+
+        assert!(root.is_dir());
+        assert_eq!(cwd, root.canonicalize().unwrap());
+
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    /// A reader project that disappeared is reported, not recreated: an empty
+    /// directory in its place would start the Agent somewhere nobody chose.
+    ///
+    /// The sentence names the path, and the code is the workspace one rather
+    /// than the generic configuration failure the report had to decode by hand.
+    #[test]
+    fn a_missing_project_directory_is_named_in_the_failure() {
+        let root = std::env::temp_dir().join(format!(
+            "vibex-acp-project-{}",
+            vibex_core::RequestId::new().as_str()
+        ));
+        let root_text = root.to_string_lossy().into_owned();
+        let config = AcpProviderConfig {
+            command: "true".to_string(),
+            args: Vec::new(),
+            env: Vec::new(),
+            cwd_template: None,
+            process_strategy: vibex_core::AcpProcessStrategy::default(),
+            terminal_tools: false,
+            terminal_auth: false,
+            models: Vec::new(),
+            modes: Vec::new(),
+            features: Vec::new(),
+            disabled_tools: Vec::new(),
+        };
+
+        let error = AcpRuntimeClient::resolve_workspace_cwd(&config, &root_text)
+            .map_err(|error| workspace_launch_failure(error, &root_text))
+            .unwrap_err();
+
+        assert_eq!(error.code, "agent_workspace_missing");
+        assert_eq!(
+            error.message,
+            format!("The Agent session workspace is missing: {root_text}")
+        );
+        assert!(error.diagnostics.iter().any(|diagnostic| {
+            diagnostic.key == "causeCode" && diagnostic.value == "acp_workspace_missing"
+        }));
+        assert!(!root.exists());
     }
 
     #[test]
