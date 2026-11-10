@@ -85219,6 +85219,7 @@ fn connection_diagnostic_title(
             "运行时升级失败",
             "執行階段升級失敗",
         ),
+        SshDiagnosticKind::Wsl => locale::text("WSL is unavailable", "WSL 不可用", "WSL 無法使用"),
         SshDiagnosticKind::Unknown => {
             locale::text("SSH setup failed", "SSH 配置失败", "SSH 設定失敗")
         }
@@ -86183,6 +86184,19 @@ struct FoundationSettings {
     connections_wsl_open: bool,
     connections_wsl_distros: Vec<String>,
     connections_wsl_selected: Option<String>,
+    /// The distro read still running in the background. `wsl.exe` is a process
+    /// call that can take a while on a broken WSL install, so the dialog opens
+    /// first and fills in when the list arrives.
+    connections_wsl_task: Option<Task<()>>,
+    /// Which read the list belongs to. A newer read bumps this, so the older
+    /// one's answer is dropped instead of overwriting it.
+    connections_wsl_generation: u64,
+    /// The last read is still running; the dialog says so instead of claiming
+    /// there are no distros.
+    connections_wsl_loading: bool,
+    /// The last read failed, with the child's own message. The dialog keeps it
+    /// on screen; the hint layer carries the same text.
+    connections_wsl_error: Option<String>,
     /// Whether the Bootstrap SSH panel is showing. The command is generated
     /// only after the user names the Linux account it authorizes.
     bootstrap_open: bool,
@@ -86658,6 +86672,10 @@ impl FoundationSettings {
                 connections_wsl_open: false,
                 connections_wsl_distros: Vec::new(),
                 connections_wsl_selected: None,
+                connections_wsl_task: None,
+                connections_wsl_generation: 0,
+                connections_wsl_loading: false,
+                connections_wsl_error: None,
                 bootstrap_open: false,
                 bootstrap_user_input,
                 bootstrap_command: None,
@@ -90449,22 +90467,80 @@ impl FoundationSettings {
         cx.notify();
     }
 
+    /// Reads the installed distros in the background and fills the WSL dialog.
+    ///
+    /// `wsl.exe` is a process call, and a broken WSL install answers it slowly
+    /// or not at all; reading it inline meant the whole settings window froze
+    /// before the dialog could even paint. The dialog therefore opens first and
+    /// shows Reading, the read runs on a blocking worker, and its answer lands
+    /// on the next frame — a failure included, with `wsl.exe`'s own words.
     fn load_wsl_distros(&mut self, cx: &mut Context<Self>) {
         self.connections_wsl_open = true;
-        match crate::ssh_connection::wsl::list_distros(Path::new("wsl.exe")) {
-            Ok(distros) => {
-                self.connections_wsl_selected = distros.first().cloned();
-                self.connections_wsl_distros = distros;
-            }
-            Err(error) => {
-                self.connections_wsl_distros.clear();
-                self.connections_wsl_selected = None;
-                // The distro list is read before the dialog opens, so the
-                // failure is a hint on the layer rather than a line in a body
-                // the reader has no way to dismiss.
-                self.report_connections_failure(format!("{}: {}", error.code, error.message), cx);
-            }
+        self.connections_wsl_loading = true;
+        if self.connections_wsl_task.take().is_some() {
+            // A second read replaces the first: the list is a snapshot of the
+            // machine, and an answer from a superseded read would overwrite the
+            // newer one.
+            self.connections_wsl_generation = self.connections_wsl_generation.wrapping_add(1);
         }
+        let generation = self.connections_wsl_generation;
+        // `wsl.exe` is a process call, and one that hangs must not hang the
+        // window that is drawing the dialog, so the read runs on a blocking
+        // worker. It has to *start* on Tokio: `spawn_blocking` needs a reactor
+        // and panics on the foreground executor.
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            tokio::task::spawn_blocking(|| {
+                crate::ssh_connection::wsl::list_distros(Path::new("wsl.exe"))
+            })
+            .await
+            .unwrap_or_else(|error| {
+                Err(crate::ssh_connection::wsl::WslError {
+                    code: "wsl_list_task_failed",
+                    message: format!("the WSL distro read stopped unexpectedly: {error}"),
+                    retryable: true,
+                })
+            })
+        });
+        self.connections_wsl_task = Some(cx.spawn(
+            async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let result = runner.await.ok();
+                let _ = entity.update(cx, |this, cx| {
+                    if this.connections_wsl_generation != generation {
+                        return;
+                    }
+                    this.connections_wsl_loading = false;
+                    match result {
+                        Some(Ok(distros)) => {
+                            this.connections_wsl_selected = distros.first().cloned();
+                            this.connections_wsl_distros = distros;
+                            this.connections_wsl_error = None;
+                        }
+                        Some(Err(error)) => {
+                            this.connections_wsl_distros.clear();
+                            this.connections_wsl_selected = None;
+                            let message = format!("{}: {}", error.code, error.message);
+                            // The failure is both a hint on the layer and the
+                            // dialog body's own line: a hint is dismissed by a
+                            // click and may already be gone by the time the
+                            // reader looks, while the dialog is what they are
+                            // reading.
+                            this.connections_wsl_error = Some(message.clone());
+                            this.report_connections_failure(message, cx);
+                        }
+                        None => {
+                            this.connections_wsl_distros.clear();
+                            this.connections_wsl_selected = None;
+                            let message =
+                                "wsl_list_task_failed: the WSL distro read stopped unexpectedly"
+                                    .to_string();
+                            this.connections_wsl_error = Some(message.clone());
+                            this.report_connections_failure(message, cx);
+                        }
+                    }
+                    cx.notify();
+                });
+            },
+        ));
         cx.notify();
     }
 
@@ -90810,11 +90886,13 @@ impl FoundationSettings {
         window.open_dialog(cx, move |dialog, _, cx| {
             let entity = entity.clone();
             let entity_for_footer = entity.clone();
-            let (distros, selected) = entity
+            let (distros, selected, loading, error) = entity
                 .update(cx, |this, _| {
                     (
                         this.connections_wsl_distros.clone(),
                         this.connections_wsl_selected.clone(),
+                        this.connections_wsl_loading,
+                        this.connections_wsl_error.clone(),
                     )
                 })
                 .unwrap_or_default();
@@ -90830,7 +90908,55 @@ impl FoundationSettings {
                         "WSL2 在本機執行 Linux，不需要 sshd 或 SSH 金鑰。",
                     )),
             );
-            if distros.is_empty() {
+            if let Some(error) = error {
+                // The read failed and this dialog is what stays on screen. The
+                // hint layer carries the same text; the body repeats it because
+                // a hint is dismissed by a click, and a reader who looks down
+                // after dismissing it would otherwise be told there are no
+                // distros on a machine whose WSL never answered.
+                body = body.child(
+                    v_flex()
+                        .w_full()
+                        .min_w_0()
+                        .gap_2()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(cx.theme().border)
+                        .p_2()
+                        .child(
+                            div()
+                                .w_full()
+                                .min_w_0()
+                                .text_xs()
+                                .whitespace_normal()
+                                .child(error),
+                        )
+                        .child(
+                            Button::new("connections-wsl-retry")
+                                .small()
+                                .outline()
+                                .label(locale::text("Retry", "重试", "重試"))
+                                .on_click({
+                                    let retry = entity_for_footer.clone();
+                                    move |_, _, cx| {
+                                        let _ =
+                                            retry.update(cx, |this, cx| this.load_wsl_distros(cx));
+                                    }
+                                }),
+                        ),
+                );
+            } else if loading {
+                body = body.child(
+                    div()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(locale::text(
+                            "Reading WSL distros…",
+                            "正在读取 WSL 发行版…",
+                            "正在讀取 WSL 發行版…",
+                        )),
+                );
+            } else if distros.is_empty() {
                 body = body.child(
                     div()
                         .text_sm()
@@ -118246,6 +118372,57 @@ mod tests {
         ] {
             assert!(page.contains(opener), "the page must route {opener}");
         }
+    }
+
+    /// Reading the distro list must not run on the UI thread.
+    ///
+    /// `wsl.exe -l -q` used to be called inline from the dialog opener, with no
+    /// deadline: a half-installed WSL, a stopped `LxssManager` or an AppLocker
+    /// prompt froze the settings window before the dialog could paint, and no
+    /// message ever explained it. The read now starts on Tokio, and the dialog
+    /// owns the three states it can be in.
+    #[test]
+    fn the_wsl_distro_read_runs_off_the_ui_thread_and_reports_every_state() {
+        let source = include_str!("app.rs");
+        let loader = source
+            .split_once("    fn load_wsl_distros(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn connect_wsl_distro("))
+            .map(|(body, _)| body)
+            .expect("the WSL distro loader should remain inspectable");
+        assert!(
+            loader.contains("gpui_tokio::Tokio::spawn("),
+            "the blocking `wsl.exe` call must not run on the foreground executor"
+        );
+        assert!(
+            loader.contains("tokio::task::spawn_blocking("),
+            "`wsl.exe` blocks, so it runs on a blocking worker"
+        );
+        assert!(
+            loader.contains("connections_wsl_generation"),
+            "a superseded read must not overwrite the newer list"
+        );
+        assert!(
+            loader.contains("this.report_connections_failure(message, cx)"),
+            "a failed read is still announced on the hint layer"
+        );
+
+        let dialog = source
+            .split_once("    fn open_connections_wsl_dialog(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// Opens the provisioning dialog"))
+            .map(|(body, _)| body)
+            .expect("the WSL dialog should remain inspectable");
+        assert!(
+            dialog.contains("connections_wsl_loading"),
+            "the dialog says it is reading instead of claiming there are no distros"
+        );
+        assert!(
+            dialog.contains("connections_wsl_error"),
+            "the dialog keeps the failure `wsl.exe` reported"
+        );
+        assert!(
+            dialog.contains("connections-wsl-retry"),
+            "a failed read can be retried without reopening the dialog"
+        );
     }
 
     /// Provisioning is a dialog the reader can close, not a page section.

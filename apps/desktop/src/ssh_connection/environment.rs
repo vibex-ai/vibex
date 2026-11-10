@@ -214,7 +214,13 @@ impl EnvironmentError {
                 format!("the remote environment probe returned an invalid value: {detail}")
             }
             Self::Script(message) => message.clone(),
-            Self::Ssh(failure) => failure.message.clone(),
+            // OpenSSH's own sentence is the only thing that tells the four
+            // authentication failures apart — an unloaded agent key, a wrong
+            // `IdentityFile`, a locked account, a host that offers no key auth.
+            // Reporting the class without it leaves "SSH authentication failed"
+            // as the whole story, which is what the reader already knew.
+            Self::Ssh(failure) if failure.stderr_tail.is_empty() => failure.message.clone(),
+            Self::Ssh(failure) => format!("{}: {}", failure.message, failure.stderr_tail),
         }
     }
 
@@ -787,5 +793,35 @@ runtime=present\n";
         assert_eq!(environment.arch, RemoteArch::X86_64);
         assert_eq!(environment.port_state, PortState::Free);
         assert!(!environment.runtime_present);
+    }
+
+    /// An authentication failure must carry OpenSSH's own sentence.
+    ///
+    /// The class alone — "SSH authentication failed" — is the same string for a
+    /// locked key, a key the agent never loaded, a wrong `IdentityFile` and a
+    /// host that refuses key auth. The probe's error is what the desktop shows,
+    /// so dropping the stderr tail dropped the only part that says which.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_probe_reports_the_openssh_sentence_with_its_class() {
+        let dir = tempfile::tempdir().unwrap();
+        let ssh = crate::ssh_connection::test_support::unique_path(dir.path(), "fake-ssh");
+        crate::ssh_connection::test_support::write_executable(
+            &ssh,
+            "#!/bin/sh\ncat >/dev/null\nprintf 'dev@10.0.0.5: Permission denied (publickey).\\n' >&2\nexit 255\n",
+        );
+        let command = SshCommand {
+            program: ssh,
+            args: Vec::new(),
+            stdin: None,
+            remote_arg_start: None,
+        };
+        let error = probe(&command, 8765, MIN_FREE_KB).unwrap_err();
+        assert_eq!(error.code(), "ssh_auth_failed");
+        assert!(
+            error.message().contains("Permission denied (publickey)"),
+            "the class alone hides which authentication path failed: {}",
+            error.message()
+        );
     }
 }

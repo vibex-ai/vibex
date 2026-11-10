@@ -278,6 +278,7 @@ lines of `server.log`) and **Copy log command**.
 | Tunnel | `ssh_tunnel_*` | Usually the local port is taken or SSH dropped; Retry. |
 | Pairing | `ssh_pairing_*`, `remote_*` | Retry. If the runtime revoked this desktop, choose Connect on the connection to pair again. |
 | Upgrade | `ssh_upgrade_*` | The upgrade rolled back to `previous`; View log for the new version's failure. |
+| WSL unavailable | `wsl_*` (`wsl_missing`, `wsl_list_spawn_failed`, `wsl_exec_failed`, `wsl_list_timeout`, …) | WSL is reached through `wsl.exe`, not SSH, so an sshd or a key is not the problem. Run `wsl --update` and `wsl -l -v`: no distro listed means WSL itself is not installed or registered. The **Add WSL runtime** dialog keeps `wsl.exe`'s own message, and Retry there rereads the list without reopening it. |
 
 ## Operations reference
 

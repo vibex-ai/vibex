@@ -230,6 +230,77 @@ console::hidden_command(program: impl AsRef<OsStr>) -> std::process::Command
 - `ssh_connection::console::tests::hidden_command_keeps_the_program_it_was_given`
   — the helper still starts the program it was handed.
 
+## Scenario: WSL distro discovery and its failures
+
+### 1. Scope / Trigger
+
+- Any change to how the desktop lists WSL distros, opens the **Add WSL
+  runtime** dialog, or reports a `wsl_*` failure.
+
+### 2. Signatures
+
+```rust
+// apps/desktop/src/ssh_connection/wsl.rs
+wsl::list_distros(program: &Path) -> Result<Vec<String>, WslError> // LIST_TIMEOUT = 15s
+wsl::parse_distro_output(bytes: &[u8]) -> Vec<String>
+
+// apps/desktop/src/app.rs — FoundationSettings
+FoundationSettings::load_wsl_distros(&mut self, cx: &mut Context<Self>)
+```
+
+### 3. Contracts
+
+- Saying "SSH into WSL" is a category error: the WSL transport is `wsl.exe -d
+  <distro> --exec /bin/sh`, so no sshd, key, or agent takes part. A reader who
+  reports an SSH failure and a WSL failure at once has hit two unrelated paths.
+- A failed `wsl -l -q` must carry `wsl.exe`'s own stderr and exit status. The
+  class code names the failure; only the child's sentence names the cause.
+- The distro read never runs on the UI thread. `wsl.exe` is a process call with
+  no bound of its own, and a half-installed WSL used to freeze the settings
+  window before the dialog could paint. It runs through
+  `gpui_tokio::Tokio::spawn` + `tokio::task::spawn_blocking` (`spawn_blocking`
+  panics when polled from the foreground executor), and `list_distros` enforces
+  its own deadline with `try_wait`.
+- The dialog owns three states — reading, failed with Retry, list — and a
+  superseded read is dropped by generation rather than overwriting a newer one.
+- Every `wsl_*` code classifies as `SshDiagnosticKind::Wsl`, whose guidance names
+  `wsl --update` / `wsl -l -v` and never offers to install an SSH server.
+- A non-empty `SshFailure::stderr_tail` survives into `EnvironmentError::message`
+  for the same reason: `ssh_auth_failed` alone is identical for a locked key, an
+  unloaded agent, a wrong `IdentityFile` and a host that refuses key auth.
+
+### 4. Validation & Error Matrix
+
+| Condition | Behaviour |
+| --- | --- |
+| `wsl.exe` not on PATH | `wsl_missing` |
+| spawn denied / not found at the path | `wsl_list_spawn_failed` with the OS error |
+| `-l -q` exits non-zero | `wsl_exec_failed`, message carries stderr + exit code |
+| no answer within `LIST_TIMEOUT` | `wsl_list_timeout`, retryable |
+| dialog opened, read still running | "Reading WSL distros…", Connect disabled |
+| read failed | the child's message stays in the dialog, plus a Retry button |
+| read succeeded with no distros | "Install WSL2 and at least one distro first." |
+
+### 5. Good / Base / Bad
+
+- Good: `list_distros` drains both pipes on reader threads and polls
+  `try_wait` against a deadline, then reports `stderr_detail(&stderr)`.
+- Base: `parse_distro_output` decoding UTF-16LE only when the stream carries a
+  NUL byte.
+- Bad: `Command::output()` from a dialog opener — no deadline, no stderr, and
+  the UI thread blocks on it.
+
+### 6. Tests Required
+
+- `ssh_connection::wsl::tests::a_failed_list_keeps_the_childs_own_words` — the
+  stderr and exit status survive; the error is not marked retryable.
+- `ssh_connection::wsl::tests::a_hung_wsl_is_cut_off_at_the_deadline` — a child
+  that never returns is killed and reported as `wsl_list_timeout`.
+- `ssh_connection::wsl::tests::a_missing_wsl_exe_stays_a_installation_problem`
+- `ssh_connection::diagnostics::tests::wsl_failures_get_their_own_card_and_never_ssh_advice`
+- `ssh_connection::environment::tests::a_failed_probe_reports_the_openssh_sentence_with_its_class`
+- `app::tests::the_wsl_distro_read_runs_off_the_ui_thread_and_reports_every_state`
+
 ## Testing Gotchas
 
 - Fake executables (`ssh`, `ssh-keygen`, `wsl.exe`) must be written with

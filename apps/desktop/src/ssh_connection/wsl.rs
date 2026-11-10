@@ -21,8 +21,16 @@ use super::console::hidden_command;
 use super::environment::{EnvironmentError, RemoteEnvironment, parse_probe_output, probe_script};
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+/// `wsl -l -q` only reads the registered distros, so it answers at once or not
+/// at all. A half-installed WSL or a stopped `LxssManager` can leave `wsl.exe`
+/// running for minutes, and the list is read while the add dialog is opening.
+const LIST_TIMEOUT: Duration = Duration::from_secs(15);
 const UPLOAD_SCRIPT: &str = r#"set -eu; umask 077; mkdir -p "$(dirname "$1")"; cat > "$1""#;
 const MAX_SCRIPT_BYTES: usize = 64 * 1024;
+/// How much of a child's stderr travels with an error. `wsl.exe` prints one
+/// actionable sentence, and the point of keeping it is that the reader can
+/// read it.
+const MAX_STDERR_CHARS: usize = 2048;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WslError {
@@ -316,32 +324,141 @@ impl WslOutput {
 /// Lists installed distros. WSL's redirected output is UTF-16LE on Windows;
 /// `WSL_UTF8=1` asks for UTF-8, and the NUL-stripping fallback handles older
 /// builds.
+///
+/// The two failures are kept apart on purpose: a build that cannot start
+/// `wsl.exe` at all is an installation problem, while a `wsl.exe` that runs and
+/// exits non-zero is a broken WSL registration. Both used to report
+/// `wsl_list_failed` and neither carried the child's stderr, so the only thing
+/// the reader got was "could not list distros" with no cause and no next step.
 pub fn list_distros(program: &Path) -> Result<Vec<String>, WslError> {
-    let output = hidden_command(program)
+    list_distros_with_timeout(program, LIST_TIMEOUT)
+}
+
+/// [`list_distros`] with the deadline as an argument, so a test does not have
+/// to wait the production one out.
+fn list_distros_with_timeout(program: &Path, timeout: Duration) -> Result<Vec<String>, WslError> {
+    let mut command = hidden_command(program);
+    command
         .args(["-l", "-q"])
         .env("WSL_UTF8", "1")
-        .output()
-        .map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                WslError::new("wsl_missing", "wsl.exe is not available")
-            } else {
-                WslError::new(
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            WslError::new("wsl_missing", "wsl.exe is not available")
+        } else {
+            WslError::new(
+                "wsl_list_spawn_failed",
+                format!("wsl.exe could not start: {error}"),
+            )
+        }
+    })?;
+    // Both pipes are drained on their own threads while the child runs: a
+    // child that fills one of them before exiting would otherwise wait for a
+    // reader that this loop cannot reach.
+    let stdout_reader = child.stdout.take().map(|output| {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = std::io::BufReader::new(output).read_to_end(&mut bytes);
+            bytes
+        })
+    });
+    let stderr_reader = child.stderr.take().map(|output| {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = std::io::BufReader::new(output).read_to_end(&mut bytes);
+            bytes
+        })
+    });
+    let started = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) => {}
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(WslError::new(
                     "wsl_list_failed",
-                    format!("wsl.exe could not list distros: {error}"),
-                )
+                    format!("wsl.exe status could not be read: {error}"),
+                ));
             }
-        })?;
-    if !output.status.success() {
-        return Err(WslError::new(
-            "wsl_list_failed",
-            "wsl.exe could not list distros",
+        }
+        if started.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(WslError::retryable(
+                "wsl_list_timeout",
+                format!(
+                    "wsl.exe did not list distros within {} seconds; run `wsl --status` in a terminal",
+                    timeout.as_secs()
+                ),
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    let stdout = stdout_reader
+        .and_then(|reader| reader.join().ok())
+        .unwrap_or_default();
+    let stderr = stderr_reader
+        .and_then(|reader| reader.join().ok())
+        .unwrap_or_default();
+    let Some(status) = status else {
+        return Err(WslError::retryable(
+            "wsl_list_timeout",
+            "wsl.exe did not list distros",
         ));
+    };
+    if !status.success() {
+        let detail = stderr_detail(&stderr);
+        let exit = status.code().unwrap_or(-1);
+        let message = if detail.is_empty() {
+            format!("wsl.exe could not list distros (exit {exit})")
+        } else {
+            format!("wsl.exe could not list distros (exit {exit}): {detail}")
+        };
+        return Err(WslError::new("wsl_exec_failed", message));
     }
-    Ok(parse_distro_output(&output.stdout))
+    Ok(parse_distro_output(&stdout))
+}
+
+/// The child's own words, on one line, bounded the way `SshFailure` bounds its
+/// stderr tail. WSL writes UTF-16LE for older builds, so a NUL-bearing stream
+/// goes through the same decoder the distro list uses.
+fn stderr_detail(stderr: &[u8]) -> String {
+    let text = decode_wsl_text(stderr);
+    let mut joined = String::new();
+    for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        if !joined.is_empty() {
+            joined.push_str("; ");
+        }
+        joined.push_str(line);
+    }
+    if joined.chars().count() <= MAX_STDERR_CHARS {
+        return joined;
+    }
+    joined.chars().take(MAX_STDERR_CHARS).collect()
 }
 
 pub fn parse_distro_output(bytes: &[u8]) -> Vec<String> {
-    let text = if bytes.contains(&0) {
+    decode_wsl_text(bytes)
+        .lines()
+        .map(|line| line.trim().trim_end_matches('\r'))
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Decodes text that `wsl.exe` wrote to a redirected pipe.
+///
+/// `WSL_UTF8=1` asks current builds for UTF-8, but the variable is a request
+/// rather than a guarantee, and builds that ignore it emit UTF-16LE — whose
+/// every character after the first has a NUL byte. A NUL-bearing stream is
+/// therefore decoded as UTF-16LE; anything else is read as UTF-8, lossily,
+/// because a decode failure must not turn into an empty list.
+fn decode_wsl_text(bytes: &[u8]) -> String {
+    if bytes.contains(&0) {
         bytes
             .as_chunks::<2>()
             .0
@@ -351,12 +468,7 @@ pub fn parse_distro_output(bytes: &[u8]) -> Vec<String> {
             .collect::<String>()
     } else {
         String::from_utf8_lossy(bytes).into_owned()
-    };
-    text.lines()
-        .map(|line| line.trim().trim_end_matches('\r'))
-        .filter(|line| !line.is_empty())
-        .map(str::to_string)
-        .collect()
+    }
 }
 
 /// Probes the Linux environment inside a distro using the same fixed script as
@@ -408,6 +520,59 @@ mod tests {
         let wsl = fake_wsl(dir.path(), "#!/bin/sh\nprintf 'Ubuntu-24.04\\nDebian\\n'\n");
         let _guard = test_support::process_guard();
         assert_eq!(list_distros(&wsl).unwrap(), ["Ubuntu-24.04", "Debian"]);
+    }
+
+    /// A `wsl.exe` that fails has to say why.
+    ///
+    /// Every failed `wsl -l -q` used to collapse into the same sentence with the
+    /// child's stderr discarded, so "could not list distros" was all a reader
+    /// ever saw — no cause, no next step.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_list_keeps_the_childs_own_words() {
+        let dir = tempfile::tempdir().unwrap();
+        let wsl = fake_wsl(
+            dir.path(),
+            "#!/bin/sh\nprintf 'wsl: no installed distributions. Run wsl --install.\\n' >&2\nexit 1\n",
+        );
+        let _guard = test_support::process_guard();
+        let error = list_distros(&wsl).unwrap_err();
+        assert_eq!(error.code, "wsl_exec_failed");
+        assert!(
+            error.message.contains("no installed distributions"),
+            "the child's stderr must survive: {}",
+            error.message
+        );
+        assert!(
+            error.message.contains("exit 1"),
+            "the exit status belongs in the message: {}",
+            error.message
+        );
+        assert!(!error.retryable, "a broken WSL registration is not a flake");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_missing_wsl_exe_stays_a_installation_problem() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = list_distros(&dir.path().join("no-such-wsl")).unwrap_err();
+        assert_eq!(error.code, "wsl_missing");
+    }
+
+    /// WSL that never answers must not hold the caller forever.
+    ///
+    /// `list_distros` used to use `Command::output`, which has no deadline, and
+    /// the add dialog read it on the UI thread; a half-installed WSL froze the
+    /// whole window with nothing on screen to explain why.
+    #[cfg(unix)]
+    #[test]
+    fn a_hung_wsl_is_cut_off_at_the_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let wsl = fake_wsl(dir.path(), "#!/bin/sh\nsleep 30\n");
+        let _guard = test_support::process_guard();
+        let error = list_distros_with_timeout(&wsl, Duration::from_millis(250)).unwrap_err();
+        assert_eq!(error.code, "wsl_list_timeout");
+        assert!(error.retryable, "a timeout is worth another try");
     }
 
     #[test]

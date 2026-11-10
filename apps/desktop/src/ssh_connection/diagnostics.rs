@@ -28,6 +28,10 @@ pub enum SshDiagnosticKind {
     Tunnel,
     Pairing,
     Upgrade,
+    /// The WSL transport itself: `wsl.exe` is missing, cannot start, or cannot
+    /// list the distros. None of the SSH cards fit, and sending a WSL reader to
+    /// "install an SSH server" is the wrong next step entirely.
+    Wsl,
     Unknown,
 }
 
@@ -52,6 +56,7 @@ impl SshDiagnosticKind {
             Self::Tunnel => "tunnel",
             Self::Pairing => "pairing",
             Self::Upgrade => "upgrade",
+            Self::Wsl => "wsl",
             Self::Unknown => "unknown",
         }
     }
@@ -153,6 +158,7 @@ pub fn diagnose_with_platform(
         SshDiagnosticKind::Start
         | SshDiagnosticKind::Tunnel
         | SshDiagnosticKind::Pairing
+        | SshDiagnosticKind::Wsl
         | SshDiagnosticKind::Unknown => vec![
             SshDiagnosticAction::Retry,
             SshDiagnosticAction::CopyDiagnostics,
@@ -217,6 +223,11 @@ pub fn diagnose_with_platform(
             "Free the runtime port or retry so the next free port is selected.",
             "释放运行时端口，或重试以自动选择下一个空闲端口。",
             "釋放執行階段連接埠，或重試以自動選擇下一個空閒連接埠。",
+        )),
+        SshDiagnosticKind::Wsl => Some(locale::text(
+            "Vibex reaches WSL through `wsl.exe`, not SSH, so an sshd or a key is not the problem. Run `wsl --update` and `wsl -l -v` in a terminal: no distro listed means WSL itself is not installed or registered yet. Then retry; if the distro list works but the runtime does not start, reopen the dialog.",
+            "Vibex 通过 `wsl.exe` 访问 WSL，不走 SSH，因此问题不在 sshd 或密钥。请在终端运行 `wsl --update` 和 `wsl -l -v`：列不出任何发行版说明 WSL 本身尚未安装或注册。然后重试；若发行版列表正常但运行时仍无法启动，请重新打开该对话框。",
+            "Vibex 透過 `wsl.exe` 存取 WSL，不走 SSH，因此問題不在 sshd 或金鑰。請在終端機執行 `wsl --update` 和 `wsl -l -v`：列不出任何發行版表示 WSL 本身尚未安裝或註冊。然後重試；若發行版清單正常但執行階段仍無法啟動，請重新開啟該對話方塊。",
         )),
         _ => None,
     }
@@ -303,6 +314,11 @@ pub fn classify(code: &str) -> SshDiagnosticKind {
             SshDiagnosticKind::Pairing
         }
         code if code.starts_with("ssh_upgrade") => SshDiagnosticKind::Upgrade,
+        // Every WSL code names the same transport, so one card covers the
+        // missing exe, a spawn that failed, a list that never answered and one
+        // that exited non-zero. Falling through to Unknown used to offer
+        // "install an SSH server" for a runtime that has no SSH hop at all.
+        code if code.starts_with("wsl_") => SshDiagnosticKind::Wsl,
         _ => SshDiagnosticKind::Unknown,
     }
 }
@@ -478,5 +494,56 @@ New key fingerprint is SHA256:newNewNewNewNew.\n";
         assert_eq!(card.kind, SshDiagnosticKind::Unknown);
         assert!(card.actions.contains(&SshDiagnosticAction::Retry));
         assert!(card.actions.contains(&SshDiagnosticAction::CopyLogCommand));
+    }
+
+    /// A WSL failure is not an SSH failure, and the card must not pretend it is.
+    ///
+    /// Every `wsl_*` code used to fall through to `Unknown`, which offers Retry
+    /// and a log command but no explanation — and the nearest advice in the
+    /// product was the SSH cards' "install an SSH server", for a transport that
+    /// has no SSH hop at all.
+    #[test]
+    fn wsl_failures_get_their_own_card_and_never_ssh_advice() {
+        for code in [
+            "wsl_missing",
+            "wsl_list_spawn_failed",
+            "wsl_exec_failed",
+            "wsl_list_timeout",
+            "wsl_probe_invalid",
+        ] {
+            let card = diagnose(code, "wsl.exe could not list distros", "", None, None);
+            assert_eq!(
+                card.kind,
+                SshDiagnosticKind::Wsl,
+                "{code} must classify as the WSL transport"
+            );
+            assert_eq!(card.kind.code(), "wsl");
+            assert!(card.actions.contains(&SshDiagnosticAction::Retry));
+            assert!(
+                !card.actions.contains(&SshDiagnosticAction::BootstrapSshd),
+                "{code} must not offer to install an SSH server"
+            );
+            assert!(
+                !card.actions.contains(&SshDiagnosticAction::InstallClient),
+                "{code} must not offer to install an SSH client"
+            );
+            let guidance = card.guidance.expect("the card explains the WSL transport");
+            assert!(guidance.contains("wsl.exe") || guidance.contains("wsl --"));
+            assert!(guidance.contains("wsl -l -v"));
+        }
+    }
+
+    #[test]
+    fn an_authentication_card_keeps_the_openssh_sentence_in_its_diagnostics() {
+        let card = diagnose(
+            "ssh_auth_failed",
+            "SSH authentication failed: dev@10.0.0.5: Permission denied (publickey).",
+            "Load key \"/home/dev/.ssh/id_ed25519\": incorrect passphrase supplied to decrypt private key",
+            Some("build-box"),
+            None,
+        );
+        assert_eq!(card.kind, SshDiagnosticKind::Authentication);
+        assert!(card.diagnostics.contains("incorrect passphrase"));
+        assert!(card.diagnostics.contains("host: build-box"));
     }
 }
