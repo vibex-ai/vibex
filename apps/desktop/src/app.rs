@@ -2176,39 +2176,14 @@ impl SearchableListItem for NewSessionBaseRefChoice {
 /// One folder the new-session page can file its draft under.
 ///
 /// The choice carries the label the menu draws and the id the placement tree
-/// files by, so the control never has to look a folder up again by name.
+/// files by, so the control never has to look a folder up again by name. The
+/// depth indents a nested folder under its parent, which is what makes the menu
+/// read as the tree the sidebar draws.
 #[derive(Clone)]
 struct NewSessionFolderChoice {
     folder_id: String,
     label: String,
     depth: usize,
-}
-
-impl SearchableListItem for NewSessionFolderChoice {
-    type Value = String;
-
-    fn title(&self) -> SharedString {
-        self.label.clone().into()
-    }
-
-    fn value(&self) -> &Self::Value {
-        &self.folder_id
-    }
-
-    fn render(&self, _: &mut Window, cx: &mut App) -> impl IntoElement {
-        h_flex()
-            .min_w_0()
-            .gap_2()
-            // A nested folder is indented by its depth, so the menu reads as the
-            // tree the sidebar draws rather than a flat list of names.
-            .pl(px(self.depth as f32 * 12.0))
-            .child(
-                sidebar_icon("icons/vibex/folder.svg")
-                    .size(px(14.0))
-                    .text_color(cx.theme().muted_foreground),
-            )
-            .child(div().min_w_0().truncate().child(self.label.clone()))
-    }
 }
 
 #[derive(Debug, Default)]
@@ -10388,18 +10363,11 @@ pub struct VibexWorkbench {
     /// The choices currently loaded into [`Self::new_session_base_ref_select`],
     /// so the select is only rebuilt when the worktree eligibility changes.
     new_session_base_ref_choices: Vec<String>,
-    /// The folder the draft will be filed under, when the page was opened from a
-    /// folder row. It is also the folder the page's own control shows, so
-    /// changing the control changes where the session lands.
-    new_session_folder_select: Entity<SelectState<Vec<NewSessionFolderChoice>>>,
-    /// The folder ids currently loaded into
-    /// [`Self::new_session_folder_select`], so the control is only rebuilt when
-    /// the project's folders change.
-    new_session_folder_choices: Vec<String>,
-    /// The folder the control was last synced to show. It is part of the sync
-    /// key because a folder row's new-chat action can pre-select a folder the
-    /// project already offered, which leaves the choice list unchanged.
-    new_session_folder_selection: Option<String>,
+    /// Whether the folder menu the new-session page offers is open.
+    ///
+    /// The trigger is a popover button, so the page owns the open state the
+    /// same way the project and location menus do.
+    new_session_folder_menu_open: bool,
     new_session_project_menu_focus: FocusHandle,
     new_session_project_trigger_bounds: Option<Bounds<Pixels>>,
     workspaces: Vec<(ProjectRecord, WorkspaceRecord)>,
@@ -11695,8 +11663,6 @@ impl VibexWorkbench {
         });
         let new_session_base_ref_select =
             cx.new(|cx| SelectState::new(Vec::new(), None, window, cx).searchable(true));
-        let new_session_folder_select =
-            cx.new(|cx| SelectState::new(Vec::new(), None, window, cx).searchable(false));
         let new_session_runtime_search = cx.new(|cx| {
             InputState::new(window, cx).placeholder(locale::text(
                 "Search providers and models",
@@ -11820,15 +11786,6 @@ impl VibexWorkbench {
                     if let Some(base_ref) = base_ref {
                         this.set_new_session_base_ref(base_ref.clone(), cx);
                     }
-                },
-            ),
-            cx.subscribe(
-                &new_session_folder_select,
-                |this, _, event: &SelectEvent<Vec<NewSessionFolderChoice>>, cx| {
-                    let SelectEvent::Confirm(folder_id) = event;
-                    // Clearing the choice files the draft at the project root,
-                    // which is what the page did before it had a folder control.
-                    this.set_new_session_folder(folder_id.clone(), cx);
                 },
             ),
             cx.subscribe(
@@ -12275,9 +12232,7 @@ impl VibexWorkbench {
             new_session_project_search,
             new_session_base_ref_select,
             new_session_base_ref_choices: Vec::new(),
-            new_session_folder_select,
-            new_session_folder_choices: Vec::new(),
-            new_session_folder_selection: None,
+            new_session_folder_menu_open: false,
             new_session_project_menu_focus,
             new_session_project_trigger_bounds: None,
             workspaces: Vec::new(),
@@ -59317,62 +59272,183 @@ impl VibexWorkbench {
             .map(|choice| choice.folder_id.clone())
             .collect::<Vec<_>>();
         // A folder row's new-chat action pre-selects a folder that the project
-        // may already have offered, so the remembered folder is part of what is
-        // synced and not only a side effect of the choice list changing.
+        // may already have offered, so the remembered folder is read from the
+        // draft rather than cached: the trigger simply shows what the draft
+        // will be filed under.
         let active_folder_id = self
             .new_session_folder_id
             .clone()
             .filter(|folder_id| folder_choice_ids.contains(folder_id));
         let folder_has_choices = !folder_choice_ids.is_empty();
-        if self.new_session_folder_choices != folder_choice_ids
-            || self.new_session_folder_selection != active_folder_id
-        {
-            self.new_session_folder_choices = folder_choice_ids;
-            self.new_session_folder_selection = active_folder_id.clone();
-            self.new_session_folder_select.update(cx, |select, cx| {
-                select.set_items(folder_choices, window, cx);
-                match active_folder_id.as_ref() {
-                    Some(selected) => select.set_selected_value(selected, window, cx),
-                    None => select.set_selected_index(None, window, cx),
-                }
-            });
-        }
         // The remembered folder can name a folder the draft's project does not
         // offer — the reader switched projects while a folder row's draft was
-        // open. Filing nowhere is the honest answer, and the control already
-        // shows no selection for it.
-        let folder_control = folder_has_choices.then(|| {
-            div()
-                .flex_none()
-                .max_w(px(208.0))
+        // open. Filing nowhere is the honest answer, and the trigger already
+        // reads as the project root for it.
+        let folder_trigger_label = active_folder_id
+            .as_ref()
+            .and_then(|folder_id| {
+                folder_choices
+                    .iter()
+                    .find(|choice| &choice.folder_id == folder_id)
+            })
+            .map(|choice| choice.label.clone())
+            .unwrap_or_else(|| {
+                locale::text("Project root", "项目根目录", "專案根目錄").to_string()
+            });
+        // The trigger is a ghost button like the project and location triggers
+        // beside it: this row answers "where does this session run and where is
+        // it filed", and three bordered selects there read as three forms. The
+        // icon, label and chevron order is the same one those two use.
+        let folder_trigger = Button::new("new-session-folder-menu")
+            .xsmall()
+            .ghost()
+            .h(px(32.0))
+            .px_2()
+            .selected(self.new_session_folder_menu_open)
+            .text_color(muted_foreground)
+            .tooltip(locale::text(
+                "Folder this session is filed under",
+                "会话所属文件夹",
+                "會話所屬資料夾",
+            ))
+            .child(
+                h_flex()
+                    .gap(px(6.0))
+                    // The project trigger leads with the same folder glyph and
+                    // chevron, so the two triggers read as one column of
+                    // "where" answers rather than two unrelated menus.
+                    .child(Icon::new(IconName::Folder).size(px(14.0)))
+                    .child(
+                        div()
+                            .max_w(px(140.0))
+                            .min_w_0()
+                            .truncate()
+                            .child(folder_trigger_label),
+                    )
+                    .child(Icon::new(IconName::ChevronDown).size(px(13.0))),
+            )
+            .disabled(self.agent_action_pending);
+        let folder_rows = folder_choices
+            .iter()
+            .map(|choice| {
+                let selected = active_folder_id.as_ref() == Some(&choice.folder_id);
+                let folder_id = choice.folder_id.clone();
+                Button::new(format!("new-session-folder-{folder_id}"))
+                    .small()
+                    .ghost()
+                    .w_full()
+                    .h(px(32.0))
+                    .px_2()
+                    .selected(selected)
+                    .rounded(gpui_component::button::ButtonRounded::Size(px(7.0)))
+                    .text_color(popover_foreground)
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .justify_between()
+                            .gap_2()
+                            .child(
+                                h_flex()
+                                    .min_w_0()
+                                    .gap_2()
+                                    // A nested folder is indented by its depth,
+                                    // so the menu reads as the tree the sidebar
+                                    // draws rather than a flat list of names.
+                                    .pl(px(choice.depth as f32 * 12.0))
+                                    .child(Icon::new(IconName::Folder).size(px(14.0)))
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .truncate()
+                                            .child(choice.label.clone()),
+                                    ),
+                            )
+                            .when(selected, |this| {
+                                this.child(Icon::new(IconName::Check).size(px(14.0)))
+                            }),
+                    )
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.set_new_session_folder(Some(folder_id.clone()), cx);
+                        this.new_session_folder_menu_open = false;
+                        this.new_session_input
+                            .update(cx, |input, cx| input.focus(window, cx));
+                    }))
+                    .into_any_element()
+            })
+            .collect::<Vec<_>>();
+        // Filing at the project root is a real answer — it is what a draft gets
+        // when the reader never picks a folder — so it is offered as its own
+        // row instead of being reachable only by clearing a selection.
+        let folder_root_row = {
+            let selected = active_folder_id.is_none();
+            Button::new("new-session-folder-root")
+                .small()
+                .ghost()
+                .w_full()
+                .h(px(32.0))
+                .px_2()
+                .selected(selected)
+                .rounded(gpui_component::button::ButtonRounded::Size(px(7.0)))
+                .text_color(popover_foreground)
                 .child(
-                    Select::new(&self.new_session_folder_select)
-                        .id("new-session-folder")
-                        .small()
-                        .h(px(32.0))
-                        .text_xs()
-                        .icon(Icon::default().path("icons/vibex/folder.svg"))
-                        .menu_width(px(282.0))
-                        .menu_max_h(px(240.0))
-                        .placeholder(locale::text(
-                            "Project root",
-                            "项目根目录",
-                            "專案根目錄",
-                        ))
-                        .empty(|_, _| {
-                            div()
-                                .px_2()
-                                .py_3()
-                                .text_xs()
-                                .child(locale::text(
-                                    "No folders",
-                                    "没有文件夹",
-                                    "沒有資料夾",
-                                ))
-                                .into_any_element()
-                        })
-                        .disabled(self.agent_action_pending),
+                    h_flex()
+                        .w_full()
+                        .justify_between()
+                        .gap_2()
+                        .child(
+                            h_flex()
+                                .min_w_0()
+                                .gap_2()
+                                .child(Icon::new(IconName::Folder).size(px(14.0)))
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .truncate()
+                                        .child(locale::text(
+                                            "Project root",
+                                            "项目根目录",
+                                            "專案根目錄",
+                                        )),
+                                ),
+                        )
+                        .when(selected, |this| {
+                            this.child(Icon::new(IconName::Check).size(px(14.0)))
+                        }),
                 )
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.set_new_session_folder(None, cx);
+                    this.new_session_folder_menu_open = false;
+                    this.new_session_input
+                        .update(cx, |input, cx| input.focus(window, cx));
+                }))
+                .into_any_element()
+        };
+        let folder_panel = v_flex()
+            .w(px(260.0))
+            .min_w_0()
+            .max_h(window.viewport_size().height - px(16.0))
+            .overflow_y_scrollbar()
+            .rounded(px(8.0))
+            .border_1()
+            .border_color(border_color)
+            .bg(popover_color)
+            .p_2()
+            .scroll_gutter()
+            .text_color(popover_foreground)
+            .shadow_lg()
+            .child(folder_root_row)
+            .children(folder_rows);
+        let folder_control = folder_has_choices.then(|| {
+            Popover::new("new-session-folder-menu")
+                .appearance(false)
+                .anchor(Anchor::TopLeft)
+                .open(self.new_session_folder_menu_open)
+                .on_open_change(cx.listener(|this, open, _, cx| {
+                    this.new_session_folder_menu_open = *open;
+                    cx.notify();
+                }))
+                .trigger(folder_trigger)
+                .child(folder_panel)
                 .into_any_element()
         });
         let base_ref_button = div()
@@ -59754,6 +59830,15 @@ impl VibexWorkbench {
                 .when(show_location_control, |this| {
                     this.child(div().flex_none().child(location_control))
                 })
+                // The filing target sits beside the project and location
+                // triggers, not at the far end of the row: all three answer
+                // "where does this session go", and the row reads left to right
+                // from the project down to the folder inside it. A project with
+                // no folders offers nothing, so the row simply moves on to the
+                // next control.
+                .when_some(folder_control, |this, folder_control| {
+                    this.child(div().flex_none().child(folder_control))
+                })
                 .when(worktree_selected, |this| {
                     this.child(div().flex_none().child(base_ref_button))
                 })
@@ -59784,14 +59869,6 @@ impl VibexWorkbench {
                 .child(div().flex_1())
                 .when_some(transport_switch, |this, transport_switch| {
                     this.child(div().flex_none().child(transport_switch))
-                })
-                // The filing target trails the row, at the lower right of the
-                // prompt box: the reader has already said where the session
-                // runs, and this answers where its row will live. A project
-                // with no folders offers nothing, so the row simply ends at the
-                // transport.
-                .when_some(folder_control, |this, folder_control| {
-                    this.child(div().flex_none().child(folder_control))
                 }),
         );
 
@@ -123131,10 +123208,28 @@ mod tests {
             .map(|(body, _)| body)
             .expect("new-session panel should remain inspectable");
         assert!(page.contains("self.new_session_folder_choices()"));
-        assert!(page.contains("Select::new(&self.new_session_folder_select)"));
+        // The trigger is a ghost popover button, the same shape the project and
+        // location triggers beside it use: the row answers one question three
+        // times, so it must not read as three different kinds of control.
+        assert!(page.contains("Button::new(\"new-session-folder-menu\")"));
+        assert!(page.contains("Popover::new(\"new-session-folder-menu\")"));
+        assert!(page.contains(".ghost()"));
+        assert!(page.contains("Icon::new(IconName::ChevronDown)"));
+        // The menu offers the project root as a real answer, so a draft can be
+        // filed at the root without clearing a selection.
+        assert!(page.contains("Button::new(\"new-session-folder-root\")"));
         assert!(page.contains("let folder_control = folder_has_choices.then(|| {"));
-        assert!(page.contains(".when_some(folder_control, |this, folder_control| {"));
+        // The control sits on the left, beside the project and location
+        // triggers, rather than trailing the row.
+        let control_row = page
+            .split_once(".child(div().flex_none().child(workspace_button))")
+            .and_then(|(_, tail)| tail.split_once(".when(has_agent_choices, |this| {"))
+            .map(|(body, _)| body)
+            .expect("the workspace control row should remain inspectable");
+        assert!(control_row.contains(".when_some(folder_control, |this, folder_control| {"));
+        assert!(control_row.contains("child(location_control)"));
         assert!(source.contains("this.set_new_session_folder(folder_id.clone(), cx);"));
+        assert!(source.contains("this.set_new_session_folder(None, cx);"));
         assert!(source.contains("self.set_new_session_folder(Some(folder_id.clone()), cx);"));
     }
 
