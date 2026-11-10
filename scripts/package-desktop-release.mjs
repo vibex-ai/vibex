@@ -159,6 +159,13 @@ function writePlatformConfig(platform, arch, channel, triple, cross, packageDire
     }
     if (platform === "macos") {
       config = withIcons(config, MACOS_ICON_INPUTS);
+      // The Windows launcher is a batch file, so it only belongs to the NSIS
+      // package. macOS and Linux add their own launcher, and a `.cmd` inside an
+      // `.app` would be dead weight the signature has to seal.
+      config = config.replace(
+        /^resources = \[[\s\S]*?^\]\n/m,
+        "",
+      );
       config = config.replace(/\n\[nsis\][\s\S]*$/, "\n");
       const appBundle = join(packageDirectory, `${fieldValue(channelConfig, "productName")}.app`);
       config = withMacosBundleSigning(config, appBundle);

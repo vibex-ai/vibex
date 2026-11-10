@@ -15,7 +15,7 @@ embeds the other product's assets.
 | iOS mobile | Unsigned simulator app + unsigned device IPA + XCFramework | `pnpm build:mobile:ios` and `pnpm package:mobile:ios` on macOS | Rust source, Cargo lock, pinned gpui-pre/gpui-pre-mobile revisions, XcodeGen project | `pnpm check:mobile-native`, simulator/device validation; the installer re-signs the IPA, see [Installing the Unsigned iOS Build](./ios-unsigned-install.md) |
 | Headless server Linux x86_64/aarch64 | `vibex-server-<version>-linux-<arch>.tar.gz` + `.sha256` | `deploy/server/Dockerfile.build` in the tagged workflow; the link step runs inside the pinned Debian 12 image | Debian 12 base digest, Rust 1.99.1, Cargo lock, deterministic tar | `scripts/check-server-artifact.mjs` (ELF arch, no `libdbus`/`libsystemd`, `GLIBC_*` ≤ 2.35), `sha256sum -c`, clean Ubuntu 22.04/24.04 `--version` and `config-check` |
 | Relay | Transport container | `pnpm smoke:relay:local` plus deployment scripts | Rust source and Cargo lock | Health/API smoke, TLS/NAT/operator validation |
-| Terminal (TUI) | Ships inside the desktop packages as a second, non-main `vibex` binary | Same package commands as the desktop channel | Same as the desktop channel | The binary must be reachable on `PATH` after install on Linux and macOS, and the console subsystem must be verified on Windows. |
+| Terminal (TUI) | Ships inside the desktop packages as a second, non-main `vibex` binary, plus the `vibex-tui` launcher on Linux and Windows | Same package commands as the desktop channel | Same as the desktop channel, including the compiled channel the binary answers from | `vibex status` must report the channel the package was built as (`channel-source=packaged`), `/usr/bin/vibex-tui` and `/usr/bin/vibex` must both be present in the `.deb` and AppImage, the NSIS installer must put its directory on the user `PATH`, and the console subsystem must be verified on Windows. |
 | AUR `vibex-bin` | `PKGBUILD` + `.SRCINFO` that unpack the published Linux `.deb` | `.github/workflows/publish-aur.yml`; local dry run is `node scripts/publish-aur.mjs --version <x.y.z> --dry-run` | Stable only; the checksums of the release `.deb` payloads | `makepkg` must build the package from the release assets, `namcap` runs on it, and `publish-aur.mjs` refuses a prerelease or a version that is not newer than the AUR's |
 
 ## Linux AppImage Packaging Rules
@@ -48,6 +48,27 @@ embeds the other product's assets.
   `.deb` (the 0.1.0-rc.8 preview payload drops from 119.8 MB to 69.8 MB).
 - Building a `.deb` requires `xz` on the packaging host; the repacked package
   must still extract with `dpkg-deb -x`/`-e`.
+
+## Terminal Client Rules
+
+- The character-grid client is a second, non-main `vibex` binary in every
+  desktop package, and it answers from the channel that package was built as
+  (`VIBEX_CHANNEL` is exported by `scripts/build-channel.mjs` before cargo
+  runs). `VIBEX_CHANNEL` still overrides it at runtime, and `--channel` is the
+  one-run flag; `--home` wins over all of them.
+- `vibex-tui` is a launcher, not a second copy: `apps/desktop/packaging/vibex-tui`
+  on Linux (installed to `/usr/bin/vibex-tui` by the deb and AppImage configs,
+  and copied out of the `.deb` by the AUR `PKGBUILD`) and
+  `apps/desktop/packaging/vibex-tui.cmd` on Windows (a resource that lands next
+  to `vibex.exe`). Both forward to the `vibex` beside them before falling back
+  to `PATH`.
+- Windows reaches PATH through the vendored `apps/desktop/packaging/nsis/installer.nsi`,
+  which adds the per-user install directory on install and removes it on
+  uninstall. Re-sync that file when `CARGO_PACKAGER_VERSION` moves; only the two
+  PATH functions differ from cargo-packager's template.
+- macOS does not install a PATH entry: a dmg is a drag-to-Applications bundle
+  and has no installer script of its own. The client lives at
+  `Vibex.app/Contents/MacOS/vibex`, which the bundle signature already covers.
 
 ## Linux Binary Linking Rules
 

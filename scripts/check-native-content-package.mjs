@@ -34,6 +34,19 @@ function sha256(path) {
   return createHash("sha256").update(readFileSync(path)).digest("hex");
 }
 
+// `vibex status` prints `key=value` lines, one fact per line. A value may be
+// absent (`endpoint` only exists for a remote seat), so the parser keeps what
+// it is given rather than inventing defaults.
+function parseStatus(output) {
+  const facts = {};
+  for (const line of output.split("\n")) {
+    const separator = line.indexOf("=");
+    if (separator <= 0) continue;
+    facts[line.slice(0, separator)] = line.slice(separator + 1);
+  }
+  return facts;
+}
+
 function run(command, args, options = {}) {
   const result = spawnSync(command, args, {
     cwd: options.cwd ?? ROOT,
@@ -122,13 +135,28 @@ function validate() {
 
     // The character-grid client ships as a second, non-main binary. It has to
     // reach PATH in the package, otherwise `vibex` is only available from a
-    // source checkout.
+    // source checkout. `vibex status` prints one `key=value` line per fact, not
+    // JSON, so it is read as such.
     const debClient = join(debRoot, "usr/bin/vibex");
     assert(existsSync(debClient), ".deb is missing the vibex terminal client");
-    const clientStatus = JSON.parse(run(debClient, ["status"]));
+    const clientStatus = parseStatus(run(debClient, ["status"]));
     assert(typeof clientStatus.home === "string" && clientStatus.home.length > 0,
       "the packaged vibex client does not report a home directory");
     assert(clientStatus.version.length > 0, "the packaged vibex client reports no version");
+    assert(clientStatus.channel === "preview",
+      `the preview .deb client reports channel ${clientStatus.channel}`);
+    assert(clientStatus["channel-source"] === "packaged",
+      "the packaged client does not answer from its compiled channel");
+
+    // The explicit name is a launcher installed beside the client, and it must
+    // reach the same binary the package put on PATH.
+    const debLauncher = join(debRoot, "usr/bin/vibex-tui");
+    assert(existsSync(debLauncher), ".deb is missing the vibex-tui launcher");
+    const launcherStatus = parseStatus(run(debLauncher, ["status"]));
+    assert(launcherStatus.home === clientStatus.home && launcherStatus.version === clientStatus.version,
+      "the vibex-tui launcher does not run the packaged vibex client");
+    const appImageLauncher = join(appImageRoot, "usr/bin/vibex-tui");
+    assert(existsSync(appImageLauncher), "the AppImage is missing the vibex-tui launcher");
 
     console.log(JSON.stringify({
       status: "passed",

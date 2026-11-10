@@ -51,8 +51,16 @@ depends = [
   "libgtk-3-0 | libgtk-3-0t64",
 ]
 section = "devel"
-files = { "packaging/dev.vibex.desktop.desktop" = "/usr/share/applications/dev.vibex.desktop.desktop" }
+
+[deb.files]
+"packaging/dev.vibex.desktop.desktop" = "/usr/share/applications/dev.vibex.desktop.desktop"
+# `vibex-tui` is the explicit name for the character-grid client; the
+# launcher forwards to the `vibex` binary shipped beside it.
+"packaging/vibex-tui" = "/usr/bin/vibex-tui"
 
 [appimage]
 excludedLibs = ["libpdfium.so", "libwayland*"]
-files = { "packaging/dev.vibex.desktop.desktop" = "/usr/share/applications/dev.vibex.desktop.desktop" }
+
+[appimage.files]
+"packaging/dev.vibex.desktop.desktop" = "/usr/share/applications/dev.vibex.desktop.desktop"
+"packaging/vibex-tui" = "/usr/bin/vibex-tui"

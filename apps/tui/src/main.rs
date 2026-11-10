@@ -108,6 +108,13 @@ fn run(arguments: Vec<String>) -> Result<ExitCode, Failure> {
                 request.home = Some(std::path::PathBuf::from(home));
                 index += 1;
             }
+            "--channel" => {
+                let channel = arguments.get(index + 1).cloned().ok_or_else(|| {
+                    Failure::Message("`--channel` needs stable, rc, or preview".to_string())
+                })?;
+                request.channel = Some(channel);
+                index += 1;
+            }
             "--local" => request.prefer_authority = true,
             "--remote" => request.prefer_authority = false,
             "--take-over" => request.take_over = true,
@@ -140,10 +147,30 @@ fn run(arguments: Vec<String>) -> Result<ExitCode, Failure> {
     // Attaching first would make it fail for exactly the situations it exists
     // to explain.
     if command == Command::Status {
-        let home = vibex_client::seat::resolve_home(request.home.clone()).map_err(Failure::from)?;
+        let channel = vibex_client::seat::requested_channel(&request);
+        let home =
+            vibex_client::seat::resolve_home_for_channel(request.home.clone(), channel.as_deref())
+                .map_err(Failure::from)?;
         let probe = vibex_client::seat::probe(&home);
         println!("home={}", probe.home.display());
         println!("flavour={}", probe.flavour.label());
+        // Which channel chose that home: the packaged one, `--channel`, or
+        // `VIBEX_CHANNEL`. `status` exists to explain a surprising home, and
+        // "why this home" was the missing half of the answer.
+        println!(
+            "channel={}",
+            vibex_client::seat::resolved_channel(channel.as_deref())
+        );
+        println!(
+            "channel-source={}",
+            if request.channel.is_some() {
+                "flag"
+            } else if channel.is_some() {
+                "environment"
+            } else {
+                "packaged"
+            }
+        );
         println!(
             "seat={}",
             match probe.seat {
@@ -252,19 +279,29 @@ fn restart_as_authority(arguments: &[String]) -> Result<ExitCode, Failure> {
 }
 
 fn usage() -> String {
+    let (channel, home) = match vibex_client::seat::resolved_channel(None) {
+        "stable" => ("stable", "~/.vibex/desktop-stable"),
+        "rc" => ("rc", "~/.vibex/desktop-rc"),
+        _ => ("preview", "~/.vibex/desktop-preview"),
+    };
     format!(
         "vibex {VERSION} — character-grid client for a Vibex runtime\n\
          \n\
          USAGE:\n\
-         \x20   vibex [tui] [--home <dir>] [--local|--remote] [--theme <id>]\n\
+         \x20   vibex [tui] [--home <dir>] [--channel <c>] [--local|--remote]\n\
+         \x20          [--theme <id>]\n\
          \n\
          HOMES:\n\
-         \x20   A home ending in desktop-preview / desktop-rc / desktop-stable is\n\
-         \x20   that desktop channel; anything else is a server home. The flavour is\n\
-         \x20   taken from the path, because the runtime refuses to start a channel\n\
-         \x20   in a home that does not match it.\n\
+         \x20   This client serves the {channel} channel it was packaged as, so\n\
+         \x20   plain `vibex` opens {home}.\n\
+         \x20   `--channel stable|rc|preview` (or VIBEX_CHANNEL) serves another\n\
+         \x20   one. A home ending in desktop-preview / desktop-rc /\n\
+         \x20   desktop-stable is that channel; anything else is a server home.\n\
+         \x20   The flavour is taken from the path, because the runtime refuses to\n\
+         \x20   start a channel in a home that does not match it.\n\
          \x20   vibex connect <vibex://… | pairing-code>\n\
-         \x20   vibex status [--home <dir>]        report the mode without attaching\n\
+         \x20   vibex status [--home <dir>] [--channel <c>]\n\
+         \x20                                      report the mode without attaching\n\
          \x20   vibex computer <command>           drive the desktop; needs the\n\
          \x20                                     environment a running runtime\n\
          \x20                                     gives an Agent session\n\
@@ -275,8 +312,8 @@ fn usage() -> String {
          \x20   `vibex status` prints the mode as seat=authority or seat=remote.\n\
          \n\
          ENVIRONMENT:\n\
-         \x20   VIBEX_HOME        runtime home (default ~/.vibex/<channel>)\n\
-         \x20   VIBEX_CHANNEL     stable | rc | preview\n\
+         \x20   VIBEX_HOME        runtime home (default {home})\n\
+         \x20   VIBEX_CHANNEL     stable | rc | preview; overrides the packaged one\n\
          \x20   VIBEX_THEME       theme id (default: appearance default)\n\
          \x20   VIBEX_TUI_COLOR   truecolor | ansi256 | 16 | none\n\
          \x20   VIBEX_TUI_ICONS   auto | emoji | ascii\n\
@@ -299,7 +336,9 @@ mod tests {
             "vibex connect",
             "vibex status",
             "vibex computer",
+            "--channel",
             "VIBEX_HOME",
+            "VIBEX_CHANNEL",
             "local mode",
             "remote mode",
         ] {

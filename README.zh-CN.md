@@ -317,7 +317,7 @@ Vibex 使用 [Agent Client Protocol](https://agentclientprotocol.com/)（ACP）�
 | --- | --- | --- |
 | **桌面端** | 完整的原生 GPUI 工作台，也是 Agent、工作区、文件、Git、PTY、浏览器、电脑操作、供应商、权限和持久化状态的权威 `DesktopRuntime`。 | 支持 Linux、macOS 和 Windows；[下载最新版本](https://github.com/vibex-ai/vibex/releases/latest)。 |
 | **移动端** | 原生 GPUI iOS 和 Android 伴侣应用。将桌面会话模型渲染为 GUI 时间线，并发送类型化远程变更。 | 从 [Releases](https://github.com/vibex-ai/vibex/releases/latest) 获取 Android APK 和未签名 iOS 真机 IPA。 |
-| **TUI** | 基于同一套运行时协议的字符网格客户端。随每个桌面安装包发布，也能附着到正在运行的桌面运行时。 | `vibex`、`vibex connect` 或 `vibex-server tui`。 |
+| **TUI** | 基于同一套运行时协议的字符网格客户端。随每个桌面安装包发布，也能附着到正在运行的桌面运行时。 | `vibex` / `vibex-tui`、`vibex connect` 或 `vibex-server tui`。 |
 | **无头运行时** | `vibex-server`：没有窗口的同一套权威运行时，适合服务器或常开机器。 | `ghcr.io/vibex-ai/vibex-server` 或发布二进制。 |
 | **Relay** | 可选的 Rust/Axum 加密 WebSocket 帧传输服务，不存储工作区、供应商、Agent 或应用数据。 | `apps/relay-server` 和 `deploy/relay`。 |
 
@@ -346,14 +346,14 @@ macOS 和 Windows 安装包目前没有代码签名，首次打开需要 Gatekee
 
 ### 试试终端客户端
 
-TUI 随桌面安装包一起发布：
+TUI 随桌面安装包一起发布，装完即可在终端里使用：
 
 ```bash
 cd /path/to/your/project
-vibex
+vibex          # 或 vibex-tui，两个名字是同一个客户端
 ```
 
-它会附着到该 home 对应的运行时，必要时自己启动一个。运行 `vibex status` 可以查看它会使用哪个运行时；运行 `vibex connect vibex://…` 可以配对远程运行时。详见 [Vibex TUI](https://vibex.peatboy.com/docs/tui)。
+它服务于所安装的那个 channel（RC 包打开 `desktop-rc`，正式版打开 `desktop-stable`），无需设置任何环境变量；要临时换一个 channel，用 `vibex --channel stable`。它会附着到该 home 对应的运行时，必要时自己启动一个。运行 `vibex status` 可以查看它会使用哪个运行时；运行 `vibex connect vibex://…` 可以配对远程运行时。详见 [Vibex TUI](https://vibex.peatboy.com/docs/tui)。
 
 ### 从源码构建
 

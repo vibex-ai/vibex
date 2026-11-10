@@ -81,6 +81,7 @@ fn run_tui(local: bool) {
     let mut request = vibex_client::seat::SeatRequest {
         connect: None,
         home: None,
+        channel: None,
         prefer_authority: local,
         // The desktop hands its home over by restarting itself, not by asking
         // the seat resolver for it, so this entry point never takes over.
