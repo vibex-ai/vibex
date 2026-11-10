@@ -23042,6 +23042,17 @@ impl VibexWorkbench {
             .next_available_group_name(project_id, workspace_id, self.strings().sidebar_group_stem);
         let group_id = RequestId::new().to_string();
         let session_workspaces = self.sidebar_session_workspaces();
+        // A group built from rows the reader filed together stays where those
+        // rows are. The group is a sibling of its members, so it inherits the
+        // folder they all share; members filed apart keep the group at the
+        // project root, which is the only place they have in common.
+        let parent_folder_id = self.ui_state.sidebar.organization.common_parent_folder(
+            &session_ids
+                .iter()
+                .cloned()
+                .map(SidebarOrganizationItem::Session)
+                .collect::<Vec<_>>(),
+        );
         if !self.ui_state.sidebar.organization.create_group(
             &group_id,
             name,
@@ -23049,7 +23060,7 @@ impl VibexWorkbench {
             workspace_id,
             session_ids,
             &session_workspaces,
-            None,
+            parent_folder_id,
         ) {
             return;
         }

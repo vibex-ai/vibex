@@ -1305,6 +1305,25 @@ impl SidebarOrganizationState {
             .and_then(|placement| placement.parent_folder_id.clone())
     }
 
+    /// The one folder that holds every item in `items`.
+    ///
+    /// A group built from sessions the reader filed together has to stay where
+    /// those sessions were: the group takes their shared folder instead of
+    /// reappearing at the project root. Items filed in different folders, or not
+    /// filed at all, have no shared parent and answer `None`.
+    pub fn common_parent_folder(&self, items: &[SidebarOrganizationItem]) -> Option<String> {
+        let mut parent: Option<String> = None;
+        for item in items {
+            let item_parent = self.parent_of(item)?;
+            match parent.as_deref() {
+                Some(expected) if expected == item_parent => {}
+                Some(_) => return None,
+                None => parent = Some(item_parent),
+            }
+        }
+        parent
+    }
+
     pub fn ordered_children(
         &self,
         parent_folder_id: Option<&str>,
@@ -3339,6 +3358,148 @@ mod tests {
         assert_eq!(group.member_session_ids, group_members(&["session-a"]));
         state.cleanup_references(&BTreeSet::new(), &BTreeSet::new());
         assert!(state.group("group-1").is_none());
+    }
+
+    /// The folder a group inherits from the rows it was built out of.
+    ///
+    /// Creating a group from sessions the reader filed together has to leave the
+    /// group where those sessions were. A group is placed by its own record, so
+    /// without this it fell back to the project root and the reader watched the
+    /// rows leave the folder they had just been filed in.
+    #[test]
+    fn a_group_inherits_the_folder_its_members_were_filed_in() {
+        let mut state = SidebarOrganizationState::default();
+        assert!(state.create_folder("folder-1", "Archive", Some("project-a".to_string()), None));
+        // Both sessions belong to project-a, so both can be filed under the
+        // folder that project owns.
+        let projects = BTreeMap::from([
+            ("session-a".to_string(), "project-a".to_string()),
+            ("session-b".to_string(), "project-a".to_string()),
+        ]);
+        for session_id in ["session-a", "session-b"] {
+            assert!(state.place_into_folder(
+                &SidebarOrganizationItem::Session(session_id.to_string()),
+                "folder-1",
+                &projects,
+            ));
+        }
+
+        let members = group_members(&["session-a", "session-b"]);
+        let items = members
+            .iter()
+            .cloned()
+            .map(SidebarOrganizationItem::Session)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            state.common_parent_folder(&items),
+            Some("folder-1".to_string())
+        );
+        assert!(state.create_group(
+            "group-1",
+            "会话组 1",
+            "project-a",
+            "workspace-a",
+            &members,
+            &group_workspaces(),
+            state.common_parent_folder(&items),
+        ));
+        assert_eq!(
+            state.parent_of(&SidebarOrganizationItem::Group("group-1".into())),
+            Some("folder-1".to_string()),
+            "the group stays in the folder its members were filed in"
+        );
+    }
+
+    /// Members filed apart have no folder in common, so the group goes to the
+    /// project root rather than picking one member's folder.
+    #[test]
+    fn a_group_of_members_filed_apart_stays_at_the_project_root() {
+        let mut state = SidebarOrganizationState::default();
+        assert!(state.create_folder("folder-1", "Archive", Some("project-a".to_string()), None));
+        assert!(state.create_folder("folder-2", "Later", Some("project-a".to_string()), None));
+        let projects = BTreeMap::from([
+            ("session-a".to_string(), "project-a".to_string()),
+            ("session-b".to_string(), "project-a".to_string()),
+            ("session-c".to_string(), "project-a".to_string()),
+        ]);
+        assert!(state.place_into_folder(
+            &SidebarOrganizationItem::Session("session-a".to_string()),
+            "folder-1",
+            &projects,
+        ));
+        assert!(state.place_into_folder(
+            &SidebarOrganizationItem::Session("session-b".to_string()),
+            "folder-2",
+            &projects,
+        ));
+
+        let items = ["session-a", "session-b"]
+            .iter()
+            .map(|id| SidebarOrganizationItem::Session((*id).to_string()))
+            .collect::<Vec<_>>();
+        assert_eq!(state.common_parent_folder(&items), None);
+
+        // An unplaced member is the same answer: the group cannot inherit a
+        // folder one of its rows does not live in.
+        let mixed = [
+            SidebarOrganizationItem::Session("session-a".to_string()),
+            SidebarOrganizationItem::Session("session-c".to_string()),
+        ];
+        assert_eq!(state.common_parent_folder(&mixed), None);
+    }
+
+    /// The folder a group inherits is always one that can hold it.
+    ///
+    /// `common_parent_folder` reports whatever parent the members share, and a
+    /// root-scoped folder is a legitimate parent for a session. It can never be
+    /// the answer here, because a project session cannot be filed under a
+    /// root-scoped folder in the first place — the placement is refused. That is
+    /// what lets `create_group` take the inherited folder on trust: the only
+    /// folders it can name are the ones that already hold these sessions.
+    #[test]
+    fn an_inherited_folder_is_always_one_that_can_hold_the_group() {
+        let mut state = SidebarOrganizationState::default();
+        assert!(state.create_folder("root-folder", "Loose", None, None));
+        let projects = BTreeMap::from([
+            ("session-a".to_string(), "project-a".to_string()),
+            ("session-b".to_string(), "project-a".to_string()),
+        ]);
+        // A project session cannot be filed into a root-scoped folder, so no
+        // shared parent of project sessions can ever be root-scoped.
+        assert!(!state.place_into_folder(
+            &SidebarOrganizationItem::Session("session-a".to_string()),
+            "root-folder",
+            &projects,
+        ));
+
+        // With a project folder as the shared parent, creation succeeds.
+        assert!(state.create_folder("folder-1", "Archive", Some("project-a".to_string()), None));
+        for session_id in ["session-a", "session-b"] {
+            assert!(state.place_into_folder(
+                &SidebarOrganizationItem::Session(session_id.to_string()),
+                "folder-1",
+                &projects,
+            ));
+        }
+        let items = ["session-a", "session-b"]
+            .iter()
+            .map(|id| SidebarOrganizationItem::Session((*id).to_string()))
+            .collect::<Vec<_>>();
+        let inherited = state.common_parent_folder(&items);
+        assert_eq!(inherited, Some("folder-1".to_string()));
+        assert!(state.create_group(
+            "group-1",
+            "会话组 1",
+            "project-a",
+            "workspace-a",
+            &group_members(&["session-a", "session-b"]),
+            &group_workspaces(),
+            inherited,
+        ));
+        assert_eq!(
+            state.parent_of(&SidebarOrganizationItem::Group("group-1".into())),
+            Some("folder-1".to_string())
+        );
     }
 
     #[test]
