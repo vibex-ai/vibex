@@ -337,6 +337,15 @@ bytes, `\0`.
 - A new workspace crate inherits `license.workspace` and needs no new license
   decision, but it is absent from the SBOM and the notices until `--write` runs.
 - `--write` is idempotent: a second run produces no further diff.
+- The unregistered-asset scan covers source-owned trees only. Generated build
+  outputs — `apps/mobile/android/app/src/main/jniLibs`,
+  `apps/mobile/android/app/build`, and `apps/mobile/ios/VibexFFI.xcframework` —
+  are excluded by `GENERATED_ASSET_ROOTS`, because they are copies of inputs the
+  policy already pins (Gradle's `mergeReleaseAssets/fonts/` copy of the Android
+  emoji font, the packaged native libraries). Pinning a copy would either
+  double-count the same bytes or demand a second policy entry for a file nobody
+  authored; add a new root to that list only when the directory is build output,
+  never to make a real source asset disappear.
 
 ### 4. Validation & Error Matrix
 
