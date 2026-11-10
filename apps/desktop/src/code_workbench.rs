@@ -942,7 +942,7 @@ impl SearchableListItem for GitHistoryBranchChoice {
                 h_flex()
                     .flex_none()
                     .gap_1p5()
-                    .font_family("monospace")
+                    .font_family(cx.theme().mono_font_family.clone())
                     .text_xs()
                     .child(
                         div()
@@ -1907,7 +1907,7 @@ impl CodeWorkbench {
             None,
             None,
             None,
-            crate::platform::default_code_font_family().to_string(),
+            crate::theme::default_mono_font_family().to_string(),
             13,
             false,
             false,
@@ -16336,7 +16336,7 @@ impl CodeRightRail {
                     .child(
                         div()
                             .flex_none()
-                            .font_family("monospace")
+                            .font_family(cx.theme().mono_font_family.clone())
                             .font_weight(code_font_weight(cx))
                             .font_semibold()
                             .text_color(cx.theme().warning)
@@ -16349,7 +16349,7 @@ impl CodeRightRail {
                             .min_w_0()
                             .cursor_pointer()
                             .truncate()
-                            .font_family("monospace")
+                            .font_family(cx.theme().mono_font_family.clone())
                             .font_weight(code_font_weight(cx))
                             .text_xs()
                             .child(path.clone())
@@ -16551,6 +16551,7 @@ impl CodeRightRail {
                                                     pull_count,
                                                     "↙",
                                                     cx.theme().info,
+                                                    cx,
                                                 ))
                                             })
                                             .when(push_count > 0, |this| {
@@ -16558,6 +16559,7 @@ impl CodeRightRail {
                                                     push_count,
                                                     "↗",
                                                     cx.theme().success,
+                                                    cx,
                                                 ))
                                             }),
                                     )
@@ -16897,7 +16899,7 @@ impl CodeRightRail {
                             h_flex()
                                 .flex_none()
                                 .gap_3()
-                                .font_family("monospace")
+                                .font_family(cx.theme().mono_font_family.clone())
                                 .font_weight(code_font_weight(cx))
                                 .text_xs()
                                 .font_semibold()
@@ -17143,7 +17145,9 @@ impl CodeRightRail {
                                                             .rounded(px(4.0))
                                                             .bg(cx.theme().primary.opacity(0.18))
                                                             .px_1()
-                                                            .font_family("monospace")
+                                                            .font_family(
+                                                                cx.theme().mono_font_family.clone(),
+                                                            )
                                                             .text_xs()
                                                             .text_color(cx.theme().foreground)
                                                             .child(selected_count.to_string()),
@@ -17433,7 +17437,7 @@ impl CodeRightRail {
                             .flex_none()
                             .gap_1()
                             .ml_2()
-                            .font_family("monospace")
+                            .font_family(cx.theme().mono_font_family.clone())
                             .font_weight(code_font_weight(cx))
                             .text_xs()
                             .child(
@@ -17467,7 +17471,7 @@ impl CodeRightRail {
                             .border_1()
                             .border_color(cx.theme().border.opacity(0.70))
                             .px_1()
-                            .font_family("monospace")
+                            .font_family(cx.theme().mono_font_family.clone())
                             .font_weight(code_font_weight(cx))
                             .text_xs()
                             .text_color(cx.theme().sidebar_foreground.opacity(0.50))
@@ -18017,7 +18021,7 @@ impl CodeRightRail {
                             .child(
                                 div()
                                     .flex_none()
-                                    .font_family("monospace")
+                                    .font_family(cx.theme().mono_font_family.clone())
                                     .font_weight(code_font_weight(cx))
                                     .child(commit.short_hash),
                             ),
@@ -18128,7 +18132,7 @@ impl CodeRightRail {
                                             .border_color(cx.theme().border.opacity(0.70))
                                             .px_1p5()
                                             .py_0p5()
-                                            .font_family("monospace")
+                                            .font_family(cx.theme().mono_font_family.clone())
                                             .font_weight(code_font_weight(cx))
                                             .text_xs()
                                             .text_color(cx.theme().muted_foreground)
@@ -18139,7 +18143,7 @@ impl CodeRightRail {
                                 h_flex()
                                     .flex_none()
                                     .gap_1p5()
-                                    .font_family("monospace")
+                                    .font_family(cx.theme().mono_font_family.clone())
                                     .font_weight(code_font_weight(cx))
                                     .text_xs()
                                     .font_semibold()
@@ -18770,7 +18774,7 @@ fn git_sync_counts(branches: &[GitBranchSummary]) -> (u32, u32) {
         .unwrap_or_default()
 }
 
-fn git_sync_badge(count: u32, arrow: &'static str, color: Hsla) -> AnyElement {
+fn git_sync_badge(count: u32, arrow: &'static str, color: Hsla, cx: &App) -> AnyElement {
     h_flex()
         .h(px(18.0))
         .min_w(px(24.0))
@@ -18781,7 +18785,7 @@ fn git_sync_badge(count: u32, arrow: &'static str, color: Hsla) -> AnyElement {
         .rounded(px(3.0))
         .bg(color.opacity(0.12))
         .text_color(color)
-        .font_family("monospace")
+        .font_family(cx.theme().mono_font_family.clone())
         .text_xs()
         .child(format!("{arrow} {count}"))
         .into_any_element()

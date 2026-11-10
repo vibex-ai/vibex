@@ -151,6 +151,15 @@ pnpm build:mobile:ios
   payload is modified. Naming a family the build does not carry is a defect:
   GPUI falls through to its own cascade and lands on the proportional UI face,
   which silently breaks the terminal grid.
+- The desktop's default code font is a family the process actually loaded, not
+  the platform's monospace name. Linux keeps its font database bounded to the
+  bundled faces plus a couple of system ones, so `gpui-base`'s typography
+  default (`DejaVu Sans Mono`) and gpui-component's stand-in list are both
+  absent; the component probe then lands on `.SystemUIFont`, which the bounded
+  database answers with the bundled *sans* face. `theme::default_mono_font_family`
+  is the one place the default is named, and on Linux it names the bundled
+  code family — the same face the `monospace` alias resolves to. A reader's
+  choice still wins, and it is installed through `load_selected_font_families`.
 - `Window::insets()` is the only safe-area/IME geometry source. GPUI refreshes
   the window when platform insets change, and the root composition applies the
   effective top/right/bottom/left padding.
