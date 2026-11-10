@@ -663,6 +663,62 @@ impl SidebarOrganizationState {
         crate::ordered_groups(entries, &order)
     }
 
+    /// Every folder one project owns, in the order the sidebar draws them.
+    ///
+    /// A folder belongs to a project and optionally to one of its Worktrees.
+    /// Both scopes are listed here, because the new-session page files a draft
+    /// by folder and the folder it offers has to be one the sidebar would
+    /// actually show the session under. The walk is the placement tree's own
+    /// depth-first order, so nested folders follow their parent instead of
+    /// arriving in map-key order.
+    pub fn folders_for_project(&self, project_id: &str) -> Vec<(String, &SidebarFolderUiState)> {
+        let mut ordered = Vec::new();
+        let mut seen = BTreeSet::new();
+        self.walk_project_folders(project_id, None, 0, &mut seen, &mut ordered);
+        // A folder whose placement is missing or unreachable still exists; it
+        // belongs to the project, so it is offered at the end rather than lost.
+        for (folder_id, folder) in &self.folders {
+            if folder.project_id.as_deref() == Some(project_id) && seen.insert(folder_id.clone()) {
+                ordered.push((folder_id.clone(), folder));
+            }
+        }
+        ordered
+    }
+
+    fn walk_project_folders<'a>(
+        &'a self,
+        project_id: &str,
+        parent: Option<&str>,
+        depth: usize,
+        seen: &mut BTreeSet<String>,
+        ordered: &mut Vec<(String, &'a SidebarFolderUiState)>,
+    ) {
+        if depth > 32 {
+            return;
+        }
+        for placement in &self.placements {
+            if placement.parent_folder_id.as_deref() != parent {
+                continue;
+            }
+            let SidebarOrganizationItem::Folder(folder_id) = &placement.item else {
+                continue;
+            };
+            let Some(folder) = self.folders.get(folder_id) else {
+                continue;
+            };
+            if folder.project_id.as_deref() != Some(project_id) {
+                continue;
+            }
+            // A hand-edited document can describe a cycle; `seen` keeps the walk
+            // finite and keeps a folder from being offered twice.
+            if !seen.insert(folder_id.clone()) {
+                continue;
+            }
+            ordered.push((folder_id.clone(), folder));
+            self.walk_project_folders(project_id, Some(folder_id), depth + 1, seen, ordered);
+        }
+    }
+
     /// Groups anchored to one Worktree, in sidebar order.
     pub fn groups_for_workspace(
         &self,
@@ -2092,6 +2148,63 @@ mod tests {
             state.folder("beta").map(|folder| folder.name.as_str()),
             Some("Beta")
         );
+    }
+
+    /// The folders one project offers, in the order the sidebar draws them.
+    ///
+    /// The new-session page files a draft by folder, so the list it offers has
+    /// to be the project's own folders — including the ones nested under another
+    /// folder, which follow their parent rather than arriving in key order.
+    #[test]
+    fn folders_for_project_lists_only_that_project_in_tree_order() {
+        let mut state = SidebarOrganizationState::default();
+        assert!(state.create_folder("alpha", "Alpha", Some("project-a".into()), None));
+        assert!(state.create_folder(
+            "alpha-child",
+            "Alpha child",
+            Some("project-a".into()),
+            Some("alpha".into()),
+        ));
+        assert!(state.create_folder(
+            "alpha-grandchild",
+            "Alpha grandchild",
+            Some("project-a".into()),
+            Some("alpha-child".into()),
+        ));
+        assert!(state.create_folder("beta", "Beta", Some("project-a".into()), None));
+        assert!(state.create_folder("other", "Other", Some("project-b".into()), None));
+        // A root-scoped folder belongs to no project, so no project offers it.
+        assert!(state.create_folder("root", "Root", None, None));
+
+        let ids = state
+            .folders_for_project("project-a")
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect::<Vec<_>>();
+        // The order is the sidebar's own: a new root folder is placed first, and
+        // a nested folder follows the parent it was created under.
+        assert_eq!(
+            ids,
+            vec![
+                "beta".to_string(),
+                "alpha".to_string(),
+                "alpha-child".to_string(),
+                "alpha-grandchild".to_string(),
+            ]
+        );
+        // Every folder of the project is listed once, at every depth.
+        assert_eq!(ids.len(), 4);
+        assert!(!ids.contains(&"other".to_string()));
+        assert!(!ids.contains(&"root".to_string()));
+        assert_eq!(
+            state
+                .folders_for_project("project-b")
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect::<Vec<_>>(),
+            vec!["other".to_string()]
+        );
+        assert!(state.folders_for_project("project-c").is_empty());
     }
 
     #[test]

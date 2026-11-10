@@ -582,6 +582,23 @@ const SIDEBAR_FOLDER_CHILD_INDENT: f32 = 18.0;
 /// Offset from the children container's left edge where the vertical
 /// tree guide line is drawn, aligning with the parent folder icon center.
 const SIDEBAR_FOLDER_TREE_GUIDE_OFFSET: f32 = 7.0;
+/// Edge length of the disclosure chevron a group row leads with.
+///
+/// The group's tree connector runs down that chevron's center, so the two read
+/// as one column: the chevron opens the branch and the trunk carries it down.
+const SIDEBAR_GROUP_CHEVRON_SIZE: f32 = 12.0;
+/// Where a group's connector runs relative to a member row's leading edge.
+///
+/// The group row starts its content one overhang in and puts its disclosure
+/// chevron first, so the chevron's center sits half its width past that. A
+/// member row is indented by [`SIDEBAR_FOLDER_CHILD_INDENT`], which makes the
+/// trunk's column negative relative to the row: the connector lives in the
+/// gutter the group already reserves, and the elbow then crosses the row's own
+/// leading padding to end on the member's Agent logo. Nothing is laid out beside
+/// the row, so its geometry matches every other session row.
+const SIDEBAR_GROUP_GUIDE_TRUNK_OFFSET: f32 = SIDEBAR_WORKSPACE_SESSION_CARD_OVERHANG
+    + SIDEBAR_GROUP_CHEVRON_SIZE / 2.0
+    - SIDEBAR_FOLDER_CHILD_INDENT;
 const SIDEBAR_FOLDER_DROP_EDGE_HEIGHT: f32 = 8.0;
 const STARTUP_LOADING_INDICATOR_DELAY: Duration = Duration::from_secs(5);
 const STARTUP_LOADING_MIN_DURATION: Duration = Duration::from_secs(1);
@@ -2153,6 +2170,44 @@ impl SearchableListItem for NewSessionBaseRefChoice {
                     .text_color(cx.theme().muted_foreground),
             )
             .child(div().min_w_0().truncate().child(self.name.clone()))
+    }
+}
+
+/// One folder the new-session page can file its draft under.
+///
+/// The choice carries the label the menu draws and the id the placement tree
+/// files by, so the control never has to look a folder up again by name.
+#[derive(Clone)]
+struct NewSessionFolderChoice {
+    folder_id: String,
+    label: String,
+    depth: usize,
+}
+
+impl SearchableListItem for NewSessionFolderChoice {
+    type Value = String;
+
+    fn title(&self) -> SharedString {
+        self.label.clone().into()
+    }
+
+    fn value(&self) -> &Self::Value {
+        &self.folder_id
+    }
+
+    fn render(&self, _: &mut Window, cx: &mut App) -> impl IntoElement {
+        h_flex()
+            .min_w_0()
+            .gap_2()
+            // A nested folder is indented by its depth, so the menu reads as the
+            // tree the sidebar draws rather than a flat list of names.
+            .pl(px(self.depth as f32 * 12.0))
+            .child(
+                sidebar_icon("icons/vibex/folder.svg")
+                    .size(px(14.0))
+                    .text_color(cx.theme().muted_foreground),
+            )
+            .child(div().min_w_0().truncate().child(self.label.clone()))
     }
 }
 
@@ -10333,6 +10388,18 @@ pub struct VibexWorkbench {
     /// The choices currently loaded into [`Self::new_session_base_ref_select`],
     /// so the select is only rebuilt when the worktree eligibility changes.
     new_session_base_ref_choices: Vec<String>,
+    /// The folder the draft will be filed under, when the page was opened from a
+    /// folder row. It is also the folder the page's own control shows, so
+    /// changing the control changes where the session lands.
+    new_session_folder_select: Entity<SelectState<Vec<NewSessionFolderChoice>>>,
+    /// The folder ids currently loaded into
+    /// [`Self::new_session_folder_select`], so the control is only rebuilt when
+    /// the project's folders change.
+    new_session_folder_choices: Vec<String>,
+    /// The folder the control was last synced to show. It is part of the sync
+    /// key because a folder row's new-chat action can pre-select a folder the
+    /// project already offered, which leaves the choice list unchanged.
+    new_session_folder_selection: Option<String>,
     new_session_project_menu_focus: FocusHandle,
     new_session_project_trigger_bounds: Option<Bounds<Pixels>>,
     workspaces: Vec<(ProjectRecord, WorkspaceRecord)>,
@@ -11628,6 +11695,8 @@ impl VibexWorkbench {
         });
         let new_session_base_ref_select =
             cx.new(|cx| SelectState::new(Vec::new(), None, window, cx).searchable(true));
+        let new_session_folder_select =
+            cx.new(|cx| SelectState::new(Vec::new(), None, window, cx).searchable(false));
         let new_session_runtime_search = cx.new(|cx| {
             InputState::new(window, cx).placeholder(locale::text(
                 "Search providers and models",
@@ -11751,6 +11820,15 @@ impl VibexWorkbench {
                     if let Some(base_ref) = base_ref {
                         this.set_new_session_base_ref(base_ref.clone(), cx);
                     }
+                },
+            ),
+            cx.subscribe(
+                &new_session_folder_select,
+                |this, _, event: &SelectEvent<Vec<NewSessionFolderChoice>>, cx| {
+                    let SelectEvent::Confirm(folder_id) = event;
+                    // Clearing the choice files the draft at the project root,
+                    // which is what the page did before it had a folder control.
+                    this.set_new_session_folder(folder_id.clone(), cx);
                 },
             ),
             cx.subscribe(
@@ -12197,6 +12275,9 @@ impl VibexWorkbench {
             new_session_project_search,
             new_session_base_ref_select,
             new_session_base_ref_choices: Vec::new(),
+            new_session_folder_select,
+            new_session_folder_choices: Vec::new(),
+            new_session_folder_selection: None,
             new_session_project_menu_focus,
             new_session_project_trigger_bounds: None,
             workspaces: Vec::new(),
@@ -22341,39 +22422,46 @@ impl VibexWorkbench {
         };
         let members = group.member_session_ids.clone();
         let mut elements = Vec::new();
-        for id in &members {
-            if self
-                .delegated_tree
-                .get(id)
-                .and_then(|node| node.parent_session_ref.as_ref())
-                .is_some_and(|parent| members.contains(&parent.id))
-            {
-                continue;
-            }
+        // The rows a group paints, in the order it paints them. The guide
+        // geometry needs to know which row is last before it draws any of them,
+        // because the last row's trunk stops at its elbow instead of running on
+        // to a row that is not there.
+        let rows = members
+            .iter()
+            .filter(|id| {
+                !self
+                    .delegated_tree
+                    .get(*id)
+                    .and_then(|node| node.parent_session_ref.as_ref())
+                    .is_some_and(|parent| members.contains(&parent.id))
+            })
+            .filter(|id| {
+                self.registered_session(id)
+                    .is_some_and(|session| self.sidebar_session_visible_under_filter(session))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let row_count = rows.len();
+        for (index, id) in rows.iter().enumerate() {
             let Some(session) = self.registered_session(id).cloned() else {
                 continue;
             };
-            // A group's members are drawn from the organization tree rather
-            // than the projection, so the filter has to be asked here too.
-            if !self.sidebar_session_visible_under_filter(&session) {
-                continue;
-            }
             self.sidebar_visible_session_ids.push(id.clone());
-            if let Some(node) = self
+            let row = if let Some(node) = self
                 .delegated_tree
                 .get(id)
                 .filter(|node| node.parent_session_ref.is_some())
                 .cloned()
             {
-                elements.push(self.render_delegated_session_row(
+                self.render_delegated_session_row(
                     &node,
                     0,
                     self.delegated_has_children(id),
                     self.delegated_branch_is_collapsed(id),
                     cx,
-                ));
+                )
             } else {
-                elements.push(self.render_sidebar_session(
+                self.render_sidebar_session(
                     &session,
                     session.project_id.as_str(),
                     reorder_enabled,
@@ -22381,8 +22469,22 @@ impl VibexWorkbench {
                     Some(group_id),
                     self.strings(),
                     cx,
-                ));
-            }
+                )
+            };
+            // A member is a child of its group row, so it hangs off the same
+            // kind of tree connector a delegated child wears under its parent:
+            // a trunk down the group's indent with an elbow into the member's
+            // Agent logo. The connector is painted over the indent the group
+            // already reserves, so it never moves the row it belongs to.
+            elements.push(
+                div()
+                    .relative()
+                    .w_full()
+                    .min_w_0()
+                    .child(row)
+                    .child(sidebar_group_tree_guide(index + 1 == row_count, cx))
+                    .into_any_element(),
+            );
             elements.extend(self.render_delegated_subtree(id, 0, cx));
         }
         elements
@@ -39130,6 +39232,91 @@ impl VibexWorkbench {
         cx.notify();
     }
 
+    /// Files the draft under `folder_id`, or at the project root for `None`.
+    ///
+    /// The page's own control is the only writer: it is what the reader changes,
+    /// and what a folder row's new-chat action pre-selects. A folder that has
+    /// since been deleted, or that no longer belongs to the draft's project, is
+    /// ignored rather than written, so a stale id can never file a session
+    /// somewhere the sidebar would not show it.
+    fn set_new_session_folder(&mut self, folder_id: Option<String>, cx: &mut Context<Self>) {
+        let next = folder_id.filter(|folder_id| {
+            self.ui_state
+                .sidebar
+                .organization
+                .folder(folder_id)
+                .is_some_and(|folder| {
+                    folder.project_id.is_some()
+                        && folder.project_id == self.new_session_workspace.project_id
+                            .as_ref()
+                            .map(|project_id| project_id.as_str().to_string())
+                })
+        });
+        if self.new_session_folder_id != next {
+            self.new_session_folder_id = next;
+            cx.notify();
+        }
+    }
+
+    /// The folders the draft's project offers, in sidebar order.
+    ///
+    /// A folder scoped to another Worktree is left out: the sidebar would never
+    /// show the session under it, and [`Self::file_new_session_in_folder`] would
+    /// decline the placement after the fact. A project with no folders yields an
+    /// empty list, which is what hides the control.
+    fn new_session_folder_choices(&self) -> Vec<NewSessionFolderChoice> {
+        let Some(project_id) = self
+            .new_session_workspace
+            .project_id
+            .as_ref()
+            .map(|project_id| project_id.as_str().to_string())
+        else {
+            return Vec::new();
+        };
+        let session_workspace_id = self
+            .new_session_workspace
+            .fixed_workspace
+            .as_ref()
+            .map(|workspace| workspace.id.as_str().to_string())
+            .or_else(|| {
+                self.new_session_workspace
+                    .origin_workspace_id
+                    .as_ref()
+                    .map(|workspace_id| workspace_id.as_str().to_string())
+            });
+        let folders = self
+            .ui_state
+            .sidebar
+            .organization
+            .folders_for_project(&project_id);
+        // A nested folder's depth is its parent's depth plus one. The walk
+        // visits parents first, so one pass over the ordered list is enough.
+        let mut depths = BTreeMap::new();
+        for (folder_id, _) in &folders {
+            let parent = self
+                .ui_state
+                .sidebar
+                .organization
+                .parent_of(&SidebarOrganizationItem::Folder(folder_id.clone()));
+            let depth = parent
+                .as_ref()
+                .and_then(|parent| depths.get(parent).copied())
+                .map_or(0, |depth| depth + 1);
+            depths.insert(folder_id.clone(), depth);
+        }
+        folders
+            .into_iter()
+            .filter(|(_, folder)| {
+                folder.workspace_id.is_none() || folder.workspace_id == session_workspace_id
+            })
+            .map(|(folder_id, folder)| NewSessionFolderChoice {
+                label: folder.name.clone(),
+                depth: depths.get(&folder_id).copied().unwrap_or(0),
+                folder_id,
+            })
+            .collect()
+    }
+
     /// Opens the new-session page on the project or Worktree `folder_id`
     /// belongs to, and remembers the folder so the session the page creates is
     /// filed under it.
@@ -39151,7 +39338,9 @@ impl VibexWorkbench {
         // Opening the page clears the folder, so the folder that owns this
         // draft is recorded after it, and only once it is known to be startable.
         self.open_new_session(Some(target), window, cx);
-        self.new_session_folder_id = Some(folder_id.clone());
+        // Through the setter, so the control the page draws and the folder the
+        // session is filed under are the same answer.
+        self.set_new_session_folder(Some(folder_id.clone()), cx);
         self.reveal_sidebar_folder(&folder_id);
         cx.notify();
     }
@@ -52683,7 +52872,7 @@ impl VibexWorkbench {
                             "icons/vibex/chevrons-down-up.svg"
                         })
                         .flex_none()
-                        .size(px(12.0))
+                        .size(px(SIDEBAR_GROUP_CHEVRON_SIZE))
                         .text_color(cx.theme().sidebar_foreground.opacity(0.60)),
                     )
                     .child(div().flex_none().child(avatars))
@@ -55540,16 +55729,31 @@ impl VibexWorkbench {
                 )
                 .on_mouse_up_out(
                     MouseButton::Left,
-                    cx.listener(move |this, _, _, cx| {
+                    cx.listener(move |_, _, window, cx| {
                         // Released away from this row: whatever the pointer was
-                        // over handled the drop, so this only runs when it landed
-                        // on nothing — outside every group.
-                        this.finish_sidebar_session_drag(
-                            &release_out_workspace_id,
-                            &release_out_session_id,
-                            None,
-                            cx,
-                        );
+                        // over gets the first chance at the drop.
+                        //
+                        // This listener runs in the capture phase, which GPUI
+                        // dispatches before the row under the pointer sees the
+                        // release in the bubble phase. Resolving the drop here
+                        // would therefore always win: the row the user dropped
+                        // on would find the drag state already taken and drop
+                        // the gesture, which is exactly how a session dragged
+                        // onto a group member bounced back to where it started.
+                        // Deferring to the end of the effect cycle gives the
+                        // target's drop handler the first word; by then a row
+                        // that took the drop has cleared the drag state, and
+                        // this call leaves it alone.
+                        let workspace_id = release_out_workspace_id.clone();
+                        let session_id = release_out_session_id.clone();
+                        cx.defer_in(window, move |this, _, cx| {
+                            this.finish_sidebar_session_drag(
+                                &workspace_id,
+                                &session_id,
+                                None,
+                                cx,
+                            );
+                        });
                     }),
                 )
                 .on_drag(drag_payload, move |drag, cursor_offset, _, cx| {
@@ -59103,6 +59307,74 @@ impl VibexWorkbench {
                 }
             });
         }
+        // The folder control speaks for where the draft will be filed. Its
+        // choices belong to the draft's project, so a project switch reloads
+        // them, and a project without folders simply offers none — which is
+        // what hides the control entirely.
+        let folder_choices = self.new_session_folder_choices();
+        let folder_choice_ids = folder_choices
+            .iter()
+            .map(|choice| choice.folder_id.clone())
+            .collect::<Vec<_>>();
+        // A folder row's new-chat action pre-selects a folder that the project
+        // may already have offered, so the remembered folder is part of what is
+        // synced and not only a side effect of the choice list changing.
+        let active_folder_id = self
+            .new_session_folder_id
+            .clone()
+            .filter(|folder_id| folder_choice_ids.contains(folder_id));
+        let folder_has_choices = !folder_choice_ids.is_empty();
+        if self.new_session_folder_choices != folder_choice_ids
+            || self.new_session_folder_selection != active_folder_id
+        {
+            self.new_session_folder_choices = folder_choice_ids;
+            self.new_session_folder_selection = active_folder_id.clone();
+            self.new_session_folder_select.update(cx, |select, cx| {
+                select.set_items(folder_choices, window, cx);
+                match active_folder_id.as_ref() {
+                    Some(selected) => select.set_selected_value(selected, window, cx),
+                    None => select.set_selected_index(None, window, cx),
+                }
+            });
+        }
+        // The remembered folder can name a folder the draft's project does not
+        // offer — the reader switched projects while a folder row's draft was
+        // open. Filing nowhere is the honest answer, and the control already
+        // shows no selection for it.
+        let folder_control = folder_has_choices.then(|| {
+            div()
+                .flex_none()
+                .max_w(px(208.0))
+                .child(
+                    Select::new(&self.new_session_folder_select)
+                        .id("new-session-folder")
+                        .small()
+                        .h(px(32.0))
+                        .text_xs()
+                        .icon(Icon::default().path("icons/vibex/folder.svg"))
+                        .menu_width(px(282.0))
+                        .menu_max_h(px(240.0))
+                        .placeholder(locale::text(
+                            "Project root",
+                            "项目根目录",
+                            "專案根目錄",
+                        ))
+                        .empty(|_, _| {
+                            div()
+                                .px_2()
+                                .py_3()
+                                .text_xs()
+                                .child(locale::text(
+                                    "No folders",
+                                    "没有文件夹",
+                                    "沒有資料夾",
+                                ))
+                                .into_any_element()
+                        })
+                        .disabled(self.agent_action_pending),
+                )
+                .into_any_element()
+        });
         let base_ref_button = div()
             .flex_none()
             .max_w(px(208.0))
@@ -59512,6 +59784,14 @@ impl VibexWorkbench {
                 .child(div().flex_1())
                 .when_some(transport_switch, |this, transport_switch| {
                     this.child(div().flex_none().child(transport_switch))
+                })
+                // The filing target trails the row, at the lower right of the
+                // prompt box: the reader has already said where the session
+                // runs, and this answers where its row will live. A project
+                // with no folders offers nothing, so the row simply ends at the
+                // transport.
+                .when_some(folder_control, |this, folder_control| {
+                    this.child(div().flex_none().child(folder_control))
                 }),
         );
 
@@ -78846,6 +79126,59 @@ fn delegated_tree_guide_line(
                     .bg(trunk),
             )
         })
+        .into_any_element()
+}
+
+/// The connector a group draws beside each of its member rows.
+///
+/// An expanded group already indents its members, which says "these rows belong
+/// to that group" only by position. The connector says the same thing with the
+/// tree language the rest of the sidebar uses: a trunk down the group's indent
+/// and an elbow turning into the member's Agent logo, exactly the way a
+/// delegated child hangs off its parent.
+///
+/// It is painted over the indent rather than laid out beside the row, so the
+/// member keeps the geometry every other session row has — the same height, the
+/// same logo column and the same hit area. `last` stops the trunk at its own
+/// elbow, so the run ends at the final member instead of continuing into the
+/// rows below the group.
+fn sidebar_group_tree_guide(last: bool, cx: &App) -> AnyElement {
+    let trunk = cx.theme().border.opacity(0.70);
+    // The trunk runs in the indent gutter the group reserves, which is to the
+    // left of the row; the elbow crosses the row's own leading padding to end
+    // on the member's Agent logo. Both are negative because they are painted
+    // over space the row does not own.
+    let trunk_left = SIDEBAR_GROUP_GUIDE_TRUNK_OFFSET;
+    let elbow_end = SIDEBAR_WORKSPACE_SESSION_CARD_OVERHANG;
+    let trunk_height = if last {
+        SIDEBAR_SESSION_ROW_HEIGHT / 2.0
+    } else {
+        SIDEBAR_SESSION_ROW_HEIGHT + SIDEBAR_SESSION_CONTENT_GAP
+    };
+    div()
+        .absolute()
+        .left(px(trunk_left))
+        .top_0()
+        .bottom_0()
+        .w(px(elbow_end - trunk_left))
+        .child(
+            div()
+                .absolute()
+                .left_0()
+                .top_0()
+                .w(px(1.0))
+                .h(px(trunk_height))
+                .bg(trunk),
+        )
+        .child(
+            div()
+                .absolute()
+                .left_0()
+                .top(px(SIDEBAR_SESSION_ROW_HEIGHT / 2.0))
+                .w(px(elbow_end - trunk_left))
+                .h(px(1.0))
+                .bg(trunk),
+        )
         .into_any_element()
 }
 
@@ -107392,7 +107725,11 @@ mod tests {
             )
         );
         assert!(opening.contains("self.open_new_session(Some(target), window, cx);"));
-        assert!(opening.contains("self.new_session_folder_id = Some(folder_id.clone());"));
+        // The folder row answers through the same setter the page's control
+        // uses, so the folder the row picked and the folder the control shows
+        // are one answer rather than two writes that could drift apart.
+        assert!(opening.contains("self.set_new_session_folder(Some(folder_id.clone()), cx);"));
+        assert!(!opening.contains("self.new_session_folder_id = Some(folder_id.clone());"));
         assert!(opening.contains("self.reveal_sidebar_folder(&folder_id);"));
 
         let resolution = source
@@ -122706,6 +123043,138 @@ mod tests {
             .map(|(body, _)| body)
             .expect("sidebar renderer should remain inspectable");
         assert!(sidebar.contains(".on_drop(cx.listener(|this, drag: &SidebarGroupDrag"));
+    }
+
+    /// A session dragged onto a group member has to join that member's group.
+    ///
+    /// The source row's release handler runs in the capture phase, which GPUI
+    /// dispatches before the row under the pointer sees the release in the
+    /// bubble phase. Resolving the drop there always won, so the row the user
+    /// dropped on found the drag state already taken and dropped the gesture —
+    /// the session visibly joined the group while the pointer moved, then
+    /// snapped back when the button came up. The release therefore defers, which
+    /// is what lets the target's own drop handler commit the move first.
+    #[test]
+    fn a_session_released_over_a_group_joins_it_instead_of_bouncing_back() {
+        let source = include_str!("app.rs");
+
+        let row = source
+            .split_once("    fn render_sidebar_session(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_runtime_choice_popover("))
+            .map(|(body, _)| body)
+            .expect("session row renderer should remain inspectable");
+        let release_out = row
+            .split_once(".on_mouse_up_out(")
+            .and_then(|(_, tail)| tail.split_once(".on_drag(drag_payload"))
+            .map(|(body, _)| body)
+            .expect("the release-away handler should remain inspectable");
+        // The away-from-row release must not resolve the drop itself: it hands
+        // the gesture to the target first and only then finishes what nothing
+        // claimed.
+        assert!(release_out.contains("cx.defer_in(window, move |this, _, cx| {"));
+        assert!(release_out.contains("this.finish_sidebar_session_drag("));
+        assert!(!release_out.contains("landed_on: Some("));
+        // The deferred call is what finishes a drop that landed on nothing, so
+        // it must still name the row it came from and no landing row.
+        assert!(release_out.contains("None,"));
+
+        // The group row still owns the drop that commits the join.
+        let group = source
+            .split_once("    fn render_sidebar_group(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn build_sidebar_group_menu("))
+            .map(|(body, _)| body)
+            .expect("group renderer should remain inspectable");
+        assert!(group.contains("this.finish_sidebar_session_drag_into_group("));
+        assert!(group.contains(".on_drop("));
+    }
+
+    /// The new-session page offers the draft's folder, and only when the
+    /// project has one.
+    ///
+    /// The control is the page's only writer of the filing target, so a folder
+    /// row's new-chat action pre-selects through it and the reader can change
+    /// the answer before sending. A project with no folders offers nothing,
+    /// because a control with no choice cannot answer the question it asks.
+    #[test]
+    fn the_new_session_page_offers_the_projects_folders() {
+        let source = include_str!("app.rs");
+
+        let choices = source
+            .split_once("    fn new_session_folder_choices(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// Opens the new-session page on the project or Worktree")
+            })
+            .map(|(body, _)| body)
+            .expect("folder choices should remain inspectable");
+        // The list comes from the draft's project, not from every folder the
+        // organization holds.
+        assert!(choices.contains("folders_for_project(&project_id)"));
+        // A folder scoped to another Worktree would never show the session, so
+        // it is not offered.
+        assert!(choices.contains("folder.workspace_id.is_none() || folder.workspace_id == session_workspace_id"));
+
+        let setter = source
+            .split_once("    fn set_new_session_folder(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// The folders the draft's project offers"))
+            .map(|(body, _)| body)
+            .expect("the folder setter should remain inspectable");
+        // A stale or foreign folder is refused rather than written.
+        assert!(setter.contains(".folder(folder_id)"));
+        assert!(setter.contains("folder.project_id == self.new_session_workspace.project_id"));
+
+        // The page draws the control from the choices, so an empty list hides
+        // it, and the control writes through the same setter the folder row
+        // uses.
+        let page = source
+            .split_once("    fn render_new_session_panel(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn show_turn_preview_rail("))
+            .map(|(body, _)| body)
+            .expect("new-session panel should remain inspectable");
+        assert!(page.contains("self.new_session_folder_choices()"));
+        assert!(page.contains("Select::new(&self.new_session_folder_select)"));
+        assert!(page.contains("let folder_control = folder_has_choices.then(|| {"));
+        assert!(page.contains(".when_some(folder_control, |this, folder_control| {"));
+        assert!(source.contains("this.set_new_session_folder(folder_id.clone(), cx);"));
+        assert!(source.contains("self.set_new_session_folder(Some(folder_id.clone()), cx);"));
+    }
+
+    /// An expanded group draws a tree connector beside each member row.
+    ///
+    /// The indent alone said "these rows belong to that group" only by
+    /// position. The connector says it in the tree language the rest of the
+    /// sidebar already uses, and it is painted over the indent rather than laid
+    /// out beside the row, so a member keeps the geometry of every other
+    /// session row.
+    #[test]
+    fn an_expanded_group_draws_a_tree_connector_beside_its_members() {
+        let source = include_str!("app.rs");
+
+        let navigation = source
+            .split_once("    fn render_group_navigation(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// The slot a session row keeps for its branch toggle")
+            })
+            .map(|(body, _)| body)
+            .expect("group navigation should remain inspectable");
+        assert!(navigation.contains("sidebar_group_tree_guide("));
+        // The guide is an overlay on the row's own block, so the row is not
+        // narrowed or shifted to make room for it.
+        assert!(navigation.contains(".relative()"));
+        assert!(navigation.contains(".child(sidebar_group_tree_guide("));
+        assert!(!navigation.contains(".items_stretch()"));
+
+        let guide = source
+            .split_once("fn sidebar_group_tree_guide(")
+            .and_then(|(_, tail)| tail.split_once("\n/// The tint an unselected session row's title reads in."))
+            .map(|(body, _)| body)
+            .expect("the group connector should remain inspectable");
+        // The trunk stops at the last member's elbow instead of running into the
+        // rows below the group.
+        assert!(guide.contains("let trunk_height = if last {"));
+        assert!(guide.contains("SIDEBAR_SESSION_ROW_HEIGHT / 2.0"));
+        // Both segments share one trunk column and one theme tone.
+        assert!(guide.contains("let trunk = cx.theme().border.opacity(0.70);"));
+        assert!(guide.contains("SIDEBAR_GROUP_GUIDE_TRUNK_OFFSET"));
     }
 
     /// A group paints its member rows from its own order, so a drag that starts
