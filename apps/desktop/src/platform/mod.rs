@@ -489,21 +489,6 @@ fn is_bundled_font_family(family: &str) -> bool {
     )
 }
 
-pub fn default_code_font_family() -> &'static str {
-    #[cfg(target_os = "macos")]
-    {
-        "Menlo"
-    }
-    #[cfg(target_os = "windows")]
-    {
-        "Consolas"
-    }
-    #[cfg(target_os = "linux")]
-    {
-        "monospace"
-    }
-}
-
 pub fn system_font_families(_cx: &App) -> Vec<String> {
     #[cfg(target_os = "linux")]
     let discovered = discover_system_font_families();
@@ -520,7 +505,7 @@ pub fn system_font_families(_cx: &App) -> Vec<String> {
             )
             .chain([
                 "Inter Variable".to_string(),
-                default_code_font_family().to_string(),
+                crate::theme::default_mono_font_family().to_string(),
             ]),
     )
 }

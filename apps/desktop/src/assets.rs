@@ -61,6 +61,13 @@ pub(crate) const LILEX_BOLD_ITALIC: &[u8] = include_bytes!(concat!(
 /// italics — the temporary preview tab — names this family instead of the
 /// configured one.
 pub const BUNDLED_SANS_FAMILY: &str = "IBM Plex Sans";
+/// The bundled code family, loaded on every platform.
+///
+/// This is the face the generic `monospace` alias resolves to, and the family
+/// Linux names as its default code font: the Linux font database is bounded
+/// (see `platform::bounded_text`), so the platform default a font stack would
+/// name — `DejaVu Sans Mono` — is not in it.
+pub const BUNDLED_CODE_FAMILY: &str = "Lilex";
 /// The bundled CJK family.
 ///
 /// Shared with the image editor, which parses it with its own font database:

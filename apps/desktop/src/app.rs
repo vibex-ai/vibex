@@ -4158,7 +4158,7 @@ fn git_activity_badge(count: u32, cx: &Context<VibexWorkbench>) -> AnyElement {
         .rounded_full()
         .bg(cx.theme().success.opacity(0.10))
         .text_color(cx.theme().success)
-        .font_family("monospace")
+        .font_family(cx.theme().mono_font_family.clone())
         .text_xs()
         .font_semibold()
         .child(count.to_string())
@@ -11869,7 +11869,7 @@ impl VibexWorkbench {
             .code_font
             .family
             .clone()
-            .unwrap_or_else(|| crate::platform::default_code_font_family().to_string());
+            .unwrap_or_else(|| crate::theme::default_mono_font_family().to_string());
         let code_font_size = ui_state.appearance.code_font.size;
         let code_workbench = cx.new(|cx| {
             let mut workbench = CodeWorkbench::new(
@@ -14400,7 +14400,7 @@ impl VibexWorkbench {
             .code_font
             .family
             .clone()
-            .unwrap_or_else(|| crate::platform::default_code_font_family().to_string());
+            .unwrap_or_else(|| crate::theme::default_mono_font_family().to_string());
         let code_font_size = state.appearance.code_font.size;
         let selected_font_families = [
             state.appearance.interface_font.family.as_deref(),
@@ -46185,7 +46185,7 @@ impl VibexWorkbench {
             .code_font
             .family
             .clone()
-            .unwrap_or_else(|| crate::platform::default_code_font_family().to_string());
+            .unwrap_or_else(|| crate::theme::default_mono_font_family().to_string());
         let code_size = self.ui_state.appearance.code_font.size;
         self.code_workbench.update(cx, |workbench, cx| {
             workbench.set_code_font(code_family, code_size, cx)
@@ -46247,7 +46247,7 @@ impl VibexWorkbench {
             .code_font
             .family
             .clone()
-            .unwrap_or_else(|| crate::platform::default_code_font_family().to_string());
+            .unwrap_or_else(|| crate::theme::default_mono_font_family().to_string());
         let code_size = self.ui_state.appearance.code_font.size;
         self.code_workbench.update(cx, |workbench, cx| {
             workbench.set_code_font(code_family, code_size, cx)
@@ -47577,7 +47577,7 @@ impl VibexWorkbench {
             .code_font
             .family
             .clone()
-            .unwrap_or_else(|| crate::platform::default_code_font_family().to_string());
+            .unwrap_or_else(|| crate::theme::default_mono_font_family().to_string());
         let code_font_size = snapshot.appearance.code_font.size;
         let preview = snapshot.preview.layout.clone();
         let parked_previews = snapshot.preview.layout_scopes.clone();
@@ -58399,7 +58399,7 @@ impl VibexWorkbench {
             .code_font
             .family
             .clone()
-            .unwrap_or_else(|| crate::platform::default_code_font_family().to_string());
+            .unwrap_or_else(|| crate::theme::default_mono_font_family().to_string());
         let runtime_controls_cascade = self.render_new_session_runtime_cascade(
             selection.clone(),
             self.runtime_catalog.clone(),
@@ -90218,7 +90218,7 @@ impl FoundationSettings {
                             div()
                                 .w_full()
                                 .text_xs()
-                                .font_family("monospace")
+                                .font_family(cx.theme().mono_font_family.clone())
                                 .whitespace_normal()
                                 .child(command.command.clone()),
                         ),

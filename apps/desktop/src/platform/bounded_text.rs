@@ -33,11 +33,19 @@ use smallvec::SmallVec;
 
 /// The family GPUI falls back to when a requested family is unavailable.
 const SYSTEM_FONT_FALLBACK: &str = "IBM Plex Sans";
-/// What the UI means by `monospace`.
-const BUNDLED_CODE_FAMILY: &str = "Lilex";
+/// What the UI means by `monospace`. Shared with the theme's default code font
+/// so the two cannot drift: a default the database cannot answer is a default
+/// GPUI has to substitute.
+const BUNDLED_CODE_FAMILY: &str = crate::assets::BUNDLED_CODE_FAMILY;
 /// System families the UI relies on that are not bundled: emoji and the
 /// symbol/fallback coverage DejaVu provides.
 const REQUIRED_SYSTEM_FONT_FAMILIES: &[&str] = &["Noto Color Emoji", "DejaVu Sans"];
+
+/// The bundled monospace family, for callers outside this module that have to
+/// agree with the `monospace` alias this wrapper resolves.
+pub fn bundled_code_family() -> &'static str {
+    BUNDLED_CODE_FAMILY
+}
 
 /// Wraps the platform's text system so the font database stays bounded and the
 /// generic family names resolve to bundled families.
