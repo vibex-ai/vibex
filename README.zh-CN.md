@@ -8,7 +8,7 @@
   <img src="https://img.shields.io/badge/Rust-1.99.1-black?style=flat&logo=rust&logoColor=white" alt="Rust 1.99.1" />
   <img src="https://img.shields.io/badge/UI-GPUI-2563eb?style=flat" alt="GPUI" />
   <img src="https://img.shields.io/badge/platforms-macOS%20%7C%20Windows%20%7C%20Linux%20%7C%20iOS%20%7C%20Android-4493F8?style=flat" alt="支持平台: macOS、Windows、Linux、iOS 和 Android" />
-  <img src="https://img.shields.io/badge/status-0.1.0--rc.10-f97316?style=flat" alt="发布状态: 0.1.0-rc.10" />
+  <img src="https://img.shields.io/badge/status-0.1.0-22c55e?style=flat" alt="发布状态: 0.1.0" />
 </p>
 
 <p align="center">
