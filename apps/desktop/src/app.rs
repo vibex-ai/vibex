@@ -38,13 +38,13 @@ use gpui::{
     EntityInputHandler, ExternalPaths, FocusHandle, Focusable as _, FontWeight, Global,
     GlobalElementId, HighlightStyle, Hsla, Image, ImageFormat, InspectorElementId, IntoElement,
     KeyBinding, KeyDownEvent, Keystroke, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent,
-    ObjectFit, Orientation, ParentElement as _, Pixels, Point, Render, Rgba, Role, ScrollAnchor,
-    ScrollDelta, ScrollEvent, ScrollHandle, ScrollStrategy, SharedString, Size, Stateful,
-    StatefulInteractiveElement as _, StyleRefinement, Styled as _, StyledImage as _, StyledText,
-    Subscription, SystemNotification, Task, TitlebarOptions, Unbind, WeakEntity, Window,
-    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowControls, WindowDecorations,
-    WindowId, WindowKind, WindowOptions, div, img, linear_color_stop, linear_gradient, point,
-    prelude::*, px, relative, rgb, size,
+    ObjectFit, Orientation, ParentElement as _, Pixels, Point, Render, RenderImage, Rgba, Role,
+    ScrollAnchor, ScrollDelta, ScrollEvent, ScrollHandle, ScrollStrategy, SharedString, Size,
+    Stateful, StatefulInteractiveElement as _, StyleRefinement, Styled as _, StyledImage as _,
+    StyledText, Subscription, SystemNotification, Task, TitlebarOptions, Unbind, WeakEntity,
+    Window, WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowControls,
+    WindowDecorations, WindowId, WindowKind, WindowOptions, div, img, linear_color_stop,
+    linear_gradient, point, prelude::*, px, relative, rgb, size,
 };
 use gpui_base::text::MarkdownExtensions;
 use gpui_component::{
@@ -2239,8 +2239,6 @@ struct ComposerGeometry {
 struct AttachmentImagePreviewState {
     attachment: ComposerAttachment,
     image_source: Arc<std::path::Path>,
-    confirmed_image: Option<Arc<Image>>,
-    edited_image: Option<Arc<Image>>,
     edit_buffer: Option<Arc<image::RgbaImage>>,
     edit_session: Option<Arc<ImageEditSession>>,
     intrinsic_size: Option<(u32, u32)>,
@@ -2253,6 +2251,76 @@ struct AttachmentImagePreviewState {
     tool: ImageEditTool,
     edit_drag: Option<AttachmentImageEditDragState>,
     edit_drag_base: Option<Arc<image::RgbaImage>>,
+    /// The working image as the GPU can draw it, rebuilt at most once per
+    /// frame.
+    ///
+    /// A gesture used to re-encode the whole picture as a PNG and let the
+    /// `img()` element decode it again — per pointer sample, on the UI thread.
+    /// That is both the freeze on a large screenshot and the reason the picture
+    /// vanished while drawing: every sample introduced a *new* image id whose
+    /// pixels were decoded asynchronously, so the element had nothing to paint
+    /// in between. The pixels are now uploaded directly, and only when the
+    /// frame being drawn actually differs from the last one.
+    rendered: Option<PreviewRenderedImage>,
+    /// Textures that may be released on the next paint. A [`RenderImage`] mints
+    /// a new sprite-atlas id, and nothing else evicts the old one, so the
+    /// editor would otherwise grow the atlas by one full picture per frame.
+    /// They are released at the *start* of the next frame, once the frame that
+    /// drew them has been presented.
+    pending_texture_drop: Vec<Arc<RenderImage>>,
+}
+
+/// The working image, ready for `img()`.
+#[derive(Clone, Debug)]
+struct PreviewRenderedImage {
+    render: Arc<RenderImage>,
+    /// The session revision the pixels were copied from, so a frame that did
+    /// not change the picture does not rebuild or re-upload it.
+    revision: u64,
+}
+
+impl AttachmentImagePreviewState {
+    /// Replace the uploaded image, retiring the previous texture.
+    fn replace_rendered(&mut self, render: Arc<RenderImage>, revision: u64) {
+        if let Some(previous) = self
+            .rendered
+            .replace(PreviewRenderedImage { render, revision })
+        {
+            self.pending_texture_drop.push(previous.render);
+        }
+    }
+
+    /// Forget the uploaded image, keeping the pixels it came from. The next
+    /// paint falls back to the file on disk.
+    fn clear_rendered(&mut self) {
+        if let Some(rendered) = self.rendered.take() {
+            self.pending_texture_drop.push(rendered.render);
+        }
+    }
+
+    /// Hand the textures the editor is done with to the workbench, which owns
+    /// the `Window` needed to release them.
+    fn take_pending_textures(&mut self) -> Vec<Arc<RenderImage>> {
+        std::mem::take(&mut self.pending_texture_drop)
+    }
+}
+
+/// Copy an RGBA working image into the BGRA layout GPUI uploads.
+///
+/// `RenderImage` is BGRA while the `image` crate produces RGBA, so the red and
+/// blue channels swap on the way in. This replaces the PNG encode/decode pair
+/// that used to sit on the pointer-move path.
+fn preview_render_image(image: &image::RgbaImage) -> Arc<RenderImage> {
+    let (width, height) = image.dimensions();
+    let mut bgra = image.as_raw().clone();
+    for pixel in bgra.as_chunks_mut::<4>().0 {
+        pixel.swap(0, 2);
+    }
+    let frame = image::Frame::new(
+        image::RgbaImage::from_raw(width, height, bgra)
+            .unwrap_or_else(|| image::RgbaImage::new(width, height)),
+    );
+    Arc::new(RenderImage::new(vec![frame]))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -5621,6 +5689,9 @@ pub struct SessionView {
     composer_plan_expanded: Option<ComposerPlanIdentity>,
     dismissed_composer_plans: BTreeSet<ComposerPlanIdentity>,
     attachment_image_preview: Option<AttachmentImagePreviewState>,
+    /// Working-image textures whose replacement frame has been presented, kept
+    /// here when the preview closes so the atlas entry can still be released.
+    preview_texture_graveyard: Vec<Arc<RenderImage>>,
     composer_queue_editing_id: Option<u64>,
     composer_queue_edit_attachments: Vec<InlineComposerAttachment>,
     composer_queue_edit_geometry: ComposerGeometry,
@@ -5765,6 +5836,7 @@ impl SessionView {
             composer_plan_expanded: None,
             dismissed_composer_plans: BTreeSet::new(),
             attachment_image_preview: None,
+            preview_texture_graveyard: Vec::new(),
             composer_queue_editing_id: None,
             composer_queue_edit_attachments: Vec::new(),
             composer_queue_edit_geometry: ComposerGeometry::default(),
@@ -35255,19 +35327,25 @@ impl VibexWorkbench {
             })
             .flatten();
         let can_edit = editable && edit_buffer.is_some();
-        let confirmed_image = edit_buffer.as_ref().and_then(|buffer| {
-            encode_editor_image(buffer)
-                .ok()
-                .map(|bytes| Arc::new(Image::from_bytes(ImageFormat::Png, bytes)))
-        });
+        // The preview draws the file it already has, so opening it does not
+        // encode a PNG nobody asked for. Only the editor needs the decoded
+        // working pixels.
         let intrinsic_size = image::image_dimensions(&path).ok();
+        // Opening another picture replaces whatever preview was on screen; its
+        // working texture still holds a sprite-atlas entry that only a window
+        // can release, so it is parked for the next frame instead of dropped.
+        if let Some(mut previous) = self.attachment_image_preview.take() {
+            self.preview_texture_graveyard
+                .append(&mut previous.take_pending_textures());
+            if let Some(rendered) = previous.rendered.take() {
+                self.preview_texture_graveyard.push(rendered.render);
+            }
+        }
         self.attachment_image_preview = Some(AttachmentImagePreviewState {
             attachment,
             image_source: Arc::<std::path::Path>::from(
                 std::path::PathBuf::from(path).into_boxed_path(),
             ),
-            confirmed_image,
-            edited_image: None,
             edit_buffer,
             edit_session: None,
             intrinsic_size,
@@ -35280,6 +35358,8 @@ impl VibexWorkbench {
             tool: ImageEditTool::Brush,
             edit_drag: None,
             edit_drag_base: None,
+            rendered: None,
+            pending_texture_drop: Vec::new(),
         });
         self.composer_runtime_menu_open = false;
         cx.notify();
@@ -35395,11 +35475,11 @@ impl VibexWorkbench {
             if !changed {
                 if let Some(preview) = self.attachment_image_preview.as_mut() {
                     preview.edit_session = None;
-                    preview.edited_image = preview.confirmed_image.clone();
                     preview.editing = false;
                     preview.edit_drag = None;
                     preview.edit_drag_base = None;
                     preview.drag = None;
+                    preview.clear_rendered();
                 }
                 cx.notify();
                 return;
@@ -35415,10 +35495,10 @@ impl VibexWorkbench {
             if let Some(preview) = self.attachment_image_preview.as_mut() {
                 preview.edit_session = Some(Arc::new(ImageEditSession::new(buffer)));
                 preview.editing = true;
-                preview.edited_image = preview.confirmed_image.clone();
                 preview.edit_drag = None;
                 preview.edit_drag_base = None;
                 preview.drag = None;
+                preview.clear_rendered();
             }
         }
         cx.notify();
@@ -35434,7 +35514,6 @@ impl VibexWorkbench {
             return;
         }
         preview.edit_session = None;
-        preview.edited_image = preview.confirmed_image.clone();
         preview.intrinsic_size = preview
             .edit_buffer
             .as_deref()
@@ -35443,6 +35522,7 @@ impl VibexWorkbench {
         preview.edit_drag = None;
         preview.edit_drag_base = None;
         preview.drag = None;
+        preview.clear_rendered();
         let layout = attachment_image_preview_layout(
             preview.intrinsic_size,
             preview.zoom,
@@ -35453,43 +35533,47 @@ impl VibexWorkbench {
         cx.notify();
     }
 
-    fn update_attachment_editor_render(&mut self, cx: &mut Context<Self>) {
-        let Some(buffer) = self.attachment_image_preview.as_ref().and_then(|preview| {
-            preview
-                .edit_session
-                .as_ref()
-                .map(|session| session.current_clone())
-        }) else {
-            return;
-        };
-        let Ok(bytes) = encode_editor_image(&buffer) else {
-            self.agent_error = Some(
-                locale::text(
-                    "Edited image could not be encoded",
-                    "编辑后的图片无法编码",
-                    "編輯後的圖片無法編碼",
-                )
-                .to_string(),
-            );
-            cx.notify();
-            return;
-        };
-        let image = Arc::new(Image::from_bytes(ImageFormat::Png, bytes));
-        let dimensions = buffer.dimensions();
+    /// Bring the uploaded working image up to date with the session.
+    ///
+    /// This runs once per frame from the preview's own render, not once per
+    /// pointer sample: a mouse can report several moves inside one frame, and
+    /// each rebuild is a full-size BGRA copy plus a full texture upload.
+    ///
+    /// The editor used to go through an encode/decode pair instead — PNG out,
+    /// async decode back — on every sample, on the UI thread. That is the
+    /// freeze the reader sees while drawing on a large screenshot, and it is
+    /// also why the picture disappeared under the cursor: each sample handed
+    /// the element a *new* image id whose pixels were decoded asynchronously,
+    /// so for the frames in between the `img()` element had nothing to paint.
+    /// A [`RenderImage`] is uploaded synchronously by the next paint, so the
+    /// element always has the pixels for the frame being drawn.
+    fn sync_attachment_editor_texture(&mut self) {
         let viewport_width = self.last_visibility.layout.viewport_width as f32;
         let viewport_height = self.last_visibility.layout.viewport_height as f32;
-        if let Some(preview) = self.attachment_image_preview.as_mut() {
-            preview.edited_image = Some(image);
-            preview.intrinsic_size = Some(dimensions);
-            let layout = attachment_image_preview_layout(
-                preview.intrinsic_size,
-                preview.zoom,
-                viewport_width,
-                viewport_height,
-            );
-            (preview.pan_x, preview.pan_y) = layout.clamp_pan(preview.pan_x, preview.pan_y);
+        let Some(preview) = self.attachment_image_preview.as_mut() else {
+            return;
+        };
+        let Some(session) = preview.edit_session.as_ref() else {
+            return;
+        };
+        let revision = session.revision();
+        if preview
+            .rendered
+            .as_ref()
+            .is_some_and(|rendered| rendered.revision == revision)
+        {
+            return;
         }
-        cx.notify();
+        let (width, height) = session.current().dimensions();
+        preview.replace_rendered(preview_render_image(session.current()), revision);
+        preview.intrinsic_size = Some((width, height));
+        let layout = attachment_image_preview_layout(
+            preview.intrinsic_size,
+            preview.zoom,
+            viewport_width,
+            viewport_height,
+        );
+        (preview.pan_x, preview.pan_y) = layout.clamp_pan(preview.pan_x, preview.pan_y);
     }
 
     fn undo_attachment_edit(&mut self, cx: &mut Context<Self>) {
@@ -35507,7 +35591,9 @@ impl VibexWorkbench {
             })
             .unwrap_or(false);
         if changed {
-            self.update_attachment_editor_render(cx);
+            // The picture changed, so ask for a frame; the preview rebuilds the
+            // texture at the start of it.
+            cx.notify();
         }
     }
 
@@ -35526,7 +35612,7 @@ impl VibexWorkbench {
             })
             .unwrap_or(false);
         if changed {
-            self.update_attachment_editor_render(cx);
+            cx.notify();
         }
     }
 
@@ -35576,41 +35662,9 @@ impl VibexWorkbench {
         if preview.editable && preview.editing {
             preview.tool = tool;
             preview.edit_drag = None;
+            preview.edit_drag_base = None;
             cx.notify();
         }
-    }
-
-    fn attachment_preview_point(
-        &self,
-        preview: &AttachmentImagePreviewState,
-        pointer_x: f32,
-        pointer_y: f32,
-    ) -> Option<(u32, u32)> {
-        let (source_width, source_height) = preview.intrinsic_size?;
-        let layout = attachment_image_preview_layout(
-            preview.intrinsic_size,
-            preview.zoom,
-            self.last_visibility.layout.viewport_width as f32,
-            self.last_visibility.layout.viewport_height as f32,
-        );
-        if layout.image_width <= 0.0 || layout.image_height <= 0.0 {
-            return None;
-        }
-        // The centered image lives inside the padded viewport child. Pointer
-        // events are reported in overlay coordinates, so include that inset
-        // before converting back to source pixels.
-        let origin_x = IMAGE_PREVIEW_HORIZONTAL_PADDING
-            + (layout.viewport_width - layout.image_width) / 2.0
-            + preview.pan_x;
-        let origin_y = IMAGE_PREVIEW_VERTICAL_PADDING
-            + (layout.viewport_height - layout.image_height) / 2.0
-            + preview.pan_y;
-        let x = ((pointer_x - origin_x) / layout.image_width * source_width as f32).round();
-        let y = ((pointer_y - origin_y) / layout.image_height * source_height as f32).round();
-        if x < 0.0 || y < 0.0 || x >= source_width as f32 || y >= source_height as f32 {
-            return None;
-        }
-        Some((x as u32, y as u32))
     }
 
     fn persist_attachment_editor_buffer(&self, bytes: &[u8]) -> std::io::Result<PathBuf> {
@@ -35663,7 +35717,6 @@ impl VibexWorkbench {
             cx.notify();
             return false;
         };
-        let image = Arc::new(Image::from_bytes(ImageFormat::Png, bytes));
         let dimensions = buffer.dimensions();
         let viewport_width = self.last_visibility.layout.viewport_width as f32;
         let viewport_height = self.last_visibility.layout.viewport_height as f32;
@@ -35678,8 +35731,6 @@ impl VibexWorkbench {
             preview.attachment.path = Some(path.to_string_lossy().into_owned());
             preview.attachment.mime_type = Some("image/png".to_string());
             preview.image_source = Arc::<Path>::from(path.clone().into_boxed_path());
-            preview.confirmed_image = Some(image.clone());
-            preview.edited_image = Some(image);
             preview.edit_buffer = Some(Arc::new(buffer));
             preview.edit_session = None;
             preview.intrinsic_size = Some(dimensions);
@@ -35687,6 +35738,10 @@ impl VibexWorkbench {
             preview.edit_drag = None;
             preview.edit_drag_base = None;
             preview.drag = None;
+            // The working texture already holds exactly the committed pixels,
+            // so it stays on screen until the file-backed preview replaces it.
+            // Clearing it here would blink the picture while GPUI reads and
+            // decodes the PNG that was just written.
             let layout = attachment_image_preview_layout(
                 preview.intrinsic_size,
                 preview.zoom,
@@ -35723,50 +35778,67 @@ impl VibexWorkbench {
         pointer_y: f32,
         cx: &mut Context<Self>,
     ) {
-        let Some(snapshot) = self.attachment_image_preview.clone() else {
+        let viewport_width = self.last_visibility.layout.viewport_width as f32;
+        let viewport_height = self.last_visibility.layout.viewport_height as f32;
+        // The text tool is applied once on press; it never takes part in the
+        // drag. Reading the caption before touching the preview keeps the two
+        // borrows separate.
+        let caption = {
+            let input = self.image_editor_text_input.read(cx);
+            let text = input.value().trim().to_string();
+            (!text.is_empty()).then_some(text)
+        };
+        let Some(preview) = self.attachment_image_preview.as_mut() else {
             return;
         };
-        if !snapshot.editable || !snapshot.editing {
+        if !preview.editable || !preview.editing {
             return;
         }
-        let Some(point) = self.attachment_preview_point(&snapshot, pointer_x, pointer_y) else {
+        let Some(point) = attachment_preview_point(
+            preview,
+            viewport_width,
+            viewport_height,
+            pointer_x,
+            pointer_y,
+        ) else {
             return;
         };
-        if snapshot.tool == ImageEditTool::Text {
-            let text = self.image_editor_text_input.read(cx).value().to_string();
-            if text.trim().is_empty() {
-                return;
-            }
-            let Some(session) = snapshot.edit_session else {
+        if preview.tool == ImageEditTool::Text {
+            let Some(text) = caption else {
                 return;
             };
+            let Some(session) = preview.edit_session.as_mut() else {
+                return;
+            };
+            let session = Arc::make_mut(session);
             let mut buffer = session.current_clone();
             apply_text(&mut buffer, point, &text);
-            if let Some(preview) = self.attachment_image_preview.as_mut() {
-                Arc::make_mut(
-                    preview
-                        .edit_session
-                        .get_or_insert_with(|| Arc::new(ImageEditSession::new(buffer.clone()))),
-                )
-                .commit(buffer);
+            if session.commit(buffer) {
+                cx.notify();
             }
-            self.update_attachment_editor_render(cx);
             return;
         }
-        if let Some(preview) = self.attachment_image_preview.as_mut() {
-            preview.edit_drag = Some(AttachmentImageEditDragState {
-                start_x: point.0,
-                start_y: point.1,
-                current_x: point.0,
-                current_y: point.1,
-            });
-            preview.edit_drag_base = preview
-                .edit_session
-                .as_ref()
-                .map(|session| Arc::new(session.current_clone()));
-            preview.drag = None;
-            cx.notify();
-        }
+        preview.edit_drag = Some(AttachmentImageEditDragState {
+            start_x: point.0,
+            start_y: point.1,
+            current_x: point.0,
+            current_y: point.1,
+        });
+        // Crop re-reads the pixels when the pointer is released, so it needs no
+        // baseline. Every other tool does: a shape is redrawn over the picture
+        // the gesture started from, and a stroke is committed against it. The
+        // snapshot is one copy per gesture — the per-move copies that used to
+        // happen along with it are gone.
+        preview.edit_drag_base = (preview.tool != ImageEditTool::Crop)
+            .then(|| {
+                preview
+                    .edit_session
+                    .as_ref()
+                    .map(|session| Arc::new(session.current_clone()))
+            })
+            .flatten();
+        preview.drag = None;
+        cx.notify();
     }
 
     fn update_attachment_edit_gesture(
@@ -35775,112 +35847,139 @@ impl VibexWorkbench {
         pointer_y: f32,
         cx: &mut Context<Self>,
     ) {
-        let Some(snapshot) = self.attachment_image_preview.clone() else {
+        let viewport_width = self.last_visibility.layout.viewport_width as f32;
+        let viewport_height = self.last_visibility.layout.viewport_height as f32;
+        let Some(preview) = self.attachment_image_preview.as_mut() else {
             return;
         };
-        let Some(mut point) = self.attachment_preview_point(&snapshot, pointer_x, pointer_y) else {
+        let Some(gesture) = preview.edit_drag else {
             return;
         };
-        let Some(gesture) = snapshot.edit_drag else {
+        let Some(mut point) = attachment_preview_point(
+            preview,
+            viewport_width,
+            viewport_height,
+            pointer_x,
+            pointer_y,
+        ) else {
             return;
         };
-        point.0 = point.0.min(
-            snapshot
-                .intrinsic_size
-                .map_or(point.0, |size| size.0.saturating_sub(1)),
-        );
-        point.1 = point.1.min(
-            snapshot
-                .intrinsic_size
-                .map_or(point.1, |size| size.1.saturating_sub(1)),
-        );
-        if let Some(preview) = self.attachment_image_preview.as_mut() {
-            preview.edit_drag = Some(AttachmentImageEditDragState {
-                current_x: point.0,
-                current_y: point.1,
-                ..gesture
-            });
+        if let Some(size) = preview.intrinsic_size {
+            point.0 = point.0.min(size.0.saturating_sub(1));
+            point.1 = point.1.min(size.1.saturating_sub(1));
         }
-        let Some(base) = snapshot.edit_drag_base else {
+        if point == (gesture.current_x, gesture.current_y) {
+            return;
+        }
+        preview.edit_drag = Some(AttachmentImageEditDragState {
+            current_x: point.0,
+            current_y: point.1,
+            ..gesture
+        });
+        let tool = preview.tool;
+        // Borrow the baseline before taking the session, so the two fields stay
+        // independent.
+        let base = preview.edit_drag_base.clone();
+        let Some(session) = preview.edit_session.as_mut() else {
             return;
         };
-        let Some(session) = snapshot.edit_session else {
-            return;
-        };
-        let mut buffer = if matches!(snapshot.tool, ImageEditTool::Brush | ImageEditTool::Mosaic) {
-            session.current_clone()
-        } else {
-            base.as_ref().clone()
-        };
-        match snapshot.tool {
-            ImageEditTool::Brush => {
-                apply_brush(&mut buffer, (gesture.current_x, gesture.current_y), point)
+        let session = Arc::make_mut(session);
+        match tool {
+            // A stroke only grows: every sample extends the last one in place.
+            // Copying the whole picture here is what made a slow drag on a 4K
+            // screenshot feel like a freeze.
+            ImageEditTool::Brush => session.preview_in_place(|image| {
+                apply_brush(image, (gesture.current_x, gesture.current_y), point)
+            }),
+            ImageEditTool::Mosaic => session.preview_in_place(|image| {
+                apply_mosaic(image, (gesture.current_x, gesture.current_y), point)
+            }),
+            // A shape follows the pointer as a whole, so it is redrawn over the
+            // picture the gesture started from.
+            ImageEditTool::Rectangle | ImageEditTool::Circle | ImageEditTool::Arrow => {
+                let Some(base) = base else {
+                    return;
+                };
+                session.preview_over(&base, |image| match tool {
+                    ImageEditTool::Rectangle => {
+                        apply_rectangle(image, (gesture.start_x, gesture.start_y), point)
+                    }
+                    ImageEditTool::Circle => {
+                        apply_circle(image, (gesture.start_x, gesture.start_y), point)
+                    }
+                    _ => apply_arrow(image, (gesture.start_x, gesture.start_y), point),
+                });
             }
-            ImageEditTool::Mosaic => {
-                apply_mosaic(&mut buffer, (gesture.current_x, gesture.current_y), point)
-            }
-            ImageEditTool::Rectangle => {
-                apply_rectangle(&mut buffer, (gesture.start_x, gesture.start_y), point)
-            }
-            ImageEditTool::Circle => {
-                apply_circle(&mut buffer, (gesture.start_x, gesture.start_y), point)
-            }
-            ImageEditTool::Arrow => {
-                apply_arrow(&mut buffer, (gesture.start_x, gesture.start_y), point)
-            }
-            ImageEditTool::Crop | ImageEditTool::Text => {}
+            ImageEditTool::Crop | ImageEditTool::Text => return,
         }
-        if let Some(preview) = self.attachment_image_preview.as_mut()
-            && let Some(session) = preview.edit_session.as_mut()
-        {
-            Arc::make_mut(session).preview(buffer);
-        }
-        self.update_attachment_editor_render(cx);
+        cx.notify();
     }
 
     fn finish_attachment_edit_gesture(&mut self, cx: &mut Context<Self>) {
-        let Some(snapshot) = self.attachment_image_preview.clone() else {
+        let Some(preview) = self.attachment_image_preview.as_mut() else {
             return;
         };
-        let Some(gesture) = snapshot.edit_drag else {
+        let Some(gesture) = preview.edit_drag else {
             return;
         };
-        let Some(base) = snapshot.edit_drag_base else {
+        let base = preview.edit_drag_base.take();
+        preview.edit_drag = None;
+        let tool = preview.tool;
+        let Some(session) = preview.edit_session.as_mut() else {
             return;
         };
-        let Some(session) = snapshot.edit_session else {
-            return;
-        };
-        let mut committed = false;
-        if snapshot.tool == ImageEditTool::Crop {
+        let session = Arc::make_mut(session);
+        if tool == ImageEditTool::Crop {
             if let Some(cropped) = apply_crop(
                 session.current(),
                 (gesture.start_x, gesture.start_y),
                 (gesture.current_x, gesture.current_y),
-            ) && let Some(preview) = self.attachment_image_preview.as_mut()
-                && let Some(session) = preview.edit_session.as_mut()
-            {
-                committed = Arc::make_mut(session).commit(cropped);
+            ) {
+                session.commit(cropped);
             }
-        } else if let Some(preview) = self.attachment_image_preview.as_mut()
-            && let Some(session) = preview.edit_session.as_mut()
-        {
-            let _ = base;
-            committed = Arc::make_mut(session).commit_gesture(base.as_ref().clone());
+        } else if let Some(base) = base {
+            // The pixels are already what the gesture drew, so this only records
+            // the history step; no new texture is needed. Moving the snapshot
+            // into history (rather than cloning it) keeps a gesture from paying
+            // for a second full-size copy on release.
+            let base = Arc::try_unwrap(base).unwrap_or_else(|base| (*base).clone());
+            session.commit_gesture(base);
+        }
+        cx.notify();
+    }
+
+    /// Release the working textures the editor replaced on the last frame.
+    ///
+    /// The editor hands over its retired `RenderImage`s instead of dropping
+    /// them, because a sprite-atlas tile can only be removed with a
+    /// `&mut Window` — and it must not be removed while the frame on screen is
+    /// still drawing it. They are queued when replaced and released at the
+    /// start of the next frame, so the atlas holds at most one working texture
+    /// per editor.
+    fn release_preview_textures(&mut self, window: &mut Window) {
+        for image in std::mem::take(&mut self.preview_texture_graveyard) {
+            let _ = window.drop_image(image);
         }
         if let Some(preview) = self.attachment_image_preview.as_mut() {
-            preview.edit_drag = None;
-            preview.edit_drag_base = None;
-        }
-        if committed {
-            self.update_attachment_editor_render(cx);
-        } else {
-            cx.notify();
+            for image in preview.take_pending_textures() {
+                let _ = window.drop_image(image);
+            }
         }
     }
 
     fn close_attachment_preview(&mut self, cx: &mut Context<Self>) {
-        self.attachment_image_preview = None;
+        // Closing the overlay leaves no frame that draws the working texture, so
+        // it can be released right away; the `Window` is requested on the next
+        // frame because this handler does not own one.
+        if let Some(mut preview) = self.attachment_image_preview.take() {
+            self.preview_texture_graveyard
+                .append(&mut preview.take_pending_textures());
+            if let Some(rendered) = preview.rendered.take() {
+                self.preview_texture_graveyard.push(rendered.render);
+            }
+        }
+        // The next frame's preview render drains the graveyard even while the
+        // overlay is closed, so nothing is left holding an atlas entry.
         cx.notify();
     }
 
@@ -63006,7 +63105,13 @@ impl VibexWorkbench {
             .collect()
     }
 
-    fn render_attachment_image_preview(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    fn render_attachment_image_preview(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        self.release_preview_textures(window);
+        self.sync_attachment_editor_texture();
         let preview = self.attachment_image_preview.clone()?;
         let viewport_width = self.last_visibility.layout.viewport_width as f32;
         let viewport_height = self.last_visibility.layout.viewport_height as f32;
@@ -63028,20 +63133,25 @@ impl VibexWorkbench {
         let copy_mime_type = preview.attachment.mime_type.clone();
         let copy_entity = cx.weak_entity();
         let image_source = preview.image_source;
-        let rendered_image = preview.edited_image;
-        let image_element = rendered_image
-            .map(|image| {
-                img(image)
-                    .size_full()
-                    .object_fit(ObjectFit::Contain)
-                    .into_any_element()
-            })
-            .unwrap_or_else(|| {
-                img(image_source)
-                    .size_full()
-                    .object_fit(ObjectFit::Contain)
-                    .into_any_element()
-            });
+        // While editing, draw the working pixels directly. They are uploaded as
+        // one `RenderImage`, so a pointer sample paints this frame instead of
+        // waiting for an asynchronous PNG decode — which is what used to blink
+        // the picture out from under the cursor. Outside the editor, the source
+        // file stays the element's image.
+        let working_image = preview
+            .rendered
+            .as_ref()
+            .map(|rendered| rendered.render.clone());
+        let image_element = match working_image {
+            Some(image) => img(image)
+                .size_full()
+                .object_fit(ObjectFit::Contain)
+                .into_any_element(),
+            None => img(image_source)
+                .size_full()
+                .object_fit(ObjectFit::Contain)
+                .into_any_element(),
+        };
         let editable = preview.editable;
         let editing = preview.editing;
         let selected_tool = preview.tool;
@@ -80803,6 +80913,47 @@ fn fitted_attachment_preview_size(
     (width * scale, height * scale)
 }
 
+/// Convert an overlay pointer position into a source pixel of the preview.
+///
+/// It is a free function rather than a method because the gesture handlers need
+/// `&mut` access to the preview state while they convert: going through
+/// `&self` would borrow the whole workbench and force the handlers to clone the
+/// state — including the `Arc`s whose extra strong counts turned every
+/// `Arc::make_mut` into a deep copy of the whole undo history.
+fn attachment_preview_point(
+    preview: &AttachmentImagePreviewState,
+    viewport_width: f32,
+    viewport_height: f32,
+    pointer_x: f32,
+    pointer_y: f32,
+) -> Option<(u32, u32)> {
+    let (source_width, source_height) = preview.intrinsic_size?;
+    let layout = attachment_image_preview_layout(
+        preview.intrinsic_size,
+        preview.zoom,
+        viewport_width,
+        viewport_height,
+    );
+    if layout.image_width <= 0.0 || layout.image_height <= 0.0 {
+        return None;
+    }
+    // The centered image lives inside the padded viewport child. Pointer events
+    // are reported in overlay coordinates, so include that inset before
+    // converting back to source pixels.
+    let origin_x = IMAGE_PREVIEW_HORIZONTAL_PADDING
+        + (layout.viewport_width - layout.image_width) / 2.0
+        + preview.pan_x;
+    let origin_y = IMAGE_PREVIEW_VERTICAL_PADDING
+        + (layout.viewport_height - layout.image_height) / 2.0
+        + preview.pan_y;
+    let x = ((pointer_x - origin_x) / layout.image_width * source_width as f32).round();
+    let y = ((pointer_y - origin_y) / layout.image_height * source_height as f32).round();
+    if x < 0.0 || y < 0.0 || x >= source_width as f32 || y >= source_height as f32 {
+        return None;
+    }
+    Some((x as u32, y as u32))
+}
+
 fn attachment_image_preview_layout(
     intrinsic_size: Option<(u32, u32)>,
     zoom: f32,
@@ -95298,7 +95449,7 @@ impl Render for VibexWorkbench {
             .map(|context| context.target);
         let composer_suggestion_overlay =
             suggestion_target.map(|target| self.render_composer_suggestions(target, window, cx));
-        let attachment_image_preview = self.render_attachment_image_preview(cx);
+        let attachment_image_preview = self.render_attachment_image_preview(window, cx);
         let startup_loading = self
             .startup_loading
             .then(|| startup_loading_overlay(self.startup_loading_indicator_visible, cx));
@@ -117443,6 +117594,80 @@ mod tests {
         assert!(editor.contains("redo-attachment-edit"));
         assert!(editor.contains("cancel-attachment-edit"));
         assert!(editor.contains("finish-attachment-edit"));
+    }
+
+    #[test]
+    fn image_editor_paints_working_pixels_without_a_per_sample_png_round_trip() {
+        let source = include_str!("app.rs");
+
+        // The gesture handlers used to hand every pointer sample through
+        // `encode_editor_image` + `Image::from_bytes` and let the `img()`
+        // element decode it asynchronously. That is what froze the window on a
+        // large picture, and what blinked the picture away between decodes:
+        // `img()` had no pixels to paint for the frames in between.
+        for handler in [
+            "    fn begin_attachment_edit_gesture(",
+            "    fn update_attachment_edit_gesture(",
+            "    fn finish_attachment_edit_gesture(",
+        ] {
+            let body = source
+                .split_once(handler)
+                .and_then(|(_, tail)| tail.split_once("\n    fn "))
+                .map(|(body, _)| body)
+                .unwrap_or_else(|| panic!("{handler} should remain inspectable"));
+            assert!(
+                !body.contains("encode_editor_image("),
+                "{handler} must not encode the working image on the pointer path"
+            );
+        }
+
+        // The renderer draws the uploaded working image, and the image is
+        // brought up to date once per frame by the render itself.
+        let editor = source
+            .split_once("    fn render_attachment_image_preview(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_timeline_turn("))
+            .map(|(body, _)| body)
+            .expect("image editor renderer should remain inspectable");
+        assert!(editor.contains("self.release_preview_textures(window)"));
+        assert!(editor.contains("self.sync_attachment_editor_texture()"));
+        assert!(editor.contains(".rendered"));
+        assert!(!editor.contains("edited_image"));
+
+        let sync = source
+            .split_once("    fn sync_attachment_editor_texture(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn "))
+            .map(|(body, _)| body)
+            .expect("working-image sync should remain inspectable");
+        assert!(sync.contains("replace_rendered"));
+        assert!(sync.contains("revision"));
+    }
+
+    #[test]
+    fn working_image_textures_are_released_after_the_frame_that_drew_them() {
+        let source = include_str!("app.rs");
+        // Every replacement mints a new sprite-atlas id; dropping the old tile
+        // before the frame that drew it has been presented erases the picture
+        // under the cursor. The queue is drained at the start of the next
+        // frame's render, and the renderer passes the window through for that.
+        let render = source
+            .split_once("    fn render_attachment_image_preview(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_timeline_turn("))
+            .map(|(body, _)| body)
+            .expect("image editor renderer should remain inspectable");
+        let entry = source
+            .split_once("impl Render for VibexWorkbench")
+            .map(|(_, body)| body)
+            .expect("workbench renderer should remain inspectable");
+        let release = source
+            .split_once("    fn release_preview_textures(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn "))
+            .map(|(body, _)| body)
+            .expect("texture release should remain inspectable");
+        assert!(entry.contains("self.render_attachment_image_preview(window, cx)"));
+        assert!(render.contains("release_preview_textures"));
+        assert!(render.contains(".rendered"));
+        assert!(release.contains("take_pending_textures"));
+        assert!(release.contains("drop_image"));
     }
 
     #[test]

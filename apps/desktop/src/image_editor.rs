@@ -7,6 +7,14 @@ use image::{Rgba, RgbaImage};
 
 const MAX_EDIT_HISTORY: usize = 64;
 
+/// How many bytes of pixel history one session may retain.
+///
+/// A 4K screenshot is ~33 MB per entry, so the entry cap alone would allow more
+/// than two gigabytes of undo snapshots — enough to exhaust a desktop's memory
+/// during a long editing session. The budget keeps several full-size steps of
+/// ordinary screenshots and still bounds the worst case.
+const MAX_EDIT_HISTORY_BYTES: usize = 192 * 1024 * 1024;
+
 /// A bounded, in-memory editing session.
 ///
 /// The session deliberately owns only image buffers. Persistence and attachment
@@ -16,6 +24,14 @@ pub struct ImageEditSession {
     current: RgbaImage,
     undo: Vec<RgbaImage>,
     redo: Vec<RgbaImage>,
+    undo_bytes: usize,
+    redo_bytes: usize,
+    /// Monotonic counter of pixel changes.
+    ///
+    /// The view redraws the working image from this buffer instead of encoding
+    /// it per pointer sample, so it needs a cheap way to tell whether the
+    /// picture it already uploaded is still current.
+    revision: u64,
 }
 
 impl ImageEditSession {
@@ -24,6 +40,9 @@ impl ImageEditSession {
             current: image,
             undo: Vec::new(),
             redo: Vec::new(),
+            undo_bytes: 0,
+            redo_bytes: 0,
+            revision: 0,
         }
     }
 
@@ -35,31 +54,59 @@ impl ImageEditSession {
         self.current.clone()
     }
 
-    /// Replace the visible working image without creating a history entry.
-    /// This is used for transient previews while a pointer gesture is active.
-    pub fn preview(&mut self, image: RgbaImage) {
-        self.current = image;
+    /// The generation of the working pixels. It moves forward on every change
+    /// that alters what the editor should draw.
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// Draw on the working image in place, without a history entry.
+    ///
+    /// A pointer gesture produces one of these per sample, so a tool that only
+    /// extends what is already on screen — a brush stroke, a mosaic strip —
+    /// must not copy the whole picture first.
+    pub fn preview_in_place(&mut self, draw: impl FnOnce(&mut RgbaImage)) {
+        draw(&mut self.current);
+        self.bump_revision();
+    }
+
+    /// Redraw a gesture that always starts from the picture it began with: the
+    /// shapes that follow the pointer as a whole rather than growing.
+    pub fn preview_over(&mut self, base: &RgbaImage, draw: impl FnOnce(&mut RgbaImage)) {
+        if self.current.dimensions() == base.dimensions() {
+            // `ImageBuffer` derefs mutably to its raw channel slice.
+            self.current.copy_from_slice(base.as_raw());
+        } else {
+            self.current = base.clone();
+        }
+        draw(&mut self.current);
+        self.bump_revision();
     }
 
     /// Commit a completed operation as one undoable history entry.
     pub fn commit(&mut self, image: RgbaImage) -> bool {
-        let previous = self.current.clone();
-        if previous == image {
+        if self.current == image {
             return false;
         }
-        self.current = image;
+        let previous = std::mem::replace(&mut self.current, image);
         self.push_undo(previous);
         self.redo.clear();
+        self.redo_bytes = 0;
+        self.bump_revision();
         true
     }
 
     /// Commit a gesture whose transient preview started from `base`.
+    ///
+    /// The pixels are already on screen — the gesture previewed them — so this
+    /// records the history step without asking for another upload.
     pub fn commit_gesture(&mut self, base: RgbaImage) -> bool {
         if base == self.current {
             return false;
         }
         self.push_undo(base);
         self.redo.clear();
+        self.redo_bytes = 0;
         true
     }
 
@@ -75,8 +122,11 @@ impl ImageEditSession {
         let Some(previous) = self.undo.pop() else {
             return false;
         };
+        self.undo_bytes = self.undo_bytes.saturating_sub(image_bytes(&previous));
         let current = std::mem::replace(&mut self.current, previous);
+        self.redo_bytes = self.redo_bytes.saturating_add(image_bytes(&current));
         self.redo.push(current);
+        self.bump_revision();
         true
     }
 
@@ -84,17 +134,34 @@ impl ImageEditSession {
         let Some(next) = self.redo.pop() else {
             return false;
         };
+        self.redo_bytes = self.redo_bytes.saturating_sub(image_bytes(&next));
         let current = std::mem::replace(&mut self.current, next);
         self.push_undo(current);
+        self.bump_revision();
         true
     }
 
-    fn push_undo(&mut self, image: RgbaImage) {
-        if self.undo.len() == MAX_EDIT_HISTORY {
-            self.undo.remove(0);
-        }
-        self.undo.push(image);
+    fn bump_revision(&mut self) {
+        self.revision = self.revision.wrapping_add(1);
     }
+
+    /// Keep the newest snapshot and drop the oldest until both the entry cap
+    /// and the byte budget hold. The step just recorded is never dropped, so
+    /// one undo always remains available.
+    fn push_undo(&mut self, image: RgbaImage) {
+        self.undo_bytes = self.undo_bytes.saturating_add(image_bytes(&image));
+        self.undo.push(image);
+        while self.undo.len() > 1
+            && (self.undo.len() > MAX_EDIT_HISTORY || self.undo_bytes > MAX_EDIT_HISTORY_BYTES)
+        {
+            let dropped = self.undo.remove(0);
+            self.undo_bytes = self.undo_bytes.saturating_sub(image_bytes(&dropped));
+        }
+    }
+}
+
+fn image_bytes(image: &RgbaImage) -> usize {
+    image.as_raw().len()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -610,16 +677,82 @@ mod tests {
     #[test]
     fn edit_session_records_a_live_preview_as_one_gesture() {
         let original = RgbaImage::from_pixel(8, 8, Rgba([0, 0, 0, 255]));
-        let mut preview = original.clone();
-        preview.put_pixel(4, 4, MARK_COLOR);
 
         let mut session = ImageEditSession::new(original.clone());
-        session.preview(preview.clone());
+        session.preview_in_place(|image| image.put_pixel(4, 4, MARK_COLOR));
         assert!(!session.can_undo());
+        assert_eq!(session.current().get_pixel(4, 4), &MARK_COLOR);
         assert!(session.commit_gesture(original.clone()));
-        assert_eq!(session.current(), &preview);
+        assert_eq!(session.current().get_pixel(4, 4), &MARK_COLOR);
 
         assert!(session.undo());
         assert_eq!(session.current(), &original);
+    }
+
+    #[test]
+    fn a_shape_preview_redraws_over_the_gesture_baseline() {
+        let original = RgbaImage::from_pixel(32, 32, Rgba([0, 0, 0, 255]));
+        let mut session = ImageEditSession::new(original.clone());
+
+        session.preview_over(&original, |image| apply_rectangle(image, (2, 2), (8, 8)));
+        let first = session.current().clone();
+        session.preview_over(&original, |image| apply_rectangle(image, (2, 2), (16, 16)));
+
+        // The second frame must not carry the first frame's smaller box.
+        for x in 9..16 {
+            assert_eq!(
+                session.current().get_pixel(x, 2),
+                &MARK_COLOR,
+                "the widened box is drawn at ({x}, 2)"
+            );
+        }
+        assert_ne!(session.current(), &first);
+        assert_eq!(session.current().get_pixel(0, 0), &Rgba([0, 0, 0, 255]));
+    }
+
+    #[test]
+    fn every_pixel_change_moves_the_revision() {
+        let original = RgbaImage::from_pixel(8, 8, Rgba([0, 0, 0, 255]));
+        let mut session = ImageEditSession::new(original.clone());
+        let start = session.revision();
+
+        session.preview_in_place(|image| image.put_pixel(1, 1, MARK_COLOR));
+        let drawn = session.revision();
+        assert_ne!(start, drawn);
+
+        let mut next = session.current_clone();
+        next.put_pixel(2, 2, MARK_COLOR);
+        assert!(session.commit(next));
+        assert_ne!(drawn, session.revision());
+
+        // An operation that changes nothing must not ask for another upload.
+        let unchanged = session.revision();
+        assert!(!session.commit(session.current_clone()));
+        assert_eq!(unchanged, session.revision());
+    }
+
+    #[test]
+    fn edit_history_is_bounded_by_bytes_as_well_as_entries() {
+        // 16x16 pixels is 1 KiB per snapshot; the byte budget admits far fewer
+        // than the entry cap, so the budget is what has to hold.
+        let original = RgbaImage::from_pixel(16, 16, Rgba([0, 0, 0, 255]));
+        let mut session = ImageEditSession::new(original);
+        let steps = MAX_EDIT_HISTORY_BYTES / (16 * 16 * 4) + 8;
+
+        for step in 0..steps {
+            let mut next = session.current_clone();
+            next.put_pixel((step % 16) as u32, 0, MARK_COLOR);
+            session.commit(next);
+        }
+
+        let mut undos = 0;
+        while session.undo() {
+            undos += 1;
+        }
+        assert!(
+            undos < steps,
+            "history should drop old snapshots once it passes the byte budget"
+        );
+        assert!(undos > 0, "the newest step must stay undoable");
     }
 }
