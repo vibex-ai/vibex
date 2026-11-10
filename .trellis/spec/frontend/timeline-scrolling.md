@@ -49,6 +49,22 @@ back, and a closing row flashes a blank band.
 | The child Agent rail takes no part in any of this. | It scrolls by itself, and its rows name turns of another timeline, so they neither release the parent's follow nor open its settle window. |
 | A disclosure landing on the bottom edge resumes the follow (`resume_timeline_follow_after_disclosure`). | The reader never scrolled, so the wheel-idle state machine has nothing to resume from. The distance comes from the row table, because the handle's extent is still the last prepaint's. |
 
+## 3a. Where a Fixed-Size Virtual List Is Wrong
+
+`v_virtual_list` places its rows from the sizes it is handed; it never measures
+them. The timeline can do that because `timeline_row_sizes` is the authority for
+every row's height, including the estimates it starts from.
+
+That is not true of a row whose own content decides its height — an inline
+editor, a settings panel, an expanded trace. The panel's height depends on the
+pane width, the locale, and how its chips and labels wrap, so any constant
+budget is right only at the size it was measured at; where it is wrong, the rows
+after the panel are placed inside it and paint over its fields. Those surfaces
+use GPUI's measured `list` with a `ListState` the view keeps, re-measured when
+the panel opens or closes. The Providers → Models tab is the worked example:
+its list lives on the entity, the tab is a fixed detail page so the list has a
+definite height, and the card's row set is reconciled before every draw.
+
 ## 4. Why the Main Transcript Does Not Use MessageScroller
 
 `gpui-component 0.8.x`'s `MessageScrollerState` exposes `logical_scroll_top`,

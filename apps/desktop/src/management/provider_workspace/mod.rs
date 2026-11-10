@@ -28,6 +28,7 @@ pub(in crate::management) use model_editor::{
 // Only tests reach it; the editor itself reads the live fields.
 #[cfg(test)]
 pub(in crate::management) use model_editor::capability_matches_suggestion;
+pub(in crate::management) use provider::ProviderModelsList;
 pub(in crate::management) use route_group::RouteGroupFormScope;
 pub(crate) use route_stage::RouteStage;
 pub(crate) use routes::GatewayRouteTrail;

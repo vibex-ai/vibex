@@ -7133,15 +7133,15 @@ ModelCatalogStatus { availability: Fresh|Stale|Bundled|Missing, fetched_at_ms? }
 - The result is correlated by the clicked credential in the UI; the backend
   result keeps the existing profile-level shape.
 
-### Import preview, model paging, and list keyboard
+### Import preview, the Models list, and list keyboard
 
 - The source step can run a native import scan before importing; the scan stores
   the preview, the panel shows the importable count, and Apply runs the existing
   import path. A successful import leaves a dismissible report with imported
   and missing-secret counts.
-- The shared Provider Models tab is windowed to 50 filtered rows with previous/
-  next controls and a `first-last / total` range. This is bounded rendering, not
-  a nested virtual scroll; filters clamp the page.
+- The shared Provider Models tab draws every filtered row through one measured
+  list. It is not paged, and its rows scroll inside the Models card rather than
+  scrolling the page.
 - The Provider list container is focusable: Up/Down move the selection,
   Home/End jump to the edges, and Enter leaves the current selection. Escape and
   search shortcuts keep their existing paths.
@@ -7166,9 +7166,9 @@ ModelCatalogStatus { availability: Fresh|Stale|Bundled|Missing, fetched_at_ms? }
 - Provider and route-group Traffic cards share a 1h/24h/7d range and show the
   most frequent HTTP error status in the window, alongside request/success/
   token/p50/p95 values.
-- The Gateway request ledger is filtered first, then paginated at 50 rows with a
-  range label and previous/next controls; the clear action still clears the
-  whole ledger, not the page.
+- The Gateway request ledger is filtered first, then paged with a count label
+  and a `Load older` action; the clear action still clears the whole ledger, not
+  the page.
 
 ### Inline Model editor
 
@@ -7181,10 +7181,18 @@ ModelCatalogStatus { availability: Fresh|Stale|Bundled|Missing, fetched_at_ms? }
 - Reasoning off also clears fixed reasoning efforts, matching the Agent model
   editor's declaration rule.
 
-### Virtual Models table, endpoint probes, field controls, row keyboard
+### Measured Models table, endpoint probes, field controls, row keyboard
 
-- The Models tab renders through `v_virtual_list` with fixed row heights and an
-  expanded row height for the inline editor. It no longer pages.
+- The Models tab renders through `gpui::list` with a `ListState` the page keeps,
+  so every row — including the one whose inline editor is open — is placed by
+  the height it measured. There is no fixed row or editor height to predict: the
+  panel's real height depends on the pane width, the locale and how the protocol
+  chips wrap, and any constant is wrong somewhere. Opening or closing the editor
+  re-measures the rows; a changed row set resets the list.
+- The Models card takes the height the page leaves and the rows scroll inside
+  it, which is why this tab uses the fixed detail page rather than the page's
+  own scroll. The list owns the scrollbar gutter; the bar is a sibling of the
+  list, never a child of the content it tracks.
 - Endpoint latency probes GET each saved endpoint through the first Key's proxy,
   order passing probes by latency, and `Use fastest` moves the fastest API
   endpoint to the front of the profile before a v2 update.
@@ -7205,9 +7213,8 @@ ModelCatalogStatus { availability: Fresh|Stale|Bundled|Missing, fetched_at_ms? }
 - Auth modes override the protocol default; Anthropic keeps its version header.
 - Extra body is a shallow top-level object merge applied after translation; a
   field the gateway owns is skipped, and the routed model id is written last.
-- The gateway request ledger renders through `v_virtual_list` with a fixed
-  collapsed row height and a larger expanded trace height; filtering happens
-  before the list, and the clear action still clears the whole ledger.
+- Filtering happens before the ledger's table, and the clear action still clears
+  the whole ledger rather than the visible page.
 
 ### Source tile badges
 

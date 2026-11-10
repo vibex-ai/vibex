@@ -15,9 +15,91 @@ const PROVIDER_TABS: [ProviderDetailTab; 4] = [
     ProviderDetailTab::Advanced,
 ];
 
-/// A model row, and the settings that open under it, in the virtual list.
-const MODEL_ROW_HEIGHT: f32 = 52.0;
-const MODEL_EDITOR_HEIGHT: f32 = 430.0;
+/// How much of the row list is measured beyond the visible edge.
+///
+/// It keeps the row just outside the viewport already measured, so scrolling
+/// does not pop it in at the wrong height for a frame.
+const MODEL_LIST_OVERDRAW: f32 = 320.0;
+
+/// The height a model row is assumed to have until it has been measured.
+///
+/// This only seeds the scrollbar's extent; the list replaces it with the height
+/// each row reports. It is deliberately not used to place rows: an open editor
+/// is taller than a closed row by an amount that depends on the pane's width,
+/// the locale and how the protocol chips wrap.
+const MODEL_ROW_HINT_HEIGHT: f32 = 56.0;
+
+/// The Models tab's row list, and the rows it currently describes.
+///
+/// The list measures every row it draws, so the settings panel that opens under
+/// a row is what places the rows after it. The tab used to place rows from a
+/// constant row height plus a constant editor height, which is only correct at
+/// the one width and locale the constants were chosen for: everywhere else the
+/// panel grew past its budget and the rows below it were painted inside it.
+pub(in crate::management) struct ProviderModelsList {
+    /// The Provider the rows belong to. Another record starts a new list
+    /// instead of inheriting this one's scroll position.
+    profile_id: String,
+    /// The row identities, in order: the models the search and filter matched.
+    ids: Vec<String>,
+    /// The Model whose editor is open, if any.
+    expanded: Option<String>,
+    /// The measurements `gpui::list` keeps for those rows.
+    pub(in crate::management) state: ListState,
+}
+
+impl ProviderModelsList {
+    fn new(profile_id: &str, ids: &[String], expanded: Option<&str>) -> Self {
+        Self {
+            profile_id: profile_id.to_string(),
+            ids: ids.to_vec(),
+            expanded: expanded.map(str::to_string),
+            state: ListState::new(ids.len(), ListAlignment::Top, px(MODEL_LIST_OVERDRAW))
+                .with_uniform_item_height(px(MODEL_ROW_HINT_HEIGHT)),
+        }
+    }
+
+    /// Brings the measurements in line with the rows about to be drawn.
+    ///
+    /// Rows arrive and leave with the search, the filter, an add, a delete and
+    /// a catalogue refresh, and the open editor changes one row's extent. Any
+    /// of those makes the old measurements describe rows that are no longer
+    /// there, so they are dropped and the next layout measures what it draws.
+    fn reconcile(&mut self, profile_id: &str, ids: &[String], expanded: Option<&str>) {
+        if self.profile_id != profile_id {
+            *self = Self::new(profile_id, ids, expanded);
+            return;
+        }
+        if self.ids != ids {
+            let top = self.state.logical_scroll_top();
+            let count = ids.len();
+            // The row at the top keeps its place when it still exists; a list
+            // that got shorter than the scroll position starts over.
+            let item_ix = top.item_ix.min(count.saturating_sub(1));
+            self.state
+                .reset_with_uniform_height(count, px(MODEL_ROW_HINT_HEIGHT));
+            self.state.scroll_to(ListOffset {
+                item_ix,
+                offset_in_item: if item_ix == top.item_ix {
+                    top.offset_in_item
+                } else {
+                    px(0.)
+                },
+            });
+            self.ids = ids.to_vec();
+            self.expanded = expanded.map(str::to_string);
+            return;
+        }
+        if self.expanded.as_deref() != expanded {
+            // Every row after the one that opens or closes moves with its
+            // height, so all of them are measured again. The rows inside the
+            // viewport are measured on every frame anyway; this is what drops
+            // the cached heights of the rows below the fold.
+            self.state.remeasure_items(0..ids.len());
+        }
+        self.expanded = expanded.map(str::to_string);
+    }
+}
 
 fn provider_tab_label(tab: ProviderDetailTab) -> &'static str {
     match tab {
@@ -51,29 +133,39 @@ impl ManagementCenter {
             }
             _ => self.render_workspace_provider_overview(&row, cx),
         };
-        ws_detail_page(
-            "management-provider-page",
-            self.render_workspace_provider_header(&row, cx),
-            ws_tabs(
-                "management-provider-detail-tabs",
-                PROVIDER_TABS
-                    .iter()
-                    .map(|tab| provider_tab_label(*tab))
-                    .collect(),
-                selected,
-                |this, index, _, cx| {
-                    if let Some(tab) = PROVIDER_TABS.get(index) {
-                        this.provider_detail_tab = *tab;
-                        this.workspace_detail_scroll
-                            .set_offset(point(px(0.0), px(0.0)));
-                        cx.notify();
-                    }
-                },
-                cx,
-            ),
-            body,
-            &self.workspace_detail_scroll,
-        )
+        let header = self.render_workspace_provider_header(&row, cx);
+        let tabs = ws_tabs(
+            "management-provider-detail-tabs",
+            PROVIDER_TABS
+                .iter()
+                .map(|tab| provider_tab_label(*tab))
+                .collect(),
+            selected,
+            |this, index, _, cx| {
+                if let Some(tab) = PROVIDER_TABS.get(index) {
+                    this.provider_detail_tab = *tab;
+                    this.workspace_detail_scroll
+                        .set_offset(point(px(0.0), px(0.0)));
+                    cx.notify();
+                }
+            },
+            cx,
+        );
+        if tab == ProviderDetailTab::Models {
+            // The Models tab sizes its card to the page and scrolls the rows
+            // inside that card. Wrapping it in the page's scroll would leave the
+            // card at its own content height, and the row list — which takes the
+            // height the card has left — would get almost none of it.
+            ws_detail_page_fixed("management-provider-page", header, tabs, body)
+        } else {
+            ws_detail_page(
+                "management-provider-page",
+                header,
+                tabs,
+                body,
+                &self.workspace_detail_scroll,
+            )
+        }
     }
 
     fn render_workspace_provider_header(
@@ -1278,79 +1370,125 @@ impl ManagementCenter {
                 cx,
             )
         } else {
-            let profile_rc = Rc::new(profile.clone());
-            let models_rc = Rc::new(matched);
+            let profile_id = profile.id.to_string();
+            let rows = matched.clone();
+            let ids = rows
+                .iter()
+                .map(|model| model.id.clone())
+                .collect::<Vec<_>>();
             let expanded = self.provider_model_edit_id.clone();
-            let sizes = Rc::new(
-                models_rc
-                    .iter()
-                    .map(|model| {
-                        let height = if expanded.as_deref() == Some(model.id.as_str()) {
-                            MODEL_ROW_HEIGHT + MODEL_EDITOR_HEIGHT
-                        } else {
-                            MODEL_ROW_HEIGHT
-                        };
-                        gpui_size(px(0.0), px(height))
-                    })
-                    .collect::<Vec<GpuiSize<gpui::Pixels>>>(),
-            );
-            let height = (models_rc.len() as f32 * MODEL_ROW_HEIGHT).clamp(160.0, 560.0)
-                + if expanded.is_some() {
-                    MODEL_EDITOR_HEIGHT
-                } else {
-                    0.0
-                };
+            let state = match self.provider_models_list.as_mut() {
+                Some(list) => {
+                    list.reconcile(&profile_id, &ids, expanded.as_deref());
+                    list.state.clone()
+                }
+                None => {
+                    let list = ProviderModelsList::new(&profile_id, &ids, expanded.as_deref());
+                    let state = list.state.clone();
+                    self.provider_models_list = Some(list);
+                    state
+                }
+            };
+            let profile_rc = Rc::new(profile.clone());
+            let rows_rc = Rc::new(rows);
+            let bar_state = state.clone();
+            // A definite height, so the rows scroll inside the card: the card
+            // takes what the toolbar and the add row leave instead of growing
+            // with every model the Provider offers.
             div()
+                .id("management-provider-models-list")
+                .debug_selector(|| "management-provider-models-list".to_string())
+                .relative()
                 .w_full()
-                .h(px(height))
+                .min_w_0()
+                .flex_1()
                 .min_h_0()
-                .child(v_virtual_list(
-                    cx.entity(),
-                    SharedString::from(format!("management-provider-models-{}", profile.id)),
-                    sizes,
-                    move |this, range: Range<usize>, window, cx| {
-                        range
-                            .filter_map(|index| {
-                                let model = models_rc.get(index)?;
-                                Some(this.render_shared_provider_model_row(
-                                    &profile_rc,
-                                    model,
-                                    window,
-                                    cx,
-                                ))
-                            })
-                            .collect()
-                    },
-                ))
+                .child(
+                    div()
+                        .size_full()
+                        // The rows end in buttons flush with the trailing edge;
+                        // the bar keeps a lane of its own so its thumb never
+                        // paints over them.
+                        .scroll_gutter()
+                        .child(
+                            list(
+                                state,
+                                cx.processor(move |this, index, window, cx| {
+                                    let Some(model) = rows_rc.get(index) else {
+                                        return div().into_any_element();
+                                    };
+                                    this.render_shared_provider_model_row(
+                                        &profile_rc,
+                                        model,
+                                        window,
+                                        cx,
+                                    )
+                                }),
+                            )
+                            .size_full(),
+                        ),
+                )
+                // A sibling of the list, not a child: attached to the measured
+                // content the bar would move with the rows it tracks.
+                .child(
+                    gpui_component::scroll::Scrollbar::vertical(&bar_state)
+                        .id("management-provider-models-scrollbar")
+                        .viewport_from_layout(),
+                )
                 .into_any_element()
         };
-        ws_stack(vec![ws_section(
-            management_locale_text("Models", "模型", "模型"),
-            Some(management_locale_text(
-                "What this Provider offers to the Agents that use it. Turned-off models stay out of every picker.",
-                "该供应商提供给 Agent 的模型；停用的模型不会出现在任何选择器中。",
-                "該供應商提供給 Agent 的模型；停用的模型不會出現在任何選擇器中。",
-            )),
-            Some(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(format!(
-                        "{enabled}/{} {}",
-                        profile.configured_models.len(),
-                        management_locale_text("on", "已启用", "已啟用")
-                    ))
-                    .into_any_element(),
-            ),
+        let card_body = if matched.is_empty() {
             v_flex()
                 .w_full()
+                .min_h_0()
                 .gap_3()
                 .child(toolbar)
                 .child(content)
                 .child(add_row)
-                .into_any_element(),
-            cx,
-        )])
+                .into_any_element()
+        } else {
+            v_flex()
+                .w_full()
+                .min_h_0()
+                .flex_1()
+                .gap_3()
+                .child(toolbar)
+                .child(content)
+                .child(add_row)
+                .into_any_element()
+        };
+        // The page hands this tab a fixed height, so the card is sized by the
+        // page rather than by its rows: the row list takes what the toolbar and
+        // the add row leave and scrolls inside the card.
+        v_flex()
+            .w_full()
+            .min_w_0()
+            .h_full()
+            .min_h_0()
+            .gap_4()
+            .child(ws_section_fill(
+                "management-provider-models-section",
+                management_locale_text("Models", "模型", "模型"),
+                Some(management_locale_text(
+                    "What this Provider offers to the Agents that use it. Turned-off models stay out of every picker.",
+                    "该供应商提供给 Agent 的模型；停用的模型不会出现在任何选择器中。",
+                    "該供應商提供給 Agent 的模型；停用的模型不會出現在任何選擇器中。",
+                )),
+                Some(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(format!(
+                            "{enabled}/{} {}",
+                            profile.configured_models.len(),
+                            management_locale_text("on", "已启用", "已啟用")
+                        ))
+                        .into_any_element(),
+                ),
+                card_body,
+                cx,
+            ))
+            .into_any_element()
     }
 
     // ----- Settings --------------------------------------------------------

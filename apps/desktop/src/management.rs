@@ -7,7 +7,6 @@
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::num::IntErrorKind;
-use std::ops::Range;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -17,10 +16,10 @@ use crate::typography::{code_font_weight, ui_rems};
 use gpui::{
     AccessibleAction, Anchor, AnyElement, App, Bounds, ClickEvent, Context, DragMoveEvent, Empty,
     Entity, EventEmitter, FocusHandle, Focusable as _, FontWeight, HitboxBehavior, Hsla,
-    IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, Orientation, PathBuilder, Pixels, Rems,
-    Render, Role, ScrollAnchor, ScrollDelta, ScrollEvent, ScrollHandle, SharedString,
-    Size as GpuiSize, StatefulInteractiveElement as _, Subscription, Task, Toggled, WeakEntity,
-    Window, canvas, div, point, prelude::*, px, rems, size as gpui_size,
+    IntoElement, KeyDownEvent, ListAlignment, ListOffset, ListState, MouseButton, MouseDownEvent,
+    Orientation, PathBuilder, Pixels, Rems, Render, Role, ScrollAnchor, ScrollDelta, ScrollEvent,
+    ScrollHandle, SharedString, StatefulInteractiveElement as _, Subscription, Task, Toggled,
+    WeakEntity, Window, canvas, div, list, point, prelude::*, px, rems,
 };
 use gpui_component::{
     ActiveTheme as _, ColorName, Disableable as _, ElementExt as _, Icon, IconName,
@@ -54,7 +53,7 @@ use gpui_component::{
     table::{Column, DataTable, TableDelegate, TableState},
     tag::Tag,
     tooltip::Tooltip,
-    v_flex, v_virtual_list,
+    v_flex,
 };
 use vibex_backend::{
     AgentModelOwnedCatalogRequest, BackendFacade, ManagementProfileSelectionRequest,
@@ -1781,6 +1780,13 @@ pub struct ManagementCenter {
     provider_models_filter: ProviderModelsFilter,
     traffic_range: TrafficRange,
     provider_model_edit_id: Option<String>,
+    /// The Models tab's measured row list, with the rows it describes.
+    ///
+    /// `gpui::list` measures each row it draws, so the settings panel that
+    /// opens under a row is what places the rows after it. The list keeps its
+    /// measurements here rather than in the element, so they survive a repaint
+    /// and are reset only when the rows themselves change.
+    provider_models_list: Option<provider_workspace::ProviderModelsList>,
     /// The in-flight catalogue lookup for the model the inline editor has open.
     provider_model_capability_task: Option<Task<()>>,
     /// The one model editor's draft, shared by the Agent dialog and the Models
@@ -3262,6 +3268,7 @@ impl ManagementCenter {
             provider_models_filter: ProviderModelsFilter::All,
             traffic_range: TrafficRange::Day,
             provider_model_edit_id: None,
+            provider_models_list: None,
             provider_model_capability_task: None,
             model_editor: provider_workspace::ModelEditDraft::new(window, cx),
             provider_model_add_input,
@@ -54458,6 +54465,179 @@ mod gateway_surface_tests {
         assert!(
             widths[1..].iter().all(|lane| *lane > 200.0),
             "the text lanes should take the room: {widths:?}"
+        );
+    }
+
+    /// The Models tab measures the row it opens instead of predicting it.
+    ///
+    /// The tab used to place rows from a constant row height plus a constant
+    /// editor height. The editor's real height depends on the pane's width, the
+    /// locale and how the protocol chips wrap, so at any other measurements the
+    /// rows after it were placed inside the open panel: their names and switches
+    /// painted over its fields. Draw a real page, open its first row, and require
+    /// the panel to end before the next row begins.
+    #[gpui::test]
+    fn the_models_tab_places_rows_after_the_measured_editor(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let (center, cx) = cx.add_window_view(ManagementCenter::new);
+        let models = (0..8)
+            .map(|index| vibex_core::ModelProviderCatalogEntry {
+                id: format!("model-{index:02}"),
+                display_name: Some(format!("Model {index:02}")),
+                enabled: true,
+                metadata: Vec::new(),
+                capabilities: vibex_core::ProviderModelCapabilities {
+                    context_tokens: Some(128_000),
+                    output_tokens: Some(8_192),
+                    reasoning: Some(true),
+                    image_input: Some(true),
+                    ..Default::default()
+                },
+            })
+            .collect::<Vec<_>>();
+        let profile = vibex_core::ModelProviderProfile {
+            display_name: "Provider".to_string(),
+            configured_models: models,
+            status: vibex_core::ModelProviderProfileStatus::Enabled,
+            ..Default::default()
+        };
+        let first_model = profile.configured_models[0].id.clone();
+        let provider_id = profile.id.as_str().to_string();
+        cx.update(|_, cx| {
+            center.update(cx, |center, cx| {
+                center.navigation.active = ManagementSection::Providers;
+                center.providers_sidebar_tab = ProviderSidebarTab::Providers;
+                center.selected_global_provider_id = Some(provider_id);
+                center.provider_detail_tab = ProviderDetailTab::Models;
+                center.providers = vec![profile];
+                cx.notify();
+            });
+        });
+        // Draw the closed list first, the way the tab arrives: opening a row
+        // afterwards is what has to move the rows below it.
+        for _ in 0..2 {
+            cx.update(|window, cx| {
+                let _ = window.draw(cx);
+            });
+            cx.run_until_parked();
+        }
+        cx.update(|_, cx| {
+            center.update(cx, |center, cx| {
+                center.provider_model_edit_id = Some(first_model.clone());
+                cx.notify();
+            });
+        });
+        // The narrowest width the app allows, so the editor's fields and chips
+        // wrap as far as they ever do. The tall window is the one that fits the
+        // whole panel plus the row under it; the shorter ones prove the card
+        // still gives the rows a viewport when the page is squeezed.
+        let mut compared_the_next_row = false;
+        for height in [1600.0f32, 1161.0, 900.0, 620.0] {
+            cx.simulate_resize(gpui::size(px(1125.0), px(height)));
+            for _ in 0..3 {
+                cx.update(|window, cx| {
+                    let _ = window.draw(cx);
+                });
+                cx.run_until_parked();
+            }
+
+            let list = cx
+                .debug_bounds("management-provider-models-list")
+                .expect("the Models tab draws its row list");
+            let section = cx
+                .debug_bounds("management-provider-models-section")
+                .expect("the Models card is drawn");
+            assert!(
+                list.top() >= section.top() && list.bottom() <= section.bottom(),
+                "the row list must stay inside its card at {height}px: \
+                 card={section:?} list={list:?}"
+            );
+            assert!(
+                list.size.height >= px(160.0),
+                "the card must leave the rows a viewport at {height}px, got {list:?}"
+            );
+            let editor = cx
+                .debug_bounds("shared-model-editor")
+                .expect("the open row draws the settings panel");
+            assert!(
+                editor.bottom() > list.top(),
+                "the open panel must be in the rows at {height}px: \
+                 list={list:?} editor={editor:?}"
+            );
+            // The list places each row at the origin its measured height
+            // decides: the row under the open panel starts after it ends, which
+            // is exactly what a fixed height could not promise.
+            let (expanded, following) = center.read_with(cx, |center, _| {
+                let state = center
+                    .provider_models_list
+                    .as_ref()
+                    .map(|list| list.state.clone())
+                    .expect("the Models tab keeps its measured list");
+                (state.bounds_for_item(0), state.bounds_for_item(1))
+            });
+            let expanded = expanded.expect("the open row is measured");
+            assert!(
+                expanded.size.height > px(430.0),
+                "a real editor is taller than the old constant at {height}px: {expanded:?}"
+            );
+            let Some(following) = following else {
+                // Not measured at this window height, so nothing can be placed
+                // inside it; the reader scrolls to it.
+                continue;
+            };
+            compared_the_next_row = true;
+            assert!(
+                expanded.bottom() <= following.top(),
+                "the open panel must place the next row below it at {height}px, \
+                 not inside it: open={expanded:?} next={following:?}"
+            );
+        }
+        assert!(
+            compared_the_next_row,
+            "no window height drew the row under the open panel, so the \
+             placement was never checked"
+        );
+    }
+
+    /// The Models tab draws its rows through the measured list.
+    ///
+    /// `v_virtual_list` is a fixed-size list: it places rows by the heights it is
+    /// handed and never measures them, so a row that opens a panel of its own can
+    /// only be supported by predicting the panel's height. That prediction is the
+    /// bug this pins against; the tab must keep using the measuring list, and
+    /// must re-measure the rows when the open panel changes.
+    #[test]
+    fn the_models_tab_measures_its_rows_instead_of_predicting_them() {
+        let source = include_str!("management/provider_workspace/provider.rs");
+        for marker in [
+            "struct ProviderModelsList",
+            "ListState",
+            "list(",
+            "self.state.remeasure_items(0..ids.len());",
+            "management-provider-models-list",
+        ] {
+            assert!(source.contains(marker), "the Models tab must keep {marker}");
+        }
+        assert!(
+            !source.contains("v_virtual_list"),
+            "the Models tab must not place rows by a fixed height"
+        );
+        assert!(
+            !source.contains("MODEL_EDITOR_HEIGHT") && !source.contains("MODEL_ROW_HEIGHT"),
+            "the tab must not predict a row or editor height"
+        );
+        // The list needs a height the page decides: the Models tab is a fixed
+        // detail page and the card fills it, or the list would measure against
+        // its own content and never scroll.
+        assert!(
+            source.contains("ws_detail_page_fixed("),
+            "the Models tab must fill the page instead of scrolling it"
+        );
+        assert!(
+            source.contains(
+                "ws_section_fill(\n                \"management-provider-models-section\""
+            ),
+            "the Models card must take the height the page leaves"
         );
     }
 

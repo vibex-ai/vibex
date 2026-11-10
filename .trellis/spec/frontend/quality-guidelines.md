@@ -1290,6 +1290,17 @@ crates/core/src/file.rs -> vibex-backend -> GPUI
   variable list with `DIFF_ROW_HEIGHT`, render one model row per callback, reset it
   when the patch revision changes, reconcile its item count after commit-file
   collapse/expand, and preserve focused-file scrolling.
+- Any row that reveals a variable-height panel of its own — a disclosure, an
+  inline editor, an expanded trace — goes through GPUI's variable-height `list`
+  with a `ListState` the view keeps, never `v_virtual_list`. `v_virtual_list`
+  places rows by the heights it is handed and never measures them, so a constant
+  row height plus a constant panel height is the only thing it can express, and
+  the panel's real height varies with the pane width, the locale and how its
+  chips wrap. When the real panel is taller than the budget, the rows after it
+  are placed inside it and their text and controls paint over its fields. Size
+  the container to a definite height (`flex_1().min_h_0()` inside a fixed page),
+  reconcile the list when the row set changes, and re-measure the rows when the
+  open panel changes.
 - Files, Git Changes, Git History, working-tree diff, and commit patch remain
   independently identified virtual surfaces. Their render callbacks must not
   materialize the full model as `.children(...)`; the variable patch list measures
@@ -1310,6 +1321,7 @@ crates/core/src/file.rs -> vibex-backend -> GPUI
 | Requested virtual range exceeds the eager bound | Clamp the returned range; never allocate all rows. |
 | A tracked `uniform_list` omits `.size_full()` | Source contract test fails. |
 | A wrapping patch row is rendered in `uniform_list` or keeps a fixed height | Source contract test fails; use the per-tab variable-height list. |
+| A row's disclosure or inline editor is placed by a constant height in `v_virtual_list` | Source contract test fails; use a measured `list` and re-measure when it opens or closes. |
 | Patch width, revision, or visible row count changes | Remeasure/reset the `ListState` without materializing the full patch; focused-file navigation still reaches the requested row. |
 | 360 px viewport renders a persisted horizontal split | Render panes vertically without mutating persisted direction. |
 | A Backend or GPUI layer redefines a Rust protocol leaf type | Rust compilation or protocol tests fail; import the canonical `crates/core` type. |
