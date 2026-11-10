@@ -9,6 +9,7 @@
   <img src="https://img.shields.io/badge/UI-GPUI-2563eb?style=flat" alt="GPUI" />
   <img src="https://img.shields.io/badge/platforms-macOS%20%7C%20Windows%20%7C%20Linux%20%7C%20iOS%20%7C%20Android-4493F8?style=flat" alt="Platforms: macOS, Windows, Linux, iOS, and Android" />
   <img src="https://img.shields.io/badge/status-0.1.0-22c55e?style=flat" alt="Release status: 0.1.0" />
+  <a href="https://deepwiki.com/vibex-ai/vibex"><img src="https://deepwiki.com/badge.svg" alt="ask for deepwiki" /></a>
 </p>
 
 <p align="center">
