@@ -431,7 +431,12 @@ function validatePackaging() {
     "gh release download",
     // makepkg refuses to run as root, and the container job is root.
     "runuser -u builder",
-    "useradd"
+    "useradd",
+    // `publish-aur.mjs` re-enters makepkg as `builder`, whose `--printsrcinfo`
+    // writes into the PKGBUILD directory. The tree has to belong to that user
+    // before the script's first write, or makepkg aborts with "You do not have
+    // write permission for the directory $BUILDDIR".
+    'chown -R builder:builder "${GITHUB_WORKSPACE}"'
   ]) {
     assert(aurWorkflow.includes(required), `AUR workflow is missing ${required}`);
   }

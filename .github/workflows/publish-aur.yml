@@ -168,6 +168,12 @@ jobs:
           VERSION: ${{ steps.release.outputs.version }}
         run: |
           set -euo pipefail
+          # makepkg refuses to run as root, so the script re-enters it as
+          # `builder`, and `--printsrcinfo` writes into the PKGBUILD directory.
+          # The tree has to belong to that user before the script runs: the
+          # verify step used to hand it over afterwards, which is too late for
+          # this step's first write.
+          chown -R builder:builder "${GITHUB_WORKSPACE}"
           node scripts/publish-aur.mjs \
             --version "${VERSION}" \
             --archive-dir "${SRCDEST}" \
