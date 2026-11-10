@@ -10729,6 +10729,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "crossterm",
+ "dirs 6.0.0",
  "html5ever",
  "image",
  "markup5ever_rcdom",

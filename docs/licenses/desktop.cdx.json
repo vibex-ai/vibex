@@ -48532,6 +48532,7 @@
       "dependsOn": [
         "cargo:chrono@0.4.45:c19b7c6f923b580a",
         "cargo:crossterm@0.29.0:c19b7c6f923b580a",
+        "cargo:dirs@6.0.0:c19b7c6f923b580a",
         "cargo:html5ever@0.27.0:c19b7c6f923b580a",
         "cargo:image@0.25.10:c19b7c6f923b580a",
         "cargo:markup5ever_rcdom@0.3.0:c19b7c6f923b580a",

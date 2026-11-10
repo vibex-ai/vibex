@@ -1907,12 +1907,7 @@ impl Keymap {
             .ok()
             .filter(|value| !value.trim().is_empty())
             .map(PathBuf::from)
-            .or_else(|| {
-                std::env::var("HOME")
-                    .ok()
-                    .filter(|value| !value.trim().is_empty())
-                    .map(|value| PathBuf::from(value).join(".vibex"))
-            })?;
+            .or_else(crate::user_home::default_vibex_home)?;
         Some(home.join("tui-keys.toml"))
     }
 

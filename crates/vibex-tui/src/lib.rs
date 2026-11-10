@@ -87,6 +87,7 @@ pub mod text;
 pub mod theme;
 pub mod transcript;
 pub mod turn;
+pub mod user_home;
 pub mod view;
 pub mod worker;
 

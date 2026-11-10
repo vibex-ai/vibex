@@ -59,6 +59,12 @@ order is:
 name the client does not know is an error rather than a silent fall-through to
 preview: `unknown channel "nightly"; use stable, rc, or preview`.
 
+The user's home directory behind that last step is resolved the way the platform
+means it — `HOME` on Unix, the known-folder API (backed by `USERPROFILE`) on
+Windows — so a stock Windows shell finds the client's home without any variable
+exported, exactly as the desktop app does. `VIBEX_HOME` remains the way to point
+a client at a home somewhere else.
+
 This is the one place the client and the desktop app differ on purpose. The
 desktop app refuses a `VIBEX_CHANNEL` that disagrees with its compiled identity
 (`release_channel_override_rejected`), because a package's window is its

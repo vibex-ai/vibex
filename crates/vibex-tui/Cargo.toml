@@ -19,6 +19,12 @@ description = "Character-grid client for the Vibex DesktopRuntime"
 # and the terminal is never the wasm target.
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 crossterm.workspace = true
+# The user's home directory, resolved the way the platform means it: `HOME` on
+# Unix, the known-folder API on Windows. Reading `HOME` directly is what left
+# the client unable to find a home on a stock Windows shell, where the desktop
+# app resolves one through this same crate. It is already in the graph, so this
+# adds no package.
+dirs = "6"
 # Markdown is parsed in-crate (`src/markdown/`) so the terminal client owns its
 # own document model instead of depending on the desktop Markdown crate.
 html5ever.workspace = true

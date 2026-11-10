@@ -862,13 +862,14 @@ pub fn resolve_home_for_channel(
     {
         return Ok(parent.to_path_buf());
     }
-    let base = std::env::var("HOME")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .map(PathBuf::from)
-        .ok_or_else(|| SeatError::Environment {
-            detail: "could not determine a home directory; set VIBEX_HOME".to_string(),
-        })?;
+    // `HOME` is a POSIX convention, and Windows sets `USERPROFILE` instead, so
+    // the platform's own answer is what this reads. Resolving `HOME` directly
+    // made the packaged client unable to find a home at all on a stock Windows
+    // shell, while the desktop app — which resolves through the same library —
+    // found one without trouble.
+    let base = vibex_tui::user_home::user_home().ok_or_else(|| SeatError::Environment {
+        detail: "could not determine a home directory; set VIBEX_HOME".to_string(),
+    })?;
     let leaf =
         channel_home_leaf(channel.or(COMPILED_CHANNEL)).ok_or_else(|| SeatError::Environment {
             detail: format!(
@@ -993,6 +994,23 @@ mod tests {
     fn home_resolution_prefers_the_explicit_path() {
         let home = resolve_home(Some(PathBuf::from("/tmp/explicit"))).unwrap();
         assert_eq!(home, PathBuf::from("/tmp/explicit"));
+    }
+
+    /// The packaged client has to find a home on a platform that does not
+    /// export `HOME`, which is what a stock Windows shell looks like. The
+    /// resolver reads the platform's own answer, so the fallback is the user's
+    /// home rather than a variable that may not exist.
+    #[test]
+    fn the_default_home_comes_from_the_platform_not_home() {
+        let leaf = channel_home_leaf(COMPILED_CHANNEL).expect("the packaged channel is known");
+        match vibex_tui::user_home::user_home() {
+            Some(user) => assert_eq!(
+                resolve_home_for_channel(None, COMPILED_CHANNEL).unwrap(),
+                user.join(".vibex").join(leaf)
+            ),
+            // No home at all is the one case the resolver is allowed to refuse.
+            None => assert!(resolve_home_for_channel(None, COMPILED_CHANNEL).is_err()),
+        }
     }
 
     #[test]
