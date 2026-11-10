@@ -155,8 +155,33 @@ pub fn set_active_selection(selection: &ThemeSelection) {
     }
 }
 
+/// The code font a run uses when the reader has not chosen one.
+///
+/// The one place the default is named. It has to be a family the process
+/// actually loaded: GPUI panics on a family it cannot resolve, and its own
+/// fallback cascade ends on a proportional face, which breaks the terminal
+/// grid rather than merely looking different.
+///
+/// Linux is the platform this cannot be delegated: `gpui_base`'s typography
+/// default names `DejaVu Sans Mono`, and the Linux font database is bounded to
+/// the bundled faces plus a couple of system ones (see
+/// [`crate::platform::bounded_text`]) — `DejaVu Sans Mono` is not among them.
+/// The gpui-component probe would then swap in a stand-in that is missing too
+/// and land on `.SystemUIFont`, i.e. the bundled *sans* face. Naming the
+/// bundled code family here keeps the default monospaced.
 pub fn default_mono_font_family() -> gpui::SharedString {
-    gpui_base::TypographyTokens::default().mono
+    #[cfg(target_os = "macos")]
+    {
+        "Menlo".into()
+    }
+    #[cfg(target_os = "windows")]
+    {
+        "Consolas".into()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        crate::assets::BUNDLED_CODE_FAMILY.into()
+    }
 }
 
 fn shared_code_font_family() -> gpui::SharedString {
@@ -1212,5 +1237,38 @@ mod tests {
                 expected_sidebar_foreground
             );
         }
+    }
+
+    /// The default code font has to be a family the process loaded, and it has
+    /// to be monospaced.
+    ///
+    /// Both halves are load-bearing. GPUI panics on a family it cannot resolve,
+    /// and its fallback cascade ends on a proportional face — which a terminal
+    /// lays out in whole cells and cannot use. Linux is where this went wrong
+    /// before: the default named `DejaVu Sans Mono`, the bounded database does
+    /// not carry it, and the substitution that followed was the bundled sans
+    /// face.
+    #[test]
+    fn the_default_code_font_is_the_bundled_monospace_face() {
+        let default = default_mono_font_family();
+        assert_ne!(
+            default.as_ref(),
+            crate::assets::BUNDLED_SANS_FAMILY,
+            "the default code font is the proportional interface face"
+        );
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        assert_eq!(
+            default.as_ref(),
+            crate::assets::BUNDLED_CODE_FAMILY,
+            "the Linux default code font must be the bundled monospace face, \
+             the only monospace family the bounded database carries"
+        );
+        // The generic alias the UI resolves through the bounded text system and
+        // the family the theme publishes are two names for one face.
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            crate::platform::bounded_text::bundled_code_family(),
+            default.as_ref()
+        );
     }
 }
