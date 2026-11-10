@@ -1,6 +1,6 @@
 # Release Notes
 
-Write the notes a Vibex release publishes, from a version such as `0.1.0`.
+Write the notes a Vibex release publishes, from a version such as `0.1.1`.
 When no version is supplied, use the `version` in the workspace `Cargo.toml`.
 
 ## Gather

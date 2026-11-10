@@ -47,7 +47,7 @@ write-only), and device permissions gate every management operation.
 The image is published for every release, so the common path is a pull:
 
 ```bash
-export VIBEX_SERVER_IMAGE=ghcr.io/vibex-ai/vibex-server:v0.1.0
+export VIBEX_SERVER_IMAGE=ghcr.io/vibex-ai/vibex-server:v0.1.1
 docker compose -f deploy/server/docker-compose.yml pull vibex-server
 docker compose -f deploy/server/docker-compose.yml up -d --no-build vibex-server
 docker logs vibex-server | grep pairing_code=
@@ -99,7 +99,7 @@ built natively on GitHub-hosted x64 and arm64 runners and merged by digest, so
 | Trigger | Published tags |
 | --- | --- |
 | Release candidate tag `v0.1.0-rc.10` | `0.1.0-rc.10`, `v0.1.0-rc.10`, `rc` |
-| Stable tag `v0.1.0` | `0.1.0`, `v0.1.0`, `latest` |
+| Stable tag `v0.1.1` | `0.1.1`, `v0.1.1`, `latest` |
 | Push to the default branch | `edge`, `sha-<commit>` |
 | Manual workflow run | `edge`, `sha-<commit>` |
 
@@ -118,8 +118,8 @@ A stable release also mirrors both manifest lists to Docker Hub, so an operator
 who already pulls from there does not need a GHCR account:
 
 ```bash
-docker pull vibexai/vibex-server:v0.1.0
-docker pull vibexai/vibex-relay:v0.1.0
+docker pull vibexai/vibex-server:v0.1.1
+docker pull vibexai/vibex-relay:v0.1.1
 ```
 
 The mirror copies the GHCR index rather than rebuilding it, so both registries
@@ -137,8 +137,8 @@ The same release is also mirrored to the CNB artifact registry, which is
 reachable from mainland China where GHCR is slow or blocked:
 
 ```bash
-docker pull docker.cnb.cool/vibex-ai/vibex/vibex-server:v0.1.0
-docker pull docker.cnb.cool/vibex-ai/vibex/vibex-relay:v0.1.0
+docker pull docker.cnb.cool/vibex-ai/vibex/vibex-server:v0.1.1
+docker pull docker.cnb.cool/vibex-ai/vibex/vibex-relay:v0.1.1
 ```
 
 CNB addresses an artifact as `<repository>/<image>`, so the repository path is

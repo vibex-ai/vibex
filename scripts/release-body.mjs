@@ -24,11 +24,11 @@
 //
 // Usage:
 //   node scripts/release-body.mjs \
-//     --version 0.1.0 --tag v0.1.0 \
-//     --notes docs/operations/release-notes-v0.1.0.md \
+//     --version 0.1.1 --tag v0.1.1 \
+//     --notes docs/operations/release-notes-v0.1.1.md \
 //     --assets target/publish \
 //     --changelog target/release-body/generated-changelog.md \
-//     --previous-tag v0.1.0-rc.10 \
+//     --previous-tag v0.1.0 \
 //     --output target/release-body/vibex-release-body.md
 //
 // Every path is resolved against the repository root. `--output` is optional

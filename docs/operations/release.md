@@ -132,12 +132,12 @@ directory and a generated changelog:
 
 ```bash
 gh api "repos/vibex-ai/vibex/releases/generate-notes" \
-  -f tag_name=v0.1.0 -f previous_tag_name=v0.1.0-rc.10 --jq .body \
+  -f tag_name=v0.1.1 -f previous_tag_name=v0.1.0 --jq .body \
   > target/release-body/generated-changelog.md
 
 node scripts/release-body.mjs \
-  --version 0.1.0 \
-  --notes docs/operations/release-notes-v0.1.0.md \
+  --version 0.1.1 \
+  --notes docs/operations/release-notes-v0.1.1.md \
   --assets target/publish \
   --changelog target/release-body/generated-changelog.md \
   --output target/release-body/vibex-release-body.md
@@ -260,7 +260,7 @@ The workflow verifies the tag against both container binaries, builds
 `linux/amd64` and `linux/arm64` natively, merges the digests into one manifest
 list, and boots each published image once before the run succeeds.
 
-- Release candidates publish `0.1.0-rc.x`, `v0.1.0-rc.x`, and the moving `rc`
+- Release candidates publish `0.1.1-rc.x`, `v0.1.1-rc.x`, and the moving `rc`
   tag; stable releases additionally move `latest`. The default branch publishes
   `edge` and `sha-<commit>`.
 - Published version tags are immutable. Rollback pulls a previously verified
@@ -294,7 +294,7 @@ Shared rules for both mirrors:
 - Both jobs are `continue-on-error`: a mirror is a convenience channel, so a
   registry outage or a rejected token must never withhold the images operators
   already pull from GHCR.
-- Tags are `0.1.0`, `v0.1.0`, and `latest` for a stable release.
+- Tags are `0.1.1`, `v0.1.1`, and `latest` for a stable release.
 - `scripts/mirror-registry.mjs` verifies the source really is a
   two-architecture index before writing and rechecks both architectures on
   every mirrored tag.
@@ -320,11 +320,11 @@ A local dry run prints the plan without touching any registry:
 
 ```bash
 # Docker Hub
-node scripts/mirror-registry.mjs --version 0.1.0 --namespace vibexai --dry-run
+node scripts/mirror-registry.mjs --version 0.1.1 --namespace vibexai --dry-run
 
 # CNB
 node scripts/mirror-registry.mjs \
-  --version 0.1.0 --target-registry docker.cnb.cool \
+  --version 0.1.1 --target-registry docker.cnb.cool \
   --namespace vibex-ai/vibex --dry-run
 ```
 
