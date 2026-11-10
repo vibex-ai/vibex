@@ -432,14 +432,21 @@ function validatePackaging() {
     // makepkg refuses to run as root, and the container job is root.
     "runuser -u builder",
     "useradd",
-    // `publish-aur.mjs` re-enters makepkg as `builder`, whose `--printsrcinfo`
-    // writes into the PKGBUILD directory. The tree has to belong to that user
-    // before the script's first write, or makepkg aborts with "You do not have
-    // write permission for the directory $BUILDDIR".
-    'chown -R builder:builder "${GITHUB_WORKSPACE}"'
+    // `publish-aur.mjs` re-enters makepkg as `builder`, which writes into both
+    // the PKGBUILD directory (`--printsrcinfo`) and SRCDEST (its download
+    // cache). Handing over only the workspace aborts with "You do not have
+    // write permission for the directory $SRCDEST"; handing over either one
+    // later than the first write aborts the same way.
+    'chown -R builder:builder "${GITHUB_WORKSPACE}" "${SRCDEST}"'
   ]) {
     assert(aurWorkflow.includes(required), `AUR workflow is missing ${required}`);
   }
+  // Every step that runs makepkg has to hand both directories over first, not
+  // just the earliest one: the build and publish steps each invoke it again.
+  assert(
+    aurWorkflow.split('chown -R builder:builder "${GITHUB_WORKSPACE}" "${SRCDEST}"').length - 1 >= 3,
+    "AUR workflow must hand the workspace and SRCDEST to the builder before each makepkg run"
+  );
   assert(
     aurWorkflow.includes("is not a stable x.y.z release"),
     "AUR workflow does not refuse a prerelease tag"
