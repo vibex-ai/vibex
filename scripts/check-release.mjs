@@ -439,6 +439,20 @@ function validatePackaging() {
     aurWorkflow.includes("is not a stable x.y.z release"),
     "AUR workflow does not refuse a prerelease tag"
   );
+  // `publish-aur.yml` listens for `release: published`, but GitHub never starts
+  // a workflow from an event the default token produced — and the release is
+  // created with that token. Without an explicit dispatch the AUR job silently
+  // never runs, which is how ten releases shipped without a single AUR run.
+  assert(
+    releaseWorkflow.includes("gh workflow run publish-aur.yml"),
+    "publish workflow does not dispatch the AUR workflow; the Release event alone never reaches it"
+  );
+  // `gh workflow run` needs the actions scope; `contents: write` alone cannot
+  // start another workflow.
+  assert(
+    releaseWorkflow.includes("actions: write"),
+    "publish workflow cannot dispatch another workflow without `actions: write`"
+  );
   const aurPackage = source("packaging/aur/vibex-bin/PKGBUILD");
   assert(
     /^pkgname=vibex-bin$/mu.test(aurPackage),

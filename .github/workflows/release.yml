@@ -474,6 +474,9 @@ jobs:
     name: Aggregate and publish release
     permissions:
       contents: write
+      # The AUR workflow is started from this job rather than by the Release
+      # event; see the dispatch step at the end of it.
+      actions: write
     needs: [release-meta, desktop, server-linux, server-macos, mobile-android, mobile-ios]
     if: ${{ always() && needs.release-meta.result == 'success' && needs.desktop.result == 'success' && needs.server-linux.result == 'success' && needs.server-macos.result == 'success' && needs.mobile-android.result == 'success' && needs.mobile-ios.result == 'success' }}
     runs-on: ubuntu-24.04
@@ -703,3 +706,28 @@ jobs:
             gh release delete "${tag}" --yes >/dev/null 2>&1 || true
             sleep $(( attempt * 15 ))
           done
+      # `publish-aur.yml` listens for the `release: published` event, and GitHub
+      # never starts a workflow from an event that the default token produced —
+      # which is the token `gh release create` above uses. The AUR workflow
+      # therefore has to be asked for explicitly. `workflow_dispatch` is the one
+      # exception to that rule, so this token may start it.
+      #
+      # The AUR carries exactly one version per package and every Arch user
+      # upgrades to whatever is there, so only a stable release is dispatched;
+      # the workflow and `scripts/publish-aur.mjs` refuse a prerelease as well.
+      - name: Publish the AUR package
+        if: needs.release-meta.outputs.channel == 'stable'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          # A failure here must not fail a release whose artifacts are already
+          # published, so the dispatch is reported and the run continues. The
+          # workflow can be replayed for this tag from its own dispatch inputs.
+          if gh workflow run publish-aur.yml --ref "${GITHUB_REF_NAME}" -f tag="${tag}"; then
+            echo "dispatched publish-aur.yml for ${tag}"
+          else
+            echo "::warning::could not dispatch publish-aur.yml for ${tag}; run it manually with -f tag=${tag}"
+          fi
