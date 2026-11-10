@@ -167,6 +167,27 @@ stops mouse-down propagation so pressing a caption never starts a window move.
 Every button carries the localized tooltip as its `aria_label`, and the maximize
 button swaps to the restore glyph while `Window::is_maximized()` is true.
 
+### The window title still names the application
+
+A client-drawn title bar does not remove the system title. Windows labels a
+taskbar button with its window title, so a workbench window that opens with
+`TitleBar::title_bar_options()` (whose `title` is `None`) shows the icon alone:
+the button has no name, and hover previews are blank too. The desktop therefore
+opens the workbench with `vibex_desktop::workbench_titlebar(application_id)` —
+the component's client-drawn options with `title` set to the channel's product
+name (`Vibex`, `Vibex RC`, `Vibex Preview`). The same helper names a workbench
+window the tray restores, since that is a new platform window and starts without
+a title again. `vibex_desktop::titled_titlebar` applies the same defaults to a
+window with a name of its own.
+
+- Every top-level window owns a taskbar button, so every one of them needs a
+  title: the computer-use panel and its floating strip, and the detached editor,
+  name themselves rather than inheriting an empty caption.
+- The name comes from the channel identity, not from a hard-coded string, so a
+  preview build does not claim the stable application's name.
+- Setting `title` keeps the other `TitlebarOptions` values: `appears_transparent`
+  is what makes the caption client-drawn in the first place.
+
 ### The native appearance follows the theme
 
 A window that keeps AppKit's traffic lights also keeps AppKit's window border,

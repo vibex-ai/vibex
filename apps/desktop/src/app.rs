@@ -50,7 +50,7 @@ use gpui_base::text::MarkdownExtensions;
 use gpui_component::{
     ActiveTheme as _, ColorName, Colorize as _, Disableable as _, ElementExt as _, Icon, IconName,
     IndexPath, InteractiveElementExt as _, Root, Selectable as _, Sizable as _, StyledExt as _,
-    Theme, ThemeStyled as _, TitleBar, VirtualListScrollHandle, WindowExt as _,
+    Theme, ThemeStyled as _, VirtualListScrollHandle, WindowExt as _,
     accordion::Accordion,
     animation::EffectTransition as Transition,
     avatar::Avatar,
@@ -12786,7 +12786,13 @@ impl VibexWorkbench {
                     size(px(560.0), px(720.0)),
                     cx,
                 ))),
-                titlebar: Some(TitleBar::title_bar_options()),
+                // A docked panel is still its own taskbar button, so it names
+                // itself the same way the floating strip does.
+                titlebar: Some(crate::titled_titlebar(locale::text(
+                    "Computer use",
+                    "电脑操作",
+                    "電腦操作",
+                ))),
                 window_min_size: Some(size(px(420.0), px(520.0))),
                 app_id: release_application_id().ok().map(str::to_string),
                 icon: window_icon().ok(),
@@ -95485,7 +95491,10 @@ pub fn open_workbench_window(cx: &mut App) -> Result<(), String> {
     // Register the process identity the OS notification centers key on: the
     // Windows AppUserModelID and the Linux application name. Windows needs this
     // before the first toast from an unpackaged build.
-    cx.set_app_identity(application_id, "Vibex");
+    cx.set_app_identity(
+        application_id,
+        crate::application_display_name(application_id),
+    );
     let bounds = Bounds::centered(
         None,
         size(px(DEFAULT_WIDTH as f32), px(DEFAULT_HEIGHT as f32)),
@@ -95493,7 +95502,9 @@ pub fn open_workbench_window(cx: &mut App) -> Result<(), String> {
     );
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
-        titlebar: Some(TitleBar::title_bar_options()),
+        // The window title is what Windows prints beside the taskbar icon, so a
+        // client-drawn bar still has to name the application.
+        titlebar: Some(crate::workbench_titlebar(application_id)),
         app_id: Some(application_id.to_string()),
         icon: Some(window_icon()?),
         window_min_size: Some(size(px(MIN_WIDTH as f32), px(MIN_HEIGHT as f32))),

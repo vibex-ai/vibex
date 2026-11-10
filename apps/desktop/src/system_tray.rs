@@ -6,7 +6,7 @@ use gpui::{
     SystemNotificationResponse, Window, WindowBackgroundAppearance, WindowBounds,
     WindowDecorations, WindowOptions, px, size,
 };
-use gpui_component::{Root, TitleBar};
+use gpui_component::Root;
 use image::ImageReader;
 use tray_icon::{
     Icon, TrayIcon, TrayIconBuilder,
@@ -383,7 +383,9 @@ fn workbench_window_options(
 ) -> Result<WindowOptions, String> {
     Ok(WindowOptions {
         window_bounds: Some(normalized_window_bounds(window_bounds)),
-        titlebar: Some(TitleBar::title_bar_options()),
+        // A restored window has to reach the taskbar with the same name the
+        // first one did, or the button loses its label again.
+        titlebar: Some(crate::workbench_titlebar(&application_id)),
         app_id: Some(application_id),
         icon: Some(crate::assets::window_icon()?),
         window_min_size: Some(size(px(MIN_WIDTH as f32), px(MIN_HEIGHT as f32))),

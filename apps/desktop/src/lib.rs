@@ -53,6 +53,38 @@ pub const DEFAULT_HEIGHT: u32 = 780;
 pub const MIN_WIDTH: u32 = 360;
 pub const MIN_HEIGHT: u32 = 620;
 
+/// The user-visible name of the application for one release channel.
+///
+/// Windows labels a taskbar button with the window title, and this desktop
+/// paints its own title bar, so a window that leaves the title unset reaches
+/// the taskbar with an empty label: the icon shows, the name does not. The
+/// three names match the channel packaging configs (`productName`), which
+/// `scripts/check-release.mjs` pins.
+pub fn application_display_name(application_id: &str) -> &'static str {
+    if application_id == vibex_desktop_runtime::STABLE_DESKTOP_APP_ID {
+        "Vibex"
+    } else if application_id == vibex_desktop_runtime::RC_APP_ID {
+        "Vibex RC"
+    } else {
+        "Vibex Preview"
+    }
+}
+
+/// Title bar options for a window that draws its own caption: the component's
+/// defaults, carrying `title` as the name the operating system shows.
+pub fn titled_titlebar(title: impl Into<gpui::SharedString>) -> gpui::TitlebarOptions {
+    gpui::TitlebarOptions {
+        title: Some(title.into()),
+        ..gpui_component::TitleBar::title_bar_options()
+    }
+}
+
+/// Title bar options for a workbench window: the component's client-drawn bar,
+/// carrying the application name as the title the operating system shows.
+pub fn workbench_titlebar(application_id: &str) -> gpui::TitlebarOptions {
+    titled_titlebar(application_display_name(application_id))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FirstFrameProbe {
@@ -174,5 +206,31 @@ mod tests {
         );
         assert!(!serialized.contains("/home/"));
         assert!(!serialized.contains("\\Users\\"));
+    }
+
+    /// Windows labels a taskbar button with the window title, and the desktop
+    /// draws its own title bar, so the title has to be set for the button to
+    /// carry a name at all. Each channel is labelled the way its package is.
+    #[test]
+    fn every_channel_names_the_window_it_opens() {
+        assert_eq!(
+            application_display_name(vibex_desktop_runtime::STABLE_DESKTOP_APP_ID),
+            "Vibex"
+        );
+        assert_eq!(
+            application_display_name(vibex_desktop_runtime::RC_APP_ID),
+            "Vibex RC"
+        );
+        assert_eq!(
+            application_display_name(vibex_desktop_runtime::PREVIEW_APP_ID),
+            "Vibex Preview"
+        );
+
+        let titlebar = workbench_titlebar(vibex_desktop_runtime::PREVIEW_APP_ID);
+        assert_eq!(titlebar.title.as_deref(), Some("Vibex Preview"));
+        // The client-drawn bar still owns the window controls and the macOS
+        // traffic lights, so the named title must not reset those options.
+        assert!(titlebar.appears_transparent);
+        assert!(titlebar.traffic_light_position.is_some());
     }
 }
