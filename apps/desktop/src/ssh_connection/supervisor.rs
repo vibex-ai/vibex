@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use serde::Deserialize;
 
 use super::command::SshCommand;
-use super::launch::{LaunchConfig, LaunchError, LaunchState, run_script, start};
+use super::launch::{LaunchConfig, LaunchError, LaunchState, run_script, start, write_env};
 
 const STATUS_TIMEOUT: Duration = Duration::from_secs(30);
 const STOP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -36,6 +36,18 @@ pub struct ServerStatus {
 impl ServerStatus {
     pub fn is_healthy(&self) -> bool {
         self.running && self.health == "ok"
+    }
+
+    /// Healthy *and* bound to the port this connection uses.
+    ///
+    /// A home owns exactly one runtime, but that runtime can outlive the
+    /// profile that started it: the SSH probe skips a port it finds busy, so
+    /// re-adding a host whose runtime is still up records the next port. The
+    /// status of the old process is still healthy, yet the tunnel and the
+    /// pairing claim address the new port, where nothing listens. Callers must
+    /// therefore treat a healthy runtime on another port as "not started".
+    pub fn is_healthy_on(&self, port: u16) -> bool {
+        self.is_healthy() && self.port == port
     }
 }
 
@@ -174,16 +186,45 @@ pub fn select_free_port(
     ))
 }
 
-/// Writes env, starts the runtime, and waits for `running=true, health=ok`.
+/// Writes env, starts the runtime, and waits for `running=true, health=ok` on
+/// `config.remote_port`.
+///
+/// A healthy runtime that is bound to a different port is not usable: the
+/// tunnel, the pairing endpoint and the env file all follow `remote_port`. It
+/// is stopped and restarted instead of being reported as already started,
+/// because otherwise pairing dials a closed loopback port and fails as
+/// `remote_http_unreachable`.
 pub fn ensure_started(
     command: &SshCommand,
     config: &LaunchConfig,
 ) -> Result<ServerStatus, SupervisorError> {
-    let outcome = start(command, config)?;
+    if let Ok(current) = status(command, config)
+        && current.is_healthy_on(config.remote_port)
+    {
+        // Refresh the env so the next start (manual or after a reboot) uses
+        // this profile's roots, but leave the running process alone.
+        write_env(command, config)?;
+        return Ok(current);
+    }
+    let mut outcome = start(command, config)?;
+    if outcome.state == LaunchState::PortConflict {
+        // The runtime that owns this home predates the profile and still holds
+        // the old port. `start` reads its own state file, so the env rewrite
+        // alone never moves it. Stop it through the same env file, then start
+        // again on the port this connection uses.
+        ensure_stopped(command, config)?;
+        outcome = start(command, config)?;
+        if outcome.state == LaunchState::PortConflict {
+            return Err(SupervisorError::retryable(
+                "ssh_runtime_port_conflict",
+                "the remote runtime is still bound to another port after a restart",
+            ));
+        }
+    }
     let deadline = Instant::now() + START_DEADLINE;
     loop {
         let current = status(command, config)?;
-        if current.is_healthy() {
+        if current.is_healthy_on(config.remote_port) {
             return Ok(current);
         }
         if !current.running
@@ -399,5 +440,120 @@ mod tests {
         assert!(STATUS_SCRIPT.contains("status --json"));
         assert!(STOP_SCRIPT.contains(" stop"));
         assert!(PORT_SCRIPT.contains("ss -ltn"));
+    }
+
+    #[test]
+    fn healthy_status_on_another_port_is_not_this_connection() {
+        let status = parse_status(
+            r#"{"schemaVersion":"vibex-server-status.v1","running":true,"pid":42,"port":8766,"version":"0.1.0","home":"/home/dev","health":"ok"}"#,
+        )
+        .unwrap();
+        assert!(status.is_healthy());
+        assert!(!status.is_healthy_on(8767));
+        assert!(status.is_healthy_on(8766));
+    }
+
+    /// The production failure: a runtime left over from an earlier profile keeps
+    /// owning the home and serves the old port, while the profile, the env file
+    /// and the tunnel all moved to the next free port. Reporting that runtime as
+    /// started makes pairing dial a closed loopback port and fail with
+    /// `remote_http_unreachable`. `ensure_started` must stop it and restart on
+    /// the requested port instead.
+    #[cfg(unix)]
+    #[test]
+    fn ensure_started_restarts_a_runtime_bound_to_another_port() {
+        let dir = tempfile::tempdir().unwrap();
+        let calls = dir.path().join("calls");
+        let running = dir.path().join("running-port");
+        std::fs::write(&running, "8766").unwrap();
+        let ssh = fake_ssh(
+            dir.path(),
+            &format!(
+                "script=$(cat)\n\
+                 wanted=8767\n\
+                 case \"$script\" in\n\
+                   *launch=already_running*)\n\
+                     current=$(cat {running} 2>/dev/null || true)\n\
+                     if [ -n \"$current\" ] && [ \"$current\" = \"$wanted\" ]; then\n\
+                       echo 'launch=already_running'\n\
+                     elif [ -n \"$current\" ]; then\n\
+                       echo \"launch=port_conflict port=$current wanted=$wanted\"\n\
+                     else\n\
+                       echo \"$wanted\" > {running}\n\
+                       echo 'launch=started pid=7'\n\
+                     fi ;;\n\
+                   *'\"$binary\" stop'*)\n\
+                     rm -f {running}\n\
+                     echo 'stopped=true' >> {calls}\n\
+                     echo 'stopped=true' ;;\n\
+                   *env=ok*)\n\
+                     echo 'env=ok' ;;\n\
+                   *'status --json'*)\n\
+                     current=$(cat {running} 2>/dev/null || true)\n\
+                     if [ -n \"$current\" ]; then\n\
+                       echo \"{{\\\"schemaVersion\\\":\\\"vibex-server-status.v1\\\",\\\"running\\\":true,\\\"pid\\\":7,\\\"port\\\":$current,\\\"version\\\":\\\"0.1.0\\\",\\\"home\\\":\\\"/home/dev\\\",\\\"health\\\":\\\"ok\\\"}}\"\n\
+                     else\n\
+                       echo '{{\"schemaVersion\":\"vibex-server-status.v1\",\"running\":false,\"pid\":null,\"port\":8767,\"version\":\"0.1.0\",\"home\":\"/home/dev\",\"health\":\"stopped\"}}'\n\
+                     fi ;;\n\
+                   *) echo 'ok';;\n\
+                 esac",
+                running = running.display(),
+                calls = calls.display(),
+            ),
+        );
+        let command = SshCommand::new(&ssh);
+        let launch = LaunchConfig::new(
+            "/home/dev",
+            "/home/dev/.local/share/vibex/server",
+            &["/home/dev".to_string()],
+            8767,
+        )
+        .unwrap();
+        let status = ensure_started(&command, &launch).unwrap();
+        assert!(status.is_healthy_on(8767));
+        assert_eq!(status.pid, Some(7));
+        // The stale runtime was stopped before the replacement started.
+        let log = std::fs::read_to_string(&calls).unwrap();
+        assert!(
+            log.contains("stopped=true"),
+            "the old runtime must be stopped: {log}"
+        );
+        assert_eq!(std::fs::read_to_string(&running).unwrap().trim(), "8767");
+    }
+
+    /// A healthy runtime already bound to the requested port is adopted as-is:
+    /// connecting to a host twice must not restart it.
+    #[cfg(unix)]
+    #[test]
+    fn ensure_started_keeps_a_runtime_on_the_requested_port() {
+        let dir = tempfile::tempdir().unwrap();
+        let calls = dir.path().join("calls");
+        let ssh = fake_ssh(
+            dir.path(),
+            &format!(
+                "script=$(cat)\n\
+                 case \"$script\" in\n\
+                   *'\"$binary\" stop'*) echo 'stopped=true' >> {calls} ;;\n\
+                   *'launch=started'*) echo 'launch=started pid=9' >> {calls} ;;\n\
+                 esac\n\
+                 case \"$script\" in\n\
+                   *'env=ok'*) echo 'env=ok' ;;\n\
+                   *'status --json'*) echo '{{\"schemaVersion\":\"vibex-server-status.v1\",\"running\":true,\"pid\":9,\"port\":8767,\"version\":\"0.1.0\",\"home\":\"/home/dev\",\"health\":\"ok\"}}' ;;\n\
+                   *) echo 'ok' ;;\n\
+                 esac",
+                calls = calls.display(),
+            ),
+        );
+        let command = SshCommand::new(&ssh);
+        let launch = LaunchConfig::new(
+            "/home/dev",
+            "/home/dev/.local/share/vibex/server",
+            &["/home/dev".to_string()],
+            8767,
+        )
+        .unwrap();
+        let status = ensure_started(&command, &launch).unwrap();
+        assert_eq!(status.pid, Some(9));
+        assert!(!calls.exists(), "a healthy runtime must not be restarted");
     }
 }

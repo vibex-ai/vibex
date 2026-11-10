@@ -295,6 +295,7 @@ pub fn classify(code: &str) -> SshDiagnosticKind {
         | "ssh_launch_unexpected"
         | "ssh_runtime_start_failed"
         | "ssh_runtime_health_timeout"
+        | "ssh_runtime_port_conflict"
         | "ssh_runtime_still_running" => SshDiagnosticKind::Start,
         "ssh_upgrade_incompatible" => SshDiagnosticKind::Version,
         code if code.starts_with("ssh_tunnel") => SshDiagnosticKind::Tunnel,

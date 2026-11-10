@@ -61,6 +61,10 @@ impl RemoteArch {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PortState {
     Free,
+    /// A post-install headless runtime for this home is already listening on
+    /// the probed port. Re-adding the host must keep that port: shifting to
+    /// the next free one would point the tunnel at a port nothing listens on.
+    OwnRuntime,
     Busy,
     Unknown,
 }
@@ -113,6 +117,9 @@ pub struct RemoteEnvironment {
 impl RemoteEnvironment {
     /// Blocking checks. Git and an unknown port are warnings; a non-writable
     /// home, missing sha256sum, old glibc, low disk and a busy port are errors.
+    ///
+    /// A port already serving this home's own runtime is neither: the profile
+    /// keeps that port and the start step reuses the healthy runtime.
     pub fn validate(&self, min_free_kb: u64) -> Result<(), EnvironmentError> {
         if self.os == "Linux" {
             let glibc = self.glibc.ok_or(EnvironmentError::MissingGlibc)?;
@@ -280,6 +287,28 @@ elif command -v lsof >/dev/null 2>&1; then
     port=free
   fi
 fi
+# A live runtime that already owns this home is the only listener re-adding
+# the host may keep. Ask the installed runtime itself which port it bound: its
+# env file and status are authoritative, and any other listener (a stranger, or
+# this runtime on a different port) leaves the probe `busy` so the caller moves
+# on. Running it in a subshell keeps the probe's own environment untouched.
+if [ "$port" = busy ] && [ -x "$HOME/{RUNTIME_CURRENT_PATH}" ]; then
+  env="$HOME/.local/state/vibex/server/runtime.env"
+  if [ -f "$env" ]; then
+    own=$(
+      set -a
+      . "$env" 2>/dev/null || exit 0
+      set +a
+      "$HOME/{RUNTIME_CURRENT_PATH}" status --json 2>/dev/null || true
+    )
+    own_port=$(printf '%s' "$own" | sed -n 's/.*"port":\([0-9][0-9]*\).*/\1/p')
+    if [ "$own_port" = "{remote_port}" ]; then
+      case "$own" in
+        *'"running":true'*) port=own_runtime ;;
+      esac
+    fi
+  fi
+fi
 printf 'port=%s\n' "$port"
 if [ -x "$HOME/{RUNTIME_CURRENT_PATH}" ]; then echo runtime=present; else echo runtime=absent; fi
 printf 'probe=ok\n'
@@ -362,6 +391,7 @@ pub fn parse_probe_output(stdout: &str) -> Result<RemoteEnvironment, Environment
             "port" => {
                 port_state = match value {
                     "free" => PortState::Free,
+                    "own_runtime" => PortState::OwnRuntime,
                     "busy" => PortState::Busy,
                     "unknown" => PortState::Unknown,
                     _ => {
@@ -499,6 +529,29 @@ runtime=present\n";
         assert!(environment.runtime_present);
         assert!(environment.warnings.is_empty());
         assert_eq!(environment.validate(MIN_FREE_KB), Ok(()));
+    }
+
+    /// Re-adding a host whose runtime is still up must keep the port it bound.
+    /// Treating that port as busy moves the profile to the next free port,
+    /// where nothing listens, and pairing then fails `remote_http_unreachable`.
+    #[test]
+    fn a_port_served_by_this_homes_runtime_is_not_busy() {
+        let output = CANONICAL.replace("port=free", "port=own_runtime");
+        let environment = parse_probe_output(&output).unwrap();
+        assert_eq!(environment.port_state, PortState::OwnRuntime);
+        assert!(environment.runtime_present);
+        assert_eq!(environment.validate(MIN_FREE_KB), Ok(()));
+    }
+
+    #[test]
+    fn a_stranger_on_the_port_is_still_busy() {
+        let output = CANONICAL.replace("port=free", "port=busy");
+        let environment = parse_probe_output(&output).unwrap();
+        assert_eq!(environment.port_state, PortState::Busy);
+        assert_eq!(
+            environment.validate(MIN_FREE_KB),
+            Err(EnvironmentError::PortBusy)
+        );
     }
 
     #[test]
@@ -664,6 +717,19 @@ runtime=present\n";
         assert!(script.contains("probe=ok"));
         assert!(script.contains(".local/share/vibex/server/current/vibex-server"));
         assert!(!script.contains("sh -c"));
+    }
+
+    /// The runtime that already owns the home is identified by asking it, not by
+    /// reading a state file: `status --json` is the contract the supervisor also
+    /// uses for the bound port.
+    #[test]
+    fn the_script_asks_the_installed_runtime_for_its_own_port() {
+        let script = probe_script(8765);
+        assert!(script.contains("own_runtime"));
+        assert!(script.contains("status --json"));
+        assert!(script.contains("runtime.env"));
+        // The probe must not treat any listener as its own.
+        assert!(!script.contains("port=own_runtime\n"));
     }
 
     #[cfg(all(target_os = "linux", target_env = "gnu"))]

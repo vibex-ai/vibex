@@ -272,8 +272,8 @@ lines of `server.log`) and **Copy log command**.
 | Permission | `ssh_permission_denied`, `ssh_environment_home_not_writable` | Fix ownership and write permission of the remote home and install root. |
 | Disk | `ssh_environment_disk_low` | Free at least 512 MiB under the remote home. |
 | glibc too old | `ssh_environment_glibc_too_old`, `ssh_environment_missing_glibc` | The host needs glibc 2.35+ (Ubuntu 22.04+, Debian 12+, RHEL 9+). musl-only hosts such as Alpine cannot run the runtime. |
-| Port busy | `ssh_environment_port_busy` | Free the runtime port or Retry; the next free port is chosen. |
-| Start failed | `ssh_launch_failed`, `ssh_runtime_start_failed`, `ssh_runtime_health_timeout`, … | View log, fix the cause it names, Retry. |
+| Port busy | `ssh_environment_port_busy` | Another program holds the runtime port. Free it or Retry; the next free port is chosen. A port already served by this host's own Vibex runtime is kept, not skipped. |
+| Start failed | `ssh_launch_failed`, `ssh_runtime_start_failed`, `ssh_runtime_health_timeout`, `ssh_runtime_port_conflict`, … | View log, fix the cause it names, Retry. A runtime still bound to an older port is stopped and restarted on the port the connection uses. |
 | Version | `ssh_upgrade_incompatible` | Update runtime or Update Vibex, per the compatibility state. |
 | Tunnel | `ssh_tunnel_*` | Usually the local port is taken or SSH dropped; Retry. |
 | Pairing | `ssh_pairing_*`, `remote_*` | Retry. If the runtime revoked this desktop, choose Connect on the connection to pair again. |

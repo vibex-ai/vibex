@@ -110,6 +110,9 @@ pub enum LaunchState {
     Started,
     AlreadyRunning,
     PidAlive,
+    /// A runtime owns this home but is bound to another port. Nothing was
+    /// started; the caller must restart it on the requested port.
+    PortConflict,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -234,8 +237,24 @@ test -x "$binary"
 set -a
 . "$envfile"
 set +a
-if "$binary" status --json 2>/dev/null | grep -q '"running":true'; then
+# The home owns at most one runtime, and that runtime may predate this env
+# file: a re-added profile picks the next free port while the old process keeps
+# running. Reporting `already_running` then would leave the tunnel and pairing
+# dialing a port nothing listens on, so the runtime's own bound port has to
+# match the one this env file asks for.
+wanted_port=${VIBEX_BIND_ADDR##*:}
+status=$("$binary" status --json 2>/dev/null || true)
+case "$status" in
+  *'"running":true'*) running=true ;;
+  *) running=false ;;
+esac
+running_port=$(printf '%s' "$status" | sed -n 's/.*"port":\([0-9][0-9]*\).*/\1/p')
+if [ "$running" = true ] && [ "$running_port" = "$wanted_port" ]; then
   echo "launch=already_running"
+  exit 0
+fi
+if [ "$running" = true ]; then
+  echo "launch=port_conflict port=$running_port wanted=$wanted_port"
   exit 0
 fi
 if [ -f "$pidfile" ]; then
@@ -271,6 +290,10 @@ fn parse_start_output(stdout: &str) -> Result<StartOutcome, LaunchError> {
             Some("started") => LaunchState::Started,
             Some("already_running") => LaunchState::AlreadyRunning,
             Some("pid_alive") => LaunchState::PidAlive,
+            // The running runtime is bound to another port. The caller stops
+            // and starts it instead of reporting success for a port nothing
+            // listens on.
+            Some("port_conflict") => LaunchState::PortConflict,
             _ => continue,
         };
         let pid = parts
@@ -443,9 +466,27 @@ mod tests {
             LaunchState::PidAlive
         );
         assert_eq!(
+            parse_start_output("launch=port_conflict port=8766 wanted=8767\n")
+                .unwrap()
+                .state,
+            LaunchState::PortConflict
+        );
+        assert_eq!(
             parse_start_output("noise\n").unwrap_err().code,
             "ssh_launch_unexpected"
         );
+    }
+
+    /// The script must compare the runtime's own bound port with the port its
+    /// env file asks for. `already_running` for any healthy runtime is what
+    /// produced `remote_http_unreachable` on a re-added host: the old process
+    /// kept serving the previous port while the tunnel moved to the new one.
+    #[test]
+    fn start_script_requires_the_running_port_to_match_the_env_port() {
+        assert!(START_SCRIPT.contains("wanted_port=${VIBEX_BIND_ADDR##*:}"));
+        assert!(START_SCRIPT.contains("running_port=$(printf '%s' \"$status\""));
+        assert!(START_SCRIPT.contains("launch=port_conflict"));
+        assert!(!START_SCRIPT.contains("grep -q '\"running\":true'"));
     }
 
     #[cfg(unix)]

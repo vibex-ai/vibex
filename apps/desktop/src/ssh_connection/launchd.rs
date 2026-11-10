@@ -86,7 +86,12 @@ pub fn plist_path(config: &LaunchConfig, label: &str) -> String {
     format!("{}/Library/LaunchAgents/{label}.plist", config.remote_home)
 }
 
-/// Writes the plist, reloads the agent, and waits for the runtime health check.
+/// Writes the plist, reloads the agent, and waits for the runtime health check
+/// on the port this connection uses.
+///
+/// A healthy runtime bound to another port is restarted: the tunnel and the
+/// pairing endpoint follow `config.remote_port`, so keeping the old process
+/// would leave pairing dialing a closed loopback port.
 pub fn ensure_started(
     command: &SshCommand,
     config: &LaunchConfig,
@@ -96,7 +101,13 @@ pub fn ensure_started(
     if let Ok(current) = supervisor::status(command, config)
         && current.is_healthy()
     {
-        return Ok(current);
+        if current.is_healthy_on(config.remote_port) {
+            return Ok(current);
+        }
+        // `KeepAlive` is false, so the reload below would boot the old agent
+        // out without its process necessarily exiting; stop the runtime
+        // explicitly so the replacement binds `config.remote_port`.
+        supervisor::ensure_stopped(command, config)?;
     }
     write_env(command, config)?;
     let plist = plist_content(config, label);
@@ -129,7 +140,7 @@ pub fn ensure_started(
     let deadline = Instant::now() + START_DEADLINE;
     loop {
         let current = supervisor::status(command, config)?;
-        if current.is_healthy() {
+        if current.is_healthy_on(config.remote_port) {
             return Ok(current);
         }
         if Instant::now() >= deadline {

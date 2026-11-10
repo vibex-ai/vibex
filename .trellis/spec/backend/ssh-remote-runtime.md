@@ -116,6 +116,18 @@ launch::LaunchConfig::new(remote_home, remote_install_root, workspace_roots, por
   Never interpolate a host, path, user, or key into the script text.
 - The runtime binds `127.0.0.1:<port>` (`VIBEX_BIND_ADDR`); the tunnel is
   `-L 127.0.0.1:<local>:127.0.0.1:<remote>` with `ExitOnForwardFailure=yes`.
+- **One home owns one runtime, and the port is part of the profile contract.**
+  `status --json` is authoritative for the port a runtime actually bound, so a
+  healthy status is only usable when `status.port == profile.remote_port`
+  (`ServerStatus::is_healthy_on`). A healthy runtime on another port is
+  restarted, never adopted: the profile, `runtime.env`, the tunnel and the
+  pairing endpoint all follow `remote_port`, so adopting the old port leaves
+  pairing dialing a closed loopback port (`remote_http_unreachable`).
+  The launcher (`START_SCRIPT`) enforces the same rule and reports
+  `launch=port_conflict` instead of `already_running`.
+- The environment probe reports `port=own_runtime` when the listener on the
+  probed port is this home's live runtime, and that state is not "busy":
+  re-adding a host must keep the port the runtime already bound.
 - Every `serve` launch (nohup, LaunchAgent plist, WSL foreground) passes
   `--no-pairing`; the pairing code is fetched only via `pairing-code --json`
   and claimed with the certificate from the same payload.
@@ -145,6 +157,12 @@ launch::LaunchConfig::new(remote_home, remote_install_root, workspace_roots, por
   ssh runs `sh -c "$*"` like sshd; `;`, `$()`, backticks, quotes, newlines reach
   the script literally and nothing executes.
 - `launch::tests::start_script_never_prints_a_pairing_code_into_the_log`.
+- `launch::tests::start_script_requires_the_running_port_to_match_the_env_port`
+  and `supervisor::tests::ensure_started_restarts_a_runtime_bound_to_another_port`
+  pin the port-ownership rule; `ensure_started_keeps_a_runtime_on_the_requested_port`
+  pins the no-restart path, and
+  `environment::tests::a_port_served_by_this_homes_runtime_is_not_busy` pins the
+  probe's `own_runtime` classification.
 - Docker E2E `provisioning_reaches_ready_over_sshd` asserts the real
   `server.log` has no `pairing_code=` / `vibex://pair`.
 - `pairing::tests` — `Debug` of `PairingPayload` redacts code, link, cert.

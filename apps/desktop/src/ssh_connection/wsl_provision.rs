@@ -187,11 +187,18 @@ impl WslProvisioner {
         Ok(())
     }
 
+    /// Starts the runtime on the port this connection uses.
+    ///
+    /// A healthy runtime bound to another port is stopped first: the distro
+    /// owns one runtime per home, so the old process would otherwise keep the
+    /// home lock and the port while WSL2 forwarding and pairing follow
+    /// `remote_port`.
     pub fn ensure_started(&self) -> Result<ServerStatus, WslProvisionError> {
         if let Ok(current) = self.status()
             && current.is_healthy()
+            && !current.is_healthy_on(self.launch.remote_port)
         {
-            return Ok(current);
+            self.stop()?;
         }
         self.write_env()?;
         self.command()
@@ -208,7 +215,7 @@ impl WslProvisioner {
         let deadline = Instant::now() + START_TIMEOUT;
         loop {
             if let Ok(current) = self.status()
-                && current.is_healthy()
+                && current.is_healthy_on(self.launch.remote_port)
             {
                 return Ok(current);
             }
@@ -225,6 +232,12 @@ impl WslProvisioner {
     /// Starts the runtime as a foreground child of a held `wsl.exe` and waits
     /// for health. The returned keepalive must stay alive for the runtime.
     pub fn start_foreground(&self) -> Result<(WslKeepalive, ServerStatus), WslProvisionError> {
+        if let Ok(current) = self.status()
+            && current.is_healthy()
+            && !current.is_healthy_on(self.launch.remote_port)
+        {
+            self.stop()?;
+        }
         self.write_env()?;
         let keepalive = WslKeepalive::spawn_runtime(
             &self.program,
@@ -236,7 +249,7 @@ impl WslProvisioner {
         let deadline = Instant::now() + START_TIMEOUT;
         loop {
             if let Ok(status) = self.status()
-                && status.is_healthy()
+                && status.is_healthy_on(self.launch.remote_port)
             {
                 return Ok((keepalive, status));
             }
