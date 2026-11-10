@@ -5887,8 +5887,10 @@ fn a_tool_heavy_turn_stays_a_short_run_of_rows() {
         "the rule does not repeat the turn's duration: {rule:?}"
     );
     // Mixed runs report each semantic category, including the changed file.
+    // Changed files lead, because that is the outcome a reader scans a summary
+    // for; the remaining categories follow in their fixed order.
     assert!(
-        screen.contains("Read 3 files · Changed 1 file · Searched 1 time"),
+        screen.contains("Changed 1 file · Read 3 files · Searched 1 time"),
         "{screen}"
     );
     assert!(
@@ -8583,10 +8585,18 @@ fn a_running_session_reads_as_rows() {
         "the bottom-only progress should leave when a tool follows:\n{screen}"
     );
     // A running tool names its command and stays visible beside completed
-    // work. The raw input and output remain behind the fold.
+    // work. The raw input and output remain behind the fold. Agents open every
+    // command with `cd <absolute path> &&` to pin the directory it runs in, and
+    // that prefix is identical on every row while pushing what the command does
+    // past the truncation point, so the row leaves it out; the full command
+    // stays in the detail.
     assert!(
-        screen.contains("cd /home/peatboy/code/peatboy/vibex-dev/vibex && git diff"),
+        screen.contains("git diff -- crates/vibex-tui/src/app.rs"),
         "the tool's command is not on its row:\n{screen}"
+    );
+    assert!(
+        !screen.contains("cd /home/peatboy/code/peatboy/vibex-dev/vibex"),
+        "the row kept the `cd` prefix it shares with every other row:\n{screen}"
     );
     assert!(
         !screen.contains("\"command\""),

@@ -305,7 +305,9 @@ fn mixed_activity_runs_count_distinct_paths_and_keep_live_failures_visible() {
         AgentSessionState::Running,
     );
     let text = draw(&mut app, 100, 30);
-    assert!(text.contains("Read 1 file · Changed 2 files"), "{text}");
+    // Changed files lead the summary, because that is the outcome a reader
+    // scans a run of activity for.
+    assert!(text.contains("Changed 2 files · Read 1 file"), "{text}");
     assert!(
         text.contains("cargo test") && text.contains("cargo check"),
         "{text}"
@@ -325,7 +327,7 @@ fn mixed_activity_runs_count_distinct_paths_and_keep_live_failures_visible() {
             .all(|block| !block.expanded && !block.group.is_hidden())
     );
     let text = draw(&mut app, 100, 40);
-    assert!(text.contains("Read 1 file · Changed 2 files"), "{text}");
+    assert!(text.contains("Changed 2 files · Read 1 file"), "{text}");
     assert!(
         text.contains("Cargo.toml") && text.contains("main.rs"),
         "{text}"
