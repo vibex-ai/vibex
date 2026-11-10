@@ -10170,6 +10170,20 @@ pub struct VibexWorkbench {
     ssh_provisioning: Option<ProvisioningService<SshProvisioningEffects>>,
     #[allow(dead_code)]
     ssh_provisioning_start_task: Option<Task<()>>,
+    /// Whether a start task (probe → manifest → download) is resolving.
+    ///
+    /// Provisioning is one run at a time — one service, one snapshot, one
+    /// tunnel — but adding two hosts in a row is ordinary. Without this the
+    /// second add replaced the first run's start task, and dropping that task
+    /// aborted the first host's download mid-stream: the `.part` file stayed
+    /// behind, no error was ever raised, and the row sat at "Offline / Not
+    /// installed" for good.
+    ssh_provisioning_starting: bool,
+    /// Profiles waiting for the single provisioning slot, in arrival order.
+    ///
+    /// A set with an order: a host added twice is provisioned once, and the
+    /// host added first is provisioned first.
+    ssh_provisioning_pending: VecDeque<String>,
     #[allow(dead_code)]
     ssh_upgrade_task: Option<Task<()>>,
     ssh_upgrade_running: bool,
@@ -12132,6 +12146,8 @@ impl VibexWorkbench {
             remote_client: None,
             ssh_provisioning: None,
             ssh_provisioning_start_task: None,
+            ssh_provisioning_starting: false,
+            ssh_provisioning_pending: VecDeque::new(),
             ssh_upgrade_task: None,
             ssh_upgrade_running: false,
             ssh_upgrade_error: None,
@@ -15232,10 +15248,6 @@ impl VibexWorkbench {
         };
         let desktop_home = config.home_dir.clone();
         self.wsl_error = None;
-        self.settings_view.update(cx, |settings, cx| {
-            settings.connections_wsl_error = None;
-            cx.notify();
-        });
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
             let mut command = WslCommand::new("wsl.exe", &distro);
             let output = command
@@ -15354,10 +15366,6 @@ impl VibexWorkbench {
                             );
                             this.mark_runtime_active(&runtime_id, cx);
                             this.wsl_runtime_labels.insert(runtime_id, distro.clone());
-                            this.settings_view.update(cx, |settings, cx| {
-                                settings.connections_wsl_error = None;
-                                cx.notify();
-                            });
                             this.runtime_note = Some(format!(
                                 "{} {distro}",
                                 locale::text(
@@ -15369,18 +15377,21 @@ impl VibexWorkbench {
                         }
                         Ok(Err(error)) => {
                             this.wsl_error = Some(error.clone());
-                            this.settings_view.update(cx, |settings, cx| {
-                                settings.connections_wsl_error = Some(error.clone());
-                                cx.notify();
-                            });
+                            // The WSL dialog closes on submit, so the failure is
+                            // announced on the hint layer instead of in a body
+                            // that is no longer on screen.
+                            this.queue_settings_operation_notice(
+                                SettingsOperationNotice::error(error),
+                                cx,
+                            );
                         }
                         Err(_) => {
                             let error = "the WSL task stopped unexpectedly".to_string();
                             this.wsl_error = Some(error.clone());
-                            this.settings_view.update(cx, |settings, cx| {
-                                settings.connections_wsl_error = Some(error);
-                                cx.notify();
-                            });
+                            this.queue_settings_operation_notice(
+                                SettingsOperationNotice::error(error),
+                                cx,
+                            );
                         }
                     }
                     cx.notify();
@@ -15695,25 +15706,59 @@ impl VibexWorkbench {
         cx.notify();
     }
 
-    /// Loads a saved profile, resolves the server artifact, downloads it, and
-    /// starts the provisioning worker. The add flow calls this after saving a
-    /// probed profile.
-    #[allow(dead_code)]
+    /// Queues a saved profile for provisioning and starts it when the slot is
+    /// free. The add flow calls this after saving a probed profile.
+    ///
+    /// Provisioning is one run at a time — one service, one snapshot, one
+    /// tunnel — but adding several hosts in a row is ordinary. Each request
+    /// therefore joins a queue instead of replacing the run in flight: the old
+    /// code overwrote `ssh_provisioning_start_task`, and dropping that task
+    /// aborted the previous host's download mid-stream. The `.part` file stayed
+    /// on disk, no error was raised, and the row sat at "Offline / Not
+    /// installed" for good.
     fn start_ssh_profile_provisioning(&mut self, profile_id: String, cx: &mut Context<Self>) {
-        if self.ssh_provisioning.is_some() {
+        if !self.ssh_provisioning_pending.contains(&profile_id) {
+            self.ssh_provisioning_pending.push_back(profile_id);
+        }
+        self.pump_ssh_provisioning_queue(cx);
+    }
+
+    /// Starts the next queued profile when nothing else owns the slot.
+    fn pump_ssh_provisioning_queue(&mut self, cx: &mut Context<Self>) {
+        if self.ssh_provisioning_starting || self.ssh_provisioning.is_some() {
             return;
         }
+        let Some(profile_id) = self.ssh_provisioning_pending.pop_front() else {
+            return;
+        };
+        self.ssh_provisioning_starting = true;
+        self.resolve_ssh_profile_provisioning(profile_id, cx);
+    }
+
+    /// Releases the slot after a failed start and hands it to the next profile.
+    ///
+    /// A start that never reaches the worker has to leave the queue moving:
+    /// otherwise one unreachable host would park every host added after it.
+    fn fail_ssh_provisioning_start(&mut self, error: String, cx: &mut Context<Self>) {
+        self.ssh_provisioning_starting = false;
+        self.ssh_provisioning_error = Some(error.clone());
+        self.queue_settings_operation_notice(SettingsOperationNotice::error(error), cx);
+        self.sync_ssh_provisioning_settings(cx);
+        self.pump_ssh_provisioning_queue(cx);
+        cx.notify();
+    }
+
+    /// Resolves one profile's artifact and hands it to the provisioning worker.
+    fn resolve_ssh_profile_provisioning(&mut self, profile_id: String, cx: &mut Context<Self>) {
         let Some(config) = self.config.clone() else {
-            self.ssh_provisioning_error =
-                Some("the runtime configuration is unavailable".to_string());
-            self.sync_ssh_provisioning_settings(cx);
-            cx.notify();
+            self.fail_ssh_provisioning_start(
+                "the runtime configuration is unavailable".to_string(),
+                cx,
+            );
             return;
         };
         let Some(runtime) = self.runtime.clone() else {
-            self.ssh_provisioning_error = Some("the local runtime is unavailable".to_string());
-            self.sync_ssh_provisioning_settings(cx);
-            cx.notify();
+            self.fail_ssh_provisioning_start("the local runtime is unavailable".to_string(), cx);
             return;
         };
         let profiles = SshProfileStore::at_home(&config.home_dir)
@@ -15723,9 +15768,7 @@ impl VibexWorkbench {
             .into_iter()
             .find(|profile| profile.id == profile_id)
         else {
-            self.ssh_provisioning_error = Some("the SSH profile was not found".to_string());
-            self.sync_ssh_provisioning_settings(cx);
-            cx.notify();
+            self.fail_ssh_provisioning_start("the SSH profile was not found".to_string(), cx);
             return;
         };
         let home = config.home_dir.clone();
@@ -15799,15 +15842,14 @@ impl VibexWorkbench {
                             this.start_ssh_provisioning(effects, profile_id, cx);
                         }
                         Ok(Err(error)) => {
-                            this.ssh_provisioning_error = Some(error);
-                            this.sync_ssh_provisioning_settings(cx);
+                            this.fail_ssh_provisioning_start(error, cx);
                         }
                         Err(_) => {
-                            this.ssh_provisioning_error = Some(
+                            this.fail_ssh_provisioning_start(
                                 "the SSH provisioning download task stopped unexpectedly"
                                     .to_string(),
+                                cx,
                             );
-                            this.sync_ssh_provisioning_settings(cx);
                         }
                     }
                     cx.notify();
@@ -15819,7 +15861,6 @@ impl VibexWorkbench {
 
     /// Starts a background SSH provisioning run. The Connections UI calls this
     /// once it has a resolved profile and a verified local artifact.
-    #[allow(dead_code)]
     fn start_ssh_provisioning(
         &mut self,
         effects: SshProvisioningEffects,
@@ -15827,19 +15868,24 @@ impl VibexWorkbench {
         cx: &mut Context<Self>,
     ) {
         if self.ssh_provisioning.is_some() {
+            // The slot is taken; the caller's profile waits its turn and the
+            // resolving flag is released so the pump can run again later.
+            self.ssh_provisioning_starting = false;
+            if !self.ssh_provisioning_pending.contains(&profile_id) {
+                self.ssh_provisioning_pending.push_back(profile_id);
+            }
             return;
         }
         let service =
             match ProvisioningService::start(effects, profile_id, unix_timestamp_ms(), false) {
                 Ok(service) => service,
                 Err(error) => {
-                    self.ssh_provisioning_error = Some(error.message);
-                    self.sync_ssh_provisioning_settings(cx);
-                    cx.notify();
+                    self.fail_ssh_provisioning_start(error.message, cx);
                     return;
                 }
             };
         self.ssh_provisioning = Some(service);
+        self.ssh_provisioning_starting = false;
         self.ssh_provisioning_error = None;
         self.ssh_provisioning_snapshot = None;
         self.sync_ssh_provisioning_settings(cx);
@@ -15984,10 +16030,23 @@ impl VibexWorkbench {
     fn finish_ssh_provisioning(
         &mut self,
         outcome: Result<ProvisioningRunOutcome, crate::ssh_connection::ProvisioningControlError>,
-        mut effects: SshProvisioningEffects,
+        effects: SshProvisioningEffects,
         cx: &mut Context<Self>,
     ) {
         self.ssh_provisioning = None;
+        self.ssh_provisioning_starting = false;
+        self.finish_ssh_provisioning_outcome(outcome, effects, cx);
+        // This run no longer owns the slot, so the next queued host starts
+        // here rather than waiting for another add to nudge it.
+        self.pump_ssh_provisioning_queue(cx);
+    }
+
+    fn finish_ssh_provisioning_outcome(
+        &mut self,
+        outcome: Result<ProvisioningRunOutcome, crate::ssh_connection::ProvisioningControlError>,
+        mut effects: SshProvisioningEffects,
+        cx: &mut Context<Self>,
+    ) {
         match outcome {
             Ok(ProvisioningRunOutcome::Ready(snapshot)) => {
                 let Some(backend) = effects.backend() else {
@@ -16037,9 +16096,18 @@ impl VibexWorkbench {
             }
             Ok(ProvisioningRunOutcome::Failed(snapshot)) => {
                 self.ssh_provisioning_snapshot = Some(snapshot.clone());
-                self.ssh_provisioning_error = snapshot
+                let error = snapshot
                     .failure
+                    .as_ref()
                     .map(|failure| format!("{}: {}", failure.code, failure.message));
+                self.ssh_provisioning_error = error.clone();
+                // The progress dialog closes itself on a terminal attempt, so a
+                // failure that only lived there would vanish with it and leave
+                // the row at "Offline / Not installed" with no explanation. It
+                // is announced on the hint layer, which outlives the dialog.
+                if let Some(error) = error {
+                    self.queue_settings_operation_notice(SettingsOperationNotice::error(error), cx);
+                }
                 self.sync_ssh_provisioning_settings(cx);
                 cx.notify();
             }
@@ -16050,7 +16118,9 @@ impl VibexWorkbench {
                 cx.notify();
             }
             Err(error) => {
-                self.ssh_provisioning_error = Some(error.to_string());
+                let error = error.to_string();
+                self.ssh_provisioning_error = Some(error.clone());
+                self.queue_settings_operation_notice(SettingsOperationNotice::error(error), cx);
                 self.sync_ssh_provisioning_settings(cx);
                 cx.notify();
             }
@@ -17081,12 +17151,17 @@ impl VibexWorkbench {
             .ssh_provisioning_snapshot
             .as_ref()
             .is_some_and(|snapshot| snapshot.profile_id == profile.id);
+        // A queued profile that is deleted must not be started later, and it
+        // must not keep the single provisioning slot reserved.
+        self.ssh_provisioning_pending
+            .retain(|pending| *pending != profile.id);
         if provisioning_matches {
             // Dropping the service signals its worker; the snapshot is cleared
             // so the Connections page stops offering progress for a profile
             // that no longer exists.
             self.ssh_provisioning = None;
             self.ssh_provisioning_task = None;
+            self.ssh_provisioning_starting = false;
             self.ssh_provisioning_snapshot = None;
             self.ssh_provisioning_error = None;
             self.sync_ssh_provisioning_settings(cx);
@@ -83655,7 +83730,6 @@ enum ConnectionsProbeState {
     Idle,
     Probing(String),
     Added(String),
-    Failed(String),
 }
 
 #[derive(Debug, Clone)]
@@ -86100,16 +86174,9 @@ struct FoundationSettings {
     connections_probe_task: Option<Task<()>>,
     connections_log_view: Option<SshLogView>,
     connections_log_task: Option<Task<()>>,
-    /// A removal that failed, kept on the page beside the list it acted on.
-    ///
-    /// Removing a connection is the one action on this list that deletes
-    /// something, so a refused write has to say why instead of leaving the row
-    /// in place with no explanation.
-    connections_remove_error: Option<String>,
     connections_wsl_open: bool,
     connections_wsl_distros: Vec<String>,
     connections_wsl_selected: Option<String>,
-    connections_wsl_error: Option<String>,
     /// Whether the Bootstrap SSH panel is showing. The command is generated
     /// only after the user names the Linux account it authorizes.
     bootstrap_open: bool,
@@ -86582,11 +86649,9 @@ impl FoundationSettings {
                 connections_probe_task: None,
                 connections_log_view: None,
                 connections_log_task: None,
-                connections_remove_error: None,
                 connections_wsl_open: false,
                 connections_wsl_distros: Vec::new(),
                 connections_wsl_selected: None,
-                connections_wsl_error: None,
                 bootstrap_open: false,
                 bootstrap_user_input,
                 bootstrap_command: None,
@@ -86627,7 +86692,42 @@ impl FoundationSettings {
                 .map(SshProfileStore::at_home)
                 .and_then(|store| store.load().ok())
                 .unwrap_or_default();
+            self.resume_unprovisioned_connections(cx);
         }
+    }
+
+    /// Starts provisioning for saved profiles that never got a runtime.
+    ///
+    /// A profile is written to the store before provisioning runs, so a start
+    /// that never reached the worker — the app quit mid-download, the probe
+    /// flow was interrupted, an earlier build dropped the start task — leaves a
+    /// row that reads "Offline / Not installed" with nothing behind it. Opening
+    /// the page is the moment the reader is looking at exactly those rows, so
+    /// it is where they get another chance; a profile that has ever been
+    /// provisioned has a version or a runtime id and is left alone.
+    fn resume_unprovisioned_connections(&mut self, cx: &mut Context<Self>) {
+        let pending: Vec<String> = self
+            .connections_profiles
+            .iter()
+            .filter(|profile| {
+                profile.registered_runtime_id.is_none() && profile.runtime_version.is_none()
+            })
+            .map(|profile| profile.id.clone())
+            .collect();
+        if pending.is_empty() {
+            return;
+        }
+        // Activation can run inside `VibexWorkbench::update`, so the hand-off
+        // waits for the next effect cycle rather than updating that entity from
+        // its own update.
+        let workbench = self.workbench.clone();
+        cx.defer(move |cx| {
+            let _ = workbench.update(cx, |workbench, cx| {
+                for profile_id in pending {
+                    workbench.start_ssh_profile_provisioning(profile_id, cx);
+                }
+            });
+        });
     }
 
     /// Starts the storage-usage probe once the workbench is off the stack.
@@ -90097,6 +90197,19 @@ impl FoundationSettings {
         });
     }
 
+    /// Records a Connections failure and announces it on the hint layer.
+    ///
+    /// The Connections page lives inside the settings dialog, so a red line
+    /// painted on it cannot be closed and competes with the controls under it.
+    /// The workbench's hint layer sits above every dialog backdrop, dismisses on
+    /// a click and hides itself, so every failure on this page — a probe, a WSL
+    /// read, a refused removal — travels that way and leaves the page with
+    /// nothing to clear.
+    fn report_connections_failure(&mut self, error: String, cx: &mut Context<Self>) {
+        self.notify_settings_operation(SettingsOperationNotice::error(error), cx);
+        cx.notify();
+    }
+
     /// Deletes one saved SSH connection and everything this machine stored for
     /// it.
     ///
@@ -90106,40 +90219,36 @@ impl FoundationSettings {
     /// the reverse would leave a row that cannot be removed at all.
     fn remove_ssh_connection(&mut self, profile_id: &str, cx: &mut Context<Self>) {
         let Some(home_dir) = self.home_dir.clone() else {
-            self.connections_remove_error = Some(
+            self.report_connections_failure(
                 locale::text(
                     "The desktop home is unavailable, so the connection was not removed.",
                     "无法访问桌面数据目录，连接未移除。",
                     "無法存取桌面資料目錄，連線未移除。",
                 )
                 .to_string(),
+                cx,
             );
-            cx.notify();
             return;
         };
         let store = SshProfileStore::at_home(&home_dir);
         let mut profiles = match store.load() {
             Ok(profiles) => profiles,
             Err(error) => {
-                self.connections_remove_error = Some(format!("{}: {}", error.code, error.message));
-                cx.notify();
+                self.report_connections_failure(format!("{}: {}", error.code, error.message), cx);
                 return;
             }
         };
         let Some(index) = profiles.iter().position(|profile| profile.id == profile_id) else {
             // Already gone: refresh so the list stops showing it.
             self.reload_connections_profiles();
-            self.connections_remove_error = None;
             cx.notify();
             return;
         };
         let profile = profiles.remove(index);
         if let Err(error) = store.save(&profiles) {
-            self.connections_remove_error = Some(format!("{}: {}", error.code, error.message));
-            cx.notify();
+            self.report_connections_failure(format!("{}: {}", error.code, error.message), cx);
             return;
         }
-        self.connections_remove_error = None;
         self.connections_log_view = None;
         if self
             .connections_progress_target
@@ -90171,9 +90280,8 @@ impl FoundationSettings {
             return;
         }
         let Some(home_dir) = self.home_dir.clone() else {
-            self.connections_probe_state =
-                ConnectionsProbeState::Failed("the desktop home is unavailable".to_string());
-            cx.notify();
+            self.connections_probe_state = ConnectionsProbeState::Idle;
+            self.report_connections_failure("the desktop home is unavailable".to_string(), cx);
             return;
         };
         self.connections_probe_state = ConnectionsProbeState::Probing(alias.clone());
@@ -90265,11 +90373,17 @@ impl FoundationSettings {
                             });
                         }
                         Ok(Err(error)) => {
-                            this.connections_probe_state = ConnectionsProbeState::Failed(error);
+                            // The add dialog closes on submit, so the failure is
+                            // announced on the hint layer rather than parked in
+                            // a body that is no longer on screen.
+                            this.connections_probe_state = ConnectionsProbeState::Idle;
+                            this.report_connections_failure(error, cx);
                         }
                         Err(_) => {
-                            this.connections_probe_state = ConnectionsProbeState::Failed(
+                            this.connections_probe_state = ConnectionsProbeState::Idle;
+                            this.report_connections_failure(
                                 "the SSH probe task stopped unexpectedly".to_string(),
+                                cx,
                             );
                         }
                     }
@@ -90331,7 +90445,6 @@ impl FoundationSettings {
 
     fn load_wsl_distros(&mut self, cx: &mut Context<Self>) {
         self.connections_wsl_open = true;
-        self.connections_wsl_error = None;
         match crate::ssh_connection::wsl::list_distros(Path::new("wsl.exe")) {
             Ok(distros) => {
                 self.connections_wsl_selected = distros.first().cloned();
@@ -90340,7 +90453,10 @@ impl FoundationSettings {
             Err(error) => {
                 self.connections_wsl_distros.clear();
                 self.connections_wsl_selected = None;
-                self.connections_wsl_error = Some(format!("{}: {}", error.code, error.message));
+                // The distro list is read before the dialog opens, so the
+                // failure is a hint on the layer rather than a line in a body
+                // the reader has no way to dismiss.
+                self.report_connections_failure(format!("{}: {}", error.code, error.message), cx);
             }
         }
         cx.notify();
@@ -90465,19 +90581,10 @@ impl FoundationSettings {
                         .child(warning.clone()),
                 );
             }
-            let failure = match &probe {
-                ConnectionsProbeState::Failed(error) => Some(error.clone()),
-                _ => None,
-            };
-            if let Some(error) = failure {
-                body = body.child(
-                    div()
-                        .text_xs()
-                        .text_color(cx.theme().danger)
-                        .whitespace_normal()
-                        .child(error),
-                );
-            }
+            // A failed probe is reported on the hint layer, above every dialog
+            // backdrop: the add dialog closes on submit, so a red line in its
+            // body would either be gone in a frame or, when the dialog stays
+            // open, be an un-closable notice inside a panel.
             let probe_label = match &probe {
                 ConnectionsProbeState::Probing(alias) => Some(format!(
                     "{} {alias}…",
@@ -90600,10 +90707,13 @@ impl FoundationSettings {
                     ),
             );
             if let Some(error) = error {
+                // A bootstrap answer is a hint, not a banner inside the dialog:
+                // the dialog is a panel the reader cannot dismiss a notice out
+                // of, and the hint layer already paints above every dialog.
                 body = body.child(
                     div()
                         .text_xs()
-                        .text_color(cx.theme().danger)
+                        .text_color(cx.theme().muted_foreground)
                         .whitespace_normal()
                         .child(error),
                 );
@@ -90694,12 +90804,11 @@ impl FoundationSettings {
         window.open_dialog(cx, move |dialog, _, cx| {
             let entity = entity.clone();
             let entity_for_footer = entity.clone();
-            let (distros, selected, error) = entity
+            let (distros, selected) = entity
                 .update(cx, |this, _| {
                     (
                         this.connections_wsl_distros.clone(),
                         this.connections_wsl_selected.clone(),
-                        this.connections_wsl_error.clone(),
                     )
                 })
                 .unwrap_or_default();
@@ -90715,15 +90824,6 @@ impl FoundationSettings {
                         "WSL2 在本機執行 Linux，不需要 sshd 或 SSH 金鑰。",
                     )),
             );
-            if let Some(error) = error {
-                body = body.child(
-                    div()
-                        .text_xs()
-                        .text_color(cx.theme().danger)
-                        .whitespace_normal()
-                        .child(error),
-                );
-            }
             if distros.is_empty() {
                 body = body.child(
                     div()
@@ -91315,46 +91415,11 @@ impl FoundationSettings {
             .child(wsl_button)
             .child(add_button)
             .into_any_element();
-        // A failure that outlives its dialog lands here rather than in the
-        // dialog's body: the dialog closes on submit, so this list is the only
-        // surface still on screen when the probe or the WSL connect fails.
-        let mut notices: Vec<AnyElement> = Vec::new();
-        if let ConnectionsProbeState::Failed(error) = &self.connections_probe_state {
-            notices.push(
-                div()
-                    .w_full()
-                    .text_xs()
-                    .text_color(cx.theme().danger)
-                    .whitespace_normal()
-                    .child(error.clone())
-                    .into_any_element(),
-            );
-        }
-        if let Some(error) = &self.connections_wsl_error {
-            notices.push(
-                div()
-                    .w_full()
-                    .text_xs()
-                    .text_color(cx.theme().danger)
-                    .whitespace_normal()
-                    .child(error.clone())
-                    .into_any_element(),
-            );
-        }
-        if let Some(error) = &self.connections_remove_error {
-            notices.push(
-                div()
-                    .w_full()
-                    .text_xs()
-                    .text_color(cx.theme().danger)
-                    .whitespace_normal()
-                    .child(error.clone())
-                    .into_any_element(),
-            );
-        }
-        if !notices.is_empty() {
-            groups.push(SettingsGroup::unlabeled(notices));
-        }
+        // A failure that outlives its dialog is a light hint, not a strip on the
+        // page: Settings is itself a dialog, so a notice painted here competes
+        // with the controls under it and cannot be closed. The workbench's hint
+        // layer sits above every dialog backdrop and dismisses on a click, so
+        // the probe, WSL and removal failures all travel that way instead.
         groups.push(SettingsGroup::with_leading(
             locale::text("SSH connections", "SSH 连接", "SSH 連線"),
             leading,
@@ -91626,19 +91691,27 @@ impl FoundationSettings {
                 Some(version) => format!("v{version}"),
                 None => locale::text("Not installed", "未安装", "未安裝").to_string(),
             });
+        // The row's primary action is the way back from every state a
+        // connection can be stuck in: an unpaired profile retries
+        // provisioning, a running one opens its progress, and a paired one
+        // opens the same dialog to manage it.
+        let primary_label = Self::connection_primary_label(row.status);
+        let primary_id = row.id.clone();
+        let primary_settings = settings.clone();
         let primary = Button::new(SharedString::from(format!(
             "connections-{}-primary",
             row.id
         )))
         .small()
         .outline()
-        .label(Self::connection_primary_label(row.status))
-        .disabled(true)
-        .tooltip(locale::text(
-            "Connection actions are not wired yet.",
-            "连接操作尚未接入。",
-            "連線操作尚未接入。",
-        ));
+        .label(primary_label)
+        .tooltip(Self::connection_primary_hint(row.status))
+        .on_click(move |_, window, cx| {
+            let profile_id = primary_id.clone();
+            let _ = primary_settings.update(cx, |this, cx| {
+                this.run_connection_primary_action(profile_id, window, cx)
+            });
+        });
         let remove_id = row.id.clone();
         let remove_name = row.name.clone();
         let remove_settings = settings.clone();
@@ -91654,10 +91727,21 @@ impl FoundationSettings {
                 let remove_id = remove_id.clone();
                 let remove_name = remove_name.clone();
                 let remove_settings = remove_settings.clone();
+                let reconnect_id = remove_id.clone();
+                let reconnect_settings = remove_settings.clone();
                 menu.item(PopupMenuItem::new(locale::text("Edit", "编辑", "編輯")).disabled(true))
                     .item(
+                        // Reconnect used to need a paired runtime, so an
+                        // unpaired profile had no action here at all. It now
+                        // re-runs provisioning, which is exactly what an
+                        // unpaired profile is missing.
                         PopupMenuItem::new(locale::text("Reconnect", "重新连接", "重新連線"))
-                            .disabled(true),
+                            .on_click(move |_, window, cx| {
+                                let profile_id = reconnect_id.clone();
+                                let _ = reconnect_settings.update(cx, |this, cx| {
+                                    this.run_connection_primary_action(profile_id, window, cx)
+                                });
+                            }),
                     )
                     .separator()
                     .item(
@@ -91751,6 +91835,74 @@ impl FoundationSettings {
             ConnectionRowStatus::NeedsAttention => locale::text("Fix", "修复", "修復"),
             ConnectionRowStatus::Connecting => locale::text("Cancel", "取消", "取消"),
         }
+    }
+
+    fn connection_primary_hint(status: ConnectionRowStatus) -> &'static str {
+        match status {
+            ConnectionRowStatus::Connected => locale::text(
+                "Open this connection's provisioning details.",
+                "查看该连接的配置详情。",
+                "檢視該連線的設定詳情。",
+            ),
+            ConnectionRowStatus::Offline => locale::text(
+                "Install, start, and pair the runtime on this host.",
+                "在该主机上安装、启动并配对运行时。",
+                "在該主機上安裝、啟動並配對執行階段。",
+            ),
+            ConnectionRowStatus::NeedsAttention => locale::text(
+                "Retry provisioning for this host.",
+                "重试该主机的配置。",
+                "重試該主機的設定。",
+            ),
+            ConnectionRowStatus::Connecting => locale::text(
+                "Stop this provisioning run.",
+                "停止当前的配置。",
+                "停止目前的設定。",
+            ),
+        }
+    }
+
+    /// Runs a row's primary action for the state the row is in.
+    ///
+    /// This is the only way back from "Offline / Not installed": a saved
+    /// profile whose provisioning never ran, was cancelled, or died with the
+    /// app had no affordance at all — the row menu's Reconnect needs a paired
+    /// runtime, and an unpaired profile has none. Every state therefore routes
+    /// to something that changes it: a live run opens its progress, a running
+    /// one cancels, and a terminal one starts provisioning again.
+    fn run_connection_primary_action(
+        &mut self,
+        profile_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let status = self
+            .connections_rows()
+            .into_iter()
+            .find(|row| row.id == profile_id)
+            .map(|row| row.status);
+        match status {
+            Some(ConnectionRowStatus::Connecting) => {
+                let workbench = self.workbench.clone();
+                cx.defer(move |cx| {
+                    let _ =
+                        workbench.update(cx, |workbench, cx| workbench.cancel_ssh_provisioning(cx));
+                });
+            }
+            Some(ConnectionRowStatus::Connected) => {
+                self.open_connections_progress_dialog(window, cx);
+            }
+            _ => {
+                let pending = profile_id.clone();
+                let workbench = self.workbench.clone();
+                cx.defer(move |cx| {
+                    let _ = workbench.update(cx, |workbench, cx| {
+                        workbench.start_ssh_profile_provisioning(pending, cx)
+                    });
+                });
+            }
+        }
+        cx.notify();
     }
 
     fn render_archived_page(&self, stacked: bool, cx: &mut Context<Self>) -> AnyElement {
@@ -118149,13 +118301,16 @@ mod tests {
         );
     }
 
-    /// A probe or WSL failure outlives its dialog.
+    /// A probe or WSL failure outlives its dialog, as a light hint.
     ///
-    /// Both submit and close their dialog, so the failure text cannot live in
-    /// the dialog body: the page carries it in a notice above the list, which is
-    /// the surface still on screen when the work reports back.
+    /// Both dialogs submit and close, so the failure cannot live in a body that
+    /// is gone by the time the work reports back. It used to be a notice above
+    /// the list, but the Connections page is itself inside the settings dialog:
+    /// a red line there competes with the controls under it and cannot be
+    /// closed. It is a top hint now — above every dialog backdrop, dismissible
+    /// and self-hiding — so nothing red is left on the page to clear.
     #[test]
-    fn connection_failures_land_on_the_page_when_their_dialog_closes() {
+    fn connection_failures_are_announced_as_top_hints() {
         let source = include_str!("app.rs");
         let page = source
             .split_once("    fn render_connections_page(")
@@ -118163,17 +118318,38 @@ mod tests {
             .map(|(body, _)| body)
             .expect("the Connections page should remain inspectable");
         assert!(
-            page.contains("ConnectionsProbeState::Failed(error)"),
-            "a failed probe must report above the list"
+            !page.contains("text_color(cx.theme().danger)"),
+            "the page must not paint a red notice the reader cannot close"
         );
         assert!(
-            page.contains("connections_wsl_error"),
-            "a failed WSL connect must report above the list"
+            !page.contains("SettingsGroup::unlabeled(notices)"),
+            "the notice group is gone; failures ride the hint layer"
         );
-        assert!(
-            page.contains("SettingsGroup::unlabeled(notices)"),
-            "the notices need a group of their own, not a row inside the list"
-        );
+
+        // Every failure this page can raise goes through the one helper, which
+        // routes it to the workbench's notification queue.
+        let report = source
+            .split_once("    fn report_connections_failure(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn remove_ssh_connection("))
+            .map(|(body, _)| body)
+            .expect("the Connections failure reporter should remain inspectable");
+        assert!(report.contains("SettingsOperationNotice::error(error)"));
+        assert!(report.contains("notify_settings_operation"));
+        for caller in [
+            "    fn remove_ssh_connection(",
+            "    fn probe_connections_host(",
+            "    fn load_wsl_distros(",
+        ] {
+            let body = source
+                .split_once(caller)
+                .and_then(|(_, tail)| tail.split_once("\n    fn "))
+                .map(|(body, _)| body)
+                .unwrap_or_else(|| panic!("{caller} should remain inspectable"));
+            assert!(
+                body.contains("report_connections_failure"),
+                "{caller} must report through the hint layer"
+            );
+        }
 
         // Both dialogs close on submit, so parking the failure in their bodies
         // would show it for one frame and then drop it.
@@ -118187,6 +118363,10 @@ mod tests {
                 .map(|(body, _)| body)
                 .unwrap_or_else(|| panic!("{opener} should remain inspectable"));
             assert!(body.contains(".on_ok("), "{opener} must submit from Enter");
+            assert!(
+                !body.contains("text_color(cx.theme().danger)"),
+                "{opener} must not paint its failure inside the panel"
+            );
         }
     }
 
@@ -118238,6 +118418,130 @@ mod tests {
                 .iter()
                 .any(|candidate| candidate.section == SettingsSection::Browser)
         );
+    }
+
+    /// Adding two hosts in a row provisions both, one after the other.
+    ///
+    /// Provisioning is a single slot — one service, one snapshot, one tunnel —
+    /// but the add flow used to overwrite the start task, and dropping that
+    /// task aborted the first host's download mid-stream. The `.part` file it
+    /// had written stayed on disk, no error was raised, and the row read
+    /// "Offline / Not installed" forever. Requests queue instead, so the first
+    /// host finishes before the second starts and neither is lost.
+    #[test]
+    fn adding_several_hosts_queues_provisioning_instead_of_cancelling_it() {
+        let source = include_str!("app.rs");
+        let start = source
+            .split_once("    fn start_ssh_profile_provisioning(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// Starts the next queued profile"))
+            .map(|(body, _)| body)
+            .expect("the provisioning queue entry point should remain inspectable");
+        assert!(
+            start.contains("ssh_provisioning_pending.push_back"),
+            "a request must join the queue rather than replace the run in flight"
+        );
+        assert!(
+            start.contains("pump_ssh_provisioning_queue"),
+            "queuing a request has to hand the slot to it when it is free"
+        );
+        assert!(
+            !start.contains("ssh_provisioning_start_task = Some("),
+            "overwriting the start task is what aborted the previous download"
+        );
+
+        let pump = source
+            .split_once("    fn pump_ssh_provisioning_queue(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// Releases the slot"))
+            .map(|(body, _)| body)
+            .expect("the provisioning pump should remain inspectable");
+        assert!(pump.contains("self.ssh_provisioning_starting"));
+        assert!(
+            pump.contains("self.ssh_provisioning.is_some()"),
+            "one run owns the slot at a time"
+        );
+        assert!(pump.contains("pop_front"));
+
+        let fail = source
+            .split_once("    fn fail_ssh_provisioning_start(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// Resolves one profile"))
+            .map(|(body, _)| body)
+            .expect("the failed start path should remain inspectable");
+        assert!(
+            fail.contains("self.ssh_provisioning_starting = false"),
+            "a failed start must release the slot"
+        );
+        assert!(
+            fail.contains("pump_ssh_provisioning_queue"),
+            "one unreachable host must not park every host queued behind it"
+        );
+        assert!(
+            fail.contains("SettingsOperationNotice::error"),
+            "a start that never reaches the worker is still a visible failure"
+        );
+
+        let finish = source
+            .split_once("    fn finish_ssh_provisioning(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn finish_ssh_provisioning_outcome("))
+            .map(|(body, _)| body)
+            .expect("the provisioning finish path should remain inspectable");
+        assert!(
+            finish.contains("pump_ssh_provisioning_queue"),
+            "a finished run hands the slot to the next queued host"
+        );
+    }
+
+    /// A connection that never paired has a way back, and it is on the row.
+    ///
+    /// The row menu's Reconnect needed a registered runtime, so an unpaired
+    /// profile had no action at all: the runtime manager lists runtimes, and a
+    /// profile that never provisioned has none. The primary button and the menu
+    /// now both re-run provisioning for it.
+    #[test]
+    fn an_unpaired_connection_offers_a_working_retry() {
+        let source = include_str!("app.rs");
+        let row = source
+            .split_once("    fn connection_row(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn connection_detail("))
+            .map(|(body, _)| body)
+            .expect("the Connections row should remain inspectable");
+        assert!(
+            !row.contains("Connection actions are not wired yet."),
+            "the primary button must not be a disabled placeholder"
+        );
+        assert!(row.contains("run_connection_primary_action"));
+        assert!(
+            !row.contains("PopupMenuItem::new(locale::text(\"Reconnect\", \"重新连接\", \"重新連線\"))\n                            .disabled(true)"),
+            "Reconnect must stay actionable for a profile that never paired"
+        );
+
+        let action = source
+            .split_once("    fn run_connection_primary_action(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_archived_page("))
+            .map(|(body, _)| body)
+            .expect("the row's primary action should remain inspectable");
+        assert!(
+            action.contains("start_ssh_profile_provisioning"),
+            "an unpaired or failed row has to be able to provision again"
+        );
+        assert!(
+            action.contains("cancel_ssh_provisioning"),
+            "a running row's primary action is Cancel"
+        );
+        assert!(
+            action.contains("open_connections_progress_dialog"),
+            "a paired row opens its provisioning details"
+        );
+
+        let resume = source
+            .split_once("    fn resume_unprovisioned_connections(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// Starts the storage-usage probe"))
+            .map(|(body, _)| body)
+            .expect("the resume path should remain inspectable");
+        assert!(
+            resume.contains("registered_runtime_id.is_none()"),
+            "only profiles that never provisioned are resumed"
+        );
+        assert!(resume.contains("start_ssh_profile_provisioning"));
     }
 
     #[test]
@@ -118523,8 +118827,8 @@ mod tests {
         assert!(remove.contains("store.save(&profiles)"));
         assert!(remove.contains("remove_ssh_connection_runtime"));
         assert!(
-            remove.contains("connections_remove_error"),
-            "a refused write must be reported where the list is"
+            remove.contains("report_connections_failure"),
+            "a refused write must be announced on the hint layer"
         );
 
         let teardown = source

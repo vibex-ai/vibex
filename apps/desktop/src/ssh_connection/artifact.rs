@@ -16,7 +16,15 @@ use vibex_app_update::{ServerArtifact, VerifiedManifest};
 use super::environment::RemoteArch;
 
 const MAX_VERSION_CHARS: usize = 64;
-const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(300);
+/// How long the download may take to establish its connection.
+const DOWNLOAD_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long the download may go without receiving a single byte.
+///
+/// A *read* timeout rather than a total one: a 38 MB tarball on a slow link may
+/// take as long as it needs, while a stream that has gone silent fails within a
+/// minute instead of holding the provisioning run — and the `.part` file it
+/// writes — open until a five-minute total deadline expires.
+const DOWNLOAD_READ_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalArtifact {
@@ -113,6 +121,32 @@ pub async fn download_server_artifact_for_os(
     version: &str,
     arch: RemoteArch,
     cache_dir: &Path,
+    progress: impl FnMut(u64, u64),
+) -> Result<LocalArtifact, ArtifactError> {
+    download_server_artifact_with_read_timeout(
+        artifact,
+        os,
+        version,
+        arch,
+        cache_dir,
+        DOWNLOAD_READ_TIMEOUT,
+        progress,
+    )
+    .await
+}
+
+/// [`download_server_artifact_for_os`] with the silence budget as an argument.
+///
+/// Only the timeout differs, and it is a parameter so a test can watch the
+/// stall path fail in milliseconds instead of waiting out the real minute.
+#[allow(clippy::too_many_arguments)]
+async fn download_server_artifact_with_read_timeout(
+    artifact: &ServerArtifact,
+    os: &str,
+    version: &str,
+    arch: RemoteArch,
+    cache_dir: &Path,
+    read_timeout: Duration,
     mut progress: impl FnMut(u64, u64),
 ) -> Result<LocalArtifact, ArtifactError> {
     let os = normalized_server_os(os);
@@ -147,7 +181,8 @@ pub async fn download_server_artifact_for_os(
     let part = cache_dir.join(format!("{file_name}.part"));
     let _ = fs::remove_file(&part);
     let client = reqwest::Client::builder()
-        .timeout(DOWNLOAD_TIMEOUT)
+        .connect_timeout(DOWNLOAD_CONNECT_TIMEOUT)
+        .read_timeout(read_timeout)
         .user_agent(concat!("Vibex/", env!("CARGO_PKG_VERSION")))
         .build()
         .map_err(|error| {
@@ -572,5 +607,56 @@ mod tests {
         assert_eq!(error.code, "ssh_artifact_hash_mismatch");
         let remains = fs::read_dir(dir.path()).unwrap().count();
         assert_eq!(remains, 0, "partial download should be removed");
+    }
+
+    /// A stream that goes silent fails on the read timeout, not never.
+    ///
+    /// The client used to carry a single five-minute total timeout, so a server
+    /// that stopped sending after the headers left the download — and the
+    /// `.part` file it had written — pending until that deadline, with no
+    /// progress and no error. The read timeout bounds exactly the silence.
+    #[tokio::test]
+    async fn a_stalled_download_fails_and_removes_the_partial_file() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 2048];
+            let _ = stream.read(&mut request);
+            // Promise more than is sent, then hold the connection open: the
+            // client must give up on its own rather than wait for bytes that
+            // never arrive.
+            let header = "HTTP/1.1 200 OK\r\nContent-Length: 1024\r\nConnection: close\r\n\r\n";
+            let _ = stream.write_all(header.as_bytes());
+            let _ = stream.write_all(b"partial");
+            std::thread::sleep(Duration::from_secs(120));
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let artifact = ServerArtifact {
+            os: "linux".to_string(),
+            arch: "x86_64".to_string(),
+            url: url::Url::parse(&format!("http://{address}/artifact.tar.gz")).unwrap(),
+            size: 1024,
+            sha256: "b".repeat(64),
+        };
+        let error = download_server_artifact_with_read_timeout(
+            &artifact,
+            "linux",
+            "0.1.0-rc.8",
+            RemoteArch::X86_64,
+            dir.path(),
+            Duration::from_millis(200),
+            |_, _| {},
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.retryable,
+            "a stalled stream is worth retrying: {}",
+            error.code
+        );
+        assert_eq!(error.code, "ssh_artifact_download_failed");
+        let remains = fs::read_dir(dir.path()).unwrap().count();
+        assert_eq!(remains, 0, "the partial file must not outlive the failure");
     }
 }
