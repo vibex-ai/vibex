@@ -335,6 +335,13 @@ Download the package for your platform from [GitHub Releases](https://github.com
 - **macOS:** `.dmg` for Apple silicon or Intel.
 - **Windows:** NSIS `.exe` for x86_64 or ARM64.
 
+Arch Linux users can install from the AUR instead, which republishes the release
+`.deb` with the `vibex` and `vibex-tui` commands on `PATH`:
+
+```bash
+yay -S vibex-bin     # or: paru -S vibex-bin
+```
+
 macOS and Windows packages are currently unsigned, so the first launch needs Gatekeeper or SmartScreen approval. See [Install](https://vibex.peatboy.com/docs/install) for the exact steps.
 
 ### First session

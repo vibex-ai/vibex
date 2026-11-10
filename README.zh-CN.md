@@ -335,6 +335,12 @@ Vibex 使用 [Agent Client Protocol](https://agentclientprotocol.com/)（ACP）�
 - **macOS：** Apple 芯片或 Intel 使用 `.dmg`。
 - **Windows：** x86_64 或 ARM64 使用 NSIS `.exe`。
 
+Arch Linux 用户也可以直接从 AUR 安装：该包由正式版的 `.deb` 重新打包，并把 `vibex` 与 `vibex-tui` 命令放进 `PATH`。
+
+```bash
+yay -S vibex-bin     # 或：paru -S vibex-bin
+```
+
 macOS 和 Windows 安装包目前没有代码签名，首次打开需要 Gatekeeper 或 SmartScreen 放行。具体步骤见[安装](https://vibex.peatboy.com/docs/install)。
 
 ### 第一次会话
