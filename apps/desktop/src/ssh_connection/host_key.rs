@@ -6,8 +6,8 @@
 
 use std::env;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
+use super::console::hidden_command;
 use super::error::SshFailure;
 
 /// `~/.ssh/known_hosts` on Unix and `%USERPROFILE%\.ssh\known_hosts` on Windows.
@@ -33,7 +33,7 @@ pub fn known_hosts_contains(
     #[cfg(test)]
     let _process_guard = crate::ssh_connection::test_support::process_guard();
     validate_host(host)?;
-    let output = Command::new(ssh_keygen)
+    let output = hidden_command(ssh_keygen)
         .args(["-F", host, "-f"])
         .arg(known_hosts)
         .env("LC_ALL", "C")

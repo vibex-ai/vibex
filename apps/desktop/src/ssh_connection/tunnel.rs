@@ -7,10 +7,11 @@ use std::ffi::OsString;
 use std::fmt;
 use std::net::{Ipv4Addr, TcpListener};
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::time::Duration;
 
 use super::command::{SshCommand, SshDestination};
+use super::console::hidden_command;
 
 const MAX_LOCAL_PORT_ATTEMPTS: u16 = 20;
 const MAX_BACKOFF_EXPONENT: u32 = 5;
@@ -127,7 +128,7 @@ impl TunnelProcess {
         #[cfg(test)]
         let _process_guard = crate::ssh_connection::test_support::process_guard();
         let command = spec.command()?;
-        let child = Command::new(&command.program)
+        let child = hidden_command(&command.program)
             .args(&command.args)
             .stdin(Stdio::null())
             .stdout(Stdio::null())

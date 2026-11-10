@@ -182,6 +182,54 @@ let user = self.bootstrap_user_input.read(cx).value().trim().to_string();
 generate(&user, &key, 22, now)    // validate_user rejects bad names
 ```
 
+## Scenario: Windows child console windows
+
+### 1. Scope / Trigger
+
+- Any new `ssh` / `ssh-keygen` / `wsl.exe` spawn under
+  `apps/desktop/src/ssh_connection/`, and any change to how one of those
+  children is started.
+
+### 2. Signatures
+
+```rust
+// apps/desktop/src/ssh_connection/console.rs
+console::hidden_command(program: impl AsRef<OsStr>) -> std::process::Command
+```
+
+### 3. Contracts
+
+- Those three executables are console programs and the desktop is a
+  GUI-subsystem binary, so Windows allocates a console of its own for every
+  child — a black window over the reader's desktop that piped stdio does not
+  prevent. Every production spawn in `ssh_connection` goes through
+  `hidden_command`, which passes `CREATE_NO_WINDOW` on Windows and is a plain
+  `Command::new` elsewhere.
+- The rule covers the whole module, not only `SshCommand`: the `ssh -G` config
+  probe, the `ssh-keygen -F` host-key check, the `-N -L` tunnel,
+  `WslCommand`, `WslKeepalive`, and `list_distros` all inherit it.
+
+### 4. Validation & Error Matrix
+
+| Condition | Behaviour |
+| --- | --- |
+| Windows child without the flag | console window appears and stays for the child's lifetime |
+| non-Windows build | helper is `Command::new`, no flags, no behaviour change |
+
+### 5. Good / Base / Bad
+
+- Good: `hidden_command(&self.program)` in `SshCommand::run_with_timeout`.
+- Base: `Command::new` in a `#[cfg(test)]` block, which never runs on Windows.
+- Bad: `Command::new("ssh")` in production code — the test below fails on it.
+
+### 6. Tests Required
+
+- `ssh_connection::console::tests::remote_instance_children_never_use_command_new_directly`
+  — scans the production half of every spawning file for a bare `Command::new`
+  and fails naming the file.
+- `ssh_connection::console::tests::hidden_command_keeps_the_program_it_was_given`
+  — the helper still starts the program it was handed.
+
 ## Testing Gotchas
 
 - Fake executables (`ssh`, `ssh-keygen`, `wsl.exe`) must be written with

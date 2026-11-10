@@ -14,9 +14,10 @@ use std::fmt;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
+use super::console::hidden_command;
 use super::environment::{EnvironmentError, RemoteEnvironment, parse_probe_output, probe_script};
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -132,7 +133,7 @@ impl WslCommand {
     }
 
     pub fn run_with_timeout(&self, timeout: Duration) -> Result<WslOutput, WslError> {
-        let mut command = Command::new(&self.program);
+        let mut command = hidden_command(&self.program);
         command.args(&self.args);
         command.env("WSL_UTF8", "1");
         command.stdin(if self.stdin.is_some() {
@@ -237,7 +238,7 @@ impl WslKeepalive {
         env_file: &str,
         binary: &str,
     ) -> Result<Self, WslError> {
-        let child = Command::new(program)
+        let child = hidden_command(program)
             .args([
                 "-d",
                 distro,
@@ -271,7 +272,7 @@ impl WslKeepalive {
     }
 
     pub fn spawn(program: &Path, distro: &str) -> Result<Self, WslError> {
-        let child = Command::new(program)
+        let child = hidden_command(program)
             .args(["-d", distro, "--exec", "sleep", "infinity"])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -316,7 +317,7 @@ impl WslOutput {
 /// `WSL_UTF8=1` asks for UTF-8, and the NUL-stripping fallback handles older
 /// builds.
 pub fn list_distros(program: &Path) -> Result<Vec<String>, WslError> {
-    let output = Command::new(program)
+    let output = hidden_command(program)
         .args(["-l", "-q"])
         .env("WSL_UTF8", "1")
         .output()

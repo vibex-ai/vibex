@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 use vibex_core::{VibexError, VibexResult};
 
+use super::console::hidden_command;
 use super::error::SshFailure;
 
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
@@ -175,7 +176,7 @@ impl SshCommand {
     pub fn run_with_timeout(&self, timeout: Duration) -> Result<SshOutput, SshFailure> {
         #[cfg(test)]
         let _process_guard = crate::ssh_connection::test_support::process_guard();
-        let mut command = Command::new(&self.program);
+        let mut command = hidden_command(&self.program);
         self.append_args(&mut command);
         command.env("LC_ALL", "C");
         command.stdin(if self.stdin.is_some() {
@@ -279,7 +280,7 @@ impl SshCommand {
     ) -> Result<SshOutput, SshFailure> {
         #[cfg(test)]
         let _process_guard = crate::ssh_connection::test_support::process_guard();
-        let mut command = Command::new(&self.program);
+        let mut command = hidden_command(&self.program);
         self.append_args(&mut command);
         command.env("LC_ALL", "C");
         command.stdin(if self.stdin.is_some() {

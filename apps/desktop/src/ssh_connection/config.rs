@@ -8,9 +8,10 @@ use std::collections::HashSet;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use vibex_core::{VibexError, VibexResult};
+
+use super::console::hidden_command;
 
 const MAX_INCLUDE_DEPTH: usize = 8;
 const MAX_WARNINGS: usize = 32;
@@ -80,7 +81,7 @@ pub fn resolve_effective(
     alias: &str,
 ) -> VibexResult<SshEffectiveConfig> {
     validate_alias(alias)?;
-    let mut command = Command::new(ssh_binary);
+    let mut command = hidden_command(ssh_binary);
     if let Some(path) = config_path {
         command.arg("-F").arg(expand_tilde_path(path));
     }

@@ -9,6 +9,7 @@ pub mod bootstrap;
 pub mod command;
 pub mod compat;
 pub mod config;
+pub mod console;
 pub mod diagnostics;
 pub mod effects;
 pub mod environment;
