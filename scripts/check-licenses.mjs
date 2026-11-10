@@ -34,7 +34,14 @@ const ASSET_EXTENSIONS = new Set([
 ]);
 const GENERATED_ASSET_ROOTS = [
   resolve(ROOT, "apps/mobile/android/app/src/main/jniLibs"),
-  resolve(ROOT, "apps/mobile/ios/VibexFFI.xcframework")
+  resolve(ROOT, "apps/mobile/ios/VibexFFI.xcframework"),
+  // A local Gradle build copies the registered Android emoji font into
+  // `app/build/intermediates/.../mergeReleaseAssets/fonts/`. That tree is a
+  // generated output of `apps/mobile/android/app/src/main/assets/fonts`, which
+  // the policy already registers, so counting the copy would report the same
+  // font twice and fail the gate on a developer machine that built an APK.
+  // The build directory is git-ignored, so no packaged input lives here.
+  resolve(ROOT, "apps/mobile/android/app/build")
 ];
 
 function fail(message) {
