@@ -142,11 +142,43 @@ function validatePackaging() {
       !config.includes("../web/dist") && !config.includes("../mobile-wasm/dist"),
       `${channel} desktop package must not embed browser or mobile runtime assets`
     );
+    // The client answers from the channel it was compiled as, so the packaged
+    // binary opens its own desktop's home without an environment variable. The
+    // package command is what exports that channel to the build.
+    assert(
+      config.includes('"packaging/vibex-tui" = "/usr/bin/vibex-tui"'),
+      `${channel} package does not install the vibex-tui launcher`
+    );
     const command = packageJson.scripts?.[`package:${channel}`] ?? "";
     assert(command.includes(`build-channel.mjs ${channel}`), `${channel} package command drifted`);
     assert(command.includes("--formats deb,appimage"), `${channel} package formats drifted`);
     assert(command.includes("compress-deb.mjs"), `${channel} package does not xz-compress its deb`);
   }
+  // The Windows installer is the only place a `vibex` typed in a shell can come
+  // from, so its directory has to reach PATH. The generic config points at the
+  // vendored template, and that template both writes and removes the entry.
+  const windowsConfig = source("apps/desktop/Packager.toml");
+  assert(
+    windowsConfig.includes('template = "packaging/nsis/installer.nsi"'),
+    "the Windows installer does not use the template that registers the client on PATH"
+  );
+  assert(
+    windowsConfig.includes('"packaging/vibex-tui.cmd"'),
+    "the Windows package does not ship the vibex-tui launcher"
+  );
+  const nsisTemplate = source("apps/desktop/packaging/nsis/installer.nsi");
+  for (const required of [
+    "AddInstallDirectoryToPath",
+    "un.RemoveInstallDirectoryFromPath",
+    'WriteRegExpandStr HKCU "Environment" "Path"',
+  ]) {
+    assert(nsisTemplate.includes(required), `the NSIS template is missing ${required}`);
+  }
+  assert(
+    source("apps/desktop/packaging/vibex-tui").includes('exec "$dir/vibex" "$@"'),
+    "the Linux vibex-tui launcher stopped forwarding to the client beside it"
+  );
+
   const workflow = workflowSource(".github/workflows/release-candidate.yml");
   assert(workflow.includes("ubuntu-24.04"), "candidate workflow lost its Linux host");
   assert(workflow.includes("--formats deb,appimage"), "candidate workflow formats drifted");

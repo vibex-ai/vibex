@@ -116,6 +116,12 @@ pub struct SeatRequest {
     pub connect: Option<String>,
     /// Use this home directory instead of the environment default.
     pub home: Option<PathBuf>,
+    /// Serve this channel instead of the one the binary was packaged as.
+    ///
+    /// `--channel` is the explicit spelling of `VIBEX_CHANNEL`, and it wins
+    /// over both, because a flag on this run is a stronger statement than an
+    /// exported variable. `--home` still wins over all three.
+    pub channel: Option<String>,
     /// Force the authority seat even when a remote credential exists.
     pub prefer_authority: bool,
     /// Take the home if it has become free, and stay a client if it has not.
@@ -126,6 +132,19 @@ pub struct SeatRequest {
     /// with a working client rather than a refusal.
     pub take_over: bool,
 }
+
+/// The channel this binary was packaged as.
+///
+/// `scripts/build-channel.mjs` exports `VIBEX_CHANNEL` for the cargo invocation
+/// that builds a channel package, so the value is baked into the binary the
+/// same way the desktop app bakes its release identity. A developer build has
+/// no channel and is a preview build.
+///
+/// This is what makes an installed RC or stable client open the home its own
+/// desktop app owns: before it existed, a `vibex` copied out of the RC package
+/// still looked in `desktop-preview` unless the reader exported an environment
+/// variable first.
+pub const COMPILED_CHANNEL: Option<&str> = option_env!("VIBEX_CHANNEL");
 
 /// The loopback address a desktop runtime serves clients running on this
 /// machine at.
@@ -229,7 +248,8 @@ impl Seat {
             return Self::connect(target, &request).await;
         }
 
-        let home = resolve_home(request.home.clone())?;
+        let channel = requested_channel(&request);
+        let home = resolve_home_for_channel(request.home.clone(), channel.as_deref())?;
         let config = home_config(&home)?;
 
         if request.prefer_authority || request.take_over || !credential_path(&home).exists() {
@@ -344,7 +364,8 @@ impl Seat {
 
     /// Attach to an explicit link, code, or URL.
     async fn connect(target: &str, request: &SeatRequest) -> Result<Self, SeatError> {
-        let home = resolve_home(request.home.clone())?;
+        let channel = requested_channel(request);
+        let home = resolve_home_for_channel(request.home.clone(), channel.as_deref())?;
         let target = target.trim();
 
         let bundle = if target.starts_with("vibex://") {
@@ -787,7 +808,46 @@ fn read_saved_url(path: &Path) -> Option<String> {
 /// would defeat the purpose. The environment path is also verbatim, for the
 /// same reason `VIBEX_HOME` is honoured by every other binary. Only the
 /// fallback derives a channel home under `~/.vibex`.
+///
+/// The channel comes from [`COMPILED_CHANNEL`] first, because that is the
+/// channel the reader installed: a client from the RC package must open
+/// `desktop-rc` without anybody exporting anything. `VIBEX_CHANNEL` overrides
+/// it so one installed client can still be pointed at another channel's home,
+/// and `status` reports which channel won.
 pub fn resolve_home(explicit: Option<PathBuf>) -> Result<PathBuf, SeatError> {
+    let channel = channel_override();
+    resolve_home_for_channel(explicit, channel.as_deref())
+}
+
+/// The channel named for this run, or `None` to use the packaged one.
+///
+/// A value the resolver does not recognise is kept rather than dropped: the
+/// caller is about to fail, and `vibex status` has to explain which spelling it
+/// could not use instead of silently falling back to preview.
+fn channel_override() -> Option<String> {
+    std::env::var("VIBEX_CHANNEL")
+        .ok()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+}
+
+/// The channel this run asked for: the flag first, then the environment, and
+/// `None` when neither named one and the packaged channel should win.
+pub fn requested_channel(request: &SeatRequest) -> Option<String> {
+    request
+        .channel
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_lowercase)
+        .or_else(channel_override)
+}
+
+/// The home the channel named by `--channel` or `VIBEX_CHANNEL` uses.
+pub fn resolve_home_for_channel(
+    explicit: Option<PathBuf>,
+    channel: Option<&str>,
+) -> Result<PathBuf, SeatError> {
     if let Some(home) = explicit {
         return Ok(home);
     }
@@ -802,20 +862,46 @@ pub fn resolve_home(explicit: Option<PathBuf>) -> Result<PathBuf, SeatError> {
     {
         return Ok(parent.to_path_buf());
     }
-    let base = std::env::var("HOME")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .map(PathBuf::from)
-        .ok_or_else(|| SeatError::Environment {
-            detail: "could not determine a home directory; set VIBEX_HOME".to_string(),
+    // `HOME` is a POSIX convention, and Windows sets `USERPROFILE` instead, so
+    // the platform's own answer is what this reads. Resolving `HOME` directly
+    // made the packaged client unable to find a home at all on a stock Windows
+    // shell, while the desktop app — which resolves through the same library —
+    // found one without trouble.
+    let base = vibex_tui::user_home::user_home().ok_or_else(|| SeatError::Environment {
+        detail: "could not determine a home directory; set VIBEX_HOME".to_string(),
+    })?;
+    let leaf =
+        channel_home_leaf(channel.or(COMPILED_CHANNEL)).ok_or_else(|| SeatError::Environment {
+            detail: format!(
+                "unknown channel {:?}; use `stable`, `rc`, or `preview`",
+                channel.or(COMPILED_CHANNEL).unwrap_or_default()
+            ),
         })?;
-    let channel = std::env::var("VIBEX_CHANNEL").unwrap_or_default();
-    let leaf = match channel.trim().to_ascii_lowercase().as_str() {
-        "stable" => "desktop-stable",
-        "rc" | "release-candidate" => "desktop-rc",
-        _ => "desktop-preview",
-    };
     Ok(base.join(".vibex").join(leaf))
+}
+
+/// The home leaf a channel name selects, or `None` when the name is not one of
+/// the three channels this client can serve.
+fn channel_home_leaf(channel: Option<&str>) -> Option<&'static str> {
+    match channel
+        .map(str::trim)
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("stable") => Some("desktop-stable"),
+        Some("rc") | Some("release-candidate") => Some("desktop-rc"),
+        Some("preview") | None => Some("desktop-preview"),
+        Some(_) => None,
+    }
+}
+
+/// The channel this run resolves to, as the label `status` prints.
+pub fn resolved_channel(channel: Option<&str>) -> &'static str {
+    match channel_home_leaf(channel.or(COMPILED_CHANNEL)) {
+        Some("desktop-stable") => "stable",
+        Some("desktop-rc") => "rc",
+        _ => "preview",
+    }
 }
 
 /// Where the local device credential lives.
@@ -908,6 +994,57 @@ mod tests {
     fn home_resolution_prefers_the_explicit_path() {
         let home = resolve_home(Some(PathBuf::from("/tmp/explicit"))).unwrap();
         assert_eq!(home, PathBuf::from("/tmp/explicit"));
+    }
+
+    /// The packaged client has to find a home on a platform that does not
+    /// export `HOME`, which is what a stock Windows shell looks like. The
+    /// resolver reads the platform's own answer, so the fallback is the user's
+    /// home rather than a variable that may not exist.
+    #[test]
+    fn the_default_home_comes_from_the_platform_not_home() {
+        let leaf = channel_home_leaf(COMPILED_CHANNEL).expect("the packaged channel is known");
+        match vibex_tui::user_home::user_home() {
+            Some(user) => assert_eq!(
+                resolve_home_for_channel(None, COMPILED_CHANNEL).unwrap(),
+                user.join(".vibex").join(leaf)
+            ),
+            // No home at all is the one case the resolver is allowed to refuse.
+            None => assert!(resolve_home_for_channel(None, COMPILED_CHANNEL).is_err()),
+        }
+    }
+
+    #[test]
+    fn every_channel_has_its_own_home_leaf() {
+        assert_eq!(channel_home_leaf(Some("stable")), Some("desktop-stable"));
+        assert_eq!(channel_home_leaf(Some("rc")), Some("desktop-rc"));
+        assert_eq!(
+            channel_home_leaf(Some("release-candidate")),
+            Some("desktop-rc")
+        );
+        assert_eq!(channel_home_leaf(Some("preview")), Some("desktop-preview"));
+        // A developer build carries no channel and is a preview build, which is
+        // what keeps `cargo run -p vibex-client` pointed at the dev home.
+        assert_eq!(channel_home_leaf(None), Some("desktop-preview"));
+        // A misspelling is refused rather than silently served by preview, so
+        // the reader learns that nothing was opened instead of editing the
+        // wrong home.
+        assert_eq!(channel_home_leaf(Some("nightly")), None);
+    }
+
+    #[test]
+    fn a_named_channel_beats_the_packaged_one() {
+        // `--channel` is the flag, then `VIBEX_CHANNEL`, then the packaged
+        // value: a reader who exported the variable for one run means it.
+        let request = SeatRequest {
+            channel: Some("stable".to_string()),
+            ..SeatRequest::default()
+        };
+        assert_eq!(requested_channel(&request).as_deref(), Some("stable"));
+        let request = SeatRequest {
+            channel: Some("  RC  ".to_string()),
+            ..SeatRequest::default()
+        };
+        assert_eq!(requested_channel(&request).as_deref(), Some("rc"));
     }
 
     #[test]

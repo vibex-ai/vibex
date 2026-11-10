@@ -3264,12 +3264,7 @@ impl App {
             .ok()
             .filter(|value| !value.trim().is_empty())
             .map(std::path::PathBuf::from)
-            .or_else(|| {
-                std::env::var("HOME")
-                    .ok()
-                    .filter(|value| !value.trim().is_empty())
-                    .map(|value| std::path::PathBuf::from(value).join(".vibex"))
-            })
+            .or_else(crate::user_home::default_vibex_home)
     }
 
     /// Persist the arrangement. A failure is silent: losing a pin is not worth
@@ -8978,9 +8973,9 @@ fn pasted_path(line: &str) -> String {
     // backslashes themselves, so unescaping them is never wrong here.
     let unescaped = text.replace("\\ ", " ");
     if let Some(rest) = unescaped.strip_prefix("~/")
-        && let Some(home) = std::env::var_os("HOME")
+        && let Some(home) = crate::user_home::user_home()
     {
-        return std::path::Path::new(&home).join(rest).display().to_string();
+        return home.join(rest).display().to_string();
     }
     unescaped
 }
@@ -10486,10 +10481,10 @@ mod tests {
 
     #[test]
     fn a_home_relative_paste_is_expanded() {
-        let Some(home) = std::env::var_os("HOME") else {
+        let Some(home) = crate::user_home::user_home() else {
             return;
         };
-        let path = std::path::Path::new(&home).join("vibex-paste-probe.png");
+        let path = home.join("vibex-paste-probe.png");
         std::fs::write(&path, b"png").unwrap();
         let expanded = App::image_paths_from_paste("~/vibex-paste-probe.png");
         std::fs::remove_file(&path).unwrap();

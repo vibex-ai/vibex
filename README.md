@@ -8,7 +8,7 @@
   <img src="https://img.shields.io/badge/Rust-1.99.1-black?style=flat&logo=rust&logoColor=white" alt="Rust 1.99.1" />
   <img src="https://img.shields.io/badge/UI-GPUI-2563eb?style=flat" alt="GPUI" />
   <img src="https://img.shields.io/badge/platforms-macOS%20%7C%20Windows%20%7C%20Linux%20%7C%20iOS%20%7C%20Android-4493F8?style=flat" alt="Platforms: macOS, Windows, Linux, iOS, and Android" />
-  <img src="https://img.shields.io/badge/status-0.1.0--rc.10-f97316?style=flat" alt="Release status: 0.1.0-rc.10" />
+  <img src="https://img.shields.io/badge/status-0.1.0-22c55e?style=flat" alt="Release status: 0.1.0" />
 </p>
 
 <p align="center">
@@ -317,7 +317,7 @@ You can also register any ACP-compatible executable with its command, arguments,
 | --- | --- | --- |
 | **Desktop** | Full native GPUI workbench and the authoritative `DesktopRuntime` for Agents, workspaces, files, Git, PTYs, browser, computer use, providers, permissions, and durable state. | Linux, macOS, and Windows; [download the latest release](https://github.com/vibex-ai/vibex/releases/latest). |
 | **Mobile** | Native GPUI iOS and Android companion. Renders the desktop session model as a GUI timeline and sends typed remote mutations. | Android APK and unsigned iOS device IPA from [Releases](https://github.com/vibex-ai/vibex/releases/latest). |
-| **TUI** | Character-grid client over the same runtime protocol. Ships inside every desktop package and can attach to a running desktop runtime. | `vibex`, `vibex connect`, or `vibex-server tui`. |
+| **TUI** | Character-grid client over the same runtime protocol. Ships inside every desktop package and can attach to a running desktop runtime. | `vibex` / `vibex-tui`, `vibex connect`, or `vibex-server tui`. |
 | **Headless runtime** | `vibex-server`: the same authoritative runtime without a window, for a server or always-on machine. | `ghcr.io/vibex-ai/vibex-server` or a release binary. |
 | **Relay** | Optional Rust/Axum transport for encrypted WebSocket frames. It stores no workspace, provider, Agent, or application data. | `apps/relay-server` and `deploy/relay`. |
 
@@ -346,14 +346,20 @@ macOS and Windows packages are currently unsigned, so the first launch needs Gat
 
 ### Try the terminal client
 
-The TUI ships with the desktop package:
+The TUI ships with the desktop package and works from a terminal straight after
+install:
 
 ```bash
 cd /path/to/your/project
-vibex
+vibex          # or vibex-tui; both names are the same client
 ```
 
-It attaches to the runtime for that home, starting one if needed. Run `vibex status` to see which runtime it would use, or `vibex connect vibex://…` to pair with a remote runtime. See [Vibex TUI](https://vibex.peatboy.com/docs/tui).
+It serves the channel it was installed as — the RC package opens `desktop-rc`,
+the stable package `desktop-stable` — so nothing has to be exported first. Use
+`vibex --channel stable` to serve another channel for one run. It attaches to
+the runtime for that home, starting one if needed. Run `vibex status` to see
+which runtime it would use, or `vibex connect vibex://…` to pair with a remote
+runtime. See [Vibex TUI](https://vibex.peatboy.com/docs/tui).
 
 ### Build from source
 

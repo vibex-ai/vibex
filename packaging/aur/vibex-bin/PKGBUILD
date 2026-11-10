@@ -84,7 +84,8 @@ prepare() {
   fi
   bsdtar -xf "${payload}" -C "${srcdir}/pkg"
 
-  for binary in vibex-desktop vibex; do
+  # `vibex` is the character-grid client; `vibex-tui` is its explicit name.
+  for binary in vibex-desktop vibex vibex-tui; do
     if [[ ! -x "${srcdir}/pkg/usr/bin/${binary}" ]]; then
       echo "the .deb payload is missing usr/bin/${binary}" >&2
       return 1
@@ -97,6 +98,8 @@ package() {
   # The character-grid client ships alongside the GUI so a shell user never has
   # to install anything extra.
   install -Dm755 "${srcdir}/pkg/usr/bin/vibex" "${pkgdir}/usr/bin/vibex"
+  # The explicit name is a launcher next to the client, not a second copy.
+  install -Dm755 "${srcdir}/pkg/usr/bin/vibex-tui" "${pkgdir}/usr/bin/vibex-tui"
 
   # The GUI resolves PDFium at ../lib/vibex-desktop/pdfium relative to its own
   # path, so this payload must keep the layout the .deb shipped.

@@ -1,6 +1,6 @@
 [package]
 name = "vibex-desktop"
-version = "0.1.0-rc.10"
+version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -106,6 +106,10 @@ tray-icon = { workspace = true, features = ["ksni"] }
 [dev-dependencies]
 axum.workspace = true
 gpui = { workspace = true, features = ["test-support"] }
+# Reads the bundled CJK face directly: its advances are the contract the text
+# system cannot check for itself, and a font swap has to fail here rather than
+# in Korean text on screen.
+ttf-parser = "0.25"
 tempfile = "3"
 vibex-db = { path = "../../crates/db" }
 vibex-remote-client = { path = "../../crates/vibex-remote-client" }

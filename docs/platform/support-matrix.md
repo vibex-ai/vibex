@@ -16,7 +16,7 @@ platform-specific checks.
 | iOS | Native GPUI client using `gpui-pre-mobile` and UIKit | `pnpm build:mobile:ios` on macOS | Simulator/device, signing, and distribution validation remain separate release evidence. |
 | Relay server | Optional user-self-hosted encrypted transport | `pnpm smoke:relay:local` | Relay is transport only; deployment, TLS, NAT, and device proof are operator-owned. |
 | SSH / WSL runtime (beta) | Desktop-provisioned `vibex-server` on a Linux or macOS host over SSH, or in a local WSL2 distro | `scripts/e2e-ssh-docker.sh <server-tarball>` | Settings → Remote instances; per-platform status in [SSH Remote Runtime](../remote/ssh-runtime.md#support-matrix). |
-| Terminal (TUI) | Character-grid client for an authority or remote runtime | `cargo test -p vibex-tui`, `vibex status` | Requires an interactive terminal; CJK and RTL rendering depend on the user's terminal font and width tables, which are not queryable. |
+| Terminal (TUI) | Character-grid client for an authority or remote runtime | `cargo test -p vibex-tui`, `vibex status` | Requires an interactive terminal; CJK and RTL rendering depend on the user's terminal font and width tables, which are not queryable. Installed as `vibex` and `vibex-tui`; the client serves the channel its package was built as, so no environment variable is needed on first run. |
 
 Desktop is the only authoritative runtime. Mobile is a remote client through the
 typed backend facade and `AutoRemoteTransport`; it does not run local Agents,

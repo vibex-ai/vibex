@@ -1,0 +1,45 @@
+#!/bin/sh
+# `vibex-tui` — the name that says what the client is.
+#
+# The character-grid client ships as `vibex`, because that is the name the
+# documentation, the desktop's "Vibex TUI" setting and `vibex connect` all use.
+# A reader who reaches for the explicit name should not have to learn that the
+# binary is called something else, so this launcher forwards to the client that
+# shipped beside it.
+#
+# The neighbour wins over PATH: an AppImage and a system install each carry
+# their own copy, and resolving the sibling keeps a run inside the package the
+# reader launched. PATH is the fallback for a launcher that was copied
+# somewhere else on its own.
+#
+# `$0` may be a bare command name when the shell found this file on PATH. It is
+# then looked up once, because `dirname` of a bare name is the working
+# directory, which is not where the client is.
+dir=$(dirname "$0")
+if [ "$dir" = "." ]; then
+  resolved=$(command -v -- "$0" 2>/dev/null || true)
+  case "$resolved" in
+    */*) dir=$(dirname "$resolved") ;;
+  esac
+fi
+if [ -x "$dir/vibex" ]; then
+  exec "$dir/vibex" "$@"
+fi
+# A symlink elsewhere skips the neighbour check above; the link's own target is
+# the last place to look before trusting PATH.
+resolved=$(command -v -- "$0" 2>/dev/null || true)
+if [ -L "$resolved" ]; then
+  target=$(readlink "$resolved")
+  case "$target" in
+    /*) ;;
+    *) target=$(dirname "$resolved")/$target ;;
+  esac
+  if [ -x "$(dirname "$target")/vibex" ]; then
+    exec "$(dirname "$target")/vibex" "$@"
+  fi
+fi
+if command -v -- vibex >/dev/null 2>&1; then
+  exec vibex "$@"
+fi
+echo "vibex-tui: the Vibex terminal client is not installed; reinstall the Vibex package" >&2
+exit 127

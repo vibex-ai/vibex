@@ -132,12 +132,12 @@ directory and a generated changelog:
 
 ```bash
 gh api "repos/vibex-ai/vibex/releases/generate-notes" \
-  -f tag_name=v0.1.0-rc.10 -f previous_tag_name=v0.1.0-rc.9 --jq .body \
+  -f tag_name=v0.1.0 -f previous_tag_name=v0.1.0-rc.10 --jq .body \
   > target/release-body/generated-changelog.md
 
 node scripts/release-body.mjs \
-  --version 0.1.0-rc.10 \
-  --notes docs/operations/release-notes-v0.1.0-rc.10.md \
+  --version 0.1.0 \
+  --notes docs/operations/release-notes-v0.1.0.md \
   --assets target/publish \
   --changelog target/release-body/generated-changelog.md \
   --output target/release-body/vibex-release-body.md

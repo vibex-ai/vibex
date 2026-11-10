@@ -381,6 +381,7 @@ async fn tui(local: bool) -> Result<(), Box<dyn Error>> {
     let request = vibex_client::seat::SeatRequest {
         connect: None,
         home: Some(config.home_dir.clone()),
+        channel: None,
         prefer_authority: local,
         // The headless `tui` entry point is not the interactive client that
         // watches for a handover offer, so it never takes a home over.

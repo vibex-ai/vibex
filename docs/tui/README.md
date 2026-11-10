@@ -6,18 +6,25 @@ the desktop and mobile apps: it renders authoritative state owned by a
 media stack itself.
 
 ```bash
-vibex                      # attach to (or start) the runtime for this home
+vibex                      # attach to (or start) the runtime for this channel's home
+vibex-tui                  # the same client, under its explicit name
 vibex connect vibex://…    # pair with a runtime and attach to it
 vibex status               # report which mode this home would use
 vibex status --home <dir>  # ... for another home, without attaching
+vibex --channel rc         # serve another channel's home for this run
 vibex --home <dir>         # run against another home
 vibex-server tui           # run the client from the server binary
 vibex-desktop tui          # run the client from the desktop binary (Linux)
 ```
 
+There is nothing to export before the first run: the client serves the channel
+it was packaged as, so a client from the RC package opens `desktop-rc` and a
+client from the stable package opens `desktop-stable`.
+
 `vibex status` never attaches, so it is the first thing to run when something
-is wrong — it prints the home, the flavour, the mode, the endpoint and the
-reason, and exits zero even when the real run would fail.
+is wrong — it prints the home, the flavour, the channel and where that channel
+came from, the mode, the endpoint and the reason, and exits zero even when the
+real run would fail.
 
 ### Homes and flavours
 
@@ -32,6 +39,38 @@ The flavour has to come from the path because the runtime refuses to start a
 channel in a home that does not match it. `--home /tmp/scratch` is therefore a
 throwaway server-style runtime, which is the quickest way to try the client
 without touching a real home.
+
+### Which channel a client serves
+
+`scripts/build-channel.mjs` exports the channel to the cargo build, so the
+client bakes it in the way the desktop app bakes its release identity. The
+order is:
+
+| Precedence | Source | Example |
+| --- | --- | --- |
+| 1 | `--home <dir>` | `vibex --home ~/.vibex/desktop-rc` |
+| 2 | `VIBEX_HOME`, then `VIBEX_DB_PATH` | a deployment's own home |
+| 3 | `--channel <c>` | `vibex --channel stable` |
+| 4 | `VIBEX_CHANNEL` | a shell that serves one channel all day |
+| 5 | the packaged channel | a developer build is `preview` |
+
+`vibex status` prints both `channel=` and `channel-source=` (`flag`,
+`environment`, or `packaged`), so a surprising home explains itself. A channel
+name the client does not know is an error rather than a silent fall-through to
+preview: `unknown channel "nightly"; use stable, rc, or preview`.
+
+The user's home directory behind that last step is resolved the way the platform
+means it — `HOME` on Unix, the known-folder API (backed by `USERPROFILE`) on
+Windows — so a stock Windows shell finds the client's home without any variable
+exported, exactly as the desktop app does. `VIBEX_HOME` remains the way to point
+a client at a home somewhere else.
+
+This is the one place the client and the desktop app differ on purpose. The
+desktop app refuses a `VIBEX_CHANNEL` that disagrees with its compiled identity
+(`release_channel_override_rejected`), because a package's window is its
+channel. The client is a viewer: one installed copy may be pointed at another
+channel's home for a run, which is what makes debugging an RC next to a stable
+install possible.
 
 Local attachment never trusts the loopback interface on its own: the client
 reads the runtime's identity public key — and, from it, the certificate the
@@ -50,10 +89,18 @@ binary so a shell user never installs anything extra:
 
 | Platform | How the client is reached |
 | --- | --- |
-| Linux | `/usr/bin/vibex` from the `.deb` / AppImage |
-| macOS | `vibex` next to the `.app` bundle, symlinked onto `PATH` by the installer |
-| Windows | `vibex.exe` from the NSIS installer; the GUI binary uses the `windows` subsystem and cannot host a console |
+| Linux | `/usr/bin/vibex`, plus the `/usr/bin/vibex-tui` launcher, from the `.deb` or inside the AppImage |
+| macOS | `Vibex.app/Contents/MacOS/vibex`; the package does not install a `PATH` entry, so link it once: `ln -s "/Applications/Vibex.app/Contents/MacOS/vibex" ~/.local/bin/vibex` |
+| Windows | `vibex.exe` beside `vibex-desktop.exe` in the NSIS install directory, which the installer adds to the user `PATH`; the GUI binary uses the `windows` subsystem and cannot host a console, so always start the client, never the GUI |
+| AUR `vibex-bin` | `/usr/bin/vibex` and `/usr/bin/vibex-tui`, unpacked from the stable `.deb` |
 | Containers | `docker exec -it <container> vibex-server tui` |
+
+`vibex-tui` is a launcher next to the client, not a second copy: it runs the
+`vibex` that shipped beside it and falls back to `PATH`. AUR, the `.deb`, the
+AppImage and the NSIS installer all carry it.
+
+Both names serve the channel the package was built as. `--channel` (or
+`VIBEX_CHANNEL`) picks a different one, and `--home` still wins over both.
 
 ## Modes
 
@@ -958,7 +1005,7 @@ and `Esc` closes it.
 | Variable | Meaning |
 | --- | --- |
 | `VIBEX_HOME` | runtime home (default `~/.vibex/<channel>`) |
-| `VIBEX_CHANNEL` | `stable`, `rc`, or `preview` |
+| `VIBEX_CHANNEL` | `stable`, `rc`, or `preview`; overrides the channel the binary was packaged as |
 | `VIBEX_THEME` | theme id, for this run (outranks the remembered choice) |
 | `VIBEX_TUI_COLOR` | `truecolor`, `ansi256`, `16`, `none` |
 | `VIBEX_TUI_ICONS` | `auto`, `emoji`, `ascii` |

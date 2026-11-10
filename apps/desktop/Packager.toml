@@ -1,6 +1,6 @@
 name = "vibex-desktop"
 productName = "Vibex Preview"
-version = "0.1.0-rc.10"
+version = "0.1.0"
 identifier = "dev.vibex.desktop.preview"
 description = "Production-shaped desktop preview package"
 authors = ["Vibex"]
@@ -20,6 +20,13 @@ icons = [
   "assets/app-icons/icon.png",
   "assets/app-icons/icon.ico",
 ]
+# Windows resolves a second command name from a `.cmd` beside the binary, which
+# is what makes `vibex-tui` work in a shell there. macOS packaging strips this
+# entry: a `.cmd` has no meaning inside an app bundle.
+resources = [
+  { src = "packaging/vibex-tui.cmd", target = "vibex-tui.cmd" },
+]
+
 [[binaries]]
 path = "vibex-desktop"
 main = true
@@ -52,3 +59,7 @@ files = { "packaging/dev.vibex.desktop.preview.desktop" = "/usr/share/applicatio
 [nsis]
 installMode = "currentUser"
 compression = "zlib"
+# The vendored template adds the install directory to the user PATH on install
+# and removes it on uninstall; see the header comment in the file for the two
+# differences from cargo-packager's own template.
+template = "packaging/nsis/installer.nsi"

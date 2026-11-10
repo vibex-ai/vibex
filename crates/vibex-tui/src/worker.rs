@@ -428,11 +428,15 @@ fn local_directory_listing(
 }
 
 /// The directory a listing starts from when the reader named none.
+///
+/// The user's home, resolved the way the platform means it. The fallback is the
+/// working directory rather than a hard-coded `/`, which names no drive at all
+/// on Windows.
 fn home_directory() -> std::path::PathBuf {
-    std::env::var_os("HOME")
-        .map(std::path::PathBuf::from)
+    crate::user_home::user_home()
         .filter(|path| path.is_absolute())
-        .unwrap_or_else(|| std::path::PathBuf::from("/"))
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| std::path::PathBuf::from(std::path::MAIN_SEPARATOR_STR))
 }
 
 /// What an install or a rollback left behind.
