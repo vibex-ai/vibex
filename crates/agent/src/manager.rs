@@ -10841,8 +10841,29 @@ mod tests {
     /// MCP credentials never live in the database: plain entries are stored,
     /// secrets stay with the configured backend and are resolved only when the
     /// server is actually forwarded.
+    ///
+    /// The secret is written through the real store API, which reaches the OS
+    /// keychain unless a store is configured. CI has no D-Bus secret service, so
+    /// an unconfigured run fails with `provider_secret_keychain_store_failed`
+    /// for a reason that has nothing to do with what this test checks; point the
+    /// store at a temporary directory first.
+    fn configure_test_secret_store() {
+        use std::sync::OnceLock;
+        static ROOT: OnceLock<std::path::PathBuf> = OnceLock::new();
+        ROOT.get_or_init(|| {
+            let root =
+                std::env::temp_dir().join(format!("vibex-agent-secrets-{}", std::process::id()));
+            std::fs::create_dir_all(&root).expect("create the test secret store root");
+            vibex_config_switch::secrets::configure_provider_secret_store(
+                vibex_config_switch::secrets::ProviderSecretStoreConfig::host_file(root.clone()),
+            );
+            root
+        });
+    }
+
     #[test]
     fn mcp_runtime_entries_merge_stored_values_with_resolved_secrets() {
+        configure_test_secret_store();
         use vibex_config_switch::secrets::store_provider_secret;
         use vibex_core::{
             McpSecretTarget, McpServerEnvEntry, McpServerHeaderEntry, McpServerId,

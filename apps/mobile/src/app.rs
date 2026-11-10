@@ -1435,7 +1435,7 @@ impl RuntimeStatus {
                 }
                 vibex_ui::locale::Locale::ZhTw => {
                     format!("正在重新連線（第 {reconnect_attempt} 次）")
-                },
+                }
                 _ => {
                     format!("Reconnecting (attempt {reconnect_attempt})")
                 }
@@ -3932,7 +3932,10 @@ impl MobileApp {
         // The cycle walks `LanguagePreference::all`, so a language added to the
         // picker joins the rotation without this row learning its name.
         let all = locale::LanguagePreference::all();
-        let index = all.iter().position(|choice| *choice == current).unwrap_or(0);
+        let index = all
+            .iter()
+            .position(|choice| *choice == current)
+            .unwrap_or(0);
         let next = all[(index + 1) % all.len()];
         self.app_settings.language = Some(next);
         locale::set_preference(next);
@@ -31395,7 +31398,10 @@ impl MobileApp {
     fn cycle_language(&mut self, _: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
         let current = self.app_settings.language.unwrap_or_default();
         let all = locale::LanguagePreference::all();
-        let index = all.iter().position(|choice| *choice == current).unwrap_or(0);
+        let index = all
+            .iter()
+            .position(|choice| *choice == current)
+            .unwrap_or(0);
         let next = all[(index + 1) % all.len()];
         self.update_language(next, window, cx);
     }
@@ -35063,7 +35069,7 @@ fn mobile_folder_archive_label(days: Option<u8>) -> String {
             } else {
                 format!("After {days} days")
             }
-        },
+        }
     }
 }
 
@@ -36792,8 +36798,8 @@ fn session_sidebar_time_label_at(
             vibex_ui::locale::Locale::En => format!("{days} days ago"),
             vibex_ui::locale::Locale::ZhCn | vibex_ui::locale::Locale::ZhTw => {
                 format!("{days} 天前")
-            },
-            _ => format!("{days} days ago")
+            }
+            _ => format!("{days} days ago"),
         };
     }
     if days < 30 {

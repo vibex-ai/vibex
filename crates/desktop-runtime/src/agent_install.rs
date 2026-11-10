@@ -5659,7 +5659,10 @@ async fn install_kiro_windows(archive: &Path, staging: &Path) -> VibexResult<Pat
     })
 }
 
-#[cfg(any(target_os = "windows", target_os = "macos"))]
+// Only the Windows installer unpacks an archive and then hunts for the binary
+// inside it; macOS installs from the extracted layout it already knows. Gating
+// this on macOS too left it dead code there, which the quality gate rejects.
+#[cfg(target_os = "windows")]
 fn find_file_named(root: &Path, name: &str) -> Option<PathBuf> {
     let mut pending = vec![root.to_path_buf()];
     let mut inspected = 0_usize;

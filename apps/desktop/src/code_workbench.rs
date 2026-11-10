@@ -16887,7 +16887,7 @@ impl CodeRightRail {
                                                 }
                                                 locale::ResolvedLocale::ZhTw => {
                                                     format!("（{change_count} 個檔案）")
-                                                },
+                                                }
                                                 _ => {
                                                     format!("({change_count} files)")
                                                 }
@@ -18251,7 +18251,7 @@ impl CodeRightRail {
                                     }
                                     locale::ResolvedLocale::ZhTw => {
                                         format!("還有 {} 個檔案", total_rows - 200)
-                                    },
+                                    }
                                     _ => {
                                         format!("{} more files", total_rows - 200)
                                     }
@@ -19019,8 +19019,8 @@ fn git_history_relative_time_at(
             locale::ResolvedLocale::En => format!("{seconds}s ago"),
             locale::ResolvedLocale::ZhCn | locale::ResolvedLocale::ZhTw => {
                 format!("{seconds}秒前")
-            },
-            _ => format!("{seconds}s ago")
+            }
+            _ => format!("{seconds}s ago"),
         }
     } else if seconds < 3_600 {
         let minutes = seconds / 60;
@@ -19028,8 +19028,8 @@ fn git_history_relative_time_at(
             locale::ResolvedLocale::En => format!("{minutes}m ago"),
             locale::ResolvedLocale::ZhCn | locale::ResolvedLocale::ZhTw => {
                 format!("{minutes}分钟前")
-            },
-            _ => format!("{minutes}m ago")
+            }
+            _ => format!("{minutes}m ago"),
         }
     } else if seconds < 6 * 3_600 {
         let hours = seconds / 3_600;
@@ -19037,8 +19037,8 @@ fn git_history_relative_time_at(
             locale::ResolvedLocale::En => format!("{hours}h ago"),
             locale::ResolvedLocale::ZhCn | locale::ResolvedLocale::ZhTw => {
                 format!("{hours}小时前")
-            },
-            _ => format!("{hours}h ago")
+            }
+            _ => format!("{hours}h ago"),
         }
     } else if day_delta == 0 {
         let relative = match resolved_locale {
@@ -19145,8 +19145,8 @@ fn git_history_date_label(
         locale::ResolvedLocale::En => timestamp.format("%Y-%m-%d").to_string(),
         locale::ResolvedLocale::ZhCn | locale::ResolvedLocale::ZhTw => {
             timestamp.format("%Y年%-m月%-d日").to_string()
-        },
-        _ => timestamp.format("%Y-%m-%d").to_string()
+        }
+        _ => timestamp.format("%Y-%m-%d").to_string(),
     }
 }
 
@@ -19161,8 +19161,8 @@ fn git_commit_authored_at(authored_at_ms: Option<i64>) -> String {
         locale::ResolvedLocale::En => timestamp.format("%b %-d, %Y, %H:%M").to_string(),
         locale::ResolvedLocale::ZhCn | locale::ResolvedLocale::ZhTw => {
             timestamp.format("%Y年%-m月%-d日 %H:%M").to_string()
-        },
-        _ => timestamp.format("%b %-d, %Y, %H:%M").to_string()
+        }
+        _ => timestamp.format("%b %-d, %Y, %H:%M").to_string(),
     }
 }
 
@@ -20148,7 +20148,7 @@ fn commit_file_count_label(file_count: usize) -> String {
             } else {
                 format!("{file_count} changed files in this commit")
             }
-        },
+        }
     }
 }
 
@@ -21003,8 +21003,8 @@ fn localized_integration_action_label(target: &str, strategy: GitWorktreeMergeSt
             }
             locale::ResolvedLocale::ZhTw => {
                 format!("Rebase 到 {}", bounded_ref_label(target))
-            },
-            _ => format!("Rebase into {}", bounded_ref_label(target))
+            }
+            _ => format!("Rebase into {}", bounded_ref_label(target)),
         };
     }
     localized_merge_action_label(target)
@@ -21072,7 +21072,7 @@ fn localized_source_delta(count: u32) -> String {
         locale::ResolvedLocale::ZhTw => format!("來源分支新增 {count} 個提交，不包含在本次合併中"),
         _ => {
             format!("{count} new source commit(s) are excluded from this merge")
-        },
+        }
     }
 }
 
@@ -21085,7 +21085,7 @@ fn localized_conflict_render_limit(limit: usize, total: usize) -> String {
         locale::ResolvedLocale::ZhTw => format!("顯示 {total} 個衝突中的前 {limit} 個"),
         _ => {
             format!("Showing the first {limit} of {total} conflicts")
-        },
+        }
     }
 }
 

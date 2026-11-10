@@ -126,12 +126,55 @@ assertToolchainPin();
 const allowedFutureIncompatibilities = loadFutureIncompatAllowlist();
 const workspacePackages = workspacePackageNames();
 
-run("cargo", [
-  "fmt",
-  ...workspacePackages.flatMap((name) => ["--package", name]),
-  "--",
-  "--check"
-]);
+// `cargo fmt -- --check` makes rustfmt report every difference through
+// `rustfmt_diff::make_diff`, whose line matcher allocates O(source × diff). On
+// `apps/desktop/src/app.rs` — one file of about 127k lines — that asks for ~52
+// GB and aborts with "memory allocation of ... bytes failed" on Linux, macOS
+// and Windows alike, so the gate died before clippy or the tests ever ran.
+// Formatting the file itself is fine; only the diff report does not scale.
+//
+// `--emit stdout` prints what rustfmt would write, one `path:` header per file
+// it touched, so comparing those bytes to the files on disk answers the same
+// question without the quadratic report — and it names the file that differs.
+function checkFormatting() {
+  const packages = workspacePackages.flatMap((name) => ["--package", name]);
+  const emitted = spawnSync("cargo", ["fmt", ...packages, "--", "--emit", "stdout"], {
+    cwd: ROOT,
+    encoding: "utf8",
+    maxBuffer: 512 * 1024 * 1024
+  });
+  if (emitted.error) fail(`cargo fmt failed to start: ${emitted.error.message}`);
+  if (emitted.status !== 0) {
+    process.stderr.write(`${emitted.stderr ?? ""}`);
+    fail("cargo fmt could not format the workspace");
+  }
+  const output = `${emitted.stdout ?? ""}`;
+  const unformatted = [];
+  // Each segment is "<absolute path>:\n<formatted source>".
+  const segments = output.split(/^(?=\/[^\n]*\.rs:\n)/mu);
+  for (const segment of segments) {
+    const newline = segment.indexOf("\n");
+    if (newline < 0) continue;
+    const header = segment.slice(0, newline).trim();
+    if (!header.endsWith(".rs:")) continue;
+    const file = header.slice(0, -1);
+    // rustfmt writes the header, then a blank separator line, then the source.
+    const formatted = segment.slice(newline + 1).replace(/^\n/u, "");
+    const relative = file.startsWith(ROOT) ? file.slice(ROOT.length + 1) : file;
+    if (!readFileSync(join(ROOT, relative)).equals(Buffer.from(formatted))) {
+      unformatted.push(relative);
+    }
+  }
+  if (unformatted.length > 0) {
+    fail(
+      `these files are not formatted; run \`cargo fmt --all\`:\n${unformatted
+        .map((file) => `  ${file}`)
+        .join("\n")}`
+    );
+  }
+}
+
+checkFormatting();
 runFutureCompatibleCheck(allowedFutureIncompatibilities);
 run("cargo", [
   "clippy",

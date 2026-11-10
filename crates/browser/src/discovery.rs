@@ -338,12 +338,49 @@ fn probe_version_within(executable: &Path, timeout: std::time::Duration) -> Opti
 /// user closes that window. Detection runs on every runtime start
 /// (`BrowserService::new`), so probing here opened a browser window out of
 /// nowhere on every launch — and with no browser already running, waiting for
-/// the process blocked the startup for as long as the window stayed open. The
-/// version has no consumer in the product, so Windows reports it as unknown
-/// instead of starting a browser to find out.
+/// the process blocked the startup for as long as the window stayed open.
+///
+/// The version is still needed, because it is what makes the page see a normal
+/// desktop UA instead of `HeadlessChrome` (see `normal_user_agent`). Chromium
+/// keeps every build in a version-named directory beside the launcher
+/// (`…\Application\156.0.8078.79\chrome.exe`), so the newest such directory
+/// answers the question from the file system alone, with no process started.
 #[cfg(windows)]
-fn probe_version(_executable: &Path) -> Option<String> {
-    None
+fn probe_version(executable: &Path) -> Option<String> {
+    let application = executable.parent()?;
+    let mut newest: Option<(Vec<u32>, String)> = None;
+    for entry in std::fs::read_dir(application).ok()?.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(parsed) = numeric_version(name) else {
+            continue;
+        };
+        // Only a directory that actually holds the browser counts; the
+        // launcher's own siblings are not builds.
+        if !entry.path().is_dir() {
+            continue;
+        }
+        match &newest {
+            Some((best, _)) if *best >= parsed => {}
+            _ => newest = Some((parsed, name.to_string())),
+        }
+    }
+    newest.map(|(_, name)| name)
+}
+
+/// A dotted all-numeric version, split into comparable components.
+///
+/// Chromium build directories are named exactly like this; anything else in the
+/// application directory (installer logs, `SetupMetrics`, locale files) fails
+/// the check and is skipped. Only the Windows probe reads build directories, so
+/// this is gated with it rather than left dead on the other platforms.
+#[cfg(windows)]
+fn numeric_version(value: &str) -> Option<Vec<u32>> {
+    let parts: Vec<u32> = value
+        .split('.')
+        .map(|part| part.parse::<u32>().ok())
+        .collect::<Option<Vec<u32>>>()?;
+    (parts.len() >= 2).then_some(parts)
 }
 
 /// Returns the process-wide cached detection result.
@@ -492,10 +529,34 @@ mod tests {
             ),
         )
         .expect("write");
+        // The launcher has no version-named build directory beside it, so the
+        // probe reports nothing — and, crucially, runs nothing.
         assert_eq!(probe_version(&stand_in), None);
         assert!(
             !marker.exists(),
             "the version probe executed a browser on Windows"
+        );
+    }
+
+    /// The version comes from the build directory Chromium keeps beside the
+    /// launcher, so the UA override works on Windows without a process start.
+    #[cfg(windows)]
+    #[test]
+    fn windows_reads_the_version_from_the_build_directory() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let launcher = directory.path().join("chrome.exe");
+        std::fs::write(&launcher, b"stub").expect("write");
+        // A sibling that is not a version, plus two builds to choose between.
+        std::fs::write(directory.path().join("SetupMetrics"), b"x").expect("write");
+        // `9.0` sorts after `156.0` as text, so picking the newest by text would
+        // choose a stale build; the comparison is per numeric component.
+        for build in ["156.0.8078.79", "155.0.8000.12", "9.0.1.1"] {
+            std::fs::create_dir(directory.path().join(build)).expect("mkdir");
+        }
+        assert_eq!(
+            probe_version(&launcher),
+            Some("156.0.8078.79".to_string()),
+            "the newest build directory names the version"
         );
     }
 }

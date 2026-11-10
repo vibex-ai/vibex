@@ -8830,7 +8830,7 @@ fn failover_switched_label(
         }
         locale::ResolvedLocale::ZhTw => {
             format!("路由組已將 {model} 從 {from_name} 切換到 {to_name}。")
-        },
+        }
         _ => {
             format!("Route group switched {model} from {from_name} to {to_name}.")
         }
@@ -13096,7 +13096,7 @@ impl VibexWorkbench {
                                         "已從 {} 暫存 RC 資料，正在重新啟動執行階段",
                                         outcome.source_home
                                     )
-                                },
+                                }
                                 _ => format!(
                                     "RC data staged from {}; restarting the runtime",
                                     outcome.source_home
@@ -19342,25 +19342,19 @@ impl VibexWorkbench {
     /// One retry only, and a fresh request clears the flag first: a transient
     /// failure heals, while a backend that cannot answer at all cannot keep the
     /// shell reading in a loop.
-    fn schedule_agent_catalog_retry(
-        &mut self,
-        entity: WeakEntity<Self>,
-        cx: &mut Context<Self>,
-    ) {
+    fn schedule_agent_catalog_retry(&mut self, entity: WeakEntity<Self>, cx: &mut Context<Self>) {
         if self.agent_catalog_retry_pending {
             return;
         }
         self.agent_catalog_retry_pending = true;
-        self.agent_catalog_retry_task = Some(cx.spawn(
-            async move |_, cx: &mut gpui::AsyncApp| {
-                cx.background_executor()
-                    .timer(AGENT_CATALOG_RETRY_BACKOFF)
-                    .await;
-                let _ = entity.update(cx, |this, cx| {
-                    this.load_agent_runtime_catalog_inner(cx);
-                });
-            },
-        ));
+        self.agent_catalog_retry_task = Some(cx.spawn(async move |_, cx: &mut gpui::AsyncApp| {
+            cx.background_executor()
+                .timer(AGENT_CATALOG_RETRY_BACKOFF)
+                .await;
+            let _ = entity.update(cx, |this, cx| {
+                this.load_agent_runtime_catalog_inner(cx);
+            });
+        }));
     }
 
     /// Keeps the new-session page honest about a download it is waiting on.
@@ -34556,7 +34550,7 @@ impl VibexWorkbench {
                                 }
                                 locale::ResolvedLocale::ZhTw => {
                                     format!("已排隊，目標為 {runtime_label}")
-                                },
+                                }
                                 _ => {
                                     format!("Queued for {runtime_label}")
                                 }
@@ -39213,9 +39207,12 @@ impl VibexWorkbench {
                 .folder(folder_id)
                 .is_some_and(|folder| {
                     folder.project_id.is_some()
-                        && folder.project_id == self.new_session_workspace.project_id
-                            .as_ref()
-                            .map(|project_id| project_id.as_str().to_string())
+                        && folder.project_id
+                            == self
+                                .new_session_workspace
+                                .project_id
+                                .as_ref()
+                                .map(|project_id| project_id.as_str().to_string())
                 })
         });
         if self.new_session_folder_id != next {
@@ -52799,8 +52796,8 @@ impl VibexWorkbench {
                             );
                         });
                         let popup_entity = cx.entity();
-                        let _ = context_entity
-                            .update(cx, |this, cx| this.begin_sidebar_menu_hover(cx));
+                        let _ =
+                            context_entity.update(cx, |this, cx| this.begin_sidebar_menu_hover(cx));
                         Self::hold_sidebar_hover_preview_for_menu(
                             &popup_entity,
                             &context_entity,
@@ -59367,12 +59364,7 @@ impl VibexWorkbench {
                                     // draws rather than a flat list of names.
                                     .pl(px(choice.depth as f32 * 12.0))
                                     .child(Icon::new(IconName::Folder).size(px(14.0)))
-                                    .child(
-                                        div()
-                                            .min_w_0()
-                                            .truncate()
-                                            .child(choice.label.clone()),
-                                    ),
+                                    .child(div().min_w_0().truncate().child(choice.label.clone())),
                             )
                             .when(selected, |this| {
                                 this.child(Icon::new(IconName::Check).size(px(14.0)))
@@ -59411,16 +59403,11 @@ impl VibexWorkbench {
                                 .min_w_0()
                                 .gap_2()
                                 .child(Icon::new(IconName::Folder).size(px(14.0)))
-                                .child(
-                                    div()
-                                        .min_w_0()
-                                        .truncate()
-                                        .child(locale::text(
-                                            "Project root",
-                                            "项目根目录",
-                                            "專案根目錄",
-                                        )),
-                                ),
+                                .child(div().min_w_0().truncate().child(locale::text(
+                                    "Project root",
+                                    "项目根目录",
+                                    "專案根目錄",
+                                ))),
                         )
                         .when(selected, |this| {
                             this.child(Icon::new(IconName::Check).size(px(14.0)))
@@ -60537,7 +60524,7 @@ impl VibexWorkbench {
                     }
                     locale::ResolvedLocale::ZhTw => {
                         format!("跳轉到第 {turn_number} 輪：{title}")
-                    },
+                    }
                     _ => {
                         format!("Jump to turn {turn_number}: {title}")
                     }
@@ -61165,7 +61152,7 @@ impl VibexWorkbench {
                     }
                     locale::ResolvedLocale::ZhTw => {
                         format!("{} 條新訊息", self.timeline_follow.unread_count)
-                    },
+                    }
                     _ => {
                         format!("{} new", self.timeline_follow.unread_count)
                     }
@@ -63967,7 +63954,7 @@ impl VibexWorkbench {
                     }
                     locale::ResolvedLocale::ZhTw => {
                         format!("再顯示 {remaining_count} 個檔案")
-                    },
+                    }
                     _ => {
                         format!("Show {remaining_count} more files")
                     }
@@ -72270,7 +72257,7 @@ impl VibexWorkbench {
                                     }
                                     locale::ResolvedLocale::ZhTw => {
                                         format!("{attachment_count} 個附件")
-                                    },
+                                    }
                                     _ => {
                                         format!("{attachment_count} attachment(s)")
                                     }
@@ -73805,11 +73792,7 @@ impl VibexWorkbench {
     }
 
     /// Adds one session to the visible terminal set when it can actually paint.
-    fn note_visible_terminal_session(
-        &self,
-        visible: &mut BTreeSet<String>,
-        session_id: &str,
-    ) {
+    fn note_visible_terminal_session(&self, visible: &mut BTreeSet<String>, session_id: &str) {
         if self
             .registered_session(session_id)
             .is_some_and(AgentSession::is_terminal)
@@ -75667,8 +75650,8 @@ fn format_timeline_hover_time(timestamp_ms: i64, locale: locale::ResolvedLocale)
         locale::ResolvedLocale::En => timestamp.format("%m/%d/%Y, %H:%M:%S").to_string(),
         locale::ResolvedLocale::ZhCn | locale::ResolvedLocale::ZhTw => {
             timestamp.format("%Y/%m/%d %H:%M:%S").to_string()
-        },
-        _ => timestamp.format("%m/%d/%Y, %H:%M:%S").to_string()
+        }
+        _ => timestamp.format("%m/%d/%Y, %H:%M:%S").to_string(),
     }
 }
 
@@ -81047,7 +81030,7 @@ fn sidebar_auto_archive_days_label(days: u8, locale: locale::ResolvedLocale) -> 
             } else {
                 format!("After {days} days")
             }
-        },
+        }
     }
 }
 
@@ -82415,8 +82398,8 @@ fn sidebar_selected_count_label(
         locale::ResolvedLocale::En => format!("{selected}/{total} selected"),
         locale::ResolvedLocale::ZhCn | locale::ResolvedLocale::ZhTw => {
             format!("已选 {selected}/{total}")
-        },
-        _ => format!("{selected}/{total} selected")
+        }
+        _ => format!("{selected}/{total} selected"),
     }
 }
 
@@ -82445,8 +82428,8 @@ fn sidebar_batch_menu_label(
         locale::ResolvedLocale::En => format!("{label} ({count})"),
         locale::ResolvedLocale::ZhCn | locale::ResolvedLocale::ZhTw => {
             format!("{label}（{count}）")
-        },
-        _ => format!("{label} ({count})")
+        }
+        _ => format!("{label} ({count})"),
     }
 }
 
@@ -82492,7 +82475,7 @@ fn sidebar_delete_session_description(locale: locale::ResolvedLocale, title: &st
         locale::ResolvedLocale::ZhTw => format!("刪除「{title}」？此操作無法復原。"),
         _ => {
             format!("Delete \"{title}\"? This action cannot be undone.")
-        },
+        }
     }
 }
 
@@ -82578,10 +82561,10 @@ fn sidebar_delete_group_description(locale: locale::ResolvedLocale, count: usize
         }
         locale::ResolvedLocale::ZhTw => {
             format!("將刪除該會話組及其中的 {count} 個會話，此操作無法復原。")
-        },
+        }
         _ => format!(
             "Delete this session group and its {count} sessions? This action cannot be undone."
-        )
+        ),
     }
 }
 
@@ -82604,7 +82587,7 @@ fn sidebar_delete_sessions_description(locale: locale::ResolvedLocale, count: us
         }
         locale::ResolvedLocale::ZhTw => {
             format!("將刪除選中的 {count} 個會話，此操作無法復原。")
-        },
+        }
         _ => {
             format!("Delete {count} selected sessions? This action cannot be undone.")
         }
@@ -105473,7 +105456,9 @@ mod tests {
             .expect("agent overview should remain inspectable");
         let catalog = source
             .split_once("    fn load_agent_runtime_catalog(")
-            .and_then(|(_, tail)| tail.split_once("\n    fn reconcile_new_session_runtime_selection("))
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    fn reconcile_new_session_runtime_selection(")
+            })
             .map(|(body, _)| body)
             .expect("runtime catalog loader should remain inspectable");
         let timeline = source
@@ -108942,7 +108927,9 @@ mod tests {
         let page = source
             .split_once("    fn render_session_terminal_body(")
             .and_then(|(_, tail)| {
-                tail.split_once("\n    /// What the page shows when the session has no running PTY.")
+                tail.split_once(
+                    "\n    /// What the page shows when the session has no running PTY.",
+                )
             })
             .map(|(body, _)| body)
             .expect("the terminal page body should remain inspectable");
@@ -109185,7 +109172,9 @@ mod tests {
         let page = source
             .split_once("    fn render_session_terminal_body(")
             .and_then(|(_, tail)| {
-                tail.split_once("\n    /// What the page shows when the session has no running PTY.")
+                tail.split_once(
+                    "\n    /// What the page shows when the session has no running PTY.",
+                )
             })
             .map(|(body, _)| body)
             .expect("the terminal page body should remain inspectable");
@@ -116325,7 +116314,9 @@ mod tests {
             .expect("the catalogue read should remain inspectable");
         let retry = source
             .split_once("    fn schedule_agent_catalog_retry(")
-            .and_then(|(_, tail)| tail.split_once("\n    fn reconcile_new_session_runtime_selection("))
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    fn reconcile_new_session_runtime_selection(")
+            })
             .map(|(body, _)| body)
             .expect("the catalogue retry should remain inspectable");
 
@@ -118665,7 +118656,9 @@ mod tests {
         // automatic panel whose preference was already Window.
         let toggle = source
             .split_once("    fn set_computer_panel_mode(")
-            .and_then(|(_, tail)| tail.split_once("\n    /// Opens the panel, optionally replacing"))
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// Opens the panel, optionally replacing")
+            })
             .map(|(body, _)| body)
             .expect("the shell toggle should remain inspectable");
         assert!(toggle.contains("self.computer_panel_open_mode != Some(mode)"));
@@ -122518,7 +122511,9 @@ mod tests {
         let body = source
             .split_once("    fn render_session_terminal_body(")
             .and_then(|(_, tail)| {
-                tail.split_once("\n    /// What the page shows when the session has no running PTY.")
+                tail.split_once(
+                    "\n    /// What the page shows when the session has no running PTY.",
+                )
             })
             .map(|(body, _)| body)
             .expect("the terminal body should remain inspectable");
@@ -123199,11 +123194,15 @@ mod tests {
         assert!(choices.contains("folders_for_project(&project_id)"));
         // A folder scoped to another Worktree would never show the session, so
         // it is not offered.
-        assert!(choices.contains("folder.workspace_id.is_none() || folder.workspace_id == session_workspace_id"));
+        assert!(choices.contains(
+            "folder.workspace_id.is_none() || folder.workspace_id == session_workspace_id"
+        ));
 
         let setter = source
             .split_once("    fn set_new_session_folder(")
-            .and_then(|(_, tail)| tail.split_once("\n    /// The folders the draft's project offers"))
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// The folders the draft's project offers")
+            })
             .map(|(body, _)| body)
             .expect("the folder setter should remain inspectable");
         // A stale or foreign folder is refused rather than written.
@@ -123271,7 +123270,9 @@ mod tests {
 
         let guide = source
             .split_once("fn sidebar_group_tree_guide(")
-            .and_then(|(_, tail)| tail.split_once("\n/// The tint an unselected session row's title reads in."))
+            .and_then(|(_, tail)| {
+                tail.split_once("\n/// The tint an unselected session row's title reads in.")
+            })
             .map(|(body, _)| body)
             .expect("the group connector should remain inspectable");
         // The trunk stops at the last member's elbow instead of running into the
