@@ -28,6 +28,7 @@ pub mod model_gateway;
 pub mod model_route;
 pub mod pairing_code_link;
 pub mod permission;
+pub mod plugin_market;
 #[cfg(not(target_family = "wasm"))]
 pub mod process_environment;
 pub mod provider;
@@ -261,6 +262,7 @@ pub use permission::{
     PermissionActionDetail, PermissionMode, PermissionRequest, PermissionRequestStatus,
     PermissionResolution, PermissionResponseKind, PermissionResponseOption, PermissionRiskCategory,
 };
+pub use plugin_market::*;
 pub use provider::{
     AcpProcessStrategy, AcpProviderCatalogListResponse, AcpProviderCatalogPreset,
     AcpProviderConfig, AcpProviderEnvReference, AcpProviderEnvSource,

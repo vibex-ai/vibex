@@ -102,6 +102,7 @@ vibex_id!(AgentRuntimeProbeId, "agent_probe");
 vibex_id!(AgentAuthenticationOperationId, "agent_auth");
 vibex_id!(AgentAuthContextId, "agent_auth_context");
 vibex_id!(McpServerId, "mcp");
+vibex_id!(PluginId, "plugin");
 vibex_id!(SkillId, "skill");
 vibex_id!(PromptId, "prompt");
 vibex_id!(ScheduledTaskId, "scheduled_task");
