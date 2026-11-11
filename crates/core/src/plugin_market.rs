@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 /// The set is closed: a catalog entry naming anything else lands in `Other`
 /// and is never used to widen a check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "kebab-case")]
 pub enum PluginCategory {
     Panels,
     Themes,
@@ -390,7 +390,7 @@ pub struct PluginMarketLocalized {
 }
 
 /// One plugin as the market lists it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PluginMarketEntry {
     /// Market identity: `<publisher>.<name>`.

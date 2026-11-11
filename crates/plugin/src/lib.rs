@@ -12,12 +12,13 @@
 //!   unpacking, version directories, atomic activation and rollback.
 //!
 //! It deliberately does not depend on the scripting host: the host is reached
-//! through [`runtime::PluginRuntime`], so the market and package management can
-//! be built and tested without it, and the host integration stays in one place.
+//! through a runtime seam, so the market and package management can be built
+//! and tested without it, and the host integration stays in one place.
 
 pub mod error;
 pub mod fingerprint;
 pub mod manifest;
+pub mod market;
 pub mod permission;
 pub mod shell;
 
@@ -26,6 +27,10 @@ pub use fingerprint::consent_fingerprint;
 pub use manifest::{
     AUTHOR_MANIFEST_FILE, PluginCapabilities, PluginFsCapability, PluginManifest,
     PluginNetworkCapability, PluginSettingContribution,
+};
+pub use market::{
+    DEFAULT_TOPIC, GithubTopicSource, MarketCache, MarketCatalog, MarketConfig, MarketHttpClient,
+    MarketUrlPolicy, merge_entries, search_entries,
 };
 pub use permission::{
     PermissionSpec, PluginPermissionCatalog, default_permission_catalog, permissions_for,
