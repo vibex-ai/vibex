@@ -475,6 +475,29 @@ impl McpMarketRequest {
     }
 }
 
+/// Which surface of the Plugins page is showing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PluginTab {
+    /// Browse and search the catalog, first-party listings included.
+    Discover,
+    /// Every installed plugin, first-party and script.
+    Installed,
+    /// Updates the catalog offers for installed script plugins.
+    Updates,
+}
+
+impl PluginTab {
+    const ALL: [Self; 3] = [Self::Discover, Self::Installed, Self::Updates];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Discover => management_locale_text("Discover", "发现", "發現"),
+            Self::Installed => management_locale_text("Installed", "已安装", "已安裝"),
+            Self::Updates => management_locale_text("Updates", "更新", "更新"),
+        }
+    }
+}
+
 /// What one Model editor renders, resolved from the Agent projection once per
 /// frame instead of per row.
 struct ProfileModelEditorContext {
@@ -2043,6 +2066,20 @@ pub struct ManagementCenter {
     /// Whether the MCP market view is showing in place of the server list.
     mcp_market_open: bool,
     mcp_market_query: Entity<InputState>,
+    /// Which Plugins tab is showing.
+    plugin_market_tab: PluginTab,
+    plugin_market_query: Entity<InputState>,
+    /// The merged catalog the Discover tab lists.
+    plugin_market_entries: Vec<vibex_core::PluginMarketEntry>,
+    plugin_market_installed: Vec<vibex_core::InstalledPlugin>,
+    plugin_market_updates: Vec<vibex_core::PluginUpdate>,
+    plugin_market_detail: Option<vibex_core::PluginMarketDetail>,
+    /// The plugin whose detail page is open.
+    plugin_market_selected: Option<String>,
+    plugin_market_category: Option<vibex_core::PluginCategory>,
+    plugin_market_loading: bool,
+    plugin_market_error: Option<String>,
+    plugin_market_generation: u64,
     /// The page of the index the grid is showing, as the runtime cut it.
     mcp_market_entries: Vec<vibex_core::McpMarketEntry>,
     /// Which page the grid is on. The runtime is asked for this page by offset,
@@ -2439,6 +2476,13 @@ impl ManagementCenter {
                 "Search the Skill market",
                 "搜索 Skill 市场",
                 "搜尋 Skill 市場",
+            ))
+        });
+        let plugin_market_query = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(management_locale_text(
+                "Search plugins",
+                "搜索插件",
+                "搜尋外掛",
             ))
         });
         let mcp_name_draft = cx.new(|cx| {
@@ -3148,6 +3192,17 @@ impl ManagementCenter {
             skill_market_install_agents: BTreeSet::new(),
             skill_market_document: None,
             skill_market_preview_loading: false,
+            plugin_market_tab: PluginTab::Discover,
+            plugin_market_query,
+            plugin_market_entries: Vec::new(),
+            plugin_market_installed: Vec::new(),
+            plugin_market_updates: Vec::new(),
+            plugin_market_detail: None,
+            plugin_market_selected: None,
+            plugin_market_category: None,
+            plugin_market_loading: false,
+            plugin_market_error: None,
+            plugin_market_generation: 0,
             mcp_validation: None,
             skill_validation: None,
             provider_display_order_drop_target: None,
@@ -5570,6 +5625,7 @@ impl ManagementCenter {
             match section {
                 ManagementSection::Mcp => self.open_mcp_market(cx),
                 ManagementSection::Skills => self.open_skill_market(cx),
+                ManagementSection::Plugins => self.open_plugins(cx),
                 _ => {}
             }
         }
@@ -11947,6 +12003,845 @@ impl ManagementCenter {
         }));
     }
 
+    // ---- plugins ----
+
+    fn open_plugins(&mut self, cx: &mut Context<Self>) {
+        self.plugin_market_tab = PluginTab::Discover;
+        self.plugin_market_selected = None;
+        self.plugin_market_detail = None;
+        self.load_plugin_catalog(cx);
+        self.load_installed_plugins(cx);
+    }
+
+    fn load_plugin_catalog(&mut self, cx: &mut Context<Self>) {
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        self.plugin_market_loading = true;
+        self.plugin_market_error = None;
+        self.plugin_market_generation = self.plugin_market_generation.wrapping_add(1);
+        let generation = self.plugin_market_generation;
+        let entity = cx.weak_entity();
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            backend
+                .management()
+                .plugin_market_index(vibex_core::PluginMarketIndexRequest {
+                    refresh: false,
+                    include_github: true,
+                })
+                .await
+                .map_err(crate::app::remote_error_into_vibex)
+        });
+        self.mutation_task = Some(cx.spawn(async move |_, cx| {
+            let outcome = runner.await;
+            let _ = entity.update(cx, |this, cx| {
+                if this.plugin_market_generation != generation {
+                    return;
+                }
+                this.plugin_market_loading = false;
+                match outcome {
+                    Ok(Ok(response)) => {
+                        this.plugin_market_entries = response.entries;
+                        this.plugin_market_error = response.partial_reason;
+                    }
+                    Ok(Err(error)) => {
+                        this.plugin_market_error =
+                            Some(management_market_error_text(&error.code, &error.message));
+                    }
+                    Err(error) => this.plugin_market_error = Some(format!("{error}")),
+                }
+                cx.notify();
+            });
+        }));
+    }
+
+    fn search_plugins(&mut self, cx: &mut Context<Self>) {
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        let query = self.plugin_market_query.read(cx).value().trim().to_string();
+        let category = self.plugin_market_category;
+        self.plugin_market_loading = true;
+        self.plugin_market_error = None;
+        self.plugin_market_generation = self.plugin_market_generation.wrapping_add(1);
+        let generation = self.plugin_market_generation;
+        let entity = cx.weak_entity();
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            backend
+                .management()
+                .search_plugin_market(vibex_core::PluginMarketSearchRequest {
+                    query: (!query.is_empty()).then_some(query),
+                    category,
+                    sort: vibex_core::PluginMarketSort::Recommended,
+                    limit: Some(200),
+                    offset: Some(0),
+                })
+                .await
+                .map_err(crate::app::remote_error_into_vibex)
+        });
+        self.mutation_task = Some(cx.spawn(async move |_, cx| {
+            let outcome = runner.await;
+            let _ = entity.update(cx, |this, cx| {
+                if this.plugin_market_generation != generation {
+                    return;
+                }
+                this.plugin_market_loading = false;
+                match outcome {
+                    Ok(Ok(response)) => this.plugin_market_entries = response.entries,
+                    Ok(Err(error)) => {
+                        this.plugin_market_error =
+                            Some(management_market_error_text(&error.code, &error.message));
+                    }
+                    Err(error) => this.plugin_market_error = Some(format!("{error}")),
+                }
+                cx.notify();
+            });
+        }));
+    }
+
+    fn load_installed_plugins(&mut self, cx: &mut Context<Self>) {
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        let entity = cx.weak_entity();
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            backend
+                .management()
+                .plugins()
+                .await
+                .map_err(crate::app::remote_error_into_vibex)
+        });
+        self.mutation_task = Some(cx.spawn(async move |_, cx| {
+            let outcome = runner.await;
+            let _ = entity.update(cx, |this, cx| {
+                match outcome {
+                    Ok(Ok(plugins)) => this.plugin_market_installed = plugins,
+                    Ok(Err(error)) => {
+                        this.plugin_market_error =
+                            Some(management_market_error_text(&error.code, &error.message));
+                    }
+                    Err(error) => this.plugin_market_error = Some(format!("{error}")),
+                }
+                cx.notify();
+            });
+        }));
+    }
+
+    fn open_plugin_detail(&mut self, plugin_id: String, cx: &mut Context<Self>) {
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        self.plugin_market_selected = Some(plugin_id.clone());
+        self.plugin_market_detail = None;
+        let entity = cx.weak_entity();
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            backend
+                .management()
+                .plugin_market_detail(vibex_core::PluginMarketDetailRequest {
+                    entry_id: plugin_id,
+                    version: None,
+                })
+                .await
+                .map_err(crate::app::remote_error_into_vibex)
+        });
+        self.mutation_task = Some(cx.spawn(async move |_, cx| {
+            let outcome = runner.await;
+            let _ = entity.update(cx, |this, cx| {
+                match outcome {
+                    Ok(Ok(detail)) => this.plugin_market_detail = Some(detail),
+                    Ok(Err(error)) => {
+                        this.plugin_market_error =
+                            Some(management_market_error_text(&error.code, &error.message));
+                    }
+                    Err(error) => this.plugin_market_error = Some(format!("{error}")),
+                }
+                cx.notify();
+            });
+        }));
+    }
+
+    fn install_plugin(&mut self, plugin_id: String, cx: &mut Context<Self>) {
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        let granted: Vec<vibex_core::PluginPermissionGrant> = self
+            .plugin_market_detail
+            .as_ref()
+            .filter(|detail| detail.entry.id == plugin_id)
+            .map(|detail| {
+                detail
+                    .requested_permissions
+                    .iter()
+                    .map(vibex_core::PluginPermissionGrant::from)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let entity = cx.weak_entity();
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            backend
+                .management()
+                .install_plugin_market_entry(MutationRequest::new(
+                    vibex_core::PluginMarketInstallRequest {
+                        entry_id: plugin_id,
+                        version: None,
+                        granted_permissions: granted,
+                        consent_fingerprint: None,
+                        enable: true,
+                        auto_update: false,
+                    },
+                ))
+                .await
+                .map_err(crate::app::remote_error_into_vibex)
+        });
+        self.mutation_task = Some(cx.spawn(async move |_, cx| {
+            let outcome = runner.await;
+            let _ = entity.update(cx, |this, cx| {
+                match outcome {
+                    Ok(Ok(result)) => {
+                        this.plugin_market_installed
+                            .retain(|plugin| plugin.plugin_id != result.plugin.plugin_id);
+                        this.plugin_market_installed.push(result.plugin);
+                    }
+                    Ok(Err(error)) => {
+                        this.plugin_market_error =
+                            Some(management_market_error_text(&error.code, &error.message));
+                    }
+                    Err(error) => this.plugin_market_error = Some(format!("{error}")),
+                }
+                cx.notify();
+            });
+        }));
+    }
+
+    fn set_plugin_enabled(&mut self, plugin_id: String, enabled: bool, cx: &mut Context<Self>) {
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        let entity = cx.weak_entity();
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            backend
+                .management()
+                .set_plugin_enabled(MutationRequest::new(vibex_core::PluginEnabledRequest {
+                    plugin_id,
+                    enabled,
+                }))
+                .await
+                .map_err(crate::app::remote_error_into_vibex)
+        });
+        self.mutation_task = Some(cx.spawn(async move |_, cx| {
+            let outcome = runner.await;
+            let _ = entity.update(cx, |this, cx| {
+                match outcome {
+                    Ok(Ok(plugin)) => {
+                        if let Some(existing) = this
+                            .plugin_market_installed
+                            .iter_mut()
+                            .find(|candidate| candidate.plugin_id == plugin.plugin_id)
+                        {
+                            *existing = plugin;
+                        }
+                    }
+                    Ok(Err(error)) => {
+                        this.plugin_market_error =
+                            Some(management_market_error_text(&error.code, &error.message));
+                    }
+                    Err(error) => this.plugin_market_error = Some(format!("{error}")),
+                }
+                cx.notify();
+            });
+        }));
+    }
+
+    fn uninstall_plugin(&mut self, plugin_id: String, cx: &mut Context<Self>) {
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        let entity = cx.weak_entity();
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            backend
+                .management()
+                .uninstall_plugin(MutationRequest::new(vibex_core::PluginUninstallRequest {
+                    plugin_id,
+                    remove_data: false,
+                }))
+                .await
+                .map_err(crate::app::remote_error_into_vibex)
+        });
+        self.mutation_task = Some(cx.spawn(async move |_, cx| {
+            let outcome = runner.await;
+            let _ = entity.update(cx, |this, cx| {
+                match outcome {
+                    Ok(Ok(())) => this.load_installed_plugins(cx),
+                    Ok(Err(error)) => {
+                        this.plugin_market_error =
+                            Some(management_market_error_text(&error.code, &error.message));
+                    }
+                    Err(error) => this.plugin_market_error = Some(format!("{error}")),
+                }
+                cx.notify();
+            });
+        }));
+    }
+
+    fn check_plugin_updates(&mut self, cx: &mut Context<Self>) {
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        self.plugin_market_loading = true;
+        let entity = cx.weak_entity();
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            backend
+                .management()
+                .check_plugin_updates(vibex_core::PluginUpdateCheckRequest {
+                    plugin_ids: Vec::new(),
+                    refresh: true,
+                })
+                .await
+                .map_err(crate::app::remote_error_into_vibex)
+        });
+        self.mutation_task = Some(cx.spawn(async move |_, cx| {
+            let outcome = runner.await;
+            let _ = entity.update(cx, |this, cx| {
+                this.plugin_market_loading = false;
+                match outcome {
+                    Ok(Ok(response)) => this.plugin_market_updates = response.updates,
+                    Ok(Err(error)) => {
+                        this.plugin_market_error =
+                            Some(management_market_error_text(&error.code, &error.message));
+                    }
+                    Err(error) => this.plugin_market_error = Some(format!("{error}")),
+                }
+                cx.notify();
+            });
+        }));
+    }
+
+    fn apply_plugin_update(&mut self, plugin_id: String, cx: &mut Context<Self>) {
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        let entity = cx.weak_entity();
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            backend
+                .management()
+                .apply_plugin_updates(MutationRequest::new(vibex_core::PluginUpdateApplyRequest {
+                    plugin_ids: vec![plugin_id],
+                    granted_permissions: Vec::new(),
+                }))
+                .await
+                .map_err(crate::app::remote_error_into_vibex)
+        });
+        self.mutation_task = Some(cx.spawn(async move |_, cx| {
+            let outcome = runner.await;
+            let _ = entity.update(cx, |this, cx| {
+                match outcome {
+                    Ok(Ok(results)) => {
+                        for result in results {
+                            this.plugin_market_installed
+                                .retain(|plugin| plugin.plugin_id != result.plugin.plugin_id);
+                            this.plugin_market_installed.push(result.plugin);
+                        }
+                        this.plugin_market_updates.clear();
+                    }
+                    Ok(Err(error)) => {
+                        this.plugin_market_error =
+                            Some(management_market_error_text(&error.code, &error.message));
+                    }
+                    Err(error) => this.plugin_market_error = Some(format!("{error}")),
+                }
+                cx.notify();
+            });
+        }));
+    }
+
+    fn render_plugins(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let tab = self.plugin_market_tab;
+        let loading = self.plugin_market_loading;
+        let error = self.plugin_market_error.clone();
+        let mut content = v_flex().size_full().min_h_0().gap_3();
+        content = content.child(
+            h_flex()
+                .w_full()
+                .min_w_0()
+                .flex_none()
+                .items_center()
+                .gap_3()
+                .child(management_market_glyph("icons/vibex/package.svg", cx))
+                .child(
+                    v_flex()
+                        .min_w_0()
+                        .flex_1()
+                        .gap(px(2.0))
+                        .child(
+                            div()
+                                .text_lg()
+                                .font_semibold()
+                                .child(management_locale_text("Plugins", "插件", "外掛")),
+                        )
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(management_locale_text(
+                                    "First-party panels and script packages, from the signed catalog.",
+                                    "官方原生面板与脚本插件，来自签名目录。",
+                                    "官方原生面板與腳本外掛，來自簽名目錄。",
+                                )),
+                        ),
+                ),
+        );
+
+        let mut tabs = h_flex().w_full().flex_none().gap_2();
+        for candidate in PluginTab::ALL {
+            let selected = candidate == tab;
+            let button = Button::new(SharedString::from(format!(
+                "management-plugin-tab-{:?}",
+                candidate
+            )))
+            .small()
+            .label(candidate.label());
+            let button = if selected {
+                button.primary()
+            } else {
+                button.outline()
+            };
+            tabs = tabs.child(button.on_click(cx.listener(move |this, _, _, cx| {
+                if this.plugin_market_tab == candidate {
+                    return;
+                }
+                this.plugin_market_tab = candidate;
+                this.plugin_market_error = None;
+                match candidate {
+                    PluginTab::Discover => this.load_plugin_catalog(cx),
+                    PluginTab::Installed => this.load_installed_plugins(cx),
+                    PluginTab::Updates => this.check_plugin_updates(cx),
+                }
+                cx.notify();
+            })));
+        }
+        content = content.child(tabs);
+
+        if let Some(error) = &error {
+            content = content.child(management_market_banner(
+                "management-plugin-error",
+                error.clone(),
+            ));
+        }
+
+        if let Some(plugin_id) = self.plugin_market_selected.clone() {
+            content = content.child(self.render_plugin_detail(&plugin_id, cx));
+        } else {
+            content = content.child(match tab {
+                PluginTab::Discover => self.render_plugin_discover(loading, cx),
+                PluginTab::Installed => self.render_plugin_installed(cx),
+                PluginTab::Updates => self.render_plugin_updates(cx),
+            });
+        }
+        content.into_any_element()
+    }
+
+    fn render_plugins_sidebar(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let installed = self
+            .plugin_market_installed
+            .iter()
+            .filter(|plugin| plugin.enabled)
+            .count();
+        v_flex()
+            .size_full()
+            .gap_2()
+            .child(
+                div()
+                    .text_sm()
+                    .font_semibold()
+                    .child(management_locale_text("Plugins", "插件", "外掛")),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(format!(
+                        "{} · {}",
+                        management_locale_text("Enabled", "已启用", "已啟用"),
+                        installed
+                    )),
+            )
+            .into_any_element()
+    }
+
+    fn render_plugin_discover(&mut self, loading: bool, cx: &mut Context<Self>) -> AnyElement {
+        let entries = self.plugin_market_entries.clone();
+        let query = self.plugin_market_query.clone();
+        let category = self.plugin_market_category;
+        let mut column = v_flex().w_full().gap_3();
+        column = column.child(management_market_toolbar(
+            "management-plugin-search",
+            &query,
+            loading,
+            false,
+            cx.listener(|this, _, _, cx| this.search_plugins(cx)),
+            None,
+            cx,
+        ));
+        let mut chips = h_flex().w_full().flex_wrap().gap_1();
+        chips = chips.child(management_option_chip(
+            SharedString::from("management-plugin-category-all"),
+            SharedString::from(management_locale_text("All", "全部", "全部")),
+            category.is_none(),
+            false,
+            None,
+            cx.listener(|this, _: &bool, _, cx| {
+                this.plugin_market_category = None;
+                this.search_plugins(cx);
+            }),
+            cx,
+        ));
+        for candidate in vibex_core::PluginCategory::ALL {
+            let selected = category == Some(candidate);
+            chips = chips.child(management_option_chip(
+                SharedString::from(format!("management-plugin-category-{}", candidate.key())),
+                SharedString::from(candidate.label()),
+                selected,
+                false,
+                None,
+                cx.listener(move |this, _: &bool, _, cx| {
+                    this.plugin_market_category = (!selected).then_some(candidate);
+                    this.search_plugins(cx);
+                }),
+                cx,
+            ));
+        }
+        column = column.child(chips);
+
+        if entries.is_empty() {
+            column = column.child(management_market_empty_row(
+                management_locale_text("No plugins found", "没有找到插件", "沒有找到外掛"),
+                management_locale_text(
+                    "Try a different search, or check the catalog index.",
+                    "换一个搜索词，或检查目录索引。",
+                    "換一個搜尋詞，或檢查目錄索引。",
+                ),
+                None,
+                cx,
+            ));
+        } else {
+            for entry in entries {
+                column = column.child(self.render_plugin_row(&entry, cx));
+            }
+        }
+        column.into_any_element()
+    }
+
+    fn render_plugin_row(
+        &mut self,
+        entry: &vibex_core::PluginMarketEntry,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let installed = self
+            .plugin_market_installed
+            .iter()
+            .any(|plugin| plugin.plugin_id == entry.id);
+        let open_id = entry.id.clone();
+        let button_id = entry.id.clone();
+        let name = entry.name.clone();
+        let summary = entry.summary.clone().unwrap_or_default();
+        let meta = format!(
+            "{} · {} · {}",
+            entry.publisher.display_name,
+            entry.trust.label(),
+            entry.latest_version.clone().unwrap_or_default()
+        );
+        let action = Button::new(SharedString::from(format!(
+            "management-plugin-action-{button_id}"
+        )))
+        .small()
+        .label(if installed {
+            management_locale_text("Open", "打开", "開啟")
+        } else {
+            management_locale_text("Install", "安装", "安裝")
+        })
+        .on_click(cx.listener(move |this, _, _, cx| {
+            this.open_plugin_detail(open_id.clone(), cx);
+            cx.notify();
+        }));
+        h_flex()
+            .w_full()
+            .min_w_0()
+            .items_center()
+            .gap_3()
+            .p_3()
+            .rounded(cx.theme().radius)
+            .border_1()
+            .border_color(cx.theme().border.opacity(0.7))
+            .child(
+                v_flex()
+                    .min_w_0()
+                    .flex_1()
+                    .gap(px(2.0))
+                    .child(div().text_sm().font_semibold().child(name))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(summary),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(meta),
+                    ),
+            )
+            .child(action)
+            .into_any_element()
+    }
+
+    fn render_plugin_detail(&mut self, plugin_id: &str, cx: &mut Context<Self>) -> AnyElement {
+        let Some(detail) = self
+            .plugin_market_detail
+            .clone()
+            .filter(|detail| detail.entry.id == plugin_id)
+        else {
+            return v_flex()
+                .child(management_locale_text("Loading…", "加载中…", "載入中…"))
+                .into_any_element();
+        };
+        let entry = detail.entry.clone();
+        let install_id = plugin_id.to_string();
+        let installed = self
+            .plugin_market_installed
+            .iter()
+            .any(|plugin| plugin.plugin_id == entry.id);
+        let mut column = v_flex().w_full().gap_3();
+        column = column.child(
+            h_flex()
+                .w_full()
+                .items_center()
+                .gap_2()
+                .child(
+                    Button::new("management-plugin-back")
+                        .xsmall()
+                        .link()
+                        .label(management_locale_text("Back", "返回", "返回"))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.plugin_market_selected = None;
+                            this.plugin_market_detail = None;
+                            cx.notify();
+                        })),
+                )
+                .child(div().text_lg().font_semibold().child(entry.name.clone())),
+        );
+        column = column.child(
+            div()
+                .text_sm()
+                .text_color(cx.theme().muted_foreground)
+                .child(format!(
+                    "{} · {} · {}",
+                    entry.publisher.display_name,
+                    entry.trust.label(),
+                    entry.latest_version.clone().unwrap_or_default()
+                )),
+        );
+        if let Some(description) = &detail.description {
+            column = column.child(div().text_sm().child(description.clone()));
+        }
+        if !detail.requested_permissions.is_empty() {
+            let mut list = v_flex().gap_1();
+            for permission in &detail.requested_permissions {
+                list = list.child(
+                    div()
+                        .text_xs()
+                        .child(format!("{} ({:?})", permission.key, permission.risk)),
+                );
+            }
+            column = column.child(
+                v_flex()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_semibold()
+                            .child(management_locale_text("Permissions", "权限", "權限")),
+                    )
+                    .child(list),
+            );
+        }
+        if let Some(readme) = &detail.readme {
+            column = column.child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(readme.clone()),
+            );
+        }
+        if !installed {
+            column = column.child(
+                Button::new("management-plugin-install")
+                    .small()
+                    .primary()
+                    .label(management_locale_text("Install", "安装", "安裝"))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.install_plugin(install_id.clone(), cx);
+                        cx.notify();
+                    })),
+            );
+        }
+        column.into_any_element()
+    }
+
+    fn render_plugin_installed(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let installed = self.plugin_market_installed.clone();
+        let mut column = v_flex().w_full().gap_3();
+        if installed.is_empty() {
+            column = column.child(management_market_empty_row(
+                management_locale_text(
+                    "No plugins installed",
+                    "没有已安装的插件",
+                    "沒有已安裝的外掛",
+                ),
+                management_locale_text(
+                    "Browse Discover to add one.",
+                    "到发现页添加一个。",
+                    "到發現頁新增一個。",
+                ),
+                None,
+                cx,
+            ));
+        }
+        for plugin in installed {
+            let toggle_id = plugin.plugin_id.clone();
+            let uninstall_id = plugin.plugin_id.clone();
+            let enabled = plugin.enabled;
+            let uninstallable = plugin.can_uninstall();
+            let mut row = h_flex()
+                .w_full()
+                .min_w_0()
+                .items_center()
+                .gap_3()
+                .p_3()
+                .rounded(cx.theme().radius)
+                .border_1()
+                .border_color(cx.theme().border.opacity(0.7))
+                .child(
+                    v_flex()
+                        .min_w_0()
+                        .flex_1()
+                        .gap(px(2.0))
+                        .child(div().text_sm().font_semibold().child(plugin.name.clone()))
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(format!(
+                                    "{} · {} · {}",
+                                    plugin.version,
+                                    plugin.trust.label(),
+                                    if plugin.bundled {
+                                        management_locale_text("built-in", "内置", "內建")
+                                    } else {
+                                        management_locale_text("market", "市场", "市場")
+                                    }
+                                )),
+                        ),
+                )
+                .child(
+                    Button::new(SharedString::from(format!(
+                        "management-plugin-toggle-{toggle_id}"
+                    )))
+                    .small()
+                    .outline()
+                    .label(if enabled {
+                        management_locale_text("Disable", "禁用", "停用")
+                    } else {
+                        management_locale_text("Enable", "启用", "啟用")
+                    })
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.set_plugin_enabled(toggle_id.clone(), !enabled, cx);
+                        cx.notify();
+                    })),
+                );
+            if uninstallable {
+                row = row.child(
+                    Button::new(SharedString::from(format!(
+                        "management-plugin-uninstall-{uninstall_id}"
+                    )))
+                    .small()
+                    .outline()
+                    .label(management_locale_text("Uninstall", "卸载", "卸載"))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.uninstall_plugin(uninstall_id.clone(), cx);
+                        cx.notify();
+                    })),
+                );
+            }
+            column = column.child(row);
+        }
+        column.into_any_element()
+    }
+
+    fn render_plugin_updates(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let updates = self.plugin_market_updates.clone();
+        let mut column = v_flex().w_full().gap_3();
+        if updates.is_empty() {
+            column = column.child(management_market_empty_row(
+                management_locale_text("No updates", "没有可用的更新", "沒有可用的更新"),
+                management_locale_text(
+                    "Installed plugins are up to date.",
+                    "已安装插件均为最新版本。",
+                    "已安裝外掛均為最新版本。",
+                ),
+                None,
+                cx,
+            ));
+        }
+        for update in updates {
+            let plugin_id = update.plugin_id.clone();
+            let mut row = h_flex()
+                .w_full()
+                .min_w_0()
+                .items_center()
+                .gap_3()
+                .p_3()
+                .rounded(cx.theme().radius)
+                .border_1()
+                .border_color(cx.theme().border.opacity(0.7))
+                .child(
+                    v_flex()
+                        .min_w_0()
+                        .flex_1()
+                        .gap(px(2.0))
+                        .child(div().text_sm().font_semibold().child(plugin_id.clone()))
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(format!(
+                                    "{} → {}",
+                                    update.installed_version, update.available_version
+                                )),
+                        ),
+                );
+            if update.permission_diff.requires_consent() {
+                row = row.child(management_market_chip(management_locale_text(
+                    "New permissions",
+                    "需要新权限",
+                    "需要新權限",
+                )));
+            }
+            row = row.child(
+                Button::new("management-plugin-update")
+                    .small()
+                    .primary()
+                    .label(management_locale_text("Update", "更新", "更新"))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.apply_plugin_update(plugin_id.clone(), cx);
+                        cx.notify();
+                    })),
+            );
+            column = column.child(row);
+        }
+        column.into_any_element()
+    }
+
     fn request_mcp_market(&mut self, request: McpMarketRequest, cx: &mut Context<Self>) {
         let Some(backend) = self.backend.clone() else {
             return;
@@ -14995,6 +15890,11 @@ impl ManagementCenter {
             ),
             (ManagementSection::Mcp, copy.mcp, IconName::Network),
             (ManagementSection::Skills, copy.skills, IconName::BookOpen),
+            (
+                ManagementSection::Plugins,
+                management_locale_text("Plugins", "插件", "外掛"),
+                IconName::Frame,
+            ),
             (
                 ManagementSection::PromptsHooks,
                 copy.prompts,
@@ -21099,6 +21999,7 @@ impl ManagementCenter {
             }
             ManagementSection::Mcp => self.render_mcp(cx),
             ManagementSection::Skills => self.render_skills(cx),
+            ManagementSection::Plugins => self.render_plugins(cx),
             ManagementSection::PromptsHooks => self.render_prompts(window, cx),
             ManagementSection::Advanced => self.render_advanced(window, cx),
             ManagementSection::Scheduled => self.render_scheduled(window, cx),
@@ -21119,6 +22020,7 @@ impl ManagementCenter {
             }
             ManagementSection::Mcp => self.render_mcp_sidebar(cx),
             ManagementSection::Skills => self.render_skills_sidebar(cx),
+            ManagementSection::Plugins => self.render_plugins_sidebar(cx),
             ManagementSection::PromptsHooks => self.render_prompts_sidebar(cx),
             ManagementSection::Advanced => self.render_advanced_sidebar(window, cx),
             _ => unreachable!("primary management section must be normalized"),
@@ -36009,6 +36911,7 @@ fn management_primary_section(section: ManagementSection) -> ManagementSection {
         ManagementSection::Gateway => ManagementSection::Providers,
         ManagementSection::Mcp => ManagementSection::Mcp,
         ManagementSection::Skills => ManagementSection::Skills,
+        ManagementSection::Plugins => ManagementSection::Plugins,
         ManagementSection::PromptsHooks => ManagementSection::PromptsHooks,
         ManagementSection::Advanced
         | ManagementSection::Scheduled

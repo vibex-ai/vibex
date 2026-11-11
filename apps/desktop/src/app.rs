@@ -16135,7 +16135,10 @@ impl VibexWorkbench {
         self.ssh_provisioning_snapshot = Some(ProvisioningSnapshot::preparing(
             profile_id,
             PREPARING_ATTEMPT_ID,
-            stage.lock().map(|stage| stage.detail.clone()).unwrap_or_default(),
+            stage
+                .lock()
+                .map(|stage| stage.detail.clone())
+                .unwrap_or_default(),
             unix_timestamp_ms(),
         ));
         self.sync_ssh_provisioning_settings(cx);
@@ -16146,7 +16149,9 @@ impl VibexWorkbench {
                         .timer(Duration::from_millis(120))
                         .await;
                     let Some(next) = entity
-                        .update(cx, |this, cx| this.poll_ssh_provisioning_preparing(&stage, cx))
+                        .update(cx, |this, cx| {
+                            this.poll_ssh_provisioning_preparing(&stage, cx)
+                        })
                         .ok()
                         .flatten()
                     else {
@@ -119977,9 +119982,7 @@ mod tests {
         let source = include_str!("app.rs");
         let resolve = source
             .split_once("    fn resolve_ssh_profile_provisioning(")
-            .and_then(|(_, tail)| {
-                tail.split_once("\n    /// Makes the preparing window visible")
-            })
+            .and_then(|(_, tail)| tail.split_once("\n    /// Makes the preparing window visible"))
             .map(|(body, _)| body)
             .expect("the start path should remain inspectable");
         let placeholder = resolve
@@ -120027,13 +120030,13 @@ mod tests {
         // dialog reopen by itself at step one.
         let sync = source
             .split_once("    fn sync_ssh_provisioning_settings(")
-            .and_then(|(_, tail)| {
-                tail.split_once("\n    fn finish_ssh_provisioning(")
-            })
+            .and_then(|(_, tail)| tail.split_once("\n    fn finish_ssh_provisioning("))
             .map(|(body, _)| body)
             .expect("the settings sync should remain inspectable");
         assert!(
-            sync.contains("connections_progress_dismissed = Some((profile_id.clone(), attempt_id))"),
+            sync.contains(
+                "connections_progress_dismissed = Some((profile_id.clone(), attempt_id))"
+            ),
             "a dismissed placeholder has to suppress the run it became"
         );
     }
@@ -120058,9 +120061,7 @@ mod tests {
             .expect("the install path must reload the registry the pairing wrote");
         let activate = install
             .find("self.mark_runtime_active(&runtime_id, cx);")
-            .unwrap_or_else(|| {
-                panic!("the install path must still activate the runtime")
-            });
+            .unwrap_or_else(|| panic!("the install path must still activate the runtime"));
         assert!(
             reload < activate,
             "the registry has to contain the runtime before it becomes active"

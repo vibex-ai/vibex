@@ -32,6 +32,8 @@ pub enum ManagementSection {
     Gateway,
     Mcp,
     Skills,
+    /// The plugin market: first-party native plugins and script packages.
+    Plugins,
     PromptsHooks,
     Advanced,
     Scheduled,
@@ -46,12 +48,13 @@ impl ManagementSection {
     /// Providers page, not a page of its own. The variant survives so a stored
     /// selection from before the move still resolves, and the Config Center
     /// normalises it to `Providers`.
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::Agents,
         Self::ModelProviders,
         Self::Providers,
         Self::Mcp,
         Self::Skills,
+        Self::Plugins,
         Self::PromptsHooks,
         Self::Advanced,
         Self::Scheduled,
@@ -67,6 +70,7 @@ impl ManagementSection {
             Self::Gateway => "gateway",
             Self::Mcp => "mcp",
             Self::Skills => "skills",
+            Self::Plugins => "plugins",
             Self::PromptsHooks => "prompts-hooks",
             Self::Advanced => "advanced",
             Self::Scheduled => "scheduled",
@@ -83,6 +87,7 @@ impl ManagementSection {
             Self::Gateway => "Gateway",
             Self::Mcp => "MCP",
             Self::Skills => "Skills",
+            Self::Plugins => "Plugins",
             Self::PromptsHooks => "Prompts",
             Self::Advanced => "Advanced",
             Self::Scheduled => "Scheduled",
