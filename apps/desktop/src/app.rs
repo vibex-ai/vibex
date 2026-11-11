@@ -4125,6 +4125,16 @@ fn right_rail_activity_id(mode: RightRailMode) -> &'static str {
     }
 }
 
+/// The first-party plugin that owns a rail activity.
+fn right_rail_plugin_id(activity: RightRailActivity) -> Option<&'static str> {
+    match activity {
+        RightRailActivity::Editor => Some("vibex.system.editor"),
+        RightRailActivity::Files => Some("vibex.system.files"),
+        RightRailActivity::Git => Some("vibex.system.git"),
+        RightRailActivity::ChildAgents => Some("vibex.system.child-agents"),
+    }
+}
+
 fn route_right_rail_activity_id(value: &str) -> Option<String> {
     match value.trim() {
         "" => None,
@@ -10693,6 +10703,11 @@ pub struct VibexWorkbench {
     session_group_tab_removal_active: bool,
     /// Where a dragged right-rail activity button would land.
     right_rail_activity_drop_target: Option<RightRailActivityDropTarget>,
+    /// First-party plugin ids whose rail activity is enabled.
+    ///
+    /// `None` until the plugin catalog has been read, which keeps every
+    /// activity visible rather than hiding the rail before the first read.
+    right_rail_enabled_plugins: Option<BTreeSet<String>>,
     /// Group members whose parked view is being fetched.
     session_group_view_loads: BTreeSet<String>,
     session_group_view_errors: BTreeMap<String, String>,
@@ -12461,6 +12476,7 @@ impl VibexWorkbench {
             session_group_tab_drop_target: None,
             session_group_tab_removal_active: false,
             right_rail_activity_drop_target: None,
+            right_rail_enabled_plugins: None,
             session_group_view_loads: BTreeSet::new(),
             session_group_view_errors: BTreeMap::new(),
             session_group_available_width_rem: 72.0,
@@ -17451,6 +17467,7 @@ impl VibexWorkbench {
             .to_string(),
         );
         self.runtime = Some(runtime.clone());
+        self.refresh_right_rail_plugins(cx);
         self.sync_timeline_display_settings_to_runtime();
         self.start_sidebar_organization_bridge(&runtime, cx);
         self.start_session_group_presentation_bridge(&runtime, cx);
@@ -46464,7 +46481,43 @@ impl VibexWorkbench {
 
     /// The activity bar buttons in the reader's order.
     fn right_rail_activity_order(&self) -> Vec<RightRailActivity> {
-        resolved_right_rail_activity_order(&self.ui_state.right_rail.activity_order)
+        let order = resolved_right_rail_activity_order(&self.ui_state.right_rail.activity_order);
+        let Some(enabled) = &self.right_rail_enabled_plugins else {
+            return order;
+        };
+        order
+            .into_iter()
+            .filter(|activity| {
+                right_rail_plugin_id(*activity)
+                    .map(|plugin_id| enabled.contains(plugin_id))
+                    .unwrap_or(true)
+            })
+            .collect()
+    }
+
+    /// Reads which first-party plugins are enabled, so a panel turned off in
+    /// the Plugins page is not shown in the rail.
+    pub(crate) fn refresh_right_rail_plugins(&mut self, cx: &mut Context<Self>) {
+        let Some(runtime) = self.runtime.clone() else {
+            return;
+        };
+        match runtime.plugins().list() {
+            Ok(plugins) => {
+                let enabled = plugins
+                    .into_iter()
+                    .filter(|plugin| plugin.enabled)
+                    .map(|plugin| plugin.plugin_id)
+                    .collect();
+                self.right_rail_enabled_plugins = Some(enabled);
+                cx.notify();
+            }
+            Err(error) => {
+                eprintln!(
+                    "vibex-foundation: right-rail-plugin-read-failed code={}",
+                    error.code
+                );
+            }
+        }
     }
 
     /// Remembers which side of a button a dragged activity would land on.
@@ -46701,6 +46754,8 @@ impl VibexWorkbench {
         }
         self.sync_management_agent_ordering(cx);
         self.sync_management_pairing_context(cx);
+        // The Plugins page may have enabled or disabled a first-party panel.
+        self.refresh_right_rail_plugins(cx);
         // The cards carry the persisted per-Agent tool answers, and the local
         // authority may have been replaced since they were last pushed.
         self.sync_agent_tool_state(cx);
