@@ -24,6 +24,16 @@ pub enum PreviewTarget {
         /// this URL and rebinds the preview tab to the new runtime id.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         url: Option<String>,
+        /// The project file this browser tab renders, when it renders one.
+        ///
+        /// A local page has two identities. The runtime tab is a browser tab —
+        /// it has a page, a history and frames — but what the reader opened is
+        /// a file, and the tab they go back to has to keep saying so after a
+        /// restart. The runtime id cannot carry that: it does not survive the
+        /// process. The path does, so a restored tab serves the file again
+        /// instead of falling back to the start page.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        preview_path: Option<String>,
     },
     GitDiff {
         path: String,
@@ -52,9 +62,13 @@ impl PreviewTarget {
             Self::Browser {
                 browser_tab_id,
                 url,
+                preview_path,
             } => {
                 *browser_tab_id = normalized_text(browser_tab_id)?;
                 *url = url.take().and_then(|value| normalized_text(&value));
+                *preview_path = preview_path
+                    .take()
+                    .and_then(|value| normalized_text(&value));
             }
             Self::GitCommit {
                 commit_hash,
@@ -601,17 +615,16 @@ impl PreviewState {
         browser_tab_id: &str,
         url: Option<&str>,
     ) -> Option<String> {
+        let preview_path = match self.tabs.get(tab_id).map(|tab| &tab.target) {
+            Some(PreviewTarget::Browser { preview_path, .. }) => preview_path.clone(),
+            _ => return None,
+        };
         let target = PreviewTarget::Browser {
             browser_tab_id: browser_tab_id.to_string(),
             url: url.and_then(normalized_text),
+            preview_path,
         }
         .normalize()?;
-        if !matches!(
-            self.tabs.get(tab_id).map(|tab| &tab.target),
-            Some(PreviewTarget::Browser { .. })
-        ) {
-            return None;
-        }
         let next_id = target.tab_id();
         let mut tab = self.tabs.remove(tab_id)?;
         tab.id = next_id.clone();
@@ -643,6 +656,7 @@ impl PreviewState {
             if let PreviewTarget::Browser {
                 browser_tab_id: id,
                 url: remembered,
+                ..
             } = &mut tab.target
                 && id == browser_tab_id
             {
@@ -662,7 +676,35 @@ impl PreviewState {
             PreviewTarget::Browser {
                 browser_tab_id: id,
                 url,
+                ..
             } if id == browser_tab_id => url.as_deref(),
+            _ => None,
+        })
+    }
+
+    /// The project file a browser tab renders, when it renders one.
+    ///
+    /// The runtime tab id dies with the process; this path is what lets a
+    /// restored layout serve the same local page again.
+    pub fn browser_preview_path(&self, browser_tab_id: &str) -> Option<&str> {
+        self.tabs.values().find_map(|tab| match &tab.target {
+            PreviewTarget::Browser {
+                browser_tab_id: id,
+                preview_path,
+                ..
+            } if id == browser_tab_id => preview_path.as_deref(),
+            _ => None,
+        })
+    }
+
+    /// Finds the browser tab already rendering `path`, if any.
+    pub fn browser_tab_for_preview_path(&self, path: &str) -> Option<(&str, &str)> {
+        self.tabs.values().find_map(|tab| match &tab.target {
+            PreviewTarget::Browser {
+                browser_tab_id,
+                preview_path: Some(preview_path),
+                ..
+            } if preview_path == path => Some((browser_tab_id.as_str(), tab.id.as_str())),
             _ => None,
         })
     }
@@ -1131,6 +1173,7 @@ mod tests {
         PreviewTarget::Browser {
             browser_tab_id: browser_tab_id.to_string(),
             url: None,
+            preview_path: None,
         }
     }
 
@@ -1138,6 +1181,7 @@ mod tests {
         PreviewTarget::Browser {
             browser_tab_id: browser_tab_id.to_string(),
             url: Some(url.to_string()),
+            preview_path: None,
         }
     }
 
@@ -1511,6 +1555,63 @@ mod tests {
         assert_eq!(
             state.browser_url("browser_tab_y"),
             Some("https://example.com/next")
+        );
+    }
+
+    #[test]
+    fn a_file_browser_tab_keeps_the_file_it_renders() {
+        let mut state = PreviewState::default();
+        let tab_id = state
+            .open(
+                PreviewTarget::Browser {
+                    browser_tab_id: "browser_tab_x".to_string(),
+                    url: Some("http://127.0.0.1:4123/lpv_abc/index.html".to_string()),
+                    preview_path: Some("site/index.html".to_string()),
+                },
+                None,
+                10,
+            )
+            .unwrap();
+
+        // The layout round trip is what a restart reads: the runtime tab id and
+        // its ephemeral port are both gone by then, the file path is not.
+        let encoded = serde_json::to_string(&state).unwrap();
+        assert!(encoded.contains("site/index.html"));
+        let mut restored: PreviewState = serde_json::from_str(&encoded).unwrap();
+        restored.normalize();
+        assert_eq!(
+            restored.browser_preview_path("browser_tab_x"),
+            Some("site/index.html")
+        );
+        assert_eq!(
+            restored.browser_tab_for_preview_path("site/index.html"),
+            Some(("browser_tab_x", tab_id.as_str()))
+        );
+
+        // Rebinding to a fresh runtime tab keeps the file, so a restored page
+        // does not become an ordinary browser tab showing a dead port.
+        let rebound = restored
+            .rebind_browser_tab(&tab_id, "browser_tab_y", None)
+            .expect("the tab is rebound");
+        assert_eq!(rebound, "browser:browser_tab_y");
+        assert_eq!(
+            restored.browser_preview_path("browser_tab_y"),
+            Some("site/index.html")
+        );
+    }
+
+    #[test]
+    fn an_ordinary_browser_tab_carries_no_preview_path() {
+        let mut state = PreviewState::default();
+        state.open(browser("browser_tab_x"), None, 10).unwrap();
+        assert_eq!(state.browser_preview_path("browser_tab_x"), None);
+        assert_eq!(state.browser_tab_for_preview_path("index.html"), None);
+        assert_eq!(
+            serde_json::to_value(&state.tabs["browser:browser_tab_x"].target).unwrap(),
+            serde_json::json!({
+                "kind": "browser",
+                "browser_tab_id": "browser_tab_x",
+            })
         );
     }
 

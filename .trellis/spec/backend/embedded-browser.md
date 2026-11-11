@@ -330,6 +330,34 @@ retained pixel detail and full coverage after resizing, scrolling, and repaintin
   `browser_local_file_approval_required`, whose card lists the file names and
   deliberately offers no "always allow" — a file sent to a page leaves the
   workspace, and the approval is spent by the retry that carries it.
+- **A local page a human opened is served over loopback, not as `data:`.** A
+  `data:` document has no origin, so the page's own `<link>`, `<script>` and
+  `<img>` references resolve to nothing: the reader gets an unstyled document
+  and the panel looks broken. The workbench therefore runs one
+  `vibex_browser::preview::LocalPreviewServer` per previewed directory — an
+  ephemeral `127.0.0.1` port plus a per-server random token in the path — and
+  navigates the panel's tab at it. The boundary is the directory, not the
+  workspace: the server refuses `..`, dotfiles, backslashes and any request
+  whose canonical path leaves that directory, and answers `GET` only. The URL
+  the page sees carries the token and the file's path *inside* the directory,
+  never the directory itself.
+
+  This path is for files a **human** opened in the workbench. An Agent's
+  `browser_preview_open` keeps the approval card and the `data:` URL: one
+  approved file must not become a directory a page can read. Nothing here
+  widens `workspace_roots` or the navigation policy: the server is created by
+  the desktop client off one file the human chose, and the tab is navigated by
+  the human-driven `BrowserService::navigate`, which has no approval prompt by
+  design.
+
+  The server lives in the desktop process, so it only exists where the file and
+  the browser are on the same machine; `BrowserTransport::runs_locally` is what
+  the workbench asks before it takes this path. A paired remote runtime keeps
+  its Chrome on the far host, and its workspaces keep opening pages in the
+  editor. A server stops when the last tab rendering a file from its directory
+  closes — a stopped server never comes back at the same port, which is why a
+  restored tab is served again from the file it remembers and not from the
+  saved URL.
 - **Page content is untrusted data.** Every tool description carries
   `BROWSER_UNTRUSTED_CONTENT_NOTICE`, and page-derived results — the AX element
   list from `browser_observe` / `browser_find`, and `browser_extract` — are
@@ -498,6 +526,14 @@ carries the one piece of page state that can be restored — the address.
   `BrowserSurfaceEvent::TabChanged`, and the workbench writes it through
   `PreviewState::remember_browser_url` — a real navigation is what persists, not
   a repaint.
+- **A local page also keeps the file it renders.** `PreviewTarget::Browser`
+  carries an optional `preview_path`, set when a tab was opened from a project
+  page. The runtime id and the loopback port both die with the process; the path
+  does not, so a restored page tab is served again by a fresh
+  `LocalPreviewServer` instead of navigating at a port nothing is listening on.
+  `PreviewState::browser_preview_path` and `browser_tab_for_preview_path` are
+  the read side, the second one so opening a page that is already on screen
+  brings its tab forward rather than starting a second server.
 - **A saved tab with no binding is reopened, not left waiting.** Restore
   hydration (`ensure_browser_surface`) and a browser transport installed after
   the layout was restored (`set_browser_transport`) both call
@@ -722,6 +758,17 @@ transport shipped broken, and `page_tabs` now also carries the restart case — 
 second service on the same profile directory has to open a tab after the first
 browser was killed — because it is the only test that covers the leftover
 endpoint file.
+
+`preview::tests` pins the local preview server's boundary the same way: a page
+and its sibling stylesheet are served through one capability URL, a directory
+request opens its `index.html`, spaces and non-ASCII names round-trip, and
+traversal, dotfiles, a wrong token, a symlink leaving the directory and a file
+over the size cap are all refused — with the refusal asserted to be a bare 404
+that carries none of the file's content. `apps/desktop` covers the wiring:
+opening a page in the file tree creates a browser tab and starts exactly one
+server per directory, reopening it comes forward instead of making a second tab,
+closing the last tab stops the server, and a tab restored from a saved layout is
+served again from its file rather than navigated at the dead port.
 
 The CI browser smoke (`.github/workflows/ci.yml`) runs on `ubuntu-latest` and
 `windows-latest` for the same reason: Windows is the only platform whose CDP

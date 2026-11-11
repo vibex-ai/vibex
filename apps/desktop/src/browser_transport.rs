@@ -142,6 +142,16 @@ pub trait BrowserTransport: Send + Sync + 'static {
     /// Whether a browser is usable, and if not, why.
     fn availability(&self) -> BrowserTransportFuture<'_, BrowserAvailability>;
 
+    /// Whether the browser renders on this machine.
+    ///
+    /// A local page is served from this process over `127.0.0.1`, which only a
+    /// browser running here can reach. A paired remote runtime keeps its Chrome
+    /// on the other host, so those workspaces keep opening pages in the editor
+    /// rather than handing the panel an address it could never load.
+    fn runs_locally(&self) -> bool {
+        false
+    }
+
     fn list_sessions(&self) -> BrowserTransportFuture<'_, Vec<BrowserSession>>;
 
     fn session_snapshot(
@@ -406,6 +416,10 @@ impl BrowserTransport for LocalBrowserTransport {
     fn availability(&self) -> BrowserTransportFuture<'_, BrowserAvailability> {
         let service = self.service.clone();
         Box::pin(self.run(async move { Ok(service.availability().await) }))
+    }
+
+    fn runs_locally(&self) -> bool {
+        true
     }
 
     fn list_sessions(&self) -> BrowserTransportFuture<'_, Vec<BrowserSession>> {

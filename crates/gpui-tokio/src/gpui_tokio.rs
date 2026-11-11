@@ -118,4 +118,14 @@ impl Tokio {
     pub fn handle(cx: &App) -> tokio::runtime::Handle {
         GlobalTokio::global(cx).handle.clone()
     }
+
+    /// Whether [`init`] or [`init_from_handle`] has run.
+    ///
+    /// [`Tokio::spawn`] panics without a global, which is the right answer for
+    /// startup code that must have one. A UI path that merely *wants* a runtime
+    /// — a local preview server, say — checks this first and degrades instead
+    /// of taking the window down.
+    pub fn initialized(cx: &App) -> bool {
+        cx.has_global::<GlobalTokio>()
+    }
 }

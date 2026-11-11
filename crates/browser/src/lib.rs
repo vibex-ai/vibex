@@ -30,6 +30,7 @@ pub mod find;
 pub mod http;
 pub mod mcp;
 pub mod policy;
+pub mod preview;
 pub mod process;
 /// Reading a real Chromium-family profile's login state. Gated because it
 /// pulls SQLite and a LevelDB reader that only desktop and server builds need.

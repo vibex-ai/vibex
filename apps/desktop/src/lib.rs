@@ -17,6 +17,7 @@ pub mod gpui_ext;
 pub mod hint_layer;
 pub mod image_editor;
 pub mod local_history_import;
+pub mod local_preview;
 pub mod locale;
 pub mod management;
 pub mod markdown;

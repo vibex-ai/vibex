@@ -37205,6 +37205,28 @@ impl VibexWorkbench {
         self.open_workspace_reference_in_tab(&path, window, cx);
     }
 
+    /// Opens a web address where the reader already is.
+    ///
+    /// The embedded browser is part of this window, so a link in a conversation
+    /// opens in it rather than pulling the reader out to another application.
+    /// The system browser stays the fallback for a project whose runtime has no
+    /// panel to show the page in.
+    fn open_web_link(&mut self, url: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let opened = self.code_workbench.update(cx, |workbench, cx| {
+            workbench.open_web_link(url.to_string(), window, cx)
+        });
+        if opened {
+            self.reveal_code_preview(cx);
+            return;
+        }
+        if let Err(error) = validate_external_open_url(url)
+            .and_then(|validated| crate::platform::open_external_url(&validated.url))
+        {
+            self.agent_error = Some(format!("{}: {}", error.code, error.message));
+            cx.notify();
+        }
+    }
+
     /// Open the workspace file a composer token refers to.
     ///
     /// A mention chip answers a click the way the same path in an attachment
@@ -37437,12 +37459,8 @@ impl VibexWorkbench {
             return;
         }
         if let Ok(parsed) = url::Url::parse(url) {
-            if matches!(parsed.scheme(), "http" | "https")
-                && let Err(error) = validate_external_open_url(url)
-                    .and_then(|validated| crate::platform::open_external_url(&validated.url))
-            {
-                self.agent_error = Some(format!("{}: {}", error.code, error.message));
-                cx.notify();
+            if matches!(parsed.scheme(), "http" | "https") {
+                self.open_web_link(url, window, cx);
             }
             return;
         }

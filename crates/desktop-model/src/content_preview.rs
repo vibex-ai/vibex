@@ -273,6 +273,18 @@ mod tests {
             content_preview_kind_for_path("a.svg"),
             ContentPreviewKind::Image
         );
+        // A page keeps the text editor as its *content* kind. Which surface
+        // renders it is the workbench's decision — it sends pages to the
+        // embedded browser and everything else here — and a helper that already
+        // answered "text" must not start claiming a surface it cannot build.
+        assert_eq!(
+            content_preview_kind_for_path("index.html"),
+            ContentPreviewKind::TextEditor
+        );
+        assert_eq!(
+            content_preview_kind_for_path("docs/page.htm"),
+            ContentPreviewKind::TextEditor
+        );
     }
 
     #[test]

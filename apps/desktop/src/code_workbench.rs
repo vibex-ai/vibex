@@ -1484,6 +1484,13 @@ pub struct CodeWorkbench {
     browser_preferences: BrowserUiState,
     /// The runtime's browser event stream, started with the first surface.
     browser_events_task: Option<Task<()>>,
+    /// One loopback server per directory a local page is previewed from.
+    ///
+    /// A local page cannot be loaded with `file://`, and a `data:` document has
+    /// no origin for its own stylesheets and scripts to resolve against. The
+    /// servers live in this process, so a page on a paired remote host never
+    /// takes this path.
+    local_previews: crate::local_preview::LocalPreviews,
     workspace: Option<WorkbenchWorkspace>,
     /// The project directory when it lives on this machine, which is what the
     /// preview panel's file browser starts from. A workspace on a paired
@@ -1777,6 +1784,7 @@ impl CodeWorkbench {
             browser_restores: BTreeMap::new(),
             browser_preferences: BrowserUiState::default(),
             browser_events_task: None,
+            local_previews: crate::local_preview::LocalPreviews::default(),
             workspace: None,
             local_workspace_root: None,
             pending_workspace: None,
@@ -3296,6 +3304,7 @@ impl CodeWorkbench {
             self.retire_browser_surfaces(cx);
             self.active_browser_surface_ids.clear();
             self.browser_restores.clear();
+            self.local_previews.clear();
         }
         cx.notify();
     }
@@ -3341,6 +3350,7 @@ impl CodeWorkbench {
             self.browser_surface_subscriptions.clear();
             self.browser_restores.clear();
             self.browser_events_task = None;
+            self.local_previews.clear();
         } else {
             // The layout is restored before the runtime is installed, so a
             // transport that arrives later still has to reopen the browser tabs
@@ -3535,6 +3545,7 @@ impl CodeWorkbench {
         self.active_browser_surface_ids.clear();
         // An attempt to reopen a tab belongs to the workspace that asked for it.
         self.browser_restores.clear();
+        self.local_previews.clear();
         self.backend = Some(backend.clone());
         self.pending_workspace = None;
         self.presentations.clear();
@@ -5514,9 +5525,48 @@ impl CodeWorkbench {
         self.open_file_in_pane(path, None, temporary, window, cx);
     }
 
+    /// Whether a file should open in the embedded browser instead of the editor.
+    ///
+    /// Three things have to be true, and each one is a real limit rather than a
+    /// preference: the file has to be a page the browser renders, a browser has
+    /// to be available, and that browser has to run on this machine — a local
+    /// page is served from this process over loopback, which a paired runtime's
+    /// browser cannot reach. Anything else keeps the editor, which is where the
+    /// reader already was.
+    fn opens_in_browser(&self, path: &str) -> bool {
+        crate::local_preview::renders_in_browser(path)
+            && self
+                .browser_transport
+                .as_ref()
+                .is_some_and(|transport| transport.runs_locally())
+    }
+
     /// Opens a workspace file as a preview tab, in `pane_id` when one is
     /// named and in the focused pane otherwise.
+    ///
+    /// A page goes to the embedded browser; everything else to the editor. The
+    /// caller that means the editor specifically — the file tree's "Editor"
+    /// entry — calls [`Self::open_editor_tab`] instead.
     pub(crate) fn open_file_in_pane(
+        &mut self,
+        path: String,
+        pane_id: Option<String>,
+        temporary: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(path) = normalized_preview_path(&path) else {
+            return;
+        };
+        if self.opens_in_browser(&path) {
+            self.open_local_page(path, pane_id, window, cx);
+            return;
+        }
+        self.open_editor_tab_in_pane(path, pane_id, temporary, window, cx);
+    }
+
+    /// Opens a file in the editor even when the browser could render it.
+    fn open_editor_tab_in_pane(
         &mut self,
         path: String,
         pane_id: Option<String>,
@@ -5575,6 +5625,121 @@ impl CodeWorkbench {
         cx.notify();
     }
 
+    /// Opens a file in the editor, whatever the embedded browser could do with
+    /// it.
+    pub(crate) fn open_editor_tab(
+        &mut self,
+        path: String,
+        temporary: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_editor_tab_in_pane(path, None, temporary, window, cx);
+    }
+
+    /// The absolute path of a file this machine can serve, when it exists.
+    fn local_page_path(&self, path: &str) -> Option<PathBuf> {
+        let file = if is_local_external_path(path) {
+            PathBuf::from(path)
+        } else {
+            self.local_workspace_root.as_ref()?.join(path)
+        };
+        file.canonicalize().ok().filter(|file| file.is_file())
+    }
+
+    /// The capability URL that serves a local page, starting its server.
+    ///
+    /// The URL carries the file's path *inside* the directory, never the
+    /// directory: a page learns an origin it can resolve its own assets
+    /// against, and nothing about where the project lives.
+    fn local_page_url(&mut self, path: &str, cx: &App) -> Result<String, String> {
+        let Some(file) = self.local_page_path(path) else {
+            return Err(locale::text(
+                "This page is not on this machine.",
+                "这个页面不在本机上。",
+                "這個頁面不在本機上。",
+            )
+            .to_string());
+        };
+        if !gpui_tokio::Tokio::initialized(cx) {
+            return Err(locale::text(
+                "The local preview server is unavailable.",
+                "本地预览服务不可用。",
+                "本機預覽服務無法使用。",
+            )
+            .to_string());
+        }
+        let runtime = gpui_tokio::Tokio::handle(cx);
+        self.local_previews.url_for(&file, &runtime)
+    }
+
+    /// Opens a local page in the embedded browser.
+    ///
+    /// A page already on screen is brought forward instead of being served
+    /// twice: the tab the reader sees is the one that owns the server.
+    fn open_local_page(
+        &mut self,
+        path: String,
+        pane_id: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some((_, preview_tab_id)) = self.preview.browser_tab_for_preview_path(&path) {
+            let preview_tab_id = preview_tab_id.to_string();
+            self.focus_tab(preview_tab_id, window, cx);
+            self.request_preview_panel(cx);
+            return;
+        }
+        let url = match self.local_page_url(&path, cx) {
+            Ok(url) => url,
+            Err(error) => {
+                self.pending_error = Some(error);
+                cx.notify();
+                return;
+            }
+        };
+        if !is_local_external_path(&path) {
+            self.selected_file_path = Some(path.clone());
+            self.file_tree.clear_selected_directory();
+            self.file_tree.select(&path, false, false);
+        }
+        self.open_browser_tab_for(Some(url), pane_id, false, Some(path), window, cx);
+    }
+
+    /// Stops every preview server no browser tab can still reach.
+    ///
+    /// A server outlives the tab that first needed it because a sibling page in
+    /// the same directory reuses it; it must not outlive the last tab that
+    /// renders anything from that directory.
+    fn prune_local_previews(&mut self) {
+        let mut directories = BTreeSet::new();
+        let mut collect = |preview: &PreviewState| {
+            for tab in preview.tabs.values() {
+                let PreviewTarget::Browser {
+                    preview_path: Some(path),
+                    ..
+                } = &tab.target
+                else {
+                    continue;
+                };
+                if let Some(directory) = self
+                    .local_workspace_root
+                    .as_ref()
+                    .map(|root| root.join(path))
+                    .or_else(|| Some(PathBuf::from(path)))
+                    .and_then(|file| crate::local_preview::LocalPreviews::directory_of(&file))
+                {
+                    directories.insert(directory);
+                }
+            }
+        };
+        collect(&self.preview);
+        for parked in self.parked_states.values() {
+            collect(&parked.preview);
+        }
+        self.local_previews.retain(&directories);
+    }
+
     fn open_file_search_result(
         &mut self,
         mut reveal: FileSearchReveal,
@@ -5590,7 +5755,10 @@ impl CodeWorkbench {
             self.markdown_edit_paths.insert(path.clone());
         }
         self.request_preview_panel(cx);
-        self.open_file(path.clone(), false, window, cx);
+        // A search hit names a line, and a line only exists in the editor: a
+        // page opened in the browser would drop the reader at the top of the
+        // document instead.
+        self.open_editor_tab(path.clone(), false, window, cx);
         self.schedule_file_search_reveal(path, window, cx);
     }
 
@@ -5964,14 +6132,28 @@ impl CodeWorkbench {
             return;
         }
         let surface = self.browser_surfaces.get(browser_tab_id).cloned();
-        // A tab saved before addresses were remembered has none to reopen, so it
-        // opens the start page: the same answer a new tab gets, which is what
-        // the reader asked for when the tab was created.
-        let url = self
+        // A restored page is served again rather than reopened at the port the
+        // previous run happened to get: that port died with the process, and
+        // the saved address would come back as a connection error.
+        let preview_path = self
             .preview
-            .browser_url(browser_tab_id)
-            .map(str::to_string)
-            .unwrap_or_else(|| self.browser_preferences.resolved_start_page().to_string());
+            .browser_preview_path(browser_tab_id)
+            .map(str::to_string);
+        let saved_url = self.preview.browser_url(browser_tab_id).map(str::to_string);
+        let url = match preview_path.as_deref() {
+            Some(path) => match self.local_page_url(path, cx) {
+                Ok(url) => url,
+                Err(error) => {
+                    self.report_unattached_browser_tab(browser_tab_id, error, cx);
+                    return;
+                }
+            },
+            // A tab saved before addresses were remembered has none to reopen,
+            // so it opens the start page: the same answer a new tab gets, which
+            // is what the reader asked for when the tab was created.
+            None => saved_url
+                .unwrap_or_else(|| self.browser_preferences.resolved_start_page().to_string()),
+        };
         let Some(transport) = self.browser_transport.clone() else {
             self.report_unattached_browser_tab(
                 browser_tab_id,
@@ -6364,6 +6546,7 @@ impl CodeWorkbench {
             PreviewTarget::Browser {
                 browser_tab_id: browser_tab_id.clone(),
                 url: None,
+                preview_path: None,
             },
             None,
             unix_timestamp_ms(),
@@ -6445,6 +6628,23 @@ impl CodeWorkbench {
         url: Option<String>,
         pane_id: Option<String>,
         reuse_existing: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_browser_tab_for(url, pane_id, reuse_existing, None, window, cx);
+    }
+
+    /// Opens a browser tab, optionally on behalf of a project file.
+    ///
+    /// `preview_path` is the file this tab renders, when there is one. It
+    /// outlives the runtime tab — the path is what a restart can bring back —
+    /// so the tab keeps saying which page it is and can serve it again.
+    fn open_browser_tab_for(
+        &mut self,
+        url: Option<String>,
+        pane_id: Option<String>,
+        reuse_existing: bool,
+        preview_path: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -6547,6 +6747,7 @@ impl CodeWorkbench {
                         PreviewTarget::Browser {
                             browser_tab_id: tab_string.clone(),
                             url: tab_url,
+                            preview_path: preview_path.clone(),
                         },
                         pane_id.as_deref(),
                         unix_timestamp_ms(),
@@ -6828,11 +7029,31 @@ impl CodeWorkbench {
         cx.notify();
     }
 
+    /// Opens an `http`/`https` address in the embedded browser.
+    ///
+    /// Returns `false` when this workbench cannot host a page — no transport, or
+    /// no workspace — so the caller can fall back to the system browser instead
+    /// of losing the click.
+    pub(crate) fn open_web_link(
+        &mut self,
+        url: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.browser_transport.is_none() || self.workspace.is_none() {
+            return false;
+        }
+        self.open_browser(Some(url), window, cx);
+        true
+    }
+
     /// Open the destination a rendered Markdown link points at.
     ///
     /// The text view reports the destination exactly as the document wrote it:
-    /// an external URL opens in the system browser, a fragment stays in place,
-    /// and anything else is a workspace path relative to the document.
+    /// an external URL opens in this window's embedded browser (falling back to
+    /// the system browser when there is no panel to show it in), a fragment
+    /// stays in place, and anything else is a workspace path relative to the
+    /// document — which is how a link to a local page reaches the browser.
     fn open_markdown_link(
         &mut self,
         url: &str,
@@ -6845,7 +7066,12 @@ impl CodeWorkbench {
         }
         if let Ok(parsed) = url::Url::parse(url) {
             if matches!(parsed.scheme(), "http" | "https") {
-                self.open_web_external(url.to_string(), cx);
+                // A link in a document opens where the reader already is: the
+                // panel. The system browser stays the answer when this
+                // workbench has no panel to show the page in.
+                if !self.open_web_link(url.to_string(), window, cx) {
+                    self.open_web_external(url.to_string(), cx);
+                }
             }
             return;
         }
@@ -7667,6 +7893,10 @@ impl CodeWorkbench {
                     })
                     .detach();
             }
+            // The loopback server that served this page has no tab left to
+            // serve, and a page in another tab of the same directory keeps
+            // sharing it.
+            self.prune_local_previews();
         }
         if let Some(path) = tab_id.strip_prefix("file:") {
             self.editors.close(path, force);
@@ -9942,13 +10172,20 @@ impl CodeWorkbench {
                     locale::text("Terminal unavailable", "终端不可用", "終端不可用").to_string()
                 }),
             // The page names its own tab; the generic "Browser" label is only
-            // what a tab shows before the page has reported a title.
-            PreviewTarget::Browser { browser_tab_id, .. } => self
+            // what a tab shows before the page has reported a title. A page
+            // opened from the project falls back to its file name instead: the
+            // reader opened a document, and "Browser" says nothing about which.
+            PreviewTarget::Browser {
+                browser_tab_id,
+                preview_path,
+                ..
+            } => self
                 .browser_tab_labels
                 .get(browser_tab_id)
                 .map(|label| label.title.trim())
                 .filter(|title| !title.is_empty())
                 .map(str::to_string)
+                .or_else(|| preview_path.as_deref().map(file_name_of))
                 .unwrap_or_else(|| tab_label(&tab.target)),
             target => tab_label(target),
         };
@@ -10618,7 +10855,7 @@ impl CodeWorkbench {
                                                 .disabled(!can_open_in_editor)
                                                 .on_click(move |_, window, cx| {
                                                     let _ = editor_entity.update(cx, |this, cx| {
-                                                        this.open_file(
+                                                        this.open_editor_tab(
                                                             editor_path.clone(),
                                                             false,
                                                             window,
@@ -11608,7 +11845,7 @@ impl CodeWorkbench {
                                         "在編輯器中開啟工作區連結",
                                     ))
                                     .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.open_file(open_path.clone(), false, window, cx)
+                                        this.open_editor_tab(open_path.clone(), false, window, cx)
                                     }))
                             })),
                     )
@@ -12236,7 +12473,7 @@ impl CodeWorkbench {
                                             .size(px(14.0)),
                                     )
                                     .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.open_file(edit_path.clone(), false, window, cx)
+                                        this.open_editor_tab(edit_path.clone(), false, window, cx)
                                     })),
                             )
                             .child(reveal_in_files_button(
@@ -14406,6 +14643,11 @@ impl CodeRightRail {
         let integrated_path = target.path.clone();
         let native_path = target.path.clone();
         let reveal_path = target.path.clone();
+        // A page the embedded browser renders gets its own entry: double-clicking
+        // it already goes there, and this is how a reader reaches the same place
+        // from the menu instead of guessing.
+        let browser_available = target.kind == FileEntryKind::File
+            && crate::local_preview::renders_in_browser(&target.path);
         let submenu_controller = controller;
         let submenu_path = target.path;
         let target_kind = target.kind;
@@ -14426,6 +14668,8 @@ impl CodeRightRail {
                 let integrated_path = integrated_path.clone();
                 let native_path = native_path.clone();
                 let reveal_path = reveal_path.clone();
+                let browser_controller = submenu_controller.clone();
+                let browser_path = submenu_path.clone();
                 submenu = submenu
                     .item(
                         PopupMenuItem::new(locale::text("Editor", "编辑器", "編輯器"))
@@ -14434,9 +14678,29 @@ impl CodeRightRail {
                             .on_click(move |_, window, cx| {
                                 let _ = editor_controller.update(cx, |workbench, cx| {
                                     workbench.request_preview_panel(cx);
-                                    workbench.open_file(editor_path.clone(), false, window, cx)
+                                    workbench.open_editor_tab(
+                                        editor_path.clone(),
+                                        false,
+                                        window,
+                                        cx,
+                                    )
                                 });
                             }),
+                    )
+                    .item(
+                        PopupMenuItem::new(locale::text(
+                            "Embedded browser",
+                            "内嵌浏览器",
+                            "內嵌瀏覽器",
+                        ))
+                        .icon(IconName::Globe)
+                        .disabled(!browser_available)
+                        .on_click(move |_, window, cx| {
+                            let _ = browser_controller.update(cx, |workbench, cx| {
+                                workbench.request_preview_panel(cx);
+                                workbench.open_file(browser_path.clone(), false, window, cx)
+                            });
+                        }),
                     )
                     .item(
                         PopupMenuItem::new(locale::text("Default App", "默认应用", "預設應用程式"))
@@ -20733,6 +20997,15 @@ fn relative_parent_path(path: &str) -> &str {
         .unwrap_or("")
 }
 
+/// The last segment of a path, which is what a tab calls the file it shows.
+fn file_name_of(path: &str) -> String {
+    path.rsplit(['/', '\\'])
+        .next()
+        .filter(|name| !name.is_empty())
+        .unwrap_or(path)
+        .to_string()
+}
+
 fn relative_directory_path_chain(path: &str) -> Vec<String> {
     let mut current = String::new();
     path.split('/')
@@ -21995,7 +22268,9 @@ mod tests {
 
     /// A browser transport that never delivers frames, and hands out a fresh
     /// runtime tab for every `create_tab`.
-    #[derive(Default)]
+    ///
+    /// It stands in for the in-process browser, so it renders on this machine
+    /// unless a test says otherwise.
     struct IdleBrowserTransport {
         created_tabs: Arc<std::sync::Mutex<Vec<BrowserTabId>>>,
         /// Addresses the panel asked each tab to open, in call order.
@@ -22008,11 +22283,32 @@ mod tests {
         downloads_enabled: Arc<std::sync::atomic::AtomicBool>,
         /// How many times the policy was set, so a no-op is recognizable.
         downloads_calls: Arc<std::sync::atomic::AtomicUsize>,
+        /// Whether this transport stands in for a browser on this machine. A
+        /// paired runtime's browser is elsewhere, which is what decides whether
+        /// a local page can be previewed at all.
+        local_browser: bool,
+    }
+
+    impl Default for IdleBrowserTransport {
+        fn default() -> Self {
+            Self {
+                created_tabs: Arc::default(),
+                created_urls: Arc::default(),
+                reveals: Arc::default(),
+                reveal_hits: Arc::default(),
+                downloads_enabled: Arc::default(),
+                downloads_calls: Arc::default(),
+                local_browser: true,
+            }
+        }
     }
 
     impl crate::browser_transport::BrowserTransport for IdleBrowserTransport {
         fn as_any(&self) -> &dyn std::any::Any {
             self
+        }
+        fn runs_locally(&self) -> bool {
+            self.local_browser
         }
         fn availability(
             &self,
@@ -22287,11 +22583,23 @@ mod tests {
         browser_tab_id: &str,
         url: Option<&str>,
     ) {
+        restore_browser_layout_for(workbench, cx, browser_tab_id, url, None);
+    }
+
+    /// The same, for a tab that renders a project page rather than a site.
+    fn restore_browser_layout_for(
+        workbench: &Entity<CodeWorkbench>,
+        cx: &mut gpui::VisualTestContext,
+        browser_tab_id: &str,
+        url: Option<&str>,
+        preview_path: Option<&str>,
+    ) {
         workbench.update(cx, |workbench, _| {
             workbench.preview.open(
                 PreviewTarget::Browser {
                     browser_tab_id: browser_tab_id.to_string(),
                     url: url.map(str::to_string),
+                    preview_path: preview_path.map(str::to_string),
                 },
                 None,
                 unix_timestamp_ms(),
@@ -22342,6 +22650,7 @@ mod tests {
             let PreviewTarget::Browser {
                 browser_tab_id,
                 url,
+                ..
             } = &tab.target
             else {
                 unreachable!("the entry was filtered to browser tabs")
@@ -22392,6 +22701,65 @@ mod tests {
         workbench.read_with(cx, |workbench, _| {
             assert_eq!(workbench.browser_bindings.len(), 1);
             assert!(workbench.browser_restores.is_empty());
+        });
+    }
+
+    // A saved page tab must not reopen the port the previous run happened to
+    // get: that server died with the process. The file it rendered is what the
+    // layout kept, and that is what is served again.
+    #[gpui::test]
+    fn a_restored_page_tab_is_served_again_instead_of_reopening_a_dead_port(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(gpui_tokio::init);
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        std::fs::write(directory.path().join("index.html"), "<h1>restored</h1>").unwrap();
+        let page = directory.path().join("index.html");
+        let page_path = page.to_string_lossy().to_string();
+
+        let (workbench, cx) = fixture_workbench(cx);
+        restore_browser_layout_for(
+            &workbench,
+            cx,
+            "browser_tab_previous_run",
+            Some("http://127.0.0.1:1/lpv_gone/index.html"),
+            Some(&page_path),
+        );
+        let transport = std::sync::Arc::new(IdleBrowserTransport::default());
+        let urls = transport.created_urls.clone();
+        workbench.update(cx, |workbench, cx| {
+            workbench.set_browser_transport(Some(transport), cx);
+        });
+        cx.run_until_parked();
+
+        let opened = urls.lock().unwrap().clone();
+        assert_eq!(opened.len(), 1, "the tab is reopened once");
+        let url = opened[0].clone().expect("the restored tab is given a page");
+        assert!(
+            !url.contains("127.0.0.1:1/"),
+            "the dead port is not reused: {url}"
+        );
+        assert!(url.starts_with("http://127.0.0.1:"), "{url}");
+        assert!(
+            url.contains("/lpv_"),
+            "the new server has its own token: {url}"
+        );
+        workbench.read_with(cx, |workbench, _| {
+            let (_, tab) = workbench
+                .preview
+                .tabs
+                .iter()
+                .find(|(_, tab)| matches!(tab.target, PreviewTarget::Browser { .. }))
+                .expect("the restored page tab is still in the layout");
+            let PreviewTarget::Browser { preview_path, .. } = &tab.target else {
+                unreachable!("the entry was filtered to browser tabs")
+            };
+            assert_eq!(
+                preview_path.as_deref(),
+                Some(page_path.as_str()),
+                "the tab keeps saying which file it renders"
+            );
+            assert_eq!(workbench.local_previews.len(), 1);
         });
     }
 
@@ -22474,6 +22842,231 @@ mod tests {
             browser.origin.x > terminal.origin.x,
             "the browser follows the terminal inside the create group"
         );
+    }
+
+    // Double-clicking a page in the file tree shows the page. The editor is the
+    // wrong surface for it, and the system browser is outside the product: the
+    // panel's own browser renders it, over a loopback URL so the page's
+    // stylesheets and scripts resolve.
+    #[gpui::test]
+    fn opening_a_page_in_the_file_tree_opens_it_in_the_embedded_browser(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(gpui_tokio::init);
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        std::fs::write(
+            directory.path().join("index.html"),
+            "<link rel=stylesheet href=site.css><h1>hello</h1>",
+        )
+        .unwrap();
+        std::fs::write(directory.path().join("site.css"), "h1 { color: red }").unwrap();
+        let page = directory.path().join("index.html");
+
+        let (workbench, cx) = fixture_workbench(cx);
+        let transport = std::sync::Arc::new(IdleBrowserTransport::default());
+        let urls = transport.created_urls.clone();
+        workbench.update(cx, |workbench, cx| {
+            workbench.set_preview_visible(true, cx);
+            workbench.set_browser_transport(Some(transport), cx);
+        });
+        cx.run_until_parked();
+        workbench.update_in(cx, |workbench, window, cx| {
+            workbench.open_file(page.to_string_lossy().to_string(), false, window, cx);
+        });
+        cx.run_until_parked();
+
+        let opened = urls.lock().unwrap().clone();
+        assert_eq!(opened.len(), 1, "the page opens one browser tab");
+        let url = opened[0].clone().expect("the browser is given the page");
+        assert!(url.starts_with("http://127.0.0.1:"), "{url}");
+        assert!(url.contains("/lpv_"), "{url}");
+        assert!(
+            !url.contains(directory.path().to_str().unwrap()),
+            "the page's own directory is never handed over: {url}"
+        );
+
+        // The page really is served: its stylesheet comes back through the
+        // same capability URL.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        let (status, body) = runtime.block_on(async {
+            let response = reqwest::get(&url).await.expect("the page is served");
+            let status = response.status();
+            (status, response.text().await.unwrap_or_default())
+        });
+        assert_eq!(status, reqwest::StatusCode::OK);
+        assert!(body.contains("hello"));
+
+        workbench.read_with(cx, |workbench, _| {
+            let (_, tab) = workbench
+                .preview
+                .tabs
+                .iter()
+                .find(|(_, tab)| matches!(tab.target, PreviewTarget::Browser { .. }))
+                .expect("the page became a browser tab");
+            let PreviewTarget::Browser {
+                browser_tab_id,
+                preview_path,
+                ..
+            } = &tab.target
+            else {
+                unreachable!("the entry was filtered to browser tabs")
+            };
+            assert_eq!(
+                preview_path.as_deref(),
+                Some(page.to_string_lossy().as_ref()),
+                "the tab remembers the file it renders"
+            );
+            assert!(workbench.browser_bindings.contains_key(browser_tab_id));
+            assert_eq!(workbench.local_previews.len(), 1);
+
+            // Reopening the same page comes forward instead of starting a
+            // second server and a second tab.
+            assert_eq!(
+                workbench
+                    .preview
+                    .browser_tab_for_preview_path(&page.to_string_lossy()),
+                Some((browser_tab_id.as_str(), tab.id.as_str()))
+            );
+        });
+        assert_eq!(
+            urls.lock().unwrap().len(),
+            1,
+            "reopening the same page makes no second browser tab"
+        );
+    }
+
+    // Two pages in one directory share a server, and closing the only tab that
+    // rendered one stops it: a server nobody can reach is a port left open.
+    #[gpui::test]
+    fn a_local_preview_server_stops_with_its_last_tab(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_tokio::init);
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        std::fs::write(directory.path().join("index.html"), "<h1>one</h1>").unwrap();
+        std::fs::write(directory.path().join("two.html"), "<h1>two</h1>").unwrap();
+
+        let (workbench, cx) = fixture_workbench(cx);
+        let transport = std::sync::Arc::new(IdleBrowserTransport::default());
+        workbench.update(cx, |workbench, cx| {
+            workbench.set_preview_visible(true, cx);
+            workbench.set_browser_transport(Some(transport), cx);
+        });
+        cx.run_until_parked();
+        for name in ["index.html", "two.html"] {
+            let page = directory.path().join(name);
+            workbench.update_in(cx, |workbench, window, cx| {
+                workbench.open_file(page.to_string_lossy().to_string(), false, window, cx);
+            });
+            cx.run_until_parked();
+        }
+        workbench.read_with(cx, |workbench, _| {
+            assert_eq!(
+                workbench.local_previews.len(),
+                1,
+                "two pages of one directory share one server"
+            );
+            assert_eq!(
+                workbench
+                    .preview
+                    .tabs
+                    .values()
+                    .filter(|tab| matches!(tab.target, PreviewTarget::Browser { .. }))
+                    .count(),
+                2,
+                "each page has its own tab"
+            );
+        });
+
+        let tab_ids = workbench.read_with(cx, |workbench, _| {
+            workbench.preview.tabs.keys().cloned().collect::<Vec<_>>()
+        });
+        for tab_id in tab_ids {
+            workbench.update(cx, |workbench, cx| workbench.close_tab(tab_id, true, cx));
+            cx.run_until_parked();
+        }
+        workbench.read_with(cx, |workbench, _| {
+            assert!(
+                workbench.local_previews.is_empty(),
+                "the last tab closing stops the server"
+            );
+        });
+    }
+
+    // A page stays an editor tab when no browser can render it: a workspace on
+    // a paired runtime keeps its Chrome on the far host, which a loopback URL
+    // from this process cannot reach.
+    #[gpui::test]
+    fn a_page_without_a_local_browser_keeps_the_editor(cx: &mut gpui::TestAppContext) {
+        let (workbench, cx) = fixture_workbench(cx);
+        let transport = std::sync::Arc::new(IdleBrowserTransport {
+            local_browser: false,
+            ..IdleBrowserTransport::default()
+        });
+        workbench.update(cx, |workbench, cx| {
+            workbench.set_browser_transport(Some(transport), cx);
+        });
+        cx.run_until_parked();
+        workbench.update_in(cx, |workbench, window, cx| {
+            workbench.open_file("site/index.html".to_string(), false, window, cx);
+        });
+        cx.run_until_parked();
+        workbench.read_with(cx, |workbench, _| {
+            assert!(
+                workbench.browser_bindings.is_empty(),
+                "no browser tab was asked for"
+            );
+            assert!(
+                workbench.local_previews.is_empty(),
+                "no server was started for a page nothing can render"
+            );
+        });
+    }
+
+    // A link in a rendered document opens in the panel's own browser, which is
+    // where the reader already is, instead of pulling them out to the system
+    // browser.
+    #[gpui::test]
+    fn a_document_link_opens_in_the_embedded_browser(cx: &mut gpui::TestAppContext) {
+        let (workbench, cx) = fixture_workbench(cx);
+        let transport = std::sync::Arc::new(IdleBrowserTransport::default());
+        let urls = transport.created_urls.clone();
+        workbench.update(cx, |workbench, cx| {
+            workbench.set_preview_visible(true, cx);
+            workbench.set_browser_transport(Some(transport), cx);
+        });
+        cx.run_until_parked();
+        workbench.update_in(cx, |workbench, window, cx| {
+            workbench.open_markdown_link("https://example.com/docs", "README.md", window, cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            urls.lock().unwrap().clone(),
+            vec![Some("https://example.com/docs".to_string())],
+            "the page opens in the panel's browser"
+        );
+        workbench.read_with(cx, |workbench, _| {
+            let (_, tab) = workbench
+                .preview
+                .tabs
+                .iter()
+                .find(|(_, tab)| matches!(tab.target, PreviewTarget::Browser { .. }))
+                .expect("the link became a browser tab");
+            let PreviewTarget::Browser {
+                url, preview_path, ..
+            } = &tab.target
+            else {
+                unreachable!("the entry was filtered to browser tabs")
+            };
+            assert_eq!(url.as_deref(), Some("https://example.com/docs"));
+            assert_eq!(
+                preview_path.as_deref(),
+                None,
+                "a web page is not a project file"
+            );
+        });
     }
 
     // The address bar searches with the engine the settings chose, and a change
