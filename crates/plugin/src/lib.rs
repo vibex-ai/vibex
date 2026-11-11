@@ -1,0 +1,33 @@
+//! Desktop plugin packages and the market that distributes them.
+//!
+//! The crate owns everything between "a catalog says a plugin exists" and "a
+//! version is installed on disk":
+//!
+//! - the author's manifest (`vibex-plugin.json`) and its validation;
+//! - the permission model and the consent fingerprint derived from it;
+//! - the generated scripting-host manifest (`gpui-shell.json`);
+//! - the market sources: a signed static index and GitHub topic discovery,
+//!   merged into one catalog;
+//! - the install pipeline: download, hash and signature verification, safe
+//!   unpacking, version directories, atomic activation and rollback.
+//!
+//! It deliberately does not depend on the scripting host: the host is reached
+//! through [`runtime::PluginRuntime`], so the market and package management can
+//! be built and tested without it, and the host integration stays in one place.
+
+pub mod error;
+pub mod fingerprint;
+pub mod manifest;
+pub mod permission;
+pub mod shell;
+
+pub use error::{ManifestError, PluginError};
+pub use fingerprint::consent_fingerprint;
+pub use manifest::{
+    AUTHOR_MANIFEST_FILE, PluginCapabilities, PluginFsCapability, PluginManifest,
+    PluginNetworkCapability, PluginSettingContribution,
+};
+pub use permission::{
+    PermissionSpec, PluginPermissionCatalog, default_permission_catalog, permissions_for,
+};
+pub use shell::{SHELL_MANIFEST_FILE, ShellManifest, build_shell_manifest};

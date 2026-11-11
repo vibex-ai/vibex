@@ -24,6 +24,7 @@ members = [
   "crates/gpui-tokio",
   "crates/model-catalog",
   "crates/model-gateway",
+  "crates/plugin",
   "crates/relay",
   "crates/remote",
   "crates/terminal",

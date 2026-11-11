@@ -10575,6 +10575,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "vibex-plugin"
+version = "0.1.2"
+dependencies = [
+ "async-trait",
+ "base64",
+ "ed25519-dalek",
+ "futures-util",
+ "reqwest",
+ "semver",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "url",
+ "vibex-core",
+ "zip",
+]
+
+[[package]]
 name = "vibex-relay"
 version = "0.1.2"
 dependencies = [
