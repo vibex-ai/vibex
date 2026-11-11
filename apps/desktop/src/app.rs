@@ -15243,7 +15243,9 @@ impl VibexWorkbench {
             cx.notify();
             return;
         }
-        profile.display_name = display_name;
+        let previous_name = profile.display_name.trim().to_string();
+        let runtime_id = profile.registered_runtime_id.clone();
+        profile.display_name = display_name.clone();
         profile.ssh_client_path = (!client.is_empty()).then(|| PathBuf::from(client));
         profile.ssh_config_path = (!config_path.is_empty()).then(|| PathBuf::from(config_path));
         profile.workspace_roots = workspaces;
@@ -15260,6 +15262,31 @@ impl VibexWorkbench {
             cx.notify();
             return;
         }
+        // The runtime row shows this connection's name while the operator has
+        // not renamed the runtime itself. Keep that derived label in step with
+        // an edited connection, but never overwrite an explicit rename.
+        if let Some(runtime_id) = runtime_id {
+            let derived = self
+                .runtime_registry
+                .remote(&runtime_id)
+                .is_some_and(|runtime| {
+                    runtime
+                        .display_name
+                        .as_deref()
+                        .is_none_or(|current| current == previous_name)
+                });
+            if derived {
+                if let Some(runtime) = self.runtime_registry.remote_mut(&runtime_id) {
+                    runtime.display_name = Some(display_name.clone());
+                }
+                self.persist_runtime_registry(cx);
+            }
+        }
+        let settings_view = self.settings_view.clone();
+        settings_view.update(cx, |settings, cx| {
+            settings.reload_connections_profiles();
+            cx.notify();
+        });
         self.runtime_edit_pending = None;
         self.runtime_edit_error = None;
         self.runtime_note = Some(if active {
@@ -16313,6 +16340,100 @@ impl VibexWorkbench {
         let _ = store.save(&profiles);
     }
 
+    /// Copies the operator's SSH connection name onto its runtime row.
+    ///
+    /// A registered runtime is labelled by the name the remote machine
+    /// published, which is often the same "dev" on every host. The SSH
+    /// connection is the thing the operator actually named, so its name is
+    /// what the row should read. An explicit runtime rename always wins:
+    /// `display_name` is only filled while it is still empty.
+    fn sync_ssh_profile_display_name(&mut self, runtime_id: &str, cx: &mut Context<Self>) {
+        let Some(config) = self.config.as_ref() else {
+            return;
+        };
+        let Ok(profiles) = SshProfileStore::at_home(&config.home_dir).load() else {
+            return;
+        };
+        let Some(name) = profiles
+            .into_iter()
+            .find(|profile| profile.registered_runtime_id.as_deref() == Some(runtime_id))
+            .map(|profile| profile.display_name.trim().to_string())
+            .filter(|name| !name.is_empty())
+        else {
+            return;
+        };
+        let changed = match self.runtime_registry.remote_mut(runtime_id) {
+            Some(runtime) if runtime.display_name.is_none() => {
+                runtime.display_name = Some(name);
+                true
+            }
+            _ => false,
+        };
+        if changed {
+            self.persist_runtime_registry(cx);
+        }
+    }
+
+    /// Mirrors each saved connection's live reachability into Settings.
+    ///
+    /// The Connections page renders inside the workbench's own update, so it
+    /// cannot read the runtime registry or the live remote client itself.
+    /// Recomputing is cheap — one profile-store read — and happens only when
+    /// the registry, the client or a pending switch changes.
+    fn sync_connections_live_status(&self, cx: &mut Context<Self>) {
+        let Some(config) = self.config.as_ref() else {
+            return;
+        };
+        let profiles = SshProfileStore::at_home(&config.home_dir)
+            .load()
+            .unwrap_or_default();
+        let mut live = BTreeMap::new();
+        for profile in profiles {
+            let status = match profile.registered_runtime_id.as_deref() {
+                Some(runtime_id) => {
+                    if self.runtime_switch_pending.as_deref() == Some(runtime_id) {
+                        ConnectionRowStatus::Connecting
+                    } else if self.runtime_registry.active_runtime_id() != runtime_id {
+                        ConnectionRowStatus::Offline
+                    } else {
+                        match self
+                            .remote_client
+                            .as_ref()
+                            .filter(|client| client.runtime_id == runtime_id)
+                        {
+                            Some(client) => match client.backend.connection_state().state {
+                                RemoteConnectionState::Online | RemoteConnectionState::Degraded => {
+                                    ConnectionRowStatus::Connected
+                                }
+                                RemoteConnectionState::Reconnecting => {
+                                    ConnectionRowStatus::Connecting
+                                }
+                                RemoteConnectionState::Offline
+                                | RemoteConnectionState::Revoked
+                                | RemoteConnectionState::Incompatible => {
+                                    ConnectionRowStatus::NeedsAttention
+                                }
+                                RemoteConnectionState::Idle
+                                | RemoteConnectionState::Resolving
+                                | RemoteConnectionState::Probing
+                                | RemoteConnectionState::Connecting
+                                | RemoteConnectionState::Authenticating
+                                | RemoteConnectionState::Syncing => ConnectionRowStatus::Connecting,
+                            },
+                            None => ConnectionRowStatus::Offline,
+                        }
+                    }
+                }
+                None => ConnectionRowStatus::Offline,
+            };
+            live.insert(profile.id, status);
+        }
+        self.settings_view.update(cx, |settings, cx| {
+            settings.connections_live_status = live;
+            cx.notify();
+        });
+    }
+
     fn sync_ssh_provisioning_settings(&self, cx: &mut Context<Self>) {
         let snapshot = self.ssh_provisioning_snapshot.clone();
         let error = self.ssh_provisioning_error.clone();
@@ -16331,6 +16452,9 @@ impl VibexWorkbench {
             cx.notify();
             follow
         });
+        // The live mirror and the provisioning snapshot are separate facts; a
+        // terminal Ready snapshot falls through to the mirror, so keep it fresh.
+        self.sync_connections_live_status(cx);
         let Some((profile_id, attempt_id, terminal)) = follow else {
             return;
         };
@@ -16460,6 +16584,7 @@ impl VibexWorkbench {
                 );
                 self.mark_runtime_active(&runtime_id, cx);
                 self.bind_ssh_profile_runtime(&profile_id, &runtime_id, version);
+                self.sync_ssh_profile_display_name(&runtime_id, cx);
                 self.sync_ssh_provisioning_settings(cx);
                 cx.notify();
             }
@@ -16534,6 +16659,10 @@ impl VibexWorkbench {
                 }
             }
         }
+        // The runtime row carries the SSH connection's name, not the remote
+        // machine's own, so a switch back to "dev-home" does not relabel it
+        // "dev" just because the runtime publishes the same name as the local one.
+        self.sync_ssh_profile_display_name(&runtime_id, cx);
         let backend = client.backend.clone();
         let sidebar_authority = remote_authority_key(&client.credential);
         self.remote_client = Some(client);
@@ -16851,6 +16980,30 @@ impl VibexWorkbench {
             .find(|profile| profile.registered_runtime_id.as_deref() == Some(runtime_id))
     }
 
+    /// Whether the SSH tunnel this shell already holds still forwards the
+    /// profile's ports to the profile's host.
+    ///
+    /// A parked authority keeps its tunnel running, so switching back needs no
+    /// new `ssh -L`. Spawning a second forward on the same loopback port fails
+    /// to bind, and adopting it then drops — and kills — the healthy tunnel,
+    /// which is how a switch back ended up with no forward at all.
+    fn ssh_tunnel_reaches_profile(&mut self, profile: &SshConnectionProfile) -> bool {
+        if self
+            .ssh_tunnel
+            .as_mut()
+            .is_none_or(|tunnel| tunnel.try_wait().ok().flatten().is_some())
+        {
+            return false;
+        }
+        self.ssh_tunnel_spec.as_ref().is_some_and(|spec| {
+            spec.local_port == profile.local_tunnel_port
+                && spec.remote_port == profile.remote_port
+                && spec.destination.host == profile.host
+                && spec.destination.port == profile.port
+                && spec.destination.user == profile.user
+        })
+    }
+
     fn ssh_tunnel_spec_for_profile(&self, profile_id: &str) -> Option<TunnelSpec> {
         let config = self.config.as_ref()?;
         let profile = SshProfileStore::at_home(&config.home_dir)
@@ -16960,6 +17113,54 @@ impl VibexWorkbench {
         self.ssh_tunnel_task = Some(task);
     }
 
+    /// Reconnects a saved SSH connection for real.
+    ///
+    /// A paired profile restores the tunnel it was parked with and re-runs the
+    /// client handshake, so the workbench drives that runtime again. A profile
+    /// that never paired has nothing to reconnect to, so provisioning is the
+    /// only way forward. The Connections row and the runtime detail both land
+    /// here.
+    fn reconnect_ssh_connection(&mut self, profile_id: String, cx: &mut Context<Self>) {
+        // A run in flight owns the profile; the Settings page already offers to
+        // open its progress, and starting a second run would silently queue.
+        let in_flight = self
+            .ssh_provisioning_snapshot
+            .as_ref()
+            .is_some_and(|snapshot| {
+                snapshot.profile_id == profile_id && !snapshot.status.is_terminal()
+            });
+        if in_flight {
+            return;
+        }
+        let Some(config) = self.config.as_ref() else {
+            return;
+        };
+        let Ok(profiles) = SshProfileStore::at_home(&config.home_dir).load() else {
+            return;
+        };
+        let Some(profile) = profiles
+            .into_iter()
+            .find(|profile| profile.id == profile_id)
+        else {
+            return;
+        };
+        let Some(runtime_id) = profile.registered_runtime_id.clone() else {
+            self.start_ssh_profile_provisioning(profile_id, cx);
+            return;
+        };
+        let Some(runtime) = self.runtime_registry.remote(&runtime_id).cloned() else {
+            self.start_ssh_profile_provisioning(profile_id, cx);
+            return;
+        };
+        // A fresh attempt should not keep the previous failure on the row.
+        self.runtime_connect_errors.remove(&runtime_id);
+        if let Some(profile) = self.ssh_profile_for_runtime(&runtime_id) {
+            self.begin_ssh_restore(runtime, profile, RuntimeConnectOrigin::Switch, cx);
+        } else {
+            self.begin_remote_connect(runtime, RuntimeConnectOrigin::Switch, cx);
+        }
+    }
+
     /// Restores the SSH tunnel and remote runtime before booting the client.
     /// The pairing credential points at the loopback tunnel, so a stale or
     /// missing tunnel must be rebuilt first.
@@ -16973,6 +17174,30 @@ impl VibexWorkbench {
         if self.runtime_switch_pending.is_some() {
             return;
         }
+        // A parked switch keeps the tunnel it connected through. Rebuilding it
+        // would only fight the running forward for the loopback port, so a live
+        // tunnel that already reaches this profile is reused and the restore
+        // goes straight to the client handshake.
+        if self.ssh_tunnel_reaches_profile(&profile) {
+            self.runtime_status = RuntimeStatus::Starting;
+            self.runtime_note = Some(
+                locale::text(
+                    "Restoring SSH runtime…",
+                    "正在恢复 SSH 运行时…",
+                    "正在恢復 SSH 執行階段…",
+                )
+                .to_string(),
+            );
+            self.begin_remote_connect(runtime, origin, cx);
+            return;
+        }
+        // A tunnel that is dead or points somewhere else cannot be reused, and
+        // it still holds the loopback port. Close it before the replacement
+        // binds, so the new forward does not die on `ExitOnForwardFailure`.
+        self.ssh_tunnel = None;
+        self.ssh_tunnel_spec = None;
+        self.ssh_tunnel_generation = self.ssh_tunnel_generation.wrapping_add(1);
+        self.ssh_tunnel_task = None;
         let program = profile
             .ssh_client_path
             .clone()
@@ -17051,6 +17276,7 @@ impl VibexWorkbench {
             )
             .to_string(),
         );
+        self.sync_connections_live_status(cx);
         let spawn_spec = spec.clone();
         let monitor_spec = spec;
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
@@ -17121,6 +17347,7 @@ impl VibexWorkbench {
         if matches!(origin, RuntimeConnectOrigin::Boot) {
             self.runtime_status = RuntimeStatus::Starting;
         }
+        self.sync_connections_live_status(cx);
         let runtime_id = runtime.id.clone();
         let credential = runtime.credential.clone();
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
@@ -17185,6 +17412,10 @@ impl VibexWorkbench {
                 self.finish_startup_loading(cx);
             }
         }
+        // The attempt is over: release the switch slot before mirroring the
+        // live status, or the row would keep reading "Connecting".
+        self.runtime_switch_pending = None;
+        self.sync_connections_live_status(cx);
     }
 
     /// Attaches the workbench to the embedded runtime that is already running.
@@ -17449,6 +17680,7 @@ impl VibexWorkbench {
             self.runtime_registry.set_active(id);
         }
         self.persist_runtime_registry(cx);
+        self.sync_connections_live_status(cx);
         cx.notify();
     }
 
@@ -18579,51 +18811,6 @@ impl VibexWorkbench {
         _profile: &SshConnectionProfile,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let field = |label: &'static str, input: AnyElement| {
-            v_flex()
-                .w_full()
-                .gap_1()
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(label),
-                )
-                .child(input)
-                .into_any_element()
-        };
-        let mut fields = v_flex().w_full().gap_2();
-        fields = fields
-            .child(field(
-                locale::text("Display name", "显示名称", "顯示名稱"),
-                Input::new(&self.runtime_edit_name_input)
-                    .small()
-                    .into_any_element(),
-            ))
-            .child(field(
-                locale::text("SSH client path", "SSH 客户端路径", "SSH 用戶端路徑"),
-                Input::new(&self.runtime_edit_client_input)
-                    .small()
-                    .into_any_element(),
-            ))
-            .child(field(
-                locale::text("SSH config path", "SSH 配置路径", "SSH 設定路徑"),
-                Input::new(&self.runtime_edit_config_input)
-                    .small()
-                    .into_any_element(),
-            ))
-            .child(field(
-                locale::text("Workspace roots", "工作区根目录", "工作區根目錄"),
-                Input::new(&self.runtime_edit_workspaces_input)
-                    .small()
-                    .into_any_element(),
-            ))
-            .child(field(
-                locale::text("Local tunnel port", "本地隧道端口", "本機通道連接埠"),
-                Input::new(&self.runtime_edit_local_port_input)
-                    .small()
-                    .into_any_element(),
-            ));
         v_flex()
             .w_full()
             .gap_2()
@@ -18634,10 +18821,15 @@ impl VibexWorkbench {
                 "编辑 SSH 连接",
                 "編輯 SSH 連線",
             )))
-            .when_some(self.runtime_edit_error.clone(), |this, error| {
-                this.child(div().text_xs().text_color(cx.theme().danger).child(error))
-            })
-            .child(fields)
+            .child(ssh_profile_edit_fields(
+                &self.runtime_edit_name_input,
+                &self.runtime_edit_client_input,
+                &self.runtime_edit_config_input,
+                &self.runtime_edit_workspaces_input,
+                &self.runtime_edit_local_port_input,
+                self.runtime_edit_error.clone(),
+                cx,
+            ))
             .child(
                 h_flex()
                     .gap_1()
@@ -85616,6 +85808,62 @@ fn connections_profile_id(alias: &str, now_ms: i64) -> String {
     id
 }
 
+/// The field set shared by the runtime detail's edit panel and the Connections
+/// row's edit dialog.
+///
+/// Both edit the same `SshConnectionProfile`, so they read the same input
+/// entities and render the same labels; only the surrounding surface differs.
+fn ssh_profile_edit_fields(
+    name: &Entity<InputState>,
+    client: &Entity<InputState>,
+    config: &Entity<InputState>,
+    workspaces: &Entity<InputState>,
+    local_port: &Entity<InputState>,
+    error: Option<String>,
+    cx: &App,
+) -> AnyElement {
+    let field = |label: &'static str, input: Entity<InputState>| {
+        v_flex()
+            .w_full()
+            .gap_1()
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(label),
+            )
+            .child(Input::new(&input).small())
+            .into_any_element()
+    };
+    v_flex()
+        .w_full()
+        .gap_2()
+        .when_some(error, |this, error| {
+            this.child(div().text_xs().text_color(cx.theme().danger).child(error))
+        })
+        .child(field(
+            locale::text("Display name", "显示名称", "顯示名稱"),
+            name.clone(),
+        ))
+        .child(field(
+            locale::text("SSH client path", "SSH 客户端路径", "SSH 用戶端路徑"),
+            client.clone(),
+        ))
+        .child(field(
+            locale::text("SSH config path", "SSH 配置路径", "SSH 設定路徑"),
+            config.clone(),
+        ))
+        .child(field(
+            locale::text("Workspace roots", "工作区根目录", "工作區根目錄"),
+            workspaces.clone(),
+        ))
+        .child(field(
+            locale::text("Local tunnel port", "本地隧道端口", "本機通道連接埠"),
+            local_port.clone(),
+        ))
+        .into_any_element()
+}
+
 fn connection_diagnostic_title(
     kind: crate::ssh_connection::diagnostics::SshDiagnosticKind,
 ) -> &'static str {
@@ -86614,6 +86862,15 @@ struct FoundationSettings {
     /// The active provisioning snapshot/error mirrored from the workbench.
     connections_snapshot: Option<ProvisioningSnapshot>,
     connections_error: Option<String>,
+    /// Live reachability per saved connection, mirrored from the workbench.
+    ///
+    /// The page renders inside the workbench's own update, so it cannot read
+    /// the runtime registry or the live client; the workbench pushes what it
+    /// knows whenever a runtime is installed, parked, refused or removed.
+    connections_live_status: BTreeMap<String, ConnectionRowStatus>,
+    /// Why the row edit dialog rejected the last save. The dialog keeps itself
+    /// open on a rejection and renders this where the fields are.
+    connections_edit_error: Option<String>,
     /// The provisioning attempt whose dialog is open, as
     /// `(profile id, attempt id)`.
     ///
@@ -87118,6 +87375,8 @@ impl FoundationSettings {
                 connections_profiles: Vec::new(),
                 connections_snapshot: None,
                 connections_error: None,
+                connections_live_status: BTreeMap::new(),
+                connections_edit_error: None,
                 connections_progress_target: None,
                 connections_progress_dismissed: None,
                 connections_progress_open: false,
@@ -91502,6 +91761,121 @@ impl FoundationSettings {
         });
     }
 
+    /// Opens the edit dialog for one saved SSH connection.
+    ///
+    /// The row's Edit used to be disabled because the only editor lived in the
+    /// runtime manager's detail stage, which a saved-but-unpaired profile never
+    /// reaches. This surfaces the same fields over Settings and commits through
+    /// the same `save_ssh_profile_edit`, so both editors agree.
+    fn open_connections_edit_dialog(
+        &mut self,
+        profile_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(profile) = self
+            .connections_profiles
+            .iter()
+            .find(|profile| profile.id == profile_id)
+            .cloned()
+        else {
+            return;
+        };
+        // The edit inputs live on the workbench, which also commits the save.
+        let workbench = self.workbench.clone();
+        let _ = workbench.update(cx, |workbench, cx| {
+            workbench.open_ssh_profile_edit(&profile, window, cx)
+        });
+        // Capture the handles once: the dialog body must not read the workbench
+        // while Settings renders inside the workbench's own update.
+        let Some((name, client, config, workspaces, port)) = workbench
+            .read_with(cx, |workbench, _| {
+                (
+                    workbench.runtime_edit_name_input.clone(),
+                    workbench.runtime_edit_client_input.clone(),
+                    workbench.runtime_edit_config_input.clone(),
+                    workbench.runtime_edit_workspaces_input.clone(),
+                    workbench.runtime_edit_local_port_input.clone(),
+                )
+            })
+            .ok()
+        else {
+            return;
+        };
+        self.connections_edit_error = None;
+        let entity = cx.weak_entity();
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let entity = entity.clone();
+            let entity_for_footer = entity.clone();
+            let workbench_for_save = workbench.clone();
+            let error = entity
+                .read_with(cx, |this, _| this.connections_edit_error.clone())
+                .ok()
+                .flatten();
+            dialog
+                .title(locale::text(
+                    "Edit SSH connection",
+                    "编辑 SSH 连接",
+                    "編輯 SSH 連線",
+                ))
+                .w(px(480.0))
+                .child(ssh_profile_edit_fields(
+                    &name,
+                    &client,
+                    &config,
+                    &workspaces,
+                    &port,
+                    error,
+                    cx,
+                ))
+                .footer(
+                    DialogFooter::new()
+                        .child(
+                            DialogClose::new().child(
+                                Button::new("connections-edit-cancel")
+                                    .outline()
+                                    .label(locale::text("Cancel", "取消", "取消")),
+                            ),
+                        )
+                        .child(
+                            DialogAction::new().child(
+                                Button::new("connections-edit-save")
+                                    .primary()
+                                    .label(locale::text("Save", "保存", "儲存")),
+                            ),
+                        ),
+                )
+                .on_ok(move |_, _, cx| {
+                    let saved = workbench_for_save
+                        .update(cx, |workbench, cx| {
+                            workbench.save_ssh_profile_edit(cx);
+                            workbench.runtime_edit_pending.is_none()
+                        })
+                        .unwrap_or(false);
+                    let failure = if saved {
+                        None
+                    } else {
+                        workbench_for_save
+                            .read_with(cx, |workbench, _| workbench.runtime_edit_error.clone())
+                            .ok()
+                            .flatten()
+                    };
+                    let _ = entity_for_footer.update(cx, |this, cx| {
+                        if saved {
+                            this.connections_edit_error = None;
+                            this.reload_connections_profiles();
+                        } else {
+                            // A rejected edit keeps the dialog open so the error
+                            // is readable where the fields are.
+                            this.connections_edit_error = failure;
+                        }
+                        cx.notify();
+                    });
+                    saved
+                })
+        });
+    }
+
     /// Opens the provisioning dialog for an attempt that has not finished.
     ///
     /// Provisioning runs for minutes across nine steps, so it gets a dialog the
@@ -92078,39 +92452,49 @@ impl FoundationSettings {
     fn connections_rows(&self) -> Vec<ConnectionDisplayRow> {
         self.connections_profiles
             .iter()
-            .map(|profile| {
-                let status = match self
-                    .connections_snapshot
-                    .as_ref()
-                    .filter(|snapshot| snapshot.profile_id == profile.id)
-                {
-                    Some(snapshot) => match snapshot.status {
-                        ProvisioningStatus::Ready => ConnectionRowStatus::Connected,
-                        ProvisioningStatus::Failed => ConnectionRowStatus::NeedsAttention,
-                        ProvisioningStatus::Cancelled | ProvisioningStatus::Pending => {
-                            ConnectionRowStatus::Offline
-                        }
-                        ProvisioningStatus::Running | ProvisioningStatus::Cancelling => {
-                            ConnectionRowStatus::Connecting
-                        }
-                    },
-                    None if profile.last_connected_at_ms.is_some() => {
-                        ConnectionRowStatus::Connected
-                    }
-                    None => ConnectionRowStatus::Offline,
-                };
-                ConnectionDisplayRow {
-                    id: profile.id.clone(),
-                    name: profile.display_name.clone(),
-                    alias: profile.ssh_alias.clone(),
-                    user: profile.user.clone().unwrap_or_default(),
-                    host: profile.host.clone(),
-                    port: profile.port,
-                    version: profile.runtime_version.clone(),
-                    status,
-                }
+            .map(|profile| ConnectionDisplayRow {
+                id: profile.id.clone(),
+                name: profile.display_name.clone(),
+                alias: profile.ssh_alias.clone(),
+                user: profile.user.clone().unwrap_or_default(),
+                host: profile.host.clone(),
+                port: profile.port,
+                version: profile.runtime_version.clone(),
+                status: self.connection_row_status(profile),
             })
             .collect()
+    }
+
+    /// Whether a saved connection is reachable right now.
+    ///
+    /// `last_connected_at_ms` records history, not liveness: a profile that was
+    /// once paired used to paint a green "Connected" dot even while the
+    /// workbench was parked on another runtime. Liveness is mirrored from the
+    /// workbench (this page renders inside its update and cannot read it), and
+    /// an in-flight provisioning run overrides the mirror; a terminal `Ready`
+    /// snapshot falls through to the mirror so switching away stops reading
+    /// "Connected".
+    fn connection_row_status(&self, profile: &SshConnectionProfile) -> ConnectionRowStatus {
+        if let Some(snapshot) = self
+            .connections_snapshot
+            .as_ref()
+            .filter(|snapshot| snapshot.profile_id == profile.id)
+        {
+            match snapshot.status {
+                ProvisioningStatus::Running | ProvisioningStatus::Cancelling => {
+                    return ConnectionRowStatus::Connecting;
+                }
+                ProvisioningStatus::Failed => return ConnectionRowStatus::NeedsAttention,
+                ProvisioningStatus::Pending | ProvisioningStatus::Cancelled => {
+                    return ConnectionRowStatus::Offline;
+                }
+                ProvisioningStatus::Ready => {}
+            }
+        }
+        self.connections_live_status
+            .get(profile.id.as_str())
+            .copied()
+            .unwrap_or(ConnectionRowStatus::Offline)
     }
 
     fn request_ssh_log(&mut self, profile_id: String, cx: &mut Context<Self>) {
@@ -92284,8 +92668,8 @@ impl FoundationSettings {
             });
         // The row's primary action is the way back from every state a
         // connection can be stuck in: an unpaired profile retries
-        // provisioning, a running one opens its progress, and a paired one
-        // opens the same dialog to manage it.
+        // provisioning, a running one cancels, and a paired one reconnects to
+        // the runtime it kept.
         let primary_label = Self::connection_primary_label(row.status);
         let primary_id = row.id.clone();
         let primary_settings = settings.clone();
@@ -92318,37 +92702,49 @@ impl FoundationSettings {
                 let remove_id = remove_id.clone();
                 let remove_name = remove_name.clone();
                 let remove_settings = remove_settings.clone();
+                let edit_id = remove_id.clone();
+                let edit_settings = remove_settings.clone();
                 let reconnect_id = remove_id.clone();
                 let reconnect_settings = remove_settings.clone();
-                menu.item(PopupMenuItem::new(locale::text("Edit", "编辑", "編輯")).disabled(true))
-                    .item(
-                        // Reconnect used to need a paired runtime, so an
-                        // unpaired profile had no action here at all. It now
-                        // re-runs provisioning, which is exactly what an
-                        // unpaired profile is missing.
-                        PopupMenuItem::new(locale::text("Reconnect", "重新连接", "重新連線"))
-                            .on_click(move |_, window, cx| {
-                                let profile_id = reconnect_id.clone();
-                                let _ = reconnect_settings.update(cx, |this, cx| {
-                                    this.run_connection_primary_action(profile_id, window, cx)
-                                });
-                            }),
-                    )
-                    .separator()
-                    .item(
-                        PopupMenuItem::new(locale::text("Remove", "移除", "移除")).on_click(
-                            move |_, window, cx| {
-                                let _ = remove_settings.update(cx, |this, cx| {
-                                    this.confirm_remove_ssh_connection(
-                                        remove_id.clone(),
-                                        remove_name.clone(),
-                                        window,
-                                        cx,
-                                    )
-                                });
-                            },
-                        ),
-                    )
+                menu.item(
+                    PopupMenuItem::new(locale::text("Edit", "编辑", "編輯")).on_click(
+                        move |_, window, cx| {
+                            let profile_id = edit_id.clone();
+                            let _ = edit_settings.update(cx, |this, cx| {
+                                this.open_connections_edit_dialog(profile_id, window, cx)
+                            });
+                        },
+                    ),
+                )
+                .item(
+                    // Reconnect used to need a paired runtime, so an unpaired
+                    // profile had no action here at all. It now re-runs
+                    // provisioning for one, and restores the tunnel and client
+                    // for a profile that has paired before.
+                    PopupMenuItem::new(locale::text("Reconnect", "重新连接", "重新連線")).on_click(
+                        move |_, window, cx| {
+                            let profile_id = reconnect_id.clone();
+                            let _ = reconnect_settings.update(cx, |this, cx| {
+                                this.run_connection_primary_action(profile_id, window, cx)
+                            });
+                        },
+                    ),
+                )
+                .separator()
+                .item(
+                    PopupMenuItem::new(locale::text("Remove", "移除", "移除")).on_click(
+                        move |_, window, cx| {
+                            let _ = remove_settings.update(cx, |this, cx| {
+                                this.confirm_remove_ssh_connection(
+                                    remove_id.clone(),
+                                    remove_name.clone(),
+                                    window,
+                                    cx,
+                                )
+                            });
+                        },
+                    ),
+                )
             })
             .anchor(Anchor::TopRight);
         let actions = h_flex()
@@ -92421,7 +92817,7 @@ impl FoundationSettings {
 
     fn connection_primary_label(status: ConnectionRowStatus) -> &'static str {
         match status {
-            ConnectionRowStatus::Connected => locale::text("Manage", "管理", "管理"),
+            ConnectionRowStatus::Connected => locale::text("Reconnect", "重新连接", "重新連線"),
             ConnectionRowStatus::Offline => locale::text("Connect", "连接", "連線"),
             ConnectionRowStatus::NeedsAttention => locale::text("Fix", "修复", "修復"),
             ConnectionRowStatus::Connecting => locale::text("Cancel", "取消", "取消"),
@@ -92431,9 +92827,9 @@ impl FoundationSettings {
     fn connection_primary_hint(status: ConnectionRowStatus) -> &'static str {
         match status {
             ConnectionRowStatus::Connected => locale::text(
-                "Open this connection's provisioning details.",
-                "查看该连接的配置详情。",
-                "檢視該連線的設定詳情。",
+                "Reconnect and make this runtime authoritative.",
+                "重新连接并使该运行时成为当前运行时。",
+                "重新連線並使該執行階段成為目前執行階段。",
             ),
             ConnectionRowStatus::Offline => locale::text(
                 "Install, start, and pair the runtime on this host.",
@@ -92441,9 +92837,9 @@ impl FoundationSettings {
                 "在該主機上安裝、啟動並配對執行階段。",
             ),
             ConnectionRowStatus::NeedsAttention => locale::text(
-                "Retry provisioning for this host.",
-                "重试该主机的配置。",
-                "重試該主機的設定。",
+                "Retry the connection to this host.",
+                "重试连接该主机。",
+                "重試連線該主機。",
             ),
             ConnectionRowStatus::Connecting => locale::text(
                 "Stop this provisioning run.",
@@ -92455,16 +92851,14 @@ impl FoundationSettings {
 
     /// Runs a row's primary action for the state the row is in.
     ///
-    /// This is the only way back from "Offline / Not installed": a saved
-    /// profile whose provisioning never ran, was cancelled, or died with the
-    /// app had no affordance at all — the row menu's Reconnect needs a paired
-    /// runtime, and an unpaired profile has none. Every state therefore routes
-    /// to something that changes it: a live run opens its progress, a running
-    /// one cancels, and a terminal one starts provisioning again.
+    /// A running run cancels; every other state reconnects. The button is the
+    /// connection's own action now, not a way into the provisioning dialog: a
+    /// paired profile restores its tunnel and client, and an unpaired one
+    /// provisions from the start.
     fn run_connection_primary_action(
         &mut self,
         profile_id: String,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let status = self
@@ -92472,27 +92866,23 @@ impl FoundationSettings {
             .into_iter()
             .find(|row| row.id == profile_id)
             .map(|row| row.status);
-        match status {
-            Some(ConnectionRowStatus::Connecting) => {
-                let workbench = self.workbench.clone();
-                cx.defer(move |cx| {
-                    let _ =
-                        workbench.update(cx, |workbench, cx| workbench.cancel_ssh_provisioning(cx));
-                });
-            }
-            Some(ConnectionRowStatus::Connected) => {
-                self.open_connections_progress_dialog(window, cx);
-            }
-            _ => {
-                let pending = profile_id.clone();
-                let workbench = self.workbench.clone();
-                cx.defer(move |cx| {
-                    let _ = workbench.update(cx, |workbench, cx| {
-                        workbench.start_ssh_profile_provisioning(pending, cx)
-                    });
-                });
-            }
+        if status == Some(ConnectionRowStatus::Connecting) {
+            let workbench = self.workbench.clone();
+            cx.defer(move |cx| {
+                let _ = workbench.update(cx, |workbench, cx| workbench.cancel_ssh_provisioning(cx));
+            });
+            cx.notify();
+            return;
         }
+        // Reconnecting touches the tunnel, the registry and the live client,
+        // all of which belong to the workbench; Settings only asks for it.
+        let pending = profile_id.clone();
+        let workbench = self.workbench.clone();
+        cx.defer(move |cx| {
+            let _ = workbench.update(cx, |workbench, cx| {
+                workbench.reconnect_ssh_connection(pending, cx)
+            });
+        });
         cx.notify();
     }
 
@@ -119216,7 +119606,8 @@ mod tests {
     /// The row menu's Reconnect needed a registered runtime, so an unpaired
     /// profile had no action at all: the runtime manager lists runtimes, and a
     /// profile that never provisioned has none. The primary button and the menu
-    /// now both re-run provisioning for it.
+    /// now both reconnect for real: a paired profile restores its tunnel and
+    /// client, and an unpaired one provisions from the start.
     #[test]
     fn an_unpaired_connection_offers_a_working_retry() {
         let source = include_str!("app.rs");
@@ -119231,6 +119622,10 @@ mod tests {
         );
         assert!(row.contains("run_connection_primary_action"));
         assert!(
+            row.contains("this.open_connections_edit_dialog(profile_id, window, cx)"),
+            "the row menu's Edit must open the editor instead of staying disabled"
+        );
+        assert!(
             !row.contains("PopupMenuItem::new(locale::text(\"Reconnect\", \"重新连接\", \"重新連線\"))\n                            .disabled(true)"),
             "Reconnect must stay actionable for a profile that never paired"
         );
@@ -119241,16 +119636,29 @@ mod tests {
             .map(|(body, _)| body)
             .expect("the row's primary action should remain inspectable");
         assert!(
-            action.contains("start_ssh_profile_provisioning"),
-            "an unpaired or failed row has to be able to provision again"
+            action.contains("reconnect_ssh_connection"),
+            "the primary button must reconnect, not only open the progress dialog"
         );
         assert!(
             action.contains("cancel_ssh_provisioning"),
             "a running row's primary action is Cancel"
         );
+
+        // The workbench owns the tunnel, the registry and the live client, so
+        // the real reconnect routes an unpaired profile to provisioning and a
+        // paired one to the tunnel/client restore.
+        let reconnect = source
+            .split_once("    fn reconnect_ssh_connection(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// Restores the SSH tunnel"))
+            .map(|(body, _)| body)
+            .expect("the reconnect path should remain inspectable");
         assert!(
-            action.contains("open_connections_progress_dialog"),
-            "a paired row opens its provisioning details"
+            reconnect.contains("start_ssh_profile_provisioning"),
+            "an unpaired profile has to be able to provision again"
+        );
+        assert!(
+            reconnect.contains("begin_ssh_restore"),
+            "a paired profile has to restore its tunnel and client"
         );
 
         let resume = source
@@ -119263,6 +119671,102 @@ mod tests {
             "only profiles that never provisioned are resumed"
         );
         assert!(resume.contains("start_ssh_profile_provisioning"));
+    }
+
+    /// Switching back to a parked SSH runtime reuses its live tunnel.
+    ///
+    /// A parked authority keeps its `ssh -L` forward running. Spawning a second
+    /// forward on the same loopback port fails to bind, and adopting it then
+    /// drops — and kills — the healthy tunnel, so the switch found no forward
+    /// at all and the direct probe failed with `remote_candidates_unreachable`.
+    #[test]
+    fn switching_back_to_a_parked_ssh_runtime_reuses_its_tunnel() {
+        let source = include_str!("app.rs");
+        let restore = source
+            .split_once("    fn begin_ssh_restore(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// Connects to a registered remote runtime")
+            })
+            .map(|(body, _)| body)
+            .expect("the SSH restore path should remain inspectable");
+        let reuse = restore
+            .find("self.ssh_tunnel_reaches_profile(&profile)")
+            .expect("the live tunnel must be checked before it is rebuilt");
+        let teardown = restore
+            .find("self.ssh_tunnel = None;")
+            .expect("a stale forward must be closed before a replacement binds");
+        let spawn = restore
+            .find("TunnelProcess::spawn(&spawn_spec)")
+            .expect("the restore still spawns a forward when it must");
+        assert!(
+            reuse < teardown && teardown < spawn,
+            "reuse first, then close the old forward before the new one binds"
+        );
+    }
+
+    /// A parked connection stops reading "Connected".
+    ///
+    /// The settings row used to paint success whenever `last_connected_at_ms`
+    /// was set, which is history: it stayed green while the workbench was
+    /// parked on the embedded runtime. Liveness is now the workbench's mirror.
+    #[test]
+    fn a_parked_connection_stops_reading_connected() {
+        let source = include_str!("app.rs");
+        let status = source
+            .split_once("    fn connection_row_status(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn request_ssh_log("))
+            .map(|(body, _)| body)
+            .expect("the live connection status should remain inspectable");
+        assert!(
+            status.contains("connections_live_status"),
+            "the page must use the workbench's live mirror"
+        );
+        assert!(
+            !status.contains("last_connected_at_ms"),
+            "a stored last-connected timestamp is not liveness"
+        );
+
+        let mirror = source
+            .split_once("    fn sync_connections_live_status(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn sync_ssh_provisioning_settings("))
+            .map(|(body, _)| body)
+            .expect("the live mirror should remain inspectable");
+        assert!(
+            mirror.contains("runtime_registry.active_runtime_id()"),
+            "a profile parked behind another authority is Offline"
+        );
+        assert!(
+            mirror.contains("remote_client"),
+            "the live client is what makes a profile Connected"
+        );
+    }
+
+    /// An SSH connection's own name labels the runtime it produced.
+    ///
+    /// Every remote machine can publish the same "dev", so a row built only
+    /// from the runtime's name was indistinguishable from the embedded one.
+    /// The SSH connection's name fills an unnamed runtime row, while an
+    /// explicit runtime rename still wins.
+    #[test]
+    fn an_ssh_connection_name_labels_its_runtime_row() {
+        let source = include_str!("app.rs");
+        let sync = source
+            .split_once("    fn sync_ssh_profile_display_name(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn sync_connections_live_status("))
+            .map(|(body, _)| body)
+            .expect("the display-name sync should remain inspectable");
+        assert!(
+            sync.contains("profile.registered_runtime_id"),
+            "the name comes from the profile bound to the runtime"
+        );
+        assert!(
+            sync.contains("runtime.display_name.is_none()"),
+            "an explicit runtime rename must win over the connection name"
+        );
+        assert!(
+            source.contains("self.sync_ssh_profile_display_name(&runtime_id, cx);"),
+            "both the first provisioning and a reconnect label the row"
+        );
     }
 
     /// The progress dialog appears on the click, not after the download.
