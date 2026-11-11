@@ -98076,7 +98076,12 @@ fn session_markdown_text_view(
     image_plugin: Option<session_images::SessionImagePlugin>,
     on_link_click: impl Fn(&SharedString, &ClickEvent, &mut Window, &mut App) + Send + Sync + 'static,
 ) -> TextView {
-    let view = markdown_text_view(state, presentation, cx, on_link_click);
+    // A reader who only sees the label cannot tell where a destination goes, so
+    // every session Markdown surface names it beside the pointer. A user
+    // message's links are attachment keys rather than destinations and keep
+    // their own view, which is built by `markdown_text_view`.
+    let view = markdown_text_view(state, presentation, cx, on_link_click)
+        .link_tooltip(crate::markdown::link_tooltip);
     let Some(plugin) = image_plugin else {
         return view;
     };

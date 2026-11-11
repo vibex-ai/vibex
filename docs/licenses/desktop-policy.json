@@ -346,7 +346,7 @@
       "treeSha256": "f1b204593bacbc43ebea2d8d065434d120392be3abf45f705955f8396b6a8d5e",
       "licenseExpression": "OFL-1.1",
       "source": "https://github.com/googlefonts/noto-emoji",
-      "licenseEvidence": "Noto Color Emoji 2.042 in its CBDT/CBLC bitmap build, the only colour-emoji format swash can rasterize. gpui-mobile's Android platform reads this exact APK asset path when the system emoji font is COLR v1 (Android 13+) and otherwise logs \"no compatible emoji font loaded - emoji glyphs may not render\". Copyright 2022 Google Inc.; the complete SIL Open Font License 1.1 text ships beside the font. The reviewed binary is the asset carried by the gpui-mobile example pack, unchanged across the revisions this workspace pins (`7548ebc` and the `0.3.11` bump built on it); its embedded name table identifies noto-emoji 20231129 and its SHA-256 is c2f19f6a404baa7da7a710b018c2892d7b51386983ddca146811f76aea0b6861."
+      "licenseEvidence": "Noto Color Emoji 2.042 in its CBDT/CBLC bitmap build, the only colour-emoji format swash can rasterize. gpui-mobile's Android platform reads this exact APK asset path when the system emoji font is COLR v1 (Android 13+) and otherwise logs \"no compatible emoji font loaded - emoji glyphs may not render\". Copyright 2022 Google Inc.; the complete SIL Open Font License 1.1 text ships beside the font. The reviewed binary is the asset carried by the gpui-mobile example pack, unchanged across the revisions this workspace pins (`7548ebc` and the `0.3.12` bump built on it); its embedded name table identifies noto-emoji 20231129 and its SHA-256 is c2f19f6a404baa7da7a710b018c2892d7b51386983ddca146811f76aea0b6861."
     },
     {
       "id": "vibex-desktop-nerd-symbols",

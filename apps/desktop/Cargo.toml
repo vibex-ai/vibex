@@ -93,7 +93,7 @@ vibex-ui = { path = "../../crates/vibex-ui" }
 vibex-terminal = { path = "../../crates/terminal" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-gpui_wgpu = { package = "gpui-pre-wgpu", version = "=0.3.11" }
+gpui_wgpu = { package = "gpui-pre-wgpu", version = "=0.3.12" }
 libc.workspace = true
 # GTK 3 is still read for the desktop's caption layout and initialized so the
 # AppIndicator-era trays keep working; the crate line is 0.19 so it pulls a

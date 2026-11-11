@@ -91,9 +91,9 @@ function validateContract(read = source, exists = (path) => existsSync(join(ROOT
   assert(manifest.includes('crate-type = ["cdylib", "staticlib", "rlib"]'), "native_mobile_crate_types_invalid");
   assert(manifest.includes('gpui-mobile = { package = "gpui-pre-mobile"'), "mobile_gpui_pre_mobile_dependency_missing");
   // Upstream still pins gpui-pre 0.3.10, so the pin names the reviewed fork
-  // (longbridge/gpui-mobile#46) that accepts the 0.3.11 gpui-kit 0.9.0 pins.
+  // (longbridge/gpui-mobile#56) that accepts the 0.3.12 gpui-kit 0.9.1 pins.
   assert(manifest.includes("PeatBoy/gpui-mobile"), "mobile_gpui_pre_mobile_source_missing");
-  assert(manifest.includes('rev = "f6e8b3769933bed5f838b9ec3d45ec84fc2a5a8e"'), "mobile_gpui_pre_mobile_revision_missing");
+  assert(manifest.includes('rev = "d8945a826e4012b43a46b53d7e72b6beae24cc80"'), "mobile_gpui_pre_mobile_revision_missing");
   assert(!manifest.includes("vendor/zed"), "mobile_vendor_zed_dependency_present");
   assert(manifest.includes('rustls-platform-verifier = "0.7"'), "android_tls_platform_verifier_dependency_missing");
   assert(workspace.includes('webpki-root-certs = "1"'), "android_webpki_root_workspace_dependency_missing");

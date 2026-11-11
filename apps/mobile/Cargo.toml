@@ -67,16 +67,15 @@ vibex-terminal-ui = { path = "../../crates/vibex-terminal-ui" }
 vibex-ui = { path = "../../crates/vibex-ui" }
 
 [target.'cfg(any(target_os = "android", target_os = "ios"))'.dependencies]
-# `gpui-pre-mobile` must build against the same `gpui-pre` that gpui-kit 0.9.0
-# pins (`=0.3.11`), and Cargo cannot hold two exact pins in the same 0.3 range.
+# `gpui-pre-mobile` must build against the same `gpui-pre` that gpui-kit 0.9.1
+# pins (`=0.3.12`), and Cargo cannot hold two exact pins in the same 0.3 range.
 # Upstream's latest revision (`7548ebc`) still pins `=0.3.10`, so this names
-# `PeatBoy/gpui-mobile` at `f6e8b37`: upstream plus the version bump, the
-# re-vendored 0.3.11 `gpui-pre-wgpu`, and the `WgpuContext::new` call sites the
-# 0.3.11 renderer API moved. That branch is proposed upstream as
-# longbridge/gpui-mobile#46; when it lands, this pin returns to upstream at the
-# merge commit. The pin names a revision rather than a branch so its contents
-# stay fixed.
-gpui-mobile = { package = "gpui-pre-mobile", git = "https://github.com/PeatBoy/gpui-mobile", rev = "f6e8b3769933bed5f838b9ec3d45ec84fc2a5a8e" }
+# `PeatBoy/gpui-mobile` at `d8945a8`: upstream plus the version bump, the
+# re-vendored 0.3.12 `gpui-pre-wgpu`, and the `WgpuContext::new` call sites the
+# renderer API moved. That branch is proposed upstream as
+# longbridge/gpui-mobile#56. The pin names a revision rather than a branch so its
+# contents stay fixed.
+gpui-mobile = { package = "gpui-pre-mobile", git = "https://github.com/PeatBoy/gpui-mobile", rev = "d8945a826e4012b43a46b53d7e72b6beae24cc80" }
 
 [target.'cfg(target_os = "android")'.dependencies]
 # `gpui-pre-mobile` links `android-activity`'s NativeActivity glue into the
