@@ -1339,6 +1339,46 @@ impl TimelineItem {
         self.payload_depth = TimelinePayloadDepth::Summary;
         self
     }
+
+    /// A summary for a client that pays for every byte on the wire.
+    ///
+    /// The ordinary summary keeps a user message's inline `data:` attachment
+    /// because the desktop can read it straight from the item. A paired phone
+    /// cannot, and would download the picture with every timeline window, so
+    /// the remote read replaces the payload with a bounded marker. Opening the
+    /// attachment reads the one detail item, which still carries the bytes.
+    pub fn into_remote_summary(self) -> Self {
+        let mut item = self.into_summary();
+        let mut stripped = false;
+        if let TimelinePayload::UserMessage(message) = &mut item.payload {
+            for (index, attachment) in message.attachments.iter_mut().enumerate() {
+                if attachment
+                    .uri
+                    .as_deref()
+                    .is_some_and(|uri| uri.starts_with("data:"))
+                {
+                    attachment.uri = Some(format!("{INLINE_ATTACHMENT_URI_PREFIX}{index}"));
+                    stripped = true;
+                }
+            }
+        }
+        if stripped {
+            item.payload_depth = TimelinePayloadDepth::Summary;
+        }
+        item
+    }
+}
+
+/// The URI a summary read puts in place of an inline `data:` attachment.
+///
+/// The bytes stay in the authoritative detail row; a summary page only names
+/// the attachment and its position, so a client that wants the picture asks
+/// for that one item instead of downloading it with every timeline window.
+pub const INLINE_ATTACHMENT_URI_PREFIX: &str = "vibex-inline-attachment://";
+
+pub fn inline_attachment_index(uri: &str) -> Option<usize> {
+    uri.strip_prefix(INLINE_ATTACHMENT_URI_PREFIX)
+        .and_then(|index| index.parse().ok())
 }
 
 impl TimelinePayload {
@@ -1457,7 +1497,19 @@ impl TimelinePayload {
             })
         }
         let body = match self {
-            Self::UserMessage(message) => text(&message.text),
+            Self::UserMessage(message) => {
+                text(&message.text)
+                    + message
+                        .attachments
+                        .iter()
+                        .map(|attachment| {
+                            text(&attachment.label)
+                                + optional(&attachment.mime_type)
+                                + optional(&attachment.uri)
+                                + ELEMENT_BYTES
+                        })
+                        .sum::<usize>()
+            }
             Self::AgentMessageDelta(delta) => text(&delta.text_delta),
             Self::AgentMessage(message) => text(&message.text),
             Self::Reasoning(reasoning) => text(&reasoning.text),
@@ -1526,6 +1578,29 @@ impl TimelinePayload {
             Self::PermissionResolution(_) | Self::ElicitationResolution(_) => 0,
         };
         body.saturating_add(ENVELOPE_BYTES)
+    }
+
+    /// The inline attachment bytes a paired client never receives.
+    ///
+    /// These are not "tool detail": the local summary keeps them on purpose.
+    /// The page budget still has to discount them, or one pasted photograph
+    /// would consume the whole window that a phone then receives without it.
+    pub fn stripped_inline_attachment_bytes(&self) -> usize {
+        match self {
+            Self::UserMessage(message) => message
+                .attachments
+                .iter()
+                .filter(|attachment| {
+                    attachment
+                        .uri
+                        .as_deref()
+                        .is_some_and(|uri| uri.starts_with("data:"))
+                })
+                .filter_map(|attachment| attachment.uri.as_deref())
+                .map(str::len)
+                .sum(),
+            _ => 0,
+        }
     }
 
     /// The bytes [`Self::into_summary`] would remove from this payload.
@@ -1838,6 +1913,69 @@ mod tests {
             .expect("the invocation survives a summary");
         assert!(extension.content_blocks.is_empty());
         assert!(extension.raw_input.is_some());
+    }
+
+    #[test]
+    fn a_summary_names_an_inline_attachment_without_its_payload() {
+        let session = VibexSessionId::new();
+        let item = TimelineItem {
+            id: TimelineItemId::new(),
+            session_id: session,
+            sequence: 1,
+            timestamp_ms: 1,
+            source: TimelineSource::User,
+            kind: TimelineItemKind::UserMessage,
+            correlation_id: None,
+            provider_correlation_id: None,
+            redaction_state: TimelineRedactionState::None,
+            execution_attribution: None,
+            payload_depth: TimelinePayloadDepth::Detail,
+            payload: TimelinePayload::UserMessage(UserMessagePayload {
+                text: "look".into(),
+                attachments: vec![MessageAttachment {
+                    label: "shot.png".into(),
+                    mime_type: Some("image/png".into()),
+                    uri: Some(format!("data:image/png;base64,{}", "A".repeat(4096))),
+                    inline_text_offset: None,
+                }],
+                ..Default::default()
+            }),
+        };
+        let complete_bytes = item.payload.approximate_bytes();
+
+        // The desktop reads the local summary straight from the item and can
+        // still open the picture, so the ordinary summary keeps the bytes.
+        let local = item.clone().into_summary();
+        assert!(local.has_complete_payload());
+        let TimelinePayload::UserMessage(local_message) = &local.payload else {
+            panic!("the payload kind survives a summary");
+        };
+        assert!(
+            local_message.attachments[0]
+                .uri
+                .as_deref()
+                .is_some_and(|uri| uri.starts_with("data:"))
+        );
+
+        // A paired phone gets the marker instead; the detail read still has
+        // the payload.
+        let remote = item.into_remote_summary();
+        assert_eq!(remote.payload_depth, TimelinePayloadDepth::Summary);
+        let TimelinePayload::UserMessage(message) = &remote.payload else {
+            panic!("the payload kind survives a summary");
+        };
+        assert_eq!(
+            message.attachments[0].uri.as_deref(),
+            Some("vibex-inline-attachment://0")
+        );
+        assert_eq!(
+            inline_attachment_index("vibex-inline-attachment://0"),
+            Some(0)
+        );
+        assert!(
+            remote.payload.approximate_bytes() < complete_bytes / 2,
+            "the remote summary must not carry the inline payload"
+        );
     }
 
     #[test]

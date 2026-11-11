@@ -17977,7 +17977,9 @@ const TIMELINE_IN_FLIGHT_TAIL_MAX_BYTES: usize = 256 * 1024;
 /// stripped file snapshot does not spend the whole page on detail it never
 /// carries.
 fn page_payload_cost(item: &TimelineItem) -> usize {
-    item.payload.approximate_bytes() - item.payload.stripped_tool_detail_bytes()
+    item.payload.approximate_bytes()
+        - item.payload.stripped_tool_detail_bytes()
+        - item.payload.stripped_inline_attachment_bytes()
 }
 
 /// Whether a page's oldest row begins a conversational turn.

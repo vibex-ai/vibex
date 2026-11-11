@@ -88,9 +88,9 @@ mod lan_pairing;
 mod pairing_v2;
 mod zero_config_pairing;
 pub use gateway::{
-    RelayAttachmentTasks, RelayRemoteOutbound, RemoteGateway, RemoteGatewayConfig,
-    RemoteGatewayDeploymentMode, RemoteGatewayPairingRoutes, RemoteGatewayPeerLimits,
-    RemoteGatewayStatus, RemoteGatewayTlsIdentity, RemoteGatewayTlsPolicy,
+    GatewaySubscriptions, RelayAttachmentTasks, RelayRemoteOutbound, RemoteGateway,
+    RemoteGatewayConfig, RemoteGatewayDeploymentMode, RemoteGatewayPairingRoutes,
+    RemoteGatewayPeerLimits, RemoteGatewayStatus, RemoteGatewayTlsIdentity, RemoteGatewayTlsPolicy,
 };
 pub use zero_config_pairing::pinned_tls_certificate_base64;
 
@@ -5372,7 +5372,7 @@ async fn dispatch_agent_request(
                 Some(request_id),
                 correlation_id,
             )?;
-            let page = manager.fetch_timeline(request.request).await?;
+            let page = manager.fetch_timeline_remote(request.request).await?;
             serde_json::to_value(RemoteAgentTimelineFetchResponse { page })
                 .map_err(remote_payload_encode_error)
         }
@@ -8009,7 +8009,7 @@ async fn catch_up_agent_timeline(
 
     for cursor in request.cursors {
         let page = manager
-            .fetch_timeline(FetchTimelineRequest {
+            .fetch_timeline_remote(FetchTimelineRequest {
                 session_id: cursor.session_id.clone(),
                 after_sequence: Some(cursor.after_sequence),
                 before_sequence: None,
@@ -8081,7 +8081,7 @@ async fn session_timeline_preview(
         });
     }
     manager
-        .fetch_timeline(FetchTimelineRequest {
+        .fetch_timeline_remote(FetchTimelineRequest {
             session_id: session_id.clone(),
             after_sequence: None,
             before_sequence: None,
