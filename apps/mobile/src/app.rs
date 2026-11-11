@@ -28114,8 +28114,21 @@ impl MobileApp {
 
     fn active_host_url(&self) -> String {
         self.active_host_entry()
-            .map(|host| host.bundle.record.server_url.clone())
+            .map(|host| host_address_label(&host.bundle.record.server_url))
             .unwrap_or_else(|| locale::common("Connected").to_string())
+    }
+}
+
+/// How a credential's address is shown to the reader.
+///
+/// The built-in relay is the one address a user never chose and cannot change,
+/// so it is named rather than printed: a URL on this row reads as something to
+/// copy somewhere else.
+fn host_address_label(server_url: &str) -> String {
+    if vibex_core::is_official_relay_origin(server_url) {
+        locale::text("Official relay", "官方中继服务", "官方中繼服務").to_string()
+    } else {
+        server_url.to_string()
     }
 }
 
@@ -28688,7 +28701,7 @@ impl MobileApp {
                     ))
                     .child(host_detail_field(
                         "Address",
-                        &host.bundle.record.server_url,
+                        &host_address_label(&host.bundle.record.server_url),
                         false,
                         false,
                     ))

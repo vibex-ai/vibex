@@ -1671,6 +1671,11 @@ strings! {
         "該裝置已配對，配對碼已作廢。"
     },
     devices_route => { "Route", "路线", "路線" },
+    devices_route_official => {
+        "Official relay",
+        "官方中继服务",
+        "官方中繼服務"
+    },
     devices_route_choice => {
         "switch route",
         "切换路线",
