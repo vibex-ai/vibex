@@ -48596,6 +48596,12 @@ impl VibexWorkbench {
                 .settings_render_context
                 .scroll
                 .set_offset(point(px(0.0), px(0.0)));
+            // The column reopens on General, so its list starts at the top
+            // again; a short window would otherwise reopen mid-list from the
+            // offset the previous visit ended on.
+            settings
+                .navigation_scroll
+                .set_offset(point(px(0.0), px(0.0)));
             cx.notify();
         });
         self.settings_open = true;
@@ -119186,6 +119192,13 @@ mod tests {
         assert!(open_settings.contains(".child(settings_for_content.clone())"));
         assert!(open_settings.contains(".rounded(px(SETTINGS_DIALOG_RADIUS))"));
         assert!(!open_settings.contains("\n                .child(settings.clone())"));
+        // Reopening shows General, which is at the top of the column: a short
+        // window must not open on the offset the previous visit ended at.
+        let reopen_reset = open_settings
+            .split_once(".navigation_scroll")
+            .map(|(_, tail)| tail)
+            .expect("reopening should reset the navigation column");
+        assert!(reopen_reset[..reopen_reset.len().min(96)].contains("set_offset"));
 
         let settings = source
             .split_once("impl Render for FoundationSettings")
