@@ -21,6 +21,7 @@ pub mod install;
 pub mod manifest;
 pub mod market;
 pub mod native;
+pub mod pack;
 pub mod permission;
 pub mod runtime;
 pub mod service;
@@ -29,8 +30,8 @@ pub mod shell;
 pub use error::{ManifestError, PluginError};
 pub use fingerprint::consent_fingerprint;
 pub use install::{
-    ExtractReport, PendingInstall, PluginStore, RecoveryOutcome, extract_zip, safe_relative_path,
-    sha256_hex, sha512_hex, verify_checksums,
+    ExtractReport, PendingInstall, PluginStore, RecoveryOutcome, extract_zip,
+    read_package_manifest, safe_relative_path, sha256_hex, sha512_hex, verify_checksums,
 };
 pub use manifest::{
     AUTHOR_MANIFEST_FILE, PluginCapabilities, PluginFsCapability, PluginManifest,
@@ -40,6 +41,10 @@ pub use market::{
     DEFAULT_TOPIC, GithubTopicSource, MarketCache, MarketCatalog, MarketConfig, MarketHttpClient,
     MarketUrlPolicy, merge_entries, search_entries,
 };
+pub use native::{
+    NativePluginDescriptor, NativePluginRegistry, RIGHT_RAIL_ACTIVITY, default_native_plugins,
+};
+pub use pack::{PACKAGE_EXTENSION, pack_directory, write_package};
 pub use permission::{
     PermissionSpec, PluginPermissionCatalog, default_permission_catalog, permissions_for,
 };
