@@ -15,6 +15,7 @@ mod home_lock;
 mod lan_pairing;
 mod management;
 pub mod network_proxy;
+mod plugins;
 mod rc_import;
 mod relay;
 mod remote_connectivity;
@@ -24,6 +25,7 @@ mod storage;
 mod terminal_observation;
 mod timeline_display_settings;
 mod usage;
+pub use plugins::PluginHandle;
 mod vibex_use;
 mod workbench;
 mod worktree;
@@ -4634,6 +4636,11 @@ impl DesktopRuntime {
 
     pub fn providers(&self) -> ProviderHandle {
         self.providers.clone()
+    }
+
+    /// The plugin market and lifecycle handle.
+    pub fn plugins(&self) -> PluginHandle {
+        PluginHandle::new(self.config.database_path.clone())
     }
 
     /// The local model gateway: one loopback endpoint that routes each call to

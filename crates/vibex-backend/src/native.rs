@@ -5212,6 +5212,148 @@ impl ManagementBackend for NativeBackend {
             })
         })
     }
+
+    fn plugin_market_index(
+        &self,
+        request: vibex_core::PluginMarketIndexRequest,
+    ) -> BackendFuture<'_, vibex_core::PluginMarketIndexResponse> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime.plugins().index(request).await.map_err(Into::into)
+        })
+    }
+
+    fn search_plugin_market(
+        &self,
+        request: vibex_core::PluginMarketSearchRequest,
+    ) -> BackendFuture<'_, vibex_core::PluginMarketSearchResponse> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime.plugins().search(request).await.map_err(Into::into)
+        })
+    }
+
+    fn plugin_market_detail(
+        &self,
+        request: vibex_core::PluginMarketDetailRequest,
+    ) -> BackendFuture<'_, vibex_core::PluginMarketDetail> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime.plugins().detail(request).await.map_err(Into::into)
+        })
+    }
+
+    fn plugins(&self) -> BackendFuture<'_, Vec<vibex_core::InstalledPlugin>> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime.plugins().list().map_err(Into::into)
+        })
+    }
+
+    fn install_plugin_market_entry(
+        &self,
+        request: MutationRequest<vibex_core::PluginMarketInstallRequest>,
+    ) -> BackendFuture<'_, vibex_core::PluginMarketInstallResult> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .plugins()
+                .install(request.payload)
+                .await
+                .map_err(Into::into)
+        })
+    }
+
+    fn install_plugin_from_file(
+        &self,
+        request: MutationRequest<vibex_core::PluginLocalInstallRequest>,
+    ) -> BackendFuture<'_, vibex_core::PluginMarketInstallResult> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .plugins()
+                .install_from_file(request.payload)
+                .map_err(Into::into)
+        })
+    }
+
+    fn set_plugin_enabled(
+        &self,
+        request: MutationRequest<vibex_core::PluginEnabledRequest>,
+    ) -> BackendFuture<'_, vibex_core::InstalledPlugin> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .plugins()
+                .set_enabled(request.payload)
+                .map_err(Into::into)
+        })
+    }
+
+    fn set_plugin_auto_update(
+        &self,
+        request: MutationRequest<vibex_core::PluginAutoUpdateRequest>,
+    ) -> BackendFuture<'_, vibex_core::InstalledPlugin> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .plugins()
+                .set_auto_update(request.payload)
+                .map_err(Into::into)
+        })
+    }
+
+    fn uninstall_plugin(
+        &self,
+        request: MutationRequest<vibex_core::PluginUninstallRequest>,
+    ) -> BackendFuture<'_, ()> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .plugins()
+                .uninstall(request.payload)
+                .map_err(Into::into)
+        })
+    }
+
+    fn check_plugin_updates(
+        &self,
+        request: vibex_core::PluginUpdateCheckRequest,
+    ) -> BackendFuture<'_, vibex_core::PluginUpdateCheckResponse> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .plugins()
+                .check_updates(request)
+                .await
+                .map_err(Into::into)
+        })
+    }
+
+    fn apply_plugin_updates(
+        &self,
+        request: MutationRequest<vibex_core::PluginUpdateApplyRequest>,
+    ) -> BackendFuture<'_, Vec<vibex_core::PluginMarketInstallResult>> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .plugins()
+                .apply_updates(request.payload)
+                .await
+                .map_err(Into::into)
+        })
+    }
 }
 
 fn map_relay_state(state: RelayClientConnectionState) -> RelayConnectionState {

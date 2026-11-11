@@ -25,7 +25,7 @@ pub struct LoadedPlugin {
 /// Implementations run on the thread that owns the host; `unload` must cancel
 /// the plugin's work before it returns, so an upgrade never leaves the old
 /// version's tasks running against the new one.
-pub trait PluginRuntime {
+pub trait PluginRuntime: Send + Sync {
     fn load(&self, plugin: &LoadedPlugin) -> Result<(), PluginError>;
     fn unload(&self, plugin_id: &str) -> Result<(), PluginError>;
 }

@@ -1720,6 +1720,80 @@ impl ManagementBackend for DisconnectedBackend {
     ) -> BackendFuture<'_, McpMarketInstallResult> {
         disconnected_future!()
     }
+
+    fn plugin_market_index(
+        &self,
+        _request: vibex_core::PluginMarketIndexRequest,
+    ) -> BackendFuture<'_, vibex_core::PluginMarketIndexResponse> {
+        disconnected_future!()
+    }
+
+    fn search_plugin_market(
+        &self,
+        _request: vibex_core::PluginMarketSearchRequest,
+    ) -> BackendFuture<'_, vibex_core::PluginMarketSearchResponse> {
+        disconnected_future!()
+    }
+
+    fn plugin_market_detail(
+        &self,
+        _request: vibex_core::PluginMarketDetailRequest,
+    ) -> BackendFuture<'_, vibex_core::PluginMarketDetail> {
+        disconnected_future!()
+    }
+
+    fn plugins(&self) -> BackendFuture<'_, Vec<vibex_core::InstalledPlugin>> {
+        disconnected_future!()
+    }
+
+    fn install_plugin_market_entry(
+        &self,
+        _request: MutationRequest<vibex_core::PluginMarketInstallRequest>,
+    ) -> BackendFuture<'_, vibex_core::PluginMarketInstallResult> {
+        disconnected_future!()
+    }
+
+    fn install_plugin_from_file(
+        &self,
+        _request: MutationRequest<vibex_core::PluginLocalInstallRequest>,
+    ) -> BackendFuture<'_, vibex_core::PluginMarketInstallResult> {
+        disconnected_future!()
+    }
+
+    fn set_plugin_enabled(
+        &self,
+        _request: MutationRequest<vibex_core::PluginEnabledRequest>,
+    ) -> BackendFuture<'_, vibex_core::InstalledPlugin> {
+        disconnected_future!()
+    }
+
+    fn set_plugin_auto_update(
+        &self,
+        _request: MutationRequest<vibex_core::PluginAutoUpdateRequest>,
+    ) -> BackendFuture<'_, vibex_core::InstalledPlugin> {
+        disconnected_future!()
+    }
+
+    fn uninstall_plugin(
+        &self,
+        _request: MutationRequest<vibex_core::PluginUninstallRequest>,
+    ) -> BackendFuture<'_, ()> {
+        disconnected_future!()
+    }
+
+    fn check_plugin_updates(
+        &self,
+        _request: vibex_core::PluginUpdateCheckRequest,
+    ) -> BackendFuture<'_, vibex_core::PluginUpdateCheckResponse> {
+        disconnected_future!()
+    }
+
+    fn apply_plugin_updates(
+        &self,
+        _request: MutationRequest<vibex_core::PluginUpdateApplyRequest>,
+    ) -> BackendFuture<'_, Vec<vibex_core::PluginMarketInstallResult>> {
+        disconnected_future!()
+    }
 }
 
 impl DeviceBackend for DisconnectedBackend {

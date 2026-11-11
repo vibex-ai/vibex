@@ -97,6 +97,14 @@ pub struct ManagementProfileSelectionRequest {
     pub scope: Option<vibex_core::ProviderProfileDefaultScope>,
 }
 
+use vibex_core::{
+    InstalledPlugin, PluginAutoUpdateRequest, PluginEnabledRequest, PluginLocalInstallRequest,
+    PluginMarketDetail, PluginMarketDetailRequest, PluginMarketIndexRequest,
+    PluginMarketIndexResponse, PluginMarketInstallRequest, PluginMarketInstallResult,
+    PluginMarketSearchRequest, PluginMarketSearchResponse, PluginUninstallRequest,
+    PluginUpdateApplyRequest, PluginUpdateCheckRequest, PluginUpdateCheckResponse,
+};
+
 pub trait ManagementBackend: BackendBound {
     fn list_agents(&self, request: AgentListRequest) -> BackendFuture<'_, AgentListResponse>;
 
@@ -893,4 +901,59 @@ pub trait ManagementBackend: BackendBound {
         &self,
         request: ProviderNativeExportListRequest,
     ) -> BackendFuture<'_, Vec<ProviderNativeExportRecordSummary>>;
+
+    // ---- plugins ----
+
+    /// Fetches and merges the plugin catalog (signed index plus discovery).
+    fn plugin_market_index(
+        &self,
+        request: PluginMarketIndexRequest,
+    ) -> BackendFuture<'_, PluginMarketIndexResponse>;
+
+    fn search_plugin_market(
+        &self,
+        request: PluginMarketSearchRequest,
+    ) -> BackendFuture<'_, PluginMarketSearchResponse>;
+
+    fn plugin_market_detail(
+        &self,
+        request: PluginMarketDetailRequest,
+    ) -> BackendFuture<'_, PluginMarketDetail>;
+
+    fn plugins(&self) -> BackendFuture<'_, Vec<InstalledPlugin>>;
+
+    fn install_plugin_market_entry(
+        &self,
+        request: MutationRequest<PluginMarketInstallRequest>,
+    ) -> BackendFuture<'_, PluginMarketInstallResult>;
+
+    fn install_plugin_from_file(
+        &self,
+        request: MutationRequest<PluginLocalInstallRequest>,
+    ) -> BackendFuture<'_, PluginMarketInstallResult>;
+
+    fn set_plugin_enabled(
+        &self,
+        request: MutationRequest<PluginEnabledRequest>,
+    ) -> BackendFuture<'_, InstalledPlugin>;
+
+    fn set_plugin_auto_update(
+        &self,
+        request: MutationRequest<PluginAutoUpdateRequest>,
+    ) -> BackendFuture<'_, InstalledPlugin>;
+
+    fn uninstall_plugin(
+        &self,
+        request: MutationRequest<PluginUninstallRequest>,
+    ) -> BackendFuture<'_, ()>;
+
+    fn check_plugin_updates(
+        &self,
+        request: PluginUpdateCheckRequest,
+    ) -> BackendFuture<'_, PluginUpdateCheckResponse>;
+
+    fn apply_plugin_updates(
+        &self,
+        request: MutationRequest<PluginUpdateApplyRequest>,
+    ) -> BackendFuture<'_, Vec<PluginMarketInstallResult>>;
 }

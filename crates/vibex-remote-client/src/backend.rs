@@ -7177,6 +7177,113 @@ impl ManagementBackend for WebRemoteBackend {
             "Relay status belongs to the local desktop management runtime",
         )
     }
+
+    fn plugin_market_index(
+        &self,
+        _request: vibex_core::PluginMarketIndexRequest,
+    ) -> BackendFuture<'_, vibex_core::PluginMarketIndexResponse> {
+        self.unsupported(
+            "plugin_remote_unsupported",
+            "Plugin management belongs to the local desktop runtime",
+        )
+    }
+
+    fn search_plugin_market(
+        &self,
+        _request: vibex_core::PluginMarketSearchRequest,
+    ) -> BackendFuture<'_, vibex_core::PluginMarketSearchResponse> {
+        self.unsupported(
+            "plugin_remote_unsupported",
+            "Plugin management belongs to the local desktop runtime",
+        )
+    }
+
+    fn plugin_market_detail(
+        &self,
+        _request: vibex_core::PluginMarketDetailRequest,
+    ) -> BackendFuture<'_, vibex_core::PluginMarketDetail> {
+        self.unsupported(
+            "plugin_remote_unsupported",
+            "Plugin management belongs to the local desktop runtime",
+        )
+    }
+
+    fn plugins(&self) -> BackendFuture<'_, Vec<vibex_core::InstalledPlugin>> {
+        self.unsupported(
+            "plugin_remote_unsupported",
+            "Plugin management belongs to the local desktop runtime",
+        )
+    }
+
+    fn install_plugin_market_entry(
+        &self,
+        _request: MutationRequest<vibex_core::PluginMarketInstallRequest>,
+    ) -> BackendFuture<'_, vibex_core::PluginMarketInstallResult> {
+        self.unsupported(
+            "plugin_remote_unsupported",
+            "Plugin management belongs to the local desktop runtime",
+        )
+    }
+
+    fn install_plugin_from_file(
+        &self,
+        _request: MutationRequest<vibex_core::PluginLocalInstallRequest>,
+    ) -> BackendFuture<'_, vibex_core::PluginMarketInstallResult> {
+        self.unsupported(
+            "plugin_remote_unsupported",
+            "Plugin management belongs to the local desktop runtime",
+        )
+    }
+
+    fn set_plugin_enabled(
+        &self,
+        _request: MutationRequest<vibex_core::PluginEnabledRequest>,
+    ) -> BackendFuture<'_, vibex_core::InstalledPlugin> {
+        self.unsupported(
+            "plugin_remote_unsupported",
+            "Plugin management belongs to the local desktop runtime",
+        )
+    }
+
+    fn set_plugin_auto_update(
+        &self,
+        _request: MutationRequest<vibex_core::PluginAutoUpdateRequest>,
+    ) -> BackendFuture<'_, vibex_core::InstalledPlugin> {
+        self.unsupported(
+            "plugin_remote_unsupported",
+            "Plugin management belongs to the local desktop runtime",
+        )
+    }
+
+    fn uninstall_plugin(
+        &self,
+        _request: MutationRequest<vibex_core::PluginUninstallRequest>,
+    ) -> BackendFuture<'_, ()> {
+        self.unsupported(
+            "plugin_remote_unsupported",
+            "Plugin management belongs to the local desktop runtime",
+        )
+    }
+
+    fn check_plugin_updates(
+        &self,
+        _request: vibex_core::PluginUpdateCheckRequest,
+    ) -> BackendFuture<'_, vibex_core::PluginUpdateCheckResponse> {
+        self.unsupported(
+            "plugin_remote_unsupported",
+            "Plugin management belongs to the local desktop runtime",
+        )
+    }
+
+    fn apply_plugin_updates(
+        &self,
+        _request: MutationRequest<vibex_core::PluginUpdateApplyRequest>,
+    ) -> BackendFuture<'_, Vec<vibex_core::PluginMarketInstallResult>> {
+        self.unsupported(
+            "plugin_remote_unsupported",
+            "Plugin management belongs to the local desktop runtime",
+        )
+    }
 }
 
 impl DeviceBackend for WebRemoteBackend {
