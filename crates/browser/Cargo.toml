@@ -1,6 +1,6 @@
 [package]
 name = "vibex-browser"
-version = "0.1.1"
+version = "0.1.2"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -36,6 +36,7 @@ tokio.workspace = true
 tokio-tungstenite.workspace = true
 tracing.workspace = true
 url.workspace = true
+uuid.workspace = true
 vibex-core = { path = "../core" }
 
 [target.'cfg(unix)'.dependencies]
