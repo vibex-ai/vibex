@@ -20,8 +20,10 @@ pub mod fingerprint;
 pub mod install;
 pub mod manifest;
 pub mod market;
+pub mod native;
 pub mod permission;
 pub mod runtime;
+pub mod service;
 pub mod shell;
 
 pub use error::{ManifestError, PluginError};
@@ -42,4 +44,5 @@ pub use permission::{
     PermissionSpec, PluginPermissionCatalog, default_permission_catalog, permissions_for,
 };
 pub use runtime::{LoadedPlugin, NullRuntime, PluginRuntime};
+pub use service::{KEPT_VERSIONS, PluginService, is_newer};
 pub use shell::{SHELL_MANIFEST_FILE, ShellManifest, build_shell_manifest};

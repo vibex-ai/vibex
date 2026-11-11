@@ -12,6 +12,7 @@ base64.workspace = true
 ed25519-dalek.workspace = true
 futures-util.workspace = true
 reqwest.workspace = true
+rusqlite = { version = "0.37", features = ["bundled"] }
 semver.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -20,6 +21,7 @@ thiserror.workspace = true
 tokio.workspace = true
 url.workspace = true
 vibex-core = { path = "../core" }
+vibex-db = { path = "../db" }
 zip.workspace = true
 
 [dev-dependencies]

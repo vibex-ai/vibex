@@ -83,6 +83,8 @@ mod model_route;
 pub use model_route::*;
 mod model_source;
 pub use model_source::*;
+mod plugin;
+pub use plugin::*;
 
 pub type DbConnection = Connection;
 
@@ -1857,6 +1859,82 @@ const MIGRATIONS: &[Migration] = &[
                 auth_source_id = provider_profile_id,
                 auth_source_revision = 0
             WHERE auth_source_kind IS NULL;
+        ",
+    },
+    Migration {
+        version: 46,
+        name: "plugin_market_storage",
+        sql: "
+            CREATE TABLE IF NOT EXISTS plugins (
+                plugin_id                 TEXT PRIMARY KEY,
+                display_name              TEXT NOT NULL,
+                version                   TEXT NOT NULL,
+                kind                      TEXT NOT NULL,
+                source                    TEXT NOT NULL,
+                bundled                   INTEGER NOT NULL DEFAULT 0,
+                uninstallable             INTEGER NOT NULL DEFAULT 1,
+                builtin_key               TEXT NULL,
+                publisher_id              TEXT NULL,
+                publisher_name            TEXT NULL,
+                publisher_verified        INTEGER NOT NULL DEFAULT 0,
+                trust                     TEXT NOT NULL,
+                index_id                  TEXT NULL,
+                install_dir               TEXT NULL,
+                data_dir                  TEXT NULL,
+                enabled                   INTEGER NOT NULL DEFAULT 1,
+                auto_update               INTEGER NOT NULL DEFAULT 0,
+                status                    TEXT NOT NULL,
+                permissions_json          TEXT NOT NULL DEFAULT '[]',
+                granted_permissions_json  TEXT NOT NULL DEFAULT '[]',
+                consent_fingerprint       TEXT NULL,
+                min_vibex                 TEXT NULL,
+                size_bytes                INTEGER NULL,
+                last_error                TEXT NULL,
+                last_checked_at_ms        INTEGER NULL,
+                installed_at_ms           INTEGER NOT NULL,
+                updated_at_ms             INTEGER NOT NULL,
+                deleted_at_ms             INTEGER NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_plugins_deleted
+                ON plugins(deleted_at_ms, updated_at_ms);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_plugins_builtin_key
+                ON plugins(builtin_key)
+                WHERE builtin_key IS NOT NULL AND deleted_at_ms IS NULL;
+
+            CREATE TABLE IF NOT EXISTS plugin_versions (
+                plugin_id        TEXT NOT NULL,
+                version          TEXT NOT NULL,
+                path             TEXT NOT NULL,
+                sha256           TEXT NOT NULL,
+                sha512           TEXT NULL,
+                signature_key_id TEXT NULL,
+                signature_status TEXT NOT NULL,
+                size_bytes       INTEGER NULL,
+                active           INTEGER NOT NULL DEFAULT 0,
+                installed_at_ms  INTEGER NOT NULL,
+                PRIMARY KEY (plugin_id, version)
+            );
+            CREATE INDEX IF NOT EXISTS idx_plugin_versions_active
+                ON plugin_versions(plugin_id, active);
+
+            CREATE TABLE IF NOT EXISTS plugin_permission_grants (
+                plugin_id     TEXT NOT NULL,
+                permission    TEXT NOT NULL,
+                scope_json    TEXT NULL,
+                risk          TEXT NOT NULL,
+                granted_at_ms INTEGER NOT NULL,
+                revision      INTEGER NOT NULL DEFAULT 1,
+                PRIMARY KEY (plugin_id, permission)
+            );
+
+            CREATE TABLE IF NOT EXISTS plugin_contributions (
+                plugin_id       TEXT NOT NULL,
+                kind            TEXT NOT NULL,
+                contribution_id TEXT NOT NULL,
+                title           TEXT NULL,
+                enabled         INTEGER NOT NULL DEFAULT 1,
+                PRIMARY KEY (plugin_id, kind, contribution_id)
+            );
         ",
     },
 ];

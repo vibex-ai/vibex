@@ -1,0 +1,1080 @@
+//! The plugin service: market, install, lifecycle and updates in one place.
+//!
+//! Everything the runtime calls lives here. Market documents are fetched
+//! through [`MarketCatalog`], packages land through [`PluginStore`], durable
+//! state goes through `vibex-db`, and the scripting host is reached only
+//! through [`PluginRuntime`].
+
+use std::sync::Arc;
+
+use semver::Version;
+use vibex_core::{
+    InstalledPlugin, InstalledPluginStatus, PluginContribution, PluginKind, PluginListingSource,
+    PluginMarketDetail, PluginMarketEntry, PluginMarketIndexRequest, PluginMarketIndexResponse,
+    PluginMarketInstallRequest, PluginMarketInstallResult, PluginMarketSearchRequest,
+    PluginMarketSearchResponse, PluginMarketVersion, PluginPermission, PluginPermissionDiff,
+    PluginPermissionGrant, PluginSource, PluginTrust, PluginUpdate, PluginUpdateApplyRequest,
+    PluginUpdateCheckRequest, PluginUpdateCheckResponse, VibexError, VibexResult,
+    unix_timestamp_ms,
+};
+use vibex_db::{PluginRecord, PluginRepository, PluginVersionRecord};
+
+use crate::error::PluginError;
+use crate::fingerprint::{SCRIPT_EXECUTION_MODEL, consent_fingerprint_for};
+use crate::install::{PendingInstall, PluginStore, RecoveryOutcome, extract_zip, verify_checksums};
+use crate::manifest::{AUTHOR_MANIFEST_FILE, PluginManifest};
+use crate::market::catalog::MarketCatalog;
+use crate::market::index::PluginIndexEntry;
+use crate::market::merge::search_entries;
+use crate::native::{NativePluginRegistry, default_native_plugins};
+use crate::runtime::{LoadedPlugin, PluginRuntime};
+use crate::shell::{ShellManifestContext, write_shell_manifest};
+
+/// How many versions of a script plugin are kept on disk.
+pub const KEPT_VERSIONS: usize = 2;
+
+/// The plugin service.
+pub struct PluginService {
+    market: MarketCatalog,
+    store: PluginStore,
+    runtime: Arc<dyn PluginRuntime>,
+    app_version: Version,
+    native: NativePluginRegistry,
+}
+
+impl PluginService {
+    pub fn new(
+        market: MarketCatalog,
+        store: PluginStore,
+        runtime: Arc<dyn PluginRuntime>,
+        app_version: Version,
+    ) -> Self {
+        Self {
+            market,
+            store,
+            runtime,
+            app_version,
+            native: default_native_plugins(),
+        }
+    }
+
+    pub fn store(&self) -> &PluginStore {
+        &self.store
+    }
+
+    pub fn market(&self) -> &MarketCatalog {
+        &self.market
+    }
+
+    pub fn native_registry(&self) -> NativePluginRegistry {
+        self.native
+    }
+
+    fn now_ms() -> i64 {
+        unix_timestamp_ms()
+    }
+
+    // ---- catalog ----
+
+    /// Fetches and merges the catalog, including first-party listings.
+    pub async fn index(&self, request: &PluginMarketIndexRequest) -> PluginMarketIndexResponse {
+        let mut response = self.market.load(request).await;
+        let mut bundled = self.native.market_entries(env!("CARGO_PKG_VERSION"));
+        // First-party listings lead the catalog.
+        bundled.extend(response.entries);
+        response.entries = bundled;
+        response
+    }
+
+    /// Searches the merged catalog, first-party listings included.
+    pub async fn search(&self, request: &PluginMarketSearchRequest) -> PluginMarketSearchResponse {
+        let index = self
+            .index(&PluginMarketIndexRequest {
+                refresh: false,
+                include_github: true,
+            })
+            .await;
+        let entries: Vec<PluginIndexEntry> = index
+            .entries
+            .into_iter()
+            .map(|entry| PluginIndexEntry {
+                entry,
+                versions: Vec::new(),
+                publisher_key_id: None,
+            })
+            .collect();
+        search_entries(&entries, request)
+    }
+
+    /// Reads one plugin's detail page.
+    pub async fn detail(
+        &self,
+        plugin_id: &str,
+        version: Option<&str>,
+    ) -> VibexResult<PluginMarketDetail> {
+        if let Some(descriptor) = self.native.get(plugin_id) {
+            return Ok(PluginMarketDetail {
+                entry: descriptor.to_entry(env!("CARGO_PKG_VERSION")),
+                description: Some(descriptor.description.to_string()),
+                readme: None,
+                readme_bytes: 0,
+                screenshots: Vec::new(),
+                homepage: None,
+                repository: None,
+                license: Some("AGPL-3.0-or-later".to_string()),
+                versions: Vec::new(),
+                reviews: None,
+                requested_permissions: Vec::new(),
+            });
+        }
+        self.market
+            .detail(plugin_id, version)
+            .await
+            .map_err(VibexError::from)
+    }
+
+    // ---- first-party plugins ----
+
+    /// Seeds the first-party plugin rows, preserving a user's enable choice.
+    pub fn seed_native_plugins(&self, conn: &rusqlite::Connection) -> VibexResult<()> {
+        let now = Self::now_ms();
+        let version = env!("CARGO_PKG_VERSION");
+        for descriptor in self.native.descriptors() {
+            match PluginRepository::get(conn, descriptor.plugin_id)? {
+                Some(existing) => {
+                    let mut record = descriptor.to_record(version, existing.installed_at_ms);
+                    record.enabled = existing.enabled;
+                    record.status = existing.status;
+                    record.updated_at_ms = now;
+                    PluginRepository::upsert(conn, &record)?;
+                }
+                None => {
+                    PluginRepository::upsert(conn, &descriptor.to_record(version, now))?;
+                }
+            }
+            PluginRepository::replace_contributions(
+                conn,
+                descriptor.plugin_id,
+                &descriptor.to_contributions(),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Resolves a stored right-rail activity id to a first-party plugin.
+    pub fn canonical_activity_id(&self, activity_id: &str) -> Option<&'static str> {
+        self.native.canonical_activity_id(activity_id)
+    }
+
+    // ---- installed state ----
+
+    /// Every managed plugin, first-party and script.
+    pub fn list(&self, conn: &rusqlite::Connection) -> VibexResult<Vec<InstalledPlugin>> {
+        let mut plugins: Vec<InstalledPlugin> = PluginRepository::list(conn)?
+            .into_iter()
+            .map(|record| record.to_installed())
+            .collect();
+        for plugin in &mut plugins {
+            plugin.size_bytes = plugin
+                .size_bytes
+                .or_else(|| Some(self.store.data_size(&plugin.plugin_id)));
+        }
+        Ok(plugins)
+    }
+
+    /// Enables or disables a plugin.
+    pub fn set_enabled(
+        &self,
+        conn: &rusqlite::Connection,
+        plugin_id: &str,
+        enabled: bool,
+    ) -> VibexResult<InstalledPlugin> {
+        let mut record = PluginRepository::get(conn, plugin_id)?
+            .ok_or_else(|| PluginError::NotInstalled(plugin_id.to_string()))?;
+        if record.kind == PluginKind::Native {
+            record.enabled = enabled;
+            record.status = if enabled {
+                InstalledPluginStatus::Enabled
+            } else {
+                InstalledPluginStatus::Disabled
+            };
+            record.updated_at_ms = Self::now_ms();
+            PluginRepository::upsert(conn, &record)?;
+            return Ok(record.to_installed());
+        }
+        if enabled {
+            // Re-enabling reads the version from the record, not the link: a
+            // disabled plugin has no link, which is the point of disabling it.
+            let version = record.version.clone();
+            if !self.store.has_version(plugin_id, &version) {
+                return Err(PluginError::NotInstalled(plugin_id.to_string()).into());
+            }
+            let loaded = self.loaded_plugin(plugin_id, &version)?;
+            self.runtime.load(&loaded).map_err(VibexError::from)?;
+            self.store
+                .activate(plugin_id, &version)
+                .map_err(VibexError::from)?;
+            PluginRepository::set_status(
+                conn,
+                plugin_id,
+                InstalledPluginStatus::Enabled,
+                None,
+                Self::now_ms(),
+            )?;
+        } else {
+            self.runtime.unload(plugin_id).map_err(VibexError::from)?;
+            self.store.deactivate(plugin_id).map_err(VibexError::from)?;
+            PluginRepository::set_status(
+                conn,
+                plugin_id,
+                InstalledPluginStatus::Disabled,
+                None,
+                Self::now_ms(),
+            )?;
+        }
+        PluginRepository::set_enabled(conn, plugin_id, enabled, Self::now_ms())?;
+        let record = PluginRepository::get(conn, plugin_id)?
+            .ok_or_else(|| PluginError::NotInstalled(plugin_id.to_string()))?;
+        Ok(record.to_installed())
+    }
+
+    /// Sets a plugin's auto-update flag.
+    pub fn set_auto_update(
+        &self,
+        conn: &rusqlite::Connection,
+        plugin_id: &str,
+        auto_update: bool,
+    ) -> VibexResult<InstalledPlugin> {
+        let record = PluginRepository::get(conn, plugin_id)?
+            .ok_or_else(|| PluginError::NotInstalled(plugin_id.to_string()))?;
+        if record.kind == PluginKind::Native {
+            return Err(PluginError::NotUninstallable(plugin_id.to_string()).into());
+        }
+        PluginRepository::set_auto_update(conn, plugin_id, auto_update, Self::now_ms())?;
+        let record = PluginRepository::get(conn, plugin_id)?
+            .ok_or_else(|| PluginError::NotInstalled(plugin_id.to_string()))?;
+        Ok(record.to_installed())
+    }
+
+    /// Uninstalls a script plugin, optionally removing its data.
+    pub fn uninstall(
+        &self,
+        conn: &rusqlite::Connection,
+        plugin_id: &str,
+        remove_data: bool,
+    ) -> VibexResult<()> {
+        let record = PluginRepository::get(conn, plugin_id)?
+            .ok_or_else(|| PluginError::NotInstalled(plugin_id.to_string()))?;
+        if record.kind == PluginKind::Native || !record.uninstallable {
+            return Err(PluginError::NotUninstallable(plugin_id.to_string()).into());
+        }
+        let _ = self.runtime.unload(plugin_id);
+        self.store.deactivate(plugin_id).map_err(VibexError::from)?;
+        let _ = self.store.remove_version(plugin_id, &record.version);
+        for version in PluginRepository::list_versions(conn, plugin_id)? {
+            let _ = self.store.remove_version(plugin_id, &version.version);
+            PluginRepository::delete_version(conn, plugin_id, &version.version)?;
+        }
+        if remove_data {
+            self.store
+                .remove_data(plugin_id)
+                .map_err(VibexError::from)?;
+        }
+        PluginRepository::soft_delete(conn, plugin_id, Self::now_ms())
+    }
+
+    // ---- install ----
+
+    /// Installs a plugin from the catalog.
+    pub async fn install(
+        &self,
+        conn: &rusqlite::Connection,
+        request: &PluginMarketInstallRequest,
+    ) -> VibexResult<PluginMarketInstallResult> {
+        let index = self.market.load(&PluginMarketIndexRequest::default()).await;
+        let entry = index
+            .entries
+            .iter()
+            .find(|entry| entry.id == request.entry_id)
+            .cloned()
+            .ok_or_else(|| PluginError::NotFound(request.entry_id.clone()))?;
+        let catalog_entry = self
+            .store_entry(&request.entry_id)
+            .ok_or_else(|| PluginError::NotFound(request.entry_id.clone()))?;
+        let version = match &request.version {
+            Some(version) => catalog_entry
+                .versions
+                .iter()
+                .find(|candidate| &candidate.version == version)
+                .cloned(),
+            None => catalog_entry
+                .versions
+                .iter()
+                .find(|candidate| !candidate.yanked)
+                .cloned(),
+        }
+        .ok_or_else(|| PluginError::NotFound(request.entry_id.clone()))?;
+
+        if version.yanked {
+            return Err(PluginError::Yanked(version.version.clone()).into());
+        }
+        if !entry.installable_here() {
+            return Err(PluginError::HostTooOld {
+                required: entry
+                    .compatibility
+                    .min_vibex
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_string()),
+                current: self.app_version.to_string(),
+            }
+            .into());
+        }
+        if let Some(required) = &version.min_vibex
+            && let Ok(requirement) = semver::VersionReq::parse(required)
+            && !requirement.matches(&self.app_version)
+        {
+            return Err(PluginError::HostTooOld {
+                required: required.clone(),
+                current: self.app_version.to_string(),
+            }
+            .into());
+        }
+        if let Some(blocked) = self.market.blocked(&entry.id, &version.version) {
+            return Err(PluginError::Blocked(entry.id.clone(), blocked.reason).into());
+        }
+
+        // Consent: the fingerprint the UI approved must be this version's.
+        let expected = consent_fingerprint_for(
+            &entry.id,
+            &version.version,
+            SCRIPT_EXECUTION_MODEL,
+            &version.permissions,
+        );
+        if let Some(provided) = &request.consent_fingerprint
+            && provided != &expected
+        {
+            return Err(PluginError::PermissionDenied(
+                "the approved consent fingerprint does not match the package".to_string(),
+            )
+            .into());
+        }
+        let granted: Vec<PluginPermissionGrant> = if request.granted_permissions.is_empty() {
+            version
+                .permissions
+                .iter()
+                .map(PluginPermissionGrant::from)
+                .collect()
+        } else {
+            request.granted_permissions.clone()
+        };
+        for permission in &version.permissions {
+            if !granted.iter().any(|grant| grant.key == permission.key) {
+                return Err(PluginError::PermissionDenied(permission.key.clone()).into());
+            }
+        }
+
+        let bytes = self.download_package(&entry, &version).await?;
+        let signature_status = if entry.listing_source == PluginListingSource::Index {
+            "verified".to_string()
+        } else {
+            "unsigned".to_string()
+        };
+        let trusted = entry.trust;
+        let source = if entry.listing_source == PluginListingSource::Index {
+            PluginSource::Market
+        } else {
+            PluginSource::Market
+        };
+        self.finish_install(
+            conn,
+            &entry,
+            &version,
+            &bytes,
+            source,
+            trusted,
+            None,
+            &signature_status,
+            &granted,
+            &expected,
+            request.enable,
+            request.auto_update,
+        )
+    }
+
+    /// Installs a plugin from a local package file.
+    pub fn install_from_file(
+        &self,
+        conn: &rusqlite::Connection,
+        path: &str,
+        enable: bool,
+    ) -> VibexResult<PluginMarketInstallResult> {
+        let bytes = std::fs::read(path).map_err(|error| {
+            VibexError::storage(
+                "plugin_package_read_failed",
+                format!("the plugin package could not be read: {error}"),
+            )
+        })?;
+        let manifest = crate::install::read_package_manifest(&bytes).map_err(VibexError::from)?;
+        let version = PluginMarketVersion {
+            version: manifest.version.clone(),
+            published_at: None,
+            size_bytes: Some(bytes.len() as u64),
+            sha256: crate::install::sha256_hex(&bytes),
+            sha512: None,
+            url: path.to_string(),
+            changelog: None,
+            min_vibex: manifest.vibex.clone(),
+            min_shell: manifest.shell_version.clone(),
+            permissions: manifest.permissions(),
+            platforms: Vec::new(),
+            yanked: false,
+            yanked_reason: None,
+            signature: None,
+            provenance: None,
+            review: None,
+        };
+        let entry = PluginMarketEntry {
+            id: manifest.id.clone(),
+            name: manifest.name.clone(),
+            kind: PluginKind::Script,
+            bundled: false,
+            listing_source: PluginListingSource::Github,
+            summary: manifest.description.clone(),
+            icon_url: None,
+            publisher: vibex_core::PluginPublisher::from_login("local"),
+            categories: manifest.normalized_categories(),
+            tags: Vec::new(),
+            latest_version: Some(manifest.version.clone()),
+            installs: 0,
+            rating: None,
+            updated_at: None,
+            license: Some(manifest.license.clone()),
+            homepage: manifest.homepage.clone(),
+            repository: manifest.repository.clone(),
+            trust: PluginTrust::Unverified,
+            permissions: manifest.permissions(),
+            compatibility: Default::default(),
+            size_bytes: Some(bytes.len() as u64),
+            featured: false,
+            i18n: Default::default(),
+        };
+        let granted: Vec<PluginPermissionGrant> = version
+            .permissions
+            .iter()
+            .map(PluginPermissionGrant::from)
+            .collect();
+        let fingerprint = consent_fingerprint_for(
+            &entry.id,
+            &version.version,
+            SCRIPT_EXECUTION_MODEL,
+            &version.permissions,
+        );
+        self.finish_install(
+            conn,
+            &entry,
+            &version,
+            &bytes,
+            PluginSource::Local,
+            PluginTrust::Unverified,
+            None,
+            "unsigned",
+            &granted,
+            &fingerprint,
+            enable,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finish_install(
+        &self,
+        conn: &rusqlite::Connection,
+        entry: &PluginMarketEntry,
+        version: &PluginMarketVersion,
+        bytes: &[u8],
+        source: PluginSource,
+        trust: PluginTrust,
+        index_id: Option<String>,
+        signature_status: &str,
+        granted: &[PluginPermissionGrant],
+        fingerprint: &str,
+        enable: bool,
+        auto_update: bool,
+    ) -> VibexResult<PluginMarketInstallResult> {
+        let existing = PluginRepository::get(conn, &entry.id)?;
+        let previous_version = existing.as_ref().map(|record| record.version.clone());
+        let created = existing.is_none();
+
+        // Verify and unpack into staging.
+        verify_checksums(bytes, &version.sha256, version.sha512.as_deref())
+            .map_err(VibexError::from)?;
+        let staging = self
+            .store
+            .create_staging(&entry.id)
+            .map_err(PluginError::from)
+            .map_err(VibexError::from)?;
+        let extract_result = (|| -> Result<(), PluginError> {
+            extract_zip(bytes, &staging)?;
+            crate::install::flatten_single_root(&staging)?;
+            if !staging.join(AUTHOR_MANIFEST_FILE).is_file() {
+                return Err(PluginError::MissingManifest);
+            }
+            let manifest = PluginManifest::from_file(&staging.join(AUTHOR_MANIFEST_FILE))?;
+            if manifest.id != entry.id {
+                return Err(PluginError::Manifest(
+                    crate::error::ManifestError::InvalidId(manifest.id.clone()),
+                ));
+            }
+            write_shell_manifest(
+                &staging,
+                &manifest,
+                &ShellManifestContext {
+                    plugin_dir: Some(staging.clone()),
+                    data_dir: Some(self.store.data_dir(&entry.id)),
+                    workspace_root: None,
+                    home_dir: None,
+                },
+            )
+            .map_err(PluginError::Io)?;
+            Ok(())
+        })();
+        if let Err(error) = extract_result {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(VibexError::from(error));
+        }
+
+        let size = crate::install::directory_size(&staging);
+        let destination = self
+            .store
+            .publish_version(&entry.id, &version.version, &staging)
+            .map_err(VibexError::from)?;
+        let install_dir = destination.to_string_lossy().to_string();
+        let data_dir = self.store.data_dir(&entry.id);
+        std::fs::create_dir_all(&data_dir)
+            .map_err(|error| VibexError::storage("plugin_data_dir_failed", error.to_string()))?;
+
+        // Publish, mark, then move the link.
+        self.store
+            .write_pending(&PendingInstall {
+                plugin_id: entry.id.clone(),
+                previous_version: previous_version.clone(),
+                new_version: version.version.clone(),
+                started_at_ms: Self::now_ms().max(0) as u64,
+            })
+            .map_err(VibexError::from)?;
+
+        let now = Self::now_ms();
+        let mut record = existing.unwrap_or_else(|| {
+            PluginRecord::new(
+                entry.id.clone(),
+                entry.name.clone(),
+                version.version.clone(),
+                now,
+            )
+        });
+        record.display_name = entry.name.clone();
+        record.version = version.version.clone();
+        record.kind = PluginKind::Script;
+        record.source = source;
+        record.bundled = false;
+        record.uninstallable = true;
+        record.publisher_id = Some(entry.publisher.id.clone());
+        record.publisher_name = Some(entry.publisher.display_name.clone());
+        record.publisher_verified = entry.publisher.verified;
+        record.trust = trust;
+        record.index_id = index_id;
+        record.install_dir = Some(install_dir);
+        record.data_dir = Some(data_dir.to_string_lossy().to_string());
+        record.auto_update = auto_update && trust.allows_auto_update();
+        record.enabled = enable;
+        record.status = if enable {
+            InstalledPluginStatus::Enabled
+        } else {
+            InstalledPluginStatus::Disabled
+        };
+        record.permissions = version.permissions.clone();
+        record.granted_permissions = granted.to_vec();
+        record.consent_fingerprint = Some(fingerprint.to_string());
+        record.min_vibex = version.min_vibex.clone();
+        record.size_bytes = Some(size);
+        record.last_error = None;
+        record.updated_at_ms = now;
+        record.deleted_at_ms = None;
+        PluginRepository::upsert(conn, &record)?;
+        PluginRepository::upsert_version(
+            conn,
+            &PluginVersionRecord {
+                plugin_id: entry.id.clone(),
+                version: version.version.clone(),
+                path: record.install_dir.clone().unwrap_or_default(),
+                sha256: version.sha256.clone(),
+                sha512: version.sha512.clone(),
+                signature_key_id: version.signature.as_ref().map(|s| s.key_id.clone()),
+                signature_status: signature_status.to_string(),
+                size_bytes: Some(size),
+                active: enable,
+                installed_at_ms: now,
+            },
+        )?;
+        PluginRepository::replace_grants(conn, &entry.id, granted, &version.permissions, now)?;
+        PluginRepository::replace_contributions(conn, &entry.id, &contributions_for(entry))?;
+        PluginRepository::set_active_version(
+            conn,
+            &entry.id,
+            &version.version,
+            record.install_dir.as_deref(),
+            record.data_dir.as_deref(),
+            Some(size),
+            now,
+        )?;
+
+        if enable {
+            self.store
+                .activate(&entry.id, &version.version)
+                .map_err(VibexError::from)?;
+            let loaded = self.loaded_plugin(&entry.id, &version.version)?;
+            if let Err(error) = self.runtime.load(&loaded) {
+                let _ = self.store.recover_pending();
+                PluginRepository::set_status(
+                    conn,
+                    &entry.id,
+                    InstalledPluginStatus::Broken,
+                    Some(&error.to_string()),
+                    Self::now_ms(),
+                )?;
+                return Err(VibexError::from(error));
+            }
+        } else {
+            self.store.deactivate(&entry.id).map_err(VibexError::from)?;
+            let _ = self
+                .store
+                .remove_version(&entry.id, &version.version)
+                .map(|_| ());
+        }
+
+        self.store.clear_pending().map_err(VibexError::from)?;
+        let kept = PluginRepository::list_versions(conn, &entry.id)?;
+        let keep: Vec<String> = kept
+            .iter()
+            .take(KEPT_VERSIONS)
+            .map(|version| version.version.clone())
+            .collect();
+        let _ = self.store.prune_versions(&entry.id, &keep);
+
+        let plugin = PluginRepository::get(conn, &entry.id)?
+            .ok_or_else(|| PluginError::NotInstalled(entry.id.clone()))?
+            .to_installed();
+        Ok(PluginMarketInstallResult { plugin, created })
+    }
+
+    // ---- updates ----
+
+    /// Finds available updates for the installed script plugins.
+    pub async fn check_updates(
+        &self,
+        conn: &rusqlite::Connection,
+        request: &PluginUpdateCheckRequest,
+    ) -> VibexResult<PluginUpdateCheckResponse> {
+        let index = self
+            .market
+            .load(&PluginMarketIndexRequest {
+                refresh: request.refresh,
+                include_github: true,
+            })
+            .await;
+        let installed = PluginRepository::list(conn)?;
+        let now = Self::now_ms();
+        let mut updates = Vec::new();
+        for record in installed {
+            if record.kind == PluginKind::Native
+                || (!request.plugin_ids.is_empty()
+                    && !request.plugin_ids.contains(&record.plugin_id))
+            {
+                continue;
+            }
+            let Some(entry) = index
+                .entries
+                .iter()
+                .find(|entry| entry.id == record.plugin_id)
+            else {
+                continue;
+            };
+            let Some(latest) = entry.latest_version.as_deref() else {
+                continue;
+            };
+            if !is_newer(latest, &record.version) {
+                PluginRepository::set_checked(conn, &record.plugin_id, now)?;
+                continue;
+            }
+            let diff = self.permission_diff_for(
+                &record.plugin_id,
+                latest,
+                &record.granted_permissions,
+                record.consent_fingerprint.as_deref(),
+            );
+            if !diff.is_empty() {
+                PluginRepository::set_status(
+                    conn,
+                    &record.plugin_id,
+                    InstalledPluginStatus::UpdateAvailable,
+                    record.last_error.as_deref(),
+                    now,
+                )?;
+            }
+            updates.push(PluginUpdate {
+                plugin_id: record.plugin_id.clone(),
+                installed_version: record.version.clone(),
+                available_version: latest.to_string(),
+                permission_diff: diff,
+                yanked: self.market.blocked(&record.plugin_id, latest).is_some(),
+                changelog: None,
+            });
+            PluginRepository::set_checked(conn, &record.plugin_id, now)?;
+        }
+        Ok(PluginUpdateCheckResponse { updates })
+    }
+
+    /// Applies the named updates.
+    pub async fn apply_updates(
+        &self,
+        conn: &rusqlite::Connection,
+        request: &PluginUpdateApplyRequest,
+    ) -> VibexResult<Vec<PluginMarketInstallResult>> {
+        let mut results = Vec::new();
+        for plugin_id in &request.plugin_ids {
+            let record = PluginRepository::get(conn, plugin_id)?
+                .ok_or_else(|| PluginError::NotInstalled(plugin_id.clone()))?;
+            let install = PluginMarketInstallRequest {
+                entry_id: plugin_id.clone(),
+                version: None,
+                granted_permissions: if request.granted_permissions.is_empty() {
+                    record.granted_permissions.clone()
+                } else {
+                    request.granted_permissions.clone()
+                },
+                consent_fingerprint: None,
+                enable: record.enabled,
+                auto_update: record.auto_update,
+            };
+            results.push(self.install(conn, &install).await?);
+        }
+        Ok(results)
+    }
+
+    fn permission_diff_for(
+        &self,
+        plugin_id: &str,
+        version: &str,
+        granted: &[PluginPermissionGrant],
+        installed_fingerprint: Option<&str>,
+    ) -> PluginPermissionDiff {
+        let Some(entry) = self.store_entry(plugin_id) else {
+            return PluginPermissionDiff::default();
+        };
+        let Some(candidate) = entry.versions.iter().find(|c| c.version == version) else {
+            return PluginPermissionDiff::default();
+        };
+        let added: Vec<PluginPermission> = candidate
+            .permissions
+            .iter()
+            .filter(|permission| !granted.iter().any(|grant| grant.key == permission.key))
+            .cloned()
+            .collect();
+        let removed: Vec<PluginPermission> = granted
+            .iter()
+            .filter(|grant| {
+                !candidate
+                    .permissions
+                    .iter()
+                    .any(|permission| permission.key == grant.key)
+            })
+            .map(|grant| PluginPermission::new(&grant.key, Default::default()))
+            .collect();
+        let expected = consent_fingerprint_for(
+            plugin_id,
+            version,
+            SCRIPT_EXECUTION_MODEL,
+            &candidate.permissions,
+        );
+        let fingerprint_changed = installed_fingerprint.is_some_and(|current| current != expected);
+        PluginPermissionDiff {
+            added,
+            removed,
+            fingerprint_changed,
+        }
+    }
+
+    // ---- recovery ----
+
+    /// Recovers an interrupted install.
+    pub fn recover(&self, conn: &rusqlite::Connection) -> VibexResult<RecoveryOutcome> {
+        let outcome = self.store.recover_pending().map_err(VibexError::from)?;
+        match &outcome {
+            RecoveryOutcome::Completed { plugin_id, version }
+            | RecoveryOutcome::RolledBack { plugin_id, version } => {
+                PluginRepository::set_active(conn, plugin_id, version)?;
+                let status = if self.store.current_version(plugin_id).is_some() {
+                    InstalledPluginStatus::Enabled
+                } else {
+                    InstalledPluginStatus::Disabled
+                };
+                PluginRepository::set_status(conn, plugin_id, status, None, Self::now_ms())?;
+                PluginRepository::set_active_version(
+                    conn,
+                    plugin_id,
+                    version,
+                    None,
+                    None,
+                    None,
+                    Self::now_ms(),
+                )?;
+            }
+            RecoveryOutcome::Broken { plugin_id } => {
+                PluginRepository::set_status(
+                    conn,
+                    plugin_id,
+                    InstalledPluginStatus::Broken,
+                    Some("the install could not be recovered"),
+                    Self::now_ms(),
+                )?;
+            }
+            RecoveryOutcome::None => {}
+        }
+        Ok(outcome)
+    }
+
+    // ---- helpers ----
+
+    fn store_entry(&self, plugin_id: &str) -> Option<PluginIndexEntry> {
+        self.market.config().cache.find_entry(plugin_id)
+    }
+
+    fn loaded_plugin(&self, plugin_id: &str, version: &str) -> VibexResult<LoadedPlugin> {
+        Ok(LoadedPlugin {
+            plugin_id: plugin_id.to_string(),
+            version: version.to_string(),
+            directory: self.store.version_dir(plugin_id, version),
+            data_directory: self.store.data_dir(plugin_id),
+        })
+    }
+
+    async fn download_package(
+        &self,
+        entry: &PluginMarketEntry,
+        version: &PluginMarketVersion,
+    ) -> VibexResult<Vec<u8>> {
+        let client = self.market.client();
+        let (url, expected_sha256) = if let Some(repo) = version.url.strip_prefix("github:") {
+            let commit = crate::install::resolve_github_commit(client, repo)
+                .await
+                .map_err(VibexError::from)?;
+            (
+                format!("https://codeload.github.com/{repo}/zip/{commit}"),
+                String::new(),
+            )
+        } else {
+            (version.url.clone(), version.sha256.clone())
+        };
+        let url = url::Url::parse(&url).map_err(|error| {
+            VibexError::validation("plugin_package_url_invalid", error.to_string())
+        })?;
+        let bytes = client
+            .fetch_bytes(&url, vibex_core::MAX_PLUGIN_PACKAGE_BYTES)
+            .await
+            .map_err(VibexError::from)?;
+        if bytes.len() as u64 > vibex_core::MAX_PLUGIN_PACKAGE_BYTES {
+            return Err(PluginError::ResponseTooLarge.into());
+        }
+        verify_checksums(&bytes, &expected_sha256, version.sha512.as_deref())
+            .map_err(VibexError::from)?;
+        let _ = entry;
+        Ok(bytes)
+    }
+}
+
+/// The contribution rows a catalog listing owns.
+fn contributions_for(entry: &PluginMarketEntry) -> Vec<PluginContribution> {
+    vec![PluginContribution {
+        plugin_id: entry.id.clone(),
+        kind: "panel".to_string(),
+        contribution_id: entry.id.clone(),
+        title: Some(entry.name.clone()),
+        enabled: true,
+    }]
+}
+
+/// Whether `candidate` is a newer semantic version than `current`.
+pub fn is_newer(candidate: &str, current: &str) -> bool {
+    match (Version::parse(candidate), Version::parse(current)) {
+        (Ok(candidate), Ok(current)) => candidate > current,
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    use crate::install::PluginStore;
+    use crate::market::{MarketCache, MarketConfig, MarketHttpClient, MarketUrlPolicy};
+    use crate::runtime::NullRuntime;
+
+    #[test]
+    fn newer_versions_are_ordered_semantically() {
+        assert!(is_newer("1.2.0", "1.1.9"));
+        assert!(!is_newer("1.1.0", "1.1.0"));
+        assert!(!is_newer("1.0.0", "1.1.0"));
+        assert!(!is_newer("not-a-version", "1.0.0"));
+    }
+
+    fn package() -> Vec<u8> {
+        let manifest = serde_json::json!({
+            "schemaVersion": 1,
+            "id": "acme.widgets",
+            "name": "Widgets",
+            "version": "1.0.0",
+            "license": "MIT",
+            "entry": "main.js",
+            "capabilities": { "panel": true, "storage": true }
+        });
+        let mut buffer = Vec::new();
+        {
+            let mut writer = zip::ZipWriter::new(std::io::Cursor::new(&mut buffer));
+            let options = zip::write::SimpleFileOptions::default();
+            writer.start_file("vibex-plugin.json", options).unwrap();
+            writer
+                .write_all(&serde_json::to_vec(&manifest).unwrap())
+                .unwrap();
+            writer.start_file("main.js", options).unwrap();
+            writer.write_all(b"export const name = 'widgets';").unwrap();
+            writer.finish().unwrap();
+        }
+        buffer
+    }
+
+    fn service(directory: &std::path::Path) -> PluginService {
+        let cache = MarketCache::new(directory.join("market"));
+        let catalog = MarketCatalog::new(
+            MarketHttpClient::new(MarketUrlPolicy::Testing),
+            MarketConfig::empty(cache),
+        );
+        PluginService::new(
+            catalog,
+            PluginStore::new(directory),
+            Arc::new(NullRuntime),
+            Version::parse("0.1.2").unwrap(),
+        )
+    }
+
+    fn connection() -> rusqlite::Connection {
+        let mut connection = rusqlite::Connection::open_in_memory().unwrap();
+        vibex_db::apply_migrations(&mut connection).unwrap();
+        connection
+    }
+
+    #[test]
+    fn a_local_package_installs_enables_and_uninstalls() {
+        let directory = tempfile::tempdir().unwrap();
+        let service = service(directory.path());
+        let connection = connection();
+
+        let package_path = directory.path().join("acme.widgets.vibexplug");
+        std::fs::write(&package_path, package()).unwrap();
+
+        let result = service
+            .install_from_file(&connection, package_path.to_str().unwrap(), true)
+            .unwrap();
+        assert!(result.created);
+        assert_eq!(result.plugin.plugin_id, "acme.widgets");
+        assert_eq!(result.plugin.version, "1.0.0");
+        assert!(result.plugin.enabled);
+        assert_eq!(result.plugin.trust, PluginTrust::Unverified);
+        assert_eq!(
+            result
+                .plugin
+                .permissions
+                .iter()
+                .map(|permission| permission.key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["storage", "ui.panel"]
+        );
+        // The link resolves and the generated host manifest is in place.
+        assert_eq!(
+            service.store().current_version("acme.widgets").as_deref(),
+            Some("1.0.0")
+        );
+        assert!(
+            service.store().data_dir("acme.widgets").is_dir(),
+            "the data directory must exist"
+        );
+        let installed = service.list(&connection).unwrap();
+        assert_eq!(installed.len(), 1);
+
+        // Disabling and re-enabling keeps the version but moves the link.
+        service
+            .set_enabled(&connection, "acme.widgets", false)
+            .unwrap();
+        assert_eq!(service.store().current_version("acme.widgets"), None);
+        service
+            .set_enabled(&connection, "acme.widgets", true)
+            .unwrap();
+        assert_eq!(
+            service.store().current_version("acme.widgets").as_deref(),
+            Some("1.0.0")
+        );
+
+        // Uninstalling removes the link, the versions and the data.
+        service
+            .uninstall(&connection, "acme.widgets", true)
+            .unwrap();
+        assert!(service.list(&connection).unwrap().is_empty());
+        assert!(!service.store().data_dir("acme.widgets").exists());
+        assert!(
+            !service
+                .store()
+                .version_dir("acme.widgets", "1.0.0")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn first_party_plugins_seed_and_keep_their_choice() {
+        let directory = tempfile::tempdir().unwrap();
+        let service = service(directory.path());
+        let connection = connection();
+        service.seed_native_plugins(&connection).unwrap();
+        let plugins = service.list(&connection).unwrap();
+        assert!(
+            plugins
+                .iter()
+                .any(|plugin| plugin.plugin_id == "vibex.system.git")
+        );
+        assert!(
+            plugins
+                .iter()
+                .all(|plugin| plugin.kind == PluginKind::Native && plugin.bundled)
+        );
+
+        service
+            .set_enabled(&connection, "vibex.system.git", false)
+            .unwrap();
+        service.seed_native_plugins(&connection).unwrap();
+        let git = PluginRepository::get(&connection, "vibex.system.git")
+            .unwrap()
+            .unwrap();
+        assert!(!git.enabled, "seeding must preserve the user's choice");
+
+        // A native plugin cannot be uninstalled or auto-updated.
+        assert!(
+            service
+                .uninstall(&connection, "vibex.system.git", false)
+                .is_err()
+        );
+        assert!(
+            service
+                .set_auto_update(&connection, "vibex.system.git", true)
+                .is_err()
+        );
+    }
+}

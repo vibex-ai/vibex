@@ -10583,6 +10583,7 @@ dependencies = [
  "ed25519-dalek",
  "futures-util",
  "reqwest",
+ "rusqlite",
  "semver",
  "serde",
  "serde_json",
@@ -10592,6 +10593,7 @@ dependencies = [
  "tokio",
  "url",
  "vibex-core",
+ "vibex-db",
  "zip",
 ]
 

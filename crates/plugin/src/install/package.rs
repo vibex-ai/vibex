@@ -12,6 +12,7 @@ use sha2::{Digest, Sha256, Sha512};
 use zip::ZipArchive;
 
 use crate::error::PluginError;
+use crate::manifest::{AUTHOR_MANIFEST_FILE, PluginManifest};
 
 /// What an extraction wrote.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -67,7 +68,7 @@ pub fn extract_zip(archive_bytes: &[u8], target: &Path) -> Result<ExtractReport,
     let mut report = ExtractReport::default();
     let mut seen = std::collections::BTreeSet::new();
     for index in 0..archive.len() {
-        let mut entry = archive
+        let entry = archive
             .by_index(index)
             .map_err(|error| PluginError::Archive(error.to_string()))?;
         let name = entry
@@ -156,6 +157,100 @@ pub fn safe_relative_path(name: &str) -> Option<String> {
         return None;
     }
     Some(cleaned.to_string_lossy().replace('\\', "/"))
+}
+
+/// The bytes a directory tree occupies.
+pub fn directory_size(path: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return 0;
+    };
+    let mut total = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            total += directory_size(&path);
+        } else if let Ok(metadata) = entry.metadata() {
+            total += metadata.len();
+        }
+    }
+    total
+}
+
+/// Reads the author manifest out of a package without unpacking it.
+pub fn read_package_manifest(bytes: &[u8]) -> Result<PluginManifest, PluginError> {
+    let mut archive = ZipArchive::new(std::io::Cursor::new(bytes))
+        .map_err(|error| PluginError::Archive(error.to_string()))?;
+    let mut best: Option<(usize, Vec<u8>)> = None;
+    for index in 0..archive.len() {
+        let mut entry = archive
+            .by_index(index)
+            .map_err(|error| PluginError::Archive(error.to_string()))?;
+        let name = entry
+            .name()
+            .map_err(|error| PluginError::Archive(error.to_string()))?
+            .to_string();
+        if !name.ends_with(AUTHOR_MANIFEST_FILE) {
+            continue;
+        }
+        let depth = name.matches('/').count();
+        if best
+            .as_ref()
+            .is_some_and(|(best_depth, _)| *best_depth <= depth)
+        {
+            continue;
+        }
+        let mut content = Vec::new();
+        entry.read_to_end(&mut content)?;
+        best = Some((depth, content));
+    }
+    let (_, content) = best.ok_or(PluginError::MissingManifest)?;
+    Ok(PluginManifest::parse(&content)?)
+}
+
+/// Moves a package's single top-level directory up to the staging root.
+///
+/// A Git archive wraps every file in `<repo>-<commit>/`; a package built by the
+/// publish tool does not. Both have to end up at the root.
+pub fn flatten_single_root(directory: &Path) -> Result<(), PluginError> {
+    if directory.join(AUTHOR_MANIFEST_FILE).is_file() {
+        return Ok(());
+    }
+    let mut subdirectories = Vec::new();
+    for entry in std::fs::read_dir(directory)? {
+        let entry = entry?;
+        if entry.path().is_dir() {
+            subdirectories.push(entry.path());
+        }
+    }
+    if subdirectories.len() != 1 {
+        return Ok(());
+    }
+    let root = subdirectories.remove(0);
+    for entry in std::fs::read_dir(&root)? {
+        let entry = entry?;
+        let target = directory.join(entry.file_name());
+        if target.exists() {
+            continue;
+        }
+        std::fs::rename(entry.path(), target)?;
+    }
+    let _ = std::fs::remove_dir(&root);
+    Ok(())
+}
+
+/// Resolves a repository's head commit through the GitHub API.
+pub async fn resolve_github_commit(
+    client: &crate::market::fetch::MarketHttpClient,
+    repo: &str,
+) -> Result<String, PluginError> {
+    #[derive(serde::Deserialize)]
+    struct Commit {
+        sha: String,
+    }
+    let url = url::Url::parse(&format!("https://api.github.com/repos/{repo}/commits/HEAD"))
+        .map_err(|error| PluginError::Network(error.to_string()))?;
+    let commit: Commit = client.fetch_json(&url, 1024 * 1024).await?;
+    Ok(commit.sha)
 }
 
 #[cfg(test)]
