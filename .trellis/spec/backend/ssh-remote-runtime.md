@@ -301,6 +301,80 @@ FoundationSettings::load_wsl_distros(&mut self, cx: &mut Context<Self>)
 - `ssh_connection::environment::tests::a_failed_probe_reports_the_openssh_sentence_with_its_class`
 - `app::tests::the_wsl_distro_read_runs_off_the_ui_thread_and_reports_every_state`
 
+## Scenario: The runtime a provisioning run borrows
+
+### 1. Scope / Trigger
+
+- Any change to `ProvisioningService` (start, worker thread, cancellation,
+  effects handoff), or to where `SshProvisioningEffects::connect` runs.
+- A report that an SSH connection establishes and then fails on the next read
+  with `Runtime catalog unavailable (remote_socket_write_failed: … A Tokio 1.x
+  context was found, but it is being shutdown.)`.
+
+### 2. Signatures
+
+```rust
+// apps/desktop/src/ssh_connection/service.rs
+ProvisioningService::start(
+    runtime: &tokio::runtime::Handle, effects: E, profile_id: String,
+    now_ms: i64, retry_failed: bool,
+) -> Result<ProvisioningService<E>, ProvisioningServiceError>
+ProvisioningService::start_with_cancellation(/* …, cancel: RunCancellation */)
+
+// apps/desktop/src/app.rs
+VibexWorkbench::start_ssh_provisioning(/* … */)   // gpui_tokio::Tokio::handle(cx)
+```
+
+### 3. Contracts
+
+- **A socket belongs to the runtime that created it, for its whole life.** A
+  provisioning run ends by handing a *connected* backend to the workbench, and
+  every later RPC writes through that socket. So the run must be driven by a
+  runtime that outlives the run — the workbench's `gpui_tokio` runtime, not one
+  the service builds for itself.
+- The service still owns a dedicated `vibex-ssh-provisioning` thread, because
+  the effects future is not `Send`. It enters the borrowed runtime from that
+  thread; it does not create a runtime.
+- Dropping the runtime that opened a socket does not close it visibly: the
+  first write to the file descriptor returns
+  `io::ErrorKind::Other` with `"A Tokio 1.x context was found, but it is being
+  shutdown."` (`tokio::runtime::is_rt_shutdown_err`). That detail reaches the
+  UI as the `remote_socket_write_failed` message on the *catalogue* read, which
+  is why the symptom names a runtime catalog and not SSH.
+- A current-thread runtime is rejected up front
+  (`ssh_provisioning_runtime_unsupported`) instead of accepted and hung on:
+  `Handle::block_on` cannot drive a current-thread runtime's I/O and timer
+  drivers.
+
+### 4. Validation & Error Matrix
+
+| Condition | Behaviour |
+| --- | --- |
+| caller passes a multi-thread `Handle` | run proceeds on it; the handoff backend stays usable |
+| caller passes a current-thread `Handle` | `ssh_provisioning_runtime_unsupported`, no worker spawned |
+| worker thread cannot start | `ssh_provisioning_worker_failed` |
+| worker panics | `ssh_provisioning_worker_panicked` from `join` |
+| service dropped mid-run | cancellation only; the route/supervisor effects keep their own cleanup |
+
+### 5. Good / Base / Bad
+
+- Good: `start_ssh_provisioning` reads `gpui_tokio::Tokio::handle(cx)` and
+  passes it to `ProvisioningService::start`.
+- Base: the service keeps the `Send`-bound workaround — a thread for the
+  future — while borrowing the runtime for its drivers.
+- Bad: `Builder::new_current_thread().enable_all()` inside the worker. Every
+  effect up to Connect passes, the backend is installed, and the *next* RPC
+  fails with the shutdown error because the runtime died with the worker.
+
+### 6. Tests Required
+
+- `ssh_connection::service::tests::a_socket_opened_by_the_run_still_writes_after_the_worker_exits`
+  — opens a socket in the connect step, joins the worker, then writes from the
+  caller's runtime; fails with the field error if the run owned its runtime.
+- `ssh_connection::service::tests::a_current_thread_runtime_is_rejected_instead_of_hanging_the_run`
+- `ssh_connection::service::tests::runs_effects_on_the_worker_and_emits_updates`
+- `ssh_connection::service::tests::cancel_stops_the_worker_before_the_next_effect`
+
 ## Testing Gotchas
 
 - Fake executables (`ssh`, `ssh-keygen`, `wsl.exe`) must be written with

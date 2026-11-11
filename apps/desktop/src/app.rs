@@ -15954,14 +15954,27 @@ impl VibexWorkbench {
             }
             return;
         }
-        let service =
-            match ProvisioningService::start(effects, profile_id, unix_timestamp_ms(), false) {
+        let service = {
+            // The run borrows the workbench's process-lifetime runtime, so the
+            // backend it hands back stays connected. A runtime of the worker's
+            // own would be dropped with the worker, and the first catalogue RPC
+            // on the installed client would fail with "A Tokio 1.x context was
+            // found, but it is being shutdown."
+            let runtime = gpui_tokio::Tokio::handle(cx);
+            match ProvisioningService::start(
+                &runtime,
+                effects,
+                profile_id,
+                unix_timestamp_ms(),
+                false,
+            ) {
                 Ok(service) => service,
                 Err(error) => {
                     self.fail_ssh_provisioning_start(error.message, cx);
                     return;
                 }
-            };
+            }
+        };
         self.ssh_provisioning = Some(service);
         self.ssh_provisioning_starting = false;
         self.ssh_provisioning_error = None;
@@ -118966,6 +118979,12 @@ mod tests {
             .map(|(body, _)| body)
             .expect("the SSH provisioning start path should remain inspectable");
         assert!(start.contains("ProvisioningService::start"));
+        assert!(
+            start.contains("gpui_tokio::Tokio::handle(cx)") && start.contains("&runtime,"),
+            "the run must borrow the workbench runtime; a runtime of the \
+             worker's own dies with the worker and breaks the installed \
+             backend's socket"
+        );
         assert!(start.contains("ProvisioningServiceEvent::Update"));
         assert!(start.contains("ProvisioningServiceEvent::Finished"));
         let finish = source
