@@ -512,7 +512,7 @@ mod tests {
     #[test]
     fn management_contract_covers_security_and_generation_boundaries() {
         let probe = management_contract_probe();
-        assert_eq!(probe.section_count, 10);
+        assert_eq!(probe.section_count, 11);
         assert!(probe.section_generation_fenced);
         assert!(probe.graph_cas_versioned);
         assert!(probe.static_pairing_urls_removed);
