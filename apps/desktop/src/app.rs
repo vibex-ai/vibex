@@ -17287,9 +17287,23 @@ impl VibexWorkbench {
                 supervisor::ensure_started(&command, &launch)
                     .map_err(|error| format!("{}: {}", error.code, error.message))?;
             }
-            let tunnel = TunnelProcess::spawn(&spawn_spec)
+            let mut tunnel = TunnelProcess::spawn(&spawn_spec)
                 .map_err(|error| format!("{}: {}", error.code, error.message))?;
-            tokio::time::sleep(Duration::from_millis(250)).await;
+            // Wait until the forward actually accepts connections before the
+            // client probes it. A fixed sleep raced a slow SSH handshake, and
+            // the direct probe then failed with `remote_candidates_unreachable`
+            // before the loopback port was listening.
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while !crate::ssh_connection::wsl::localhost_forwarded(spawn_spec.local_port) {
+                if std::time::Instant::now() >= deadline
+                    || tunnel.try_wait().ok().flatten().is_some()
+                {
+                    // The probe that follows reports the failure with its own
+                    // code; do not strand the switch here.
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
             Ok::<TunnelProcess, String>(tunnel)
         });
         self.boot_task = Some(cx.spawn(
