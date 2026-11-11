@@ -1247,8 +1247,14 @@ ProviderConfigService::search_skill_market(SkillMarketSearchRequest)
   once and lifts the folder whose `SKILL.md` parent is named after the entry.
   `codeload` is used rather than the REST tarball endpoint because the market
   must not spend the API's hourly budget. The archive is untrusted: only files
-  inside that folder, only UTF-8 text, symlinks and directories skipped, and the
-  same per-file/per-count/total ceilings as before.
+  inside that folder, only UTF-8 text, symlinks and directories skipped, and
+  per-file/per-count/total ceilings bound what is written. The ceilings track
+  what a real published Skill contains rather than what an early registry's
+  bundles contained, because a Skill with thousands of template files was being
+  silently truncated: the download bound is the whole repository (128 MiB), the
+  file count is 16384, and the extracted total is 64 MiB. A refusal past the
+  report ceiling is counted rather than named, so a repository with tens of
+  thousands of unused entries cannot inflate the preview payload.
 - **The card's elements come from three places.** Title, repository, slug and
   install count are the catalog record; the picture is the repository owner's
   avatar (`https://github.com/<owner>.png?size=96`), loaded through

@@ -1676,6 +1676,29 @@ struct SkillBundle {
     skipped: Vec<String>,
 }
 
+/// Refusal notices one archive read may carry back.
+///
+/// Every file that is not written is reported to the caller, because a Skill
+/// whose scripts silently did not arrive is not the Skill the publisher
+/// described. A repository can hold tens of thousands of entries a Skill does
+/// not use, though, and a document that listed every one of them would be a
+/// payload and a pane of its own. The first handful are named; the rest are
+/// counted in one summary line, so the reader still learns that something was
+/// left out.
+const MAX_SKILL_MARKET_SKIPPED_REPORTS: usize = 64;
+
+/// Record one file that will not be written, up to the report ceiling.
+///
+/// Past the ceiling only the running count grows: the path is what would make
+/// the list unbounded, and the count is what the summary line needs.
+fn record_skipped(skipped: &mut Vec<String>, omitted: &mut usize, message: String) {
+    if skipped.len() < MAX_SKILL_MARKET_SKIPPED_REPORTS {
+        skipped.push(message);
+    } else {
+        *omitted = omitted.saturating_add(1);
+    }
+}
+
 /// The archive a repository hands out, which is the only place a Self-Published
 /// Skill's folder exists.
 ///
@@ -1699,6 +1722,7 @@ fn skill_folder_from_archive(
     let wanted = slug.trim().trim_matches('/');
 
     let mut skipped = Vec::new();
+    let mut omitted = 0usize;
     let mut manifest = None;
     let mut files = Vec::new();
     let mut total_bytes = 0u64;
@@ -1711,7 +1735,11 @@ fn skill_folder_from_archive(
         let mut entry = match entry {
             Ok(entry) => entry,
             Err(error) => {
-                skipped.push(format!("an entry could not be read: {error}"));
+                record_skipped(
+                    &mut skipped,
+                    &mut omitted,
+                    format!("an entry could not be read: {error}"),
+                );
                 continue;
             }
         };
@@ -1723,7 +1751,11 @@ fn skill_folder_from_archive(
         let raw = match entry.path() {
             Ok(path) => path.to_string_lossy().replace('\\', "/"),
             Err(error) => {
-                skipped.push(format!("an entry has no usable name: {error}"));
+                record_skipped(
+                    &mut skipped,
+                    &mut omitted,
+                    format!("an entry has no usable name: {error}"),
+                );
                 continue;
             }
         };
@@ -1736,9 +1768,11 @@ fn skill_folder_from_archive(
             continue;
         }
         let Some(path) = bundle_entry_path(rest) else {
-            skipped.push(format!(
-                "{rest}: the entry is not a file inside the Skill folder"
-            ));
+            record_skipped(
+                &mut skipped,
+                &mut omitted,
+                format!("{rest}: the entry is not a file inside the Skill folder"),
+            );
             continue;
         };
         let path = path
@@ -1750,21 +1784,29 @@ fn skill_folder_from_archive(
             continue;
         }
         if entry.size() > MAX_SKILL_MARKET_BUNDLE_FILE_BYTES {
-            skipped.push(format!(
-                "{path}: larger than the {MAX_SKILL_MARKET_BUNDLE_FILE_BYTES} byte file limit"
-            ));
+            record_skipped(
+                &mut skipped,
+                &mut omitted,
+                format!(
+                    "{path}: larger than the {MAX_SKILL_MARKET_BUNDLE_FILE_BYTES} byte file limit"
+                ),
+            );
             continue;
         }
         if files.len() >= MAX_SKILL_MARKET_BUNDLE_FILES {
-            skipped.push(format!(
-                "{path}: the bundle already carries {MAX_SKILL_MARKET_BUNDLE_FILES} files"
-            ));
+            record_skipped(
+                &mut skipped,
+                &mut omitted,
+                format!("{path}: the bundle already carries {MAX_SKILL_MARKET_BUNDLE_FILES} files"),
+            );
             continue;
         }
         if total_bytes >= MAX_SKILL_MARKET_BUNDLE_BYTES {
-            skipped.push(format!(
-                "{path}: the bundle already carries {MAX_SKILL_MARKET_BUNDLE_BYTES} bytes"
-            ));
+            record_skipped(
+                &mut skipped,
+                &mut omitted,
+                format!("{path}: the bundle already carries {MAX_SKILL_MARKET_BUNDLE_BYTES} bytes"),
+            );
             continue;
         }
         let limit =
@@ -1774,15 +1816,27 @@ fn skill_folder_from_archive(
             .read_to_end(&mut body)
             .is_err()
         {
-            skipped.push(format!("{path}: the entry could not be decompressed"));
+            record_skipped(
+                &mut skipped,
+                &mut omitted,
+                format!("{path}: the entry could not be decompressed"),
+            );
             continue;
         }
         if body.len() as u64 > limit {
-            skipped.push(format!("{path}: larger than the size a Skill may carry"));
+            record_skipped(
+                &mut skipped,
+                &mut omitted,
+                format!("{path}: larger than the size a Skill may carry"),
+            );
             continue;
         }
         let Ok(content) = String::from_utf8(body) else {
-            skipped.push(format!("{path}: not UTF-8 text and was not installed"));
+            record_skipped(
+                &mut skipped,
+                &mut omitted,
+                format!("{path}: not UTF-8 text and was not installed"),
+            );
             continue;
         };
         let bytes = content.len() as u64;
@@ -1796,6 +1850,9 @@ fn skill_folder_from_archive(
                 bytes,
             });
         }
+    }
+    if omitted > 0 {
+        skipped.push(format!("{omitted} more files were not installed"));
     }
     files.sort_by(|left, right| left.path.cmp(&right.path));
     Ok((manifest, files, skipped))
@@ -1865,7 +1922,26 @@ fn fetch_skill_bundle(
                 format!("the repository {source} answered HTTP {}", status.as_u16()),
             )
         },
-    )?;
+    )
+    .map_err(|error| {
+        // The generic size refusal is about a catalog record, but here it means
+        // the whole repository is too large to lift a Skill out of. Naming the
+        // repository and the ceiling is what turns "too large" into something a
+        // reader can act on — the same Skill has a smaller repository, or the
+        // build's ceiling is the thing to raise.
+        if error.code == "market_response_too_large" {
+            VibexError::provider(
+                "market_skill_repository_too_large",
+                format!(
+                    "the repository {source} is larger than the {} MiB the market will download",
+                    MAX_SKILL_MARKET_BUNDLE_DOWNLOAD_BYTES / (1024 * 1024)
+                ),
+            )
+            .with_diagnostic("repository", source.to_string())
+        } else {
+            error
+        }
+    })?;
     let (manifest, files, skipped) = skill_folder_from_archive(&body, slug)?;
     Ok(SkillBundle {
         manifest,
@@ -3940,6 +4016,47 @@ mod tests {
         assert_eq!(skipped.len(), 1);
         assert!(skipped[0].contains("logo.png"));
         assert!(skipped[0].contains("UTF-8"));
+    }
+
+    #[test]
+    fn a_bundle_reports_the_skips_it_cannot_name_one_by_one() {
+        // A repository holds far more entries than a Skill uses. The named
+        // refusals are bounded; the rest are counted, because a document that
+        // listed every one of them would carry the whole archive back.
+        use flate2::write::GzEncoder;
+        let omitted_files = 5usize;
+        let mut bytes = Vec::new();
+        {
+            let encoder = GzEncoder::new(&mut bytes, flate2::Compression::fast());
+            let mut builder = tar::Builder::new(encoder);
+            let mut entries: Vec<(String, Vec<u8>)> = vec![(
+                "repo-HEAD/skills/demo/SKILL.md".to_string(),
+                b"manifest".to_vec(),
+            )];
+            for index in 0..MAX_SKILL_MARKET_SKIPPED_REPORTS + omitted_files {
+                entries.push((
+                    format!("repo-HEAD/skills/demo/assets/{index}.bin"),
+                    vec![0xff, 0xfe, index as u8],
+                ));
+            }
+            for (path, content) in entries {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(content.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                builder
+                    .append_data(&mut header, &path, content.as_slice())
+                    .unwrap();
+            }
+            builder.into_inner().unwrap().finish().unwrap();
+        }
+        let (manifest, files, skipped) = skill_folder_from_archive(&bytes, "demo").unwrap();
+        assert_eq!(manifest.as_deref(), Some("manifest"));
+        assert!(files.is_empty());
+        assert_eq!(skipped.len(), MAX_SKILL_MARKET_SKIPPED_REPORTS + 1);
+        let summary = skipped.last().unwrap();
+        assert!(summary.contains(&omitted_files.to_string()));
+        assert!(summary.contains("more files were not installed"));
     }
     #[test]
     fn a_download_that_is_not_an_archive_is_refused_rather_than_unpacked() {

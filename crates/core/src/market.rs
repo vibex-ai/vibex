@@ -409,17 +409,25 @@ pub const MAX_SKILL_MARKET_DOCUMENT_BYTES: u64 = 128 * 1024;
 
 /// Text files one Skill bundle may contribute beside its manifest.
 ///
-/// A published Skill is a folder of references, scripts and templates. The
-/// ceiling is set well above what the registry's own bundles carry so a real
-/// Skill is never truncated, while a hostile archive still cannot turn one
-/// install into an unbounded write.
-pub const MAX_SKILL_MARKET_BUNDLE_FILES: usize = 128;
+/// A published Skill is a folder of references, scripts and templates, and a
+/// real one is not small: a presentation Skill ships a whole template library,
+/// which can be more than ten thousand text files. The ceiling is set well
+/// above that so a real Skill is never truncated — a Skill whose scripts were
+/// silently dropped is not the Skill the publisher described — while a hostile
+/// archive still cannot turn one install into an unbounded write. The total
+/// byte ceiling below is the bound that actually limits a decompression bomb;
+/// this one bounds the directory entries.
+pub const MAX_SKILL_MARKET_BUNDLE_FILES: usize = 16 * 1024;
 
 /// Largest single file a bundle may contribute.
 pub const MAX_SKILL_MARKET_BUNDLE_FILE_BYTES: u64 = 512 * 1024;
 
 /// Largest total a bundle's files may occupy once written.
-pub const MAX_SKILL_MARKET_BUNDLE_BYTES: u64 = 4 * 1024 * 1024;
+///
+/// This is the decompression-bomb bound: whatever an archive claims, no more
+/// than this many bytes of UTF-8 text are extracted. It sits above the real
+/// template libraries a published Skill ships rather than below them.
+pub const MAX_SKILL_MARKET_BUNDLE_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Upper bound on a catalog response body. A catalog is a list of small
 /// records; anything larger is a misconfigured or hostile source.
@@ -427,11 +435,17 @@ pub const MAX_MARKET_RESPONSE_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Upper bound on a Skill bundle download.
 ///
-/// The registry serves bundles as zip archives, so this bounds the compressed
-/// bytes; the uncompressed side is bounded separately by the per-file and
-/// per-bundle limits above, which is what makes a decompression bomb a refused
-/// file rather than an exhausted process.
-pub const MAX_SKILL_MARKET_BUNDLE_DOWNLOAD_BYTES: u64 = 16 * 1024 * 1024;
+/// A Skill is lifted out of the archive of the repository that publishes it, so
+/// this is a bound on a whole repository download, not on the Skill folder: a
+/// repository is mostly documentation and media the Skill does not use, and a
+/// popular presentation Skill's archive is already tens of megabytes. The
+/// ceiling is therefore set well above a folder-size limit while still refusing
+/// an unbounded body. The compressed bytes are read into memory, so this is also
+/// the memory a bundle download may transiently occupy. The uncompressed side is
+/// bounded separately by the per-file, per-count and per-bundle limits above,
+/// which is what makes a decompression bomb a refused file rather than an
+/// exhausted process.
+pub const MAX_SKILL_MARKET_BUNDLE_DOWNLOAD_BYTES: u64 = 128 * 1024 * 1024;
 
 /// Largest picture the market will download for an entry.
 ///

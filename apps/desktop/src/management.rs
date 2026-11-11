@@ -22808,6 +22808,10 @@ impl ManagementCenter {
             .skills
             .iter()
             .any(|skill| skill.source_uri.as_deref() == Some(&format!("market:{}", target.id)));
+        // The generic "could not be loaded" is all the empty pane used to say;
+        // the code and message the runtime refused with are what a reader can
+        // quote, so they travel into the pane with it.
+        let load_error = self.skill_market_error.clone();
 
         let heading = h_flex()
             .w_full()
@@ -22821,6 +22825,11 @@ impl ManagementCenter {
                 cx.listener(|this, _, _, cx| {
                     this.skill_market_install_target = None;
                     this.skill_market_document = None;
+                    // The install pane and the results pane share one error
+                    // slot, so the failure that emptied the preview must not
+                    // outlive it: leaving it set would show a market failure
+                    // over a grid that loaded perfectly well.
+                    this.skill_market_error = None;
                     cx.notify();
                 }),
             ))
@@ -22919,6 +22928,13 @@ impl ManagementCenter {
             preview,
             cx,
         ));
+
+        if let Some(error) = &load_error {
+            form = form.child(management_market_banner(
+                "management-skill-market-install-error",
+                error.clone(),
+            ));
+        }
 
         if document.is_some_and(|document| document.too_large) {
             form = form.child(management_market_banner(
@@ -40317,6 +40333,15 @@ const MARKET_PAGE_SIZE: usize = 20;
 /// the cursor the registry hands back with each page.
 const SKILL_MARKET_FETCH_LIMIT: u32 = 60;
 
+/// Bundle entries the install preview lists by name.
+///
+/// A published Skill can carry thousands of text files, and the preview is a
+/// plain column rather than a virtualized list, so rendering every one of them
+/// would stall the pane. The first of each kind of row is shown; the rest are
+/// counted in one trailing line, which is what keeps "what will be written"
+/// disclosed without making the pane carry every path.
+const MANAGEMENT_SKILL_BUNDLE_ROWS: usize = 100;
+
 /// The width a market card refuses to go under.
 ///
 /// The pane is whatever the sidebar leaves, so the grid has to fit two cards at
@@ -40467,7 +40492,7 @@ fn management_skill_bundle_section(
     cx: &App,
 ) -> AnyElement {
     let mut list = v_flex().w_full().min_w_0().gap_1();
-    for file in &document.files {
+    for file in document.files.iter().take(MANAGEMENT_SKILL_BUNDLE_ROWS) {
         list = list.child(
             h_flex()
                 .w_full()
@@ -40496,7 +40521,19 @@ fn management_skill_bundle_section(
                 ),
         );
     }
-    for skipped in &document.skipped_files {
+    if let Some(rest) = document
+        .files
+        .len()
+        .checked_sub(MANAGEMENT_SKILL_BUNDLE_ROWS)
+        .filter(|rest| *rest > 0)
+    {
+        list = list.child(management_skill_bundle_more_row(format!("+ {rest}"), cx));
+    }
+    for skipped in document
+        .skipped_files
+        .iter()
+        .take(MANAGEMENT_SKILL_BUNDLE_ROWS)
+    {
         list = list.child(
             h_flex()
                 .w_full()
@@ -40517,6 +40554,14 @@ fn management_skill_bundle_section(
                         .child(skipped.clone()),
                 ),
         );
+    }
+    if let Some(rest) = document
+        .skipped_files
+        .len()
+        .checked_sub(MANAGEMENT_SKILL_BUNDLE_ROWS)
+        .filter(|rest| *rest > 0)
+    {
+        list = list.child(management_skill_bundle_more_row(format!("+ {rest}"), cx));
     }
 
     let count = document.files.len();
@@ -40541,6 +40586,33 @@ fn management_skill_bundle_section(
         list.into_any_element(),
         cx,
     )
+}
+
+/// The trailing row that says how many bundle entries were not listed.
+///
+/// It stands in the same column as the rows it summarises so the list reads as
+/// one list, but it carries no path: the point is that the reader knows the
+/// list was truncated and by how much.
+fn management_skill_bundle_more_row(label: String, cx: &App) -> AnyElement {
+    h_flex()
+        .w_full()
+        .min_w_0()
+        .items_center()
+        .gap_2()
+        .child(
+            Icon::new(IconName::File)
+                .size(px(14.0))
+                .text_color(cx.theme().muted_foreground),
+        )
+        .child(
+            div()
+                .min_w_0()
+                .flex_1()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(label),
+        )
+        .into_any_element()
 }
 
 /// A byte count as a short human-readable size.
