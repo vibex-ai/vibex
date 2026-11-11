@@ -61,6 +61,13 @@ pub const REMOTE_V2_MAX_BINARY_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
 pub const REMOTE_LAN_PAIRING_SCHEMA_VERSION: &str = "vibex-lan-pairing-discovery.v1";
 pub const REMOTE_ZERO_CONFIG_LAN_PAIRING_SCHEMA_VERSION: &str = "vibex-zero-config-lan-pairing.v2";
 pub const REMOTE_LOCAL_LAN_TLS_HOSTNAME: &str = "vibex-lan.local";
+/// The origin of the relay the product ships with.
+///
+/// This is deliberately never rendered in the product UI. The official relay
+/// is one built-in option, treated like the rest of the transport defaults: a
+/// user who wants to point somewhere else uses the self-hosted Relay entry
+/// instead of editing this one.
+pub const REMOTE_OFFICIAL_RELAY_ORIGIN: &str = "https://relay.peatboy.com";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

@@ -81,13 +81,26 @@ enum RemoteAccessMutation {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RemoteAccessEntry {
-    TailscaleServe,
-    Direct,
-    SelfHostedRelay,
+    /// The relay the product ships with. It runs through the same controller
+    /// path as a self-hosted relay, but its origin is built in, so this entry
+    /// never shows or edits an address.
+    OfficialRelay,
     /// Local-network pairing, which is a way to reach this runtime from
     /// elsewhere on the network.
     LocalNetwork,
+    TailscaleServe,
+    Direct,
+    SelfHostedRelay,
 }
+
+/// The entries the setup list keeps folded behind "Other ways".
+///
+/// Both need an address the operator runs themselves, so they stay out of the
+/// way of the entries that work from a fresh install.
+const ADVANCED_CONNECTION_ENTRIES: [RemoteAccessEntry; 2] = [
+    RemoteAccessEntry::Direct,
+    RemoteAccessEntry::SelfHostedRelay,
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RemoteAccessPage {
@@ -107,11 +120,21 @@ impl RemoteAccessEntry {
 
     fn remote_method(self) -> Option<RemoteConnectivityMethod> {
         match self {
+            // The official relay is the self-hosted relay method with a
+            // built-in origin; only the presentation differs.
+            Self::OfficialRelay | Self::SelfHostedRelay => {
+                Some(RemoteConnectivityMethod::SelfHostedRelay)
+            }
             Self::TailscaleServe => Some(RemoteConnectivityMethod::TailscaleServe),
             Self::Direct => Some(RemoteConnectivityMethod::Direct),
-            Self::SelfHostedRelay => Some(RemoteConnectivityMethod::SelfHostedRelay),
             Self::LocalNetwork => None,
         }
+    }
+
+    /// True when this entry is served by the built-in relay origin rather than
+    /// an address the operator typed.
+    fn uses_builtin_relay_origin(self) -> bool {
+        matches!(self, Self::OfficialRelay)
     }
 }
 
@@ -119,6 +142,7 @@ impl RemoteAccessEntry {
 enum RemoteAccessAction {
     Refresh,
     SelectConnectionEntry(RemoteAccessEntry),
+    ToggleAdvancedMethods,
     EnableMethod(RemoteConnectivityMethod),
     ConfirmTailscalePort(u16),
     DisableMethod(RemoteConnectivityMethod),
@@ -356,6 +380,9 @@ struct PairingViewState {
     page: RemoteAccessPage,
     selected_method: RemoteConnectivityMethod,
     selected_entry: RemoteAccessEntry,
+    /// Whether the operator folded-out "Other ways" section is open. It starts
+    /// closed so the dialog leads with the two ways that need no setup.
+    advanced_methods_expanded: bool,
     permission: RemoteDevicePermissionLevel,
     zero_config_permission: RemoteDevicePermissionLevel,
     active_offer: Option<ActivePairingOffer>,
@@ -422,8 +449,9 @@ impl Default for PairingViewState {
         Self {
             connectivity: None,
             page: RemoteAccessPage::Setup,
-            selected_method: RemoteConnectivityMethod::TailscaleServe,
-            selected_entry: RemoteAccessEntry::TailscaleServe,
+            selected_method: RemoteConnectivityMethod::SelfHostedRelay,
+            selected_entry: RemoteAccessEntry::OfficialRelay,
+            advanced_methods_expanded: false,
             permission: RemoteDevicePermissionLevel::ReadOnly,
             zero_config_permission: RemoteDevicePermissionLevel::ReadOnly,
             active_offer: None,
@@ -745,8 +773,17 @@ impl RemoteAccessPairing {
                 display_name,
             } => self.rename_device(device_id, display_name, cx),
             RemoteAccessAction::SelectConnectionEntry(entry) => {
+                // Selecting a folded entry means the user wants to see it, so
+                // the section opens rather than hiding the selection again.
+                if ADVANCED_CONNECTION_ENTRIES.contains(&entry) {
+                    self.state.advanced_methods_expanded = true;
+                }
                 self.state.select_connection_entry(entry);
-                cx.notify();
+                cx.notify()
+            }
+            RemoteAccessAction::ToggleAdvancedMethods => {
+                self.state.advanced_methods_expanded = !self.state.advanced_methods_expanded;
+                cx.notify()
             }
             RemoteAccessAction::EnableMethod(method) => self.enable_method(method, cx),
             RemoteAccessAction::ConfirmTailscalePort(port) => self.confirm_tailscale_port(port, cx),
@@ -1529,7 +1566,17 @@ impl RemoteAccessPairing {
                 });
             }
             RemoteConnectivityMethod::SelfHostedRelay => {
-                let origin = match self.configured_origin(method, cx) {
+                // The built-in relay is enabled by selecting its entry, never by
+                // typing an address; anything typed means the operator wants the
+                // self-hosted endpoint instead.
+                let builtin = self.state.selected_entry.uses_builtin_relay_origin()
+                    && self.relay_origin.read(cx).value().trim().is_empty();
+                let origin = if builtin {
+                    Ok(vibex_core::REMOTE_OFFICIAL_RELAY_ORIGIN.to_string())
+                } else {
+                    self.configured_origin(method, cx)
+                };
+                let origin = match origin {
                     Ok(origin) => origin,
                     Err(error) => {
                         self.state.error_code = Some(error.code);
@@ -2800,11 +2847,67 @@ impl RemoteAccessPairing {
         v_flex()
             .w_full()
             .gap_2()
-            .child(self.render_connection_row(RemoteAccessEntry::TailscaleServe, cx))
-            .child(self.render_connection_row(RemoteAccessEntry::Direct, cx))
-            .child(self.render_connection_row(RemoteAccessEntry::SelfHostedRelay, cx))
+            .child(self.render_connection_row(RemoteAccessEntry::OfficialRelay, cx))
             .child(self.render_connection_row(RemoteAccessEntry::LocalNetwork, cx))
+            .child(self.render_connection_row(RemoteAccessEntry::TailscaleServe, cx))
+            .child(self.render_advanced_methods_section(cx))
             .into_any_element()
+    }
+
+    /// The folded "Other ways" section.
+    ///
+    /// Direct HTTPS and a hand-run Relay both need an address the operator
+    /// supplies, so they stay behind this row while the built-in relay, local
+    /// network, and Tailscale entries stay visible.
+    fn render_advanced_methods_section(&self, cx: &mut Context<Self>) -> AnyElement {
+        let expanded = self.state.advanced_methods_expanded;
+        let mut section = v_flex().w_full().gap_2().child(
+            h_flex()
+                .id("remote-access-advanced-methods")
+                .w_full()
+                .items_center()
+                .justify_between()
+                .gap_2()
+                .rounded(px(10.0))
+                .border_1()
+                .border_color(cx.theme().border.opacity(0.62))
+                .px_3()
+                .py_2()
+                .cursor_pointer()
+                .on_mouse_up(
+                    gpui::MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        this.dispatch_action(RemoteAccessAction::ToggleAdvancedMethods, cx)
+                    }),
+                )
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(locale::text(
+                            "Other ways to connect",
+                            "其他连接方式",
+                            "其他連線方式",
+                        )),
+                )
+                .child(
+                    Icon::new(if expanded {
+                        IconName::ChevronDown
+                    } else {
+                        IconName::ChevronRight
+                    })
+                    .size(px(14.0))
+                    .text_color(cx.theme().muted_foreground),
+                ),
+        );
+        if expanded {
+            for entry in ADVANCED_CONNECTION_ENTRIES {
+                section = section.child(self.render_connection_row(entry, cx));
+            }
+        }
+        section.into_any_element()
     }
 
     fn render_connection_row(
@@ -2973,12 +3076,26 @@ impl RemoteAccessPairing {
                 ColorName::Neutral,
             );
         };
-        let state = self
+        let snapshot = self
             .state
             .connectivity
             .as_ref()
-            .and_then(|connectivity| connectivity.method(method))
-            .map_or(RemoteMethodState::Disabled, |snapshot| snapshot.state);
+            .and_then(|connectivity| connectivity.method(method));
+        // The official entry only reports a live relay while the runtime is
+        // actually serving the built-in origin, so an operator who pointed the
+        // relay elsewhere does not see this entry light up.
+        if entry.uses_builtin_relay_origin() {
+            let live = snapshot
+                .filter(|snapshot| {
+                    snapshot
+                        .origin
+                        .as_deref()
+                        .is_some_and(is_official_relay_origin)
+                })
+                .map_or(RemoteMethodState::Disabled, |snapshot| snapshot.state);
+            return (method_state_label(live), method_state_color(live));
+        }
+        let state = snapshot.map_or(RemoteMethodState::Disabled, |snapshot| snapshot.state);
         (method_state_label(state), method_state_color(state))
     }
 
@@ -3000,8 +3117,22 @@ impl RemoteAccessPairing {
             .as_ref()
             .and_then(|connectivity| connectivity.method(method));
         let pending = self.state.pending.is_some();
-        let desired_enabled = snapshot.is_some_and(|snapshot| snapshot.desired_enabled);
-        let state = snapshot.map_or(RemoteMethodState::Disabled, |snapshot| snapshot.state);
+        // The official relay is the built-in origin, so its entry must neither
+        // show the address nor offer to edit it.
+        let builtin_origin = entry.uses_builtin_relay_origin();
+        // A relay pointed at an operator's own address is a different choice,
+        // so the official entry only reads as enabled while the runtime is
+        // actually serving the built-in origin.
+        let builtin_origin_live = snapshot
+            .and_then(|snapshot| snapshot.origin.as_deref())
+            .is_some_and(is_official_relay_origin);
+        let desired_enabled = snapshot.is_some_and(|snapshot| snapshot.desired_enabled)
+            && (!builtin_origin || builtin_origin_live);
+        let state = if builtin_origin && !builtin_origin_live {
+            RemoteMethodState::Disabled
+        } else {
+            snapshot.map_or(RemoteMethodState::Disabled, |snapshot| snapshot.state)
+        };
         let status_color = method_state_color(state);
         let recovery = snapshot.map_or(RemoteRecoveryAction::None, |snapshot| {
             snapshot.recovery_action
@@ -3029,14 +3160,19 @@ impl RemoteAccessPairing {
                             .min_w_0()
                             .items_center()
                             .gap_2()
-                            .child(icon_tile(method_icon(method), px(28.0), px(15.0), cx))
+                            .child(icon_tile(
+                                connection_entry_icon(entry),
+                                px(28.0),
+                                px(15.0),
+                                cx,
+                            ))
                             .child(
                                 div()
                                     .min_w_0()
                                     .truncate()
                                     .text_sm()
                                     .font_semibold()
-                                    .child(method_short_name(method)),
+                                    .child(connection_entry_name(entry)),
                             )
                             .child(status_pill(method_state_label(state), status_color)),
                     )
@@ -3045,20 +3181,21 @@ impl RemoteAccessPairing {
                             .flex_none()
                             .text_xs()
                             .text_color(cx.theme().muted_foreground)
-                            .child(method_description(method)),
+                            .child(connection_entry_description(entry)),
                     ),
-            )
-            .when_some(origin.clone(), |column, origin| {
-                column.child(
-                    div()
-                        .w_full()
-                        .truncate()
-                        .font_family(cx.theme().mono_font_family.clone())
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(origin),
-                )
-            });
+            );
+
+        if !builtin_origin && let Some(origin) = origin.clone() {
+            panel = panel.child(
+                div()
+                    .w_full()
+                    .truncate()
+                    .font_family(cx.theme().mono_font_family.clone())
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(origin),
+            );
+        }
 
         if method == RemoteConnectivityMethod::Direct {
             panel = panel.child(origin_editor(
@@ -3074,7 +3211,7 @@ impl RemoteAccessPairing {
                 method,
                 cx,
             ));
-        } else if method == RemoteConnectivityMethod::SelfHostedRelay {
+        } else if method == RemoteConnectivityMethod::SelfHostedRelay && !builtin_origin {
             panel = panel.child(origin_editor(
                 "remote-relay-origin",
                 locale::text(
@@ -4647,6 +4784,9 @@ fn method_short_name(method: RemoteConnectivityMethod) -> &'static str {
 
 fn connection_entry_name(entry: RemoteAccessEntry) -> &'static str {
     match entry {
+        RemoteAccessEntry::OfficialRelay => {
+            locale::text("Official relay", "官方中继服务", "官方中繼服務")
+        }
         RemoteAccessEntry::LocalNetwork => {
             locale::text("Local network pairing", "局域网配对", "區域網路配對")
         }
@@ -4659,6 +4799,11 @@ fn connection_entry_name(entry: RemoteAccessEntry) -> &'static str {
 
 fn connection_entry_description(entry: RemoteAccessEntry) -> &'static str {
     match entry {
+        RemoteAccessEntry::OfficialRelay => locale::text(
+            "Pair through the relay built into Vibex",
+            "通过 Vibex 内置的中继服务配对",
+            "透過 Vibex 內建的中繼服務配對",
+        ),
         RemoteAccessEntry::LocalNetwork => locale::text(
             "Discover this computer on the same network",
             "在同一网络中发现此电脑",
@@ -4677,12 +4822,32 @@ fn connection_entry_description(entry: RemoteAccessEntry) -> &'static str {
 
 fn connection_entry_id(entry: RemoteAccessEntry) -> String {
     match entry {
+        RemoteAccessEntry::OfficialRelay => "remote-access-method-official-relay".to_string(),
         RemoteAccessEntry::LocalNetwork => "remote-access-method-local-network".to_string(),
         entry => match entry.remote_method() {
             Some(method) => format!("remote-access-method-{}", method.wire_name()),
             None => "remote-access-method-unknown".to_string(),
         },
     }
+}
+
+fn connection_entry_icon(entry: RemoteAccessEntry) -> IconName {
+    match entry {
+        RemoteAccessEntry::OfficialRelay => IconName::Building2,
+        RemoteAccessEntry::LocalNetwork => IconName::Map,
+        entry => entry.remote_method().map_or(IconName::Globe, method_icon),
+    }
+}
+
+/// True when a reported relay origin is the built-in one.
+///
+/// The runtime normalizes origins, so compare the same way it stores them
+/// instead of matching the raw constant.
+fn is_official_relay_origin(origin: &str) -> bool {
+    origin
+        .trim()
+        .trim_end_matches('/')
+        .eq_ignore_ascii_case(vibex_core::REMOTE_OFFICIAL_RELAY_ORIGIN.trim_end_matches('/'))
 }
 
 fn permission_options() -> [RemoteDevicePermissionLevel; 3] {
@@ -5396,8 +5561,17 @@ mod tests {
         assert_eq!(state.page, RemoteAccessPage::Setup);
         assert_eq!(
             state.selected_entry,
-            RemoteAccessEntry::TailscaleServe,
-            "default selection mirrors the first radio row"
+            RemoteAccessEntry::OfficialRelay,
+            "the setup list opens on the entry that needs no configuration"
+        );
+        assert_eq!(
+            state.selected_method,
+            RemoteConnectivityMethod::SelfHostedRelay,
+            "the official relay runs through the relay method"
+        );
+        assert!(
+            !state.advanced_methods_expanded,
+            "the entries that need setup stay folded until asked for"
         );
 
         state.select_connection_entry(RemoteAccessEntry::Direct);
