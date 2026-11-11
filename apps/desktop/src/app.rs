@@ -86842,6 +86842,12 @@ struct FoundationSettings {
     search: Entity<InputState>,
     search_selected_index: usize,
     search_scroll: ScrollHandle,
+    /// The navigation column's own offset.
+    ///
+    /// The dialog takes its height from the viewport, so a short window leaves
+    /// the three groups taller than the column; the group list scrolls on its
+    /// own rather than clipping the last group out of reach.
+    navigation_scroll: ScrollHandle,
     settings_render_context: SettingsRenderContext,
     storage_usage_state: SettingsStorageUsageState,
     storage_usage_task: Option<Task<()>>,
@@ -87374,6 +87380,7 @@ impl FoundationSettings {
                 search,
                 search_selected_index: 0,
                 search_scroll: ScrollHandle::new(),
+                navigation_scroll: ScrollHandle::new(),
                 settings_render_context,
                 storage_usage_state: SettingsStorageUsageState::Unloaded,
                 storage_usage_task: None,
@@ -89581,6 +89588,9 @@ impl FoundationSettings {
             .collect::<Vec<_>>();
         let search = div()
             .w_full()
+            // The field keeps its height when the column runs out of room: the
+            // group list below is the only part that gives way.
+            .flex_none()
             .mt_1()
             .mb_1()
             .capture_key_down(cx.listener(Self::on_settings_search_key_down))
@@ -89650,7 +89660,26 @@ impl FoundationSettings {
             .rounded_bl(px(SETTINGS_DIALOG_CONTENT_RADIUS))
             .child(search)
             .when_some(search_results, |this, results| this.child(results))
-            .when(!has_search_results, |this| this.child(navigation_groups))
+            .when(!has_search_results, |this| {
+                // The dialog takes its height from the viewport, so a short
+                // window leaves more groups than the column can show. The
+                // search field stays put and the groups scroll beneath it; the
+                // column itself keeps clipping to the dialog's rounded edge, so
+                // the offset can only reveal rows, never paint outside the
+                // sidebar plate.
+                this.child(
+                    v_flex()
+                        .id("settings-navigation-groups")
+                        .debug_selector(|| "settings-navigation-groups".to_string())
+                        .flex_1()
+                        .min_h_0()
+                        .track_scroll(&self.navigation_scroll)
+                        .overflow_y_scroll()
+                        .pinned_scrollbar(&self.navigation_scroll, ScrollbarAxis::Vertical)
+                        .scroll_gutter()
+                        .child(navigation_groups),
+                )
+            })
             .into_any_element()
     }
 
@@ -119190,8 +119219,27 @@ mod tests {
             .and_then(|(_, tail)| tail.split_once("\n    fn render_general_page("))
             .map(|(body, _)| body)
             .expect("settings navigation should remain inspectable");
+        // The column itself keeps clipping to the dialog's rounded plate, but
+        // the groups scroll: the dialog is sized from the viewport, so a short
+        // window leaves more groups than the column can show.
         assert!(navigation.contains(".overflow_hidden()"));
         assert!(!navigation.contains(".overflow_y_scrollbar()"));
+        assert!(navigation.contains("track_scroll(&self.navigation_scroll)"));
+        assert!(navigation.contains(".overflow_y_scroll()"));
+        assert!(
+            navigation
+                .contains(".pinned_scrollbar(&self.navigation_scroll, ScrollbarAxis::Vertical)")
+        );
+        assert!(navigation.contains(".scroll_gutter()"));
+        // The search field stays put above the scroller so typing never moves
+        // the list out from under the reader.
+        let search_before_groups = navigation
+            .find(".child(search)")
+            .expect("the search field should render first");
+        let groups_scroller = navigation
+            .find("track_scroll(&self.navigation_scroll)")
+            .expect("the groups should own their scroll region");
+        assert!(search_before_groups < groups_scroller);
         assert!(navigation.contains(".rounded_tl(px(SETTINGS_DIALOG_CONTENT_RADIUS))"));
         assert!(navigation.contains(".rounded_bl(px(SETTINGS_DIALOG_CONTENT_RADIUS))"));
 
@@ -119201,6 +119249,109 @@ mod tests {
             .map(|(body, _)| body)
             .expect("settings page surface should remain inspectable");
         assert!(!page.contains(".bg(background)"));
+    }
+
+    /// A short dialog scrolls the navigation column instead of clipping it.
+    ///
+    /// The dialog takes its height from the viewport, so a 526px-tall window
+    /// leaves the three groups taller than the column. The column used to clip
+    /// them with `.overflow_hidden()`, which put the last groups out of reach:
+    /// the wheel had nothing to move. The groups now own a scroll region under
+    /// the search field, so every section stays reachable.
+    #[gpui::test]
+    fn a_short_settings_dialog_scrolls_the_navigation_groups(cx: &mut TestAppContext) {
+        struct NavigationProbe {
+            // Held so the settings view keeps the workbench it reads from.
+            _workbench: Entity<VibexWorkbench>,
+            settings: Entity<FoundationSettings>,
+        }
+
+        impl Render for NavigationProbe {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                // What the dialog hands the settings body in a 526px-tall
+                // window: the viewport less the dialog's own 32px margin.
+                v_flex()
+                    .w(px(962.0))
+                    .h(px(462.0))
+                    .overflow_hidden()
+                    .child(self.settings.clone())
+            }
+        }
+
+        cx.update(gpui_component::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let (probe, cx) = cx.add_window_view(|window, cx| {
+            let mut ui_state = DesktopUiStateV1::default();
+            ui_state.appearance.locale = LocaleMode::En;
+            let workbench =
+                cx.new(|cx| VibexWorkbench::with_initial_state(None, ui_state, None, window, cx));
+            let settings = workbench.read(cx).settings_view.clone();
+            NavigationProbe {
+                _workbench: workbench,
+                settings,
+            }
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        let extent = probe.read_with(cx, |probe, cx| {
+            probe.settings.read(cx).navigation_scroll.max_offset().y
+        });
+        assert!(
+            extent > px(0.0),
+            "a 462px-tall dialog has more groups than it can show, so the \
+             navigation must be scrollable; max offset was {extent:?}"
+        );
+        let area = cx
+            .debug_bounds("settings-navigation-groups")
+            .expect("the navigation groups should be laid out");
+
+        // The wheel belongs to the group list, so one notch moves it.
+        cx.simulate_event(ScrollEvent {
+            position: area.center(),
+            delta: ScrollDelta::Pixels(point(px(0.0), px(-120.0))),
+            modifiers: Default::default(),
+            touch_phase: gpui::TouchPhase::Moved,
+            ..Default::default()
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        let offset = probe.read_with(cx, |probe, cx| {
+            probe.settings.read(cx).navigation_scroll.offset().y
+        });
+        assert!(
+            offset < px(0.0),
+            "the navigation groups should follow the wheel: offset {offset:?}"
+        );
+
+        // And the last group is reachable, not merely a little of the list.
+        cx.simulate_event(ScrollEvent {
+            position: area.center(),
+            delta: ScrollDelta::Pixels(point(px(0.0), px(-10_000.0))),
+            modifiers: Default::default(),
+            touch_phase: gpui::TouchPhase::Moved,
+            ..Default::default()
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        let offset = probe.read_with(cx, |probe, cx| {
+            probe.settings.read(cx).navigation_scroll.offset().y
+        });
+        assert_eq!(
+            offset, -extent,
+            "the list should stop at its last group, not short of it"
+        );
+        assert_eq!(
+            cx.debug_bounds("settings-navigation-groups"),
+            Some(area),
+            "the column itself must stay put while its groups scroll"
+        );
     }
 
     /// The add flows are dialogs over the page, not sections inside it.
@@ -120923,6 +121074,15 @@ mod tests {
         assert!(navigation.contains(".gap(px(SETTINGS_NAVIGATION_SECTION_GAP))"));
         assert!(navigation.contains(".mt_1()"));
         assert!(navigation.contains(".mb_1()"));
+        // The field must not be squeezed when the groups run out of room; it
+        // gives the extra height to the list below it instead.
+        let search_field = navigation
+            .split_once("let search = div()")
+            .and_then(|(_, tail)| tail.split_once("let search_results"))
+            .map(|(body, _)| body)
+            .expect("the search field should remain inspectable");
+        assert!(search_field.contains(".flex_none()"));
+        assert!(search_field.contains(".h(px(40.0))"));
         assert!(navigation.contains("let label = settings_section_label(section)"));
         assert!(navigation.contains("let icon = Icon::new(icon.clone())"));
         assert!(navigation.contains(".mr(px(2.0))"));
