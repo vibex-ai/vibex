@@ -451,6 +451,20 @@ function validatePackaging() {
     aurWorkflow.includes("is not a stable x.y.z release"),
     "AUR workflow does not refuse a prerelease tag"
   );
+  // `archlinux:base-devel` is a rolling tag: the image can be older than the
+  // package databases it points at. `pacman -Sy <packages>` then resolves a
+  // newer openssl against libraries the image still links to `libcrypto.so=3`
+  // and aborts with "failed to prepare transaction (could not satisfy
+  // dependencies)". The install has to be a full upgrade in the same
+  // transaction, never a partial one.
+  assert(
+    aurWorkflow.includes("pacman -Syu --noconfirm"),
+    "AUR workflow must upgrade the Arch container, not refresh its database alone"
+  );
+  assert(
+    !/pacman -Sy(?![u])/u.test(aurWorkflow),
+    "AUR workflow uses a partial upgrade (`pacman -Sy`); the Arch container needs `-Syu`"
+  );
   // `publish-aur.yml` listens for `release: published`, but GitHub never starts
   // a workflow from an event the default token produced — and the release is
   // created with that token. Without an explicit dispatch the AUR job silently

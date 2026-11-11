@@ -350,6 +350,14 @@ Linux `.deb` files the Release already carries:
    `ssh://aur@aur.archlinux.org/vibex-bin.git`, commits `PKGBUILD` and
    `.SRCINFO`, and pushes to `master`.
 
+The job runs in the rolling `archlinux:base-devel` container, so its first step
+is a full `pacman -Syu` together with the tooling install. A bare `pacman -Sy`
+refreshes only the databases and leaves the image's libraries behind: pacman
+then resolves a newer `openssl` against `curl`, `pacman`, `sudo` and
+`libarchive` that still depend on `libcrypto.so=3-64`, and aborts the whole
+transaction with "could not satisfy dependencies" before any packaging step
+runs. `scripts/check-release.mjs` keeps the full upgrade under contract.
+
 The package installs the GUI plus the `vibex` terminal client and renders its
 own desktop entry: the packaged entry keeps `NoDisplay=true`, so it stays hidden
 from application menus and the AUR package supplies the visible one.

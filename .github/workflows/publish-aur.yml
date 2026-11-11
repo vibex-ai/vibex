@@ -79,7 +79,15 @@ jobs:
         run: |
           set -euo pipefail
           # `gh` downloads the release payloads and is not part of base-devel.
-          pacman -Sy --noconfirm --needed git openssh nodejs namcap github-cli
+          #
+          # Arch is a rolling release, and the `archlinux:base-devel` tag is
+          # rebuilt at its own cadence, so the image routinely ships packages
+          # older than the repos it points at. `-Sy` alone refreshes only the
+          # database: pacman then resolves openssl 4.x and aborts the whole
+          # transaction because the image's installed curl, pacman, sudo and
+          # libarchive still require `libcrypto.so=3-64`. Refresh and upgrade
+          # the system in the same transaction as the install.
+          pacman -Syu --noconfirm --needed git openssh nodejs namcap github-cli
           # `makepkg` refuses to run as root, and a container job is root by
           # default, so every makepkg invocation re-enters as this user.
           if ! id builder >/dev/null 2>&1; then
