@@ -17,13 +17,19 @@
 
 pub mod error;
 pub mod fingerprint;
+pub mod install;
 pub mod manifest;
 pub mod market;
 pub mod permission;
+pub mod runtime;
 pub mod shell;
 
 pub use error::{ManifestError, PluginError};
 pub use fingerprint::consent_fingerprint;
+pub use install::{
+    ExtractReport, PendingInstall, PluginStore, RecoveryOutcome, extract_zip, safe_relative_path,
+    sha256_hex, sha512_hex, verify_checksums,
+};
 pub use manifest::{
     AUTHOR_MANIFEST_FILE, PluginCapabilities, PluginFsCapability, PluginManifest,
     PluginNetworkCapability, PluginSettingContribution,
@@ -35,4 +41,5 @@ pub use market::{
 pub use permission::{
     PermissionSpec, PluginPermissionCatalog, default_permission_catalog, permissions_for,
 };
+pub use runtime::{LoadedPlugin, NullRuntime, PluginRuntime};
 pub use shell::{SHELL_MANIFEST_FILE, ShellManifest, build_shell_manifest};
