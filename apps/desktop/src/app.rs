@@ -327,6 +327,63 @@ fn remote_authority_key(credential: &DesktopRemoteCredential) -> String {
     format!("server:{}", credential.expected_server_id)
 }
 
+/// What a provisioning start task is doing before its service exists.
+///
+/// `resolve_ssh_profile_provisioning` runs three slow things — the SSH
+/// environment probe, the signed-manifest fetch, and a ~38 MB artifact
+/// download — before `ProvisioningService::start`. That window used to show
+/// nothing at all: the progress dialog only ever rendered a coordinator
+/// snapshot, and the coordinator is created after all of it. On a slow link
+/// the reader clicked Connect and watched an unchanged row for minutes.
+///
+/// The task runs on Tokio and has no `AsyncApp`, so it publishes here and a
+/// foreground poller turns the latest stage into the dialog's snapshot.
+#[derive(Debug, Clone)]
+struct PreparingStage {
+    step: ProvisioningStep,
+    detail: String,
+}
+
+impl Default for PreparingStage {
+    fn default() -> Self {
+        Self {
+            step: ProvisioningStep::ResolvingHost,
+            detail: locale::text(
+                "Resolving the host and reading its SSH configuration…",
+                "正在解析主机并读取 SSH 配置…",
+                "正在解析主機並讀取 SSH 設定…",
+            )
+            .to_string(),
+        }
+    }
+}
+
+impl PreparingStage {
+    fn new(step: ProvisioningStep, detail: impl Into<String>) -> Self {
+        Self {
+            step,
+            detail: detail.into(),
+        }
+    }
+}
+
+/// Attempt id used by the preparing placeholder.
+///
+/// The coordinator hands out its own ids starting at 1, so this can never
+/// collide with a real attempt: when the service starts, its first snapshot
+/// replaces the placeholder instead of being mistaken for a second attempt.
+const PREPARING_ATTEMPT_ID: u64 = 0;
+
+/// Publishes a start task's stage for the dialog to pick up.
+///
+/// Best-effort by design: a poisoned lock means the workbench dropped the
+/// handle mid-run, and losing a detail line must never fail the deployment.
+fn publish_preparing_stage(stage: &std::sync::Mutex<PreparingStage>, next: PreparingStage) {
+    if let Ok(mut stage) = stage.lock() {
+        *stage = next;
+    }
+}
+
 struct ForkSessionNotification;
 
 struct AmbiguousMessageSubmissionNotification;
@@ -10242,6 +10299,22 @@ pub struct VibexWorkbench {
     ssh_provisioning: Option<ProvisioningService<SshProvisioningEffects>>,
     #[allow(dead_code)]
     ssh_provisioning_start_task: Option<Task<()>>,
+    /// The profile whose start task (probe → manifest → download) is in flight.
+    ///
+    /// The service does not exist yet while this is set, so `ssh_provisioning`
+    /// is `None` for that whole window. Everything that reacts to "a run is
+    /// happening" — the progress dialog, the row's Cancel, the queue — has to
+    /// consult this as well, or the first minutes of a deployment are invisible
+    /// and cannot be stopped.
+    ssh_provisioning_resolving: Option<String>,
+    /// Live stage for the preparing window, written by the start task.
+    ///
+    /// The task runs on Tokio and has no `AsyncApp`, so it cannot update the
+    /// workbench itself. It publishes the stage it is in here and the poller
+    /// below turns that into the snapshot the dialog renders.
+    ssh_provisioning_preparing: Option<Arc<std::sync::Mutex<PreparingStage>>>,
+    #[allow(dead_code)]
+    ssh_provisioning_preparing_task: Option<Task<()>>,
     /// Whether a start task (probe → manifest → download) is resolving.
     ///
     /// Provisioning is one run at a time — one service, one snapshot, one
@@ -12218,6 +12291,9 @@ impl VibexWorkbench {
             remote_client: None,
             ssh_provisioning: None,
             ssh_provisioning_start_task: None,
+            ssh_provisioning_resolving: None,
+            ssh_provisioning_preparing: None,
+            ssh_provisioning_preparing_task: None,
             ssh_provisioning_starting: false,
             ssh_provisioning_pending: VecDeque::new(),
             ssh_upgrade_task: None,
@@ -15768,6 +15844,30 @@ impl VibexWorkbench {
     }
 
     fn cancel_ssh_provisioning(&mut self, cx: &mut Context<Self>) {
+        // The preparing window has no service to cancel yet. Aborting the start
+        // task is what stops it: the download future is owned by that task, and
+        // dropping it leaves the `.part` file behind for the next attempt to
+        // remove.
+        if self.ssh_provisioning.is_none() {
+            if self.ssh_provisioning_resolving.is_none() {
+                return;
+            }
+            self.ssh_provisioning_start_task = None;
+            self.ssh_provisioning_starting = false;
+            self.discard_ssh_provisioning_preparing(cx);
+            self.ssh_provisioning_error = Some(
+                locale::text(
+                    "SSH provisioning was cancelled.",
+                    "已取消 SSH 配置。",
+                    "已取消 SSH 設定。",
+                )
+                .to_string(),
+            );
+            self.sync_ssh_provisioning_settings(cx);
+            self.pump_ssh_provisioning_queue(cx);
+            cx.notify();
+            return;
+        }
         let Some(service) = self.ssh_provisioning.as_ref() else {
             return;
         };
@@ -15802,8 +15902,15 @@ impl VibexWorkbench {
     }
 
     /// Starts the next queued profile when nothing else owns the slot.
+    ///
+    /// `ssh_provisioning_resolving` counts as owning the slot: a start task is
+    /// already spending the download and the tunnel port on one profile, so a
+    /// second one must queue behind it rather than run beside it.
     fn pump_ssh_provisioning_queue(&mut self, cx: &mut Context<Self>) {
-        if self.ssh_provisioning_starting || self.ssh_provisioning.is_some() {
+        if self.ssh_provisioning_starting
+            || self.ssh_provisioning.is_some()
+            || self.ssh_provisioning_resolving.is_some()
+        {
             return;
         }
         let Some(profile_id) = self.ssh_provisioning_pending.pop_front() else {
@@ -15819,6 +15926,7 @@ impl VibexWorkbench {
     /// otherwise one unreachable host would park every host added after it.
     fn fail_ssh_provisioning_start(&mut self, error: String, cx: &mut Context<Self>) {
         self.ssh_provisioning_starting = false;
+        self.discard_ssh_provisioning_preparing(cx);
         self.ssh_provisioning_error = Some(error.clone());
         self.queue_settings_operation_notice(SettingsOperationNotice::error(error), cx);
         self.sync_ssh_provisioning_settings(cx);
@@ -15827,6 +15935,13 @@ impl VibexWorkbench {
     }
 
     /// Resolves one profile's artifact and hands it to the provisioning worker.
+    ///
+    /// This half of a deployment runs before the coordinator exists: the SSH
+    /// probe, the signed manifest, and the artifact download. It used to show
+    /// nothing, so an add looked inert for minutes. It now publishes a
+    /// [`PreparingStage`] the moment it starts and replaces it at each stage,
+    /// which the poller in [`Self::begin_ssh_provisioning_preparing`] renders
+    /// as the same dialog the worker's snapshots feed later.
     fn resolve_ssh_profile_provisioning(&mut self, profile_id: String, cx: &mut Context<Self>) {
         let Some(config) = self.config.clone() else {
             self.fail_ssh_provisioning_start(
@@ -15850,6 +15965,10 @@ impl VibexWorkbench {
             return;
         };
         let home = config.home_dir.clone();
+        // The dialog reads this before the first real snapshot exists, so the
+        // click that started the run has something on screen immediately.
+        let stage = Arc::new(std::sync::Mutex::new(PreparingStage::default()));
+        self.begin_ssh_provisioning_preparing(profile_id.clone(), stage.clone(), cx);
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
             let destination = SshDestination {
                 host: profile.host.clone(),
@@ -15862,8 +15981,30 @@ impl VibexWorkbench {
                 profile.ssh_config_path.as_deref(),
             )
             .map_err(|error| format!("{}: {}", error.code, error.message))?;
+            publish_preparing_stage(
+                &stage,
+                PreparingStage::new(
+                    ProvisioningStep::ResolvingHost,
+                    locale::text(
+                        "Checking the host over SSH…",
+                        "正在通过 SSH 检查主机…",
+                        "正在透過 SSH 檢查主機…",
+                    ),
+                ),
+            );
             let environment = probe(&command, profile.remote_port, MIN_FREE_KB)
                 .map_err(|error| format!("{}: {}", error.code(), error.message()))?;
+            publish_preparing_stage(
+                &stage,
+                PreparingStage::new(
+                    ProvisioningStep::CheckingEnvironment,
+                    locale::text(
+                        "Fetching the signed release manifest…",
+                        "正在获取签名发布清单…",
+                        "正在取得簽章發行清單…",
+                    ),
+                ),
+            );
             let verified = runtime
                 .app_update()
                 .latest_verified_manifest()
@@ -15874,6 +16015,17 @@ impl VibexWorkbench {
             let artifact_os = normalized_server_os(&environment.os);
             let artifact = select_server_artifact_for_os(&verified, artifact_os, environment.arch)
                 .map_err(|error| format!("{}: {}", error.code, error.message))?;
+            publish_preparing_stage(
+                &stage,
+                PreparingStage::new(
+                    ProvisioningStep::UploadingRuntime,
+                    locale::text(
+                        "Downloading the runtime for this host…",
+                        "正在下载适用于该主机的运行时…",
+                        "正在下載適用於該主機的執行階段…",
+                    ),
+                ),
+            );
             let local = download_server_artifact_for_os(
                 artifact,
                 artifact_os,
@@ -15917,6 +16069,7 @@ impl VibexWorkbench {
                 let _ = entity.update(cx, |this, cx| {
                     match result {
                         Ok(Ok((effects, profile_id))) => {
+                            this.end_ssh_provisioning_preparing();
                             this.start_ssh_provisioning(effects, profile_id, cx);
                         }
                         Ok(Err(error)) => {
@@ -15935,6 +16088,111 @@ impl VibexWorkbench {
             },
         ));
         cx.notify();
+    }
+
+    /// Makes the preparing window visible: one snapshot the dialog can render,
+    /// plus a poller that keeps its detail line current.
+    ///
+    /// The snapshot carries [`PREPARING_ATTEMPT_ID`], which the coordinator
+    /// never issues, so the service's first real snapshot replaces it rather
+    /// than opening a second dialog for what the reader sees as one run.
+    fn begin_ssh_provisioning_preparing(
+        &mut self,
+        profile_id: String,
+        stage: Arc<std::sync::Mutex<PreparingStage>>,
+        cx: &mut Context<Self>,
+    ) {
+        self.ssh_provisioning_resolving = Some(profile_id.clone());
+        self.ssh_provisioning_preparing = Some(stage.clone());
+        self.ssh_provisioning_error = None;
+        self.ssh_provisioning_snapshot = Some(ProvisioningSnapshot::preparing(
+            profile_id,
+            PREPARING_ATTEMPT_ID,
+            stage.lock().map(|stage| stage.detail.clone()).unwrap_or_default(),
+            unix_timestamp_ms(),
+        ));
+        self.sync_ssh_provisioning_settings(cx);
+        self.ssh_provisioning_preparing_task = Some(cx.spawn(
+            async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                loop {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(120))
+                        .await;
+                    let Some(next) = entity
+                        .update(cx, |this, cx| this.poll_ssh_provisioning_preparing(&stage, cx))
+                        .ok()
+                        .flatten()
+                    else {
+                        break;
+                    };
+                    if !next {
+                        break;
+                    }
+                }
+            },
+        ));
+    }
+
+    /// Copies the task's latest stage into the snapshot the dialog renders.
+    ///
+    /// Returns `None` once this run is no longer preparing (the service took
+    /// over, the run failed, or it was cancelled), which stops the poller.
+    fn poll_ssh_provisioning_preparing(
+        &mut self,
+        stage: &Arc<std::sync::Mutex<PreparingStage>>,
+        cx: &mut Context<Self>,
+    ) -> Option<bool> {
+        self.ssh_provisioning_resolving.as_ref()?;
+        let current = self.ssh_provisioning_preparing.as_ref()?;
+        if !Arc::ptr_eq(current, stage) {
+            return None;
+        }
+        let next = stage.lock().ok()?.clone();
+        let snapshot = self.ssh_provisioning_snapshot.as_mut()?;
+        if snapshot.attempt_id != PREPARING_ATTEMPT_ID {
+            return None;
+        }
+        let changed =
+            snapshot.step != next.step || snapshot.detail.as_deref() != Some(next.detail.as_str());
+        if !changed {
+            return Some(true);
+        }
+        snapshot.step = next.step;
+        snapshot.detail = Some(next.detail);
+        snapshot.updated_at_ms = unix_timestamp_ms();
+        self.sync_ssh_provisioning_settings(cx);
+        cx.notify();
+        Some(true)
+    }
+
+    /// Hands the preparing window over to the service without blanking the UI.
+    ///
+    /// The placeholder stays until the worker's first snapshot replaces it, so
+    /// the dialog never shows "no provisioning is running" in the gap between
+    /// the download finishing and the coordinator reporting its first step.
+    fn end_ssh_provisioning_preparing(&mut self) {
+        self.ssh_provisioning_resolving = None;
+        self.ssh_provisioning_preparing = None;
+        self.ssh_provisioning_preparing_task = None;
+    }
+
+    /// Ends the preparing window and removes its placeholder from the UI.
+    ///
+    /// The success path keeps the placeholder until the service's first
+    /// snapshot replaces it, so the dialog never shows "no provisioning is
+    /// running" between the download finishing and the worker reporting. A
+    /// failed or cancelled start has no successor, so its placeholder is
+    /// removed here and the row falls back to its stored state.
+    fn discard_ssh_provisioning_preparing(&mut self, cx: &mut Context<Self>) {
+        self.end_ssh_provisioning_preparing();
+        if self
+            .ssh_provisioning_snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.attempt_id == PREPARING_ATTEMPT_ID)
+        {
+            self.ssh_provisioning_snapshot = None;
+            self.sync_ssh_provisioning_settings(cx);
+        }
     }
 
     /// Starts a background SSH provisioning run. The Connections UI calls this
@@ -15978,7 +16236,17 @@ impl VibexWorkbench {
         self.ssh_provisioning = Some(service);
         self.ssh_provisioning_starting = false;
         self.ssh_provisioning_error = None;
-        self.ssh_provisioning_snapshot = None;
+        // Keep the preparing placeholder on screen until the worker's first
+        // snapshot arrives. Blanking it here would make the dialog render its
+        // "no provisioning is running" body for the frames between the two,
+        // which reads as the run having vanished the moment it really began.
+        if self
+            .ssh_provisioning_snapshot
+            .as_ref()
+            .is_none_or(|snapshot| snapshot.attempt_id != PREPARING_ATTEMPT_ID)
+        {
+            self.ssh_provisioning_snapshot = None;
+        }
         self.sync_ssh_provisioning_settings(cx);
         self.ssh_provisioning_task = Some(cx.spawn(
             async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
@@ -16084,6 +16352,16 @@ impl VibexWorkbench {
         // stack.
         let open_progress = settings_view.update(cx, |settings, cx| {
             settings.connections_progress_target = Some((profile_id.clone(), attempt_id));
+            // The preparing placeholder and the service's first snapshot are
+            // one run to the reader, so a dismissal during the download has to
+            // outlive the handoff. Without this the dialog the reader closed
+            // reopens by itself the moment the worker reports step one.
+            if attempt_id != PREPARING_ATTEMPT_ID
+                && settings.connections_progress_dismissed.as_ref()
+                    == Some(&(profile_id.clone(), PREPARING_ATTEMPT_ID))
+            {
+                settings.connections_progress_dismissed = Some((profile_id.clone(), attempt_id));
+            }
             if terminal {
                 settings.connections_progress_target = None;
                 settings.connections_progress_open = false;
@@ -16226,6 +16504,23 @@ impl VibexWorkbench {
         self.park_local_runtime(cx);
         let runtime_id = client.runtime_id.clone();
         self.runtime_connect_errors.remove(&runtime_id);
+        // The registry on disk is the authority for which runtimes exist: the
+        // pairing step wrote this one from the provisioning worker, on another
+        // thread, while this entity held a copy read at boot. Without a reload
+        // the runtime is missing from the panel — no row, so nothing to switch
+        // to — and `mark_runtime_active` then names an id the registry does not
+        // contain, which `validate` rejects and the whole save fails.
+        if let Some(store) = self.runtime_registry_store.clone() {
+            self.runtime_registry = store.load_or_migrate();
+        }
+        // A pairing that never reached the store still has to produce a row:
+        // the credential is in hand, and the alternative is a runtime the
+        // workbench is driving but the panel cannot list.
+        if self.runtime_registry.remote(&runtime_id).is_none() {
+            self.runtime_registry
+                .upsert(client.credential.clone(), unix_timestamp_ms());
+            self.persist_runtime_registry(cx);
+        }
         // The handshake repeats what the claim learned, so a runtime that was
         // upgraded or re-hosted since it was paired corrects itself here.
         if let Some(info) = client.backend.transport().server_info() {
@@ -118968,6 +119263,112 @@ mod tests {
             "only profiles that never provisioned are resumed"
         );
         assert!(resume.contains("start_ssh_profile_provisioning"));
+    }
+
+    /// The progress dialog appears on the click, not after the download.
+    ///
+    /// A deployment begins with the SSH probe, the signed manifest and a ~38 MB
+    /// artifact, all before the coordinator exists. The dialog used to render
+    /// only coordinator snapshots, so an add showed nothing for minutes and
+    /// then jumped straight into the middle of the run. The start task now
+    /// publishes a placeholder at the first step, which is what this pins.
+    #[test]
+    fn the_progress_dialog_appears_before_the_artifact_download_finishes() {
+        let source = include_str!("app.rs");
+        let resolve = source
+            .split_once("    fn resolve_ssh_profile_provisioning(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// Makes the preparing window visible")
+            })
+            .map(|(body, _)| body)
+            .expect("the start path should remain inspectable");
+        let placeholder = resolve
+            .find("begin_ssh_provisioning_preparing(")
+            .expect("the start must publish a placeholder before it downloads");
+        let download = resolve
+            .find("download_server_artifact_for_os(")
+            .expect("the start still downloads the artifact");
+        assert!(
+            placeholder < download,
+            "the dialog has to be claimed before the download, not after it"
+        );
+        assert!(
+            resolve.contains("PreparingStage::new("),
+            "each stage must be published so the detail line follows the work"
+        );
+
+        let preparing = source
+            .split_once("    fn begin_ssh_provisioning_preparing(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn poll_ssh_provisioning_preparing("))
+            .map(|(body, _)| body)
+            .expect("the preparing window should remain inspectable");
+        assert!(preparing.contains("ProvisioningSnapshot::preparing("));
+        assert!(preparing.contains("PREPARING_ATTEMPT_ID"));
+        assert!(
+            preparing.contains("sync_ssh_provisioning_settings(cx)"),
+            "the settings page owns the dialog; the placeholder has to reach it"
+        );
+
+        // The service's first real snapshot replaces the placeholder instead of
+        // blanking the dialog for the frames in between.
+        let start = source
+            .split_once("    fn start_ssh_provisioning(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn bind_ssh_profile_runtime("))
+            .map(|(body, _)| body)
+            .expect("the provisioning start path should remain inspectable");
+        assert!(
+            start.contains("PREPARING_ATTEMPT_ID"),
+            "the handoff must keep the placeholder on screen until the worker reports"
+        );
+
+        // Closing the dialog during the download must survive the handoff: the
+        // placeholder and the service's first snapshot are one run to the
+        // reader, so a dismissal keyed only to the placeholder id would let the
+        // dialog reopen by itself at step one.
+        let sync = source
+            .split_once("    fn sync_ssh_provisioning_settings(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    fn finish_ssh_provisioning(")
+            })
+            .map(|(body, _)| body)
+            .expect("the settings sync should remain inspectable");
+        assert!(
+            sync.contains("connections_progress_dismissed = Some((profile_id.clone(), attempt_id))"),
+            "a dismissed placeholder has to suppress the run it became"
+        );
+    }
+
+    /// A paired SSH runtime reaches the panel it was added from.
+    ///
+    /// Pairing writes the registry from the provisioning worker thread, so the
+    /// workbench's copy — read once at boot — never learned about the new
+    /// runtime. The row was missing from Remote instances with nothing to
+    /// switch to, and `mark_runtime_active` then named an id the registry did
+    /// not hold, which `validate` rejects and the save fails as a whole.
+    #[test]
+    fn a_newly_paired_ssh_runtime_reaches_the_remote_instance_list() {
+        let source = include_str!("app.rs");
+        let install = source
+            .split_once("    fn install_remote_client(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn park_local_runtime("))
+            .map(|(body, _)| body)
+            .expect("the remote install path should remain inspectable");
+        let reload = install
+            .find("self.runtime_registry = store.load_or_migrate();")
+            .expect("the install path must reload the registry the pairing wrote");
+        let activate = install
+            .find("self.mark_runtime_active(&runtime_id, cx);")
+            .unwrap_or_else(|| {
+                panic!("the install path must still activate the runtime")
+            });
+        assert!(
+            reload < activate,
+            "the registry has to contain the runtime before it becomes active"
+        );
+        assert!(
+            install.contains("upsert(client.credential.clone()"),
+            "a pairing that never reached the store still needs a row"
+        );
     }
 
     #[test]

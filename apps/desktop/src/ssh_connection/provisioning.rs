@@ -169,6 +169,41 @@ pub struct ProvisioningSnapshot {
     pub updated_at_ms: i64,
 }
 
+impl ProvisioningSnapshot {
+    /// A snapshot for the window before the coordinator exists.
+    ///
+    /// A run begins with work the coordinator never sees: the SSH probe, the
+    /// signed manifest, and the 38 MB artifact download all happen before
+    /// `ProvisioningService::start`. That window is minutes long on a slow
+    /// link, and without a snapshot for it the dialog has nothing to render,
+    /// the row has nothing to cancel, and an add looks like a no-op until the
+    /// first real step arrives. `attempt_id` is the caller's to choose, and
+    /// `0` keeps it clear of the coordinator's own ids so the service's first
+    /// snapshot replaces this placeholder instead of stacking a second attempt.
+    pub fn preparing(
+        profile_id: impl Into<String>,
+        attempt_id: u64,
+        detail: impl Into<String>,
+        now_ms: i64,
+    ) -> Self {
+        let detail = detail.into();
+        let detail = detail.trim();
+        Self {
+            profile_id: profile_id.into(),
+            attempt_id,
+            step: ProvisioningStep::ResolvingHost,
+            status: ProvisioningStatus::Running,
+            failure: None,
+            detail: (!detail.is_empty()).then(|| head_chars(detail, MAX_DETAIL_CHARS)),
+            progress: None,
+            cancel_requested: false,
+            active_runtime_id: None,
+            started_at_ms: now_ms,
+            updated_at_ms: now_ms,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProvisioningUpdate {
     pub snapshot: ProvisioningSnapshot,
@@ -830,6 +865,42 @@ mod tests {
                 .is_err()
         );
         assert!(machine.ready("runtime-1", 10).is_ok());
+    }
+
+    /// The window before the coordinator exists still has a snapshot to draw.
+    ///
+    /// A run starts with the SSH probe, the signed manifest and the artifact
+    /// download, all before `ProvisioningService::start`. Without a placeholder
+    /// the dialog had nothing to render and an add looked inert for minutes;
+    /// the placeholder is a running attempt at the first step so the dialog and
+    /// the row's Cancel have something to act on from the first frame.
+    #[test]
+    fn a_preparing_placeholder_renders_before_the_coordinator_exists() {
+        let snapshot =
+            ProvisioningSnapshot::preparing("profile-1", 0, "Checking the host over SSH…", 5);
+        assert_eq!(snapshot.profile_id, "profile-1");
+        assert_eq!(snapshot.attempt_id, 0);
+        assert_eq!(snapshot.step, ProvisioningStep::ResolvingHost);
+        assert_eq!(snapshot.status, ProvisioningStatus::Running);
+        assert!(!snapshot.status.is_terminal());
+        assert!(!snapshot.cancel_requested);
+        assert_eq!(
+            snapshot.detail.as_deref(),
+            Some("Checking the host over SSH…")
+        );
+        assert_eq!(snapshot.started_at_ms, 5);
+
+        // The id must not collide with a real attempt, or the service's first
+        // snapshot would read as a second run for the same profile.
+        let mut coordinator = ProvisioningCoordinator::default();
+        let ProvisioningBegin::Started(first) = coordinator.begin("profile-1", 0).unwrap() else {
+            panic!("the first begin should start an attempt");
+        };
+        assert_ne!(first.snapshot.attempt_id, snapshot.attempt_id);
+
+        // A blank detail is allowed and must not produce an empty line.
+        let bare = ProvisioningSnapshot::preparing("profile-1", 0, "   ", 5);
+        assert_eq!(bare.detail, None);
     }
 
     #[test]

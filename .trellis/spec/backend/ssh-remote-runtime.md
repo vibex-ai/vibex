@@ -375,6 +375,148 @@ VibexWorkbench::start_ssh_provisioning(/* … */)   // gpui_tokio::Tokio::handle
 - `ssh_connection::service::tests::runs_effects_on_the_worker_and_emits_updates`
 - `ssh_connection::service::tests::cancel_stops_the_worker_before_the_next_effect`
 
+## Scenario: The window before the coordinator exists
+
+### 1. Scope / Trigger
+
+- Any change to `resolve_ssh_profile_provisioning`, the progress dialog's
+  open/dismiss state, or the row's Cancel action.
+- A report that adding an SSH connection "does nothing" for a while and only
+  later jumps into the step graph, or that Cancel does nothing on a fresh add.
+
+### 2. Signatures
+
+```rust
+// apps/desktop/src/ssh_connection/provisioning.rs
+ProvisioningSnapshot::preparing(profile_id, attempt_id, detail, now_ms) -> ProvisioningSnapshot
+
+// apps/desktop/src/app.rs
+const PREPARING_ATTEMPT_ID: u64 = 0;
+VibexWorkbench::begin_ssh_provisioning_preparing(profile_id, stage, cx)
+VibexWorkbench::poll_ssh_provisioning_preparing(&stage, cx) -> Option<bool>
+VibexWorkbench::end_ssh_provisioning_preparing()            // handoff, keeps the placeholder
+VibexWorkbench::discard_ssh_provisioning_preparing(cx)      // failure/cancel, removes it
+```
+
+### 3. Contracts
+
+- A deployment starts with work the coordinator never sees: the SSH probe, the
+  signed manifest, and the ~38 MB artifact download all run **before**
+  `ProvisioningService::start`. That window is minutes long on a slow link.
+- The preparing placeholder is a `ProvisioningStatus::Running` snapshot at
+  `ProvisioningStep::ResolvingHost` carrying `PREPARING_ATTEMPT_ID` (`0`). The
+  coordinator's ids start at `1`, so the service's first snapshot *replaces*
+  the placeholder rather than reading as a second attempt.
+- The placeholder is published **before** the download starts, so the dialog
+  and the row's Cancel act from the first frame.
+- `ssh_provisioning_resolving` counts as owning the single provisioning slot:
+  the pump must not start a second profile beside a start task.
+- `cancel_ssh_provisioning` has two paths. With a service, it requests
+  cancellation. Without one but with `ssh_provisioning_resolving` set, it drops
+  the start task (aborting the download future) and releases the slot.
+- The success handoff keeps the placeholder until the worker's first snapshot
+  arrives; blanking it there would render "No provisioning is running" for the
+  frames in between. A failed or cancelled start has no successor, so it is
+  discarded.
+- A dismissal during the download survives the handoff: a `dismissed` entry
+  keyed to `PREPARING_ATTEMPT_ID` is carried to the service's real `attempt_id`
+  when the first snapshot lands.
+
+### 4. Validation & Error Matrix
+
+| Condition | Behaviour |
+| --- | --- |
+| add submitted, download running | dialog open at step 1/9 with a live detail line |
+| Cancel during the download | start task dropped, row returns to Offline |
+| Cancel after the service started | service cancellation, as before |
+| dialog closed during the download | stays closed when the worker reports step 1 |
+| start fails (probe, manifest, download) | placeholder removed, hint carries the error |
+
+### 5. Good / Base / Bad
+
+- Good: `begin_ssh_provisioning_preparing(...)` before
+  `download_server_artifact_for_os(...)`, with `PreparingStage::new(...)`
+  published at each slow step.
+- Base: the poller re-reads the shared stage every 120 ms and only calls
+  `sync_ssh_provisioning_settings` when the step or detail actually changed.
+- Bad: rendering only coordinator snapshots. The dialog then has nothing to
+  show until the service starts, which is exactly the "click does nothing"
+  report this scenario exists for.
+
+### 6. Tests Required
+
+- `ssh_connection::provisioning::tests::a_preparing_placeholder_renders_before_the_coordinator_exists`
+  — the placeholder is running, non-terminal, at step 1, and its id cannot
+  collide with a real attempt.
+- `app::tests::the_progress_dialog_appears_before_the_artifact_download_finishes`
+  — the placeholder is published before the download; the handoff keeps it; a
+  dismissed placeholder suppresses the run it became.
+
+## Scenario: A paired runtime must reach the instance list
+
+### 1. Scope / Trigger
+
+- Any change to `install_remote_client`, `claim_and_register`, the runtime
+  registry, or `mark_runtime_active`.
+- A report that a newly added SSH connection works but has no row in the
+  **Remote instances** panel, so there is nothing to switch to.
+
+### 2. Signatures
+
+```rust
+// apps/desktop/src/ssh_connection/pairing.rs — runs on the provisioning worker
+claim_and_register(...) -> Result<PairingOutcome, PairingError>  // writes the registry to disk
+
+// apps/desktop/src/remote_client.rs
+DesktopRuntimeRegistryStore::load_or_migrate() -> DesktopRuntimeRegistry
+DesktopRuntimeRegistry::upsert(credential, now_ms) -> String
+DesktopRuntimeRegistry::validate() -> BackendResult<()>
+
+// apps/desktop/src/app.rs
+VibexWorkbench::install_remote_client(client, cx)
+VibexWorkbench::mark_runtime_active(id, cx)
+```
+
+### 3. Contracts
+
+- **The registry on disk is the authority for which runtimes exist.** Pairing
+  writes it from the provisioning worker thread, on another thread, while the
+  workbench holds a copy read once at boot. Every install path must reload it
+  before activating anything.
+- `install_remote_client` reloads via `runtime_registry_store.load_or_migrate()`
+  and, if the id is still absent, `upsert`s the credential in hand. A pairing
+  that never reached the store must not produce a runtime the panel cannot
+  list.
+- The reload has to happen **before** `mark_runtime_active`: `set_active` on an
+  id the registry does not contain fails `validate`, and `persist` then rejects
+  the whole file — so the row never appears and the active runtime is never
+  recorded.
+- The panel renders `self.runtime_registry.runtimes`; there is no second source
+  of truth and no polling of the file.
+
+### 4. Validation & Error Matrix
+
+| Condition | Behaviour |
+| --- | --- |
+| pairing wrote the registry | reload finds it; the row appears and can be switched to |
+| pairing succeeded but the write failed | `upsert` from the in-hand credential, then persist |
+| registry file invalid | `load_or_migrate` falls back to legacy migration or default |
+| activation before the reload | `validate` rejects, save fails, no row ever appears |
+
+### 5. Good / Base / Bad
+
+- Good: reload in `install_remote_client` before `mark_runtime_active`, then
+  `upsert` only as a fallback.
+- Base: the WSL path already reloaded after its own pairing; SSH did not.
+- Bad: trusting the boot-time copy. The runtime connects and drives the
+  workbench, yet the panel shows only the local runtime and the user cannot
+  switch back to it.
+
+### 6. Tests Required
+
+- `app::tests::a_newly_paired_ssh_runtime_reaches_the_remote_instance_list` —
+  the reload precedes activation, and the upsert fallback is present.
+
 ## Testing Gotchas
 
 - Fake executables (`ssh`, `ssh-keygen`, `wsl.exe`) must be written with
