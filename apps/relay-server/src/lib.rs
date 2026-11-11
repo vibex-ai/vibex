@@ -1,11 +1,11 @@
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use axum::extract::rejection::JsonRejection;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{DefaultBodyLimit, Path, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, State};
 use axum::http::header::AUTHORIZATION;
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
@@ -45,6 +45,11 @@ pub struct RelayServerConfig {
     pub max_requests_per_window_per_room: usize,
     pub max_queue_bytes_per_connection: usize,
     pub max_bandwidth_bytes_per_window: usize,
+    pub max_connections_per_ip: usize,
+    pub max_connection_attempts_per_ip_per_window: usize,
+    pub max_room_creates_per_ip_per_window: usize,
+    pub ip_rate_limit_window_ms: i64,
+    pub max_tracked_client_ips: usize,
     pub max_push_installations: usize,
     pub max_push_dedup_entries: usize,
     pub push_adapter_timeout_ms: i64,
@@ -83,6 +88,17 @@ impl std::fmt::Debug for RelayServerConfig {
                 "max_bandwidth_bytes_per_window",
                 &self.max_bandwidth_bytes_per_window,
             )
+            .field("max_connections_per_ip", &self.max_connections_per_ip)
+            .field(
+                "max_connection_attempts_per_ip_per_window",
+                &self.max_connection_attempts_per_ip_per_window,
+            )
+            .field(
+                "max_room_creates_per_ip_per_window",
+                &self.max_room_creates_per_ip_per_window,
+            )
+            .field("ip_rate_limit_window_ms", &self.ip_rate_limit_window_ms)
+            .field("max_tracked_client_ips", &self.max_tracked_client_ips)
             .field("max_push_installations", &self.max_push_installations)
             .field("max_push_dedup_entries", &self.max_push_dedup_entries)
             .field("push_adapter_timeout_ms", &self.push_adapter_timeout_ms)
@@ -149,6 +165,26 @@ impl RelayServerConfig {
             "VIBEX_RELAY_MAX_BANDWIDTH_BYTES_PER_WINDOW",
         )?;
         apply_env_usize(
+            &mut config.max_connections_per_ip,
+            "VIBEX_RELAY_MAX_CONNECTIONS_PER_IP",
+        )?;
+        apply_env_usize(
+            &mut config.max_connection_attempts_per_ip_per_window,
+            "VIBEX_RELAY_MAX_CONNECTION_ATTEMPTS_PER_IP_PER_WINDOW",
+        )?;
+        apply_env_usize(
+            &mut config.max_room_creates_per_ip_per_window,
+            "VIBEX_RELAY_MAX_ROOM_CREATES_PER_IP_PER_WINDOW",
+        )?;
+        apply_env_i64(
+            &mut config.ip_rate_limit_window_ms,
+            "VIBEX_RELAY_IP_RATE_LIMIT_WINDOW_MS",
+        )?;
+        apply_env_usize(
+            &mut config.max_tracked_client_ips,
+            "VIBEX_RELAY_MAX_TRACKED_CLIENT_IPS",
+        )?;
+        apply_env_usize(
             &mut config.max_push_installations,
             "VIBEX_RELAY_MAX_PUSH_INSTALLATIONS",
         )?;
@@ -200,6 +236,11 @@ impl RelayServerConfig {
             || self.max_requests_per_window_per_room == 0
             || self.max_queue_bytes_per_connection == 0
             || self.max_bandwidth_bytes_per_window == 0
+            || self.max_connections_per_ip == 0
+            || self.max_connection_attempts_per_ip_per_window == 0
+            || self.max_room_creates_per_ip_per_window == 0
+            || self.ip_rate_limit_window_ms <= 0
+            || self.max_tracked_client_ips == 0
             || self.max_push_installations == 0
             || self.max_push_dedup_entries == 0
             || self.push_adapter_timeout_ms <= 0
@@ -322,6 +363,14 @@ impl Default for RelayServerConfig {
             max_requests_per_window_per_room: 120,
             max_queue_bytes_per_connection: 4 * 1024 * 1024,
             max_bandwidth_bytes_per_window: 16 * 1024 * 1024,
+            // Per-client-address admission. The relay is a public endpoint, so
+            // a single address must not be able to occupy the room or
+            // connection budget on its own.
+            max_connections_per_ip: 32,
+            max_connection_attempts_per_ip_per_window: 120,
+            max_room_creates_per_ip_per_window: 20,
+            ip_rate_limit_window_ms: 60 * 1000,
+            max_tracked_client_ips: 65_536,
             max_push_installations: 256,
             max_push_dedup_entries: 4096,
             push_adapter_timeout_ms: 10_000,
@@ -389,6 +438,11 @@ pub struct RelayServerLimits {
     pub max_requests_per_window_per_room: usize,
     pub max_queue_bytes_per_connection: usize,
     pub max_bandwidth_bytes_per_window: usize,
+    pub max_connections_per_ip: usize,
+    pub max_connection_attempts_per_ip_per_window: usize,
+    pub max_room_creates_per_ip_per_window: usize,
+    pub ip_rate_limit_window_ms: i64,
+    pub max_tracked_client_ips: usize,
     pub max_push_installations: usize,
     pub max_push_dedup_entries: usize,
     pub push_adapter_timeout_ms: i64,
@@ -412,11 +466,66 @@ impl Drop for WebSocketConnectionGuard {
     }
 }
 
+/// Admission guard for one client address.
+///
+/// The per-address counters live behind a synchronous mutex because they are
+/// only ever touched for a short, await-free critical section — including from
+/// `Drop`, which cannot await a Tokio mutex.
+struct ClientIpConnectionGuard {
+    state: RelayServerState,
+    ip: Option<IpAddr>,
+}
+
+impl Drop for ClientIpConnectionGuard {
+    fn drop(&mut self) {
+        let Some(ip) = self.ip else {
+            return;
+        };
+        let mut limits = self.state.client_ip_limits();
+        if let Some(entry) = limits.entries.get_mut(&ip) {
+            entry.active_connections = entry.active_connections.saturating_sub(1);
+        }
+    }
+}
+
+#[derive(Default)]
+struct ClientIpLimits {
+    entries: HashMap<IpAddr, ClientIpLimitEntry>,
+    last_pruned_at_ms: i64,
+}
+
+struct ClientIpLimitEntry {
+    active_connections: usize,
+    connection_window: RateWindow,
+    room_window: RateWindow,
+    last_seen_at_ms: i64,
+}
+
+impl ClientIpLimitEntry {
+    fn new(now: i64) -> Self {
+        Self {
+            active_connections: 0,
+            connection_window: RateWindow {
+                started_at_ms: now,
+                count: 0,
+            },
+            room_window: RateWindow {
+                started_at_ms: now,
+                count: 0,
+            },
+            last_seen_at_ms: now,
+        }
+    }
+}
+
 struct RelayServerInner {
     config: RelayServerConfig,
     started_at_ms: i64,
     active_connections: AtomicUsize,
     rooms: Mutex<HashMap<RelayRoomId, RoomState>>,
+    /// Per-client-address admission state. Kept separate from `rooms` so a
+    /// rejected connection never has to take the room lock.
+    client_ip_limits: std::sync::Mutex<ClientIpLimits>,
     push: Mutex<PushState>,
     push_client: reqwest::Client,
 }
@@ -538,6 +647,7 @@ impl RelayServerState {
                 started_at_ms: unix_timestamp_ms(),
                 active_connections: AtomicUsize::new(0),
                 rooms: Mutex::new(HashMap::new()),
+                client_ip_limits: std::sync::Mutex::new(ClientIpLimits::default()),
                 push: Mutex::new(PushState::default()),
                 push_client: reqwest::Client::builder()
                     .redirect(reqwest::redirect::Policy::none())
@@ -585,6 +695,123 @@ impl RelayServerState {
         }
     }
 
+    /// Locks the per-client-address table, recovering from a poisoned mutex.
+    ///
+    /// A panic elsewhere must not turn admission into a hard failure: the
+    /// counters are advisory limits, not a source of truth.
+    fn client_ip_limits(&self) -> std::sync::MutexGuard<'_, ClientIpLimits> {
+        self.inner
+            .client_ip_limits
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Drops stale address entries so a long-running public relay cannot grow
+    /// the table without bound. Entries for addresses that still hold a
+    /// connection are always kept.
+    fn prune_client_ip_limits_locked(&self, limits: &mut ClientIpLimits, now: i64) {
+        let config = self.config();
+        let retention_ms = config.ip_rate_limit_window_ms.saturating_mul(2).max(1);
+        if now - limits.last_pruned_at_ms < config.ip_rate_limit_window_ms {
+            return;
+        }
+        limits.last_pruned_at_ms = now;
+        limits.entries.retain(|_, entry| {
+            entry.active_connections > 0 || now - entry.last_seen_at_ms <= retention_ms
+        });
+    }
+
+    /// Charges one connection attempt to `ip` and reserves a concurrent slot.
+    ///
+    /// `None` means the address could not be attributed — a loopback peer with
+    /// no forwarding header, as in-process tests and local tooling use — and is
+    /// admitted without per-address accounting.
+    fn reserve_client_ip_connection(
+        &self,
+        ip: Option<IpAddr>,
+    ) -> Result<ClientIpConnectionGuard, RelayServerError> {
+        let Some(ip) = ip else {
+            return Ok(ClientIpConnectionGuard {
+                state: self.clone(),
+                ip: None,
+            });
+        };
+        let config = self.config();
+        let now = unix_timestamp_ms();
+        let mut limits = self.client_ip_limits();
+        self.prune_client_ip_limits_locked(&mut limits, now);
+        if !limits.entries.contains_key(&ip)
+            && limits.entries.len() >= config.max_tracked_client_ips
+        {
+            return Err(RelayServerError::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                RelayErrorCode::RateLimit,
+                "relay client address table is exhausted",
+            ));
+        }
+        let entry = limits
+            .entries
+            .entry(ip)
+            .or_insert_with(|| ClientIpLimitEntry::new(now));
+        entry.last_seen_at_ms = now;
+        if !allow_window(
+            &mut entry.connection_window,
+            now,
+            config.ip_rate_limit_window_ms,
+            config.max_connection_attempts_per_ip_per_window,
+        ) {
+            return Err(RelayServerError::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                RelayErrorCode::RateLimit,
+                "relay connection attempts from this address are rate limited",
+            ));
+        }
+        if entry.active_connections >= config.max_connections_per_ip {
+            return Err(RelayServerError::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                RelayErrorCode::ConnectionLimit,
+                "relay connection limit for this address is exhausted",
+            ));
+        }
+        entry.active_connections += 1;
+        Ok(ClientIpConnectionGuard {
+            state: self.clone(),
+            ip: Some(ip),
+        })
+    }
+
+    /// Charges one room creation to `ip`.
+    ///
+    /// Without this a single address could register rooms until the global
+    /// room budget was gone, which is the cheap denial-of-service this guards.
+    fn reserve_client_ip_room(&self, ip: Option<IpAddr>) -> Result<(), RelayServerError> {
+        let Some(ip) = ip else {
+            return Ok(());
+        };
+        let config = self.config();
+        let now = unix_timestamp_ms();
+        let mut limits = self.client_ip_limits();
+        self.prune_client_ip_limits_locked(&mut limits, now);
+        let entry = limits
+            .entries
+            .entry(ip)
+            .or_insert_with(|| ClientIpLimitEntry::new(now));
+        entry.last_seen_at_ms = now;
+        if !allow_window(
+            &mut entry.room_window,
+            now,
+            config.ip_rate_limit_window_ms,
+            config.max_room_creates_per_ip_per_window,
+        ) {
+            return Err(RelayServerError::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                RelayErrorCode::RateLimit,
+                "relay room creation from this address is rate limited",
+            ));
+        }
+        Ok(())
+    }
+
     async fn health(&self) -> RelayHealthStatus {
         let mut rooms = self.inner.rooms.lock().await;
         self.prune_locked(&mut rooms, unix_timestamp_ms());
@@ -628,6 +855,12 @@ impl RelayServerState {
                 max_requests_per_window_per_room: config.max_requests_per_window_per_room,
                 max_queue_bytes_per_connection: config.max_queue_bytes_per_connection,
                 max_bandwidth_bytes_per_window: config.max_bandwidth_bytes_per_window,
+                max_connections_per_ip: config.max_connections_per_ip,
+                max_connection_attempts_per_ip_per_window: config
+                    .max_connection_attempts_per_ip_per_window,
+                max_room_creates_per_ip_per_window: config.max_room_creates_per_ip_per_window,
+                ip_rate_limit_window_ms: config.ip_rate_limit_window_ms,
+                max_tracked_client_ips: config.max_tracked_client_ips,
                 max_push_installations: config.max_push_installations,
                 max_push_dedup_entries: config.max_push_dedup_entries,
                 push_adapter_timeout_ms: config.push_adapter_timeout_ms,
@@ -641,7 +874,11 @@ impl RelayServerState {
         peer_id: RelayPeerId,
         pc_sender: mpsc::Sender<String>,
         pc_queued_bytes: std::sync::Arc<AtomicUsize>,
+        client_ip: Option<IpAddr>,
     ) -> Result<RelayConnectionId, RelayServerError> {
+        // Charge the attempt before looking at the room table so a single
+        // address cannot walk the namespace for free.
+        self.reserve_client_ip_room(client_ip)?;
         let now = unix_timestamp_ms();
         let mut rooms = self.inner.rooms.lock().await;
         self.prune_locked(&mut rooms, now);
@@ -1113,24 +1350,38 @@ impl RelayServerState {
 
 impl RoomState {
     fn accept_rate(&mut self, now: i64, config: &RelayServerConfig) -> bool {
-        if config.rate_limit_window_ms <= 0 || config.max_requests_per_window_per_room == 0 {
-            return true;
-        }
-        if now - self.rate_window.started_at_ms >= config.rate_limit_window_ms {
-            self.rate_window.started_at_ms = now;
-            self.rate_window.count = 0;
-        }
-        if self.rate_window.count >= config.max_requests_per_window_per_room {
-            return false;
-        }
-        self.rate_window.count += 1;
-        true
+        allow_window(
+            &mut self.rate_window,
+            now,
+            config.rate_limit_window_ms,
+            config.max_requests_per_window_per_room,
+        )
     }
 
     fn prune_pending(&mut self, now: i64, timeout_ms: i64) {
         self.pending
             .retain(|_, pending| now - pending.created_at_ms <= timeout_ms);
     }
+}
+
+/// Charges one event to a fixed-window counter.
+///
+/// A non-positive window or a zero limit disables the check, which keeps the
+/// "limits must be positive" invariant enforceable at configuration time
+/// rather than silently here.
+fn allow_window(window: &mut RateWindow, now: i64, window_ms: i64, limit: usize) -> bool {
+    if window_ms <= 0 || limit == 0 {
+        return true;
+    }
+    if now - window.started_at_ms >= window_ms {
+        window.started_at_ms = now;
+        window.count = 0;
+    }
+    if window.count >= limit {
+        return false;
+    }
+    window.count += 1;
+    true
 }
 
 fn allow_bandwidth(
@@ -1493,8 +1744,48 @@ fn valid_opaque_id(value: &str, max_len: usize) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
-async fn ws(State(state): State<RelayServerState>, upgrade: WebSocketUpgrade) -> Response {
+/// Resolves the address the per-address limits are charged to.
+///
+/// The relay is meant to sit behind a loopback-bound reverse proxy, and only
+/// then is `X-Forwarded-For` trustworthy. A direct peer is charged to its own
+/// address and its forwarding header is ignored, so it cannot spoof its way
+/// around the limits. Within the header the right-most entry is the one the
+/// immediate proxy wrote, which is the address that actually connected to it —
+/// true whether the proxy replaces or appends.
+fn client_ip_from_request(peer: SocketAddr, headers: &HeaderMap) -> Option<IpAddr> {
+    if !peer.ip().is_loopback() {
+        return Some(peer.ip());
+    }
+    forwarded_client_ip(headers)
+}
+
+fn forwarded_client_ip(headers: &HeaderMap) -> Option<IpAddr> {
+    let value = headers.get("x-forwarded-for")?.to_str().ok()?;
+    parse_forwarded_entry(value.rsplit(',').next()?)
+}
+
+fn parse_forwarded_entry(value: &str) -> Option<IpAddr> {
+    let value = value.trim();
+    if let Ok(ip) = value.parse::<IpAddr>() {
+        return Some(ip);
+    }
+    // `host:port` is not what the header is specified to carry, but a proxy
+    // that emits it should not silently disable the limit for that request.
+    value.parse::<SocketAddr>().ok().map(|addr| addr.ip())
+}
+
+async fn ws(
+    State(state): State<RelayServerState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    upgrade: WebSocketUpgrade,
+) -> Response {
+    let client_ip = client_ip_from_request(peer, &headers);
     let guard = match state.reserve_connection() {
+        Ok(guard) => guard,
+        Err(error) => return error.into_response(),
+    };
+    let ip_guard = match state.reserve_client_ip_connection(client_ip) {
         Ok(guard) => guard,
         Err(error) => return error.into_response(),
     };
@@ -1504,7 +1795,8 @@ async fn ws(State(state): State<RelayServerState>, upgrade: WebSocketUpgrade) ->
         .max_frame_size(max_message_bytes)
         .on_upgrade(move |socket| async move {
             let _guard = guard;
-            handle_socket(socket, state).await;
+            let _ip_guard = ip_guard;
+            handle_socket(socket, state, client_ip).await;
         })
         .into_response()
 }
@@ -1628,7 +1920,7 @@ async fn command(
     }
 }
 
-async fn handle_socket(socket: WebSocket, state: RelayServerState) {
+async fn handle_socket(socket: WebSocket, state: RelayServerState, client_ip: Option<IpAddr>) {
     let (mut ws_sender, mut ws_receiver) = socket.split();
     let first_frame = match timeout(
         Duration::from_millis(state.config().bridge_timeout_ms.max(1) as u64),
@@ -1678,6 +1970,7 @@ async fn handle_socket(socket: WebSocket, state: RelayServerState) {
             peer_id,
             outbound_tx.clone(),
             queued_bytes.clone(),
+            client_ip,
         )
         .await
     {
@@ -2037,6 +2330,7 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio_tungstenite::connect_async;
     use tokio_tungstenite::tungstenite::Message as ClientMessage;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     use tower::ServiceExt;
     use vibex_core::{
         RelayFrameId, RelayHandshakeHello, RelayHandshakeReady, RelayHeartbeat, RelaySessionId,
@@ -2071,6 +2365,19 @@ mod tests {
             info.limits.max_total_connections,
             test_config().max_total_connections
         );
+        // The per-address admission limits are part of the public contract.
+        assert_eq!(
+            info.limits.max_connections_per_ip,
+            test_config().max_connections_per_ip
+        );
+        assert_eq!(
+            info.limits.max_room_creates_per_ip_per_window,
+            test_config().max_room_creates_per_ip_per_window
+        );
+        assert_eq!(
+            info.limits.ip_rate_limit_window_ms,
+            test_config().ip_rate_limit_window_ms
+        );
     }
 
     #[tokio::test]
@@ -2085,6 +2392,7 @@ mod tests {
                 pc_peer_id,
                 pc_sender,
                 std::sync::Arc::new(AtomicUsize::new(0)),
+                None,
             )
             .await
             .unwrap();
@@ -2765,7 +3073,12 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
-            axum::serve(listener, router).await.unwrap();
+            axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
         });
         format!("ws://{addr}/ws")
     }
@@ -2927,5 +3240,194 @@ mod tests {
             ciphertext: ciphertext.to_string(),
             ..encrypted_frame(room_id, RelayFrameKind::Response, ciphertext)
         }
+    }
+
+    #[test]
+    fn forwarded_client_ip_prefers_the_address_the_proxy_observed() {
+        // Only the immediate proxy's own entry is trustworthy, and that is the
+        // right-most one whether the proxy appends or replaces.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            HeaderValue::from_static("198.51.100.9, 203.0.113.7"),
+        );
+        assert_eq!(
+            client_ip_from_request("127.0.0.1:5000".parse().unwrap(), &headers),
+            Some("203.0.113.7".parse().unwrap())
+        );
+        assert_eq!(
+            client_ip_from_request("[::1]:5000".parse().unwrap(), &headers),
+            Some("203.0.113.7".parse().unwrap())
+        );
+
+        // A direct peer keeps its own address; a header it sent is ignored so
+        // it cannot claim someone else's budget.
+        assert_eq!(
+            client_ip_from_request("203.0.113.200:5000".parse().unwrap(), &headers),
+            Some("203.0.113.200".parse().unwrap())
+        );
+
+        // Nothing to attribute means no per-address accounting, which is how
+        // in-process callers and local tooling reach the relay.
+        assert_eq!(
+            client_ip_from_request("127.0.0.1:5000".parse().unwrap(), &HeaderMap::new()),
+            None
+        );
+
+        let mut malformed = HeaderMap::new();
+        malformed.insert(
+            "x-forwarded-for",
+            HeaderValue::from_static("not-an-address"),
+        );
+        assert_eq!(
+            client_ip_from_request("127.0.0.1:5000".parse().unwrap(), &malformed),
+            None
+        );
+
+        let mut with_port = HeaderMap::new();
+        with_port.insert(
+            "x-forwarded-for",
+            HeaderValue::from_static("203.0.113.7:443"),
+        );
+        assert_eq!(
+            client_ip_from_request("127.0.0.1:5000".parse().unwrap(), &with_port),
+            Some("203.0.113.7".parse().unwrap())
+        );
+    }
+
+    #[tokio::test]
+    async fn per_address_connection_budget_is_released_when_the_guard_drops() {
+        let mut config = test_config();
+        config.max_connections_per_ip = 1;
+        config.max_connection_attempts_per_ip_per_window = 10;
+        let state = RelayServerState::new(config);
+        let ip: IpAddr = "203.0.113.7".parse().unwrap();
+
+        let guard = state.reserve_client_ip_connection(Some(ip)).unwrap();
+        let refused = expect_refused(state.reserve_client_ip_connection(Some(ip)));
+        assert_eq!(refused.status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(refused.code, RelayErrorCode::ConnectionLimit);
+
+        drop(guard);
+        state
+            .reserve_client_ip_connection(Some(ip))
+            .expect("dropping the guard must return the slot");
+
+        // An unattributed peer is admitted without accounting.
+        state.reserve_client_ip_connection(None).unwrap();
+        state.reserve_client_ip_connection(None).unwrap();
+    }
+
+    #[tokio::test]
+    async fn per_address_connection_attempts_are_rate_limited() {
+        let mut config = test_config();
+        config.max_connections_per_ip = 64;
+        config.max_connection_attempts_per_ip_per_window = 2;
+        config.ip_rate_limit_window_ms = 60_000;
+        let state = RelayServerState::new(config);
+        let ip: IpAddr = "203.0.113.7".parse().unwrap();
+
+        let _first = state.reserve_client_ip_connection(Some(ip)).unwrap();
+        let _second = state.reserve_client_ip_connection(Some(ip)).unwrap();
+        let refused = expect_refused(state.reserve_client_ip_connection(Some(ip)));
+        assert_eq!(refused.code, RelayErrorCode::RateLimit);
+
+        // The attempt window is per address.
+        state
+            .reserve_client_ip_connection(Some("203.0.113.8".parse().unwrap()))
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn per_address_room_creation_is_rate_limited() {
+        let mut config = test_config();
+        config.max_room_creates_per_ip_per_window = 1;
+        config.ip_rate_limit_window_ms = 60_000;
+        let state = RelayServerState::new(config);
+        let ip: IpAddr = "203.0.113.7".parse().unwrap();
+
+        state.reserve_client_ip_room(Some(ip)).unwrap();
+        let refused = state.reserve_client_ip_room(Some(ip)).unwrap_err();
+        assert_eq!(refused.status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(refused.code, RelayErrorCode::RateLimit);
+
+        state
+            .reserve_client_ip_room(Some("203.0.113.8".parse().unwrap()))
+            .unwrap();
+        state.reserve_client_ip_room(None).unwrap();
+        state.reserve_client_ip_room(None).unwrap();
+    }
+
+    #[tokio::test]
+    async fn address_table_cap_refuses_new_addresses_but_keeps_known_ones() {
+        let mut config = test_config();
+        config.max_tracked_client_ips = 1;
+        config.ip_rate_limit_window_ms = 60_000;
+        let state = RelayServerState::new(config);
+
+        state
+            .reserve_client_ip_connection(Some("203.0.113.7".parse().unwrap()))
+            .unwrap();
+        let refused = expect_refused(
+            state.reserve_client_ip_connection(Some("203.0.113.8".parse().unwrap())),
+        );
+        assert_eq!(refused.code, RelayErrorCode::RateLimit);
+
+        // The address already in the table keeps working.
+        state
+            .reserve_client_ip_connection(Some("203.0.113.7".parse().unwrap()))
+            .unwrap();
+    }
+
+    /// The guard type deliberately carries no `Debug`, so tests assert the
+    /// refusal by pattern rather than `unwrap_err`.
+    fn expect_refused(
+        result: Result<ClientIpConnectionGuard, RelayServerError>,
+    ) -> RelayServerError {
+        match result {
+            Ok(_) => panic!("the client address should have been refused"),
+            Err(error) => error,
+        }
+    }
+
+    async fn connect_forwarded(
+        url: &str,
+        forwarded_for: &str,
+    ) -> tokio_tungstenite::tungstenite::Result<(
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        axum::http::Response<Option<Vec<u8>>>,
+    )> {
+        let mut request = url.into_client_request().unwrap();
+        request.headers_mut().insert(
+            "x-forwarded-for",
+            forwarded_for
+                .parse()
+                .expect("test address is a valid header"),
+        );
+        connect_async(request).await
+    }
+
+    #[tokio::test]
+    async fn websocket_admission_charges_the_forwarded_address() {
+        let mut config = test_config();
+        config.max_connections_per_ip = 1;
+        config.max_connection_attempts_per_ip_per_window = 64;
+        let router = build_router(config);
+        let url = spawn_ws_server(router).await;
+
+        let (mut pc, _) = connect_forwarded(&url, "203.0.113.7").await.unwrap();
+        register_pc(&mut pc, RelayRoomId::new()).await;
+
+        let refused = connect_forwarded(&url, "203.0.113.7").await;
+        assert!(
+            refused.is_err(),
+            "a second websocket from the same forwarded address must be refused"
+        );
+
+        // A different forwarded address still gets its own budget.
+        let (mut other, _) = connect_forwarded(&url, "203.0.113.8").await.unwrap();
+        register_pc(&mut other, RelayRoomId::new()).await;
     }
 }

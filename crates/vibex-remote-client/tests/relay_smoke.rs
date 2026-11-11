@@ -118,9 +118,15 @@ async fn relay_e2ee_remote_v2_handshake_rpc_event_revoke_and_reconnect_smoke() {
     let relay_address = relay_listener.local_addr().unwrap();
     let relay_url = format!("http://{relay_address}");
     let relay_server = tokio::spawn(async move {
-        axum::serve(relay_listener, build_router(RelayServerConfig::default()))
-            .await
-            .unwrap();
+        // The relay resolves the client address from connect info; the smoke
+        // harness has to publish it the same way the binary does.
+        axum::serve(
+            relay_listener,
+            build_router(RelayServerConfig::default())
+                .into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
     });
     let settings = relay_runtime.get_settings().await;
     relay_runtime

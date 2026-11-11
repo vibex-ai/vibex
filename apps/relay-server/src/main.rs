@@ -1,4 +1,5 @@
 use std::error::Error;
+use std::net::SocketAddr;
 
 use tokio::net::TcpListener;
 use vibex_relay_server::{RelayServerConfig, build_router};
@@ -18,6 +19,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let listener = TcpListener::bind(bind_addr).await?;
 
     tracing::info!(%bind_addr, "vibex relay server listening");
-    axum::serve(listener, router).await?;
+    // Connect info carries the direct peer address, which is what decides
+    // whether a forwarding header may be trusted for the per-address limits.
+    axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }

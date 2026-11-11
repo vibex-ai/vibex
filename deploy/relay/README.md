@@ -102,6 +102,11 @@ All hard limits are configurable and the effective values are reported by
 | `VIBEX_RELAY_MAX_REQUESTS_PER_WINDOW_PER_ROOM` | `120` | `maxRequestsPerWindowPerRoom` |
 | `VIBEX_RELAY_MAX_QUEUE_BYTES_PER_CONNECTION` | `4194304` | `maxQueueBytesPerConnection` |
 | `VIBEX_RELAY_MAX_BANDWIDTH_BYTES_PER_WINDOW` | `16777216` | `maxBandwidthBytesPerWindow` |
+| `VIBEX_RELAY_MAX_CONNECTIONS_PER_IP` | `32` | `maxConnectionsPerIp` |
+| `VIBEX_RELAY_MAX_CONNECTION_ATTEMPTS_PER_IP_PER_WINDOW` | `120` | `maxConnectionAttemptsPerIpPerWindow` |
+| `VIBEX_RELAY_MAX_ROOM_CREATES_PER_IP_PER_WINDOW` | `20` | `maxRoomCreatesPerIpPerWindow` |
+| `VIBEX_RELAY_IP_RATE_LIMIT_WINDOW_MS` | `60000` | `ipRateLimitWindowMs` |
+| `VIBEX_RELAY_MAX_TRACKED_CLIENT_IPS` | `65536` | `maxTrackedClientIps` |
 | `VIBEX_RELAY_MAX_PUSH_INSTALLATIONS` | `256` | `maxPushInstallations` |
 | `VIBEX_RELAY_MAX_PUSH_DEDUP_ENTRIES` | `4096` | `maxPushDedupEntries` |
 | `VIBEX_RELAY_PUSH_ADAPTER_TIMEOUT_MS` | `10000` | `pushAdapterTimeoutMs` |
@@ -110,6 +115,26 @@ All hard limits are configurable and the effective values are reported by
 owns a room, while `VIBEX_RELAY_MAX_DEVICES_PER_ROOM` bounds concurrent paired
 device routes. All numeric values must be positive; the push adapter timeout is
 also capped at 60 seconds.
+
+### Per-client-address admission
+
+The relay is a public endpoint, so a single address must not be able to spend
+the room or connection budget on its own. Every websocket handshake is charged
+to its client address, and every room registration is charged to the address
+that opened the PC connection.
+
+The address is resolved from the direct peer. Behind a loopback reverse proxy
+(the deployment this directory documents) the right-most `X-Forwarded-For`
+entry is used, which is the address that connected to that proxy. A direct,
+non-loopback peer is charged to its own address and any forwarding header it
+sent is ignored, so it cannot spoof another client's budget. A loopback peer
+with no forwarding header — in-process callers and local tooling — is admitted
+without per-address accounting.
+
+Entries are pruned two windows after their last connection, and
+`VIBEX_RELAY_MAX_TRACKED_CLIENT_IPS` bounds the table; once it is full, new
+addresses are refused with `relay_rate_limit` while known addresses keep
+working.
 
 ## Optional Push Adapter
 
