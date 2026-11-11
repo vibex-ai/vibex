@@ -13,9 +13,8 @@ use vibex_core::{
     PluginMarketDetail, PluginMarketEntry, PluginMarketIndexRequest, PluginMarketIndexResponse,
     PluginMarketInstallRequest, PluginMarketInstallResult, PluginMarketSearchRequest,
     PluginMarketSearchResponse, PluginMarketVersion, PluginPermission, PluginPermissionDiff,
-    PluginPermissionGrant, PluginSource, PluginTrust, PluginUpdate, PluginUpdateApplyRequest,
-    PluginUpdateCheckRequest, PluginUpdateCheckResponse, VibexError, VibexResult,
-    unix_timestamp_ms,
+    PluginPermissionGrant, PluginSource, PluginTrust, PluginUpdate, PluginUpdateCheckRequest,
+    PluginUpdateCheckResponse, VibexError, VibexResult, unix_timestamp_ms,
 };
 use vibex_db::{PluginRecord, PluginRepository, PluginVersionRecord};
 
@@ -288,7 +287,7 @@ impl PluginService {
     /// Installs a plugin from the catalog.
     pub async fn install(
         &self,
-        conn: &rusqlite::Connection,
+        conn: rusqlite::Connection,
         request: &PluginMarketInstallRequest,
     ) -> VibexResult<PluginMarketInstallResult> {
         let index = self.market.load(&PluginMarketIndexRequest::default()).await;
@@ -386,7 +385,7 @@ impl PluginService {
             PluginSource::Market
         };
         self.finish_install(
-            conn,
+            &conn,
             &entry,
             &version,
             &bytes,
@@ -672,7 +671,7 @@ impl PluginService {
     /// Finds available updates for the installed script plugins.
     pub async fn check_updates(
         &self,
-        conn: &rusqlite::Connection,
+        conn: rusqlite::Connection,
         request: &PluginUpdateCheckRequest,
     ) -> VibexResult<PluginUpdateCheckResponse> {
         let index = self
@@ -682,7 +681,7 @@ impl PluginService {
                 include_github: true,
             })
             .await;
-        let installed = PluginRepository::list(conn)?;
+        let installed = PluginRepository::list(&conn)?;
         let now = Self::now_ms();
         let mut updates = Vec::new();
         for record in installed {
@@ -703,7 +702,7 @@ impl PluginService {
                 continue;
             };
             if !is_newer(latest, &record.version) {
-                PluginRepository::set_checked(conn, &record.plugin_id, now)?;
+                PluginRepository::set_checked(&conn, &record.plugin_id, now)?;
                 continue;
             }
             let diff = self.permission_diff_for(
@@ -714,7 +713,7 @@ impl PluginService {
             );
             if !diff.is_empty() {
                 PluginRepository::set_status(
-                    conn,
+                    &conn,
                     &record.plugin_id,
                     InstalledPluginStatus::UpdateAvailable,
                     record.last_error.as_deref(),
@@ -729,36 +728,9 @@ impl PluginService {
                 yanked: self.market.blocked(&record.plugin_id, latest).is_some(),
                 changelog: None,
             });
-            PluginRepository::set_checked(conn, &record.plugin_id, now)?;
+            PluginRepository::set_checked(&conn, &record.plugin_id, now)?;
         }
         Ok(PluginUpdateCheckResponse { updates })
-    }
-
-    /// Applies the named updates.
-    pub async fn apply_updates(
-        &self,
-        conn: &rusqlite::Connection,
-        request: &PluginUpdateApplyRequest,
-    ) -> VibexResult<Vec<PluginMarketInstallResult>> {
-        let mut results = Vec::new();
-        for plugin_id in &request.plugin_ids {
-            let record = PluginRepository::get(conn, plugin_id)?
-                .ok_or_else(|| PluginError::NotInstalled(plugin_id.clone()))?;
-            let install = PluginMarketInstallRequest {
-                entry_id: plugin_id.clone(),
-                version: None,
-                granted_permissions: if request.granted_permissions.is_empty() {
-                    record.granted_permissions.clone()
-                } else {
-                    request.granted_permissions.clone()
-                },
-                consent_fingerprint: None,
-                enable: record.enabled,
-                auto_update: record.auto_update,
-            };
-            results.push(self.install(conn, &install).await?);
-        }
-        Ok(results)
     }
 
     fn permission_diff_for(

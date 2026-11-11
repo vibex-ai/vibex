@@ -1975,6 +1975,80 @@ mod tests {
             error_future()
         }
 
+        fn plugin_market_index(
+            &self,
+            _request: vibex_core::PluginMarketIndexRequest,
+        ) -> BackendFuture<'_, vibex_core::PluginMarketIndexResponse> {
+            error_future()
+        }
+
+        fn search_plugin_market(
+            &self,
+            _request: vibex_core::PluginMarketSearchRequest,
+        ) -> BackendFuture<'_, vibex_core::PluginMarketSearchResponse> {
+            error_future()
+        }
+
+        fn plugin_market_detail(
+            &self,
+            _request: vibex_core::PluginMarketDetailRequest,
+        ) -> BackendFuture<'_, vibex_core::PluginMarketDetail> {
+            error_future()
+        }
+
+        fn plugins(&self) -> BackendFuture<'_, Vec<vibex_core::InstalledPlugin>> {
+            error_future()
+        }
+
+        fn install_plugin_market_entry(
+            &self,
+            _request: MutationRequest<vibex_core::PluginMarketInstallRequest>,
+        ) -> BackendFuture<'_, vibex_core::PluginMarketInstallResult> {
+            error_future()
+        }
+
+        fn install_plugin_from_file(
+            &self,
+            _request: MutationRequest<vibex_core::PluginLocalInstallRequest>,
+        ) -> BackendFuture<'_, vibex_core::PluginMarketInstallResult> {
+            error_future()
+        }
+
+        fn set_plugin_enabled(
+            &self,
+            _request: MutationRequest<vibex_core::PluginEnabledRequest>,
+        ) -> BackendFuture<'_, vibex_core::InstalledPlugin> {
+            error_future()
+        }
+
+        fn set_plugin_auto_update(
+            &self,
+            _request: MutationRequest<vibex_core::PluginAutoUpdateRequest>,
+        ) -> BackendFuture<'_, vibex_core::InstalledPlugin> {
+            error_future()
+        }
+
+        fn uninstall_plugin(
+            &self,
+            _request: MutationRequest<vibex_core::PluginUninstallRequest>,
+        ) -> BackendFuture<'_, ()> {
+            error_future()
+        }
+
+        fn check_plugin_updates(
+            &self,
+            _request: vibex_core::PluginUpdateCheckRequest,
+        ) -> BackendFuture<'_, vibex_core::PluginUpdateCheckResponse> {
+            error_future()
+        }
+
+        fn apply_plugin_updates(
+            &self,
+            _request: MutationRequest<vibex_core::PluginUpdateApplyRequest>,
+        ) -> BackendFuture<'_, Vec<vibex_core::PluginMarketInstallResult>> {
+            error_future()
+        }
+
         fn model_capability_suggestion(
             &self,
             _request: vibex_core::ModelCapabilitySuggestionRequest,

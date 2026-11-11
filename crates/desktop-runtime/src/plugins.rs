@@ -139,7 +139,7 @@ impl PluginHandle {
         &self,
         request: PluginMarketInstallRequest,
     ) -> VibexResult<PluginMarketInstallResult> {
-        self.service().install(&self.connection()?, &request).await
+        self.service().install(self.connection()?, &request).await
     }
 
     pub async fn check_updates(
@@ -147,7 +147,7 @@ impl PluginHandle {
         request: PluginUpdateCheckRequest,
     ) -> VibexResult<PluginUpdateCheckResponse> {
         self.service()
-            .check_updates(&self.connection()?, &request)
+            .check_updates(self.connection()?, &request)
             .await
     }
 
@@ -155,9 +155,31 @@ impl PluginHandle {
         &self,
         request: PluginUpdateApplyRequest,
     ) -> VibexResult<Vec<PluginMarketInstallResult>> {
-        self.service()
-            .apply_updates(&self.connection()?, &request)
-            .await
+        let mut results = Vec::new();
+        for plugin_id in &request.plugin_ids {
+            let connection = self.connection()?;
+            let record =
+                vibex_db::PluginRepository::get(&connection, plugin_id)?.ok_or_else(|| {
+                    vibex_core::VibexError::validation(
+                        "plugin_not_installed",
+                        format!("the plugin `{plugin_id}` is not installed"),
+                    )
+                })?;
+            let install = PluginMarketInstallRequest {
+                entry_id: plugin_id.clone(),
+                version: None,
+                granted_permissions: if request.granted_permissions.is_empty() {
+                    record.granted_permissions.clone()
+                } else {
+                    request.granted_permissions.clone()
+                },
+                consent_fingerprint: None,
+                enable: record.enabled,
+                auto_update: record.auto_update,
+            };
+            results.push(self.service().install(connection, &install).await?);
+        }
+        Ok(results)
     }
 
     /// Recovers an interrupted install.
