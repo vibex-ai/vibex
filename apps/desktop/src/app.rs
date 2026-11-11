@@ -255,6 +255,7 @@ use crate::remote_client::{
     RegisteredRuntime,
 };
 use crate::responsive::WorkbenchVisibility;
+use crate::single_instance::LaunchClaim;
 use crate::skeleton;
 use crate::spinner::Spinner;
 use crate::ssh_connection::{
@@ -96522,6 +96523,28 @@ fn action_name(action: &str) -> &'static str {
         "undo_image_edit" => "vibex::UndoImageEdit",
         "redo_image_edit" => "vibex::RedoImageEdit",
         _ => "vibex::NoAction",
+    }
+}
+
+/// Decides whether this process is the workbench or a second launch that must
+/// hand the request to the window that is already open.
+///
+/// It runs before [`open_workbench_window`] so a second launch never builds a
+/// workbench it cannot drive: without this check the shell window opens, the
+/// runtime home lock refuses it, and the reader is left looking at
+/// `desktop_runtime_home_locked` instead of the Vibex they already had open.
+pub fn claim_workbench_launch() -> LaunchClaim {
+    match release_runtime_config() {
+        Ok(config) => crate::single_instance::claim_launch(&config),
+        Err(error) => {
+            // A channel that cannot resolve its home also cannot be owned by
+            // another launch of it; the window opens and reports the error.
+            eprintln!(
+                "vibex-desktop: single-instance check skipped ({}): {}",
+                error.code, error.message
+            );
+            LaunchClaim::Unguarded
+        }
     }
 }
 

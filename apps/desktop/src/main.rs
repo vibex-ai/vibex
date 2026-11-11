@@ -10,10 +10,12 @@ use gpui_component::{Root, TitleBar};
 use vibex_agent::run_delegation_mcp_stdio;
 use vibex_browser::stdio::run_browser_mcp_stdio;
 use vibex_computer::cli::run as run_computer_cli;
+use vibex_desktop::single_instance::LaunchClaim;
 use vibex_desktop::{
     DEFAULT_HEIGHT, DEFAULT_WIDTH, MIN_HEIGHT, MIN_WIDTH, app, assets,
     code_workbench::{CodeWorkbenchFixture, CodeWorkbenchFixtureKind},
-    first_frame_probe, hint_layer, selection_guard, system_tray, terminal_surface, theme,
+    first_frame_probe, hint_layer, selection_guard, single_instance, system_tray, terminal_surface,
+    theme,
 };
 use vibex_desktop_model::{AppearanceUiState, ThemeMode};
 use vibex_terminal::run_terminal_feasibility;
@@ -460,6 +462,25 @@ fn run() {
         None
     };
 
+    // Opening Vibex while it is already running is a request to see the window
+    // that exists, not to build a second one the runtime home lock would refuse
+    // with `desktop_runtime_home_locked`. The claim is taken before GPUI
+    // connects to the display server, so a second launch costs nothing but the
+    // process it was started from: it asks the live shell to come forward and
+    // exits without a window.
+    let shell_claim = if matches!(launch_mode, LaunchMode::Workbench) {
+        match app::claim_workbench_launch() {
+            LaunchClaim::Attached => {
+                eprintln!("vibex-desktop: raised the running Vibex window");
+                return;
+            }
+            LaunchClaim::Primary(claim) => Some(claim),
+            LaunchClaim::Unguarded => None,
+        }
+    } else {
+        None
+    };
+
     let application = vibex_desktop::platform::application();
     // On macOS a Dock click on the app icon reaches the running process as a
     // platform reopen request. The workbench owns that window, so the request
@@ -495,6 +516,12 @@ fn run() {
                     eprintln!("{error}");
                     std::process::exit(1);
                 });
+                // Only now is there a window to raise and a tray that knows how
+                // to raise it; activations that arrived while the workbench was
+                // still being built are waiting in the claim's queue.
+                if let Some(claim) = shell_claim {
+                    single_instance::install(claim, cx);
+                }
                 cx.activate(true);
                 return;
             }

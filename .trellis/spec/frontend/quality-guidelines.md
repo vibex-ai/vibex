@@ -731,6 +731,20 @@ vibex-foundation: runtime-stopped
 - `DesktopRuntime` owns the process/home lock. A second shell must fail while the
   workbench is live, and the same external lock probe must succeed only after awaited
   shutdown and process exit. Cleanup that is merely spawned and abandoned is invalid.
+- Opening Vibex again is a request to see the window that is already open, not to
+  start a second shell. `apps/desktop/src/main.rs` claims the channel's shell before
+  GPUI connects to the display server (`single_instance::claim_launch`): the first
+  launch holds `<home>/.vibex-desktop-shell.lock`, publishes
+  `<home>/.vibex-desktop-shell.json` (loopback port plus a per-launch token, owner-only)
+  and answers activation requests on a plain thread; a later launch reads that record,
+  asks the live shell to `SystemTray::restore` its window, and exits without opening
+  one. The shell lock is advisory and process-scoped, so a crash releases it and the
+  next launch becomes the primary; a record whose listener does not answer falls back
+  to the normal launch rather than leaving the reader with no window at all. This
+  claim is separate from the runtime home lock and never replaces it: a home owned by
+  something else (the TUI in authority mode, `vibex-server`) still surfaces
+  `desktop_runtime_home_locked`. `VIBEX_DESKTOP_SINGLE_INSTANCE=0` is the development
+  escape hatch for two intentional shells on one home.
 - A macOS Dock click on the app icon is a platform reopen request, not a new launch:
   GPUI exposes it as `Application::on_reopen`, and only the application entry point
   can register it. `apps/desktop/src/main.rs` registers `system_tray::handle_reopen`,
@@ -767,6 +781,10 @@ vibex-foundation: runtime-stopped
 - UI-state bytes do not change or an injected non-schema sentinel survives -> fail
   final persistence flush.
 - A second process acquires the home while GPUI runs -> fail runtime exclusivity.
+- A second launch opens a window instead of raising the running one -> fail the
+  launch hand-off; check both the activation answer and the window count.
+- A stale `.vibex-desktop-shell.json` stops a launch from opening any window -> fail
+  the hand-off fallback.
 - The lock remains unavailable after exit -> fail shutdown ownership/release.
 - Process exits non-zero or before runtime-ready -> fail the affected scenario.
 - A reactor-backed future is awaited from `cx.background_spawn` -> reject it: the
@@ -788,6 +806,10 @@ vibex-foundation: runtime-stopped
 - `cargo test -p vibex-desktop --locked` covers the shell contract, responsive
   viewports, settings, primitives, fonts, locales, and source-compatible platform
   branches.
+- `cargo test -p vibex-desktop --lib single_instance` covers the launch claim against
+  a temporary home: one owner at a time, separate channels, the activation round trip
+  and its token check, a stale record, the owner-only record mode, and the entry
+  point ordering that claims before it opens a window.
 - A source-inspection test in `apps/desktop` pins every network probe to
   `gpui_tokio::Tokio::spawn`, so the executor boundary is asserted without opening a
   socket.
