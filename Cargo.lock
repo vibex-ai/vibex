@@ -10505,6 +10505,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "vibex-installer-env"
+version = "0.1.2"
+dependencies = [
+ "windows-sys 0.59.0",
+]
+
+[[package]]
 name = "vibex-mobile"
 version = "0.1.2"
 dependencies = [

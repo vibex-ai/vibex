@@ -1,0 +1,20 @@
+[package]
+name = "vibex-installer-env"
+version = "0.1.2"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Edits the per-user Path value for the Windows installer without NSIS's fixed-size string limit."
+
+[[bin]]
+name = "vibex-installer-env"
+path = "src/main.rs"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_System_Registry",
+  "Win32_UI_WindowsAndMessaging",
+] }

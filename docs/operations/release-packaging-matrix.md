@@ -70,6 +70,24 @@ embeds the other product's assets.
   and has no installer script of its own. The client lives at
   `Vibex.app/Contents/MacOS/vibex`, which the bundle signature already covers.
 
+## Windows PATH Rules
+
+- The only writer of `HKCU\Environment\Path` is the `vibex-installer-env` binary
+  in `crates/installer-env`. The NSIS template must never read or write that
+  value directly. `ReadRegStr` stores at most 1023 characters, so a longer
+  `Path` reads as an empty string; an earlier template wrote `$INSTDIR` in that
+  case and replaced the user's whole `Path`.
+- The helper asks `RegQueryValueExW` for the real byte length, preserves
+  `REG_SZ` versus `REG_EXPAND_SZ`, compares whole entries case-insensitively,
+  and deletes the value only when no other entry remains. A read it cannot
+  complete is an error, never an empty value to write back.
+- The installer stays `installMode = "currentUser"` because the helper edits
+  `HKCU`. A per-machine installer would need a separate implementation.
+- `scripts/build-channel.mjs` builds the helper for Windows targets and
+  `scripts/package-desktop-release.mjs` adds it to the generated Packager
+  config. `pnpm check:release` rejects a template that reintroduces
+  `ReadRegStr`/`WriteRegStr` for `HKCU\Environment`, and checks this wiring.
+
 ## Linux Binary Linking Rules
 
 - Linux x86_64 release links run through lld with `--icf=all` from
