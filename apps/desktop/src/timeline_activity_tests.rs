@@ -812,10 +812,20 @@ fn activity_shimmer_stops_when_settled_or_motion_is_reduced(cx: &mut TestAppCont
 #[test]
 fn live_label_gate_stops_a_late_timeline_and_restores_it_with_hysteresis() {
     let refresh = Duration::from_micros(16_667);
-    let on_time = Duration::from_micros(16_000);
-    let late = Duration::from_micros(33_000);
+    // The app deliberately samples repeating animations at 30fps; that is the
+    // budget, not a late 60Hz frame.
+    let on_time = Duration::from_millis(33);
+    let late = Duration::from_millis(70);
     // Between the two budgets: neither streak advances.
-    let near_budget = Duration::from_micros(25_000);
+    let near_budget = Duration::from_millis(50);
+
+    let steady = LiveLabelGate::ANIMATING
+        .observe(on_time, refresh)
+        .observe(on_time, refresh);
+    assert!(
+        steady.animate,
+        "a held 30fps animation cadence must keep the sweep running"
+    );
 
     let slipped = LiveLabelGate::ANIMATING.observe(late, refresh);
     assert!(
@@ -833,7 +843,7 @@ fn live_label_gate_stops_a_late_timeline_and_restores_it_with_hysteresis() {
     let recovered = recovering.observe(on_time, refresh);
     assert!(
         recovered.animate,
-        "a held display interval restores the sweep"
+        "a held animation budget restores the sweep"
     );
 
     assert!(
