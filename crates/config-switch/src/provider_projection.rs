@@ -1816,16 +1816,28 @@ fn project_provider_control(
                 && let Some(catalog) = codex_model_catalog_overlay(provider, binding)?
             {
                 // The catalogue is what turns a declared thinking depth into a
-                // control: codex-acp publishes `reasoning_effort` only when
-                // `model/list` reports levels for the selected Model, and the
-                // bundled catalogue knows no Provider alias id.
-                targets.push(ProjectionTargetPreview {
-                    field: "reasoningEfforts".to_string(),
-                    target_kind: ProjectionTargetKind::ManagedOverlay,
-                    target: catalog.relative_path.clone(),
-                    value_preview: "declared thinking depth".to_string(),
-                    secret: false,
-                });
+                // control and carries a declared context window: codex-acp
+                // publishes `reasoning_effort` only when `model/list` reports
+                // levels for the selected Model, and the bundled catalogue
+                // knows no Provider alias id.
+                if codex_projects_reasoning_efforts(provider, binding) {
+                    targets.push(ProjectionTargetPreview {
+                        field: "reasoningEfforts".to_string(),
+                        target_kind: ProjectionTargetKind::ManagedOverlay,
+                        target: catalog.relative_path.clone(),
+                        value_preview: "declared thinking depth".to_string(),
+                        secret: false,
+                    });
+                }
+                if codex_projects_context_window(provider, binding) {
+                    targets.push(ProjectionTargetPreview {
+                        field: "contextTokens".to_string(),
+                        target_kind: ProjectionTargetKind::ManagedOverlay,
+                        target: catalog.relative_path.clone(),
+                        value_preview: "declared context window".to_string(),
+                        secret: false,
+                    });
+                }
                 overlays.push(catalog);
             }
             if *strategy == ConfigOverlayStrategy::DeepseekHarnessSettingsYaml {
@@ -2907,12 +2919,8 @@ fn codex_overlay(
     format!("{}\n", lines.join("\n"))
 }
 
-/// True when the binding projects a catalogue of its own.
-///
-/// A profile where no Model declares a thinking depth keeps the bundled
-/// catalogue byte-for-byte: it has nothing to add, and `config.toml` must not
-/// start pointing at a file that would repeat the bundled answer.
-fn codex_projects_model_catalog(
+/// True when any enabled Model of the binding declares a thinking depth.
+fn codex_projects_reasoning_efforts(
     provider: &ModelProviderProfile,
     binding: &AgentModelProviderBinding,
 ) -> bool {
@@ -2926,7 +2934,37 @@ fn codex_projects_model_catalog(
         })
 }
 
-/// The catalogue Codex answers `model/list` from, when a Model declares levels.
+/// True when any enabled Model of the binding declares a context window.
+fn codex_projects_context_window(
+    provider: &ModelProviderProfile,
+    binding: &AgentModelProviderBinding,
+) -> bool {
+    binding
+        .configured_models
+        .iter()
+        .filter(|model| model.enabled)
+        .any(|model| {
+            codex_configured_model(provider, model)
+                .is_some_and(|configured| configured.capabilities.context_tokens.is_some())
+        })
+}
+
+/// True when the binding projects a catalogue of its own.
+///
+/// A profile where no Model declares metadata the bundled catalogue cannot
+/// express — a thinking depth or a context window — keeps the bundled
+/// catalogue byte-for-byte: it has nothing to add, and `config.toml` must not
+/// start pointing at a file that would repeat the bundled answer.
+fn codex_projects_model_catalog(
+    provider: &ModelProviderProfile,
+    binding: &AgentModelProviderBinding,
+) -> bool {
+    codex_projects_reasoning_efforts(provider, binding)
+        || codex_projects_context_window(provider, binding)
+}
+
+/// The catalogue Codex answers `model/list` from, when a Model declares
+/// metadata the bundled catalogue cannot express.
 ///
 /// The reasoning-effort control is derived from `model/list` alone, and Codex
 /// answers that from its bundled catalogue: OpenAI's own model ids, with no
@@ -2934,6 +2972,10 @@ fn codex_projects_model_catalog(
 /// therefore reported no supported levels, codex-acp never published the
 /// `reasoning_effort` option, and `session/set_config_option` had nothing to
 /// apply. Projecting this file makes the Model's declared levels the answer.
+///
+/// The same entry carries a declared context window. Without the catalogue
+/// Codex answers from its bundled entry and reports that entry's window — and
+/// its `effective_context_window_percent` — instead of the declaration.
 ///
 /// The file *replaces* the bundled catalogue instead of extending it, so every
 /// enabled Model of the binding is listed: an omitted Provider id would fall
@@ -7749,12 +7791,12 @@ mod tests {
     /// model ids only. An alias id therefore reported no supported levels,
     /// codex-acp never published the control, and a reader had nothing to pick.
     #[test]
-    fn codex_projects_a_model_catalog_only_when_a_model_declares_a_thinking_depth() {
+    fn codex_projects_a_model_catalog_when_a_model_declares_a_thinking_depth() {
         let descriptor = provider_descriptor("codex");
         let (mut provider, runtime, binding) = typed_projection_fixture(&descriptor);
 
-        // Undeclared: the bundled catalogue stands, and `config.toml` must not
-        // point at a file that would only repeat it.
+        // No catalogue metadata: the bundled catalogue stands, and
+        // `config.toml` must not point at a file that would only repeat it.
         let plain = AgentProviderProjectionEngine::plan(
             &provider,
             &runtime,
@@ -7859,6 +7901,57 @@ mod tests {
                 "a projected catalogue entry needs {key}"
             );
         }
+    }
+
+    /// A declared context window alone still needs the catalogue.
+    ///
+    /// Codex answers `model/list` from its bundled catalogue, which carries
+    /// the window of its own model ids — `gpt-6-astra` is 272,000 tokens with
+    /// `effective_context_window_percent: 95`, so a session reports 258,400.
+    /// A Provider Model that declares a window but no thinking depth must not
+    /// fall back to that metadata: the declaration is catalogue metadata, not
+    /// a reasoning-only concern.
+    #[test]
+    fn codex_catalog_projects_a_declared_context_window_without_a_thinking_depth() {
+        let descriptor = provider_descriptor("codex");
+        let (mut provider, runtime, binding) = typed_projection_fixture(&descriptor);
+        provider.configured_models[0].capabilities.context_tokens = Some(1_000_000);
+
+        let plan = AgentProviderProjectionEngine::plan(
+            &provider,
+            &runtime,
+            &binding,
+            &descriptor,
+            "codex-context-catalog",
+        )
+        .unwrap();
+        assert_eq!(
+            plan.overlay_files.len(),
+            2,
+            "a declared context window has to project a catalogue"
+        );
+        let config: toml::Value = toml::from_str(&plan.overlay_files[0].content).unwrap();
+        assert_eq!(
+            config["model_catalog_json"].as_str(),
+            Some("vibex-models.json"),
+            "Codex only reads a catalogue `config.toml` names"
+        );
+        assert!(
+            plan.preview.targets.iter().any(|target| {
+                target.field == "contextTokens" && target.target == "vibex-models.json"
+            }),
+            "the editor reports where the declared window is projected"
+        );
+        let catalog: serde_json::Value =
+            serde_json::from_str(&plan.overlay_files[1].content).unwrap();
+        let model = &catalog["models"][0];
+        assert_eq!(model["slug"], "agent-model");
+        assert_eq!(model["context_window"], 1_000_000);
+        assert_eq!(model["max_context_window"], 1_000_000);
+        // The catalogue replaces the bundled one; a Model with no declared
+        // depth honestly offers none rather than inheriting bundled levels.
+        assert_eq!(model["supported_reasoning_levels"], serde_json::json!([]));
+        assert!(model.get("default_reasoning_level").is_none());
     }
 
     /// A catalogue replaces the bundled one, so it cannot omit a Model.

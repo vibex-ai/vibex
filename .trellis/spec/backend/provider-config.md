@@ -500,7 +500,7 @@ environment key and the final ACP authentication decision.
 ### 1. Scope / Trigger
 
 - Trigger: the Provider Model editor declares a Model's context window or maximum output tokens, and a projection carries that limit into an Agent's own configuration.
-- Only the projections whose Agent config owns a limit read the declaration: DeepSeek Harness, OpenCode, and ZCode. Every other Agent resolves its window from its own catalogue or API, so the declaration must not be invented for it.
+- Codex, DeepSeek Harness, OpenCode, and ZCode read the declaration. Codex carries it in the private model catalogue (`vibex-models.json`); every other Agent resolves its window from its own catalogue or API, so the declaration must not be invented for it.
 
 ### 2. Contracts
 
@@ -508,13 +508,14 @@ environment key and the final ACP authentication decision.
 - An empty field means "not declared", and the projection omits the key or keeps its own default. Zero is rejected by the editor rather than read as unknown, so clearing the field is the only way back to the Agent default.
 - The editor parses both fields before it mutates the Model, so a rejected value leaves the draft exactly as it was instead of half-applying the edit.
 - DeepSeek Harness writes `contextWindow` / `maxTokens` (undeclared -> 262,144 / 32,768), OpenCode writes `limit.context` and `limit.output` only when both are declared, and ZCode writes `limit.context`.
+- Codex writes `context_window` / `max_context_window` into the projected catalogue entry. The catalogue is generated when any enabled Model declares a context window **or** a thinking depth: a context-only declaration must still project it, or Codex answers `model/list` from its bundled entry. `gpt-6-astra` is the concrete failure: bundled at 272,000 tokens with `effective_context_window_percent: 95`, a session reports 258,400 instead of the declared window.
 - The declaration survives profile save normalization, catalogue merge, and an authoritative catalogue refresh, like every other declared capability.
 
 ### 3. Tests Required
 
 - Editor parse unit: an empty pair returns undeclared, whole positive numbers are accepted, and zero, negative, fractional, or oversized values are rejected with the field named.
 - Round-trip unit: declared limits survive profile normalization, catalogue merge, and an authoritative catalogue refresh.
-- Projection units assert each Agent's keys for a declared and an undeclared Model.
+- Projection units assert each Agent's keys for a declared and an undeclared Model. For Codex, a Model that declares only `context_tokens` still produces `vibex-models.json`, the `model_catalog_json` line, and the declared `context_window` / `max_context_window` with an empty reasoning-level list.
 
 ## Scenario: Agent Session Options The Agent Cannot Express
 
