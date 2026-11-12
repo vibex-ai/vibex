@@ -35,16 +35,16 @@ use gpui::{
     AccessibleAction, Anchor, Animation, AnimationExt as _, AnyElement, AnyWindowHandle, App,
     AvailableSpace, Bounds, BoxShadow, ClickEvent, ClipboardEntry, ClipboardItem, Context,
     Decorations, DismissEvent, Div, DragMoveEvent, Element, ElementId, Empty, Entity, EntityId,
-    EntityInputHandler, ExternalPaths, FocusHandle, Focusable as _, FontWeight, Global,
-    GlobalElementId, HighlightStyle, Hsla, Image, ImageFormat, InspectorElementId, IntoElement,
-    KeyBinding, KeyDownEvent, Keystroke, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent,
-    ObjectFit, Orientation, ParentElement as _, Pixels, Point, Render, RenderImage, Rgba, Role,
-    ScrollAnchor, ScrollDelta, ScrollEvent, ScrollHandle, ScrollStrategy, SharedString, Size,
-    Stateful, StatefulInteractiveElement as _, StyleRefinement, Styled as _, StyledImage as _,
-    StyledText, Subscription, SystemNotification, Task, TitlebarOptions, Unbind, WeakEntity,
-    Window, WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowControls,
-    WindowDecorations, WindowId, WindowKind, WindowOptions, div, img, linear_color_stop,
-    linear_gradient, point, prelude::*, px, relative, rgb, size,
+    EntityInputHandler, ExternalPaths, FocusHandle, Focusable as _, FontFeatures, FontWeight,
+    Global, GlobalElementId, HighlightStyle, Hsla, Image, ImageFormat, InspectorElementId,
+    IntoElement, KeyBinding, KeyDownEvent, Keystroke, LayoutId, MouseButton, MouseDownEvent,
+    MouseMoveEvent, ObjectFit, Orientation, ParentElement as _, Pixels, Point, Render, RenderImage,
+    Rgba, Role, ScrollAnchor, ScrollDelta, ScrollEvent, ScrollHandle, ScrollStrategy, SharedString,
+    Size, Stateful, StatefulInteractiveElement as _, StyleRefinement, Styled as _,
+    StyledImage as _, StyledText, Subscription, SystemNotification, Task, TitlebarOptions, Unbind,
+    WeakEntity, Window, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
+    WindowControls, WindowDecorations, WindowId, WindowKind, WindowOptions, div, img,
+    linear_color_stop, linear_gradient, point, prelude::*, px, relative, rgb, size,
 };
 use gpui_base::text::MarkdownExtensions;
 use gpui_component::{
@@ -27646,7 +27646,7 @@ impl VibexWorkbench {
                 }
             ),
         };
-        let tokens_per_second = tokens_per_second.map(|speed| format!("{speed:.1} t/s"));
+        let tokens_per_second = tokens_per_second.map(format_generation_speed);
         let (input_tokens, output_tokens, cache_rate) = self.agent_token_usage_metrics();
         Some(
             h_flex()
@@ -27720,7 +27720,19 @@ impl VibexWorkbench {
                     this.child(separator()).child(format!("{rate}%"))
                 })
                 .when_some(tokens_per_second, |this, speed| {
-                    this.child(separator()).child(speed)
+                    this.child(separator()).child(
+                        // The rate changes every second, so its cell is a
+                        // fixed width the number is right-aligned inside: a
+                        // value losing a digit grows leftwards instead of
+                        // pulling the rest of the bar with it.
+                        div()
+                            .flex_none()
+                            .min_w(AGENT_GENERATION_SPEED_WIDTH)
+                            .justify_end()
+                            .text_right()
+                            .font_features(tabular_numerals())
+                            .child(speed),
+                    )
                 })
                 .into_any_element(),
         )
@@ -84129,6 +84141,39 @@ fn format_compact_tokens(tokens: u64) -> String {
     }
 }
 
+/// The width the status bar always reserves for the live generation rate.
+///
+/// The rate is redrawn every second, and a value crossing from two digits to
+/// three used to widen the field, shoving every element after it left and
+/// right. The widest rate the spelling below produces is `999.9 t/s`, so the
+/// cell is sized once for five figures plus the unit and never resizes. It is
+/// measured in rems because the text is: both scale with the reader's font
+/// size, so the reservation stays right at every zoom.
+const AGENT_GENERATION_SPEED_WIDTH: gpui::Rems = gpui::rems(4.0);
+
+/// The live generation rate, in the one spelling whose width never grows.
+///
+/// Three rules keep the field a fixed size: a rate of four digits or more
+/// switches to the compact `1.2k` form instead of widening the bar, the cell
+/// under it is right-aligned so a shorter rate grows leftwards, and the
+/// figures are tabular so every digit shares one advance and the number does
+/// not shimmy as it changes.
+fn format_generation_speed(speed: f32) -> String {
+    let speed = speed.max(0.0);
+    // `999.95` is where one decimal rounds up to four figures, so it is the
+    // first rate that has to leave the wide form.
+    if speed >= 999.95 {
+        format!("{:.1}k t/s", speed / 1_000.0)
+    } else {
+        format!("{speed:.1} t/s")
+    }
+}
+
+/// Tabular figures (`tnum`), so a changing number keeps one advance per digit.
+fn tabular_numerals() -> FontFeatures {
+    FontFeatures(Arc::new(vec![("tnum".to_string(), 1)]))
+}
+
 fn render_cache_token_ring(usage: Option<&AgentTokenUsage>, cx: &mut App) -> AnyElement {
     let is_dark = cx.theme().is_dark();
     let context_fraction = usage.and_then(context_window_usage_fraction);
@@ -101690,6 +101735,39 @@ mod tests {
         assert_eq!(format_compact_tokens(2_000_000), "2.0m");
     }
 
+    /// The live rate must never widen the status bar as it changes.
+    #[test]
+    fn generation_speed_keeps_the_status_bar_a_fixed_width() {
+        // Two digits to three is the case the report named.
+        for (speed, shown) in [
+            (86.0, "86.0 t/s"),
+            (412.0, "412.0 t/s"),
+            (86.0, "86.0 t/s"),
+            (0.0, "0.0 t/s"),
+            (7.25, "7.2 t/s"),
+        ] {
+            assert_eq!(format_generation_speed(speed), shown);
+        }
+        // Every rate the wide form can print is at most five figures, so the
+        // reserved cell covers all of them.
+        assert_eq!(format_generation_speed(999.9), "999.9 t/s");
+        assert_eq!(format_generation_speed(999.94), "999.9 t/s");
+        // The first rate that would print four digits leaves the wide form
+        // rather than widening the cell.
+        assert_eq!(format_generation_speed(999.95), "1.0k t/s");
+        assert_eq!(format_generation_speed(1_240.0), "1.2k t/s");
+        assert_eq!(format_generation_speed(12_345.0), "12.3k t/s");
+        assert!(
+            format_generation_speed(12_345.0).chars().count()
+                <= format_generation_speed(999.9).chars().count(),
+            "the compact form must fit the cell the wide form already reserved"
+        );
+        assert_eq!(
+            tabular_numerals(),
+            FontFeatures(Arc::new(vec![("tnum".to_string(), 1)]))
+        );
+    }
+
     struct LongMarkdownLayoutProbe {
         body: String,
         measured_height: Rc<Cell<f32>>,
@@ -114346,6 +114424,12 @@ mod tests {
         assert!(source.contains("when(added_lines > 0 || removed_lines > 0"));
         assert!(source.contains("agent_generation_compaction_count"));
         assert!(source.contains("when_some(tokens_per_second"));
+        // The rate is redrawn every second, so its cell must keep one width:
+        // a fixed minimum the number is right-aligned inside, with tabular
+        // figures so a digit change cannot change the advance either.
+        assert!(source.contains(".min_w(AGENT_GENERATION_SPEED_WIDTH)"));
+        assert!(source.contains(".text_right()"));
+        assert!(source.contains("font_features(tabular_numerals())"));
 
         let plan = source
             .split_once("    fn render_composer_plan(")

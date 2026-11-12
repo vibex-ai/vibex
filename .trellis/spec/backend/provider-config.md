@@ -3327,6 +3327,31 @@ agent_discovery_records(
 - Good: a configured Codex model receives only the reasoning efforts returned
   for that exact model by stateless `model/list`; no generic effort list is
   fabricated when the probe is unavailable.
+- Good: a Codex Profile whose Models declare `capabilities.reasoningEfforts`
+  also gets a private `model_catalog_json` catalogue beside its `config.toml`
+  (`vibex-models.json`, resolved relative to `CODEX_HOME`). Codex answers
+  `model/list` from a catalogue that only describes OpenAI's own model ids, so
+  an alias id such as `daily` reported an empty `supportedReasoningEfforts`;
+  codex-acp publishes its `reasoning_effort` config option only when that list
+  is non-empty, and `session/set_config_option` therefore failed with
+  `Invalid params`. The projected catalogue makes the declaration the answer.
+- Base: the catalogue **replaces** Codex's bundled catalogue rather than
+  extending it, so it lists every enabled Model of the binding, declares
+  `visibility: "list"`, and carries every `ModelInfo` field Codex deserializes
+  without a default. An entry it omits silently regains bundled metadata.
+- Base: each entry carries the reduced developer prompt Codex assembles for an
+  unknown model (`crates/config-switch/assets/codex-model-instructions.md`, the
+  byte-identical prompt an alias id already ran under). An entry with an empty,
+  null or missing prompt is not rejected — it runs the session with no system
+  prompt at all.
+- Base: `default_reasoning_level` is a declared thinking level (preferred
+  `xhigh` → `high` → `medium`, else the shallowest declared one), never
+  `off`/`none`: Codex applies it to the first turn. `off` is projected as the
+  Responses spelling `none`, and a declaration's own wire spelling wins.
+- Base: a Model that declares no levels is still listed, with an empty
+  `supported_reasoning_levels` and no `default_reasoning_level`; a Profile
+  where no Model declares levels projects no catalogue at all and keeps its
+  previous single-overlay output byte for byte.
 - Bad: frontend hides a disabled agent but backend still accepts direct session
   creation.
 - Bad: `agent_list` starts `opencode acp`, Claude, Codex, or any other runtime
@@ -3363,6 +3388,11 @@ agent_discovery_records(
 - `cargo test -p vibex-desktop agent` and
   `pnpm --dir apps/desktop typecheck` and frontend builds
   cover Runtime Option Catalog/create contract consumption.
+- `cargo test -p vibex-config-switch codex_ --locked` covers the Codex
+  catalogue contract: a declared thinking depth adds the overlay and the
+  `model_catalog_json` line, an undeclared profile stays byte-identical, every
+  enabled Model is listed with its declared spellings and context window, and
+  the file materializes at `0o600` inside the private `CODEX_HOME`.
 
 ### 7. Wrong vs Correct
 
