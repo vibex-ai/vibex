@@ -12567,7 +12567,10 @@ impl ManagementCenter {
         let button_id = entry.id.clone();
         let locale = locale::current_locale().tag();
         let name = entry.localized_name(locale).to_string();
-        let summary = entry.summary.clone().unwrap_or_default();
+        let summary = entry
+            .localized_summary(locale)
+            .unwrap_or_default()
+            .to_string();
         let meta = format!(
             "{} · {} · {}",
             entry.publisher.display_name,
@@ -12654,6 +12657,7 @@ impl ManagementCenter {
             .iter()
             .any(|plugin| plugin.plugin_id == entry.id);
         let mut column = v_flex().w_full().gap_3();
+        let locale = locale::current_locale().tag();
         column = column.child(
             h_flex()
                 .w_full()
@@ -12670,7 +12674,12 @@ impl ManagementCenter {
                             cx.notify();
                         })),
                 )
-                .child(div().text_lg().font_semibold().child(entry.name.clone())),
+                .child(
+                    div()
+                        .text_lg()
+                        .font_semibold()
+                        .child(entry.localized_name(locale).to_string()),
+                ),
         );
         column = column.child(
             div()
@@ -12683,8 +12692,12 @@ impl ManagementCenter {
                     entry.latest_version.clone().unwrap_or_default()
                 )),
         );
-        if let Some(description) = &detail.description {
-            column = column.child(div().text_sm().child(description.clone()));
+        let description = entry
+            .localized_description(locale)
+            .map(str::to_string)
+            .or_else(|| detail.description.clone());
+        if let Some(description) = description {
+            column = column.child(div().text_sm().child(description));
         }
         if let Some(reviews) = &detail.reviews
             && reviews.count > 0

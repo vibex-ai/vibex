@@ -453,6 +453,21 @@ impl PluginMarketEntry {
             .and_then(|localized| localized.name.as_deref())
             .unwrap_or(&self.name)
     }
+
+    /// The summary to show for a locale, falling back to the entry's own.
+    pub fn localized_summary(&self, locale: &str) -> Option<&str> {
+        self.i18n
+            .get(locale)
+            .and_then(|localized| localized.summary.as_deref())
+            .or(self.summary.as_deref())
+    }
+
+    /// The long description to show for a locale, when one is published.
+    pub fn localized_description(&self, locale: &str) -> Option<&str> {
+        self.i18n
+            .get(locale)
+            .and_then(|localized| localized.description.as_deref())
+    }
 }
 
 /// The detached signature of a package version.
