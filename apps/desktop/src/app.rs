@@ -10258,12 +10258,10 @@ pub struct VibexWorkbench {
     fps_monitor_recorder: Option<Task<()>>,
     pair_button_hovered: bool,
     update_snapshot: UpdateSnapshot,
-    /// Whether the title-bar update panel is open. The panel stays open until
-    /// the user closes it or the release it describes stops being relevant.
+    /// Whether the title-bar update panel is open. The panel opens only from
+    /// the title-bar entry and stays open until the user closes it or the
+    /// release it describes stops being relevant.
     update_panel_open: bool,
-    /// Release version the panel currently describes, so a newly discovered
-    /// version reopens it while snapshot progress updates do not.
-    update_panel_version: Option<String>,
     /// Release version whose automatic download has already been requested.
     update_auto_download_version: Option<String>,
     update_status_task: Option<Task<()>>,
@@ -12272,7 +12270,6 @@ impl VibexWorkbench {
             pair_button_hovered: false,
             update_snapshot: UpdateSnapshot::default(),
             update_panel_open: false,
-            update_panel_version: None,
             update_auto_download_version: None,
             update_status_task: None,
             update_action_task: None,
@@ -14743,43 +14740,21 @@ impl VibexWorkbench {
             || self.ui_state.desktop_behavior.show_update_prompts
     }
 
-    /// Keep the title-bar panel in step with the current release.
+    /// Close the title-bar panel when its release is gone or prompts are off.
     ///
-    /// A newly discovered version opens the panel so the user sees the
-    /// download or the offered update; snapshot progress updates for the same
-    /// version leave the user's open/closed choice alone.
+    /// Discovering a release updates only the title-bar entry: the panel opens
+    /// on the user's click, never on a background check. Snapshot progress for
+    /// the release therefore leaves the user's open/closed choice alone.
     fn sync_update_panel(&mut self, cx: &mut Context<Self>) {
-        let was_open = self.update_panel_open;
-        let Some(version) = self
-            .update_snapshot
-            .state
-            .release()
-            .map(|release| release.version.to_string())
-        else {
-            self.update_panel_version = None;
-            self.update_auto_download_version = None;
-            self.update_panel_open = false;
-            if was_open {
+        let has_release = self.update_snapshot.state.release().is_some();
+        if !has_release || !self.update_surfaces_enabled() {
+            if self.update_panel_open {
+                self.update_panel_open = false;
                 cx.notify();
             }
-            return;
-        };
-        if !self.update_surfaces_enabled() {
-            // Do not record the version while the surfaces are hidden, so
-            // enabling a preference later reveals the release.
-            self.update_panel_version = None;
-            self.update_panel_open = false;
-            if was_open {
-                cx.notify();
-            }
-            return;
         }
-        if self.update_panel_version.as_deref() != Some(version.as_str()) {
-            self.update_panel_version = Some(version);
-            self.update_panel_open = true;
-            if !was_open {
-                cx.notify();
-            }
+        if !has_release {
+            self.update_auto_download_version = None;
         }
     }
 
@@ -48705,11 +48680,18 @@ impl VibexWorkbench {
 
     /// The title-bar update entry: an arrow that toggles the update panel.
     ///
-    /// `Popover` owns the toggle from its mouse-down handler and applies the
-    /// trigger's selected state itself, so the trigger must not add its own
-    /// click handler.
+    /// The panel is an ordinary absolutely positioned child rather than a
+    /// `Popover`. Popovers paint in GPUI's deferred pass, which runs after the
+    /// dialog layer, so a popover would float above an open modal — an update
+    /// check that lands while Settings is up must not cover it. An in-tree
+    /// layer stays below Root's dialog layers, and the title bar only clips
+    /// horizontally so the panel can hang below the band.
+    ///
+    /// The trigger owns the toggle because the panel is no longer a `Popover`
+    /// child, and it is built only while open so a closed panel costs nothing.
     fn render_update_entry(&mut self, version: &str, cx: &mut Context<Self>) -> AnyElement {
-        let panel = self.render_update_panel(cx);
+        let open = self.update_panel_open;
+        let panel = open.then(|| self.render_update_panel(cx));
         let tooltip = if version.is_empty() {
             locale::text("Update available", "有可用更新", "有可用更新").to_string()
         } else {
@@ -48724,6 +48706,7 @@ impl VibexWorkbench {
             .compact()
             .size(px(32.0))
             .px_0()
+            .selected(open)
             .tooltip(tooltip)
             // Green marks the entry as "an update is waiting", which is the only
             // state this trigger is rendered in.
@@ -48731,25 +48714,29 @@ impl VibexWorkbench {
                 Icon::new(IconName::ArrowDown)
                     .size(px(18.0))
                     .text_color(cx.theme().success),
-            );
-        div()
-            .flex_none()
-            .child(
-                Popover::new("update-popover")
-                    .anchor(Anchor::TopRight)
-                    .appearance(false)
-                    // The panel reports progress and offers the install; it
-                    // stays until the user closes it instead of disappearing
-                    // on the next click elsewhere.
-                    .overlay_closable(false)
-                    .open(self.update_panel_open)
-                    .on_open_change(cx.listener(|this, open: &bool, _, cx| {
-                        this.set_update_panel_open(*open, cx);
-                    }))
-                    .trigger(trigger)
-                    .child(panel)
-                    .top(px(6.0)),
             )
+            .on_click(cx.listener(|this, _, _, cx| {
+                let open = this.update_panel_open;
+                this.set_update_panel_open(!open, cx);
+            }));
+        div()
+            .relative()
+            .flex_none()
+            // The panel hangs below the band; keep those clicks from starting
+            // a window drag as they pass through the title-bar handler.
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(trigger)
+            .when_some(panel, |this, panel| {
+                this.child(
+                    div()
+                        .absolute()
+                        // The wrapper is vertically centered in the band, so
+                        // this puts the panel just below the bar's lower edge.
+                        .top(px(TITLE_BAR_HEIGHT))
+                        .right_0()
+                        .child(panel),
+                )
+            })
             .into_any_element()
     }
 
@@ -49494,7 +49481,9 @@ impl VibexWorkbench {
             .flex_row()
             .items_center()
             .h(px(TITLE_BAR_HEIGHT))
-            .overflow_hidden()
+            // Horizontal clipping keeps long titles inside the band, while the
+            // update panel hangs below it and must stay visible.
+            .overflow_x_hidden()
             .text_color(cx.theme().foreground)
             .when(is_linux, |this| {
                 this.on_double_click(|_, window, _| window.zoom_window())
@@ -122034,13 +122023,25 @@ mod tests {
             .and_then(|(_, tail)| tail.split_once("\n    fn open_pairing("))
             .map(|(body, _)| body)
             .expect("the title-bar update entry should remain inspectable");
-        assert!(entry.contains("Popover::new(\"update-popover\")"));
-        assert!(entry.contains(".overlay_closable(false)"));
-        assert!(entry.contains(".on_open_change("));
-        assert!(
-            !entry.contains(".on_click("),
-            "the popover owns the toggle; a click handler here closes the panel on mouse-up"
-        );
+        // The panel is an in-tree layer, not a deferred popover: a popover
+        // paints after the dialog layer and would cover an open modal.
+        assert!(!entry.contains("Popover::new"));
+        assert!(entry.contains("self.update_panel_open"));
+        assert!(entry.contains(".on_click("));
+        assert!(entry.contains(".absolute()"));
+        assert!(entry.contains(".top(px(TITLE_BAR_HEIGHT))"));
+        assert!(entry.contains(".right_0()"));
+
+        // A background check updates only the title-bar entry. The panel may
+        // close itself when its release disappears, but it must never open
+        // without a click.
+        let sync = source
+            .split_once("    fn sync_update_panel(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// Start the download"))
+            .map(|(body, _)| body)
+            .expect("update panel synchronization should remain inspectable");
+        assert!(sync.contains("update_panel_open = false"));
+        assert!(!sync.contains("update_panel_open = true"));
 
         let panel = source
             .split_once("    fn render_update_panel(")
@@ -122068,7 +122069,7 @@ mod tests {
 
         let surfaces = source
             .split_once("    fn update_surfaces_enabled(")
-            .and_then(|(_, tail)| tail.split_once("\n    /// Keep the title-bar panel"))
+            .and_then(|(_, tail)| tail.split_once("\n    /// Close the title-bar panel"))
             .map(|(body, _)| body)
             .expect("update surface policy should remain inspectable");
         assert!(surfaces.contains("auto_update"));
