@@ -720,31 +720,35 @@ impl ManagementCenter {
                     cx,
                 ));
             }
-            editor = editor.child(
-                v_flex()
-                    .w_full()
-                    .gap_1p5()
-                    .child(management_choice_group_label(
-                        management_locale_text("Thinking levels", "思考档位", "思考檔位"),
-                        cx,
-                    ))
-                    .child(levels)
-                    .child(management_input_field_with_error(
-                        management_locale_text("Declared levels", "档位列表", "檔位清單"),
-                        &self.model_editor.efforts,
-                        false,
-                        error_message.as_deref(),
-                        cx,
-                    ))
-                    .child(management_field_hint(
-                        management_locale_text(
-                            "Click a level to declare it and click it again to take it back. The field takes any other spelling: levels separated by commas, or level=wire when the endpoint spells one differently. Empty follows the Agent default.",
-                            "点击档位即可声明，再次点击取消。也可以在输入框自定义：多个档位用逗号分隔，端点拼写不同时写成 档位=实际值。留空沿用 Agent 默认。",
-                            "點擊檔位即可宣告，再次點擊取消。也可以在輸入框自訂：多個檔位用逗號分隔，端點拼寫不同時寫成 檔位=實際值。留空沿用 Agent 預設。",
-                        ),
-                        cx,
-                    )),
-            );
+            let reasoning_suggestion =
+                self.render_model_reasoning_efforts_suggestion(id_prefix, write_through, cx);
+            let mut thinking = v_flex()
+                .w_full()
+                .gap_1p5()
+                .child(management_choice_group_label(
+                    management_locale_text("Thinking levels", "思考档位", "思考檔位"),
+                    cx,
+                ))
+                .child(levels)
+                .child(management_input_field_with_error(
+                    management_locale_text("Declared levels", "档位列表", "檔位清單"),
+                    &self.model_editor.efforts,
+                    false,
+                    error_message.as_deref(),
+                    cx,
+                ))
+                .child(management_field_hint(
+                    management_locale_text(
+                        "Click a level to declare it and click it again to take it back. The field takes any other spelling: levels separated by commas, or level=wire when the endpoint spells one differently. Empty follows the Agent default.",
+                        "点击档位即可声明，再次点击取消。也可以在输入框自定义：多个档位用逗号分隔，端点拼写不同时写成 档位=实际值。留空沿用 Agent 默认。",
+                        "點擊檔位即可宣告，再次點擊取消。也可以在輸入框自訂：多個檔位用逗號分隔，端點拼寫不同時寫成 檔位=實際值。留空沿用 Agent 預設。",
+                    ),
+                    cx,
+                ));
+            if let Some(suggestion) = reasoning_suggestion {
+                thinking = thinking.child(suggestion);
+            }
+            editor = editor.child(thinking);
         }
 
         let capability_rows = self.render_model_capabilities(pending, write_through, cx);
@@ -895,9 +899,12 @@ impl ManagementCenter {
             return Vec::new();
         };
         let draft = &self.model_editor;
+        // Thinking levels have their own control and their own Apply row, so
+        // the generic list carries only the scalar fields that fit one line.
         let pending = suggestion
             .fields
             .iter()
+            .filter(|field| field.field != "reasoningEfforts")
             .filter(|field| !draft.matches_suggestion(&field.field, &field.value))
             .cloned()
             .collect::<Vec<_>>();
@@ -1004,6 +1011,70 @@ impl ManagementCenter {
         rows
     }
 
+    /// The catalogue's effort values, offered explicitly under the control.
+    ///
+    /// The catalogue publishes a level vocabulary, not this Agent's wire
+    /// spelling. The row therefore never writes the field on its own; the
+    /// reader applies it, and the declaration form parses the same text the
+    /// chips write.
+    fn render_model_reasoning_efforts_suggestion(
+        &mut self,
+        id_prefix: &str,
+        write_through: bool,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let value = self
+            .model_editor
+            .suggestion
+            .as_ref()?
+            .field("reasoningEfforts")?
+            .to_string();
+        if reasoning_efforts_match(&self.model_editor.efforts.read(cx).value(), &value) {
+            return None;
+        }
+        Some(
+            h_flex()
+                .w_full()
+                .items_center()
+                .justify_between()
+                .gap_2()
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(format!(
+                            "{} · {}",
+                            management_locale_text(
+                                "models.dev suggests",
+                                "models.dev 建议",
+                                "models.dev 建議",
+                            ),
+                            value
+                        )),
+                )
+                .child(
+                    Button::new(SharedString::from(format!(
+                        "{id_prefix}-model-adopt-reasoning-efforts"
+                    )))
+                    .xsmall()
+                    .ghost()
+                    .label(management_locale_text("Apply", "采用", "採用"))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.adopt_model_capability(
+                            "reasoningEfforts",
+                            &value,
+                            write_through,
+                            window,
+                            cx,
+                        );
+                    })),
+                )
+                .into_any_element(),
+        )
+    }
+
     fn adopt_model_capability(
         &mut self,
         field: &str,
@@ -1034,6 +1105,17 @@ impl ManagementCenter {
             "pdfInput" => draft.pdf_input = flag(value),
             "temperature" => draft.temperature = flag(value),
             "reasoning" => draft.reasoning = flag(value),
+            "reasoningEfforts" => {
+                if vibex_core::ProviderModelReasoningEfforts::parse(value)
+                    .is_ok_and(|parsed| parsed.is_some())
+                {
+                    let declaration = value.to_string();
+                    draft.reasoning_disabled = false;
+                    draft
+                        .efforts
+                        .update(cx, |state, cx| state.set_value(declaration, window, cx));
+                }
+            }
             _ => return,
         }
         self.model_editor_changed(write_through, cx);
@@ -1048,9 +1130,40 @@ impl ManagementCenter {
         let Some(suggestion) = self.model_editor.suggestion.clone() else {
             return;
         };
-        for field in suggestion.fields {
+        // Thinking levels have their own Apply row under the control; this
+        // button stays the scalar suggestions the list above shows.
+        for field in suggestion
+            .fields
+            .iter()
+            .filter(|field| field.field != "reasoningEfforts")
+        {
             self.adopt_model_capability(&field.field, &field.value, write_through, window, cx);
         }
+    }
+}
+
+/// Whether a declared level table already equals the catalogue's suggestion.
+///
+/// The comparison is by level, not by spelling: the catalogue suggests names,
+/// while a declaration may carry the endpoint's wire spelling. A raw entry the
+/// vocabulary does not name keeps the suggestion visible, because the
+/// declaration is then not just the catalogue's answer.
+fn reasoning_efforts_match(current: &str, suggested: &str) -> bool {
+    let levels = |text: &str| {
+        let entries = reasoning_level_entries(text);
+        if entries.iter().any(|entry| entry.level().is_none()) {
+            return None;
+        }
+        let mut levels = entries
+            .iter()
+            .filter_map(|entry| entry.level())
+            .collect::<Vec<_>>();
+        levels.sort();
+        Some(levels)
+    };
+    match (levels(current), levels(suggested)) {
+        (Some(current), Some(suggested)) => !current.is_empty() && current == suggested,
+        _ => false,
     }
 }
 
@@ -1122,5 +1235,19 @@ mod tests {
             "unknown",
             "1"
         ));
+    }
+
+    /// The catalogue suggests level names; a declaration may spell them on
+    /// the wire. The row counts the suggestion as applied by level, and a raw
+    /// entry means the declaration carries something the catalogue did not.
+    #[test]
+    fn a_thinking_level_suggestion_matches_by_level_not_spelling() {
+        assert!(reasoning_efforts_match("low, high", "low, high"));
+        assert!(reasoning_efforts_match("high, low=low", "low, high"));
+        assert!(reasoning_efforts_match("low=fast, high", "low, high"));
+        assert!(!reasoning_efforts_match("low", "low, high"));
+        assert!(!reasoning_efforts_match("low, custom", "low"));
+        assert!(!reasoning_efforts_match("", "low, high"));
+        assert!(!reasoning_efforts_match("low, high", ""));
     }
 }

@@ -2,7 +2,10 @@
 
 use std::collections::BTreeMap;
 
-use vibex_core::{ModelCapabilitySource, ProviderModelCapabilities, ProviderModelReasoningEfforts};
+use vibex_core::{
+    ModelCapabilitySource, ProviderModelCapabilities, ProviderModelReasoningEfforts,
+    ProviderReasoningEffortLevel,
+};
 
 /// One model's catalogue entry.
 ///
@@ -241,9 +244,11 @@ pub struct CapabilitySuggestion {
 impl CapabilitySuggestion {
     /// The fields this suggestion can fill, as `(field, value)` pairs.
     ///
-    /// `reasoning_efforts` is never included: the catalogue does not publish the
-    /// Agent's own effort vocabulary, and guessing it would produce a
-    /// declaration the Agent refuses.
+    /// `reasoningEfforts` is included only when the catalogue publishes an
+    /// `effort` control, and only for values the Agent vocabulary names. It is
+    /// an explicit suggestion, not an applied capability: the catalogue does
+    /// not publish the Agent's wire spelling, so `adopt_all` leaves the level
+    /// table alone and the editor applies it through its own control.
     pub fn fields(&self) -> Vec<(&'static str, String)> {
         let mut fields = Vec::new();
         if let Some(context) = self.model.context_tokens {
@@ -251,6 +256,9 @@ impl CapabilitySuggestion {
         }
         if let Some(output) = self.model.output_tokens {
             fields.push(("outputTokens", output.to_string()));
+        }
+        if let Some(levels) = self.reasoning_efforts_suggestion() {
+            fields.push(("reasoningEfforts", levels));
         }
         for (field, value) in [
             ("reasoning", self.model.reasoning),
@@ -265,10 +273,50 @@ impl CapabilitySuggestion {
         fields
     }
 
-    /// The capabilities a user gets by adopting every suggested field.
+    /// The catalogue's effort values as a compact thinking-level declaration.
     ///
-    /// The result carries `Catalog` provenance for each adopted field, so a
-    /// later projection can tell it apart from a hand-typed value.
+    /// The catalogue publishes values such as `low`, `high`, or `max`; values
+    /// outside the Agent's vocabulary are dropped rather than guessed, and the
+    /// `toggle` / `budget_tokens` controls are not level tables and suggest
+    /// nothing. The result is a suggestion the editor offers under the Thinking
+    /// levels control, never an applied declaration.
+    pub fn reasoning_efforts_suggestion(&self) -> Option<String> {
+        let options = self.model.reasoning_options.as_ref()?;
+        let mut levels = Vec::new();
+        for option in options {
+            let CatalogReasoningOption::Effort { values } = option else {
+                continue;
+            };
+            for value in values {
+                let Some(level) = ProviderReasoningEffortLevel::parse(value) else {
+                    continue;
+                };
+                if level != ProviderReasoningEffortLevel::Off {
+                    levels.push(level);
+                }
+            }
+        }
+        levels.sort();
+        levels.dedup();
+        if levels.is_empty() {
+            return None;
+        }
+        Some(
+            levels
+                .iter()
+                .map(|level| level.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+        )
+    }
+
+    /// The capabilities a user gets by adopting every scalar suggested field.
+    ///
+    /// The thinking-level suggestion is deliberately absent: it is
+    /// Agent-specific, and the editor applies it only through the Thinking
+    /// levels control. The result carries `Catalog` provenance for each
+    /// adopted field, so a later projection can tell it apart from a
+    /// hand-typed value.
     pub fn adopt_all(&self) -> ProviderModelCapabilities {
         let mut capabilities = ProviderModelCapabilities::default();
         if let Some(context) = self.model.context_tokens {
@@ -328,7 +376,7 @@ mod tests {
             r#"{
                 "deepseek": {"name":"DeepSeek","models":{
                     "deepseek-chat":{"limit":{"context":128000,"output":8192},"reasoning":false,"temperature":true},
-                    "deepseek-reasoner":{"limit":{"context":64000},"reasoning":true}
+                    "deepseek-reasoner":{"limit":{"context":64000},"reasoning":true,"reasoning_options":[{"type":"effort","values":["low","high","ultra"]}]}
                 }}
             }"#,
         )
@@ -395,22 +443,27 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_efforts_are_never_suggested() {
+    fn reasoning_efforts_are_suggested_but_never_adopted_automatically() {
         let suggestion = catalog()
             .suggestion("deepseek", "deepseek-reasoner")
             .unwrap();
-        assert!(suggestion.model.reasoning_efforts.is_none());
+        assert_eq!(
+            suggestion.reasoning_efforts_suggestion().as_deref(),
+            Some("low, high"),
+            "unknown catalogue levels are dropped, not guessed"
+        );
         assert!(
-            !suggestion
+            suggestion
                 .fields()
                 .iter()
-                .any(|(field, _)| *field == "reasoningEfforts")
+                .any(|(field, value)| *field == "reasoningEfforts" && value == "low, high")
         );
+        assert!(suggestion.model.reasoning_efforts.is_none());
         assert!(suggestion.adopt_all().reasoning_efforts.is_none());
     }
 
     #[test]
-    fn catalog_reasoning_options_are_not_agent_effort_levels() {
+    fn catalog_reasoning_options_are_suggested_not_declared() {
         let catalog = parse_catalog(
             r#"{"p":{"models":{"m":{
                 "reasoning_options":[
@@ -426,10 +479,33 @@ mod tests {
             suggestion.model.reasoning_options.as_ref().unwrap().len(),
             3
         );
-        // The catalogue's controls stay catalogue data; they never become the
-        // Agent's declared level table.
+        // The catalogue's controls stay catalogue data; the effort values are
+        // an explicit suggestion, not the Agent's declared level table.
+        assert_eq!(
+            suggestion.reasoning_efforts_suggestion().as_deref(),
+            Some("low, high")
+        );
         assert!(suggestion.model.reasoning_efforts.is_none());
         assert!(suggestion.adopt_all().reasoning_efforts.is_none());
+    }
+
+    #[test]
+    fn a_catalog_without_an_effort_option_suggests_no_levels() {
+        let catalog = parse_catalog(
+            r#"{"p":{"models":{"m":{"reasoning_options":[
+                {"type":"toggle"},
+                {"type":"budget_tokens","min":1024}
+            ]}}}}"#,
+        )
+        .unwrap();
+        let suggestion = catalog.suggestion("p", "m").unwrap();
+        assert!(suggestion.reasoning_efforts_suggestion().is_none());
+        assert!(
+            !suggestion
+                .fields()
+                .iter()
+                .any(|(field, _)| *field == "reasoningEfforts")
+        );
     }
 
     #[test]

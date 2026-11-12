@@ -164,8 +164,9 @@ fn read_model(model_id: &str, model: &Value) -> Option<CatalogModel> {
         structured_output: model.get("structured_output").and_then(Value::as_bool),
         canonical_model_id: string_field(model, "canonical_model_id"),
         status: string_field(model, "status"),
-        // The catalogue does not publish the Agent's own effort vocabulary, so
-        // nothing is guessed: a level table is a declaration the user makes.
+        // `reasoning_options` is an advisory control list, not a declaration:
+        // the editor may offer its known effort values, but the Agent's wire
+        // spelling remains the user's explicit choice.
         reasoning_efforts: None,
     })
 }

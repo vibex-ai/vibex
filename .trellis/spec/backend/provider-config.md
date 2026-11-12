@@ -5746,9 +5746,11 @@ ProviderConfigService::{
   - Every failure is silent. A catalogue that cannot be fetched, parsed, stored,
     or read yields no suggestion and changes nothing else; a stale document still
     suggests, but its matches are marked approximate.
-  - `reasoning_efforts` is never suggested. The catalogue does not publish an
-    Agent's own effort vocabulary, and inventing one produces a declaration the
-    Agent refuses.
+  - `reasoning_efforts` is never adopted automatically. The catalogue publishes
+    `reasoning_options` effort values, and the editor may show the values the
+    Agent vocabulary names as an explicit Apply row under Thinking levels; the
+    declaration still comes from the user's click, never from `adopt_all` or
+    auto-fill. Values outside the vocabulary are dropped.
   - No money field exists anywhere in the catalogue, its cache, or its DTOs.
 - **A route group steps aside, not the gateway.** Three consecutive requests
   that produce no upstream answer put *that group* into a stepped-aside state:
@@ -6118,7 +6120,8 @@ ProviderConfigService::{
   Key is refused, and that each add advances the revision.
 - `cargo test -p vibex-model-catalog` asserts exact and approximate matching, that
   adoption records provenance per field, that a hand-typed value is not
-  overwritten, that `reasoning_efforts` is never suggested, that a corrupt or
+  overwritten, that `reasoning_options` produce only an explicit level
+  suggestion and are never adopted by `adopt_all`, that a corrupt or
   older-schema cache reads as missing, and that no cached field carries money.
 - `cargo test -p vibex-desktop gateway_surface_tests` asserts every gateway state
   is named in words, that a gateway without a ready Key is not routable, that a
