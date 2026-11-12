@@ -134,6 +134,36 @@ impl TimelineModel {
         self.needs_authoritative_refetch = true;
     }
 
+    /// The last sequence in the unbroken run that starts at the window's
+    /// first item.
+    ///
+    /// A gap can arrive before the full refetch does. Resuming from the last
+    /// item would then skip the hole, because the gapped item is already at
+    /// the end; resuming from the contiguous run asks for exactly what is
+    /// missing.
+    pub fn contiguous_end_sequence(&self) -> Option<i64> {
+        let mut items = self.items.iter();
+        let mut end = items.next()?.sequence;
+        for item in items {
+            if item.sequence != end.saturating_add(1) {
+                break;
+            }
+            end = item.sequence;
+        }
+        Some(end)
+    }
+
+    /// Whether the window has no holes between adjacent items.
+    pub fn is_contiguous(&self) -> bool {
+        self.items
+            .windows(2)
+            .all(|pair| pair[1].sequence == pair[0].sequence.saturating_add(1))
+    }
+
+    pub fn clear_authoritative_refetch(&mut self) {
+        self.needs_authoritative_refetch = false;
+    }
+
     pub fn rows(&self) -> Vec<crate::TimelineRow> {
         crate::timeline_rows(&self.items)
     }
@@ -659,6 +689,44 @@ mod tests {
             ],
         );
         assert!(model.turns()[0].pending_permission_ids.is_empty());
+    }
+
+    #[test]
+    fn a_gap_ends_the_contiguous_run() {
+        let session = VibexSessionId::parse("session_contiguous").unwrap();
+        let mut model = TimelineModel::default();
+        model.replace_authoritative(
+            session.clone(),
+            [
+                item(
+                    &session,
+                    1,
+                    TimelinePayload::AgentMessage(AgentMessagePayload {
+                        text: "one".into(),
+                        is_final: true,
+                    }),
+                ),
+                item(
+                    &session,
+                    2,
+                    TimelinePayload::AgentMessage(AgentMessagePayload {
+                        text: "two".into(),
+                        is_final: true,
+                    }),
+                ),
+                item(
+                    &session,
+                    5,
+                    TimelinePayload::AgentMessage(AgentMessagePayload {
+                        text: "five".into(),
+                        is_final: true,
+                    }),
+                ),
+            ],
+        );
+
+        assert_eq!(model.contiguous_end_sequence(), Some(2));
+        assert!(!model.is_contiguous());
     }
 
     #[test]

@@ -170,6 +170,19 @@ function writePlatformConfig(platform, arch, channel, triple, cross, packageDire
       const appBundle = join(packageDirectory, `${fieldValue(channelConfig, "productName")}.app`);
       config = withMacosBundleSigning(config, appBundle);
     }
+    if (platform === "windows") {
+      // NSIS cannot carry the user's whole PATH in a variable, so the installer
+      // delegates both edits to this helper. It has to sit beside the app in
+      // the package; the NSIS template copies it there and deletes it on
+      // uninstall.
+      config += [
+        "",
+        "[[binaries]]",
+        'path = "vibex-installer-env"',
+        "main = false",
+        ""
+      ].join("\n");
+    }
   }
   if (cross) {
     config = withField(config, "binariesDir", `../../target/${triple}/release`);

@@ -2874,6 +2874,25 @@ impl AgentManager {
         self.fetch_timeline_window(&request)
     }
 
+    /// Reads a timeline page for a paired client.
+    ///
+    /// The local summary deliberately keeps a user message's inline `data:`
+    /// attachment, because the desktop can open it from the item. A phone
+    /// pays for that payload on every page, so the remote answer replaces it
+    /// with a bounded marker; the detail read still carries the bytes.
+    pub async fn fetch_timeline_remote(
+        &self,
+        request: FetchTimelineRequest,
+    ) -> VibexResult<TimelinePage> {
+        let mut page = self.fetch_timeline(request).await?;
+        page.items = page
+            .items
+            .into_iter()
+            .map(vibex_core::TimelineItem::into_remote_summary)
+            .collect();
+        Ok(page)
+    }
+
     /// Reads one item back at full payload depth.
     ///
     /// Pages and live events ship summary payloads, so this is how a reader
@@ -7609,10 +7628,13 @@ fn should_coalesce_provider_event(event: &ProviderEvent) -> bool {
                 error.code.as_str(),
                 "codex_stream_reconnecting" | "opencode_model_api_retrying"
             ),
-            // A final thought closes the run rather than extending it, so it
-            // stays a row of its own: the run it closes is still the row it
-            // reads back from.
-            TimelinePayload::Reasoning(reasoning) => !reasoning.is_final,
+            // A thought arrives as chunks, and each chunk is already a
+            // delta. Upserting the run would make every live event carry the
+            // whole accumulation, which is quadratic over a long thought.
+            // The projection concatenates adjacent reasoning rows, and
+            // storage compacts them at turn end, so a row per chunk is the
+            // cheaper live shape.
+            TimelinePayload::Reasoning(_) => false,
             TimelinePayload::ToolCall(_) => true,
             _ => false,
         }

@@ -3327,6 +3327,31 @@ agent_discovery_records(
 - Good: a configured Codex model receives only the reasoning efforts returned
   for that exact model by stateless `model/list`; no generic effort list is
   fabricated when the probe is unavailable.
+- Good: a Codex Profile whose Models declare `capabilities.reasoningEfforts`
+  also gets a private `model_catalog_json` catalogue beside its `config.toml`
+  (`vibex-models.json`, resolved relative to `CODEX_HOME`). Codex answers
+  `model/list` from a catalogue that only describes OpenAI's own model ids, so
+  an alias id such as `daily` reported an empty `supportedReasoningEfforts`;
+  codex-acp publishes its `reasoning_effort` config option only when that list
+  is non-empty, and `session/set_config_option` therefore failed with
+  `Invalid params`. The projected catalogue makes the declaration the answer.
+- Base: the catalogue **replaces** Codex's bundled catalogue rather than
+  extending it, so it lists every enabled Model of the binding, declares
+  `visibility: "list"`, and carries every `ModelInfo` field Codex deserializes
+  without a default. An entry it omits silently regains bundled metadata.
+- Base: each entry carries the reduced developer prompt Codex assembles for an
+  unknown model (`crates/config-switch/assets/codex-model-instructions.md`, the
+  byte-identical prompt an alias id already ran under). An entry with an empty,
+  null or missing prompt is not rejected — it runs the session with no system
+  prompt at all.
+- Base: `default_reasoning_level` is a declared thinking level (preferred
+  `xhigh` → `high` → `medium`, else the shallowest declared one), never
+  `off`/`none`: Codex applies it to the first turn. `off` is projected as the
+  Responses spelling `none`, and a declaration's own wire spelling wins.
+- Base: a Model that declares no levels is still listed, with an empty
+  `supported_reasoning_levels` and no `default_reasoning_level`; a Profile
+  where no Model declares levels projects no catalogue at all and keeps its
+  previous single-overlay output byte for byte.
 - Bad: frontend hides a disabled agent but backend still accepts direct session
   creation.
 - Bad: `agent_list` starts `opencode acp`, Claude, Codex, or any other runtime
@@ -3363,6 +3388,11 @@ agent_discovery_records(
 - `cargo test -p vibex-desktop agent` and
   `pnpm --dir apps/desktop typecheck` and frontend builds
   cover Runtime Option Catalog/create contract consumption.
+- `cargo test -p vibex-config-switch codex_ --locked` covers the Codex
+  catalogue contract: a declared thinking depth adds the overlay and the
+  `model_catalog_json` line, an undeclared profile stays byte-identical, every
+  enabled Model is listed with its declared spellings and context window, and
+  the file materializes at `0o600` inside the private `CODEX_HOME`.
 
 ### 7. Wrong vs Correct
 
@@ -4314,6 +4344,45 @@ ProviderConfigService::{
   binding whose effective process fingerprint changed becomes
   `stale_restart_required`; saving never stops an active process or advances a
   runtime generation.
+- A shared Provider is one recorded catalogue with one launch row per bound
+  Agent, and `model_provider_profiles.legacy_provider_profile_id` is `UNIQUE`, so
+  it names at most one of those rows. Any mutation on the Providers page
+  therefore fans out through `agent_model_provider_bindings_v2`, not through
+  that pointer: every binding's `configured_models`, every launch row's
+  `configured_models` + ACP `models` (inside `acp.config.v1`), and each runtime
+  Profile's `models` are rebuilt from the record. Missing the binding loop is
+  what made a Model added on the Providers page appear for the Agent the record
+  was derived from and for nobody else.
+- Each Agent's copy of the catalogue is that record filtered by the protocols
+  the Agent declares (`model_interfaces`), so it is a *view*, not a second
+  authority. A v1 edit that reaches `merge_into_shared` therefore merges — new
+  Models and per-Model label/capability/visibility — and never prunes. Writing
+  the narrower view back wholesale is what deleted Models the other Agents could
+  still reach. Deleting a Model is the Providers page's job, where the full
+  catalogue is the input.
+- The projection keeps the Agent-owned half of a launch row: `wireApi` pin,
+  `protocolBaseUrl.<id>` entries, the ACP command/args/env, import markers,
+  `account_alias`, `reasoning_effort`, `sandbox/network/permission` defaults and
+  `projection_overrides`. `provider_secret_references.secret_ref_id` is a global
+  primary key, so every bound Agent gets its own id per Key — sharing one would
+  let the second Agent's insert take the first Agent's Secret away. The link
+  across rows is `lookup_key`, and ids are reused by it so `launch_revision`
+  stays put when nothing changed.
+- The hidden `vibex.internal.profileRole = model_gateway` row is *not* projected
+  from the upstream record: its Model ids are the listener's
+  `group/<route>/<model>` names, written by `attach_gateway_to_agents` /
+  `refresh_gateway_profiles`. A shared Provider edit still changes which route
+  groups resolve, so every native `NativeBackend` write path that touches shared
+  Provider Models or Keys calls `refresh_gateway_catalog` after the facade call.
+  A paired client's write reaches the same `ProviderConfigService` through the
+  remote dispatcher and publishes the same `ProviderConfigChanged` events, but
+  it does not run that republication: it has the database, not the listener's
+  address. The desktop runtime republishes on the next route or gateway write.
+- `ProviderConfigChanged` is published per launch row, so a paired client's
+  write must go through the runtime-owned `ProviderConfigService` — the one
+  carrying the profile-change listeners — rather than a fresh instance opened on
+  the same path. Without `.with_provider_config_service(...)` the write landed in
+  SQLite and published nothing, leaving this machine's pages on the old list.
 - `NativeBackend` may expose the typed entity CRUD, preview, capability, and
   explicit Secret mutation methods. `WebRemoteBackend` exposes only bounded
   capability and redacted preview; raw entities and Secret mutation fail with a

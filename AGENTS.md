@@ -195,7 +195,7 @@ function tgit --wraps git; git --git-dir=(git rev-parse --show-toplevel)/.trelli
 
 ## 2. Project state
 
-Vibex is a Rust-first, local-first AI coding workbench, `0.1.1`,
+Vibex is a Rust-first, local-first AI coding workbench, `0.1.3`,
 AGPL-3.0-or-later. Two GPUI surfaces share one design system, and a terminal
 client renders the same runtime:
 
@@ -261,8 +261,9 @@ what you touched.
 
 A release publishes one page with three parts: the bilingual notes (English
 first, then Chinese), an English Downloads table built from the assets that run
-publishes, and an English `New Contributors` credit with the comparison link.
-The per-change list is deliberately left out; the notes already carry it.
+publishes, and the English contributor credits — every author as an `@` mention,
+then the `New Contributors` credit — followed by the comparison link. The
+per-change list is deliberately left out; the notes already carry it.
 
 ```bash
 node scripts/release-notes.mjs --version <version> --context target/release-notes/context.md

@@ -164,6 +164,10 @@ impl MobileCredentialBundle {
 
     /// Prefer the human-readable route authority for the mobile picker, then
     /// fall back to a bounded server-id label for QR/relay-only credentials.
+    ///
+    /// The built-in relay's address is skipped: it is the same origin for every
+    /// user, so it identifies nothing, and naming it here would put the
+    /// product's own endpoint in front of a reader as if it were their desktop.
     pub fn host_label(&self) -> String {
         if let Some(display_name) = self
             .display_name
@@ -183,6 +187,9 @@ impl MobileCredentialBundle {
                 .chain(route.relay.as_ref().map(|candidate| candidate.url.as_str()))
         });
         for url in route_urls {
+            if vibex_core::is_official_relay_origin(url) {
+                continue;
+            }
             if let Ok(parsed) = Url::parse(url)
                 && let Some(host) = parsed.host_str()
                 && !host.trim().is_empty()
@@ -801,6 +808,48 @@ mod tests {
         bundle.route = None;
         bundle.expected_server_id = "server-abcdefghijklmnopqrstuvwxyz-0123456789".to_string();
         assert_eq!(bundle.host_label().chars().count(), 32);
+    }
+
+    #[test]
+    fn host_picker_label_never_uses_the_built_in_relay_as_a_name() {
+        let mut bundle = MobileCredentialBundle {
+            schema_version: MOBILE_CREDENTIAL_SCHEMA_VERSION.to_string(),
+            record: RemoteCredentialRecord {
+                server_url: vibex_core::REMOTE_OFFICIAL_RELAY_ORIGIN.to_string(),
+                auth: RemoteAuthProof {
+                    device_id: DeviceId::new(),
+                    auth_token: "grant".to_string(),
+                },
+                device_identity_public_key: "public-key".to_string(),
+                server_identity_public_key: Some("server-key".to_string()),
+            },
+            identity_private_key: "private-key".to_string(),
+            expected_server_id: "server-id".to_string(),
+            client_type: RemoteClientType::Mobile,
+            allow_insecure_local_dev: false,
+            display_name: None,
+            route: Some(MobileRemoteRouteBundle {
+                local_network: None,
+                direct_candidates: Vec::new(),
+                relay: Some(MobileRelayCandidate {
+                    url: vibex_core::REMOTE_OFFICIAL_RELAY_ORIGIN.to_string(),
+                    room_id: vibex_core::RelayRoomId::new(),
+                    local_peer_id: RelayPeerId::new(),
+                    pc_peer_id: RelayPeerId::new(),
+                    pc_public_key: "relay-public".to_string(),
+                }),
+            }),
+        };
+        assert_eq!(
+            bundle.host_label(),
+            "server-id",
+            "a relay-only credential falls back to the server id, not the relay host"
+        );
+        // A self-hosted relay is the operator's own address, so it stays a name
+        // the picker can use.
+        bundle.route.as_mut().unwrap().relay.as_mut().unwrap().url =
+            "https://relay.example".to_string();
+        assert_eq!(bundle.host_label(), "relay.example");
     }
 
     #[test]

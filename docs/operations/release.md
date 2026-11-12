@@ -104,8 +104,8 @@ instructions, artifact hashes, or anything the updater must trust into it.
 
 ### Release page
 
-The GitHub Release page is composed by the publish job from three inputs, in
-this order:
+The GitHub Release page is composed by the publish job in three parts, in this
+order:
 
 1. **English**, then the Chinese section when the document carries one — the
    tagged notes, unchanged.
@@ -114,11 +114,15 @@ this order:
    rendered from the assets the run actually publishes, so a platform whose job
    failed drops out instead of leaving a dead link, and a missing server tarball
    renders as `—`.
-3. **New Contributors** and **Full Changelog** — English only. The job asks
-   GitHub to generate the release notes over the range and reuses only the
-   contributor credit, which names each new contributor's first pull request; a
-   range that carries only direct commits generates none, so the composer
-   credits the author of a first commit between the previous tag and this one.
+3. **Contributors**, **New Contributors** and **Full Changelog** — English only.
+   GitHub's generated notes name each new contributor's first pull request, and
+   the publish job keeps that credit. They name only the authors of merged pull
+   requests, so a range built from direct commits generates none. The job
+   therefore walks the commit log, resolves every distinct author email to a
+   GitHub account through the commit API, and emits a `## Contributors` list of
+   `@` mentions. Those mentions are what give the release page's contributor
+   block an avatar for every author, direct commits included; an author the API
+   cannot attribute is still credited by name.
 
 The page deliberately carries no per-change list. A release spans several
 hundred commits, so a `What's Changed` list is longer than everything a reader
@@ -126,27 +130,35 @@ came for, and the notes above already say what changed in the terms a reader
 cares about. The composer drops that section even when GitHub generates it, and
 the publish job fails if it ever reaches the body.
 
-`scripts/release-body.mjs` builds the body and `scripts/release-body.test.mjs`
-pins its rules. A local draft needs the tagged notes and, optionally, the asset
-directory and a generated changelog:
+`scripts/release-body.mjs` builds the body, `scripts/release-contributors.mjs`
+resolves the email-to-login map, and their self-tests pin the rules. A local
+draft needs the tagged notes and, optionally, the asset directory, a generated
+changelog and the contributor map:
 
 ```bash
 gh api "repos/vibex-ai/vibex/releases/generate-notes" \
   -f tag_name=v0.1.1 -f previous_tag_name=v0.1.0 --jq .body \
   > target/release-body/generated-changelog.md
 
+node scripts/release-contributors.mjs --version 0.1.1 \
+  --previous-tag v0.1.0 \
+  --output target/release-body/contributors.txt
+
 node scripts/release-body.mjs \
   --version 0.1.1 \
   --notes docs/operations/release-notes-v0.1.1.md \
   --assets target/publish \
   --changelog target/release-body/generated-changelog.md \
+  --contributors target/release-body/contributors.txt \
   --output target/release-body/vibex-release-body.md
 ```
 
-Without `--assets` the Downloads table is omitted, and an empty or missing
-`--changelog` selects the commit-log fallback for the contributor credit. The
-publish job reads the file through `gh release create --notes-file`, so the page
-and the notes asset always describe the same release.
+Without `--assets` the Downloads table is omitted. Without `--contributors` the
+page names only the pull-request authors in the generated changelog, so a
+direct-commit range carries no account names; without `--changelog` the composer
+falls back to the commit log for the new-contributor credit. The publish job
+reads the body through `gh release create --notes-file`, so the page and the
+notes asset always describe the same release.
 
 The Downloads table is a convenience for readers. The updater never reads it:
 artifact trust stays with the signed `vibex-update.json`, and every link is

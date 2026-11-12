@@ -12911,6 +12911,31 @@ impl AcpRuntimeClient {
             .process_spawn_fingerprint())
     }
 
+    /// The launch identity an Agent-account model catalog is keyed by, read
+    /// from the persisted context and the Agent's current runtime config.
+    ///
+    /// This is the same value discovery writes and session lookup reads, so a
+    /// caller can tell whether a stored catalog still describes this launch
+    /// without starting the Agent. A managed Adapter update changes the command,
+    /// arguments and version, which all feed this identity.
+    pub fn current_agent_account_catalog_fingerprint(
+        &self,
+        context: &AgentAuthContext,
+    ) -> VibexResult<String> {
+        let config = self
+            .config_service
+            .get_agent_acp_runtime_config(&context.agent_id)?;
+        let auth_source = RuntimeAuthSource::agent_account(context.id.clone());
+        let env_unsets = self.agent_account_env_unsets(&context.agent_id);
+        self.agent_account_catalog_fingerprint(
+            &auth_source,
+            context.revision,
+            &context.agent_id,
+            &config,
+            &env_unsets,
+        )
+    }
+
     fn process_spawn_config_snapshot_for_agent_account(
         &self,
         auth_source: &RuntimeAuthSource,
@@ -22172,6 +22197,66 @@ mod tests {
             .unwrap();
         assert!(identity.exact_descriptor);
         assert_eq!(identity.event_enricher, AgentEventEnricherKind::Claude);
+    }
+
+    #[test]
+    fn account_catalog_fingerprint_tracks_a_managed_command_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("vibex.db");
+        let mut conn = open_database(&db_path).unwrap();
+        apply_migrations(&mut conn).unwrap();
+        let client = AcpRuntimeClient::new(ProviderConfigService::new(&db_path));
+        let agent_id = AgentId::parse("opencode").unwrap();
+        let context = AgentAuthContext {
+            id: vibex_core::AgentAuthContextId::new(),
+            agent_id: agent_id.clone(),
+            status: AgentAuthContextStatus::Authenticated,
+            account_hint: None,
+            authenticated_via_method: None,
+            revision: 1,
+            last_verified_at_ms: Some(1),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        };
+
+        let old = test_acp_config(
+            "node",
+            vec!["/managed/opencode/1.19.3/opencode.js".to_string()],
+        );
+        let new = test_acp_config(
+            "node",
+            vec!["/managed/opencode/2.2.6/opencode.js".to_string()],
+        );
+        let mut fingerprints = Vec::new();
+        for (config, version) in [(&old, "1.19.3"), (&new, "2.2.6")] {
+            client
+                .config_service
+                .update_agent_config(vibex_core::AgentUpdateConfigRequest {
+                    agent_id: agent_id.clone(),
+                    added: Some(true),
+                    enabled: Some(true),
+                    label_override: None,
+                    description_override: None,
+                    order_index: None,
+                    command: Some(AgentCommandConfig {
+                        command: config.command.clone(),
+                        args: config.args.clone(),
+                    }),
+                    env: None,
+                    params: None,
+                })
+                .unwrap();
+            persist_managed_runtime(&conn, "opencode", "opencode", version, config);
+            fingerprints.push(
+                client
+                    .current_agent_account_catalog_fingerprint(&context)
+                    .unwrap(),
+            );
+        }
+        assert_ne!(
+            fingerprints[0], fingerprints[1],
+            "a managed command change must invalidate the catalog identity"
+        );
     }
 
     #[test]

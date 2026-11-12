@@ -21,14 +21,15 @@ use vibex_core::{
     AgentProviderProjectionDescriptor, AgentProviderProjectionPlan, AgentProviderProjectionPreview,
     AgentProviderProjectionPreviewRequest, AgentProviderProjectionRegistry, AgentRuntimeProfile,
     AgentRuntimeProfileCreateRequest, AgentRuntimeProfileId, AgentRuntimeProfileUpdateRequest,
-    ConfigOverlayStrategy, ManagedProjectionOverlay, ModelProviderCredentialReference,
-    ModelProviderEndpoint, ModelProviderHeaderReference, ModelProviderHeaderValue,
-    ModelProviderHeaderVariable, ModelProviderProfile, ModelProviderProfileCreateRequest,
-    ModelProviderProfileId, ModelProviderProfileUpdateRequest, ModelProviderProxyPolicy,
-    ProjectionAuthState, ProjectionDescriptorMatch, ProjectionEvidenceState,
-    ProjectionOverlayPreview, ProjectionSecretEnvReference, ProjectionTargetKind,
-    ProjectionTargetPreview, ProjectionVerificationState, ProviderBindingMetadata,
-    ProviderCredentialSecretMutationRequest, ProviderModelCapabilities, ProviderSecretBackend,
+    ConfigOverlayStrategy, ManagedProjectionOverlay, ModelProviderCatalogEntry,
+    ModelProviderCredentialReference, ModelProviderEndpoint, ModelProviderHeaderReference,
+    ModelProviderHeaderValue, ModelProviderHeaderVariable, ModelProviderProfile,
+    ModelProviderProfileCreateRequest, ModelProviderProfileId, ModelProviderProfileUpdateRequest,
+    ModelProviderProxyPolicy, ProjectionAuthState, ProjectionDescriptorMatch,
+    ProjectionEvidenceState, ProjectionOverlayPreview, ProjectionSecretEnvReference,
+    ProjectionTargetKind, ProjectionTargetPreview, ProjectionVerificationState,
+    ProviderBindingMetadata, ProviderCredentialSecretMutationRequest, ProviderModelCapabilities,
+    ProviderModelReasoningEfforts, ProviderReasoningEffortLevel, ProviderSecretBackend,
     ProviderSecretSetupState, ProviderSwitchBehavior, RequestId, SessionHeaderEnv, VibexError,
     VibexResult, unix_timestamp_ms,
 };
@@ -54,6 +55,23 @@ const CODEX_MODEL_PROVIDER_ENV: &str = "MODEL_PROVIDER";
 const CODEX_DEFAULT_AUTH_REQUEST_ENV: &str = "DEFAULT_AUTH_REQUEST";
 const CODEX_DEFAULT_API_KEY_AUTH_REQUEST: &str = r#"{"methodId":"api-key"}"#;
 const CODEX_PROVIDER_ORIGINATOR: &str = "codex_cli_rs";
+/// The catalogue Codex reads its `model/list` from, relative to `CODEX_HOME`.
+///
+/// A profile that declares thinking levels for an alias Model needs one: the
+/// bundled catalogue only describes OpenAI's own model ids, so codex-acp has no
+/// effort list to publish for `daily` or `local` and never renders the control.
+const CODEX_MODEL_CATALOG_FILE: &str = "vibex-models.json";
+/// Developer instructions every projected catalogue entry carries.
+///
+/// The catalogue replaces Codex's own, and an entry without a prompt leaves the
+/// session without a system prompt at all. This is the reduced prompt Codex
+/// itself assembles for a model it does not know: it names the same tools and
+/// the same working rules, and it is byte-identical to the prompt an alias
+/// Model receives today, so projecting a catalogue does not rewrite the
+/// instructions a session runs under.
+const CODEX_MODEL_INSTRUCTIONS: &str = include_str!("../assets/codex-model-instructions.md");
+/// The context window a Model that declares none is projected with.
+const CODEX_DEFAULT_CONTEXT_WINDOW: u64 = 272_000;
 const CLAUDE_AGENT_ID: &str = "claude";
 const CLAUDE_API_KEY_ENV: &str = "ANTHROPIC_API_KEY";
 const CLAUDE_AUTH_TOKEN_ENV: &str = "ANTHROPIC_AUTH_TOKEN";
@@ -825,7 +843,23 @@ impl ProviderConfigService {
         provider_id: &ModelProviderProfileId,
     ) -> VibexResult<()> {
         let conn = self.open_connection()?;
+        // The delete retires every launch row behind this Provider, and those
+        // rows are what each Agent's pages and selectors read. Announcing only a
+        // record the caller never listed left those rows alive in the UI.
+        let mut retired =
+            AgentModelProviderBindingRepository::list_for_model_provider(&conn, provider_id)?
+                .into_iter()
+                .filter_map(|binding| binding.legacy_provider_profile_id)
+                .collect::<Vec<_>>();
+        if let Some(legacy_id) = ModelProviderProfileRepository::get(&conn, provider_id)?
+            .and_then(|profile| profile.legacy_provider_profile_id)
+        {
+            retired.push(legacy_id);
+        }
         ModelProviderProfileRepository::soft_delete(&conn, provider_id, unix_timestamp_ms())?;
+        for legacy_id in &retired {
+            self.notify_profile_deleted(legacy_id);
+        }
         Ok(())
     }
 
@@ -1503,13 +1537,21 @@ impl ProviderConfigService {
             })
     }
 
-    /// Mirrors a v2 write onto the legacy record, then restales its bindings.
+    /// Mirrors a v2 write onto every Agent that binds the Provider, then
+    /// restales those bindings and announces their launch rows.
     ///
     /// Every v2 mutation funnels through here so the two shapes cannot drift.
     /// The legacy Profile is what the launch path reads for its protocol, its
     /// `provider_options` and its Keys, so a v2 edit that never reached it would
     /// be invisible to the Agent and would be reverted by the next v1 write.
-    fn sync_model_provider_to_legacy(
+    ///
+    /// One Provider has one launch row per Agent that bound it, and the record
+    /// names only the first of them — `legacy_provider_profile_id` is `UNIQUE`.
+    /// Projecting just that row is why a Model added on the global Providers page
+    /// showed up for the Agent the record was derived from and for nobody else.
+    /// The fan-out walks the bindings, because they are the only link to the
+    /// other Agents' rows.
+    pub(crate) fn refresh_bindings_for_model_provider(
         &self,
         conn: &vibex_db::DbConnection,
         provider_id: &ModelProviderProfileId,
@@ -1517,22 +1559,30 @@ impl ProviderConfigService {
         let Some(provider) = ModelProviderProfileRepository::get(conn, provider_id)? else {
             return Ok(());
         };
+        // The one row the record names is projected first, so a Provider whose
+        // credential list changed keeps the ids its own binding already uses.
         vibex_db::ProviderProjectionCompatibilityRepository::project_model_provider_to_legacy(
             conn, &provider,
         )?;
-        Ok(())
-    }
-
-    pub(crate) fn refresh_bindings_for_model_provider(
-        &self,
-        conn: &vibex_db::DbConnection,
-        provider_id: &ModelProviderProfileId,
-    ) -> VibexResult<()> {
-        self.sync_model_provider_to_legacy(conn, provider_id)?;
+        let rows =
+            vibex_db::ProviderProjectionCompatibilityRepository::sync_shared_provider_to_bindings(
+                conn, &provider,
+            )?;
+        // A binding written directly on v2 has no launch row to project onto, so
+        // its copy of the catalogue is rebuilt on its own.
+        vibex_db::ProviderProjectionCompatibilityRepository::sync_v2_binding_models(
+            conn, &provider,
+        )?;
         for binding in
             AgentModelProviderBindingRepository::list_for_model_provider(conn, provider_id)?
         {
             self.refresh_one_binding(conn, binding)?;
+        }
+        // Each row is a Profile the Agent selects its Provider through, so it is
+        // also what the desktop reloads: a Model the row gained is not in any
+        // picker until the listener hears about it.
+        for row in &rows {
+            self.notify_profile_saved(row);
         }
         Ok(())
     }
@@ -1762,6 +1812,22 @@ fn project_provider_control(
                 secret: false,
             });
             overlays.push(overlay);
+            if *strategy == ConfigOverlayStrategy::CodexStableHome
+                && let Some(catalog) = codex_model_catalog_overlay(provider, binding)?
+            {
+                // The catalogue is what turns a declared thinking depth into a
+                // control: codex-acp publishes `reasoning_effort` only when
+                // `model/list` reports levels for the selected Model, and the
+                // bundled catalogue knows no Provider alias id.
+                targets.push(ProjectionTargetPreview {
+                    field: "reasoningEfforts".to_string(),
+                    target_kind: ProjectionTargetKind::ManagedOverlay,
+                    target: catalog.relative_path.clone(),
+                    value_preview: "declared thinking depth".to_string(),
+                    secret: false,
+                });
+                overlays.push(catalog);
+            }
             if *strategy == ConfigOverlayStrategy::DeepseekHarnessSettingsYaml {
                 // 0.1.7 of the bundled runtime stopped reading this Agent's
                 // `settings.yaml` for llm routes, so the same route is also
@@ -2528,7 +2594,12 @@ fn build_overlay(
         ConfigOverlayStrategy::CodexStableHome => (
             "config.toml",
             "toml",
-            codex_overlay(provider, endpoint, model),
+            codex_overlay(
+                provider,
+                endpoint,
+                model,
+                codex_projects_model_catalog(provider, binding),
+            ),
             false,
         ),
         ConfigOverlayStrategy::DeepseekHarnessSettingsYaml => (
@@ -2762,6 +2833,7 @@ fn codex_overlay(
     provider: &ModelProviderProfile,
     endpoint: Option<&ModelProviderEndpoint>,
     model: Option<&AgentConfiguredModelBinding>,
+    has_model_catalog: bool,
 ) -> String {
     let provider_id = sanitize_provider_id(
         provider
@@ -2775,6 +2847,18 @@ fn codex_overlay(
         // session. codex-acp's model/list is its built-in catalogue and its
         // live set-model path rejects otherwise valid custom-provider ids.
         lines.push(format!("model = {}", toml_quote(&model.agent_model_id)));
+    }
+    if has_model_catalog {
+        // Codex answers `model/list` from this file instead of its bundled
+        // catalogue, and codex-acp derives the `reasoning_effort` control from
+        // that answer. Without it a Provider Model's alias id matches no
+        // bundled entry, `supportedReasoningEfforts` comes back empty, and the
+        // adapter never publishes the control. A path keeps the JSON beside
+        // `config.toml` inside the private `CODEX_HOME`.
+        lines.push(format!(
+            "model_catalog_json = {}",
+            toml_quote(CODEX_MODEL_CATALOG_FILE)
+        ));
     }
     lines.push(String::new());
     lines.push(format!("[model_providers.{}]", toml_quote(&provider_id)));
@@ -2821,6 +2905,232 @@ fn codex_overlay(
         ));
     }
     format!("{}\n", lines.join("\n"))
+}
+
+/// True when the binding projects a catalogue of its own.
+///
+/// A profile where no Model declares a thinking depth keeps the bundled
+/// catalogue byte-for-byte: it has nothing to add, and `config.toml` must not
+/// start pointing at a file that would repeat the bundled answer.
+fn codex_projects_model_catalog(
+    provider: &ModelProviderProfile,
+    binding: &AgentModelProviderBinding,
+) -> bool {
+    binding
+        .configured_models
+        .iter()
+        .filter(|model| model.enabled)
+        .any(|model| {
+            codex_configured_model(provider, model)
+                .is_some_and(|configured| configured.capabilities.reasoning_efforts.is_some())
+        })
+}
+
+/// The catalogue Codex answers `model/list` from, when a Model declares levels.
+///
+/// The reasoning-effort control is derived from `model/list` alone, and Codex
+/// answers that from its bundled catalogue: OpenAI's own model ids, with no
+/// entry for a Provider alias such as `daily` or `local`. The unknown id
+/// therefore reported no supported levels, codex-acp never published the
+/// `reasoning_effort` option, and `session/set_config_option` had nothing to
+/// apply. Projecting this file makes the Model's declared levels the answer.
+///
+/// The file *replaces* the bundled catalogue instead of extending it, so every
+/// enabled Model of the binding is listed: an omitted Provider id would fall
+/// back to bundled metadata and, with it, to a vocabulary it never declared.
+/// A Model that declares no levels is still listed, with an empty level list —
+/// selectable, and honestly offering no thinking depth.
+fn codex_model_catalog_overlay(
+    provider: &ModelProviderProfile,
+    binding: &AgentModelProviderBinding,
+) -> VibexResult<Option<ManagedProjectionOverlay>> {
+    let mut models = binding
+        .configured_models
+        .iter()
+        .filter(|model| model.enabled)
+        .collect::<Vec<_>>();
+    if !codex_projects_model_catalog(provider, binding) {
+        return Ok(None);
+    }
+    // Codex sorts the picker by `priority` ascending and marks the first entry
+    // as its recommendation, so the Provider's own default Model is listed
+    // first and the rest keep the order the binding has them in.
+    if let Some(default_id) = provider.default_model_id.as_deref() {
+        models.sort_by_key(|model| model.provider_model_id != default_id);
+    }
+    let mut entries = Vec::with_capacity(models.len());
+    for (index, model) in models.iter().enumerate() {
+        entries.push(codex_catalog_entry(provider, model, index)?);
+    }
+    Ok(Some(ManagedProjectionOverlay {
+        relative_path: CODEX_MODEL_CATALOG_FILE.to_string(),
+        format: "json".to_string(),
+        content: serialized_json(serde_json::json!({ "models": entries }))?,
+        contains_secret_reference: false,
+    }))
+}
+
+/// The Provider record a binding Model projects, if the Provider still has it.
+fn codex_configured_model<'a>(
+    provider: &'a ModelProviderProfile,
+    model: &AgentConfiguredModelBinding,
+) -> Option<&'a ModelProviderCatalogEntry> {
+    provider.configured_models.iter().find(|configured| {
+        configured.id == model.provider_model_id || configured.id == model.agent_model_id
+    })
+}
+
+/// One `models[]` entry of the projected catalogue.
+///
+/// Every field Codex deserializes without a default has to be present, and an
+/// entry without a prompt is worse than rejected: it runs the session with no
+/// developer instructions at all. The prompt is the reduced one Codex itself
+/// assembles for a Model it does not know, so projecting an alias id does not
+/// rewrite the instructions that session ran under before this catalogue
+/// existed.
+fn codex_catalog_entry(
+    provider: &ModelProviderProfile,
+    model: &AgentConfiguredModelBinding,
+    index: usize,
+) -> VibexResult<serde_json::Value> {
+    let configured = codex_configured_model(provider, model);
+    let capabilities = configured.map(|configured| &configured.capabilities);
+    let declared = capabilities.and_then(|capabilities| capabilities.reasoning_efforts.as_ref());
+    let levels = match declared {
+        Some(declared) => {
+            // The control cannot offer a table it cannot label, and the
+            // Provider editor refuses to save one; a stale record names the
+            // Model here rather than projecting a half-written ladder.
+            declared.validate().map_err(|reason| {
+                VibexError::validation(
+                    "codex_model_reasoning_efforts_invalid",
+                    "the Model's declared thinking depth cannot be projected to Codex",
+                )
+                .with_diagnostic("model", model.agent_model_id.as_str())
+                .with_diagnostic("reason", reason)
+            })?;
+            declared
+                .declared_levels()
+                .map(|(level, wire)| codex_reasoning_preset(level, wire))
+                .collect::<Vec<_>>()
+        }
+        None => Vec::new(),
+    };
+    let context_window = capabilities
+        .and_then(|capabilities| capabilities.context_tokens)
+        .map(u64::from)
+        .unwrap_or(CODEX_DEFAULT_CONTEXT_WINDOW);
+    let display_name = configured
+        .and_then(|configured| configured.display_name.clone())
+        .unwrap_or_else(|| model.agent_model_id.clone());
+    let mut entry = serde_json::Map::new();
+    entry.insert("slug".to_string(), serde_json::json!(model.agent_model_id));
+    entry.insert("display_name".to_string(), serde_json::json!(display_name));
+    entry.insert("shell_type".to_string(), serde_json::json!("unified_exec"));
+    entry.insert("visibility".to_string(), serde_json::json!("list"));
+    entry.insert("supported_in_api".to_string(), serde_json::json!(true));
+    // Codex ranks the picker by priority and treats the highest one as the
+    // default Model; the binding's own order is the order the Provider lists.
+    entry.insert(
+        "priority".to_string(),
+        serde_json::json!(i32::try_from(index).unwrap_or(i32::MAX)),
+    );
+    entry.insert("support_verbosity".to_string(), serde_json::json!(false));
+    entry.insert(
+        "truncation_policy".to_string(),
+        serde_json::json!({ "mode": "bytes", "limit": 10_000 }),
+    );
+    entry.insert(
+        "experimental_supported_tools".to_string(),
+        serde_json::json!([]),
+    );
+    entry.insert(
+        "context_window".to_string(),
+        serde_json::json!(context_window),
+    );
+    entry.insert(
+        "max_context_window".to_string(),
+        serde_json::json!(context_window),
+    );
+    entry.insert(
+        "supported_reasoning_levels".to_string(),
+        serde_json::Value::Array(levels.clone()),
+    );
+    if let Some(default_level) = codex_default_reasoning_level(declared) {
+        entry.insert(
+            "default_reasoning_level".to_string(),
+            serde_json::json!(default_level),
+        );
+    }
+    entry.insert(
+        "model_messages".to_string(),
+        serde_json::json!({ "instructions_template": CODEX_MODEL_INSTRUCTIONS }),
+    );
+    Ok(serde_json::Value::Object(entry))
+}
+
+/// One selectable level, spelled the way dispatch would send it.
+fn codex_reasoning_preset(
+    level: ProviderReasoningEffortLevel,
+    wire: Option<&str>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "effort": codex_effort_spelling(level, wire),
+        "description": codex_reasoning_description(level),
+    })
+}
+
+/// The string Codex holds for a level, which is what it sends as `effort`.
+///
+/// A declaration that names its own spelling wins: an endpoint's vocabulary is
+/// the only authority on what it accepts. `off` without a spelling becomes
+/// `none`, the Responses word for the same state — Codex always sends the level
+/// its control holds, so the empty spelling cannot travel as "no field".
+fn codex_effort_spelling(level: ProviderReasoningEffortLevel, wire: Option<&str>) -> String {
+    match wire {
+        Some(wire) => wire.to_string(),
+        None if level == ProviderReasoningEffortLevel::Off => "none".to_string(),
+        None => level.as_str().to_string(),
+    }
+}
+
+fn codex_reasoning_description(level: ProviderReasoningEffortLevel) -> &'static str {
+    match level {
+        ProviderReasoningEffortLevel::Off => "Turns reasoning off",
+        ProviderReasoningEffortLevel::Minimal => "Fastest responses with the least reasoning",
+        ProviderReasoningEffortLevel::Low => "Fast responses with lighter reasoning",
+        ProviderReasoningEffortLevel::Medium => "Balances speed and reasoning depth",
+        ProviderReasoningEffortLevel::High => "Greater reasoning depth for complex problems",
+        ProviderReasoningEffortLevel::Xhigh => "Extra high reasoning depth",
+        ProviderReasoningEffortLevel::Max => "Maximum reasoning depth",
+    }
+}
+
+/// The level the session starts on before the reader picks one.
+///
+/// Codex applies it to the first turn, so it must be a level the Model really
+/// offers — never the `off`/`none` entry, which would begin a reasoning Model
+/// with reasoning disabled. The preference matches the composer's own default
+/// (`xhigh`, `high`, `medium`); a ladder without those starts at its shallowest
+/// declared thinking level.
+fn codex_default_reasoning_level(
+    declared: Option<&ProviderModelReasoningEfforts>,
+) -> Option<String> {
+    const PREFERRED: [&str; 3] = ["xhigh", "high", "medium"];
+    let thinking = declared?
+        .declared_levels()
+        .filter(|(level, _)| *level != ProviderReasoningEffortLevel::Off)
+        .map(|(level, wire)| codex_effort_spelling(level, wire))
+        .collect::<Vec<_>>();
+    PREFERRED
+        .iter()
+        .find_map(|candidate| {
+            thinking
+                .iter()
+                .find(|effort| effort.eq_ignore_ascii_case(candidate))
+                .cloned()
+        })
+        .or_else(|| thinking.first().cloned())
 }
 
 fn opencode_overlay(
@@ -7419,7 +7729,7 @@ mod tests {
             enabled: true,
             process_scoped: true,
         };
-        let content = codex_overlay(&provider, Some(endpoint), Some(&model));
+        let content = codex_overlay(&provider, Some(endpoint), Some(&model), false);
         let config: toml::Value = toml::from_str(&content).unwrap();
         let projected = &config["model_providers"]["fake"];
 
@@ -7430,6 +7740,313 @@ mod tests {
         );
         assert_eq!(projected["requires_openai_auth"].as_bool(), Some(true));
         assert_eq!(projected["env_key"].as_str(), Some("CODEX_API_KEY"));
+    }
+
+    /// A declared thinking depth is projected as a catalogue Codex can read.
+    ///
+    /// Codex derives the `reasoning_effort` control from `model/list`, and it
+    /// answers that from its bundled catalogue — which describes OpenAI's own
+    /// model ids only. An alias id therefore reported no supported levels,
+    /// codex-acp never published the control, and a reader had nothing to pick.
+    #[test]
+    fn codex_projects_a_model_catalog_only_when_a_model_declares_a_thinking_depth() {
+        let descriptor = provider_descriptor("codex");
+        let (mut provider, runtime, binding) = typed_projection_fixture(&descriptor);
+
+        // Undeclared: the bundled catalogue stands, and `config.toml` must not
+        // point at a file that would only repeat it.
+        let plain = AgentProviderProjectionEngine::plan(
+            &provider,
+            &runtime,
+            &binding,
+            &descriptor,
+            "codex-catalog",
+        )
+        .unwrap();
+        assert_eq!(plain.overlay_files.len(), 1);
+        assert_eq!(plain.overlay_files[0].relative_path, "config.toml");
+        assert!(
+            !plain.overlay_files[0]
+                .content
+                .contains("model_catalog_json")
+        );
+
+        let mut efforts = ProviderModelReasoningEfforts::new();
+        efforts.insert(ProviderReasoningEffortLevel::Off, None);
+        efforts.insert(ProviderReasoningEffortLevel::Low, Some("low".to_string()));
+        efforts.insert(ProviderReasoningEffortLevel::High, Some("high".to_string()));
+        provider.configured_models[0].capabilities.reasoning_efforts = Some(efforts);
+
+        let plan = AgentProviderProjectionEngine::plan(
+            &provider,
+            &runtime,
+            &binding,
+            &descriptor,
+            "codex-catalog",
+        )
+        .unwrap();
+        assert_eq!(plan.overlay_files.len(), 2);
+        assert_eq!(plan.overlay_files[0].relative_path, "config.toml");
+        let config: toml::Value = toml::from_str(&plan.overlay_files[0].content).unwrap();
+        assert_eq!(
+            config["model_catalog_json"].as_str(),
+            Some("vibex-models.json"),
+            "Codex only reads a catalogue `config.toml` names"
+        );
+        assert_eq!(
+            plan.preview
+                .overlay_files
+                .iter()
+                .map(|overlay| overlay.relative_path.as_str())
+                .collect::<Vec<_>>(),
+            ["config.toml", "vibex-models.json"],
+            "the preview has to name the file the launch will write"
+        );
+        assert!(
+            plan.preview.targets.iter().any(|target| {
+                target.target_kind == ProjectionTargetKind::ManagedOverlay
+                    && target.target == "vibex-models.json"
+            }),
+            "the editor reports the file the control comes from"
+        );
+
+        let catalog = &plan.overlay_files[1];
+        assert_eq!(catalog.relative_path, "vibex-models.json");
+        assert_eq!(catalog.format, "json");
+        assert!(!catalog.contains_secret_reference);
+        let catalog: serde_json::Value = serde_json::from_str(&catalog.content).unwrap();
+        let models = catalog["models"].as_array().expect("a catalogue is a list");
+        assert_eq!(models.len(), 1);
+        let model = &models[0];
+        assert_eq!(model["slug"], "agent-model");
+        assert_eq!(model["display_name"], "Matrix Model");
+        assert_eq!(model["visibility"], "list");
+        assert_eq!(
+            model["supported_reasoning_levels"],
+            serde_json::json!([
+                { "effort": "none", "description": "Turns reasoning off" },
+                { "effort": "low", "description": "Fast responses with lighter reasoning" },
+                { "effort": "high", "description": "Greater reasoning depth for complex problems" },
+            ])
+        );
+        // The first turn runs before the reader picks anything, so the default
+        // has to be a thinking level the Model really offers.
+        assert_eq!(model["default_reasoning_level"], "high");
+        // An entry without a prompt is not rejected, it is run: the session
+        // would lose its developer instructions entirely.
+        assert_eq!(
+            model["model_messages"]["instructions_template"],
+            CODEX_MODEL_INSTRUCTIONS
+        );
+        assert!(!CODEX_MODEL_INSTRUCTIONS.trim().is_empty());
+        // The catalogue replaces the bundled one instead of extending it, so
+        // every field Codex deserializes without a default has to be there.
+        for key in [
+            "slug",
+            "display_name",
+            "shell_type",
+            "visibility",
+            "supported_in_api",
+            "priority",
+            "support_verbosity",
+            "truncation_policy",
+            "experimental_supported_tools",
+            "context_window",
+            "max_context_window",
+        ] {
+            assert!(
+                !model[key].is_null(),
+                "a projected catalogue entry needs {key}"
+            );
+        }
+    }
+
+    /// A catalogue replaces the bundled one, so it cannot omit a Model.
+    #[test]
+    fn codex_catalog_lists_every_enabled_model_of_the_binding() {
+        let descriptor = provider_descriptor("codex");
+        let (mut provider, runtime, binding) = typed_projection_fixture(&descriptor);
+        let mut efforts = ProviderModelReasoningEfforts::new();
+        efforts.insert(ProviderReasoningEffortLevel::Max, Some("max".to_string()));
+        provider.configured_models[0].capabilities.reasoning_efforts = Some(efforts);
+        provider.configured_models[0].capabilities.context_tokens = Some(1_000_000);
+        // A Model that declares nothing is still selectable, and an omitted id
+        // would silently fall back to bundled metadata and a bundled prompt.
+        provider.configured_models.push(ModelProviderCatalogEntry {
+            id: "provider-sibling".to_string(),
+            display_name: None,
+            enabled: true,
+            metadata: Vec::new(),
+            capabilities: Default::default(),
+        });
+        provider.configured_models.push(ModelProviderCatalogEntry {
+            id: "provider-retired".to_string(),
+            display_name: Some("Retired".to_string()),
+            enabled: false,
+            metadata: Vec::new(),
+            capabilities: Default::default(),
+        });
+        let mut binding = binding;
+        binding.configured_models.push(AgentConfiguredModelBinding {
+            id: AgentConfiguredModelBindingId::new(),
+            provider_model_id: "provider-sibling".to_string(),
+            agent_model_id: "sibling-model".to_string(),
+            wire_protocol_id: WIRE_PROTOCOL_OPENAI_RESPONSES.to_string(),
+            sdk_adapter_id: None,
+            deployment: None,
+            enabled: true,
+            process_scoped: false,
+        });
+        binding.configured_models.push(AgentConfiguredModelBinding {
+            id: AgentConfiguredModelBindingId::new(),
+            provider_model_id: "provider-retired".to_string(),
+            agent_model_id: "retired-model".to_string(),
+            wire_protocol_id: WIRE_PROTOCOL_OPENAI_RESPONSES.to_string(),
+            sdk_adapter_id: None,
+            deployment: None,
+            enabled: false,
+            process_scoped: false,
+        });
+
+        let plan = AgentProviderProjectionEngine::plan(
+            &provider,
+            &runtime,
+            &binding,
+            &descriptor,
+            "codex-catalog",
+        )
+        .unwrap();
+        let catalog: serde_json::Value =
+            serde_json::from_str(&plan.overlay_files[1].content).unwrap();
+        let models = catalog["models"].as_array().unwrap();
+        assert_eq!(
+            models
+                .iter()
+                .map(|model| model["slug"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["agent-model", "sibling-model"],
+            "a disabled Model is not offered, and an enabled one cannot be omitted"
+        );
+        assert_eq!(models[0]["context_window"], 1_000_000);
+        assert_eq!(
+            models[1]["context_window"], CODEX_DEFAULT_CONTEXT_WINDOW,
+            "a Model that declares no window still needs one Codex can read"
+        );
+        assert_eq!(
+            models[1]["supported_reasoning_levels"],
+            serde_json::json!([]),
+            "a Model with no declared depth offers none; it does not inherit one"
+        );
+        assert!(models[1].get("default_reasoning_level").is_none());
+        assert_eq!(models[1]["display_name"], "sibling-model");
+    }
+
+    /// The declaration's own spelling is what reaches the endpoint.
+    #[test]
+    fn codex_catalog_keeps_the_declared_wire_spelling() {
+        let descriptor = provider_descriptor("codex");
+        let (mut provider, runtime, binding) = typed_projection_fixture(&descriptor);
+        let mut efforts = ProviderModelReasoningEfforts::new();
+        efforts.insert(
+            ProviderReasoningEffortLevel::High,
+            Some("thinking_budget_high".to_string()),
+        );
+        provider.configured_models[0].capabilities.reasoning_efforts = Some(efforts);
+
+        let plan = AgentProviderProjectionEngine::plan(
+            &provider,
+            &runtime,
+            &binding,
+            &descriptor,
+            "codex-catalog",
+        )
+        .unwrap();
+        let catalog: serde_json::Value =
+            serde_json::from_str(&plan.overlay_files[1].content).unwrap();
+        assert_eq!(
+            catalog["models"][0]["supported_reasoning_levels"][0]["effort"],
+            "thinking_budget_high"
+        );
+        assert_eq!(
+            catalog["models"][0]["default_reasoning_level"],
+            "thinking_budget_high"
+        );
+    }
+
+    /// The catalogue is a private file the launch writes beside `config.toml`.
+    #[test]
+    fn codex_catalog_materializes_inside_the_private_home() {
+        let descriptor = provider_descriptor("codex");
+        let (mut provider, runtime, binding) = typed_projection_fixture(&descriptor);
+        let mut efforts = ProviderModelReasoningEfforts::new();
+        efforts.insert(ProviderReasoningEffortLevel::High, Some("high".to_string()));
+        provider.configured_models[0].capabilities.reasoning_efforts = Some(efforts);
+
+        let mut plan = AgentProviderProjectionEngine::plan(
+            &provider,
+            &runtime,
+            &binding,
+            &descriptor,
+            "codex-catalog-home",
+        )
+        .unwrap();
+        plan.secret_env[0].secret_reference.backend = ProviderSecretBackend::OsKeychain;
+        plan.secret_env[0].secret_reference.setup_state = ProviderSecretSetupState::Available;
+        let lookup_key = plan.secret_env[0].secret_reference.lookup_key.clone();
+        secrets::store_provider_secret(&lookup_key, TYPED_SECRET_SENTINEL).unwrap();
+        let dir = tempdir().unwrap();
+        let resolved = AgentProviderProjectionEngine::resolve_and_materialize(
+            &plan,
+            dir.path(),
+            "codex-catalog-home",
+        )
+        .unwrap();
+        // `model_catalog_json` is relative to `CODEX_HOME`, so the file has to
+        // land in the directory the launch points Codex at.
+        assert_eq!(resolved.overlay_files.len(), 2);
+        assert_eq!(
+            resolved.non_secret_env.get("CODEX_HOME").map(PathBuf::from),
+            Some(resolved.overlay_root.clone())
+        );
+        assert_eq!(
+            resolved
+                .overlay_files
+                .iter()
+                .map(|path| path.strip_prefix(&resolved.overlay_root).unwrap())
+                .collect::<Vec<_>>(),
+            [Path::new("config.toml"), Path::new("vibex-models.json")]
+        );
+        let catalog = fs::read_to_string(&resolved.overlay_files[1]).unwrap();
+        let catalog: serde_json::Value = serde_json::from_str(&catalog).unwrap();
+        assert_eq!(catalog["models"][0]["slug"], "agent-model");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for path in &resolved.overlay_files {
+                assert_eq!(
+                    fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                    0o600,
+                    "{} must stay private",
+                    path.display()
+                );
+            }
+        }
+        // Overlay content participates in the fingerprint, so changing a
+        // declared level re-materializes the catalogue instead of leaving the
+        // previous one behind in the private home.
+        let before = resolved.fingerprint.clone();
+        provider.configured_models[0].capabilities.reasoning_efforts =
+            ProviderModelReasoningEfforts::parse("low, high").unwrap();
+        let changed = AgentProviderProjectionEngine::plan(
+            &provider,
+            &runtime,
+            &binding,
+            &descriptor,
+            "codex-catalog-home",
+        )
+        .unwrap();
+        assert_ne!(changed.fingerprint, before);
+        secrets::delete_provider_secret(&lookup_key).unwrap();
     }
 
     const TYPED_SECRET_LOOKUP: &str = "opaque-typed-projection-secret";
@@ -12411,5 +13028,338 @@ mod workspace_key_tests {
         let other = workspace_projection_key(Path::new("/code/vibex-other"));
         assert_eq!(a, b);
         assert_ne!(a, other);
+    }
+}
+
+#[cfg(test)]
+mod shared_provider_fanout_tests {
+    use super::*;
+    use crate::acp_config_from_options;
+
+    /// A Provider created on an Agent page, with that Agent's launch row behind
+    /// it, plus a second Agent bound to the same record.
+    fn shared_with_two_agents(
+        service: &ProviderConfigService,
+    ) -> (
+        vibex_core::ProviderProfile,
+        vibex_core::ProviderProfile,
+        ModelProviderProfile,
+    ) {
+        let first = service
+            .create_agent_model_provider_profile(
+                vibex_core::AgentModelProviderProfileCreateRequest {
+                    agent_id: vibex_core::AgentId::parse("claude").unwrap(),
+                    display_name: "Team".to_string(),
+                    account_alias: None,
+                    base_url: Some("https://api.example.invalid".to_string()),
+                    default_model: Some("alpha".to_string()),
+                    small_model: None,
+                    large_model: None,
+                    configured_models: vec![vibex_core::ProviderConfiguredModel {
+                        id: "alpha".to_string(),
+                        display_name: None,
+                        enabled: true,
+                        wire_api: Some(vibex_core::ProviderModelWireApi::AnthropicMessages),
+                        capabilities: Default::default(),
+                    }],
+                    reasoning_effort: None,
+                    sandbox_defaults: None,
+                    network_defaults: None,
+                    permission_defaults: None,
+                    provider_options: None,
+                    secret_references: Vec::new(),
+                },
+            )
+            .unwrap();
+        let second = service
+            .bind_provider_to_agent(vibex_core::AgentModelProviderBindRequest {
+                provider_profile_id: vibex_core::ProviderProfileId::new(),
+                model_provider_profile_id: service
+                    .list_model_provider_profiles()
+                    .unwrap()
+                    .into_iter()
+                    .find(|profile| profile.legacy_provider_profile_id.as_ref() == Some(&first.id))
+                    .map(|profile| profile.id),
+                agent_id: vibex_core::AgentId::parse("deepseek-harness").unwrap(),
+                make_default: false,
+            })
+            .unwrap();
+        let shared = service
+            .list_model_provider_profiles()
+            .unwrap()
+            .into_iter()
+            .find(|profile| profile.legacy_provider_profile_id.as_ref() == Some(&first.id))
+            .expect("the Agent page's Provider is a shared record");
+        (first, second, shared)
+    }
+
+    fn model_ids(profile: &vibex_core::ProviderProfile) -> Vec<String> {
+        profile
+            .configured_models
+            .iter()
+            .map(|model| model.id.clone())
+            .collect()
+    }
+
+    /// The report: a Model added on the Providers page never reached the Agents.
+    ///
+    /// The record names one launch row and the second Agent's row was reached
+    /// only through its binding, so projecting the record's own pointer updated
+    /// one Agent and silently skipped the other. Both rows, both bindings and
+    /// both ACP catalogues have to gain the Model.
+    #[test]
+    fn a_model_added_on_the_providers_page_reaches_every_agent() {
+        let dir = std::env::temp_dir().join(format!(
+            "vibex-shared-fanout-{}",
+            vibex_core::RequestId::new().as_str()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let service = ProviderConfigService::new(dir.join("state.db"));
+        service.open_connection().unwrap();
+        let (first, second, shared) = shared_with_two_agents(&service);
+
+        let mut next = shared.clone();
+        next.configured_models
+            .push(vibex_core::ModelProviderCatalogEntry {
+                id: "beta".to_string(),
+                display_name: Some("Beta".to_string()),
+                enabled: true,
+                metadata: Vec::new(),
+                capabilities: Default::default(),
+            });
+        next.display_name = "Team renamed".to_string();
+        service
+            .update_model_provider_profile(vibex_core::ModelProviderProfileUpdateRequest {
+                profile: next,
+                expected_revision: shared.revision,
+            })
+            .unwrap();
+
+        let conn = service.open_connection().unwrap();
+        for row in [&first, &second] {
+            let legacy = vibex_db::ProviderProfileRepository::get(&conn, &row.id)
+                .unwrap()
+                .expect("the launch row must still exist");
+            assert!(
+                model_ids(&legacy).contains(&"beta".to_string()),
+                "{} must be offered the Model the Provider gained, has {:?}",
+                row.agent_id.as_str(),
+                model_ids(&legacy)
+            );
+            assert_eq!(legacy.display_name, "Team renamed");
+            assert!(
+                acp_config_from_options(&legacy.provider_options)
+                    .unwrap()
+                    .expect("the row keeps its ACP config")
+                    .models
+                    .contains(&"beta".to_string()),
+                "the ACP catalogue is what a session reads its Models from"
+            );
+            let binding = vibex_db::AgentModelProviderBindingRepository::get_by_legacy_profile(
+                &conn, &row.id,
+            )
+            .unwrap()
+            .expect("the row must still have a binding");
+            assert!(
+                binding
+                    .configured_models
+                    .iter()
+                    .any(|model| model.provider_model_id == "beta" && model.enabled),
+                "the binding is what the projection engine reads, got {:?}",
+                binding
+                    .configured_models
+                    .iter()
+                    .map(|model| model.provider_model_id.clone())
+                    .collect::<Vec<_>>()
+            );
+            let runtime =
+                vibex_db::AgentRuntimeProfileRepository::get_by_legacy_profile(&conn, &row.id)
+                    .unwrap()
+                    .expect("the row must still have a runtime");
+            assert!(
+                runtime.models.contains(&"beta".to_string()),
+                "the runtime Profile carries a second copy of the catalogue, got {:?}",
+                runtime.models
+            );
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The mirror case: removing a Model on the Providers page takes it away
+    /// from every Agent, not just the one the record points at.
+    #[test]
+    fn a_model_removed_on_the_providers_page_leaves_every_agent() {
+        let dir = std::env::temp_dir().join(format!(
+            "vibex-shared-fanout-remove-{}",
+            vibex_core::RequestId::new().as_str()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let service = ProviderConfigService::new(dir.join("state.db"));
+        service.open_connection().unwrap();
+        let (first, second, shared) = shared_with_two_agents(&service);
+
+        let mut next = shared.clone();
+        next.configured_models.clear();
+        next.default_model_id = None;
+        service
+            .update_model_provider_profile(vibex_core::ModelProviderProfileUpdateRequest {
+                profile: next,
+                expected_revision: shared.revision,
+            })
+            .unwrap();
+
+        let conn = service.open_connection().unwrap();
+        for row in [&first, &second] {
+            let legacy = vibex_db::ProviderProfileRepository::get(&conn, &row.id)
+                .unwrap()
+                .expect("the launch row must still exist");
+            assert!(
+                legacy.configured_models.is_empty(),
+                "{} must lose the Model the Provider dropped, has {:?}",
+                row.agent_id.as_str(),
+                model_ids(&legacy)
+            );
+            assert!(
+                legacy.default_model.is_none(),
+                "a default naming a Model that no longer exists would launch something else"
+            );
+            let binding = vibex_db::AgentModelProviderBindingRepository::get_by_legacy_profile(
+                &conn, &row.id,
+            )
+            .unwrap()
+            .expect("the row must still have a binding");
+            assert!(binding.configured_models.is_empty());
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An edit made on an Agent page must not shrink the Provider.
+    ///
+    /// The Agent's list is a view narrowed to the protocols that Agent speaks,
+    /// so folding it back wholesale deleted every Model the other Agents could
+    /// reach. This is the regression the merge exists for.
+    #[test]
+    fn an_agent_page_edit_does_not_shrink_the_shared_catalogue() {
+        let dir = std::env::temp_dir().join(format!(
+            "vibex-shared-narrow-{}",
+            vibex_core::RequestId::new().as_str()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let service = ProviderConfigService::new(dir.join("state.db"));
+        service.open_connection().unwrap();
+
+        let shared = service
+            .create_model_provider_profile(vibex_core::ModelProviderProfileCreateRequest {
+                display_name: "Two protocols".to_string(),
+                vendor_hint: None,
+                endpoints: vec![
+                    vibex_core::ModelProviderEndpoint {
+                        id: "api-chat".to_string(),
+                        kind: vibex_core::ModelProviderEndpointKind::Api,
+                        url: "https://chat.example.invalid".to_string(),
+                        wire_protocol_id: Some(
+                            vibex_core::WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS.to_string(),
+                        ),
+                    },
+                    vibex_core::ModelProviderEndpoint {
+                        id: "api-messages".to_string(),
+                        kind: vibex_core::ModelProviderEndpointKind::Api,
+                        url: "https://messages.example.invalid".to_string(),
+                        wire_protocol_id: Some(
+                            vibex_core::WIRE_PROTOCOL_ANTHROPIC_MESSAGES.to_string(),
+                        ),
+                    },
+                ],
+                proxy_policy: vibex_core::ModelProviderProxyPolicy::InheritSystem,
+                credentials: Vec::new(),
+                configured_models: vec![
+                    vibex_core::ModelProviderCatalogEntry {
+                        id: "chat-model".to_string(),
+                        display_name: None,
+                        enabled: true,
+                        metadata: vec![vibex_core::ProviderBindingMetadata {
+                            key: "wireApi".to_string(),
+                            value: vibex_core::WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS.to_string(),
+                        }],
+                        capabilities: Default::default(),
+                    },
+                    vibex_core::ModelProviderCatalogEntry {
+                        id: "claude-model".to_string(),
+                        display_name: None,
+                        enabled: true,
+                        metadata: vec![vibex_core::ProviderBindingMetadata {
+                            key: "wireApi".to_string(),
+                            value: vibex_core::WIRE_PROTOCOL_ANTHROPIC_MESSAGES.to_string(),
+                        }],
+                        capabilities: Default::default(),
+                    },
+                ],
+                default_model_id: Some("chat-model".to_string()),
+                headers: Vec::new(),
+                metadata: Default::default(),
+                status: vibex_core::ModelProviderProfileStatus::Enabled,
+            })
+            .unwrap();
+
+        // goose speaks Chat only, so its view of the record is the narrower one.
+        let goose = service
+            .bind_provider_to_agent(vibex_core::AgentModelProviderBindRequest {
+                provider_profile_id: vibex_core::ProviderProfileId::new(),
+                model_provider_profile_id: Some(shared.id.clone()),
+                agent_id: vibex_core::AgentId::parse("goose").unwrap(),
+                make_default: false,
+            })
+            .unwrap();
+        // Saving a narrower list from the Agent page is what used to delete the
+        // other Model from the record. The list it saves is the record's Models
+        // filtered to the protocols this Agent speaks, which is exactly the view
+        // the Agent's editor shows.
+        let narrowed = goose
+            .configured_models
+            .iter()
+            .filter(|model| model.id == "chat-model")
+            .cloned()
+            .collect::<Vec<_>>();
+        service
+            .update_agent_model_provider_profile(
+                vibex_core::AgentModelProviderProfileUpdateRequest {
+                    agent_id: goose.agent_id.clone(),
+                    provider_profile_id: goose.id.clone(),
+                    display_name: None,
+                    status: None,
+                    account_alias: None,
+                    base_url: None,
+                    default_model: None,
+                    small_model: None,
+                    large_model: None,
+                    configured_models: Some(narrowed),
+                    reasoning_effort: None,
+                    sandbox_defaults: None,
+                    network_defaults: None,
+                    permission_defaults: None,
+                    provider_options: None,
+                },
+            )
+            .unwrap();
+
+        let after = service
+            .list_model_provider_profiles()
+            .unwrap()
+            .into_iter()
+            .find(|profile| profile.id == shared.id)
+            .expect("the record must still be listed");
+        let ids = after
+            .configured_models
+            .iter()
+            .map(|model| model.id.clone())
+            .collect::<Vec<_>>();
+        assert!(
+            ids.contains(&"claude-model".to_string()),
+            "an Agent's narrower view must not delete a Model the others can reach, got {ids:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

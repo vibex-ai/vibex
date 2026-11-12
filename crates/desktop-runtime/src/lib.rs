@@ -907,7 +907,9 @@ impl AgentHandle {
         &self,
         agent_id: vibex_core::AgentId,
     ) -> VibexResult<vibex_core::AgentManagedInstallState> {
-        self.install_service.install(agent_id).await
+        let state = self.install_service.install(agent_id.clone()).await?;
+        self.refresh_agent_model_catalog(&agent_id).await;
+        Ok(state)
     }
 
     /// Installs the Adapter version Vibex verified for this Agent, replacing a
@@ -916,7 +918,27 @@ impl AgentHandle {
         &self,
         agent_id: vibex_core::AgentId,
     ) -> VibexResult<vibex_core::AgentManagedInstallState> {
-        self.install_service.rollback(agent_id).await
+        let state = self.install_service.rollback(agent_id.clone()).await?;
+        self.refresh_agent_model_catalog(&agent_id).await;
+        Ok(state)
+    }
+
+    /// A managed installation changes the launch identity the Agent-account
+    /// model catalog is keyed by. Re-discover it here so the next new session
+    /// does not have to fail once before the catalog catches up.
+    async fn refresh_agent_model_catalog(&self, agent_id: &vibex_core::AgentId) {
+        if let Err(error) = self
+            .auth_contexts
+            .refresh_agent_model_catalog(agent_id)
+            .await
+        {
+            tracing::warn!(
+                target: "vibex_desktop",
+                agent_id = %agent_id,
+                error_code = %error.code,
+                "Agent account model catalog could not be refreshed after the managed installation changed"
+            );
+        }
     }
 
     pub async fn check_managed_agent_update(
@@ -3227,6 +3249,11 @@ impl DesktopRuntime {
             &(vibex_use.clone() as Arc<dyn vibex_core::VibexUseToolHost>),
         )?;
         let remote_dispatcher = remote_dispatcher
+            // The same service the desktop writes through, listeners and all.
+            // Without this a paired client's Provider write lands in the
+            // database but publishes no `ProviderConfigChanged`, so this
+            // machine's Agent pages keep showing the catalogue they had.
+            .with_provider_config_service(provider_config_service.clone())
             .with_runtime_option_catalog_source(runtime_catalog.clone())
             .with_agent_auth_context_source(auth_contexts.clone())
             .with_scheduled_task_source(Arc::new(ScheduledTaskSource::new(ScheduledHandle {

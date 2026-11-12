@@ -22,6 +22,7 @@ members = [
   "crates/fs",
   "crates/git",
   "crates/gpui-tokio",
+  "crates/installer-env",
   "crates/model-catalog",
   "crates/model-gateway",
   "crates/plugin",
@@ -109,20 +110,20 @@ reqwest = { version = "0.13.4", features = ["json", "stream", "socks"] }
 rcgen = { version = "0.14.9", default-features = false, features = ["ring"] }
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
 fs2 = "0.4.3"
-gpui = { package = "gpui-pre", version = "=0.3.11" }
-gpui_platform = { package = "gpui-pre-platform", version = "=0.3.11", features = ["font-kit", "runtime_shaders", "wayland", "x11"] }
+gpui = { package = "gpui-pre", version = "=0.3.12" }
+gpui_platform = { package = "gpui-pre-platform", version = "=0.3.12", features = ["font-kit", "runtime_shaders", "wayland", "x11"] }
 gpui_tokio = { package = "gpui-tokio", path = "crates/gpui-tokio" }
-gpui-component = "0.9.0"
-gpui-fps = "0.9.0"
-gpui-kit-assets = "0.9.0"
+gpui-component = "0.9.1"
+gpui-fps = "0.9.1"
+gpui-kit-assets = "0.9.1"
 # The JavaScript host third-party plugins run in. Desktop-only: it is linked by
 # the binary that ships the Plugins page, never by the TUI or the headless
 # server. `webview` stays off, because it forces the kit's own GPU backend and
 # the desktop renders through `gpui-pre`.
-gpui-shell = { version = "0.9.0", default-features = false, features = ["quickjs", "components"] }
+gpui-shell = { version = "0.9.1", default-features = false, features = ["quickjs", "components"] }
 # The kit's motion layer, which `Plot::hover` implementations sample. Same
 # version the component crate already resolves, so the graph keeps one copy.
-gpui-base = "0.9.0"
+gpui-base = "0.9.1"
 image = { version = "=0.25.10", default-features = false }
 # The Linux backend is chosen per target in the desktop crate: `ksni` on Linux
 # so the tray does not drag in the GTK 3 binding, and no default feature

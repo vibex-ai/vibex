@@ -3732,9 +3732,9 @@ dependencies = [
 
 [[package]]
 name = "gpui-base"
-version = "0.9.0"
+version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cff6377e30f0c857681662e7edc7286bf30f5606033390401b0706d7bd930833"
+checksum = "f3e9ae5237737cfd110d0ff513fcd9c20f97d98ebabd0a73164068177f0aca4f"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -3774,9 +3774,9 @@ dependencies = [
 
 [[package]]
 name = "gpui-component"
-version = "0.9.0"
+version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "45bbfdba0efa392190f2fd446ec311325302eb047d5ce45dc1bcf189cb18f5eb"
+checksum = "e155c4914bd809d966660610d596f7b57c5cd38979ca2c132215057a91f23f03"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3849,9 +3849,9 @@ dependencies = [
 
 [[package]]
 name = "gpui-component-macros"
-version = "0.9.0"
+version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "21ac1d2ca5352973e291b3316c027e603b1e7334755341f44c8231f85fde627a"
+checksum = "9676a5d12c59ce295b5c82cc18365ad8b96cb683682e2e74668a56fb92544300"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -3861,9 +3861,9 @@ dependencies = [
 
 [[package]]
 name = "gpui-fast"
-version = "0.1.13"
+version = "0.1.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7ee67914f779fdcfce4c7f59f6ba8fa68f680bd137648b25a801cd5d9cb1b8ab"
+checksum = "f8c3a7e25e5a4789656da980b0316857acbdb72347b5d890d7d0c549bb9fee72"
 dependencies = [
  "accesskit",
  "anyhow",
@@ -3932,9 +3932,9 @@ dependencies = [
 
 [[package]]
 name = "gpui-fast-macros"
-version = "0.1.13"
+version = "0.1.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "46724abd05d2c874cc31e1996bb862539c5735780dd363cb550469003a6e5140"
+checksum = "269fc24ab55f85d5fb90ce812b3e6adcf5ad0bdccc79a08aa9ddd88a3a477494"
 dependencies = [
  "heck 0.5.0",
  "proc-macro2",
@@ -3944,9 +3944,9 @@ dependencies = [
 
 [[package]]
 name = "gpui-fps"
-version = "0.9.0"
+version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "be271ebdb379ab0f6210393dcaea484562e4e8226a7b2ab6077e8010a439bdb4"
+checksum = "d8033fae208984a79b433f57a9844fa8e9fc419619597ec255d4971467f8dfce"
 dependencies = [
  "core-graphics 0.24.0",
  "gpui-pre",
@@ -3962,9 +3962,9 @@ dependencies = [
 
 [[package]]
 name = "gpui-kit"
-version = "0.9.0"
+version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2c464934b5cdb85dd3fc511e60d09fb446fba422de159a80038368f52893c14b"
+checksum = "aca1dedfea73645b60b5893c9c16de0b1396f2cf4251d19e5f03a295c1b61879"
 dependencies = [
  "gpui-base",
  "gpui-pre",
@@ -3975,9 +3975,9 @@ dependencies = [
 
 [[package]]
 name = "gpui-kit-assets"
-version = "0.9.0"
+version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "956a9864880e1f230e274a74cea8006e5018b8af383ad7bbd30b6b18254a97a9"
+checksum = "cb5abe0bbd8f9226170c8726e529f6574519e297e9ed1bde86d5fd4d3536079a"
 dependencies = [
  "anyhow",
  "gpui-pre",
@@ -3990,9 +3990,9 @@ dependencies = [
 
 [[package]]
 name = "gpui-pre"
-version = "0.3.11"
+version = "0.3.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9303c771abf2acff2a96d706f69d9a82088c4770173a07cce88f0002431d887d"
+checksum = "29db89613527079737f53752eab27fb65c9a7dd94979256c65a0e590c9fd34d8"
 dependencies = [
  "accesskit",
  "anyhow",
@@ -4062,9 +4062,9 @@ dependencies = [
 
 [[package]]
 name = "gpui-pre-apple"
-version = "0.3.11"
+version = "0.3.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8c0bea8ffa563d3a1ada533e148bb55be7fb873c178979e889a3d1204f8e1b91"
+checksum = "a460605ec4e8cbcc9b213462a84b1d6cc3efe4ed8f0e18669659f07b2d5c6aec"
 dependencies = [
  "anyhow",
  "async-task",
@@ -4102,9 +4102,9 @@ dependencies = [
 
 [[package]]
 name = "gpui-pre-bench-metrics"
-version = "0.3.11"
+version = "0.3.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a2380f9a4c76fbbf035fe0b83e7054216e0dbacb18e2a95bb26c27bda22376e3"
+checksum = "db6a8ff719fdc3da4f5f497b5d39c5545634424073f94943b003c818fc95e1d5"
 dependencies = [
  "anyhow",
  "criterion",
@@ -4114,9 +4114,9 @@ dependencies = [
 
 [[package]]
 name = "gpui-pre-collections"
-version = "0.3.11"
+version = "0.3.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "06882d54d40681ae3b145af9ef8a4021c2bf9967cc0a9fcf0cc50f003bf3cdf3"
+checksum = "cb60ece401b399fd5ec13911915b407b0c6efa1f6c9a9f66201aaac56c7ec39d"
 dependencies = [
  "gpui-pre-util",
  "indexmap 2.14.0",
@@ -4125,9 +4125,9 @@ dependencies = [
 
 [[package]]
 name = "gpui-pre-derive-refineable"
-version = "0.3.11"
+version = "0.3.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3999591b50cfd74f1734baf97fe802cce5f282d60d85b908e3393d534fbd50fb"
+checksum = "aeb2a3f5e6c9f300f432ae7989a81b262953ccfb3f9385be51cdc3303aef8858"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4136,9 +4136,9 @@ dependencies = [
 
 [[package]]
 name = "gpui-pre-http-client"
-version = "0.3.11"
+version = "0.3.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a00ff0e68341f52c5903182d7e2e2d7dc247d87b0d9947ce3564e453720347a0"
+checksum = "55245de7e3b6e219596fd98bb29555d6e3fe44c055d025960affeb11b894c048"
 dependencies = [
  "anyhow",
  "bytes",
@@ -4155,9 +4155,9 @@ dependencies = [
 
 [[package]]
 name = "gpui-pre-ios"
-version = "0.3.11"
+version = "0.3.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "326382c3b3f004617ac0f61338594c00f053b08b7875f3486ea0f221e9b20a75"
+checksum = "10656f6db4bbedb60bd7fcbb8a70f7c7eeee45bc4582fb8933ca807d2ddf52ad"
 dependencies = [
  "anyhow",
  "block2 0.6.2",
@@ -4177,9 +4177,9 @@ dependencies = [
 
 [[package]]
 name = "gpui-pre-linux"
-version = "0.3.11"
+version = "0.3.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "79cac5cbd3485c1e3db8eafd5dc69019188f5cb0a39846946af772efa386f624"
+checksum = "54bab418d0b7c027af9495f278619b46887362b3bd6446e246c87c5b0fa167df"
 dependencies = [
  "accesskit",
  "accesskit_unix",
@@ -4222,9 +4222,9 @@ dependencies = [
 
 [[package]]
 name = "gpui-pre-macos"
-version = "0.3.11"
+version = "0.3.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d7410cfdaa1fa55a414346cc492d18ce340e3a8b6d0ac3213b984ed690c82b92"
+checksum = "2de7d3f4ad51ac387e822495db363fcc1188d349793365731d054444c4cb06ee"
 dependencies = [
  "accesskit",
  "accesskit_macos",
@@ -4263,9 +4263,9 @@ dependencies = [
 
 [[package]]
 name = "gpui-pre-macros"
-version = "0.3.11"
+version = "0.3.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ee1c52959baa6834db3183e86affe70242ca90b4fc64ed2ae6dd689a799ce78e"
+checksum = "1c7f67904eced61ed42ae3320a9b4b388aed893f8547fffe9161ec425ad162eb"
 dependencies = [
  "heck 0.5.0",
  "proc-macro-crate",
@@ -4277,7 +4277,7 @@ dependencies = [
 [[package]]
 name = "gpui-pre-mobile"
 version = "0.1.0"
-source = "git+https://github.com/PeatBoy/gpui-mobile?rev=f6e8b3769933bed5f838b9ec3d45ec84fc2a5a8e#f6e8b3769933bed5f838b9ec3d45ec84fc2a5a8e"
+source = "git+https://github.com/PeatBoy/gpui-mobile?rev=d8945a826e4012b43a46b53d7e72b6beae24cc80#d8945a826e4012b43a46b53d7e72b6beae24cc80"
 dependencies = [
  "accesskit_android",
  "android-activity",
@@ -4310,9 +4310,9 @@ dependencies = [
 
 [[package]]
 name = "gpui-pre-platform"
-version = "0.3.11"
+version = "0.3.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "175f55bd6a80ea3bb0cf44d9ba454a3312381d66e702b3b5e99f73a7ca1738ee"
+checksum = "d2b785bdcbd229f762096aebf4f9ae913bdaa9db49794907cabaf516eb55227b"
 dependencies = [
  "anyhow",
  "console_error_panic_hook",
@@ -4326,9 +4326,9 @@ dependencies = [
 
 [[package]]
 name = "gpui-pre-refineable"
-version = "0.3.11"
+version = "0.3.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "097375d98fecafd6e00ec13c7711709cc6d827ccad385694ce9e2c2f570c02a5"
+checksum = "4d197569e3b1fd84170f574bb866e95ecbc2625e7ae9443c877150eaf7d53374"
 dependencies = [
  "gpui-pre-derive-refineable",
 ]
@@ -4386,9 +4386,9 @@ dependencies = [
 
 [[package]]
 name = "gpui-pre-scheduler"
-version = "0.3.11"
+version = "0.3.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "93c3c9f76341cdf03801699d68876915b42d5858e80c52a141ebfc350358147b"
+checksum = "b1d3fa97eeb4ea233635b756684affe96db9e29fc2af8cdc269268bd7ff649fc"
 dependencies = [
  "async-task",
  "backtrace",
@@ -4403,9 +4403,9 @@ dependencies = [
 
 [[package]]
 name = "gpui-pre-shared-string"
-version = "0.3.11"
+version = "0.3.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "781aaf9a9c19e3367b94100c7b1a17283721766bc890909ce8aa34e8c5b1a99a"
+checksum = "63c2ed1e44195079d4461b83a99845aa9a52ce8fcf1516410816670a03d32d94"
 dependencies = [
  "schemars 1.2.1",
  "serde",
@@ -4414,9 +4414,9 @@ dependencies = [
 
 [[package]]
 name = "gpui-pre-sum-tree"
-version = "0.3.11"
+version = "0.3.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e0cb18765472fb2c64b7e6374f9a36f512ce25b1ccb3662fff51788564107eb3"
+checksum = "6085e61458366decd21491396b0b90b3adf928f2ec27e170c4d3c9fba455d536"
 dependencies = [
  "gpui-pre-ztracing",
  "heapless",
@@ -4426,9 +4426,9 @@ dependencies = [
 
 [[package]]
 name = "gpui-pre-util"
-version = "0.3.11"
+version = "0.3.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "49036ad9887034f8d6652b65761ee1c1fdbd7d66be33a6088245fae54dc643e3"
+checksum = "52ead57ff96b5a34e71d64758080347066d667e0c4bd4ff71e85f3a50643fa3e"
 dependencies = [
  "anyhow",
  "log",
@@ -4437,9 +4437,9 @@ dependencies = [
 
 [[package]]
 name = "gpui-pre-web"
-version = "0.3.11"
+version = "0.3.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ad51fcf6e251d45b092fd4a98a26325eb9cf6ad4e6228b0c6bc50672db9e0563"
+checksum = "a85e775c6874257c63f9cf51d99f0aba13b3bc615ed8d47e7d5338e3b5941f6a"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -4467,9 +4467,9 @@ dependencies = [
 
 [[package]]
 name = "gpui-pre-wgpu"
-version = "0.3.11"
+version = "0.3.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "211cf352de1a0b0c9bea3f105df5572ce1d2c899389b924a888e5af36b50f93d"
+checksum = "dc76608d385f6d0dcbad44504b1bf669dac3b7d7ffa2885acdb7c1c358caf852"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -4494,9 +4494,9 @@ dependencies = [
 
 [[package]]
 name = "gpui-pre-windows"
-version = "0.3.11"
+version = "0.3.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5141a3db59bab761a16ab19529fe4117a86e91922e8fc00af6dfc4829cb1744d"
+checksum = "7201762420222d5b5ce5bdf0056996199212a3349bfb2457a3a0238c688681f3"
 dependencies = [
  "accesskit",
  "accesskit_windows",
@@ -4524,9 +4524,9 @@ dependencies = [
 
 [[package]]
 name = "gpui-pre-ztracing"
-version = "0.3.11"
+version = "0.3.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7ac9274f4fb36ce6bf128f9b48032196a3120cb858503af33ced6c21366cf2f7"
+checksum = "1043bbe8d711baf03e774b03bae6521155f017450b866dcaa987a07d978d660a"
 dependencies = [
  "gpui-pre-ztracing-macro",
  "tracing",
@@ -4534,15 +4534,15 @@ dependencies = [
 
 [[package]]
 name = "gpui-pre-ztracing-macro"
-version = "0.3.11"
+version = "0.3.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "99b18b06f5026b3d312488eacfdddbe78f82b4bf32bb2d2bc3186e31e552b797"
+checksum = "85701631a9bbecf47e6d19f145e85e57767e7c50f7192d5b1bf65b5ef43cb373"
 
 [[package]]
 name = "gpui-shell"
-version = "0.9.0"
+version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3687f3ed5ef475634e1b09169ba183507f84c91cf426139feaeaf9fa6377f804"
+checksum = "a813b32b9a8c27f56ea7ae112ff43c120abd3aa00005f205735e0bc37dce4db6"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -4580,7 +4580,7 @@ dependencies = [
 
 [[package]]
 name = "gpui-tokio"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "gpui-pre",
@@ -11378,7 +11378,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vibex-agent"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "async-trait",
  "base64",
@@ -11399,7 +11399,7 @@ dependencies = [
 
 [[package]]
 name = "vibex-agent-acp"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "agent-client-protocol-schema",
  "async-trait",
@@ -11427,7 +11427,7 @@ dependencies = [
 
 [[package]]
 name = "vibex-agent-claude"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "serde",
  "serde_json",
@@ -11438,7 +11438,7 @@ dependencies = [
 
 [[package]]
 name = "vibex-agent-codex"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "serde",
  "serde_json",
@@ -11449,7 +11449,7 @@ dependencies = [
 
 [[package]]
 name = "vibex-app-update"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "async-trait",
  "base64",
@@ -11471,7 +11471,7 @@ dependencies = [
 
 [[package]]
 name = "vibex-backend"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "serde",
  "serde_json",
@@ -11488,7 +11488,7 @@ dependencies = [
 
 [[package]]
 name = "vibex-backup"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "rusqlite",
  "serde",
@@ -11500,7 +11500,7 @@ dependencies = [
 
 [[package]]
 name = "vibex-brands"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "image",
  "resvg 0.46.0",
@@ -11508,7 +11508,7 @@ dependencies = [
 
 [[package]]
 name = "vibex-browser"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "async-trait",
  "axum",
@@ -11535,7 +11535,7 @@ dependencies = [
 
 [[package]]
 name = "vibex-client"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "serde",
@@ -11555,7 +11555,7 @@ dependencies = [
 
 [[package]]
 name = "vibex-computer"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "async-trait",
  "axum",
@@ -11576,7 +11576,7 @@ dependencies = [
 
 [[package]]
 name = "vibex-config-switch"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "dirs 6.0.0",
  "flate2",
@@ -11598,7 +11598,7 @@ dependencies = [
 
 [[package]]
 name = "vibex-content"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "pdfium-render",
  "quick-xml 0.41.0",
@@ -11613,7 +11613,7 @@ dependencies = [
 
 [[package]]
 name = "vibex-core"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "base64",
  "js-sys",
@@ -11629,7 +11629,7 @@ dependencies = [
 
 [[package]]
 name = "vibex-db"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "dirs 6.0.0",
  "rusqlite",
@@ -11641,7 +11641,7 @@ dependencies = [
 
 [[package]]
 name = "vibex-desktop"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "axum",
@@ -11709,7 +11709,7 @@ dependencies = [
 
 [[package]]
 name = "vibex-desktop-model"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "serde",
  "serde_json",
@@ -11723,7 +11723,7 @@ dependencies = [
 
 [[package]]
 name = "vibex-desktop-runtime"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "async-trait",
  "base64",
@@ -11776,7 +11776,7 @@ dependencies = [
 
 [[package]]
 name = "vibex-diagnostics"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "async-trait",
  "serde",
@@ -11794,7 +11794,7 @@ dependencies = [
 
 [[package]]
 name = "vibex-fs"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "ignore",
  "regex",
@@ -11807,7 +11807,7 @@ dependencies = [
 
 [[package]]
 name = "vibex-git"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "fs2",
  "serde",
@@ -11817,8 +11817,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "vibex-installer-env"
+version = "0.1.3"
+dependencies = [
+ "windows-sys 0.59.0",
+]
+
+[[package]]
 name = "vibex-mobile"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "android-activity",
  "base64",
@@ -11855,7 +11862,7 @@ dependencies = [
 
 [[package]]
 name = "vibex-model-catalog"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "reqwest",
  "serde",
@@ -11866,7 +11873,7 @@ dependencies = [
 
 [[package]]
 name = "vibex-model-gateway"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "axum",
  "base64",
@@ -11912,7 +11919,7 @@ dependencies = [
 
 [[package]]
 name = "vibex-relay"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "base64",
  "chacha20poly1305 0.10.1",
@@ -11929,7 +11936,7 @@ dependencies = [
 
 [[package]]
 name = "vibex-relay-server"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "axum",
  "futures-util",
@@ -11947,7 +11954,7 @@ dependencies = [
 
 [[package]]
 name = "vibex-remote"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "async-trait",
  "axum",
@@ -11981,7 +11988,7 @@ dependencies = [
 
 [[package]]
 name = "vibex-remote-client"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "axum",
  "base64",
@@ -12018,7 +12025,7 @@ dependencies = [
 
 [[package]]
 name = "vibex-server"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "libc",
  "qrcode",
@@ -12038,7 +12045,7 @@ dependencies = [
 
 [[package]]
 name = "vibex-terminal"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "alacritty_terminal",
  "libc",
@@ -12052,7 +12059,7 @@ dependencies = [
 
 [[package]]
 name = "vibex-terminal-ui"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "alacritty_terminal",
  "serde",
@@ -12061,7 +12068,7 @@ dependencies = [
 
 [[package]]
 name = "vibex-tui"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "chrono",
@@ -12098,7 +12105,7 @@ dependencies = [
 
 [[package]]
 name = "vibex-ui"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "gpui-component",
  "gpui-pre",

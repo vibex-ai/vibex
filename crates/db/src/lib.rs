@@ -99,7 +99,7 @@ pub use runtime::{
     SwitchOperationJournalRepository, SwitchOperationRecord,
 };
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 88;
+pub const CURRENT_SCHEMA_VERSION: i64 = 89;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Copy)]
@@ -1862,7 +1862,7 @@ const MIGRATIONS: &[Migration] = &[
         ",
     },
     Migration {
-        version: 46,
+        version: 89,
         name: "plugin_market_storage",
         sql: "
             CREATE TABLE IF NOT EXISTS plugins (
@@ -18055,7 +18055,9 @@ const TIMELINE_IN_FLIGHT_TAIL_MAX_BYTES: usize = 256 * 1024;
 /// stripped file snapshot does not spend the whole page on detail it never
 /// carries.
 fn page_payload_cost(item: &TimelineItem) -> usize {
-    item.payload.approximate_bytes() - item.payload.stripped_tool_detail_bytes()
+    item.payload.approximate_bytes()
+        - item.payload.stripped_tool_detail_bytes()
+        - item.payload.stripped_inline_attachment_bytes()
 }
 
 /// Whether a page's oldest row begins a conversational turn.
@@ -19458,7 +19460,7 @@ mod tests {
         let mut applied = Vec::new();
         apply_runtime_auth_source_table_rebuild(&mut conn, &mut applied).unwrap();
         assert_eq!(applied, ["46:runtime_auth_source_nullable_legacy_columns"]);
-        assert_eq!(current_schema_version(&conn).unwrap(), 46);
+        assert_eq!(current_schema_version(&conn).unwrap(), 89);
         // The repository always writes the tool map now. A database frozen at
         // v46 gains that column from every later migration, so the fixture
         // needs it before the insert above can run.
@@ -19755,6 +19757,7 @@ mod tests {
             vec![
                 "44:runtime_switch_activation_completion",
                 "45:agent_auth_context_and_runtime_source",
+                "89:plugin_market_storage",
                 "46:runtime_auth_source_nullable_legacy_columns",
                 "47:agent_default_usage_model_nullable",
                 "48:agent_usage_counter_scope",
@@ -19912,6 +19915,7 @@ mod tests {
                 "43:agent_model_provider_display_order",
                 "44:runtime_switch_activation_completion",
                 "45:agent_auth_context_and_runtime_source",
+                "89:plugin_market_storage",
                 "46:runtime_auth_source_nullable_legacy_columns",
                 "47:agent_default_usage_model_nullable",
                 "48:agent_usage_counter_scope",
@@ -20103,6 +20107,7 @@ mod tests {
                 "43:agent_model_provider_display_order",
                 "44:runtime_switch_activation_completion",
                 "45:agent_auth_context_and_runtime_source",
+                "89:plugin_market_storage",
                 "46:runtime_auth_source_nullable_legacy_columns",
                 "47:agent_default_usage_model_nullable",
                 "48:agent_usage_counter_scope",
@@ -21563,6 +21568,7 @@ mod tests {
                 "43:agent_model_provider_display_order",
                 "44:runtime_switch_activation_completion",
                 "45:agent_auth_context_and_runtime_source",
+                "89:plugin_market_storage",
                 "46:runtime_auth_source_nullable_legacy_columns",
                 "47:agent_default_usage_model_nullable",
                 "48:agent_usage_counter_scope",

@@ -8,7 +8,7 @@ use crate::{
     CorrelationId, DeviceId, ErrorCategory, EventId, RemoteActionClass, RemoteAuthProof,
     RemoteDeleteDeviceRequest, RemoteDeviceDetail, RemoteDevicePermissionLevel,
     RemoteOperationKind, RemoteRenameDeviceRequest, RemoteRenameRuntimeRequest,
-    RemoteRestoreDeviceRequest, RemoteRevokeDeviceRequest, RequestId, VibexError,
+    RemoteRestoreDeviceRequest, RemoteRevokeDeviceRequest, RequestId, VibexError, VibexSessionId,
     unix_timestamp_ms,
 };
 
@@ -68,6 +68,17 @@ pub const REMOTE_LOCAL_LAN_TLS_HOSTNAME: &str = "vibex-lan.local";
 /// user who wants to point somewhere else uses the self-hosted Relay entry
 /// instead of editing this one.
 pub const REMOTE_OFFICIAL_RELAY_ORIGIN: &str = "https://relay.peatboy.com";
+
+/// Whether a relay origin is the built-in one.
+///
+/// Every surface compares against this instead of the constant so a stored
+/// origin with a trailing slash, or one differing only in case, still reads as
+/// the official relay rather than as somebody's self-hosted endpoint.
+pub fn is_official_relay_origin(value: &str) -> bool {
+    let trimmed = value.trim();
+    let trimmed = trimmed.strip_suffix('/').unwrap_or(trimmed);
+    trimmed.eq_ignore_ascii_case(REMOTE_OFFICIAL_RELAY_ORIGIN)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -383,6 +394,14 @@ pub struct RemoteSubscribeRequestV2 {
     pub subscription_id: String,
     #[serde(default)]
     pub topics: Vec<String>,
+    /// Which sessions' timeline events this connection wants.
+    ///
+    /// `None` keeps the historical behavior — every session the device may
+    /// read — so an older client that never sends the field is unchanged.
+    /// `Some([])` asks for no timeline session at all, which is what a phone
+    /// uses while it is in the background.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_ids: Option<Vec<VibexSessionId>>,
     #[serde(default)]
     pub cursors: Vec<RemoteStreamCursor>,
 }
@@ -2648,6 +2667,24 @@ mod tests {
         assert_eq!(
             normalize_remote_display_name(&"x".repeat(REMOTE_DISPLAY_NAME_MAX_CHARS + 1)),
             None
+        );
+    }
+
+    #[test]
+    fn official_relay_origin_matches_the_stored_spellings_of_one_origin() {
+        assert!(is_official_relay_origin(REMOTE_OFFICIAL_RELAY_ORIGIN));
+        assert!(is_official_relay_origin(&format!(
+            "{REMOTE_OFFICIAL_RELAY_ORIGIN}/"
+        )));
+        assert!(is_official_relay_origin(&format!(
+            "  {}  ",
+            REMOTE_OFFICIAL_RELAY_ORIGIN.to_uppercase()
+        )));
+        assert!(!is_official_relay_origin("https://relay.example.com"));
+        assert!(!is_official_relay_origin(""));
+        assert!(
+            !is_official_relay_origin("https://relay.peatboy.com.evil.example"),
+            "a suffix that merely starts with the official host is a different origin"
         );
     }
 

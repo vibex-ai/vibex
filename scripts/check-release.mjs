@@ -166,13 +166,54 @@ function validatePackaging() {
     windowsConfig.includes('"packaging/vibex-tui.cmd"'),
     "the Windows package does not ship the vibex-tui launcher"
   );
-  const nsisTemplate = source("apps/desktop/packaging/nsis/installer.nsi");
+  const nsisTemplate = source("apps/desktop/packaging/nsis/installer.nsi").split("\r\n").join("\n");
   for (const required of [
     "AddInstallDirectoryToPath",
     "un.RemoveInstallDirectoryFromPath",
-    'WriteRegExpandStr HKCU "Environment" "Path"',
+    '"$INSTDIR\\vibex-installer-env.exe" add "$INSTDIR"',
+    '"$INSTDIR\\vibex-installer-env.exe" remove "$INSTDIR"',
   ]) {
     assert(nsisTemplate.includes(required), `the NSIS template is missing ${required}`);
+  }
+  // NSIS stops at 1023 characters. Reading `HKCU\Environment\Path` with
+  // `ReadRegStr` turns a longer value into an empty string, and writing it back
+  // then replaces the user's PATH. Both edits belong to the helper.
+  assert(
+    !/ReadRegStr\s+\$\w+\s+HKCU\s+"Environment"/u.test(nsisTemplate),
+    "the NSIS template reads HKCU Environment with ReadRegStr, which truncates a long PATH"
+  );
+  assert(
+    !/WriteReg(?:Expand)?Str\s+HKCU\s+"Environment"/u.test(nsisTemplate),
+    "the NSIS template writes HKCU Environment directly instead of using vibex-installer-env"
+  );
+  assert(
+    !/DeleteReg(?:Value|Key)\s+HKCU\s+"Environment"/u.test(nsisTemplate),
+    "the NSIS template deletes HKCU Environment directly instead of using vibex-installer-env"
+  );
+  assert(
+    windowsConfig.includes('installMode = "currentUser"'),
+    "the PATH helper edits HKCU, so the NSIS installer must stay currentUser"
+  );
+  assert(
+    source("scripts/build-channel.mjs").includes('"vibex-installer-env"'),
+    "the channel build does not build the Windows PATH helper"
+  );
+  assert(
+    source("scripts/package-desktop-release.mjs").includes('path = "vibex-installer-env"'),
+    "the Windows package does not ship the PATH helper"
+  );
+  assert(
+    existsSync(path("crates/installer-env/Cargo.toml")),
+    "the installer PATH helper crate is missing"
+  );
+  const installerEnv = source("crates/installer-env/src/registry.rs");
+  for (const required of [
+    "RegQueryValueExW",
+    "RegSetValueExW",
+    "REG_EXPAND_SZ",
+    "SendMessageTimeoutW"
+  ]) {
+    assert(installerEnv.includes(required), `the PATH helper no longer uses ${required}`);
   }
   assert(
     source("apps/desktop/packaging/vibex-tui").includes('exec "$dir/vibex" "$@"'),
@@ -300,14 +341,17 @@ function validatePackaging() {
     releaseWorkflow.includes("has no English section"),
     "publish workflow does not require an English release-notes section"
   );
-  // The release page itself is composed from three inputs: the tagged notes, a
-  // Downloads table built from the assets this run publishes, and the
-  // changelog. Losing any of them ships a page without the part readers came
-  // for, and `--generate-notes` alone would drop the first two.
+  // The release page itself is composed from the tagged notes, a Downloads
+  // table built from the assets this run publishes, the generated changelog and
+  // the resolved contributor logins. Losing any of them ships a page without the
+  // part readers came for, and `--generate-notes` alone would drop the first
+  // two.
   for (const required of [
     "fetch-depth: 0",
     "releases/generate-notes",
     "scripts/release-body.mjs",
+    "scripts/release-contributors.mjs",
+    "--contributors target/release-body/contributors.txt",
     "--notes-file target/release-body/vibex-release-body.md"
   ]) {
     assert(
@@ -320,6 +364,14 @@ function validatePackaging() {
     "publish workflow still lets GitHub generate the whole body, which drops the notes and the Downloads table"
   );
   assert(existsSync(path("scripts/release-body.mjs")), "release body composer is missing");
+  assert(
+    existsSync(path("scripts/release-contributors.mjs")),
+    "release contributor resolver is missing"
+  );
+  assert(
+    existsSync(path("scripts/release-contributors.test.mjs")),
+    "release contributor resolver self-test is missing"
+  );
   assert(
     existsSync(path("scripts/release-body.test.mjs")),
     "release body composer self-test is missing"

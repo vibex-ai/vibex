@@ -196,6 +196,94 @@ impl WebRemoteBackend {
         &self.transport
     }
 
+    /// Reads only the timeline items a client missed.
+    ///
+    /// A reconnect or a lagged event queue used to answer with a full cold
+    /// window. The authority already exposes a bounded catch-up page, so the
+    /// client asks from the last sequence it rendered and applies the delta.
+    /// `compacted` means the authority no longer holds that range; the caller
+    /// then replaces the projection instead of patching it.
+    pub async fn catch_up_timeline(
+        &self,
+        session_id: VibexSessionId,
+        after_sequence: i64,
+        limit: u32,
+    ) -> BackendResult<Vec<TimelineLiveEvent>> {
+        let mut after_sequence = after_sequence.max(0);
+        let mut events = Vec::new();
+        for _ in 0..8 {
+            let payload = RemoteAgentRequest::CatchUp(vibex_core::RemoteAgentCatchUpRequest {
+                auth: self.auth(),
+                cursors: vec![vibex_core::RemoteAgentTimelineCursor {
+                    session_id: session_id.clone(),
+                    after_sequence,
+                }],
+                limit: Some(limit),
+            });
+            let value = self
+                .rpc(
+                    RemoteOperationKind::AgentSession,
+                    payload,
+                    None,
+                    None,
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            let response: vibex_core::RemoteAgentCatchUpResponse = decode(value)?;
+            if response.compacted {
+                return Err(BackendError::conflict(
+                    "agent_timeline_catch_up_compacted",
+                    "the authority no longer holds the timeline range this client missed",
+                ));
+            }
+            let page_len = response.events.len();
+            for envelope in response.events {
+                let Some(payload) = envelope.payload else {
+                    continue;
+                };
+                let event: TimelineLiveEvent = serde_json::from_value(payload).map_err(|_| {
+                    BackendError::failed(
+                        "agent_timeline_catch_up_invalid",
+                        "a catch-up event did not carry a timeline item",
+                    )
+                })?;
+                events.push(event);
+            }
+            let next = response
+                .next_cursors
+                .first()
+                .map(|cursor| cursor.after_sequence)
+                .unwrap_or(after_sequence);
+            if next <= after_sequence || page_len < limit as usize {
+                break;
+            }
+            after_sequence = next;
+        }
+        Ok(events)
+    }
+
+    /// Replaces what this connection streams without reconnecting.
+    ///
+    /// The subscription is a complete statement: the caller lists the topics
+    /// it wants and, for the timeline, the sessions it is looking at. Cursors
+    /// are deliberately empty — this is a scope change on a live socket, not a
+    /// handoff, so the server must not answer with a resync.
+    pub async fn update_live_subscription(
+        &self,
+        topics: Vec<String>,
+        session_ids: Option<Vec<VibexSessionId>>,
+    ) -> BackendResult<()> {
+        self.transport
+            .update_subscription(vibex_core::RemoteSubscribeRequestV2 {
+                subscription_id: "subscription_mobile".to_string(),
+                topics,
+                session_ids,
+                cursors: Vec::new(),
+            })
+            .await?;
+        Ok(())
+    }
+
     /// Downloads a bounded workspace-relative file through the v2 binary
     /// attachment channel. The desktop remains the only filesystem authority.
     pub async fn download_file(

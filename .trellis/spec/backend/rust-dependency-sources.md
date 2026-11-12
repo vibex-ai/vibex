@@ -22,13 +22,13 @@ vendored Android IME host.
 ```toml
 # Cargo.toml
 [workspace.dependencies]
-gpui = { package = "gpui-pre", version = "=0.3.11" }
-gpui_platform = { package = "gpui-pre-platform", version = "=0.3.11", features = ["font-kit", "runtime_shaders", "wayland", "x11"] }
+gpui = { package = "gpui-pre", version = "=0.3.12" }
+gpui_platform = { package = "gpui-pre-platform", version = "=0.3.12", features = ["font-kit", "runtime_shaders", "wayland", "x11"] }
 gpui_tokio = { package = "gpui-tokio", path = "crates/gpui-tokio" }
-gpui-component = "0.9.0"
-gpui-fps = "0.9.0"
-gpui-kit-assets = "0.9.0"
-gpui-base = "0.9.0"
+gpui-component = "0.9.1"
+gpui-fps = "0.9.1"
+gpui-kit-assets = "0.9.1"
+gpui-base = "0.9.1"
 ```
 
 ```toml
@@ -51,24 +51,32 @@ pnpm check:mobile-native              native mobile crate and project contract
 
 ### 3. Contracts
 
-- The `gpui-pre` family resolves from crates.io at the exact `=0.3.11` pins. Do not
+- The `gpui-pre` family resolves from crates.io at the exact `=0.3.12` pins. Do not
   reintroduce a `[patch.crates-io]` block that redirects it to a local fork, and do
   not rename a fork to satisfy the version constraint.
 - `gpui-pre-mobile` resolves from its pinned Git revision; the pin moves only with
   a reviewed dependency-source change, never as a floating branch.
-- gpui-kit 0.9.0 pins `gpui-pre =0.3.11`, and Cargo cannot hold two exact pins in
-  the same `0.3` range, so the mobile platform layer must accept 0.3.11 or the
+- gpui-kit 0.9.1 pins `gpui-pre =0.3.12`, and Cargo cannot hold two exact pins in
+  the same `0.3` range, so the mobile platform layer must accept 0.3.12 or the
   workspace does not resolve at all. Upstream `longbridge/gpui-mobile` still pins
   `=0.3.10` at its latest revision `7548ebc`, so the pin names the reviewed
-  `PeatBoy/gpui-mobile` revision `f6e8b37`: upstream `7548ebc` plus the 0.3.11
-  version bump, the re-vendored 0.3.11 `gpui-pre-wgpu` with the headless/offscreen
-  patch re-applied, and the `WgpuContext::new` call sites the 0.3.11 renderer API
-  moved (adapter selection now tests the surface configuration the renderer will
-  use). That branch is proposed upstream as `longbridge/gpui-mobile#46`. The
-  revision is a commit hash, so its contents are fixed by the pin; when the pull
-  request lands, the pin returns to upstream at the merge commit and this
-  paragraph names that revision instead. Keep `scripts/check-mobile-native.mjs`
-  carrying whichever revision is pinned.
+  `PeatBoy/gpui-mobile` revision `d8945a8`: upstream `7548ebc` plus the 0.3.12
+  version bump, the re-vendored 0.3.12 `gpui-pre-wgpu` with the headless/offscreen
+  patch re-applied, and the `WgpuContext::new` call sites the renderer API moved
+  (adapter selection now tests the surface configuration the renderer will use).
+  That branch is proposed upstream as `longbridge/gpui-mobile#56`. The revision is
+  a commit hash, so its contents are fixed by the pin; when the pull request
+  lands, the pin returns to upstream at the merge commit and this paragraph names
+  that revision instead. Keep `scripts/check-mobile-native.mjs` carrying
+  whichever revision is pinned.
+- Do not take the 0.3.12 support from a fork that also carries API the published
+  `gpui-pre` does not have. `longbridge/gpui-mobile` can resolve a revision from
+  a fork network (`de6527f`, which reaches `Bombatomica64/gpui-mobile`), but its
+  Android module imports `TextInputPurpose` and reads
+  `TextInputConfiguration::purpose`, and neither exists in the crates.io
+  `gpui-pre 0.3.12`. That revision compiles only against that fork's own
+  `gpui-pre` patch, which the source policy forbids here. Verify a candidate
+  revision against the published crate before pinning it.
 - `crates/gpui-tokio` is the only first-party copy of upstream Rust code. It is a
   verbatim copy of zed's Apache-2.0 `gpui_tokio` with re-pointed dependency
   coordinates, kept because no `gpui-pre-tokio` package exists. Keep it verbatim;
@@ -98,6 +106,9 @@ pnpm check:mobile-native              native mobile crate and project contract
     delegation, so every method the snapshot adds must be forwarded there. The
     0.3.9 bump added `on_displays_changed`; 0.3.11 added `platform_info` (which
     keyboard conventions resolve from), `power_mode` and `on_power_mode_change`.
+    0.3.12 adds no trait method: `Platform`, `PlatformWindow` and the other
+    platform traits are unchanged, and the snapshot's work is in image decoding
+    (animated WebP) and element internals.
   - `apps/mobile/src/android_host.rs` is `cfg(target_os = "android")`, and the
     Android build needs an NDK the quality gates do not require. 0.3.9 changed
     `gpui-pre-mobile`'s Android host entry from a process-global surface
@@ -152,7 +163,7 @@ pnpm check:mobile-native              native mobile crate and project contract
   `scripts/check-mobile-native.mjs` name the same revision. While upstream lags
   the pinned `gpui-pre`, the pin names the reviewed `PeatBoy/gpui-mobile`
   revision carrying the version bump that is open upstream as
-  `longbridge/gpui-mobile#46`.
+  `longbridge/gpui-mobile#56`.
 - Base: a non-GPUI dependency changes the root lock without moving any pin; no
   source-policy review is needed.
 - Bad: fork zed again and publish it under the `gpui-pre` name so the version
@@ -195,9 +206,9 @@ This reintroduces a renamed GPUI fork and a vendored component tree.
 #### Correct
 
 ```toml
-gpui = { package = "gpui-pre", version = "=0.3.11" }
+gpui = { package = "gpui-pre", version = "=0.3.12" }
 gpui_tokio = { package = "gpui-tokio", path = "crates/gpui-tokio" }
-gpui-component = "0.9.0"
+gpui-component = "0.9.1"
 ```
 
 ## Scenario: Redistributed Native Runtime With A Bounded Package Transform

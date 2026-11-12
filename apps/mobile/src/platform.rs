@@ -511,8 +511,6 @@ pub fn open_external_url(url: &str) -> bool {
 /// the platform layer recorded last.
 #[cfg(target_os = "android")]
 mod android {
-    use jni::objects::JString;
-
     /// Hands the host activity's IME editor the focused field's text and caret.
     ///
     /// The activity keeps a copy of this report and answers the keyboard's

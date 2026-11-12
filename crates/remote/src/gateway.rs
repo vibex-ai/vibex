@@ -49,7 +49,7 @@ use vibex_core::{
     RemoteRpcRequestV2, RemoteRpcResponseV2, RemoteRpcResultMetadata, RemoteServerInfoV2,
     RemoteSubscribeRequestV2, RemoteSubscriptionAcceptedV2, RemoteTimeoutClass,
     RemoteWsTicketRequest, RemoteWsTicketResponse, RemoteZeroConfigLanPairingHello, RequestId,
-    TerminalId, VibexError, VibexResult, WorkspaceId, remote_permissions_for_level,
+    TerminalId, VibexError, VibexResult, VibexSessionId, WorkspaceId, remote_permissions_for_level,
     unix_timestamp_ms,
 };
 use vibex_db::RemotePairingOfferRepository;
@@ -1579,7 +1579,7 @@ impl RemoteGateway {
         &self,
         context: &RelayRemoteHandshakeContext,
         message: RemoteJsonMessageV2,
-        subscriptions: &Arc<Mutex<HashSet<String>>>,
+        subscriptions: &Arc<Mutex<GatewaySubscriptions>>,
         authenticated_proof: Option<&RemoteAuthProof>,
         session_outbound: Option<&mpsc::Sender<RelayRemoteOutbound>>,
         attachment_tasks: &mut RelayAttachmentTasks,
@@ -1800,7 +1800,7 @@ impl RemoteGateway {
     pub fn relay_outbound(
         &self,
         context: &RelayRemoteHandshakeContext,
-        subscriptions: Arc<Mutex<HashSet<String>>>,
+        subscriptions: Arc<Mutex<GatewaySubscriptions>>,
     ) -> VibexResult<(
         mpsc::Sender<RelayRemoteOutbound>,
         mpsc::Receiver<RelayRemoteOutbound>,
@@ -3238,7 +3238,7 @@ async fn run_v2_socket(socket: WebSocket, state: GatewayState, ticket: WsTicketR
             return;
         }
     };
-    let subscriptions = Arc::new(Mutex::new(HashSet::<String>::new()));
+    let subscriptions = Arc::new(Mutex::new(GatewaySubscriptions::default()));
     // The runtime's published name is read at handshake time, so a rename made
     // while this socket was connecting is what the client renders.
     let server_display_name = open_migrated_database(&state.db_path)
@@ -3585,7 +3585,7 @@ async fn handle_active_text(
     ticket: &WsTicketRecord,
     text: &str,
     outbound: &mpsc::Sender<OutboundFrame>,
-    subscriptions: &Arc<Mutex<HashSet<String>>>,
+    subscriptions: &Arc<Mutex<GatewaySubscriptions>>,
     attachment_tasks: &mut HashMap<String, JoinHandle<()>>,
     rpc_slots: &Arc<Semaphore>,
 ) -> bool {
@@ -3684,7 +3684,7 @@ async fn handle_control(
     ticket: &WsTicketRecord,
     control: RemoteControlMessageV2,
     outbound: &mpsc::Sender<OutboundFrame>,
-    subscriptions: &Arc<Mutex<HashSet<String>>>,
+    subscriptions: &Arc<Mutex<GatewaySubscriptions>>,
     attachment_tasks: &mut HashMap<String, JoinHandle<()>>,
 ) -> bool {
     match control {
@@ -3906,15 +3906,48 @@ fn authenticate_active_ticket(
     })
 }
 
+/// What one connection is subscribed to.
+///
+/// A subscription is a complete statement, not a delta: the client sends the
+/// topics and the session scope it wants now, and a re-subscription replaces
+/// the previous one. That is what lets a phone drop the timeline topic when it
+/// goes to the background without inventing a second control message.
+#[derive(Default)]
+pub struct GatewaySubscriptions {
+    topics: HashSet<String>,
+    /// `None` keeps the historical all-sessions behavior. `Some` is a
+    /// connection-scoped allow-list for `agent_session` events.
+    timeline_sessions: Option<HashSet<VibexSessionId>>,
+}
+
+impl GatewaySubscriptions {
+    fn contains(&self, topic: &str) -> bool {
+        self.topics.contains(topic)
+    }
+
+    fn wants_timeline_session(&self, session_id: &VibexSessionId) -> bool {
+        self.contains("agent_session")
+            && self
+                .timeline_sessions
+                .as_ref()
+                .is_none_or(|sessions| sessions.contains(session_id))
+    }
+}
+
 fn update_subscriptions(
-    subscriptions: &Arc<Mutex<HashSet<String>>>,
+    subscriptions: &Arc<Mutex<GatewaySubscriptions>>,
     request: RemoteSubscribeRequestV2,
     permission_level: RemoteDevicePermissionLevel,
 ) -> RemoteSubscriptionAcceptedV2 {
     let supported = gateway_topics();
     let mut accepted = Vec::new();
     let mut resync_required = Vec::new();
+    let timeline_sessions = request
+        .session_ids
+        .map(|sessions| sessions.into_iter().collect::<HashSet<_>>());
     if let Ok(mut active) = subscriptions.lock() {
+        active.topics.clear();
+        active.timeline_sessions = timeline_sessions;
         for topic in request.topics {
             if supported.contains(&topic.as_str()) {
                 if !subscription_topic_permitted(permission_level, &topic) {
@@ -3931,7 +3964,7 @@ fn update_subscriptions(
                         authoritative_operation: topic.clone(),
                     });
                 }
-                active.insert(topic.clone());
+                active.topics.insert(topic.clone());
                 accepted.push(topic);
             } else {
                 resync_required.push(RemoteResyncRequired {
@@ -3967,7 +4000,7 @@ impl GatewayEventTasks {
 fn spawn_gateway_events(
     state: &GatewayState,
     outbound: mpsc::Sender<OutboundFrame>,
-    subscriptions: Arc<Mutex<HashSet<String>>>,
+    subscriptions: Arc<Mutex<GatewaySubscriptions>>,
     permission_level: RemoteDevicePermissionLevel,
 ) -> GatewayEventTasks {
     GatewayEventTasks {
@@ -3990,7 +4023,7 @@ fn spawn_gateway_events(
 fn spawn_notification_events(
     state: &GatewayState,
     outbound: mpsc::Sender<OutboundFrame>,
-    subscriptions: Arc<Mutex<HashSet<String>>>,
+    subscriptions: Arc<Mutex<GatewaySubscriptions>>,
     permission_level: RemoteDevicePermissionLevel,
 ) -> JoinHandle<()> {
     if !permission_allows(permission_level, RemoteActionClass::ReadAgentSession) {
@@ -4008,7 +4041,7 @@ fn spawn_notification_events(
                 Ok(notification) => {
                     let subscribed = subscriptions
                         .lock()
-                        .map(|topics| topics.contains("agent_notification"))
+                        .map(|subscriptions| subscriptions.contains("agent_notification"))
                         .unwrap_or(false);
                     if !subscribed {
                         continue;
@@ -4044,7 +4077,7 @@ fn spawn_notification_events(
 fn spawn_timeline_events(
     state: &GatewayState,
     outbound: mpsc::Sender<OutboundFrame>,
-    subscriptions: Arc<Mutex<HashSet<String>>>,
+    subscriptions: Arc<Mutex<GatewaySubscriptions>>,
     permission_level: RemoteDevicePermissionLevel,
 ) -> JoinHandle<()> {
     if !permission_allows(permission_level, RemoteActionClass::ReadAgentSession) {
@@ -4060,11 +4093,13 @@ fn spawn_timeline_events(
         loop {
             match events.recv().await {
                 Ok(event) => {
-                    let subscribed = subscriptions
+                    let wanted = subscriptions
                         .lock()
-                        .map(|topics| topics.contains("agent_session"))
+                        .map(|subscriptions| {
+                            subscriptions.wants_timeline_session(&event.session_id)
+                        })
                         .unwrap_or(false);
-                    if !subscribed {
+                    if !wanted {
                         continue;
                     }
                     let Ok(event) = remote_timeline_event(event) else {
@@ -4119,7 +4154,7 @@ fn timeline_domain_event(
 fn spawn_domain_events(
     state: &GatewayState,
     outbound: mpsc::Sender<OutboundFrame>,
-    subscriptions: Arc<Mutex<HashSet<String>>>,
+    subscriptions: Arc<Mutex<GatewaySubscriptions>>,
     permission_level: RemoteDevicePermissionLevel,
 ) -> JoinHandle<()> {
     let mut events = state.domain_events.subscribe();
@@ -4129,7 +4164,7 @@ fn spawn_domain_events(
                 Ok(event) => {
                     let subscribed = subscriptions
                         .lock()
-                        .map(|topics| topics.contains(&event.channel))
+                        .map(|subscriptions| subscriptions.contains(&event.channel))
                         .unwrap_or(false);
                     if subscribed
                         && domain_event_permitted(permission_level, &event.channel)
@@ -4143,11 +4178,11 @@ fn spawn_domain_events(
                 Err(broadcast::error::RecvError::Lagged(_)) => {
                     let active = subscriptions
                         .lock()
-                        .map(|topics| {
+                        .map(|subscriptions| {
                             ["file", "git", "sidebar", "provider", "device"]
                                 .into_iter()
                                 .filter(|topic| {
-                                    topics.contains(*topic)
+                                    subscriptions.contains(topic)
                                         && domain_event_permitted(permission_level, topic)
                                 })
                                 .collect::<Vec<_>>()
@@ -6310,12 +6345,13 @@ mod tests {
             .into_iter()
             .map(str::to_string)
             .collect::<Vec<_>>();
-        let read_only = Arc::new(Mutex::new(HashSet::new()));
+        let read_only = Arc::new(Mutex::new(GatewaySubscriptions::default()));
         let accepted = update_subscriptions(
             &read_only,
             RemoteSubscribeRequestV2 {
                 subscription_id: "read-only".to_string(),
                 topics: topics.clone(),
+                session_ids: None,
                 cursors: Vec::new(),
             },
             RemoteDevicePermissionLevel::ReadOnly,
@@ -6333,17 +6369,57 @@ mod tests {
                 .all(|item| item.domain != "device")
         );
 
-        let full_control = Arc::new(Mutex::new(HashSet::new()));
+        let full_control = Arc::new(Mutex::new(GatewaySubscriptions::default()));
         let accepted = update_subscriptions(
             &full_control,
             RemoteSubscribeRequestV2 {
                 subscription_id: "full-control".to_string(),
                 topics,
+                session_ids: None,
                 cursors: Vec::new(),
             },
             RemoteDevicePermissionLevel::FullControl,
         );
         assert!(accepted.topics.contains(&"device".to_string()));
+    }
+
+    #[test]
+    fn a_resubscription_replaces_the_timeline_session_scope() {
+        let subscriptions = Arc::new(Mutex::new(GatewaySubscriptions::default()));
+        let session = VibexSessionId::new();
+        let other = VibexSessionId::new();
+
+        update_subscriptions(
+            &subscriptions,
+            RemoteSubscribeRequestV2 {
+                subscription_id: "scoped".to_string(),
+                topics: vec!["agent_session".to_string()],
+                session_ids: Some(vec![session.clone()]),
+                cursors: Vec::new(),
+            },
+            RemoteDevicePermissionLevel::FullControl,
+        );
+        let active = subscriptions.lock().unwrap();
+        assert!(active.wants_timeline_session(&session));
+        assert!(!active.wants_timeline_session(&other));
+        drop(active);
+
+        // A phone in the background keeps notifications and drops the
+        // timeline topic; the next subscription is a complete statement.
+        update_subscriptions(
+            &subscriptions,
+            RemoteSubscribeRequestV2 {
+                subscription_id: "background".to_string(),
+                topics: vec!["agent_notification".to_string()],
+                session_ids: Some(Vec::new()),
+                cursors: Vec::new(),
+            },
+            RemoteDevicePermissionLevel::FullControl,
+        );
+        let active = subscriptions.lock().unwrap();
+        assert!(!active.contains("agent_session"));
+        assert!(active.contains("agent_notification"));
+        assert!(!active.wants_timeline_session(&session));
     }
 
     #[tokio::test]

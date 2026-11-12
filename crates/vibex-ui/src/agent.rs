@@ -885,19 +885,60 @@ impl AgentWorkflowController {
         &mut self,
         session_id: VibexSessionId,
     ) -> BackendResult<AgentSessionLoadTicket> {
+        self.begin_session_load_after(session_id, None)
+    }
+
+    /// Opens a session that already has a persisted prefix.
+    ///
+    /// `resume_after` is the sequence of the last item a disk-backed cache
+    /// holds. It is only consulted when no in-memory snapshot can restore the
+    /// session, and the ordinary `Tail` path still falls back to a cold window
+    /// when the authority no longer has that history.
+    pub fn begin_session_load_after(
+        &mut self,
+        session_id: VibexSessionId,
+        resume_after: Option<i64>,
+    ) -> BackendResult<AgentSessionLoadTicket> {
         self.require(BackendOperation::AgentOpenSession)?;
         self.require(BackendOperation::AgentFetchTimeline)?;
-        Ok(self.select_session_for_load(session_id))
+        Ok(self.select_session_for_load(session_id, resume_after))
+    }
+
+    /// Seeds the projection with a persisted prefix before its tail arrives.
+    ///
+    /// The ticket was issued with `Tail`, so the snapshot that follows is
+    /// merged into whatever the projection holds. A cold process has the
+    /// prefix on disk, not in memory; installing it here is what keeps an
+    /// incremental load from replacing the conversation with only its tail.
+    pub fn seed_timeline_prefix(
+        &mut self,
+        session_id: &VibexSessionId,
+        items: Vec<TimelineItem>,
+        has_older: bool,
+    ) -> bool {
+        if self.state.selected_session_id.as_ref() != Some(session_id) {
+            return false;
+        }
+        let items = self.restore_timeline_details(items);
+        self.state
+            .timeline
+            .replace_authoritative(session_id.clone(), items);
+        self.state.timeline_has_older = has_older;
+        true
     }
 
     /// Reserve the client's selected route before creation is acknowledged.
     /// This shares normal navigation's cache and generation invalidation, but
     /// performs no backend read against a session that does not exist yet.
     pub fn select_pending_session(&mut self, session_id: VibexSessionId) {
-        self.select_session_for_load(session_id);
+        self.select_session_for_load(session_id, None);
     }
 
-    fn select_session_for_load(&mut self, session_id: VibexSessionId) -> AgentSessionLoadTicket {
+    fn select_session_for_load(
+        &mut self,
+        session_id: VibexSessionId,
+        resume_after: Option<i64>,
+    ) -> AgentSessionLoadTicket {
         let switching_session = self.state.selected_session_id.as_ref() != Some(&session_id);
         if switching_session {
             self.cache_live_session_snapshot();
@@ -960,6 +1001,11 @@ impl AgentWorkflowController {
                 .items
                 .last()
                 .map(|item| TimelineLoadKind::Tail(item.sequence))
+                .or_else(|| {
+                    resume_after
+                        .filter(|sequence| *sequence > 0)
+                        .map(TimelineLoadKind::Tail)
+                })
                 .unwrap_or(TimelineLoadKind::Cold)
         } else {
             TimelineLoadKind::Cold
@@ -1292,18 +1338,36 @@ impl AgentWorkflowController {
                     // events already applied while the refresh ran. The
                     // restored window keeps the older-history knowledge it was
                     // cached with: this page is above it, not below.
-                    let merged = self
-                        .state
-                        .timeline
-                        .items
-                        .iter()
-                        .cloned()
-                        .chain(snapshot.timeline)
-                        .collect::<Vec<_>>();
-                    let merged = self.restore_timeline_details(merged);
-                    self.state
-                        .timeline
-                        .replace_authoritative(ticket.session_id.clone(), merged);
+                    // The snapshot is newer than the prefix, so a sequence
+                    // both hold must keep the snapshot's row; inserting it
+                    // second is what `normalize_items` does as well.
+                    let mut by_sequence = BTreeMap::new();
+                    for item in self.state.timeline.items.iter().cloned() {
+                        by_sequence.insert(item.sequence, item);
+                    }
+                    for item in snapshot.timeline.iter().cloned() {
+                        by_sequence.insert(item.sequence, item);
+                    }
+                    let merged = by_sequence.into_values().collect::<Vec<_>>();
+                    // A persisted prefix can be too old to resume from. The
+                    // read then answers with a fresh window instead of a
+                    // tail; appending that window to the stale prefix would
+                    // leave a hole in the middle of the conversation.
+                    if merged
+                        .windows(2)
+                        .any(|pair| pair[1].sequence != pair[0].sequence.saturating_add(1))
+                    {
+                        let restored = self.restore_timeline_details(snapshot.timeline);
+                        self.state
+                            .timeline
+                            .replace_authoritative(ticket.session_id.clone(), restored);
+                        self.state.timeline_has_older = snapshot.timeline_has_older;
+                    } else {
+                        let merged = self.restore_timeline_details(merged);
+                        self.state
+                            .timeline
+                            .replace_authoritative(ticket.session_id.clone(), merged);
+                    }
                 } else {
                     let restored = self.restore_timeline_details(snapshot.timeline);
                     self.state
@@ -3475,6 +3539,69 @@ mod tests {
         assert!(controller.state.active_session.value.is_none());
         assert!(controller.state.timeline_status.value.is_none());
         assert!(controller.state.timeline.items.is_empty());
+    }
+
+    #[test]
+    fn a_persisted_prefix_resumes_from_its_last_sequence() {
+        let session = session();
+        let backend = Arc::new(MockAgentBackend::new(session.clone(), Vec::new()));
+        let mut controller = AgentWorkflowController::new(backend, capabilities());
+
+        let ticket = controller
+            .begin_session_load_after(session.id.clone(), Some(7))
+            .expect("a persisted prefix should resume");
+
+        assert_eq!(ticket.load, TimelineLoadKind::Tail(7));
+    }
+
+    #[test]
+    fn a_stale_persisted_prefix_is_replaced_when_the_tail_is_not_contiguous() {
+        let session = session();
+        let backend = Arc::new(MockAgentBackend::new(session.clone(), Vec::new()));
+        let mut controller = AgentWorkflowController::new(backend, capabilities());
+        let ticket = controller
+            .begin_session_load_after(session.id.clone(), Some(1))
+            .expect("a persisted prefix should resume");
+        assert_eq!(ticket.load, TimelineLoadKind::Tail(1));
+        assert!(controller.seed_timeline_prefix(
+            &session.id,
+            vec![timeline_item(
+                &session.id,
+                1,
+                TimelinePayload::UserMessage(UserMessagePayload {
+                    text: "old".into(),
+                    ..Default::default()
+                }),
+            )],
+            true,
+        ));
+
+        // The tail read found the prefix too old and answered with a fresh
+        // window; appending it would leave rows 2..100 missing.
+        let snapshot = AgentSessionSnapshot {
+            session: session.clone(),
+            timeline: vec![timeline_item(
+                &session.id,
+                100,
+                TimelinePayload::UserMessage(UserMessagePayload {
+                    text: "new".into(),
+                    ..Default::default()
+                }),
+            )],
+            runtime_selection: None,
+            timeline_has_older: true,
+        };
+        assert!(controller.apply_session_snapshot(&ticket, Ok(snapshot)));
+        assert_eq!(
+            controller
+                .state
+                .timeline
+                .items
+                .iter()
+                .map(|item| item.sequence)
+                .collect::<Vec<_>>(),
+            vec![100]
+        );
     }
 
     #[tokio::test]

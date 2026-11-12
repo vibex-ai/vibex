@@ -106,32 +106,73 @@ impl AgentAuthContextService {
         AgentAuthContextRepository::list(&conn)
     }
 
-    /// Refreshes authenticated account catalogs created before model-scoped
-    /// runtime controls, or the Agent's own Model names, were persisted.
-    /// Current snapshots remain process-free.
+    /// Refreshes authenticated account catalogs that are missing, incomplete,
+    /// or keyed by a launch identity the Agent no longer has.
+    ///
+    /// A managed Adapter update changes the command, arguments and version, and
+    /// therefore the catalog fingerprint. The old snapshot stays complete, so
+    /// completeness alone would keep serving a catalog that no longer matches
+    /// the launch; the fingerprint check is what makes an update re-discover.
     pub(crate) async fn refresh_incomplete_model_catalogs(&self) -> VibexResult<usize> {
+        self.refresh_stale_model_catalogs(None).await
+    }
+
+    /// Re-discovers one Agent's account catalog after its managed installation
+    /// changed. Returns how many contexts were refreshed.
+    pub(crate) async fn refresh_agent_model_catalog(
+        &self,
+        agent_id: &vibex_core::AgentId,
+    ) -> VibexResult<usize> {
+        self.refresh_stale_model_catalogs(Some(agent_id)).await
+    }
+
+    async fn refresh_stale_model_catalogs(
+        &self,
+        agent_id: Option<&vibex_core::AgentId>,
+    ) -> VibexResult<usize> {
         let contexts = self.list()?;
         let conn = open_database(&self.db_path)?;
         let snapshots = AgentAuthModelCatalogRepository::list_current(&conn, &contexts)?;
         drop(conn);
-        let mut current_by_context = BTreeMap::new();
+        let mut snapshots_by_context: BTreeMap<
+            AgentAuthContextId,
+            Vec<AgentAuthModelCatalogSnapshot>,
+        > = BTreeMap::new();
         for snapshot in snapshots {
-            let replace = current_by_context
-                .get(&snapshot.auth_context_id)
-                .is_none_or(|current: &AgentAuthModelCatalogSnapshot| {
-                    snapshot.last_attempt_at_ms > current.last_attempt_at_ms
-                });
-            if replace {
-                current_by_context.insert(snapshot.auth_context_id.clone(), snapshot);
-            }
+            snapshots_by_context
+                .entry(snapshot.auth_context_id.clone())
+                .or_default()
+                .push(snapshot);
         }
         let mut refreshed = 0;
         for context in contexts.into_iter().filter(|context| {
             context.status == AgentAuthContextStatus::Authenticated
-                && current_by_context.get(&context.id).is_none_or(|snapshot| {
-                    !snapshot.runtime_options_complete || !snapshot.model_names_complete
-                })
+                && agent_id.is_none_or(|agent_id| context.agent_id == *agent_id)
         }) {
+            let current_fingerprint = match self
+                .acp_runtime
+                .current_agent_account_catalog_fingerprint(&context)
+            {
+                Ok(fingerprint) => fingerprint,
+                Err(error) => {
+                    // A catalog whose launch identity cannot be read cannot be
+                    // checked. Leave the existing snapshot alone and let the
+                    // normal probe/refresh path report the underlying failure.
+                    tracing::warn!(
+                        target: "vibex_desktop",
+                        agent_id = %context.agent_id,
+                        error_code = %error.code,
+                        "Agent account model catalog identity could not be read"
+                    );
+                    continue;
+                }
+            };
+            if catalog_snapshot_is_current(
+                snapshots_by_context.get(&context.id).map(Vec::as_slice),
+                &current_fingerprint,
+            ) {
+                continue;
+            }
             let operation_lock = self.operation_lock(&context.id)?;
             let _guard = operation_lock.lock().await;
             let current = self.require_revision(&context.id, context.revision)?;
@@ -1096,6 +1137,25 @@ impl RemoteAgentAuthContextSource for AgentAuthContextService {
     }
 }
 
+/// Whether a stored snapshot was produced by the launch configuration that is
+/// current now.
+///
+/// A complete snapshot under an older fingerprint is stale, not reusable: the
+/// Adapter it described has been replaced, so its model list and runtime
+/// options may no longer be what the Agent publishes.
+fn catalog_snapshot_is_current(
+    snapshots: Option<&[AgentAuthModelCatalogSnapshot]>,
+    current_fingerprint: &str,
+) -> bool {
+    snapshots.is_some_and(|snapshots| {
+        snapshots.iter().any(|snapshot| {
+            snapshot.runtime_fingerprint == current_fingerprint
+                && snapshot.runtime_options_complete
+                && snapshot.model_names_complete
+        })
+    })
+}
+
 fn is_authentication_required(error: &VibexError) -> bool {
     is_authentication_required_code(&error.code)
 }
@@ -1152,6 +1212,46 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
+
+    /// A complete catalog is only reusable under the launch identity that
+    /// produced it. A managed Agent update changes that identity without
+    /// touching `runtime_options_complete`, so completeness alone used to keep
+    /// the stale catalog and fail every new explicit-model session.
+    #[test]
+    fn a_complete_catalog_is_not_current_under_a_different_launch_fingerprint() {
+        let context_id = AgentAuthContextId::new();
+        let snapshot =
+            |fingerprint: &str, runtime_options_complete: bool| AgentAuthModelCatalogSnapshot {
+                auth_context_id: context_id.clone(),
+                auth_context_revision: 1,
+                runtime_fingerprint: fingerprint.to_string(),
+                discovery_source: vibex_core::AgentModelDiscoverySource::SessionConfig,
+                status: vibex_core::AgentAuthModelCatalogStatus::Available,
+                models: Vec::new(),
+                runtime_options_complete,
+                model_names_complete: true,
+                default_reasoning_efforts: Vec::new(),
+                default_modes: Vec::new(),
+                default_features: Vec::new(),
+                last_success_at_ms: Some(1),
+                last_attempt_at_ms: 1,
+                last_error_code: None,
+            };
+
+        assert!(!catalog_snapshot_is_current(None, "sha256:new"));
+
+        let stale = [snapshot("sha256:old", true)];
+        assert!(!catalog_snapshot_is_current(Some(&stale), "sha256:new"));
+
+        let incomplete = [snapshot("sha256:new", false)];
+        assert!(!catalog_snapshot_is_current(
+            Some(&incomplete),
+            "sha256:new"
+        ));
+
+        let current = [snapshot("sha256:new", true)];
+        assert!(catalog_snapshot_is_current(Some(&current), "sha256:new"));
+    }
 
     /// The remote-auth trait forwards through the service, never through a
     /// method of the same name on `self`.

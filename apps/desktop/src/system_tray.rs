@@ -204,6 +204,15 @@ impl SystemTray {
         let _ = window_handle.update(cx, move |_, window, cx| action(&workbench, window, cx));
     }
 
+    /// Brings the window forward because a second launch asked for it.
+    ///
+    /// This is the same path the menu bar's "Open Vibex" item takes, including
+    /// the reopen of a window that was closed to the tray: a launch that finds
+    /// the shell running must land on the workbench, not on nothing.
+    fn handle_second_launch(&mut self, cx: &mut App) {
+        self.restore(cx);
+    }
+
     /// Brings the workbench forward and selects the session named by a clicked
     /// system notification. The notification tag is the session id (see
     /// `VibexWorkbench::notify_for_timeline_events`), so a click lands the user
@@ -290,6 +299,30 @@ pub fn handle_reopen(cx: &mut App) {
         return;
     }
     cx.update_global::<SystemTray, _>(|tray, cx| tray.restore(cx));
+}
+
+/// Restores the workbench because another launch asked for this window.
+///
+/// Opening Vibex while it is already running is not a request for a second
+/// window: the new process forwarded the launch here and exited, so all that is
+/// left is to raise the workbench. The tray owns the restore path that also
+/// reopens a window closed to the menu bar; a run without a menu bar entry
+/// quits with its last window, so any window it still has can be raised
+/// directly.
+pub fn handle_second_launch(cx: &mut App) {
+    if cx.has_global::<SystemTray>() {
+        cx.update_global::<SystemTray, _>(|tray, cx| tray.handle_second_launch(cx));
+        return;
+    }
+    let Some(window) = cx.active_window().or_else(|| cx.windows().first().copied()) else {
+        return;
+    };
+    if window
+        .update(cx, |_, window, _| window.activate_window())
+        .is_ok()
+    {
+        cx.activate(true);
+    }
 }
 
 /// Handles a click on a system notification by bringing the workbench forward
@@ -451,6 +484,43 @@ mod tests {
     #[gpui::test]
     fn reopen_without_a_tray_global_is_ignored(cx: &mut gpui::TestAppContext) {
         cx.update(handle_reopen);
+    }
+
+    /// A launch that found Vibex already running forwarded its request here, so
+    /// the running shell has to raise the workbench instead of dropping it.
+    #[test]
+    fn a_second_launch_restores_the_running_window() {
+        let source = include_str!("system_tray.rs");
+        let handler = source
+            .split_once("pub fn handle_second_launch(")
+            .and_then(|(_, tail)| tail.split_once("\npub fn handle_notification_response("))
+            .map(|(body, _)| body)
+            .expect("the second-launch handler should remain inspectable");
+        assert!(
+            handler.contains("tray.handle_second_launch(cx)"),
+            "the second launch must be handed to the tray that owns the window"
+        );
+        assert!(
+            handler.contains("window.activate_window()"),
+            "a shell without a menu bar entry still has a window to raise"
+        );
+
+        let method = source
+            .split_once("fn handle_second_launch(&mut self, cx: &mut App)")
+            .and_then(|(_, tail)| tail.split_once("\n    fn focus_session_from_notification("))
+            .map(|(body, _)| body)
+            .expect("the tray restore path should remain inspectable");
+        assert!(
+            method.contains("self.restore(cx)"),
+            "a second launch restores the same window the menu bar item opens"
+        );
+    }
+
+    /// Without a menu bar entry there is no window to raise, so a forwarding
+    /// launch is ignored rather than panicking.
+    #[gpui::test]
+    fn second_launch_without_a_tray_global_is_ignored(cx: &mut gpui::TestAppContext) {
+        cx.update(handle_second_launch);
     }
 
     /// A click on a system notification has to bring the workbench forward and

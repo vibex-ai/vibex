@@ -7162,6 +7162,14 @@ fn push_offer_route(
     let transport_width = usize::from(area.width) / 4;
     let transport = crate::device_center::pairing_transport_name(route.transport);
     let label = format!("{}: ", strings.devices_route());
+    // The built-in relay's address is not the reader's to judge: it is the one
+    // route nobody configures, so the row names it instead of printing an origin
+    // that only exists so the client can dial it.
+    let origin = if vibex_core::is_official_relay_origin(&route.origin) {
+        strings.devices_route_official().to_string()
+    } else {
+        route.origin.clone()
+    };
     // The origin is what is left after the label and the transport, and one
     // column of it is still worth drawing: a route the reader cannot read is a
     // route they cannot judge.
@@ -7172,7 +7180,7 @@ fn push_offer_route(
         Span::styled(format!("{indent}{label}"), theme.muted()),
         Span::styled(format!("{:<transport_width$}", transport), theme.base()),
         Span::styled(
-            truncate_to_width(&route.origin, origin_width, "…"),
+            truncate_to_width(&origin, origin_width, "…"),
             Style::default().fg(theme.roles.gray_dim),
         ),
     ]));
@@ -7350,9 +7358,17 @@ fn publication_detail(
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     if let Some(origin) = row.origin.as_ref() {
+        // Same rule as the pairing row: the built-in relay is named, not
+        // printed, so its address never becomes something a reader copies out of
+        // the terminal and treats as a setting.
+        let origin = if vibex_core::is_official_relay_origin(origin) {
+            strings.devices_route_official().to_string()
+        } else {
+            origin.clone()
+        };
         lines.push(Line::from(vec![
             Span::styled(format!("    {}: ", strings.devices_link()), theme.muted()),
-            Span::styled(origin.clone(), theme.base()),
+            Span::styled(origin, theme.base()),
         ]));
     }
     if let Some(code) = row.error_code.as_ref() {

@@ -36,11 +36,11 @@ use vibex_core::{
     AgentSessionState, AgentTimelineDisplaySettings, AgentTimelineReasoningDisplayMode,
     ContinueAgentTurnRequest, CreateAgentSessionRequest, ElicitationAnswerValue, ElicitationField,
     ElicitationFieldKind, ElicitationOption, ElicitationRequest, ElicitationResolution,
-    ElicitationResolutionAction, ForkAgentSessionRequest, GitWorktreeCreateRequest, GoalPhase,
-    GoalSnapshot, HumanDelegationRequest, MessageAttachment, OpenWorkspaceRequest,
-    PermissionResolution, PermissionResponseKind, PermissionRiskCategory, PlanStepPayload,
-    PlanStepStatus, RemoteDeepLinkResolutionStatus, RemoteLanPairingRequestState, RemoteServerKind,
-    RemoteSidebarDropPosition, RemoteSidebarItemKind, RemoteSidebarItemRef,
+    ElicitationResolutionAction, FetchTimelineItemRequest, ForkAgentSessionRequest,
+    GitWorktreeCreateRequest, GoalPhase, GoalSnapshot, HumanDelegationRequest, MessageAttachment,
+    OpenWorkspaceRequest, PermissionResolution, PermissionResponseKind, PermissionRiskCategory,
+    PlanStepPayload, PlanStepStatus, RemoteDeepLinkResolutionStatus, RemoteLanPairingRequestState,
+    RemoteServerKind, RemoteSidebarDropPosition, RemoteSidebarItemKind, RemoteSidebarItemRef,
     RemoteSidebarOrganizationMutation, RenameAgentSessionRequest, ReplaceUserMessagePayload,
     RequestId, ResolvePermissionRequest, RuntimeAuthSourceAvailability, RuntimeAuthSourceKind,
     RuntimeAuthSourceSummary, RuntimeModelSelection, RuntimeOptionAvailability,
@@ -50,7 +50,7 @@ use vibex_core::{
     TimelineItem, TimelineItemKind, TimelineLiveEvent, TimelinePayload, TimelineRedactionState,
     TimelineSource, UserMessageDelivery, UserMessagePayload, VibexSessionId, VibexUseMention,
     VibexUseRef, WorkspaceMode, WorkspaceRecord, agent_session_turn_requires_continuation,
-    unix_timestamp_ms,
+    inline_attachment_index, unix_timestamp_ms,
 };
 use vibex_desktop_model::{
     ActiveGoal, NewSessionLocation, ReasoningDisplayMode, RuntimeCascadeChoice,
@@ -67,7 +67,7 @@ use vibex_remote_client::{
 };
 use vibex_ui::{
     AgentEventDecision, AgentMutationTicket, AgentWorkflowController, AsyncPhase,
-    ElicitationFormDraft, ShellKind, locale::Locale,
+    ElicitationFormDraft, ShellKind, TimelineLoadKind, locale::Locale,
 };
 
 use crate::bottom_sheet::{
@@ -4445,6 +4445,7 @@ impl MobileApp {
         match event {
             MobileLifecycleEvent::Backgrounded => {
                 self.app_backgrounded = true;
+                self.sync_live_subscription(cx);
                 // A backgrounded app must not hold the display: the flag is
                 // released before anything else happens here.
                 self.sync_keep_screen_on(cx);
@@ -4473,6 +4474,7 @@ impl MobileApp {
             }
             MobileLifecycleEvent::Resumed => {
                 self.app_backgrounded = false;
+                self.sync_live_subscription(cx);
                 self.refresh_battery_allowlist(cx);
                 update::check_if_stale();
                 if self.is_pairing_visible() {
@@ -5511,6 +5513,7 @@ impl MobileApp {
                         crate::platform::haptic(crate::platform::Haptic::Success);
                         this.record_active_host_connected(&backend);
                         this.start_event_stream(cx);
+                        this.sync_live_subscription(cx);
                         this.refresh_sessions(cx);
                         this.refresh_timeline_display_settings(cx);
                         this.refresh_runtime_options(cx);
@@ -5551,6 +5554,47 @@ impl MobileApp {
                 }
                 cx.notify();
             });
+        });
+        self.tasks.push(task);
+    }
+
+    /// Narrows what the live socket streams to what this phone is showing.
+    ///
+    /// The desktop owns every session, so the default subscription is every
+    /// session. A phone pays for that on cellular: it would receive output for
+    /// agents it never opened, and keep receiving it in the background. The
+    /// scope is re-sent on session switches and lifecycle changes; a failure
+    /// leaves the previous scope in place rather than interrupting the reader.
+    fn sync_live_subscription(&mut self, cx: &mut Context<Self>) {
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        let (topics, session_ids) = if self.app_backgrounded {
+            (
+                BACKGROUND_LIVE_TOPICS
+                    .iter()
+                    .map(|topic| (*topic).to_string())
+                    .collect::<Vec<_>>(),
+                Some(Vec::new()),
+            )
+        } else {
+            let selected = self
+                .controller
+                .as_ref()
+                .and_then(|controller| controller.state.selected_session_id.clone());
+            (
+                FOREGROUND_LIVE_TOPICS
+                    .iter()
+                    .map(|topic| (*topic).to_string())
+                    .collect::<Vec<_>>(),
+                Some(selected.into_iter().collect()),
+            )
+        };
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            backend.update_live_subscription(topics, session_ids).await
+        });
+        let task = cx.spawn(async move |_entity: WeakEntity<Self>, _cx| {
+            let _ = runner.await;
         });
         self.tasks.push(task);
     }
@@ -8747,10 +8791,17 @@ impl MobileApp {
         if let Some(workspace_id) = listed_workspace {
             self.ensure_workbench(workspace_id, cx);
         }
+        // The window this phone wrote on the last visit. Reading it before
+        // the ticket is issued lets a cold process resume from its last
+        // sequence instead of downloading the whole visible window again.
+        let cached_window = self.load_cached_session_window(&session_id);
+        let resume_after = cached_window
+            .as_ref()
+            .and_then(|record| record.items.last().map(|item| item.sequence));
         let Some(controller) = self.controller.as_mut() else {
             return;
         };
-        let ticket = match controller.begin_session_load(session_id.clone()) {
+        let ticket = match controller.begin_session_load_after(session_id.clone(), resume_after) {
             Ok(ticket) => ticket,
             Err(error) => {
                 self.fail(error);
@@ -8758,6 +8809,16 @@ impl MobileApp {
                 return;
             }
         };
+        // A ticket that resumes from a persisted sequence expects the prefix
+        // to be in the projection already. The in-memory cache provides it
+        // when it exists; a cold process installs its disk window here so the
+        // tail merge keeps the conversation instead of replacing it.
+        if controller.state.timeline.items.is_empty()
+            && matches!(ticket.load, TimelineLoadKind::Tail(_))
+            && let Some(record) = cached_window.as_ref()
+        {
+            controller.seed_timeline_prefix(&session_id, record.items.clone(), record.has_older);
+        }
         let future = controller.load_session(ticket.clone());
         let runner = gpui_tokio::Tokio::spawn(cx, future);
         // A cache-backed switch restores the authoritative prefix
@@ -8780,6 +8841,7 @@ impl MobileApp {
         } else {
             None
         };
+        self.sync_live_subscription(cx);
         self.reset_drawers();
         // Opening a session is a jump to that conversation's live end, so no
         // reading position of the last screen survives it. Both the follow and
@@ -8819,9 +8881,7 @@ impl MobileApp {
         // The window written by the last visit, when there is one. The
         // in-memory cache is richer (it already holds this process's detail
         // reads), so disk is only read when that one missed.
-        let cached_window = (!restored_from_cache)
-            .then(|| self.load_cached_session_window(&session_id))
-            .flatten();
+        let cached_window = (!restored_from_cache).then_some(cached_window).flatten();
         if restored_from_cache {
             self.timeline_cache_timeline = None;
             self.rebuild_timeline_turns();
@@ -12290,7 +12350,113 @@ impl MobileApp {
         self.install_bundle(entry.bundle, server_kind, cx);
     }
 
+    /// Re-reads the open conversation after a gap.
+    ///
+    /// A lagged queue or a reconnect usually missed a handful of items, not
+    /// the whole window. Ask the authority for exactly that range first; a
+    /// cold window is the fallback when the authority has compacted it away,
+    /// or when no rendered sequence is available to resume from.
     fn reload_selected_session(&mut self, cx: &mut Context<Self>) {
+        if self
+            .controller
+            .as_ref()
+            .is_some_and(|controller| controller.state.timeline_status.phase == AsyncPhase::Loading)
+        {
+            return;
+        }
+        let selected = self
+            .controller
+            .as_ref()
+            .and_then(|controller| controller.state.selected_session_id.clone());
+        let Some(session_id) = selected else {
+            return;
+        };
+        let current_session = self
+            .controller
+            .as_ref()
+            .and_then(|controller| controller.state.timeline.session_id.clone());
+        let last_sequence = self
+            .controller
+            .as_ref()
+            .and_then(|controller| controller.state.timeline.contiguous_end_sequence());
+        let (Some(last_sequence), Some(backend)) = (last_sequence, self.backend.clone()) else {
+            self.reload_selected_session_cold(cx);
+            return;
+        };
+        if current_session.as_ref() != Some(&session_id) {
+            self.reload_selected_session_cold(cx);
+            return;
+        }
+        let catch_up_session = session_id.clone();
+        let expected_session = session_id.clone();
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            backend
+                .catch_up_timeline(catch_up_session, last_sequence, 500)
+                .await
+        });
+        let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            let outcome = flatten_join(runner.await);
+            let _ = entity.update(cx, |this, cx| {
+                // A switch while the catch-up was in flight owns the projection
+                // now; these events describe the session the reader left.
+                if this
+                    .controller
+                    .as_ref()
+                    .and_then(|controller| controller.state.selected_session_id.as_ref())
+                    != Some(&expected_session)
+                {
+                    return;
+                }
+                let events = match outcome {
+                    Ok(events) => events,
+                    _ => {
+                        this.reload_selected_session_cold(cx);
+                        return;
+                    }
+                };
+                if events.is_empty() {
+                    let contiguous = this
+                        .controller
+                        .as_ref()
+                        .is_some_and(|controller| controller.state.timeline.is_contiguous());
+                    if !contiguous {
+                        this.reload_selected_session_cold(cx);
+                        return;
+                    }
+                    if let Some(controller) = this.controller.as_mut() {
+                        controller.state.timeline.clear_authoritative_refetch();
+                    }
+                    this.persist_active_session_timeline();
+                    cx.notify();
+                    return;
+                }
+                let contiguous = {
+                    let Some(controller) = this.controller.as_mut() else {
+                        return;
+                    };
+                    controller.state.timeline.apply_live_batch(events);
+                    let contiguous = controller.state.timeline.is_contiguous();
+                    if contiguous {
+                        controller.state.timeline.clear_authoritative_refetch();
+                    }
+                    contiguous
+                };
+                if !contiguous {
+                    this.reload_selected_session_cold(cx);
+                    return;
+                }
+                this.timeline_cache_timeline = None;
+                this.rebuild_timeline_turns();
+                this.remeasure_timeline();
+                this.persist_active_session_timeline();
+                cx.notify();
+            });
+        });
+        self.tasks.push(task);
+        cx.notify();
+    }
+
+    fn reload_selected_session_cold(&mut self, cx: &mut Context<Self>) {
         if self
             .controller
             .as_ref()
@@ -21611,11 +21777,19 @@ impl MobileApp {
     fn open_user_attachment(
         &mut self,
         attachment: MessageAttachment,
+        sequence: i64,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if !message_attachment_is_image(&attachment) {
             self.open_user_attachment_file(attachment, window, cx);
+            return;
+        }
+        // A summary read names the inline attachment but does not carry its
+        // bytes. Fetch that one item when the reader asks for the picture, so
+        // an image is paid for once instead of with every timeline window.
+        if let Some(index) = attachment.uri.as_deref().and_then(inline_attachment_index) {
+            self.load_inline_attachment_preview(sequence, index, attachment.label.clone(), cx);
             return;
         }
         if let Some((format, bytes)) = decode_message_attachment_data_uri(&attachment) {
@@ -21685,6 +21859,111 @@ impl MobileApp {
             });
         });
         self.tasks.push(task);
+    }
+
+    /// Reads the detail row behind a summarized inline attachment.
+    ///
+    /// Summary timeline pages replace a `data:` URI with a bounded marker, so
+    /// the picture is fetched only when the reader opens it. The detail row is
+    /// authoritative and still carries the inline payload.
+    fn load_inline_attachment_preview(
+        &mut self,
+        sequence: i64,
+        index: usize,
+        label: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(session_id) = self
+            .controller
+            .as_ref()
+            .and_then(|controller| controller.state.selected_session_id.clone())
+        else {
+            return;
+        };
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        let expected_session = session_id.clone();
+        let label = if label.trim().is_empty() {
+            locale::text("Image", "图片", "圖片").to_string()
+        } else {
+            label
+        };
+        self.attachment_preview_loading = Some(label.clone());
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            backend
+                .fetch_timeline_item(FetchTimelineItemRequest {
+                    session_id,
+                    sequence,
+                })
+                .await
+        });
+        let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            let outcome = flatten_join(runner.await);
+            let _ = entity.update(cx, |this, cx| {
+                if this
+                    .controller
+                    .as_ref()
+                    .and_then(|controller| controller.state.selected_session_id.as_ref())
+                    != Some(&expected_session)
+                {
+                    return;
+                }
+                this.attachment_preview_loading = None;
+                match outcome {
+                    Ok(item) => {
+                        let TimelinePayload::UserMessage(message) = item.payload else {
+                            this.fail(BackendError::failed(
+                                "mobile_attachment_detail_invalid",
+                                locale::text(
+                                    "That attachment is no longer available.",
+                                    "这个附件已不可用。",
+                                    "這個附件已無法使用。",
+                                ),
+                            ));
+                            cx.notify();
+                            return;
+                        };
+                        let Some(attachment) = message.attachments.get(index) else {
+                            this.fail(BackendError::failed(
+                                "mobile_attachment_detail_invalid",
+                                locale::text(
+                                    "That attachment is no longer available.",
+                                    "这个附件已不可用。",
+                                    "這個附件已無法使用。",
+                                ),
+                            ));
+                            cx.notify();
+                            return;
+                        };
+                        let Some((format, bytes)) = decode_message_attachment_data_uri(attachment)
+                        else {
+                            this.fail(BackendError::failed(
+                                "mobile_attachment_detail_invalid",
+                                locale::text(
+                                    "That attachment could not be read.",
+                                    "无法读取这个附件。",
+                                    "無法讀取這個附件。",
+                                ),
+                            ));
+                            cx.notify();
+                            return;
+                        };
+                        this.attachment_preview = Some(MobileAttachmentPreview {
+                            label: label.clone(),
+                            image: Arc::new(Image::from_bytes(format, bytes)),
+                            zoom: 1.0,
+                            offset: point(px(0.0), px(0.0)),
+                            pan: None,
+                        });
+                    }
+                    Err(error) => this.fail(error),
+                }
+                cx.notify();
+            });
+        });
+        self.tasks.push(task);
+        cx.notify();
     }
 
     fn open_user_attachment_file(
@@ -22151,6 +22430,7 @@ impl MobileApp {
         };
         let actions = Arc::new(actions);
         let entity = cx.entity().clone();
+        let sequence = row.last_sequence;
         view.update(cx, |view, cx| {
             view.set_document(
                 source,
@@ -22162,7 +22442,7 @@ impl MobileApp {
                         };
                         entity.update(cx, |this, cx| match link {
                             UserMessageAttachmentLink::Image(attachment) => {
-                                this.open_user_attachment(attachment, window, cx)
+                                this.open_user_attachment(attachment, sequence, window, cx)
                             }
                             UserMessageAttachmentLink::File(attachment) => {
                                 this.open_user_attachment_file(attachment, window, cx)
@@ -28114,8 +28394,21 @@ impl MobileApp {
 
     fn active_host_url(&self) -> String {
         self.active_host_entry()
-            .map(|host| host.bundle.record.server_url.clone())
+            .map(|host| host_address_label(&host.bundle.record.server_url))
             .unwrap_or_else(|| locale::common("Connected").to_string())
+    }
+}
+
+/// How a credential's address is shown to the reader.
+///
+/// The built-in relay is the one address a user never chose and cannot change,
+/// so it is named rather than printed: a URL on this row reads as something to
+/// copy somewhere else.
+fn host_address_label(server_url: &str) -> String {
+    if vibex_core::is_official_relay_origin(server_url) {
+        locale::text("Official relay", "官方中继服务", "官方中繼服務").to_string()
+    } else {
+        server_url.to_string()
     }
 }
 
@@ -28688,7 +28981,7 @@ impl MobileApp {
                     ))
                     .child(host_detail_field(
                         "Address",
-                        &host.bundle.record.server_url,
+                        &host_address_label(&host.bundle.record.server_url),
                         false,
                         false,
                     ))
@@ -36134,6 +36427,22 @@ const PAIRING_RUNTIME_ROW_HEIGHT: f32 = 52.0;
 /// A runtime can come and go while the phone sits on that screen, and nothing
 /// else in the app would notice.
 const REACHABILITY_REFRESH_INTERVAL: Duration = Duration::from_secs(20);
+/// Everything a foreground session may need. The timeline is narrowed to the
+/// open session by the subscription's session filter.
+const FOREGROUND_LIVE_TOPICS: [&str; 9] = [
+    "agent_session",
+    "agent_notification",
+    "sidebar",
+    "terminal",
+    "file",
+    "git",
+    "provider",
+    "device",
+    "runtime",
+];
+/// A background phone only needs notifications; session output stays on the
+/// desktop until the reader comes back.
+const BACKGROUND_LIVE_TOPICS: [&str; 1] = ["agent_notification"];
 
 /// The share of the page the saved-runtime list may cover before it scrolls.
 const PAIRING_RUNTIMES_HEIGHT_RATIO: f32 = 0.34;

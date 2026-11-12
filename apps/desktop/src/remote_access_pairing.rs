@@ -1566,12 +1566,10 @@ impl RemoteAccessPairing {
                 });
             }
             RemoteConnectivityMethod::SelfHostedRelay => {
-                // The built-in relay is enabled by selecting its entry, never by
-                // typing an address; anything typed means the operator wants the
-                // self-hosted endpoint instead.
-                let builtin = self.state.selected_entry.uses_builtin_relay_origin()
-                    && self.relay_origin.read(cx).value().trim().is_empty();
-                let origin = if builtin {
+                // The built-in entry is the built-in origin, full stop. It has no
+                // editor on screen, so letting the self-hosted field decide what
+                // it enables would make an invisible input the real setting.
+                let origin = if self.state.selected_entry.uses_builtin_relay_origin() {
                     Ok(vibex_core::REMOTE_OFFICIAL_RELAY_ORIGIN.to_string())
                 } else {
                     self.configured_origin(method, cx)
@@ -1652,8 +1650,14 @@ impl RemoteAccessPairing {
         if self.state.active_zero_config_window.is_some() {
             return;
         }
-        self.state.selected_entry =
-            RemoteAccessEntry::from_remote_method(self.state.selected_method);
+        // The selected method is the transport the offer is created against, but
+        // the official relay and a self-hosted relay share it. Keep the entry the
+        // operator picked so the list does not silently jump to the folded
+        // self-hosted row after a QR is generated.
+        if self.state.selected_entry == RemoteAccessEntry::LocalNetwork {
+            self.state.selected_entry =
+                RemoteAccessEntry::from_remote_method(self.state.selected_method);
+        }
         let controller = self.controller.clone();
         let permission = self.state.permission;
         self.begin_mutation(RemoteAccessMutation::CreateOffer, cx, async move {
@@ -2987,7 +2991,10 @@ impl RemoteAccessPairing {
                                     .font_semibold()
                                     .child(connection_entry_name(entry)),
                             )
-                            .when(entry == RemoteAccessEntry::TailscaleServe, |row| {
+                            // The entry the list opens on is the one the badge
+                            // belongs to: it is the only route that needs no
+                            // setup from the reader.
+                            .when(entry == RemoteAccessEntry::OfficialRelay, |row| {
                                 row.child(status_pill(
                                     locale::text("Recommended", "推荐", "建議"),
                                     ColorName::Blue,
@@ -3081,21 +3088,17 @@ impl RemoteAccessPairing {
             .connectivity
             .as_ref()
             .and_then(|connectivity| connectivity.method(method));
-        // The official entry only reports a live relay while the runtime is
-        // actually serving the built-in origin, so an operator who pointed the
-        // relay elsewhere does not see this entry light up.
-        if entry.uses_builtin_relay_origin() {
-            let live = snapshot
-                .filter(|snapshot| {
-                    snapshot
-                        .origin
-                        .as_deref()
-                        .is_some_and(is_official_relay_origin)
-                })
-                .map_or(RemoteMethodState::Disabled, |snapshot| snapshot.state);
-            return (method_state_label(live), method_state_color(live));
-        }
-        let state = snapshot.map_or(RemoteMethodState::Disabled, |snapshot| snapshot.state);
+        // The relay method backs two rows, so a row only reports a relay that is
+        // its own: the official row reports the built-in origin, and the
+        // self-hosted row reports an operator address. Otherwise enabling the
+        // built-in relay would light up the self-hosted row too.
+        let owns_snapshot =
+            entry_owns_relay_snapshot(entry, snapshot.and_then(|s| s.origin.as_deref()));
+        let state = if owns_snapshot {
+            snapshot.map_or(RemoteMethodState::Disabled, |snapshot| snapshot.state)
+        } else {
+            RemoteMethodState::Disabled
+        };
         (method_state_label(state), method_state_color(state))
     }
 
@@ -3120,24 +3123,31 @@ impl RemoteAccessPairing {
         // The official relay is the built-in origin, so its entry must neither
         // show the address nor offer to edit it.
         let builtin_origin = entry.uses_builtin_relay_origin();
-        // A relay pointed at an operator's own address is a different choice,
-        // so the official entry only reads as enabled while the runtime is
-        // actually serving the built-in origin.
-        let builtin_origin_live = snapshot
-            .and_then(|snapshot| snapshot.origin.as_deref())
-            .is_some_and(is_official_relay_origin);
-        let desired_enabled = snapshot.is_some_and(|snapshot| snapshot.desired_enabled)
-            && (!builtin_origin || builtin_origin_live);
-        let state = if builtin_origin && !builtin_origin_live {
-            RemoteMethodState::Disabled
-        } else {
+        // The relay method backs two rows, and only one of them owns any given
+        // relay origin. Reporting the shared snapshot on both would make
+        // enabling one row light up the other.
+        let owns_snapshot = entry_owns_relay_snapshot(
+            entry,
+            snapshot.and_then(|snapshot| snapshot.origin.as_deref()),
+        );
+        let desired_enabled =
+            snapshot.is_some_and(|snapshot| snapshot.desired_enabled) && owns_snapshot;
+        let state = if owns_snapshot {
             snapshot.map_or(RemoteMethodState::Disabled, |snapshot| snapshot.state)
+        } else {
+            RemoteMethodState::Disabled
         };
         let status_color = method_state_color(state);
         let recovery = snapshot.map_or(RemoteRecoveryAction::None, |snapshot| {
             snapshot.recovery_action
         });
-        let origin = snapshot.and_then(|snapshot| snapshot.origin.clone());
+        // The self-hosted row shares the relay method with the official entry, so
+        // it is looking at the same origin. Once the built-in relay is what the
+        // runtime serves, printing that origin here would put the address the
+        // official entry deliberately hides back on screen one row below it.
+        let origin = snapshot
+            .and_then(|snapshot| snapshot.origin.clone())
+            .filter(|origin| !is_official_relay_origin(origin));
         let entity = cx.weak_entity();
 
         let mut panel = v_flex()
@@ -4841,13 +4851,26 @@ fn connection_entry_icon(entry: RemoteAccessEntry) -> IconName {
 
 /// True when a reported relay origin is the built-in one.
 ///
-/// The runtime normalizes origins, so compare the same way it stores them
-/// instead of matching the raw constant.
+/// The comparison lives in `vibex-core` because the TUI and the mobile client
+/// have to agree with the desktop about which relay they are looking at.
 fn is_official_relay_origin(origin: &str) -> bool {
-    origin
-        .trim()
-        .trim_end_matches('/')
-        .eq_ignore_ascii_case(vibex_core::REMOTE_OFFICIAL_RELAY_ORIGIN.trim_end_matches('/'))
+    vibex_core::is_official_relay_origin(origin)
+}
+
+/// Whether one of the two relay rows owns the relay the runtime is serving.
+///
+/// The official row owns the built-in origin and the self-hosted row owns
+/// everything else, so exactly one of them reports the shared relay method's
+/// state. A relay with no origin is configured nowhere, so neither row owns it.
+/// Every non-relay entry owns its own method unconditionally.
+fn entry_owns_relay_snapshot(entry: RemoteAccessEntry, origin: Option<&str>) -> bool {
+    if entry.remote_method() != Some(RemoteConnectivityMethod::SelfHostedRelay) {
+        return true;
+    }
+    let Some(origin) = origin else {
+        return false;
+    };
+    entry.uses_builtin_relay_origin() == is_official_relay_origin(origin)
 }
 
 fn permission_options() -> [RemoteDevicePermissionLevel; 3] {
@@ -5553,6 +5576,44 @@ mod tests {
         assert_eq!(wide, DIALOG_MAX_WIDTH);
         assert_eq!(pairing_dialog_max_height(900.0), 868.0);
         assert_eq!(pairing_dialog_max_height(24.0), 1.0);
+    }
+
+    #[test]
+    fn the_two_relay_rows_never_report_one_anothers_relay() {
+        let official = RemoteAccessEntry::OfficialRelay;
+        let self_hosted = RemoteAccessEntry::SelfHostedRelay;
+        let builtin = vibex_core::REMOTE_OFFICIAL_RELAY_ORIGIN;
+
+        assert!(
+            entry_owns_relay_snapshot(official, Some(builtin)),
+            "the official row owns the built-in origin"
+        );
+        assert!(
+            !entry_owns_relay_snapshot(self_hosted, Some(builtin)),
+            "the self-hosted row must not claim the built-in relay"
+        );
+        assert!(
+            !entry_owns_relay_snapshot(official, Some("https://relay.example")),
+            "the official row must not claim an operator's relay"
+        );
+        assert!(
+            entry_owns_relay_snapshot(self_hosted, Some("https://relay.example")),
+            "the self-hosted row owns an operator's relay"
+        );
+        assert!(
+            !entry_owns_relay_snapshot(official, None),
+            "a relay that is off belongs to neither row"
+        );
+        assert!(
+            !entry_owns_relay_snapshot(self_hosted, None),
+            "a relay that is off belongs to neither row"
+        );
+        // Every other entry has its own method, so the relay ownership question
+        // does not apply to it.
+        for entry in [RemoteAccessEntry::Direct, RemoteAccessEntry::TailscaleServe] {
+            assert!(entry_owns_relay_snapshot(entry, Some(builtin)));
+            assert!(entry_owns_relay_snapshot(entry, None));
+        }
     }
 
     #[test]

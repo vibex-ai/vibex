@@ -1297,6 +1297,17 @@ pub trait RemoteTransport: BackendBound {
         &self,
         request: RemoteSubscribeRequestV2,
     ) -> BackendFuture<'_, RemoteSubscriptionAcceptedV2>;
+    /// Replaces this connection's topic and session scope.
+    ///
+    /// The transport keeps the same socket; only what it forwards changes.
+    /// Transports that cannot change scope keep the initial subscription by
+    /// refusing the update.
+    fn update_subscription(
+        &self,
+        request: RemoteSubscribeRequestV2,
+    ) -> BackendFuture<'_, RemoteSubscriptionAcceptedV2> {
+        self.subscribe(request)
+    }
     fn attach(
         &self,
         request: RemoteAttachRequestV2,
@@ -1976,6 +1987,7 @@ impl DirectWebSocketTransport {
                     "device".to_string(),
                     "runtime".to_string(),
                 ],
+                session_ids: None,
                 cursors: self.cursors(),
             })
             .await;
@@ -2738,6 +2750,7 @@ impl RelayE2eeTransport {
                     "device".to_string(),
                     "runtime".to_string(),
                 ],
+                session_ids: None,
                 cursors: self.cursors(),
             })
             .await?;
@@ -5401,6 +5414,16 @@ impl AutoRemoteTransport {
 }
 
 impl RemoteTransport for AutoRemoteTransport {
+    fn update_subscription(
+        &self,
+        request: RemoteSubscribeRequestV2,
+    ) -> BackendFuture<'_, RemoteSubscriptionAcceptedV2> {
+        Box::pin(async move {
+            let selected = self.selected_for_operation().await?;
+            selected.update_subscription(request).await
+        })
+    }
+
     fn probe_online(&self) -> BackendFuture<'_, bool> {
         Box::pin(async move {
             // The bounded candidate probe Auto mode chooses a Direct route

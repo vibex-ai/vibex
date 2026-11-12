@@ -93,16 +93,19 @@ Rules:
 
 ```bash
 node scripts/release-notes.mjs --version <version> --check
+node scripts/release-contributors.mjs --version <version> \
+  --output target/release-notes/contributors.txt
 node scripts/release-body.mjs --version <version> \
   --notes docs/operations/release-notes-v<version>.md \
+  --contributors target/release-notes/contributors.txt \
   --output target/release-notes/body-v<version>.md
 ```
 
 Read the composed body: it must open with English, carry the Chinese section,
-continue with the Downloads table, and close with the contributor credit and the
-comparison link. There is no per-change list — these notes are the changelog, so
-write them as the only thing a reader will see above the download links. The
-publish job builds the same body and fails the release when the notes are
-missing or unpublishable.
+continue with the Downloads table, and close with the contributor list, the New
+Contributors credit and the comparison link. There is no per-change list — these
+notes are the changelog, so write them as the only thing a reader will see above
+the download links. The publish job builds the same body and fails the release
+when the notes are missing or unpublishable.
 
 Do not create or edit a GitHub Release by hand; the tagged workflow owns it.

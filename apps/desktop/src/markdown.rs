@@ -10,7 +10,9 @@
 //! Nothing here renders: the component view owns layout, selection, code
 //! highlighting, tables and images.
 
-use gpui::{App, HighlightStyle, StyleRefinement, Styled as _};
+use gpui::{
+    App, HighlightStyle, InteractiveElement as _, ParentElement as _, StyleRefinement, Styled as _,
+};
 use gpui_base::text::TextViewStyle;
 use gpui_component::ActiveTheme as _;
 
@@ -48,6 +50,39 @@ pub use vibex_ui::markdown::{
 /// The largest embedded image a preview decodes, matching the previous
 /// renderer's budget.
 const DATA_IMAGE_MAX_ENCODED_BYTES: usize = 8 * 1024 * 1024;
+
+/// The widest a link's destination tooltip may grow before it wraps.
+///
+/// A query string can be longer than the window is wide, and a tooltip is not
+/// the place to read it in one line. The destination still wraps inside the
+/// tooltip's own chrome, so the reader sees all of it without the plate
+/// stretching past the edge of the screen.
+const LINK_TOOLTIP_MAX_WIDTH: gpui::Rems = gpui::rems(32.0);
+
+/// The tooltip a rendered link shows while the pointer rests on it.
+///
+/// A transcript states a destination only through the link's label, and a label
+/// shortened for reading does not say where the link goes. The text view paints
+/// this beside the pointer and keeps it while the pointer stays on the link, so
+/// the builder only owns the content: the kit supplies the chrome, the delay and
+/// the dismissal.
+pub fn link_tooltip(
+    url: &gpui::SharedString,
+    window: &mut gpui::Window,
+    cx: &mut App,
+) -> gpui::AnyView {
+    let destination = url.to_string();
+    gpui_component::tooltip::Tooltip::element(move |_, _| {
+        gpui::div()
+            // `debug_bounds` looks the plate up by this name in tests; the
+            // destination is the plate's only child, so seeing the plate is
+            // seeing the destination.
+            .debug_selector(|| "markdown-link-destination".to_string())
+            .max_w(LINK_TOOLTIP_MAX_WIDTH)
+            .child(destination.clone())
+    })
+    .build(window, cx)
+}
 
 /// Decode an embedded `data:` image.
 ///
@@ -137,6 +172,10 @@ fn themed_text_view_style(theme: &gpui_component::Theme) -> TextViewStyle {
         .with_code_block(code_block)
         .with_table(table)
         .with_table_head(table_head)
+        // The component adapter gives table body rows a hover wash; a style
+        // built here replaces that adapter wholesale, so the wash has to be
+        // named again or a themed table stops answering the pointer.
+        .with_table_row_hover(theme.table_hover)
         .with_inline_code(HighlightStyle {
             background_color: Some(theme.accent),
             ..Default::default()
@@ -147,7 +186,55 @@ fn themed_text_view_style(theme: &gpui_component::Theme) -> TextViewStyle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::{AppContext as _, TestAppContext};
+    use gpui::{AppContext as _, Context, IntoElement, Render, TestAppContext, Window, div, px};
+
+    /// The theme a surface's own style is derived from.
+    fn themed_component_theme() -> gpui_component::Theme {
+        gpui_component::Theme::default()
+    }
+
+    /// A style built here replaces the component adapter wholesale, so it has
+    /// to carry the table row wash the adapter installs. The kit added the wash
+    /// in 0.9.1; dropping it would leave every themed table inert to the
+    /// pointer while the unthemed ones still answered it.
+    #[test]
+    fn the_themed_style_keeps_the_table_row_hover_wash() {
+        let theme = themed_component_theme();
+        let style = themed_text_view_style(&theme);
+        assert_eq!(style.table_row_hover(), Some(theme.table_hover));
+    }
+
+    struct TooltipHost {
+        view: gpui::AnyView,
+    }
+
+    impl Render for TooltipHost {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().child(self.view.clone())
+        }
+    }
+
+    /// A link's tooltip states where the link goes, which the label may hide.
+    #[gpui::test]
+    fn a_links_tooltip_names_its_destination(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let url = "file:///tmp/report.json";
+        let (_, cx) = cx.add_window_view(|window, cx| TooltipHost {
+            view: link_tooltip(&gpui::SharedString::from(url), window, cx),
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        let painted = cx
+            .debug_bounds("markdown-link-destination")
+            .unwrap_or_else(|| panic!("the tooltip should paint {url}"));
+        assert!(
+            painted.size.width > px(0.0) && painted.size.height > px(0.0),
+            "the destination must take room in the tooltip, got {painted:?}"
+        );
+    }
 
     #[gpui::test]
     fn streaming_append_keeps_selection_and_accepts_unicode_and_corrections(

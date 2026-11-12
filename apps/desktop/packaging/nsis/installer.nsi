@@ -3,14 +3,21 @@
 ; Derived from cargo-packager 0.11.8's src/package/nsis/installer.nsi, which
 ; cargo-packager ships under MIT OR Apache-2.0 (Copyright 2019-2023 Tauri
 ; Programme within The Commons Conservancy, Copyright 2023 CrabNebula Ltd.).
-; Vibex distributes the derived file under the same terms. Only two
-; things differ, and both exist so a user who installs Vibex can type `vibex`
-; in a new terminal without configuring anything:
+; Vibex distributes the derived file under the same terms. Only two things
+; differ, and both exist so a user who installs Vibex can type `vibex` in a new
+; terminal without configuring anything:
 ;
-;   * the install section writes its directory to the per-user `Path` (the
-;     installer is currentUser, so the user hive is the one that matters);
-;   * the uninstall section takes it back out, but only when the entry is still
-;     ours.
+;   * the install section puts its directory on the per-user `Path`, and the
+;     uninstall section takes it back out;
+;   * both edits run through `vibex-installer-env.exe`, which ships beside the
+;     app. NSIS stores a registry string in a 1023-character variable, so
+;     reading a longer `Path` yields an empty string. The helper asks the
+;     registry for the real length instead and preserves the value type.
+;
+; Do not add `ReadRegStr`/`WriteRegStr` for `HKCU\Environment` here. A read that
+; fails because the value is too long must never be mistaken for a missing
+; value; that mistake is what replaced users' entire Path with the install
+; directory in earlier builds.
 ;
 ; Everything else — the reinstall page, shortcuts, uninstall registry keys —
 ; is untouched, so an upstream template change is a diff rather than a rewrite.
@@ -570,11 +577,9 @@ Section Install
   ; same as a missing binary. `installMode = "currentUser"` writes HKCU, which
   ; needs no elevation and follows the account that ran the installer.
   ;
-  ; The check is case-insensitive and delimiter-aware: `C:\Foo` and `c:\foo`
-  ; are one directory on Windows, and a substring match would accept
-  ; `C:\VibexTools` for `C:\Vibex`. The value is read as-is and written back
-  ; with the entry appended, so an existing PATH (including `%USERPROFILE%`-style
-  ; REG_EXPAND_SZ references) keeps its shape.
+  ; The helper owns the whole edit: it reads the value with a registry-sized
+  ; buffer, matches whole entries case-insensitively, preserves REG_EXPAND_SZ,
+  ; and never writes after a failed read. See AddInstallDirectoryToPath.
   Call AddInstallDirectoryToPath
 
   ; Auto close this page for passive mode
@@ -583,30 +588,18 @@ SectionEnd
 
 ; Append `$INSTDIR` to the user PATH unless it is already there.
 ;
-; `StrLoc` returns the position of the needle or an empty string when it is
-; absent, which is the whole test. The comparison runs on lower-cased copies
-; because the installer has no filesystem case folding to lean on.
+; All of the work happens in `vibex-installer-env.exe`. NSIS must not read the
+; value: `ReadRegStr` uses a fixed 1023-character buffer and reports a longer
+; value as an empty string, which an earlier template then wrote back as just
+; `$INSTDIR`. The helper is the only writer, and a failure here is reported but
+; never replaces the user's PATH. The environment broadcast lives in the helper
+; too, next to the write it belongs to.
 Function AddInstallDirectoryToPath
-  ReadRegStr $0 HKCU "Environment" "Path"
-  StrCpy $1 ";$0;"
-  StrCpy $2 ";$INSTDIR;"
-  ${StrCase} $1 "$1" "L"
-  ${StrCase} $2 "$2" "L"
-  ${StrLoc} $3 "$1" "$2" ">"
-  StrCmp $3 "" 0 path_done
-  StrCmp $0 "" 0 path_append
-    WriteRegExpandStr HKCU "Environment" "Path" "$INSTDIR"
-    Goto path_broadcast
-  path_append:
-    WriteRegExpandStr HKCU "Environment" "Path" "$0;$INSTDIR"
-  path_broadcast:
-    ; A program that installs shows the new entry to a shell it starts only
-    ; after the shell reads the environment at startup, so an already open
-    ; terminal keeps the old PATH until it is restarted. The broadcast asks
-    ; Explorer to re-read it, which is what makes "open a new terminal" enough
-    ; for the shells launched from it. Its failure is deliberately ignored: the
-    ; value is on disk either way, so the entry survives a restart.
-    SendMessage ${HWND_BROADCAST} ${WM_SETTINGCHANGE} 0 "STR:Environment" /TIMEOUT=5000
+  nsExec::ExecToStack '"$INSTDIR\vibex-installer-env.exe" add "$INSTDIR"'
+  Pop $0 ; exit code
+  Pop $1 ; captured output
+  StrCmp $0 "0" path_done
+    DetailPrint "Vibex could not add $INSTDIR to the user PATH (helper exit $0): $1"
   path_done:
 FunctionEnd
 
@@ -636,6 +629,12 @@ FunctionEnd
 Section Uninstall
   !insertmacro CheckIfAppIsRunning
 
+  ; Take the install directory back out of the user PATH before the delete
+  ; block below removes the helper that performs the edit. Only the entry this
+  ; installer added is removed, so a directory someone else put there — or a
+  ; PATH another channel's installer already rewrote — is left alone.
+  Call un.RemoveInstallDirectoryFromPath
+
   ; Delete the app directory and its content from disk
   ; Copy main executable
   Delete "$INSTDIR\${MAINBINARYNAME}.exe"
@@ -664,11 +663,6 @@ Section Uninstall
       DeleteRegKey SHCTX "Software\Classes\\{{protocol}}"
     !endif
   {{/each}}
-
-  ; Take the install directory back out of the user PATH. Only the exact entry
-  ; this installer added is removed, so a directory someone else put there — or
-  ; a PATH another channel's installer already rewrote — is left alone.
-  Call un.RemoveInstallDirectoryFromPath
 
   ; Delete uninstaller
   Delete "$INSTDIR\uninstall.exe"
@@ -714,32 +708,17 @@ SectionEnd
 
 ; Remove `$INSTDIR` from the user PATH.
 ;
-; Windows has no command that edits a PATH entry, so the value is split on `;`
-; and reassembled. The value is wrapped in delimiters first, which is what makes
-; an entry match whole: `C:\VibexTools` never loses the `C:\Vibex` inside it.
-;
-; The comparison is exact. A tool that rewrote the case of the entry leaves it
-; behind, which costs a stale PATH entry but never deletes somebody else's
-; directory, and that is the safer of the two failures.
+; The helper removes only whole entries that name this directory, deletes the
+; value when nothing else remains, and leaves a PATH it cannot read untouched.
+; That asymmetry is deliberate: a read failure costs a stale entry, while a
+; guessed write would cost the user's PATH. The helper file is deleted later in
+; this section, so the call has to happen before the delete block.
 Function un.RemoveInstallDirectoryFromPath
-  ReadRegStr $0 HKCU "Environment" "Path"
-  StrCmp $0 "" path_done
-  StrCmp $0 "$INSTDIR" path_clear
-  StrCpy $1 ";$0;"
-  ; `WordFunc.nsh` registers the uninstaller form under the `un.` prefix;
-  ; the installer form the rest of the template uses is a different
-  ; program and cannot be called from here.
-  ${un.WordReplace} "$1" ";$INSTDIR;" ";" "+1" $1
-  ; Trim the delimiter pair the wrap added back off.
-  StrCpy $1 "$1" -1 1
-  StrCmp $1 "" path_done
-  WriteRegExpandStr HKCU "Environment" "Path" "$1"
-  Goto path_done
-  path_clear:
-    ; An empty PATH is worse than a missing entry: Windows would then search
-    ; only the working directory. Deleting the value falls back to the system
-    ; PATH.
-    DeleteRegValue HKCU "Environment" "Path"
+  nsExec::ExecToStack '"$INSTDIR\vibex-installer-env.exe" remove "$INSTDIR"'
+  Pop $0 ; exit code
+  Pop $1 ; captured output
+  StrCmp $0 "0" path_done
+    DetailPrint "Vibex could not remove $INSTDIR from the user PATH (helper exit $0): $1"
   path_done:
 FunctionEnd
 
