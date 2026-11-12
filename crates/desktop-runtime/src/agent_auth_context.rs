@@ -173,18 +173,83 @@ impl AgentAuthContextService {
             ) {
                 continue;
             }
-            let operation_lock = self.operation_lock(&context.id)?;
+            let operation_lock = match self.operation_lock(&context.id) {
+                Ok(lock) => lock,
+                Err(error) => {
+                    tracing::warn!(
+                        target: "vibex_desktop",
+                        agent_id = %context.agent_id,
+                        error_code = %error.code,
+                        "Agent account model catalog operation lock could not be opened"
+                    );
+                    continue;
+                }
+            };
             let _guard = operation_lock.lock().await;
-            let current = self.require_revision(&context.id, context.revision)?;
+            let current = match self.require_revision(&context.id, context.revision) {
+                Ok(current) => current,
+                Err(error) => {
+                    tracing::warn!(
+                        target: "vibex_desktop",
+                        agent_id = %context.agent_id,
+                        error_code = %error.code,
+                        "Agent account model catalog refresh found a changed context"
+                    );
+                    continue;
+                }
+            };
             if current.status != AgentAuthContextStatus::Authenticated {
                 continue;
             }
-            let snapshot = self
+            // Read the last usable catalogue under the lock so a concurrent
+            // install/refresh cannot make the snapshot we preserve older than
+            // the one already stored.
+            let previous_usable = match AgentAuthModelCatalogRepository::latest_usable(
+                &open_database(&self.db_path)?,
+                &current.id,
+                current.revision,
+            ) {
+                Ok(previous) => previous,
+                Err(error) => {
+                    tracing::warn!(
+                        target: "vibex_desktop",
+                        agent_id = %context.agent_id,
+                        error_code = %error.code,
+                        "Agent account model catalog fallback could not be read"
+                    );
+                    None
+                }
+            };
+            let mut snapshot = match self
                 .acp_runtime
                 .discover_agent_auth_model_catalog(&current)
-                .await?;
+                .await
+            {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    // One unreachable Agent must not keep every other Agent on
+                    // its old catalogue. The next launch retries this one, and
+                    // the last usable snapshot still serves its sessions.
+                    tracing::warn!(
+                        target: "vibex_desktop",
+                        agent_id = %context.agent_id,
+                        error_code = %error.code,
+                        "Agent account model catalog discovery failed; keeping the previous catalogue"
+                    );
+                    continue;
+                }
+            };
+            preserve_usable_catalog_models(&mut snapshot, previous_usable.as_ref());
             let conn = open_database(&self.db_path)?;
-            AgentAuthModelCatalogRepository::upsert(&conn, &snapshot)?;
+            if let Err(error) = AgentAuthModelCatalogRepository::upsert(&conn, &snapshot) {
+                tracing::warn!(
+                    target: "vibex_desktop",
+                    agent_id = %context.agent_id,
+                    error_code = %error.code,
+                    "Agent account model catalog refresh could not be stored"
+                );
+                continue;
+            }
             self.notify_changed(&current);
             refreshed += 1;
         }
@@ -560,7 +625,7 @@ impl AgentAuthContextService {
                 "Agent account must be authenticated before refreshing models",
             ));
         }
-        let snapshot = match self
+        let mut snapshot = match self
             .acp_runtime
             .discover_agent_auth_model_catalog(&context)
             .await
@@ -579,6 +644,11 @@ impl AgentAuthContextService {
             Err(error) => return Err(error),
         };
         let conn = open_database(&self.db_path)?;
+        // A manual refresh must not replace a usable catalogue with an empty
+        // discovery just because the Adapter answered before it was ready.
+        let previous_usable =
+            AgentAuthModelCatalogRepository::latest_usable(&conn, &context.id, context.revision)?;
+        preserve_usable_catalog_models(&mut snapshot, previous_usable.as_ref());
         AgentAuthModelCatalogRepository::upsert(&conn, &snapshot)?;
         self.notify_changed(&context);
         let affected_session_ids = self.affected_sessions(&context.id)?;
@@ -1156,6 +1226,38 @@ fn catalog_snapshot_is_current(
     })
 }
 
+/// Keeps the Models of a still-usable catalogue when a re-discovery came back
+/// empty.
+///
+/// A managed Agent update can replace the Adapter before its first probe is
+/// able to answer `session/new`. Persisting that empty answer under the new
+/// fingerprint would hide every Model the reader selected, even though the
+/// previous catalogue still describes them. The new snapshot keeps the new
+/// launch identity and timestamps, borrows the previous Models, and stays
+/// marked incomplete so the next background refresh replaces it when the
+/// Adapter is ready.
+fn preserve_usable_catalog_models(
+    snapshot: &mut AgentAuthModelCatalogSnapshot,
+    previous: Option<&AgentAuthModelCatalogSnapshot>,
+) {
+    let Some(previous) = previous else {
+        return;
+    };
+    if !snapshot.models.is_empty()
+        || previous.models.is_empty()
+        || previous.status != vibex_core::AgentAuthModelCatalogStatus::Available
+    {
+        return;
+    }
+    snapshot.models = previous.models.clone();
+    snapshot.status = vibex_core::AgentAuthModelCatalogStatus::Available;
+    snapshot.default_reasoning_efforts = previous.default_reasoning_efforts.clone();
+    snapshot.default_modes = previous.default_modes.clone();
+    snapshot.default_features = previous.default_features.clone();
+    snapshot.runtime_options_complete = false;
+    snapshot.last_error_code = Some("agent_auth_model_catalog_models_preserved".to_string());
+}
+
 fn is_authentication_required(error: &VibexError) -> bool {
     is_authentication_required_code(&error.code)
 }
@@ -1251,6 +1353,68 @@ mod tests {
 
         let current = [snapshot("sha256:new", true)];
         assert!(catalog_snapshot_is_current(Some(&current), "sha256:new"));
+    }
+
+    /// An empty discovery after a launch-identity change must not erase the
+    /// Models the reader can still select from the previous catalogue.
+    #[test]
+    fn an_empty_discovery_borrows_the_previous_models_and_remains_refreshable() {
+        let context_id = AgentAuthContextId::new();
+        let previous = AgentAuthModelCatalogSnapshot {
+            auth_context_id: context_id.clone(),
+            auth_context_revision: 1,
+            runtime_fingerprint: "sha256:old".to_string(),
+            discovery_source: vibex_core::AgentModelDiscoverySource::SessionConfig,
+            status: vibex_core::AgentAuthModelCatalogStatus::Available,
+            models: vec![vibex_core::AgentAuthModelDescriptor {
+                model_id: "deepseek-flash".to_string(),
+                label: "DeepSeek Flash".to_string(),
+                reasoning_efforts: Vec::new(),
+                modes: Vec::new(),
+                features: Vec::new(),
+            }],
+            runtime_options_complete: true,
+            model_names_complete: true,
+            default_reasoning_efforts: Vec::new(),
+            default_modes: Vec::new(),
+            default_features: Vec::new(),
+            last_success_at_ms: Some(1),
+            last_attempt_at_ms: 1,
+            last_error_code: None,
+        };
+        let mut discovered = AgentAuthModelCatalogSnapshot {
+            auth_context_id: context_id,
+            auth_context_revision: 1,
+            runtime_fingerprint: "sha256:new".to_string(),
+            discovery_source: vibex_core::AgentModelDiscoverySource::AgentDefault,
+            status: vibex_core::AgentAuthModelCatalogStatus::AgentDefaultOnly,
+            models: Vec::new(),
+            runtime_options_complete: true,
+            model_names_complete: true,
+            default_reasoning_efforts: Vec::new(),
+            default_modes: Vec::new(),
+            default_features: Vec::new(),
+            last_success_at_ms: Some(2),
+            last_attempt_at_ms: 2,
+            last_error_code: None,
+        };
+
+        preserve_usable_catalog_models(&mut discovered, Some(&previous));
+
+        assert_eq!(discovered.models, previous.models);
+        assert_eq!(
+            discovered.status,
+            vibex_core::AgentAuthModelCatalogStatus::Available
+        );
+        assert_eq!(discovered.runtime_fingerprint, "sha256:new");
+        assert!(
+            !discovered.runtime_options_complete,
+            "a borrowed catalogue must stay eligible for the next refresh"
+        );
+        assert_eq!(
+            discovered.last_error_code.as_deref(),
+            Some("agent_auth_model_catalog_models_preserved")
+        );
     }
 
     /// The remote-auth trait forwards through the service, never through a

@@ -14,6 +14,16 @@ use vibex_core::{
 
 const FINGERPRINT_DOMAIN: &[u8] = b"vibex/acp/process-spawn-fingerprint/v2";
 
+/// Identity of the Agent-account model catalogue.
+///
+/// It is deliberately separate from the process fingerprint: a catalogue is
+/// discovered before a session exists, and it must not change because a runtime
+/// capability (a terminal host, an inherited environment value) was present on
+/// one launch and absent on the next. Keeping a distinct domain also makes a
+/// catalogue written by an older build explicitly different instead of silently
+/// reusing a process identity.
+const ACCOUNT_CATALOG_FINGERPRINT_DOMAIN: &[u8] = b"vibex/acp/account-catalog-fingerprint/v1";
+
 /// Immutable configuration required before an ACP process can be spawned.
 ///
 /// Model, mode, reasoning effort and other session-scoped values are
@@ -87,6 +97,22 @@ impl ProcessSpawnConfigSnapshot {
         format!("sha256:{}", hex_digest(Sha256::digest(bytes).as_slice()))
     }
 
+    /// Returns the identity an Agent-account model catalogue is keyed by.
+    ///
+    /// `volatile_env_keys` names launch inputs that are runtime capabilities or
+    /// inherited process state rather than durable configuration. They stay in
+    /// the process fingerprint, where a change has to restart the Agent, but a
+    /// catalogue must survive them: the same durable configuration has to find
+    /// the same catalogue on the next launch.
+    pub fn account_catalog_fingerprint(&self, volatile_env_keys: &BTreeSet<String>) -> String {
+        let mut catalog = self.clone();
+        for key in volatile_env_keys {
+            catalog.non_secret_env.remove(key);
+        }
+        let bytes = catalog.canonical_bytes_with_domain(ACCOUNT_CATALOG_FINGERPRINT_DOMAIN, true);
+        format!("sha256:{}", hex_digest(Sha256::digest(bytes).as_slice()))
+    }
+
     /// Computes a stable revision from the process-effective projection,
     /// excluding the revision field itself.
     pub fn content_revision(&self) -> i64 {
@@ -157,8 +183,12 @@ impl ProcessSpawnConfigSnapshot {
     }
 
     fn canonical_bytes(&self, include_revision: bool) -> Vec<u8> {
+        self.canonical_bytes_with_domain(FINGERPRINT_DOMAIN, include_revision)
+    }
+
+    fn canonical_bytes_with_domain(&self, domain: &[u8], include_revision: bool) -> Vec<u8> {
         let mut output = Vec::new();
-        write_component(&mut output, FINGERPRINT_DOMAIN);
+        write_component(&mut output, domain);
         write_required_field(&mut output, b"agent_id", self.agent_id.as_str().as_bytes());
         write_required_field(
             &mut output,
@@ -469,6 +499,52 @@ mod tests {
         assert_eq!(
             first.process_config_revision,
             equivalent.process_config_revision
+        );
+    }
+
+    /// The catalogue identity must survive runtime-only launch inputs.
+    ///
+    /// The same durable Agent configuration is discovered before a session
+    /// exists and looked up while one launches. A terminal host or an inherited
+    /// environment value that appears on only one of those paths used to change
+    /// the fingerprint and make every explicit-model session miss its catalogue.
+    #[test]
+    fn account_catalog_fingerprint_ignores_runtime_only_environment() {
+        let volatile = BTreeSet::from([
+            "__vibex_terminal_tools".to_string(),
+            "__vibex_terminal_auth".to_string(),
+            "OPENAI_BASE_URL".to_string(),
+        ]);
+        let first = snapshot();
+        let mut second = first.clone();
+        second.non_secret_env = BTreeMap::from([
+            (String::from("LANG"), String::from("C")),
+            (String::from("__vibex_terminal_tools"), String::from("true")),
+            (String::from("__vibex_terminal_auth"), String::from("true")),
+            (
+                String::from("OPENAI_BASE_URL"),
+                String::from("http://127.0.0.1:9000"),
+            ),
+        ]);
+
+        assert_eq!(
+            first.account_catalog_fingerprint(&volatile),
+            second.account_catalog_fingerprint(&volatile)
+        );
+        assert_ne!(
+            first.process_spawn_fingerprint(),
+            second.process_spawn_fingerprint(),
+            "the process fingerprint still notices a launch input change"
+        );
+
+        let mut literal = first.clone();
+        literal
+            .non_secret_env
+            .insert(String::from("LANG"), String::from("en_US.UTF-8"));
+        assert_ne!(
+            first.account_catalog_fingerprint(&volatile),
+            literal.account_catalog_fingerprint(&volatile),
+            "durable configuration remains part of the catalogue identity"
         );
     }
 

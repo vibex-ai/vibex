@@ -4013,13 +4013,31 @@ impl DesktopRuntime {
                 };
                 for agent_id in agent_ids {
                     let id = agent_id.as_str().to_string();
-                    let prepared = install_service.ensure_installed(agent_id).await;
+                    let prepared = install_service.ensure_installed(agent_id.clone()).await;
                     if let Err(error) = &prepared {
                         tracing::warn!(
                             target: "vibex_desktop",
                             agent_id = %id,
                             error_code = %error.code,
                             "managed ACP Agent background preparation failed"
+                        );
+                    }
+                    // An application upgrade can repair a managed Agent and
+                    // rewrite its command, arguments or version. That changes
+                    // the launch identity the account catalogue is keyed by, so
+                    // refresh it here rather than waiting for the whole
+                    // inventory to finish (or for the reader to press "refresh
+                    // models"). A failed repair is retried by `ensure_installed`
+                    // on the next launch and must not spend a probe now.
+                    if prepared.is_ok()
+                        && let Err(error) =
+                            auth_contexts.refresh_agent_model_catalog(&agent_id).await
+                    {
+                        tracing::warn!(
+                            target: "vibex_desktop",
+                            agent_id = %id,
+                            error_code = %error.code,
+                            "Agent account model catalog refresh after preparation failed"
                         );
                     }
                     // Repairs are per Agent and this loop is serialized behind
@@ -5537,7 +5555,10 @@ mod tests {
         assert!(!activate.contains("refresh_missing().await"));
         assert!(!manager.contains("install_service.install"));
         assert!(bootstrap.contains("install_service.bootstrap_agent_ids()"));
-        assert!(bootstrap.contains("install_service.ensure_installed(agent_id)"));
+        assert!(bootstrap.contains("install_service.ensure_installed(agent_id.clone())"));
+        // A repair can rewrite the Agent's launch identity, so the account
+        // catalogue is refreshed before the loop's invalidation is published.
+        assert!(bootstrap.contains("refresh_agent_model_catalog(&agent_id)"));
         // Every repaired Agent publishes an invalidation immediately: the
         // selectors must not wait for the whole install/probe inventory.
         let install_loop = bootstrap
@@ -5547,6 +5568,7 @@ mod tests {
             .expect("the managed Agent preparation loop should remain inspectable");
         assert!(install_loop.contains("ProviderConfigChangePhase::ProfilesChanged"));
         assert!(install_loop.contains("runtime_option_gateway.publish_provider_invalidation()"));
+        assert!(install_loop.contains("refresh_agent_model_catalog(&agent_id)"));
         assert!(!bootstrap.contains("refresh_missing"));
         assert!(bootstrap.contains("agent.added"));
         assert!(bootstrap.contains("agent.enabled"));

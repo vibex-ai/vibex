@@ -539,6 +539,80 @@ impl AgentAuthModelCatalogRepository {
         .transpose()
     }
 
+    /// The newest complete catalogue for a context revision, whatever launch
+    /// identity produced it.
+    ///
+    /// A managed Agent update or an application upgrade changes the launch
+    /// fingerprint before the background refresh has re-discovered the
+    /// catalogue. The exact lookup then finds nothing even though the previous
+    /// catalogue still names the reader's Model. This is the fallback that keeps
+    /// an existing configuration usable until the refresh writes the snapshot
+    /// for the new identity; callers still prefer [`Self::get`] for the exact
+    /// fingerprint.
+    ///
+    /// Only complete snapshots that actually describe a usable catalogue are
+    /// returned. An `Available` snapshot is preferred over an
+    /// `AgentDefaultOnly` one, so an explicit Model selection is not shadowed
+    /// by a newer snapshot that lists no Models at all.
+    pub fn latest_usable(
+        conn: &Connection,
+        auth_context_id: &AgentAuthContextId,
+        auth_context_revision: i64,
+    ) -> VibexResult<Option<AgentAuthModelCatalogSnapshot>> {
+        conn.query_row(
+            "SELECT runtime_fingerprint, discovery_source, status, catalog_json,
+                    last_success_at_ms, last_attempt_at_ms, last_error_code
+             FROM agent_auth_model_catalog_snapshots
+             WHERE auth_context_id = ?1 AND auth_context_revision = ?2
+               AND status IN ('available', 'agent_default_only')
+               AND json_extract(catalog_json, '$.runtimeOptionsComplete') = 1
+               AND json_extract(catalog_json, '$.modelNamesComplete') = 1
+             ORDER BY CASE status WHEN 'available' THEN 0 ELSE 1 END,
+                      COALESCE(last_success_at_ms, 0) DESC,
+                      last_attempt_at_ms DESC
+             LIMIT 1",
+            params![auth_context_id.as_str(), auth_context_revision],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(storage_err(
+            "agent_auth_model_catalog_get_failed",
+            "failed to read the Agent account model catalog",
+        ))?
+        .map(|raw| {
+            decode_catalog_snapshot_json(
+                &raw.3,
+                AgentAuthModelCatalogSnapshot {
+                    auth_context_id: auth_context_id.clone(),
+                    auth_context_revision,
+                    runtime_fingerprint: raw.0,
+                    discovery_source: enum_from_db(raw.1)?,
+                    status: enum_from_db(raw.2)?,
+                    models: Vec::new(),
+                    runtime_options_complete: false,
+                    model_names_complete: false,
+                    default_reasoning_efforts: Vec::new(),
+                    default_modes: Vec::new(),
+                    default_features: Vec::new(),
+                    last_success_at_ms: raw.4,
+                    last_attempt_at_ms: raw.5,
+                    last_error_code: raw.6,
+                },
+            )
+        })
+        .transpose()
+    }
+
     pub fn list_current(
         conn: &Connection,
         contexts: &[AgentAuthContext],
@@ -817,6 +891,103 @@ mod tests {
         // A row written before the Agent's own Model names travelled with the
         // catalog reads as incomplete, which is what schedules its one refresh.
         assert!(!legacy.model_names_complete);
+    }
+
+    /// A launch-identity change must not make a complete catalogue disappear
+    /// while the background refresh is still re-discovering it.
+    #[test]
+    fn latest_usable_catalog_prefers_a_complete_available_snapshot() {
+        let connection = migrated_connection();
+        let context = AgentAuthContextRepository::ensure_default(
+            &connection,
+            &AgentId::parse("opencode").unwrap(),
+        )
+        .unwrap();
+        let snapshot = |fingerprint: &str,
+                        status: AgentAuthModelCatalogStatus,
+                        model: Option<&str>,
+                        complete: bool,
+                        last_success: i64| AgentAuthModelCatalogSnapshot {
+            auth_context_id: context.id.clone(),
+            auth_context_revision: context.revision,
+            runtime_fingerprint: fingerprint.to_string(),
+            discovery_source: AgentModelDiscoverySource::SessionConfig,
+            status,
+            models: model
+                .map(|model_id| {
+                    vec![vibex_core::AgentAuthModelDescriptor {
+                        model_id: model_id.to_string(),
+                        label: model_id.to_string(),
+                        reasoning_efforts: Vec::new(),
+                        modes: Vec::new(),
+                        features: Vec::new(),
+                    }]
+                })
+                .unwrap_or_default(),
+            runtime_options_complete: complete,
+            model_names_complete: complete,
+            default_reasoning_efforts: Vec::new(),
+            default_modes: Vec::new(),
+            default_features: Vec::new(),
+            last_success_at_ms: Some(last_success),
+            last_attempt_at_ms: last_success,
+            last_error_code: None,
+        };
+
+        AgentAuthModelCatalogRepository::upsert(
+            &connection,
+            &snapshot(
+                "sha256:old",
+                AgentAuthModelCatalogStatus::Available,
+                Some("deepseek-flash"),
+                true,
+                5,
+            ),
+        )
+        .unwrap();
+        AgentAuthModelCatalogRepository::upsert(
+            &connection,
+            &snapshot(
+                "sha256:new-but-empty",
+                AgentAuthModelCatalogStatus::AgentDefaultOnly,
+                None,
+                true,
+                10,
+            ),
+        )
+        .unwrap();
+        AgentAuthModelCatalogRepository::upsert(
+            &connection,
+            &snapshot(
+                "sha256:incomplete",
+                AgentAuthModelCatalogStatus::Available,
+                Some("later-model"),
+                false,
+                20,
+            ),
+        )
+        .unwrap();
+
+        let usable = AgentAuthModelCatalogRepository::latest_usable(
+            &connection,
+            &context.id,
+            context.revision,
+        )
+        .unwrap()
+        .expect("the old complete catalogue is still usable");
+        assert_eq!(usable.runtime_fingerprint, "sha256:old");
+        assert_eq!(usable.models[0].model_id, "deepseek-flash");
+
+        assert!(
+            AgentAuthModelCatalogRepository::latest_usable(
+                &connection,
+                &context.id,
+                context.revision + 1,
+            )
+            .unwrap()
+            .is_none(),
+            "another revision must not read this catalogue"
+        );
     }
 
     #[test]

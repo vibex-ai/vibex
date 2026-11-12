@@ -9366,12 +9366,49 @@ impl RuntimeSelectionResolver for AcpRuntimeSwitchBridge {
                     .ok_or_else(|| {
                         runtime_configuration_unavailable("agent_auth_model_catalog_unavailable")
                     })?;
-            AgentAuthModelCatalogRepository::get(
+            let exact = AgentAuthModelCatalogRepository::get(
                 &conn,
                 auth_context_id,
                 context.auth_source_revision,
                 catalog_fingerprint,
-            )?
+            )?;
+            // A managed Agent update or an application upgrade changes the
+            // launch identity before the background refresh has written the
+            // catalogue for it. The previous complete snapshot is still the
+            // best description of what this account can select; using it keeps
+            // the reader's existing configuration working while the refresh
+            // runs, instead of failing every explicit-model session until a
+            // manual "refresh models".
+            let exact_covers_selection =
+                exact
+                    .as_ref()
+                    .is_some_and(|snapshot| match selection.model {
+                        RuntimeModelSelection::Explicit { .. } => {
+                            snapshot.status == AgentAuthModelCatalogStatus::Available
+                        }
+                        RuntimeModelSelection::AgentDefault => matches!(
+                            snapshot.status,
+                            AgentAuthModelCatalogStatus::Available
+                                | AgentAuthModelCatalogStatus::AgentDefaultOnly
+                        ),
+                    });
+            if exact_covers_selection {
+                exact
+            } else {
+                let fallback = AgentAuthModelCatalogRepository::latest_usable(
+                    &conn,
+                    auth_context_id,
+                    context.auth_source_revision,
+                )?;
+                if fallback.is_some() {
+                    tracing::warn!(
+                        target: "vibex_agent_acp",
+                        agent_id = %selection.agent_id,
+                        "Agent account model catalog is stale for the current launch identity; using the last complete catalogue while it refreshes"
+                    );
+                }
+                fallback.or(exact)
+            }
         } else {
             None
         };
@@ -12918,6 +12955,11 @@ impl AcpRuntimeClient {
     /// launch time. Discovery and lookup must both use this resource-free
     /// identity or the fingerprint never matches and every explicit-model
     /// Agent-account session fails with `agent_auth_model_catalog_unavailable`.
+    ///
+    /// Runtime capabilities and inherited process values are excluded as well.
+    /// They describe the machine a launch happens to see, not the durable
+    /// configuration a catalogue describes; including them made a restart under
+    /// a different shell or terminal availability look like an Agent update.
     fn agent_account_catalog_fingerprint(
         &self,
         auth_source: &RuntimeAuthSource,
@@ -12926,6 +12968,7 @@ impl AcpRuntimeClient {
         config: &AcpProviderConfig,
         env_unsets: &[String],
     ) -> VibexResult<String> {
+        let volatile_env_keys = catalog_volatile_env_keys(config);
         Ok(self
             .process_spawn_config_snapshot_for_agent_account(
                 auth_source,
@@ -12935,7 +12978,7 @@ impl AcpRuntimeClient {
                 &ProviderRuntimeResources::default(),
                 env_unsets,
             )?
-            .process_spawn_fingerprint())
+            .account_catalog_fingerprint(&volatile_env_keys))
     }
 
     /// The launch identity an Agent-account model catalog is keyed by, read
@@ -17905,6 +17948,32 @@ fn binary_identity(command: &str) -> String {
             )
         }
     }
+}
+
+/// Launch inputs that describe the machine, not the durable Agent configuration.
+///
+/// `__vibex_terminal_*` report whether this process could offer a terminal, and
+/// a `ProcessEnvironment` reference resolves whatever the launching shell
+/// exported. Both belong to the process fingerprint — a change can require a
+/// restart — but a catalogue keyed by them would miss on the next launch under
+/// a different shell or a headless start. The catalogue therefore drops them
+/// entirely: the declared value is still applied to the launch, but it is not
+/// part of the identity that decides whether a stored catalogue is current.
+fn catalog_volatile_env_keys(config: &AcpProviderConfig) -> BTreeSet<String> {
+    let mut keys = BTreeSet::from([
+        "__vibex_terminal_tools".to_string(),
+        "__vibex_terminal_auth".to_string(),
+    ]);
+    for reference in &config.env {
+        if reference.source != AcpProviderEnvSource::ProcessEnvironment {
+            continue;
+        }
+        let key = reference.key.trim();
+        if !key.is_empty() {
+            keys.insert(key.to_string());
+        }
+    }
+    keys
 }
 
 fn stable_native_state_home_id(
@@ -30306,12 +30375,20 @@ for line in sys.stdin:
         let conn = open_database(&fixture.fixture.db_path).unwrap();
         AgentAuthModelCatalogRepository::upsert(&conn, &wrong_fingerprint).unwrap();
         drop(conn);
-        let error = fixture
+        // A complete snapshot under an older launch identity is the fallback
+        // that keeps an existing configuration usable across an application
+        // upgrade. It still has to name the selected Model; the model fence
+        // below proves a stale catalogue cannot select something it never
+        // listed.
+        let resolved = fixture
             .bridge
             .resolve(&fixture.session.id, &selection, None)
             .await
-            .unwrap_err();
-        assert_runtime_configuration_cause(&error, "agent_auth_model_catalog_unavailable");
+            .expect("the previous complete catalogue remains usable");
+        assert!(matches!(
+            resolved.selection.model,
+            RuntimeModelSelection::Explicit { ref model_id } if model_id == "model-a"
+        ));
 
         let mut current_snapshot = wrong_fingerprint;
         current_snapshot.runtime_fingerprint = current_fingerprint;
