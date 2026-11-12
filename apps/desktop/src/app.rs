@@ -265,7 +265,10 @@ use crate::ssh_connection::{
     SshProfileStore, SshProvisioningEffects, SshRuntimeChannel, SshUpgradePolicy, TunnelProcess,
     TunnelSpec, default_ssh_config_path, discover_default_hosts, download_server_artifact_for_os,
     normalized_server_os, probe, resolve_effective_default, select_local_port,
-    select_server_artifact_for_os, supervisor, wsl::WslCommand, wsl_provision::WslProvisioner,
+    select_server_artifact_for_os, supervisor,
+    wsl::WslCommand,
+    wsl_profile::{WslConnectionProfile, WslProfileStore},
+    wsl_provision::{WslProvisionStage, WslProvisioner},
 };
 use crate::terminal_surface::{TerminalSurface, available_shells, bind_terminal_keys};
 use crate::typography as type_scale;
@@ -382,6 +385,212 @@ const PREPARING_ATTEMPT_ID: u64 = 0;
 fn publish_preparing_stage(stage: &std::sync::Mutex<PreparingStage>, next: PreparingStage) {
     if let Ok(mut stage) = stage.lock() {
         *stage = next;
+    }
+}
+
+/// The steps a WSL runtime deployment reports.
+///
+/// WSL has no SSH hop and no tunnel, so its sequence is its own rather than the
+/// nine SSH provisioning steps. It starts before the provisioner exists — the
+/// distro HOME read, the manifest, and the artifact download — which is exactly
+/// the window in which the click used to look inert.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WslProvisioningStep {
+    PreparingDistro,
+    CheckingEnvironment,
+    FetchingManifest,
+    DownloadingRuntime,
+    InstallingRuntime,
+    StartingRuntime,
+    WaitingForForwarding,
+    Pairing,
+    Connecting,
+    Ready,
+}
+
+impl WslProvisioningStep {
+    const ALL: [Self; 10] = [
+        Self::PreparingDistro,
+        Self::CheckingEnvironment,
+        Self::FetchingManifest,
+        Self::DownloadingRuntime,
+        Self::InstallingRuntime,
+        Self::StartingRuntime,
+        Self::WaitingForForwarding,
+        Self::Pairing,
+        Self::Connecting,
+        Self::Ready,
+    ];
+
+    fn index(self) -> usize {
+        Self::ALL
+            .iter()
+            .position(|candidate| *candidate == self)
+            .unwrap_or(0)
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::PreparingDistro => locale::text("Prepare distro", "准备发行版", "準備發行版"),
+            Self::CheckingEnvironment => locale::text("Check environment", "检查环境", "檢查環境"),
+            Self::FetchingManifest => {
+                locale::text("Fetch manifest", "获取发布清单", "取得發行清單")
+            }
+            Self::DownloadingRuntime => {
+                locale::text("Download runtime", "下载运行时", "下載執行階段")
+            }
+            Self::InstallingRuntime => {
+                locale::text("Install runtime", "安装运行时", "安裝執行階段")
+            }
+            Self::StartingRuntime => locale::text("Start runtime", "启动运行时", "啟動執行階段"),
+            Self::WaitingForForwarding => {
+                locale::text("Wait for forwarding", "等待端口转发", "等待連接埠轉送")
+            }
+            Self::Pairing => locale::text("Pair", "配对", "配對"),
+            Self::Connecting => locale::text("Connect", "连接", "連線"),
+            Self::Ready => locale::text("Ready", "就绪", "就緒"),
+        }
+    }
+
+    fn from_stage(stage: WslProvisionStage) -> Self {
+        match stage {
+            WslProvisionStage::ProbingEnvironment => Self::CheckingEnvironment,
+            WslProvisionStage::InstallingRuntime => Self::InstallingRuntime,
+            WslProvisionStage::StartingRuntime => Self::StartingRuntime,
+            WslProvisionStage::WaitingForForwarding => Self::WaitingForForwarding,
+            WslProvisionStage::Pairing => Self::Pairing,
+            WslProvisionStage::Connecting => Self::Connecting,
+            WslProvisionStage::Ready => Self::Ready,
+        }
+    }
+}
+
+/// The latest stage a WSL deployment task reached.
+///
+/// The task runs on Tokio and has no `AsyncApp`; it publishes here and the
+/// workbench's foreground poller turns the latest value into the progress
+/// dialog's snapshot.
+#[derive(Debug, Clone)]
+struct WslProvisioningStage {
+    step: WslProvisioningStep,
+    detail: String,
+}
+
+impl Default for WslProvisioningStage {
+    fn default() -> Self {
+        Self {
+            step: WslProvisioningStep::PreparingDistro,
+            detail: locale::text(
+                "Reading the distro's HOME…",
+                "正在读取发行版的 HOME…",
+                "正在讀取發行版的 HOME…",
+            )
+            .to_string(),
+        }
+    }
+}
+
+impl WslProvisioningStage {
+    fn new(step: WslProvisioningStep, detail: impl Into<String>) -> Self {
+        Self {
+            step,
+            detail: detail.into(),
+        }
+    }
+}
+
+/// Publishes a WSL deployment task's stage for the progress dialog.
+///
+/// Best-effort for the same reason as [`publish_preparing_stage`]: a poisoned
+/// lock means the workbench dropped the handle, and a missing detail line must
+/// never fail the deployment.
+fn publish_wsl_provisioning_stage(
+    stage: &std::sync::Mutex<WslProvisioningStage>,
+    next: WslProvisioningStage,
+) {
+    if let Ok(mut stage) = stage.lock() {
+        *stage = next;
+    }
+}
+
+/// One WSL deployment attempt, as the Connections page renders it.
+#[derive(Debug, Clone)]
+struct WslProvisioningSnapshot {
+    attempt_id: u64,
+    distro: String,
+    step: WslProvisioningStep,
+    status: ProvisioningStatus,
+    detail: Option<String>,
+    error: Option<String>,
+}
+
+impl WslProvisioningSnapshot {
+    fn running(attempt_id: u64, distro: String) -> Self {
+        Self {
+            attempt_id,
+            distro,
+            step: WslProvisioningStep::PreparingDistro,
+            status: ProvisioningStatus::Running,
+            detail: Some(WslProvisioningStage::default().detail),
+            error: None,
+        }
+    }
+
+    fn step_label(&self) -> String {
+        format!(
+            "{}/{} · {}",
+            self.step.index() + 1,
+            WslProvisioningStep::ALL.len(),
+            self.step.label()
+        )
+    }
+}
+
+fn provisioning_status_label(status: ProvisioningStatus) -> &'static str {
+    match status {
+        ProvisioningStatus::Pending => locale::text("Waiting", "等待中", "等待中"),
+        ProvisioningStatus::Running => locale::text("Running", "进行中", "進行中"),
+        ProvisioningStatus::Cancelling => locale::text("Cancelling", "正在取消", "正在取消"),
+        ProvisioningStatus::Ready => locale::text("Ready", "已就绪", "已就緒"),
+        ProvisioningStatus::Failed => locale::text("Failed", "失败", "失敗"),
+        ProvisioningStatus::Cancelled => locale::text("Cancelled", "已取消", "已取消"),
+    }
+}
+
+/// The detail line a WSL provisioner stage publishes.
+fn wsl_provision_stage_detail(stage: WslProvisionStage) -> &'static str {
+    match stage {
+        WslProvisionStage::ProbingEnvironment => locale::text(
+            "Checking the WSL environment…",
+            "正在检查 WSL 环境…",
+            "正在檢查 WSL 環境…",
+        ),
+        WslProvisionStage::InstallingRuntime => locale::text(
+            "Installing the runtime in the distro…",
+            "正在发行版中安装运行时…",
+            "正在發行版中安裝執行階段…",
+        ),
+        WslProvisionStage::StartingRuntime => locale::text(
+            "Starting the runtime in the distro…",
+            "正在发行版中启动运行时…",
+            "正在發行版中啟動執行階段…",
+        ),
+        WslProvisionStage::WaitingForForwarding => locale::text(
+            "Waiting for WSL2 localhost forwarding…",
+            "正在等待 WSL2 本地端口转发…",
+            "正在等待 WSL2 本機連接埠轉送…",
+        ),
+        WslProvisionStage::Pairing => locale::text(
+            "Pairing this desktop with the runtime…",
+            "正在将此桌面端与运行时配对…",
+            "正在將此桌面端與執行階段配對…",
+        ),
+        WslProvisionStage::Connecting => locale::text(
+            "Connecting to the runtime…",
+            "正在连接运行时…",
+            "正在連線執行階段…",
+        ),
+        WslProvisionStage::Ready => locale::text("Runtime ready", "运行时已就绪", "執行階段已就緒"),
     }
 }
 
@@ -10340,6 +10549,15 @@ pub struct VibexWorkbench {
     #[allow(dead_code)]
     wsl_task: Option<Task<()>>,
     wsl_error: Option<String>,
+    /// The WSL deployment currently connected to the progress surface.
+    ///
+    /// Kept after a terminal failure so the page and dialog can still show why
+    /// it stopped; a new attempt replaces it.
+    wsl_provisioning: Option<WslProvisioningSnapshot>,
+    /// The latest stage the deployment task published.
+    wsl_provisioning_stage: Option<Arc<std::sync::Mutex<WslProvisioningStage>>>,
+    wsl_provisioning_attempt: u64,
+    wsl_provisioning_poll_task: Option<Task<()>>,
     wsl_keepalive: Option<crate::ssh_connection::wsl::WslKeepalive>,
     wsl_watch_generation: u64,
     wsl_watch_task: Option<Task<()>>,
@@ -12301,6 +12519,10 @@ impl VibexWorkbench {
             ssh_uninstall_error: None,
             wsl_task: None,
             wsl_error: None,
+            wsl_provisioning: None,
+            wsl_provisioning_stage: None,
+            wsl_provisioning_attempt: 0,
+            wsl_provisioning_poll_task: None,
             wsl_keepalive: None,
             wsl_watch_generation: 0,
             wsl_watch_task: None,
@@ -15393,19 +15615,70 @@ impl VibexWorkbench {
 
     #[allow(dead_code)]
     fn provision_wsl_distro(&mut self, distro: String, cx: &mut Context<Self>) {
+        // A deployment already owns the progress surface. A second click must
+        // not start a competing install; reopen the run in flight instead.
+        if self
+            .wsl_provisioning
+            .as_ref()
+            .is_some_and(|snapshot| !snapshot.status.is_terminal())
+        {
+            self.open_wsl_progress_dialog(cx);
+            return;
+        }
         let Some(config) = self.config.clone() else {
-            self.wsl_error = Some("the runtime configuration is unavailable".to_string());
+            let error = "the runtime configuration is unavailable".to_string();
+            self.wsl_error = Some(error.clone());
+            self.queue_settings_operation_notice(SettingsOperationNotice::error(error), cx);
             cx.notify();
             return;
         };
         let Some(runtime) = self.runtime.clone() else {
-            self.wsl_error = Some("the local runtime is unavailable".to_string());
+            let error = "the local runtime is unavailable".to_string();
+            self.wsl_error = Some(error.clone());
+            self.queue_settings_operation_notice(SettingsOperationNotice::error(error), cx);
             cx.notify();
             return;
         };
         let desktop_home = config.home_dir.clone();
         self.wsl_error = None;
+        let attempt_id = self.wsl_provisioning_attempt.wrapping_add(1).max(1);
+        self.wsl_provisioning_attempt = attempt_id;
+        let stage = Arc::new(std::sync::Mutex::new(WslProvisioningStage::default()));
+        self.wsl_provisioning_stage = Some(stage.clone());
+        self.wsl_provisioning = Some(WslProvisioningSnapshot::running(attempt_id, distro.clone()));
+        self.sync_wsl_provisioning_settings(cx);
+        // The dialog appears on the click that started the work, not after the
+        // manifest and the artifact download have already spent minutes.
+        self.open_wsl_progress_dialog(cx);
+        let runner_stage = stage.clone();
+        self.wsl_provisioning_poll_task = Some(cx.spawn(
+            async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                loop {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(120))
+                        .await;
+                    let keep_going = entity
+                        .update(cx, |this, cx| this.poll_wsl_provisioning_stage(&stage, cx))
+                        .ok()
+                        .unwrap_or(false);
+                    if !keep_going {
+                        break;
+                    }
+                }
+            },
+        ));
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            publish_wsl_provisioning_stage(
+                &runner_stage,
+                WslProvisioningStage::new(
+                    WslProvisioningStep::PreparingDistro,
+                    locale::text(
+                        "Reading the distro's HOME…",
+                        "正在读取发行版的 HOME…",
+                        "正在讀取發行版的 HOME…",
+                    ),
+                ),
+            );
             let mut command = WslCommand::new("wsl.exe", &distro);
             let output = command
                 .run_script("printf '%s' \"$HOME\"", &[])
@@ -15425,12 +15698,34 @@ impl VibexWorkbench {
                 &desktop_home,
             )
             .map_err(|error| format!("{}: {}", error.code, error.message))?;
+            publish_wsl_provisioning_stage(
+                &runner_stage,
+                WslProvisioningStage::new(
+                    WslProvisioningStep::CheckingEnvironment,
+                    locale::text(
+                        "Checking the WSL environment…",
+                        "正在检查 WSL 环境…",
+                        "正在檢查 WSL 環境…",
+                    ),
+                ),
+            );
             let environment = provisioner
                 .probe()
                 .map_err(|error| format!("{}: {}", error.code, error.message))?;
             let local = match debug_wsl_artifact(environment.arch)? {
                 Some(local) => local,
                 None => {
+                    publish_wsl_provisioning_stage(
+                        &runner_stage,
+                        WslProvisioningStage::new(
+                            WslProvisioningStep::FetchingManifest,
+                            locale::text(
+                                "Fetching the signed release manifest…",
+                                "正在获取签名发布清单…",
+                                "正在取得簽章發行清單…",
+                            ),
+                        ),
+                    );
                     let verified = runtime
                         .app_update()
                         .latest_verified_manifest()
@@ -15441,25 +15736,76 @@ impl VibexWorkbench {
                     let artifact =
                         select_server_artifact_for_os(&verified, "linux", environment.arch)
                             .map_err(|error| format!("{}: {}", error.code, error.message))?;
+                    publish_wsl_provisioning_stage(
+                        &runner_stage,
+                        WslProvisioningStage::new(
+                            WslProvisioningStep::DownloadingRuntime,
+                            locale::text(
+                                "Downloading the runtime…",
+                                "正在下载运行时…",
+                                "正在下載執行階段…",
+                            ),
+                        ),
+                    );
                     download_server_artifact_for_os(
                         artifact,
                         "linux",
                         &version,
                         environment.arch,
                         &desktop_home.join("ssh-artifacts"),
-                        |_, _| {},
+                        |done, total| {
+                            let detail = if total > 0 {
+                                format!(
+                                    "{} {done}/{total}",
+                                    locale::text(
+                                        "Downloading the runtime…",
+                                        "正在下载运行时…",
+                                        "正在下載執行階段…",
+                                    )
+                                )
+                            } else {
+                                locale::text(
+                                    "Downloading the runtime…",
+                                    "正在下载运行时…",
+                                    "正在下載執行階段…",
+                                )
+                                .to_string()
+                            };
+                            publish_wsl_provisioning_stage(
+                                &runner_stage,
+                                WslProvisioningStage::new(
+                                    WslProvisioningStep::DownloadingRuntime,
+                                    detail,
+                                ),
+                            );
+                        },
                     )
                     .await
                     .map_err(|error| format!("{}: {}", error.code, error.message))?
                 }
             };
+            publish_wsl_provisioning_stage(
+                &runner_stage,
+                WslProvisioningStage::new(
+                    WslProvisioningStep::InstallingRuntime,
+                    wsl_provision_stage_detail(WslProvisionStage::InstallingRuntime),
+                ),
+            );
             let now_ms = unix_timestamp_ms();
             let outcome = provisioner
-                .provision(&local, now_ms)
+                .provision_with_progress(&local, now_ms, |stage| {
+                    publish_wsl_provisioning_stage(
+                        &runner_stage,
+                        WslProvisioningStage::new(
+                            WslProvisioningStep::from_stage(stage),
+                            wsl_provision_stage_detail(stage),
+                        ),
+                    );
+                })
                 .await
                 .map_err(|error| format!("{}: {}", error.code, error.message))?;
             let runtime_id = outcome.pairing.runtime_id;
-            let profile = crate::ssh_connection::wsl_profile::WslConnectionProfile {
+            let profile = WslConnectionProfile {
                 id: format!("wsl-{now_ms}"),
                 distro: distro.clone(),
                 display_name: distro.clone(),
@@ -15471,7 +15817,7 @@ impl VibexWorkbench {
                 created_at_ms: now_ms,
                 last_connected_at_ms: Some(now_ms),
             };
-            let store = crate::ssh_connection::wsl_profile::WslProfileStore::at_home(&desktop_home);
+            let store = WslProfileStore::at_home(&desktop_home);
             let mut profiles = store.load().unwrap_or_default();
             profiles.retain(|existing| {
                 existing.registered_runtime_id.as_deref() != Some(runtime_id.as_str())
@@ -15487,7 +15833,7 @@ impl VibexWorkbench {
                     DesktopRemoteCredential,
                     Arc<WebRemoteBackend>,
                     crate::ssh_connection::wsl::WslKeepalive,
-                    crate::ssh_connection::wsl_profile::WslConnectionProfile,
+                    WslConnectionProfile,
                 ),
                 String,
             >((
@@ -15503,6 +15849,34 @@ impl VibexWorkbench {
             async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
                 let result = runner.await;
                 let _ = entity.update(cx, |this, cx| {
+                    this.wsl_provisioning_stage = None;
+                    this.wsl_provisioning_poll_task = None;
+                    let terminal = match &result {
+                        Ok(Ok(_)) => ProvisioningStatus::Ready,
+                        Ok(Err(error)) => {
+                            this.wsl_error = Some(error.clone());
+                            ProvisioningStatus::Failed
+                        }
+                        Err(_) => {
+                            let error =
+                                "the WSL provisioning task stopped unexpectedly".to_string();
+                            this.wsl_error = Some(error);
+                            ProvisioningStatus::Failed
+                        }
+                    };
+                    if let Some(snapshot) = this.wsl_provisioning.as_mut() {
+                        snapshot.status = terminal;
+                        if terminal == ProvisioningStatus::Failed {
+                            snapshot.error = this.wsl_error.clone();
+                        } else {
+                            snapshot.step = WslProvisioningStep::Ready;
+                            snapshot.detail = Some(
+                                locale::text("Runtime connected", "运行时已连接", "執行階段已連線")
+                                    .to_string(),
+                            );
+                            snapshot.error = None;
+                        }
+                    }
                     match result {
                         Ok(Ok((runtime_id, distro, credential, backend, keepalive, profile))) => {
                             this.wsl_keepalive = Some(keepalive);
@@ -15531,31 +15905,178 @@ impl VibexWorkbench {
                                     "WSL 執行階段已連線"
                                 )
                             ));
+                            let progress_open = this
+                                .settings_view
+                                .read_with(cx, |settings, _| {
+                                    settings.connections_wsl_progress_open
+                                });
+                            this.settings_view.update(cx, |settings, cx| {
+                                settings.reload_connections_profiles();
+                                settings.connections_wsl_progress_open = false;
+                                settings.connections_wsl_progress_dismissed = None;
+                                cx.notify();
+                            });
+                            // A successful deployment is announced by the new
+                            // row and the success hint; leaving the progress
+                            // dialog behind would ask the reader to close a run
+                            // that has already finished.
+                            if progress_open
+                                && let Some(window) = this.window_handle
+                            {
+                                let _ = window.update(cx, |_, window, cx| {
+                                    window.close_dialog(cx);
+                                });
+                            }
+                            this.queue_settings_operation_notice(
+                                SettingsOperationNotice::success(format!(
+                                    "{} {distro}",
+                                    locale::text(
+                                        "WSL runtime connected",
+                                        "WSL 运行时已连接",
+                                        "WSL 執行階段已連線"
+                                    )
+                                )),
+                                cx,
+                            );
                         }
                         Ok(Err(error)) => {
-                            this.wsl_error = Some(error.clone());
-                            // The WSL dialog closes on submit, so the failure is
-                            // announced on the hint layer instead of in a body
-                            // that is no longer on screen.
-                            this.queue_settings_operation_notice(
-                                SettingsOperationNotice::error(error),
-                                cx,
-                            );
+                            // A failure in an open dialog is read there; when
+                            // the reader already dismissed it, the hint layer
+                            // is the only place left to announce it.
+                            let dialog_open = this.settings_view.read_with(cx, |settings, _| {
+                                settings.connections_wsl_progress_open
+                            });
+                            if !dialog_open {
+                                this.queue_settings_operation_notice(
+                                    SettingsOperationNotice::error(error),
+                                    cx,
+                                );
+                            }
                         }
                         Err(_) => {
-                            let error = "the WSL task stopped unexpectedly".to_string();
-                            this.wsl_error = Some(error.clone());
-                            this.queue_settings_operation_notice(
-                                SettingsOperationNotice::error(error),
-                                cx,
-                            );
+                            let error =
+                                "the WSL provisioning task stopped unexpectedly".to_string();
+                            let dialog_open = this.settings_view.read_with(cx, |settings, _| {
+                                settings.connections_wsl_progress_open
+                            });
+                            if !dialog_open {
+                                this.queue_settings_operation_notice(
+                                    SettingsOperationNotice::error(error),
+                                    cx,
+                                );
+                            }
                         }
                     }
+                    this.sync_wsl_provisioning_settings(cx);
                     cx.notify();
                 });
             },
         ));
         cx.notify();
+    }
+
+    /// Copies the latest deployment stage into the snapshot the page and its
+    /// dialog render.
+    ///
+    /// Returns `false` once the attempt is terminal, which stops the poller.
+    fn poll_wsl_provisioning_stage(
+        &mut self,
+        stage: &Arc<std::sync::Mutex<WslProvisioningStage>>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(snapshot) = self.wsl_provisioning.as_ref() else {
+            return false;
+        };
+        if snapshot.status.is_terminal() {
+            return false;
+        }
+        let Ok(next) = stage.lock().map(|stage| stage.clone()) else {
+            return false;
+        };
+        // `provision_with_progress` re-probes before it installs. That stage is
+        // behind the app's own download stage, so a progress bar must never
+        // walk backwards for it.
+        if next.step.index() < snapshot.step.index() {
+            return true;
+        }
+        let unchanged =
+            snapshot.step == next.step && snapshot.detail.as_deref() == Some(next.detail.as_str());
+        if unchanged {
+            return true;
+        }
+        if let Some(snapshot) = self.wsl_provisioning.as_mut() {
+            snapshot.step = next.step;
+            snapshot.detail = Some(next.detail);
+        }
+        self.sync_wsl_provisioning_settings(cx);
+        cx.notify();
+        true
+    }
+
+    /// Publishes the WSL deployment snapshot and its live status to Settings.
+    fn sync_wsl_provisioning_settings(&self, cx: &mut Context<Self>) {
+        let snapshot = self.wsl_provisioning.clone();
+        self.settings_view.update(cx, |settings, cx| {
+            settings.connections_wsl_progress = snapshot;
+            cx.notify();
+        });
+        self.sync_connections_live_status(cx);
+    }
+
+    /// Opens the WSL progress dialog for the attempt on screen.
+    fn open_wsl_progress_dialog(&mut self, cx: &mut Context<Self>) {
+        let Some(window) = self.window_handle else {
+            return;
+        };
+        // Progress events and a second Connect click both land here; opening
+        // again while the dialog is mounted would stack dialogs on top of each
+        // other.
+        if self
+            .settings_view
+            .read_with(cx, |settings, _| settings.connections_wsl_progress_open)
+        {
+            return;
+        }
+        let settings = self.settings_view.downgrade();
+        let _ = window.update(cx, |_, window, cx| {
+            let _ = settings.update(cx, |settings, cx| {
+                settings.open_connections_wsl_progress_dialog(window, cx);
+            });
+        });
+    }
+
+    /// Reconnects one saved WSL connection from the Connections page.
+    ///
+    /// A profile that never paired is provisioned again; a paired one restores
+    /// its foreground keepalive and then reconnects the existing credential.
+    fn connect_wsl_connection(&mut self, profile_id: String, cx: &mut Context<Self>) {
+        let profile = self
+            .wsl_profiles
+            .iter()
+            .find(|profile| profile.id == profile_id)
+            .cloned()
+            .or_else(|| {
+                self.config.as_ref().and_then(|config| {
+                    WslProfileStore::at_home(&config.home_dir)
+                        .load()
+                        .ok()?
+                        .into_iter()
+                        .find(|profile| profile.id == profile_id)
+                })
+            });
+        let Some(profile) = profile else {
+            return;
+        };
+        let Some(runtime_id) = profile.registered_runtime_id.clone() else {
+            self.provision_wsl_distro(profile.distro, cx);
+            return;
+        };
+        let Some(runtime) = self.runtime_registry.remote(&runtime_id).cloned() else {
+            self.provision_wsl_distro(profile.distro, cx);
+            return;
+        };
+        self.runtime_connect_errors.remove(&runtime_id);
+        self.begin_wsl_restore(runtime, profile, RuntimeConnectOrigin::Switch, cx);
     }
 
     #[allow(dead_code)]
@@ -16111,7 +16632,10 @@ impl VibexWorkbench {
         self.ssh_provisioning_snapshot = Some(ProvisioningSnapshot::preparing(
             profile_id,
             PREPARING_ATTEMPT_ID,
-            stage.lock().map(|stage| stage.detail.clone()).unwrap_or_default(),
+            stage
+                .lock()
+                .map(|stage| stage.detail.clone())
+                .unwrap_or_default(),
             unix_timestamp_ms(),
         ));
         self.sync_ssh_provisioning_settings(cx);
@@ -16122,7 +16646,9 @@ impl VibexWorkbench {
                         .timer(Duration::from_millis(120))
                         .await;
                     let Some(next) = entity
-                        .update(cx, |this, cx| this.poll_ssh_provisioning_preparing(&stage, cx))
+                        .update(cx, |this, cx| {
+                            this.poll_ssh_provisioning_preparing(&stage, cx)
+                        })
                         .ok()
                         .flatten()
                     else {
@@ -16403,6 +16929,49 @@ impl VibexWorkbench {
                 None => ConnectionRowStatus::Offline,
             };
             live.insert(profile.id, status);
+        }
+        // WSL connections are local and carry their own store, but their
+        // liveness is the same registry/client fact as an SSH profile's. A WSL
+        // runtime that is not the active authority is offline, not connected.
+        for profile in &self.wsl_profiles {
+            let status = match profile.registered_runtime_id.as_deref() {
+                Some(runtime_id) => {
+                    if self.runtime_switch_pending.as_deref() == Some(runtime_id) {
+                        ConnectionRowStatus::Connecting
+                    } else if self.runtime_registry.active_runtime_id() != runtime_id {
+                        ConnectionRowStatus::Offline
+                    } else {
+                        match self
+                            .remote_client
+                            .as_ref()
+                            .filter(|client| client.runtime_id == runtime_id)
+                        {
+                            Some(client) => match client.backend.connection_state().state {
+                                RemoteConnectionState::Online | RemoteConnectionState::Degraded => {
+                                    ConnectionRowStatus::Connected
+                                }
+                                RemoteConnectionState::Reconnecting => {
+                                    ConnectionRowStatus::Connecting
+                                }
+                                RemoteConnectionState::Offline
+                                | RemoteConnectionState::Revoked
+                                | RemoteConnectionState::Incompatible => {
+                                    ConnectionRowStatus::NeedsAttention
+                                }
+                                RemoteConnectionState::Idle
+                                | RemoteConnectionState::Resolving
+                                | RemoteConnectionState::Probing
+                                | RemoteConnectionState::Connecting
+                                | RemoteConnectionState::Authenticating
+                                | RemoteConnectionState::Syncing => ConnectionRowStatus::Connecting,
+                            },
+                            None => ConnectionRowStatus::Offline,
+                        }
+                    }
+                }
+                None => ConnectionRowStatus::Offline,
+            };
+            live.insert(profile.id.clone(), status);
         }
         self.settings_view.update(cx, |settings, cx| {
             settings.connections_live_status = live;
@@ -17720,13 +18289,54 @@ impl VibexWorkbench {
         }
     }
 
+    /// Removes the WSL store entry bound to a runtime.
+    ///
+    /// The WSL profile is the only record of which distro produced a runtime,
+    /// so deleting the runtime from the manager must delete it too; otherwise
+    /// the Connections page keeps a row for a runtime that no longer exists.
+    fn remove_wsl_profile_for_runtime(&mut self, runtime_id: &str) {
+        let Some(config) = self.config.as_ref() else {
+            return;
+        };
+        let store = WslProfileStore::at_home(&config.home_dir);
+        let Ok(mut profiles) = store.load() else {
+            return;
+        };
+        let before = profiles.len();
+        profiles.retain(|profile| profile.registered_runtime_id.as_deref() != Some(runtime_id));
+        if profiles.len() != before {
+            let _ = store.save(&profiles);
+        }
+        self.wsl_profiles
+            .retain(|profile| profile.registered_runtime_id.as_deref() != Some(runtime_id));
+    }
+
     fn remove_runtime(&mut self, id: String, cx: &mut Context<Self>) {
+        let was_wsl = self
+            .wsl_profiles
+            .iter()
+            .any(|profile| profile.registered_runtime_id.as_deref() == Some(id.as_str()));
+        let was_active_wsl = was_wsl && self.runtime_registry.active_runtime_id() == id;
         if !self.runtime_registry.remove(&id) {
             return;
         }
         self.runtime_compatibility.remove(&id);
         self.remove_ssh_profile_for_runtime(&id);
+        self.remove_wsl_profile_for_runtime(&id);
+        self.wsl_runtime_labels.remove(&id);
+        if was_active_wsl {
+            // The foreground child is the only thing keeping this distro's
+            // server alive. Dropping it is this shell's uninstall; an inactive
+            // WSL runtime shares no keepalive with the active one.
+            self.wsl_keepalive = None;
+            self.wsl_watch_generation = self.wsl_watch_generation.wrapping_add(1);
+            self.wsl_watch_task = None;
+        }
         self.runtime_remove_pending = None;
+        self.settings_view.update(cx, |settings, cx| {
+            settings.reload_connections_profiles();
+            cx.notify();
+        });
         if self
             .remote_client
             .as_ref()
@@ -17793,6 +18403,39 @@ impl VibexWorkbench {
         {
             self.remove_runtime(runtime_id, cx);
         }
+        cx.notify();
+    }
+
+    /// Deletes the runtime side of a removed WSL connection.
+    ///
+    /// The WSL store entry is already gone by the time this runs. An in-flight
+    /// deployment for the same distro is dropped so it cannot save a profile
+    /// the reader just removed; a paired runtime is removed through the same
+    /// path the runtime manager uses.
+    fn remove_wsl_connection_runtime(
+        &mut self,
+        profile: WslConnectionProfile,
+        cx: &mut Context<Self>,
+    ) {
+        if self.wsl_provisioning.as_ref().is_some_and(|snapshot| {
+            snapshot.distro == profile.distro && !snapshot.status.is_terminal()
+        }) {
+            self.wsl_task = None;
+            self.wsl_provisioning_poll_task = None;
+            self.wsl_provisioning_stage = None;
+            self.wsl_provisioning = None;
+            self.sync_wsl_provisioning_settings(cx);
+        }
+        if let Some(runtime_id) = profile.registered_runtime_id
+            && self.runtime_registry.remote(&runtime_id).is_some()
+        {
+            self.remove_runtime(runtime_id, cx);
+        }
+        self.wsl_profiles.retain(|saved| saved.id != profile.id);
+        self.settings_view.update(cx, |settings, cx| {
+            settings.reload_connections_profiles();
+            cx.notify();
+        });
         cx.notify();
     }
 
@@ -84470,6 +85113,12 @@ struct SshLogView {
     loading: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnectionTransport {
+    Ssh,
+    Wsl,
+}
+
 #[derive(Debug, Clone)]
 struct ConnectionDisplayRow {
     id: String,
@@ -84480,6 +85129,10 @@ struct ConnectionDisplayRow {
     port: u16,
     version: Option<String>,
     status: ConnectionRowStatus,
+    transport: ConnectionTransport,
+    /// The row's primary action needs a fact only the page holds: whether the
+    /// WSL deployment for this distro is still running.
+    wsl_provisioning: bool,
 }
 
 #[derive(Clone)]
@@ -86938,6 +87591,8 @@ struct FoundationSettings {
     /// Whether the Connections page is showing its add panel.
     /// Profiles loaded when Connections is activated.
     connections_profiles: Vec<SshConnectionProfile>,
+    /// Saved WSL connections, loaded from their own store beside the SSH list.
+    connections_wsl_profiles: Vec<WslConnectionProfile>,
     /// The active provisioning snapshot/error mirrored from the workbench.
     connections_snapshot: Option<ProvisioningSnapshot>,
     connections_error: Option<String>,
@@ -86968,6 +87623,14 @@ struct FoundationSettings {
     /// it is already open; opening again on every event would stack dialogs on
     /// top of each other.
     connections_progress_open: bool,
+    /// The WSL deployment mirrored from the workbench. Unlike the SSH snapshot
+    /// it has its own step sequence; a terminal failure stays here so the page
+    /// can still explain it after the dialog is closed.
+    connections_wsl_progress: Option<WslProvisioningSnapshot>,
+    /// The attempt the reader closed while it was still running.
+    connections_wsl_progress_dismissed: Option<u64>,
+    /// Whether the WSL progress dialog is currently mounted.
+    connections_wsl_progress_open: bool,
     /// Hosts discovered from the user's OpenSSH config for the add panel.
     connections_hosts: Vec<SshHostEntry>,
     connections_host_warnings: Vec<String>,
@@ -87453,6 +88116,7 @@ impl FoundationSettings {
                 browser_clear_task: None,
                 shortcut_note: None,
                 connections_profiles: Vec::new(),
+                connections_wsl_profiles: Vec::new(),
                 connections_snapshot: None,
                 connections_error: None,
                 connections_live_status: BTreeMap::new(),
@@ -87460,6 +88124,9 @@ impl FoundationSettings {
                 connections_progress_target: None,
                 connections_progress_dismissed: None,
                 connections_progress_open: false,
+                connections_wsl_progress: None,
+                connections_wsl_progress_dismissed: None,
+                connections_wsl_progress_open: false,
                 connections_hosts: Vec::new(),
                 connections_host_warnings: Vec::new(),
                 connections_selected_host: None,
@@ -87508,12 +88175,7 @@ impl FoundationSettings {
             self.request_local_clients_refresh(cx);
         }
         if section == SettingsSection::Connections {
-            self.connections_profiles = self
-                .home_dir
-                .as_deref()
-                .map(SshProfileStore::at_home)
-                .and_then(|store| store.load().ok())
-                .unwrap_or_default();
+            self.reload_connections_profiles();
             self.resume_unprovisioned_connections(cx);
         }
     }
@@ -90965,6 +91627,12 @@ impl FoundationSettings {
             .map(SshProfileStore::at_home)
             .and_then(|store| store.load().ok())
             .unwrap_or_default();
+        self.connections_wsl_profiles = self
+            .home_dir
+            .as_deref()
+            .map(WslProfileStore::at_home)
+            .and_then(|store| store.load().ok())
+            .unwrap_or_default();
     }
 
     fn load_connections_discovery(&mut self, cx: &mut Context<Self>) {
@@ -91041,6 +91709,70 @@ impl FoundationSettings {
         });
     }
 
+    /// Asks before deleting a WSL connection.
+    ///
+    /// The WSL profile is the only record that this desktop installed a runtime
+    /// inside that distro. Removing it deletes the profile and the saved
+    /// credential; the distro and its files are untouched.
+    fn confirm_remove_wsl_connection(
+        &mut self,
+        profile_id: String,
+        profile_name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let entity = cx.weak_entity();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let entity = entity.clone();
+            let profile_id = profile_id.clone();
+            let profile_name = profile_name.clone();
+            let title = locale::text(
+                "Remove this WSL connection?",
+                "移除此 WSL 连接？",
+                "移除此 WSL 連線？",
+            );
+            let description = match locale::current_locale() {
+                locale::ResolvedLocale::ZhCn => format!(
+                    "“{profile_name}”的连接会被移除。这台机器上保存的配对凭据和后台运行时进程会一并停止；WSL 发行版和其中的文件不受影响。"
+                ),
+                locale::ResolvedLocale::ZhTw => format!(
+                    "「{profile_name}」的連線會被移除。這台機器上儲存的配對憑證與背景執行階段程序會一併停止；WSL 發行版和其中的檔案不受影響。"
+                ),
+                locale::ResolvedLocale::En => format!(
+                    "The saved connection for \u{201c}{profile_name}\u{201d} is removed. This machine's pairing credential and the background runtime process stop with it; the WSL distro and its files are left alone."
+                ),
+                locale => vibex_ui::locale_copy::fill(
+                    locale.shared(),
+                    "The saved connection for \u{201c}{profile_name}\u{201d} is removed. This machine's pairing credential and the background runtime process stop with it; the WSL distro and its files are left alone.",
+                    &[("profile_name", profile_name.clone())],
+                ),
+            };
+            dialog
+                .title(title)
+                .child(div().whitespace_normal().child(description))
+                .footer(
+                    DialogFooter::new()
+                        .child(DialogClose::new().child(
+                            Button::new("connections-wsl-remove-cancel")
+                                .outline()
+                                .label(locale::text("Cancel", "取消", "取消")),
+                        ))
+                        .child(DialogAction::new().child(
+                            Button::new("connections-wsl-remove-confirm")
+                                .danger()
+                                .label(locale::text("Remove", "移除", "移除")),
+                        )),
+                )
+                .on_ok(move |_, _, cx| {
+                    let profile_id = profile_id.clone();
+                    let _ = entity.update(cx, |this, cx| {
+                        this.remove_wsl_connection(&profile_id, cx)
+                    });
+                    true
+                })
+        });
+    }
+
     /// Records a Connections failure and announces it on the hint layer.
     ///
     /// The Connections page lives inside the settings dialog, so a red line
@@ -91111,6 +91843,66 @@ impl FoundationSettings {
         cx.defer(move |cx| {
             let _ = workbench.update(cx, |workbench, cx| {
                 workbench.remove_ssh_connection_runtime(profile, cx)
+            });
+        });
+        cx.notify();
+    }
+
+    /// Deletes one saved WSL connection and the runtime binding this machine
+    /// stored for it.
+    ///
+    /// The store is written first for the same reason as the SSH path: a
+    /// profile that disappears from the list while its runtime removal lags is
+    /// a stale runtime the manager can still remove, not a row that cannot be
+    /// removed at all.
+    fn remove_wsl_connection(&mut self, profile_id: &str, cx: &mut Context<Self>) {
+        let Some(home_dir) = self.home_dir.clone() else {
+            self.report_connections_failure(
+                locale::text(
+                    "The desktop home is unavailable, so the WSL connection was not removed.",
+                    "无法访问桌面数据目录，WSL 连接未移除。",
+                    "無法存取桌面資料目錄，WSL 連線未移除。",
+                )
+                .to_string(),
+                cx,
+            );
+            return;
+        };
+        let store = WslProfileStore::at_home(&home_dir);
+        let mut profiles = match store.load() {
+            Ok(profiles) => profiles,
+            Err(error) => {
+                self.report_connections_failure(format!("{}: {}", error.code, error.message), cx);
+                return;
+            }
+        };
+        let Some(index) = profiles.iter().position(|profile| profile.id == profile_id) else {
+            self.reload_connections_profiles();
+            cx.notify();
+            return;
+        };
+        let profile = profiles.remove(index);
+        if let Err(error) = store.save(&profiles) {
+            self.report_connections_failure(format!("{}: {}", error.code, error.message), cx);
+            return;
+        }
+        if self
+            .connections_wsl_progress
+            .as_ref()
+            .is_some_and(|snapshot| {
+                snapshot.distro == profile.distro && !snapshot.status.is_terminal()
+            })
+        {
+            self.connections_wsl_progress = None;
+            self.connections_wsl_progress_dismissed = None;
+            self.connections_wsl_progress_open = false;
+        }
+        self.reload_connections_profiles();
+        // The workbench holds the kept-alive runtime, so it owns the teardown.
+        let workbench = self.workbench.clone();
+        cx.defer(move |cx| {
+            let _ = workbench.update(cx, |workbench, cx| {
+                workbench.remove_wsl_connection_runtime(profile, cx)
             });
         });
         cx.notify();
@@ -92075,6 +92867,219 @@ impl FoundationSettings {
         self.connections_progress_open = false;
     }
 
+    /// Opens the WSL deployment progress dialog.
+    ///
+    /// WSL used to close its add dialog and then show nothing until the runtime
+    /// appeared in the title-bar switcher minutes later. This dialog is the
+    /// click's answer: the distro, the current step, a progress bar, and the
+    /// provisioner's own detail line.
+    fn open_connections_wsl_progress_dialog(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.connections_wsl_progress_dismissed = None;
+        self.connections_wsl_progress_open = true;
+        let entity = cx.weak_entity();
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let entity = entity.clone();
+            let snapshot = entity
+                .update(cx, |this, _| this.connections_wsl_progress.clone())
+                .unwrap_or(None);
+            let settings = entity.clone();
+            let body = match snapshot.as_ref() {
+                Some(snapshot) => Self::connections_wsl_progress_body(snapshot, cx),
+                None => div()
+                    .w_full()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(locale::text(
+                        "No WSL runtime setup is running.",
+                        "当前没有正在进行的 WSL 运行时配置。",
+                        "目前沒有正在進行的 WSL 執行階段設定。",
+                    ))
+                    .into_any_element(),
+            };
+            let dismiss = entity.clone();
+            let mut footer = DialogFooter::new().child(
+                Button::new("connections-wsl-progress-close")
+                    .outline()
+                    .label(locale::text("Close", "关闭", "關閉"))
+                    .on_click(move |_, window, cx| {
+                        // Closing is not cancelling: the deployment keeps
+                        // going and the page keeps its progress entry.
+                        let _ = dismiss.update(cx, |this, cx| {
+                            this.close_connections_wsl_progress_dialog();
+                            cx.notify();
+                        });
+                        window.close_dialog(cx);
+                    }),
+            );
+            if let Some(snapshot) = snapshot.as_ref()
+                && snapshot.status == ProvisioningStatus::Failed
+            {
+                let retry_settings = settings;
+                let distro = snapshot.distro.clone();
+                footer = footer.child(
+                    Button::new("connections-wsl-progress-retry")
+                        .primary()
+                        .label(locale::text("Retry", "重试", "重試"))
+                        .on_click(move |_, window, cx| {
+                            let _ = retry_settings.update(cx, |this, cx| {
+                                this.close_connections_wsl_progress_dialog();
+                                let workbench = this.workbench.clone();
+                                let distro = distro.clone();
+                                cx.defer(move |cx| {
+                                    let _ = workbench.update(cx, |workbench, cx| {
+                                        workbench.provision_wsl_distro(distro, cx)
+                                    });
+                                });
+                            });
+                            window.close_dialog(cx);
+                        }),
+                );
+            }
+            dialog
+                .title(locale::text(
+                    "WSL runtime setup",
+                    "WSL 运行时配置",
+                    "WSL 執行階段設定",
+                ))
+                .w(px(520.0))
+                .child(body)
+                .on_close({
+                    let dismiss = entity.clone();
+                    move |_, _, cx| {
+                        let _ = dismiss.update(cx, |this, cx| {
+                            this.close_connections_wsl_progress_dialog();
+                            cx.notify();
+                        });
+                    }
+                })
+                .footer(footer)
+        });
+    }
+
+    /// Records that the reader closed the WSL progress dialog on their own.
+    ///
+    /// The same attempt stays closed on every later progress event; a new
+    /// deployment gets a new attempt id and opens again.
+    fn close_connections_wsl_progress_dialog(&mut self) {
+        if self.connections_wsl_progress_open {
+            self.connections_wsl_progress_dismissed = self
+                .connections_wsl_progress
+                .as_ref()
+                .map(|snapshot| snapshot.attempt_id);
+        }
+        self.connections_wsl_progress_open = false;
+    }
+
+    /// One WSL deployment, rendered as the dialog's body.
+    fn connections_wsl_progress_body(
+        snapshot: &WslProvisioningSnapshot,
+        cx: &mut App,
+    ) -> AnyElement {
+        let border = cx.theme().border;
+        let muted = cx.theme().muted_foreground;
+        let success = cx.theme().success;
+        let danger = cx.theme().danger;
+        let step = snapshot.step;
+        let mut body = v_flex()
+            .w_full()
+            .min_w_0()
+            .gap_2()
+            .child(
+                h_flex()
+                    .w_full()
+                    .min_w_0()
+                    .items_center()
+                    .justify_between()
+                    .gap_4()
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_sm()
+                            .font_medium()
+                            .child(format!("WSL · {}", snapshot.distro)),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(muted)
+                            .child(provisioning_status_label(snapshot.status)),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .w_full()
+                    .justify_between()
+                    .gap_4()
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_sm()
+                            .child(snapshot.step_label()),
+                    )
+                    .when_some(snapshot.detail.clone(), |this, detail| {
+                        this.child(
+                            div()
+                                .min_w_0()
+                                .max_w(px(280.0))
+                                .truncate()
+                                .text_xs()
+                                .text_color(muted)
+                                .child(detail),
+                        )
+                    }),
+            )
+            .child(
+                h_flex()
+                    .w_full()
+                    .gap_1()
+                    .children(WslProvisioningStep::ALL.iter().map(|candidate| {
+                        div().h(px(4.0)).flex_1().rounded_full().bg(
+                            if candidate.index() <= step.index() {
+                                success
+                            } else {
+                                border
+                            },
+                        )
+                    })),
+            );
+        if let Some(error) = snapshot.error.as_ref() {
+            body =
+                body.child(
+                    v_flex()
+                        .w_full()
+                        .min_w_0()
+                        .gap_1()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(danger)
+                        .p_2()
+                        .child(div().text_sm().font_medium().text_color(danger).child(
+                            locale::text(
+                                "WSL runtime setup failed",
+                                "WSL 运行时配置失败",
+                                "WSL 執行階段設定失敗",
+                            ),
+                        ))
+                        .child(
+                            div()
+                                .w_full()
+                                .min_w_0()
+                                .whitespace_normal()
+                                .text_xs()
+                                .text_color(muted)
+                                .child(error.clone()),
+                        ),
+                );
+        }
+        body.into_any_element()
+    }
+
     /// One provisioning attempt, rendered as the dialog's body.
     ///
     /// Built as a free-standing function rather than a method so the dialog's
@@ -92463,6 +93468,42 @@ impl FoundationSettings {
                 )],
             ));
         }
+        // WSL deployments do not pass through the SSH coordinator, so they get
+        // their own entry point. A failure stays visible here after the dialog
+        // is dismissed; a ready run falls through to the row in the list.
+        if let Some(snapshot) = self.connections_wsl_progress.as_ref().filter(|snapshot| {
+            snapshot.status == ProvisioningStatus::Failed || !snapshot.status.is_terminal()
+        }) {
+            let summary = if snapshot.status == ProvisioningStatus::Failed {
+                snapshot
+                    .error
+                    .as_deref()
+                    .and_then(|error| error.lines().next())
+                    .unwrap_or_else(|| snapshot.step.label())
+                    .to_string()
+            } else {
+                snapshot.step_label()
+            };
+            groups.push(SettingsGroup::new(
+                locale::text("WSL runtime setup", "WSL 运行时配置", "WSL 執行階段設定"),
+                vec![setting_row(
+                    locale::text("WSL runtime", "WSL 运行时", "WSL 執行階段"),
+                    div()
+                        .text_xs()
+                        .whitespace_normal()
+                        .child(format!("WSL · {} · {summary}", snapshot.distro)),
+                    Button::new("connections-wsl-progress-open")
+                        .small()
+                        .outline()
+                        .label(locale::text("Show progress", "查看进度", "檢視進度"))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.open_connections_wsl_progress_dialog(window, cx);
+                        })),
+                    stacked,
+                    cx,
+                )],
+            ));
+        }
 
         let rows = self.connections_rows();
         let list_rows = if rows.is_empty() {
@@ -92488,7 +93529,7 @@ impl FoundationSettings {
         // layer sits above every dialog backdrop and dismisses on a click, so
         // the probe, WSL and removal failures all travel that way instead.
         groups.push(SettingsGroup::with_leading(
-            locale::text("SSH connections", "SSH 连接", "SSH 連線"),
+            locale::text("Remote connections", "远程连接", "遠端連線"),
             leading,
             list_rows,
         ));
@@ -92496,9 +93537,9 @@ impl FoundationSettings {
         settings_page(
             locale::text("Remote instances", "远程实例", "遠端執行個體"),
             locale::text(
-                "Connect Vibex to a runtime on another machine over SSH.",
-                "通过 SSH 把 Vibex 连接到另一台机器上的运行时。",
-                "透過 SSH 把 Vibex 連線到另一台機器上的執行階段。",
+                "Connect Vibex to a runtime on another machine over SSH, or start one inside a local WSL2 distro.",
+                "通过 SSH 把 Vibex 连接到另一台机器上的运行时，或在本机 WSL2 发行版中启动一个运行时。",
+                "透過 SSH 把 Vibex 連線到另一台機器上的執行階段，或在本機 WSL2 發行版中啟動一個執行階段。",
             ),
             groups,
             cx,
@@ -92531,9 +93572,9 @@ impl FoundationSettings {
                     .text_color(muted),
             )
             .child(div().text_sm().font_semibold().child(locale::text(
-                "No SSH connections yet",
-                "还没有 SSH 连接",
-                "還沒有 SSH 連線",
+                "No remote connections yet",
+                "还没有远程连接",
+                "還沒有遠端連線",
             )))
             .child(
                 div()
@@ -92542,17 +93583,36 @@ impl FoundationSettings {
                     .text_xs()
                     .text_color(muted)
                     .child(locale::text(
-                        "Add a host to install, start, and pair a runtime over SSH.",
-                        "添加主机后，Vibex 会通过 SSH 安装、启动并配对运行时。",
-                        "新增主機後，Vibex 會透過 SSH 安裝、啟動並配對執行階段。",
+                        "Add a host to install, start, and pair a runtime over SSH, or start one inside a local WSL2 distro.",
+                        "添加主机后，Vibex 会通过 SSH 安装、启动并配对运行时；也可以在本机 WSL2 发行版中启动一个。",
+                        "新增主機後，Vibex 會透過 SSH 安裝、啟動並配對執行階段；也可以在本機 WSL2 發行版中啟動一個。",
                     )),
             )
-            .child(add)
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(add)
+                    .child(
+                        Button::new("connections-empty-add-wsl")
+                            .small()
+                            .outline()
+                            .icon(IconName::Plus)
+                            .label(locale::text(
+                                "Add WSL runtime",
+                                "添加 WSL 运行时",
+                                "新增 WSL 執行階段",
+                            ))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_connections_wsl_dialog(window, cx);
+                            })),
+                    ),
+            )
             .into_any_element()
     }
 
     fn connections_rows(&self) -> Vec<ConnectionDisplayRow> {
-        self.connections_profiles
+        let mut rows = self
+            .connections_profiles
             .iter()
             .map(|profile| ConnectionDisplayRow {
                 id: profile.id.clone(),
@@ -92563,8 +93623,32 @@ impl FoundationSettings {
                 port: profile.port,
                 version: profile.runtime_version.clone(),
                 status: self.connection_row_status(profile),
+                transport: ConnectionTransport::Ssh,
+                wsl_provisioning: false,
             })
-            .collect()
+            .collect::<Vec<_>>();
+        rows.extend(self.connections_wsl_profiles.iter().map(|profile| {
+            ConnectionDisplayRow {
+                id: profile.id.clone(),
+                name: profile.display_name.clone(),
+                alias: String::new(),
+                user: String::new(),
+                host: "WSL2".to_string(),
+                port: profile.remote_port,
+                // WSL profiles do not carry a version; the runtime manager
+                // is where an installed version can be inspected.
+                version: None,
+                status: self.connection_wsl_row_status(profile),
+                transport: ConnectionTransport::Wsl,
+                wsl_provisioning: self
+                    .connections_wsl_progress
+                    .as_ref()
+                    .is_some_and(|snapshot| {
+                        snapshot.distro == profile.distro && !snapshot.status.is_terminal()
+                    }),
+            }
+        }));
+        rows
     }
 
     /// Whether a saved connection is reachable right now.
@@ -92581,6 +93665,34 @@ impl FoundationSettings {
             .connections_snapshot
             .as_ref()
             .filter(|snapshot| snapshot.profile_id == profile.id)
+        {
+            match snapshot.status {
+                ProvisioningStatus::Running | ProvisioningStatus::Cancelling => {
+                    return ConnectionRowStatus::Connecting;
+                }
+                ProvisioningStatus::Failed => return ConnectionRowStatus::NeedsAttention,
+                ProvisioningStatus::Pending | ProvisioningStatus::Cancelled => {
+                    return ConnectionRowStatus::Offline;
+                }
+                ProvisioningStatus::Ready => {}
+            }
+        }
+        self.connections_live_status
+            .get(profile.id.as_str())
+            .copied()
+            .unwrap_or(ConnectionRowStatus::Offline)
+    }
+
+    /// Whether a saved WSL connection is reachable right now.
+    ///
+    /// A deployment in flight is `Connecting` even before its profile exists;
+    /// once the profile is saved, the workbench's live mirror takes over so
+    /// parking the runtime behind another authority reads Offline.
+    fn connection_wsl_row_status(&self, profile: &WslConnectionProfile) -> ConnectionRowStatus {
+        if let Some(snapshot) = self
+            .connections_wsl_progress
+            .as_ref()
+            .filter(|snapshot| snapshot.distro == profile.distro)
         {
             match snapshot.status {
                 ProvisioningStatus::Running | ProvisioningStatus::Cancelling => {
@@ -92764,15 +93876,18 @@ impl FoundationSettings {
         let version = div()
             .text_xs()
             .text_color(muted)
-            .child(match row.version.as_deref() {
-                Some(version) => format!("v{version}"),
-                None => locale::text("Not installed", "未安装", "未安裝").to_string(),
+            .child(match row.transport {
+                ConnectionTransport::Wsl => locale::text("WSL2", "WSL2", "WSL2").to_string(),
+                ConnectionTransport::Ssh => match row.version.as_deref() {
+                    Some(version) => format!("v{version}"),
+                    None => locale::text("Not installed", "未安装", "未安裝").to_string(),
+                },
             });
         // The row's primary action is the way back from every state a
         // connection can be stuck in: an unpaired profile retries
         // provisioning, a running one cancels, and a paired one reconnects to
         // the runtime it kept.
-        let primary_label = Self::connection_primary_label(row.status);
+        let primary_label = Self::connection_primary_label(row);
         let primary_id = row.id.clone();
         let primary_settings = settings.clone();
         let primary = Button::new(SharedString::from(format!(
@@ -92782,7 +93897,7 @@ impl FoundationSettings {
         .small()
         .outline()
         .label(primary_label)
-        .tooltip(Self::connection_primary_hint(row.status))
+        .tooltip(Self::connection_primary_hint(row))
         .on_click(move |_, window, cx| {
             let profile_id = primary_id.clone();
             let _ = primary_settings.update(cx, |this, cx| {
@@ -92792,6 +93907,8 @@ impl FoundationSettings {
         let remove_id = row.id.clone();
         let remove_name = row.name.clone();
         let remove_settings = settings.clone();
+        let wsl_menu = row.transport == ConnectionTransport::Wsl;
+        let wsl_in_flight = row.wsl_provisioning;
         let menu = Button::new(SharedString::from(format!("connections-{}-menu", row.id)))
             .small()
             .ghost()
@@ -92804,6 +93921,40 @@ impl FoundationSettings {
                 let remove_id = remove_id.clone();
                 let remove_name = remove_name.clone();
                 let remove_settings = remove_settings.clone();
+                if wsl_menu {
+                    let reconnect_id = remove_id.clone();
+                    let reconnect_settings = remove_settings.clone();
+                    let menu = menu.item(
+                        PopupMenuItem::new(locale::text("Reconnect", "重新连接", "重新連線"))
+                            .on_click(move |_, window, cx| {
+                                let profile_id = reconnect_id.clone();
+                                let _ = reconnect_settings.update(cx, |this, cx| {
+                                    this.run_connection_primary_action(profile_id, window, cx)
+                                });
+                            }),
+                    );
+                    // An in-flight deployment has no cancellable coordinator;
+                    // removing its profile would let the worker save it again
+                    // when it finishes. Keep the destructive item out until
+                    // the attempt is terminal.
+                    if wsl_in_flight {
+                        return menu;
+                    }
+                    return menu.separator().item(
+                        PopupMenuItem::new(locale::text("Remove", "移除", "移除")).on_click(
+                            move |_, window, cx| {
+                                let _ = remove_settings.update(cx, |this, cx| {
+                                    this.confirm_remove_wsl_connection(
+                                        remove_id.clone(),
+                                        remove_name.clone(),
+                                        window,
+                                        cx,
+                                    )
+                                });
+                            },
+                        ),
+                    );
+                }
                 let edit_id = remove_id.clone();
                 let edit_settings = remove_settings.clone();
                 let reconnect_id = remove_id.clone();
@@ -92890,6 +94041,9 @@ impl FoundationSettings {
     }
 
     fn connection_detail(row: &ConnectionDisplayRow) -> String {
+        if row.transport == ConnectionTransport::Wsl {
+            return format!("{} · port {}", row.host, row.port);
+        }
         if row.alias.is_empty() {
             format!("{}@{}:{}", row.user, row.host, row.port)
         } else {
@@ -92917,8 +94071,20 @@ impl FoundationSettings {
         }
     }
 
-    fn connection_primary_label(status: ConnectionRowStatus) -> &'static str {
-        match status {
+    fn connection_primary_label(row: &ConnectionDisplayRow) -> &'static str {
+        if row.transport == ConnectionTransport::Wsl {
+            if row.wsl_provisioning {
+                return locale::text("Show progress", "查看进度", "檢視進度");
+            }
+            return match row.status {
+                ConnectionRowStatus::Connected => locale::text("Reconnect", "重新连接", "重新連線"),
+                ConnectionRowStatus::NeedsAttention => locale::text("Retry", "重试", "重試"),
+                ConnectionRowStatus::Offline | ConnectionRowStatus::Connecting => {
+                    locale::text("Connect", "连接", "連線")
+                }
+            };
+        }
+        match row.status {
             ConnectionRowStatus::Connected => locale::text("Reconnect", "重新连接", "重新連線"),
             ConnectionRowStatus::Offline => locale::text("Connect", "连接", "連線"),
             ConnectionRowStatus::NeedsAttention => locale::text("Fix", "修复", "修復"),
@@ -92926,8 +94092,34 @@ impl FoundationSettings {
         }
     }
 
-    fn connection_primary_hint(status: ConnectionRowStatus) -> &'static str {
-        match status {
+    fn connection_primary_hint(row: &ConnectionDisplayRow) -> &'static str {
+        if row.transport == ConnectionTransport::Wsl {
+            if row.wsl_provisioning {
+                return locale::text(
+                    "Open the WSL runtime setup progress.",
+                    "打开 WSL 运行时配置进度。",
+                    "開啟 WSL 執行階段設定進度。",
+                );
+            }
+            return match row.status {
+                ConnectionRowStatus::Connected => locale::text(
+                    "Restore this WSL runtime and make it authoritative.",
+                    "恢复该 WSL 运行时并使其成为当前运行时。",
+                    "恢復該 WSL 執行階段並使其成為目前執行階段。",
+                ),
+                ConnectionRowStatus::NeedsAttention => locale::text(
+                    "Retry the WSL runtime setup.",
+                    "重试 WSL 运行时配置。",
+                    "重試 WSL 執行階段設定。",
+                ),
+                ConnectionRowStatus::Offline | ConnectionRowStatus::Connecting => locale::text(
+                    "Start this WSL runtime and connect to it.",
+                    "启动该 WSL 运行时并连接。",
+                    "啟動該 WSL 執行階段並連線。",
+                ),
+            };
+        }
+        match row.status {
             ConnectionRowStatus::Connected => locale::text(
                 "Reconnect and make this runtime authoritative.",
                 "重新连接并使该运行时成为当前运行时。",
@@ -92953,22 +94145,40 @@ impl FoundationSettings {
 
     /// Runs a row's primary action for the state the row is in.
     ///
-    /// A running run cancels; every other state reconnects. The button is the
-    /// connection's own action now, not a way into the provisioning dialog: a
-    /// paired profile restores its tunnel and client, and an unpaired one
-    /// provisions from the start.
+    /// A running SSH run cancels; every other state reconnects. The button is
+    /// the connection's own action now, not a way into the provisioning dialog:
+    /// a paired profile restores its tunnel and client, and an unpaired one
+    /// provisions from the start. A WSL deployment in flight opens its progress
+    /// instead, because WSL has no cancellable coordinator to hand the click to.
     fn run_connection_primary_action(
         &mut self,
         profile_id: String,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let status = self
+        let row = self
             .connections_rows()
             .into_iter()
-            .find(|row| row.id == profile_id)
-            .map(|row| row.status);
-        if status == Some(ConnectionRowStatus::Connecting) {
+            .find(|row| row.id == profile_id);
+        let Some(row) = row else {
+            return;
+        };
+        if row.transport == ConnectionTransport::Wsl {
+            if row.wsl_provisioning {
+                self.open_connections_wsl_progress_dialog(window, cx);
+                return;
+            }
+            let pending = profile_id.clone();
+            let workbench = self.workbench.clone();
+            cx.defer(move |cx| {
+                let _ = workbench.update(cx, |workbench, cx| {
+                    workbench.connect_wsl_connection(pending, cx)
+                });
+            });
+            cx.notify();
+            return;
+        }
+        if row.status == ConnectionRowStatus::Connecting {
             let workbench = self.workbench.clone();
             cx.defer(move |cx| {
                 let _ = workbench.update(cx, |workbench, cx| workbench.cancel_ssh_provisioning(cx));
@@ -119643,6 +120853,90 @@ mod tests {
             dialog.contains("connections-wsl-retry"),
             "a failed read can be retried without reopening the dialog"
         );
+    }
+
+    /// A WSL deployment shows its progress and lands in the instance list.
+    ///
+    /// The click used to close the add dialog and change nothing on screen
+    /// while `wsl.exe` installed, started and paired the runtime; the first
+    /// visible sign was the runtime appearing in the title-bar switcher minutes
+    /// later. The deployment now owns a progress snapshot and a closable
+    /// dialog, and its finished profile is listed beside the SSH connections.
+    #[test]
+    fn a_wsl_deployment_reports_progress_and_joins_the_remote_instance_list() {
+        let source = include_str!("app.rs");
+        assert!(source.contains("enum WslProvisioningStep"));
+        assert!(source.contains("provision_with_progress"));
+        assert!(source.contains("publish_wsl_provisioning_stage"));
+
+        let start = source
+            .split_once("    fn provision_wsl_distro(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// Copies the latest deployment stage"))
+            .map(|(body, _)| body)
+            .expect("the WSL deployment should remain inspectable");
+        assert!(
+            start.contains("open_wsl_progress_dialog(cx)"),
+            "the click that starts the deployment opens its progress"
+        );
+        assert!(
+            start.contains("WslProvisioningSnapshot::running"),
+            "the snapshot exists before the worker reports its first stage"
+        );
+        assert!(
+            start.contains("publish_wsl_provisioning_stage"),
+            "the task publishes each stage the dialog paints"
+        );
+        assert!(
+            start.contains("provision_with_progress"),
+            "the install/start/pair window reports where it is"
+        );
+        assert!(
+            start.contains("settings.reload_connections_profiles()"),
+            "a connected distro has to appear in the list immediately"
+        );
+
+        let dialog = source
+            .split_once("    fn open_connections_wsl_progress_dialog(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// Records that the reader closed the WSL progress dialog")
+            })
+            .map(|(body, _)| body)
+            .expect("the WSL progress dialog should remain inspectable");
+        assert!(
+            dialog.contains("connections-wsl-progress-close"),
+            "the dialog can be dismissed without cancelling the deployment"
+        );
+        assert!(
+            dialog.contains("connections-wsl-progress-retry"),
+            "a failed deployment can be retried from its dialog"
+        );
+        let body = source
+            .split_once("    fn connections_wsl_progress_body(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// One provisioning attempt"))
+            .map(|(body, _)| body)
+            .expect("the WSL progress body should remain inspectable");
+        assert!(
+            body.contains("WslProvisioningStep::ALL"),
+            "the dialog draws one segment per WSL step"
+        );
+
+        let rows = source
+            .split_once("    fn connections_rows(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// Whether a saved connection is reachable")
+            })
+            .map(|(body, _)| body)
+            .expect("the connection rows should remain inspectable");
+        assert!(
+            rows.contains("self.connections_wsl_profiles"),
+            "WSL profiles are listed with the SSH connections"
+        );
+        assert!(
+            rows.contains("ConnectionTransport::Wsl"),
+            "a WSL row can render its own detail and actions"
+        );
+        assert!(source.contains("fn remove_wsl_connection("));
+        assert!(source.contains("fn connect_wsl_connection("));
     }
 
     /// Provisioning is a dialog the reader can close, not a page section.

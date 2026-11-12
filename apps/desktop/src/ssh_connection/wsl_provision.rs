@@ -67,6 +67,22 @@ impl fmt::Display for WslProvisionError {
 
 impl std::error::Error for WslProvisionError {}
 
+/// Where a running [`WslProvisioner::provision_with_progress`] has reached.
+///
+/// The workbench forwards these to the Connections progress dialog, so a WSL
+/// deployment that spends minutes in the installer or the health wait reports
+/// what it is doing instead of looking inert after the click.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WslProvisionStage {
+    ProbingEnvironment,
+    InstallingRuntime,
+    StartingRuntime,
+    WaitingForForwarding,
+    Pairing,
+    Connecting,
+    Ready,
+}
+
 #[derive(Debug, Clone)]
 pub struct WslProvisioner {
     program: PathBuf,
@@ -293,6 +309,21 @@ impl WslProvisioner {
         artifact: &LocalArtifact,
         now_ms: i64,
     ) -> Result<WslProvisionOutcome, WslProvisionError> {
+        self.provision_with_progress(artifact, now_ms, |_| {}).await
+    }
+
+    /// [`Self::provision`] while reporting the stage it has reached.
+    ///
+    /// The callback runs on the provisioning task, so it must stay cheap: the
+    /// workbench only records the latest stage and lets a foreground poller
+    /// paint it.
+    pub async fn provision_with_progress(
+        &self,
+        artifact: &LocalArtifact,
+        now_ms: i64,
+        mut on_stage: impl FnMut(WslProvisionStage),
+    ) -> Result<WslProvisionOutcome, WslProvisionError> {
+        on_stage(WslProvisionStage::ProbingEnvironment);
         let environment = self.probe()?;
         if environment.free_kb < MIN_FREE_KB {
             return Err(WslProvisionError::new(
@@ -300,8 +331,11 @@ impl WslProvisioner {
                 "the WSL distro does not have enough free disk",
             ));
         }
+        on_stage(WslProvisionStage::InstallingRuntime);
         self.install(artifact)?;
+        on_stage(WslProvisionStage::StartingRuntime);
         let (keepalive, _) = self.start_foreground()?;
+        on_stage(WslProvisionStage::WaitingForForwarding);
         let deadline = Instant::now() + FORWARDING_DEADLINE;
         while !localhost_forwarded(self.launch.remote_port) {
             if Instant::now() >= deadline {
@@ -312,7 +346,9 @@ impl WslProvisioner {
             }
             std::thread::sleep(Duration::from_millis(300));
         }
+        on_stage(WslProvisionStage::Pairing);
         let pairing = self.pair(now_ms).await?;
+        on_stage(WslProvisionStage::Connecting);
         let backend = pairing
             .credential
             .backend()
@@ -327,6 +363,7 @@ impl WslProvisioner {
         store
             .save(&registry)
             .map_err(|error| WslProvisionError::new("wsl_registry_failed", error.message))?;
+        on_stage(WslProvisionStage::Ready);
         Ok(WslProvisionOutcome {
             pairing,
             backend,

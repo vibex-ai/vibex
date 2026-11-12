@@ -109,6 +109,11 @@ environment, not a remote Windows host. No sshd and no SSH keys are involved.
 1. Install WSL2 and at least one distro (`wsl --install`).
 2. Settings → Remote instances → **Add WSL runtime**, pick the distro, and choose
    **Connect WSL**.
+3. The **WSL runtime setup** dialog reports each step — distro check, manifest,
+   runtime download, install, start, forwarding, pairing, connect — and keeps
+   running if you close it. The connection stays listed under **Remote
+   connections** with its live status, so a failed attempt can be retried or
+   inspected from there.
 
 Vibex runs the Linux x86_64 artifact inside the distro through `wsl.exe`,
 installs it under the distro user's `~/.local/share/vibex/server`, and reaches
