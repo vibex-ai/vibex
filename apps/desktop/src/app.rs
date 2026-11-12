@@ -46615,7 +46615,7 @@ impl VibexWorkbench {
     }
 
     fn right_rail_panel_open(&self) -> bool {
-        if self.child_agent_panel_active {
+        if self.child_agent_panel_active || self.right_rail_script_panel.is_some() {
             return if self.last_visibility.right_rail_docked {
                 self.ui_state.workbench.right_rail_visible
             } else {
@@ -46660,8 +46660,8 @@ impl VibexWorkbench {
             // The rail owns its element tree: see [`ChildAgentRailView`]. It is
             // embedded here rather than built inline because everything the rail
             // mounts that animates would otherwise repaint the whole workbench.
-            return self
-                .ensure_child_agent_rail_view(cx)
+            let view = self.ensure_child_agent_rail_view(cx);
+            return view
                 .cached(StyleRefinement::default().size_full())
                 .into_any_element();
         }
