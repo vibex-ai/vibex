@@ -15008,11 +15008,9 @@ impl VibexWorkbench {
     /// the release therefore leaves the user's open/closed choice alone.
     fn sync_update_panel(&mut self, cx: &mut Context<Self>) {
         let has_release = self.update_snapshot.state.release().is_some();
-        if !has_release || !self.update_surfaces_enabled() {
-            if self.update_panel_open {
-                self.update_panel_open = false;
-                cx.notify();
-            }
+        if (!has_release || !self.update_surfaces_enabled()) && self.update_panel_open {
+            self.update_panel_open = false;
+            cx.notify();
         }
         if !has_release {
             self.update_auto_download_version = None;
