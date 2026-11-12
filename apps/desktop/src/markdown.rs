@@ -43,8 +43,9 @@ pub(crate) fn timeline_text_motion(streaming: bool) -> gpui_base::text::TextView
     })
 }
 pub use vibex_ui::markdown::{
-    MarkdownResource, base_path_for_file, escape_markdown_literal, plain_text,
-    resolve_workspace_path, resources, utf8_prefix,
+    MarkdownLinkKind, MarkdownResource, base_path_for_file, escape_markdown_literal, is_file_url,
+    is_windows_drive_path, markdown_link_kind, plain_text, resolve_workspace_path, resources,
+    utf8_prefix,
 };
 
 /// The largest embedded image a preview decodes, matching the previous

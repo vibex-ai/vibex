@@ -207,9 +207,10 @@ use vibex_ui::{
 };
 
 use crate::markdown::{
-    MarkdownPresentation, RangeHighlight, RenderedText, TextView, TextViewState,
-    escape_markdown_literal, plain_text as markdown_plain_text, resolve_workspace_path,
-    resources as markdown_resources, text_view_style, utf8_prefix,
+    MarkdownLinkKind, MarkdownPresentation, RangeHighlight, RenderedText, TextView, TextViewState,
+    escape_markdown_literal, is_file_url, is_windows_drive_path, markdown_link_kind,
+    plain_text as markdown_plain_text, resolve_workspace_path, resources as markdown_resources,
+    text_view_style, utf8_prefix,
 };
 use crate::typography::{apply_code_font_weight, apply_terminal_visuals, code_font_weight};
 
@@ -38086,21 +38087,30 @@ impl VibexWorkbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if url.starts_with('#') {
-            return;
-        }
-        if let Ok(parsed) = url::Url::parse(url) {
-            if matches!(parsed.scheme(), "http" | "https") {
+        match markdown_link_kind(url) {
+            MarkdownLinkKind::Web => {
                 self.open_web_link(url, window, cx);
+                return;
+            }
+            MarkdownLinkKind::Unsupported => return,
+            MarkdownLinkKind::Local => {}
+        }
+        let workspace_root = self
+            .selected_session()
+            .map(|session| session.workspace_root.as_str());
+        // A `file:` URL or a Windows drive path is a platform path, not a
+        // workspace link: the first parses as its own scheme and the second as
+        // a one-letter scheme, and `resolve_workspace_path` rejects the drive's
+        // `:`. Both are handed to the resolver that compares real paths.
+        if is_file_url(url) || is_windows_drive_path(url) {
+            if let Some(target) = agent_file_operation_preview_path(url, workspace_root) {
+                self.open_code_file(target, window, cx);
             }
             return;
         }
         let Some(resolved) = resolve_workspace_path(base_path, url) else {
             return;
         };
-        let workspace_root = self
-            .selected_session()
-            .map(|session| session.workspace_root.as_str());
         if let Some(target) = agent_markdown_preview_path(url, &resolved, workspace_root) {
             self.open_code_file(target, window, cx);
         }
