@@ -216,8 +216,13 @@ impl MarketCatalog {
                 }
             }
         }
+        let index = PluginIndexFile::parse(&raw)?;
         let _ = self.config.cache.write_index(&raw, &signature);
-        PluginIndexFile::parse(&raw)
+        let _ = self
+            .config
+            .cache
+            .write_publisher_keys(&index.publisher_keys);
+        Ok(index)
     }
 
     /// Builds one plugin's detail page from the cached catalog.

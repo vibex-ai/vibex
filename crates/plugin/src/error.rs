@@ -77,6 +77,10 @@ pub enum PluginError {
     NoCatalog,
     #[error("the plugin package does not carry a manifest")]
     MissingManifest,
+    #[error("the scripting host refused the plugin: {0}")]
+    Host(String),
+    #[error("the scripting host is not part of this build")]
+    HostUnavailable,
     #[error("the operation was cancelled")]
     Cancelled,
 }
@@ -105,6 +109,8 @@ impl From<PluginError> for VibexError {
             PluginError::NotFound(_) => "plugin_not_found",
             PluginError::NoCatalog => "plugin_market_unavailable",
             PluginError::MissingManifest => "plugin_manifest_missing",
+            PluginError::Host(_) => "plugin_host_rejected",
+            PluginError::HostUnavailable => "plugin_host_unavailable",
             PluginError::Cancelled => "plugin_cancelled",
         };
         let category = match &error {
@@ -121,6 +127,7 @@ impl From<PluginError> for VibexError {
             | PluginError::BuiltinConflict(_)
             | PluginError::Yanked(_) => ErrorCategory::Permission,
             PluginError::AlreadyInstalled(_) => ErrorCategory::Conflict,
+            PluginError::Host(_) | PluginError::HostUnavailable => ErrorCategory::Process,
             PluginError::Network(_) | PluginError::ResponseTooLarge | PluginError::NoCatalog => {
                 ErrorCategory::Provider
             }

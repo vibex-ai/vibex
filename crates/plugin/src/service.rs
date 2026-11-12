@@ -181,6 +181,29 @@ impl PluginService {
         Ok(plugins)
     }
 
+    /// Every contribution the enabled plugins make, in catalog order.
+    ///
+    /// A contribution from a plugin the user turned off is left out here rather
+    /// than filtered by each surface: the rail draws what this returns and the
+    /// Plugins page is the one place that decides.
+    pub fn contributions(
+        &self,
+        conn: &rusqlite::Connection,
+    ) -> VibexResult<Vec<PluginContribution>> {
+        let mut contributions = Vec::new();
+        for record in PluginRepository::list(conn)? {
+            if !record.enabled {
+                continue;
+            }
+            contributions.extend(
+                PluginRepository::list_contributions(conn, &record.plugin_id)?
+                    .into_iter()
+                    .filter(|contribution| contribution.enabled),
+            );
+        }
+        Ok(contributions)
+    }
+
     /// Enables or disables a plugin.
     pub fn set_enabled(
         &self,
@@ -208,7 +231,7 @@ impl PluginService {
             if !self.store.has_version(plugin_id, &version) {
                 return Err(PluginError::NotInstalled(plugin_id.to_string()).into());
             }
-            let loaded = self.loaded_plugin(plugin_id, &version)?;
+            let loaded = self.loaded_plugin_with_grants(&record)?;
             self.runtime.load(&loaded).map_err(VibexError::from)?;
             self.store
                 .activate(plugin_id, &version)
@@ -373,17 +396,39 @@ impl PluginService {
         }
 
         let bytes = self.download_package(&entry, &version).await?;
-        let signature_status = if entry.listing_source == PluginListingSource::Index {
+        // A publisher signature is verified against the key the signed index
+        // vouches for; only then does the install count as `Verified`.
+        let mut signature_status = if entry.listing_source == PluginListingSource::Index {
             "verified".to_string()
         } else {
             "unsigned".to_string()
         };
-        let trusted = entry.trust;
-        let source = if entry.listing_source == PluginListingSource::Index {
-            PluginSource::Market
-        } else {
-            PluginSource::Market
-        };
+        let mut trusted = entry.trust;
+        if let Some(signature) = &version.signature {
+            let keys = self
+                .market
+                .config()
+                .cache
+                .read_publisher_keys()
+                .unwrap_or_default();
+            let key = keys
+                .iter()
+                .find(|key| key.key_id == signature.key_id)
+                .ok_or(PluginError::SignatureInvalid)?;
+            crate::market::index::verify_package_signature(
+                &key.public_key,
+                &signature.signature,
+                &bytes,
+            )
+            .map_err(VibexError::from)?;
+            signature_status = "publisher-verified".to_string();
+            if entry.listing_source == PluginListingSource::Index
+                && trusted != PluginTrust::Official
+            {
+                trusted = PluginTrust::Verified;
+            }
+        }
+        let source = PluginSource::Market;
         self.finish_install(
             &conn,
             &entry,
@@ -631,7 +676,9 @@ impl PluginService {
             self.store
                 .activate(&entry.id, &version.version)
                 .map_err(VibexError::from)?;
-            let loaded = self.loaded_plugin(&entry.id, &version.version)?;
+            let stored = PluginRepository::get(conn, &entry.id)?
+                .ok_or_else(|| PluginError::NotInstalled(entry.id.clone()))?;
+            let loaded = self.loaded_plugin_with_grants(&stored)?;
             if let Err(error) = self.runtime.load(&loaded) {
                 let _ = self.store.recover_pending();
                 PluginRepository::set_status(
@@ -827,7 +874,32 @@ impl PluginService {
             version: version.to_string(),
             directory: self.store.version_dir(plugin_id, version),
             data_directory: self.store.data_dir(plugin_id),
+            granted_permissions: Vec::new(),
         })
+    }
+
+    /// The record plus the permissions the user approved, ready for the host.
+    ///
+    /// The installer asked for consent; the host asks once more, with the
+    /// approved list in hand, because the version directory is ordinary files
+    /// a third party could have rewritten since.
+    fn loaded_plugin_with_grants(&self, record: &PluginRecord) -> VibexResult<LoadedPlugin> {
+        let mut loaded = self.loaded_plugin(&record.plugin_id, &record.version)?;
+        loaded.granted_permissions = record
+            .granted_permissions
+            .iter()
+            .map(|grant| grant.key.clone())
+            .collect();
+        if loaded.granted_permissions.is_empty() {
+            // A record that predates consent storage has not been approved for
+            // anything; the manifest's own request is the only honest answer.
+            loaded.granted_permissions = record
+                .permissions
+                .iter()
+                .map(|permission| permission.key.clone())
+                .collect();
+        }
+        Ok(loaded)
     }
 
     async fn download_package(
@@ -1007,6 +1079,60 @@ mod tests {
                 .store()
                 .version_dir("acme.widgets", "1.0.0")
                 .exists()
+        );
+    }
+
+    /// The rail draws the catalog, so the catalog has to answer with the
+    /// enabled plugins' contributions and nothing else.
+    #[test]
+    fn contributions_follow_the_enable_switch() {
+        let directory = tempfile::tempdir().unwrap();
+        let service = service(directory.path());
+        let connection = connection();
+        service.seed_native_plugins(&connection).unwrap();
+
+        // Read the descriptor rather than restating it: the test is about which
+        // rows come back, not about the first-party ids themselves.
+        let contribution = |plugin_id: &str| {
+            let descriptor = crate::native::BUILTIN_NATIVE_PLUGINS
+                .iter()
+                .find(|descriptor| descriptor.plugin_id == plugin_id)
+                .expect("a first-party plugin");
+            let activity = descriptor
+                .right_rail_activity()
+                .expect("the plugin contributes a rail activity");
+            PluginContribution {
+                plugin_id: plugin_id.to_string(),
+                kind: activity.kind.to_string(),
+                contribution_id: activity.contribution_id.to_string(),
+                title: Some(activity.title.to_string()),
+                enabled: true,
+            }
+        };
+        let enabled = service.contributions(&connection).unwrap();
+        assert!(enabled.contains(&contribution("vibex.system.git")));
+
+        service
+            .set_enabled(&connection, "vibex.system.git", false)
+            .unwrap();
+        let enabled = service.contributions(&connection).unwrap();
+        assert!(
+            !enabled
+                .iter()
+                .any(|candidate| candidate.plugin_id == "vibex.system.git"),
+            "a disabled plugin must not contribute to the rail"
+        );
+        assert!(enabled.contains(&contribution("vibex.system.files")));
+
+        // Re-enabling puts it back without a restart.
+        service
+            .set_enabled(&connection, "vibex.system.git", true)
+            .unwrap();
+        assert!(
+            service
+                .contributions(&connection)
+                .unwrap()
+                .contains(&contribution("vibex.system.git"))
         );
     }
 

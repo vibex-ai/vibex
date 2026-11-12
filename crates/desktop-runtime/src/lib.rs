@@ -25,7 +25,7 @@ mod storage;
 mod terminal_observation;
 mod timeline_display_settings;
 mod usage;
-pub use plugins::PluginHandle;
+pub use plugins::{PluginHandle, install_plugin_runtime};
 mod vibex_use;
 mod workbench;
 mod worktree;

@@ -28,6 +28,7 @@ pub mod pdf_surface;
 mod pdf_worker;
 pub mod performance_log;
 pub mod platform;
+pub mod plugin_host;
 pub mod primitives;
 pub mod remote_access_pairing;
 pub mod remote_client;

@@ -26,6 +26,13 @@ pub const VERSIONS_DIR: &str = "plugin-versions";
 pub const DATA_DIR: &str = "plugin-data";
 pub const STAGING_DIR: &str = "plugin-tmp";
 pub const PENDING_FILE: &str = ".pending-install.json";
+/// The directories the scripting host adds below the data home it is given.
+///
+/// The host is pointed at [`DATA_DIR`] and stores a plugin's `localStorage`
+/// under `gpui-shell/plugins/<id>`; naming the suffix here keeps
+/// [`PluginStore::host_data_dir`] honest without pulling the host crate into
+/// this one.
+pub const HOST_DATA_SUFFIX: &str = "gpui-shell/plugins";
 
 /// The marker written before an install becomes visible.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -99,6 +106,16 @@ impl PluginStore {
 
     pub fn data_dir(&self, plugin_id: &str) -> PathBuf {
         self.data_root().join(plugin_id)
+    }
+
+    /// Where the scripting host keeps a plugin's own storage.
+    ///
+    /// The host is given [`DATA_DIR`] as its data home and appends
+    /// `gpui-shell/plugins/<id>`, so this is that path. It sits inside
+    /// [`Self::data_dir`]'s parent, which is how uninstalling a plugin removes
+    /// its `localStorage` with nothing left behind.
+    pub fn host_data_dir(&self, plugin_id: &str) -> PathBuf {
+        self.data_root().join(HOST_DATA_SUFFIX).join(plugin_id)
     }
 
     pub fn pending_path(&self) -> PathBuf {
@@ -228,18 +245,19 @@ impl PluginStore {
         Ok(removed)
     }
 
-    /// Removes a plugin's own data directory.
+    /// Removes a plugin's own data directory and the host storage beside it.
     pub fn remove_data(&self, plugin_id: &str) -> Result<(), PluginError> {
-        let directory = self.data_dir(plugin_id);
-        if directory.exists() {
-            std::fs::remove_dir_all(&directory)?;
+        for directory in [self.data_dir(plugin_id), self.host_data_dir(plugin_id)] {
+            if directory.exists() {
+                std::fs::remove_dir_all(&directory)?;
+            }
         }
         Ok(())
     }
 
-    /// The bytes a plugin's data occupies.
+    /// The bytes a plugin's data occupies, host storage included.
     pub fn data_size(&self, plugin_id: &str) -> u64 {
-        directory_size(&self.data_dir(plugin_id))
+        directory_size(&self.data_dir(plugin_id)) + directory_size(&self.host_data_dir(plugin_id))
     }
 
     /// Writes the pending marker.

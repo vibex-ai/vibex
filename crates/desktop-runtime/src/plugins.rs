@@ -1,8 +1,10 @@
 //! The desktop's plugin handle: opens a connection and calls the service.
 //!
-//! The scripting host is not linked here yet; the service is built with a
-//! [`vibex_plugin::NullRuntime`], so packages install and are managed exactly
-//! as they will be when the host is wired, and loading becomes a no-op.
+//! The scripting host itself lives in the desktop binary, because it is UI
+//! state on the UI thread. It registers its runtime through
+//! [`install_plugin_runtime`]; a build without one (the TUI, the headless
+//! server, the isolated test runtimes) keeps [`vibex_plugin::NullRuntime`] and
+//! manages packages without executing them.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -25,6 +27,28 @@ use vibex_plugin::{
 /// The default index address.
 pub const DEFAULT_PLUGIN_INDEX: &str = "https://plugins.peatboy.com/index.json";
 
+/// The runtime the desktop installs once its scripting host is up.
+///
+/// The market crate cannot name the host, so the binary hands it over here. It
+/// is process-wide because the host is: one window, one VM, one grant per
+/// plugin. Until it is set, every script load reports `plugin_host_unavailable`
+/// and the rest of the plugin management still works.
+static RUNTIME: OnceLock<Arc<dyn PluginRuntime>> = OnceLock::new();
+
+/// Installs the scripting host the plugin service will call.
+pub fn install_plugin_runtime(
+    runtime: Arc<dyn PluginRuntime>,
+) -> Result<(), Arc<dyn PluginRuntime>> {
+    RUNTIME.set(runtime)
+}
+
+fn installed_runtime() -> Arc<dyn PluginRuntime> {
+    RUNTIME
+        .get()
+        .cloned()
+        .unwrap_or_else(|| Arc::new(NullRuntime))
+}
+
 /// A handle that resolves the plugin service for one installation.
 #[derive(Clone)]
 pub struct PluginHandle {
@@ -36,7 +60,7 @@ impl PluginHandle {
     pub fn new(database_path: PathBuf) -> Self {
         Self {
             database_path,
-            runtime: Arc::new(NullRuntime),
+            runtime: installed_runtime(),
         }
     }
 
@@ -107,6 +131,15 @@ impl PluginHandle {
 
     pub fn list(&self) -> VibexResult<Vec<InstalledPlugin>> {
         self.service().list(&self.connection()?)
+    }
+
+    /// Every contribution the enabled plugins make.
+    ///
+    /// The right rail reads this instead of a compile-time list of panels, so a
+    /// plugin installed from the market appears beside the first-party ones and
+    /// one turned off in the Plugins page disappears.
+    pub fn contributions(&self) -> VibexResult<Vec<vibex_core::PluginContribution>> {
+        self.service().contributions(&self.connection()?)
     }
 
     pub fn set_enabled(&self, request: PluginEnabledRequest) -> VibexResult<InstalledPlugin> {

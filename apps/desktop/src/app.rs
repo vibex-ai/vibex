@@ -137,10 +137,10 @@ use vibex_core::{
     GitWorktreeDiscardRequest, GitWorktreeOperationRecord, GitWorktreeOperationStatus, GoalAction,
     GoalPhase, GroupPresentationCommand, GroupPresentationReply, MessageAttachment,
     MessageSubmissionState, MessageSubmissionStatus, OpenWorkspaceRequest, PermissionResolution,
-    PermissionResponseKind, PlanStepStatus, PresentationActivationPolicy, PresentationState,
-    ProjectId, ProjectRecord, PromptId, PromptUsageRecordRequest, ProviderProfileSummary,
-    RcImportPayload, RenameAgentSessionRequest, ReplaceUserMessagePayload, RequestId,
-    ResolvePermissionRequest, RuntimeAuthSource, RuntimeAuthSourceAvailability,
+    PermissionResponseKind, PlanStepStatus, PluginContribution, PresentationActivationPolicy,
+    PresentationState, ProjectId, ProjectRecord, PromptId, PromptUsageRecordRequest,
+    ProviderProfileSummary, RcImportPayload, RenameAgentSessionRequest, ReplaceUserMessagePayload,
+    RequestId, ResolvePermissionRequest, RuntimeAuthSource, RuntimeAuthSourceAvailability,
     RuntimeAuthSourceKind, RuntimeAuthSourceSummary, RuntimeClientId, RuntimeLeaseRole,
     RuntimeModelSelection, RuntimeSelectionInteraction, SendAgentMessageRequest,
     SessionRuntimeFeature, SessionRuntimeFeatureKind, SessionRuntimeOption,
@@ -4125,16 +4125,6 @@ fn right_rail_activity_id(mode: RightRailMode) -> &'static str {
     }
 }
 
-/// The first-party plugin that owns a rail activity.
-fn right_rail_plugin_id(activity: RightRailActivity) -> Option<&'static str> {
-    match activity {
-        RightRailActivity::Editor => Some("vibex.system.editor"),
-        RightRailActivity::Files => Some("vibex.system.files"),
-        RightRailActivity::Git => Some("vibex.system.git"),
-        RightRailActivity::ChildAgents => Some("vibex.system.child-agents"),
-    }
-}
-
 fn route_right_rail_activity_id(value: &str) -> Option<String> {
     match value.trim() {
         "" => None,
@@ -4197,6 +4187,70 @@ impl RightRailActivity {
     }
 }
 
+/// One button the rail draws.
+///
+/// A built-in panel is compiled into the application; a script panel belongs to
+/// a plugin installed from the market. Both reach the bar the same way — through
+/// the plugin catalog's `right_rail_activity` contributions — so the bar no
+/// longer has a second, hard-coded list of what may appear on it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RightRailEntry {
+    Builtin(RightRailActivity),
+    Script {
+        plugin_id: String,
+        contribution_id: String,
+        title: String,
+    },
+}
+
+impl RightRailEntry {
+    /// The key the persisted order stores.
+    fn id(&self) -> &str {
+        match self {
+            Self::Builtin(activity) => activity.id(),
+            Self::Script {
+                contribution_id, ..
+            } => contribution_id,
+        }
+    }
+
+    fn builtin(&self) -> Option<RightRailActivity> {
+        match self {
+            Self::Builtin(activity) => Some(*activity),
+            Self::Script { .. } => None,
+        }
+    }
+
+    fn icon(&self) -> Icon {
+        match self {
+            Self::Builtin(activity) => activity.icon(),
+            // A script panel has no compiled-in glyph; the frame mark says
+            // "this is a plugin surface" without guessing at its brand.
+            Self::Script { .. } => Icon::new(IconName::Frame),
+        }
+    }
+
+    fn plugin_id(&self) -> Option<&str> {
+        match self {
+            Self::Builtin(_) => None,
+            Self::Script { plugin_id, .. } => Some(plugin_id),
+        }
+    }
+
+    fn title(&self) -> Option<&str> {
+        match self {
+            Self::Builtin(_) => None,
+            Self::Script { title, .. } => Some(title),
+        }
+    }
+}
+
+impl From<RightRailActivity> for RightRailEntry {
+    fn from(activity: RightRailActivity) -> Self {
+        Self::Builtin(activity)
+    }
+}
+
 /// Which side of the button under the pointer a dragged activity would land on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RightRailActivityDropPosition {
@@ -4207,14 +4261,14 @@ enum RightRailActivityDropPosition {
 /// The place a dragged activity button would land.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct RightRailActivityDropTarget {
-    activity: RightRailActivity,
+    activity: RightRailEntry,
     position: RightRailActivityDropPosition,
 }
 
 /// An activity button being dragged along the bar.
 #[derive(Clone)]
 struct RightRailActivityDrag {
-    activity: RightRailActivity,
+    activity: RightRailEntry,
 }
 
 impl Render for RightRailActivityDrag {
@@ -4264,32 +4318,101 @@ fn right_rail_activity_drop_line(position: RightRailActivityDropPosition, cx: &A
 /// The persisted order leads; a button it does not name — a fresh install, or
 /// one that predates the button — keeps its built-in place after the named
 /// ones.
-fn resolved_right_rail_activity_order(persisted: &[String]) -> Vec<RightRailActivity> {
-    let mut order = Vec::with_capacity(RightRailActivity::ALL.len());
+fn resolved_right_rail_activity_order(persisted: &[String]) -> Vec<RightRailEntry> {
+    resolved_right_rail_entries(persisted, RightRailActivity::ALL)
+}
+
+/// The catalog's activities in the reader's order.
+///
+/// `available` is what the catalog currently contributes, so a button the
+/// persisted order names but the catalog no longer offers — a plugin that was
+/// uninstalled, or one this build has no panel for — is dropped rather than
+/// drawn as a dead button. An id the persisted order does not mention keeps the
+/// catalog's own order after the ones it does.
+fn resolved_right_rail_entries(
+    persisted: &[String],
+    available: impl IntoIterator<Item = RightRailActivity>,
+) -> Vec<RightRailEntry> {
+    let available = available.into_iter().collect::<Vec<_>>();
+    let mut order: Vec<RightRailEntry> = Vec::with_capacity(available.len());
     for id in persisted {
-        if let Some(activity) = RightRailActivity::ALL
-            .into_iter()
-            .find(|activity| activity.id() == id)
-            && !order.contains(&activity)
-        {
-            order.push(activity);
+        let Some(activity) = available.iter().find(|activity| activity.id() == id) else {
+            continue;
+        };
+        let entry = RightRailEntry::Builtin(*activity);
+        if !order.contains(&entry) {
+            order.push(entry);
         }
     }
-    for activity in RightRailActivity::ALL {
-        if !order.contains(&activity) {
-            order.push(activity);
+    for activity in available {
+        let entry = RightRailEntry::Builtin(activity);
+        if !order.contains(&entry) {
+            order.push(entry);
         }
     }
     order
 }
 
+/// The catalog's entries in the reader's order.
+///
+/// Same rule as [`resolved_right_rail_entries`], for the list the catalog
+/// actually returned: persisted order first, then anything it did not name.
+fn order_right_rail_entries(
+    persisted: &[String],
+    available: Vec<RightRailEntry>,
+) -> Vec<RightRailEntry> {
+    let mut order: Vec<RightRailEntry> = Vec::with_capacity(available.len());
+    for id in persisted {
+        let Some(entry) = available.iter().find(|entry| entry.id() == id) else {
+            continue;
+        };
+        if !order.contains(entry) {
+            order.push(entry.clone());
+        }
+    }
+    for entry in available {
+        if !order.contains(&entry) {
+            order.push(entry);
+        }
+    }
+    order
+}
+
+/// Every activity the catalog contributes, in its own order.
+fn catalog_right_rail_entries(contributions: &[PluginContribution]) -> Vec<RightRailEntry> {
+    let mut entries = Vec::new();
+    for contribution in contributions {
+        if contribution.kind != vibex_plugin::native::RIGHT_RAIL_ACTIVITY {
+            continue;
+        }
+        let builtin = RightRailActivity::ALL
+            .into_iter()
+            .find(|activity| activity.id() == contribution.contribution_id);
+        let entry = match builtin {
+            Some(activity) => RightRailEntry::Builtin(activity),
+            None => RightRailEntry::Script {
+                plugin_id: contribution.plugin_id.clone(),
+                contribution_id: contribution.contribution_id.clone(),
+                title: contribution
+                    .title
+                    .clone()
+                    .unwrap_or_else(|| contribution.contribution_id.clone()),
+            },
+        };
+        if !entries.contains(&entry) {
+            entries.push(entry);
+        }
+    }
+    entries
+}
+
 /// Moves `dragged` beside `target`, returning the bar's new order.
-fn reordered_right_rail_activities(
-    order: &[RightRailActivity],
-    dragged: RightRailActivity,
-    target: RightRailActivity,
+fn reordered_right_rail_activities<T: Clone + PartialEq>(
+    order: &[T],
+    dragged: T,
+    target: T,
     position: RightRailActivityDropPosition,
-) -> Vec<RightRailActivity> {
+) -> Vec<T> {
     let mut order = order.to_vec();
     if dragged == target {
         return order;
@@ -10703,11 +10826,15 @@ pub struct VibexWorkbench {
     session_group_tab_removal_active: bool,
     /// Where a dragged right-rail activity button would land.
     right_rail_activity_drop_target: Option<RightRailActivityDropTarget>,
-    /// First-party plugin ids whose rail activity is enabled.
+    /// The script plugin whose panel the rail shows, and its title.
+    right_rail_script_panel: Option<String>,
+    right_rail_script_title: Option<String>,
+    /// Every right-rail activity the enabled plugins contribute.
     ///
-    /// `None` until the plugin catalog has been read, which keeps every
-    /// activity visible rather than hiding the rail before the first read.
-    right_rail_enabled_plugins: Option<BTreeSet<String>>,
+    /// `None` until the catalog has been read once, which keeps the rail's
+    /// built-in buttons visible rather than blanking the bar before the first
+    /// read answers.
+    right_rail_activities: Option<Vec<PluginContribution>>,
     /// Group members whose parked view is being fetched.
     session_group_view_loads: BTreeSet<String>,
     session_group_view_errors: BTreeMap<String, String>,
@@ -12141,6 +12268,7 @@ impl VibexWorkbench {
             &management_view,
             window,
             |this, _, event: &ManagementEvent, window, cx| match event {
+                ManagementEvent::PluginsChanged => this.refresh_right_rail_plugins(cx),
                 ManagementEvent::AgentRegistryChanged => this.load_agent_overview(cx),
                 ManagementEvent::AgentToolToggled {
                     agent_id,
@@ -12476,7 +12604,9 @@ impl VibexWorkbench {
             session_group_tab_drop_target: None,
             session_group_tab_removal_active: false,
             right_rail_activity_drop_target: None,
-            right_rail_enabled_plugins: None,
+            right_rail_script_panel: None,
+            right_rail_script_title: None,
+            right_rail_activities: None,
             session_group_view_loads: BTreeSet::new(),
             session_group_view_errors: BTreeMap::new(),
             session_group_available_width_rem: 72.0,
@@ -12737,6 +12867,10 @@ impl VibexWorkbench {
 
     pub(crate) fn bind_to_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.window_handle = Some(window.window_handle());
+        // The plugin host answers install/enable requests from the backend and
+        // needs a window to build a script view in; the workbench is that
+        // window for the whole session.
+        crate::plugin_host::start_pump(window, cx);
         if self.ui_state.appearance.theme == ModelThemeMode::System {
             let backdrop = self.backdrop();
             theme::apply_appearance(&self.ui_state.appearance, backdrop, Some(window), cx);
@@ -46268,6 +46402,7 @@ impl VibexWorkbench {
         self.ui_state.workbench.right_rail_visible = false;
         self.right_rail_overlay_open = false;
         self.child_agent_panel_active = false;
+        self.right_rail_script_panel = None;
         if visibility_changed {
             self.queue_ui_state();
         }
@@ -46297,6 +46432,7 @@ impl VibexWorkbench {
             self.ensure_child_agent_timeline(child_session_id, false, cx);
         }
         self.child_agent_panel_active = true;
+        self.right_rail_script_panel = None;
         let visibility_changed = !self.ui_state.workbench.right_rail_visible;
         self.ui_state.workbench.right_rail_visible = true;
         if !self.right_rail_docks_when_open(cx) {
@@ -46365,6 +46501,7 @@ impl VibexWorkbench {
             return;
         }
         self.child_agent_panel_active = false;
+        self.right_rail_script_panel = None;
         let activity_id = right_rail_activity_id(mode).to_string();
         let mode_changed =
             self.ui_state.right_rail.selected_activity_id.as_ref() != Some(&activity_id);
@@ -46422,6 +46559,55 @@ impl VibexWorkbench {
         self.open_right_rail_mode(mode, cx);
     }
 
+    /// Toggles a script plugin's panel in the rail.
+    fn toggle_script_panel(&mut self, plugin_id: String, title: String, cx: &mut Context<Self>) {
+        if self.right_rail_panel_open()
+            && self.right_rail_script_panel.as_deref() == Some(&plugin_id)
+        {
+            self.close_right_rail(cx);
+            return;
+        }
+        self.right_rail_script_panel = Some(plugin_id.clone());
+        self.right_rail_script_title = Some(title);
+        self.child_agent_panel_active = false;
+        self.ui_state.right_rail.selected_activity_id = Some(format!("rail_plugin_{plugin_id}"));
+        let visibility_changed = !self.ui_state.workbench.right_rail_visible;
+        self.ui_state.workbench.right_rail_visible = true;
+        if !self.right_rail_docks_when_open(cx) {
+            self.right_rail_overlay_open = true;
+            self.preview_overlay_open = false;
+        } else {
+            self.right_rail_overlay_open = false;
+        }
+        if visibility_changed {
+            self.queue_ui_state();
+        }
+        self.ensure_script_panel(plugin_id);
+        cx.notify();
+    }
+
+    /// Asks the host for a script panel, loading the plugin if this session has
+    /// not run it yet.
+    ///
+    /// The load runs on the UI thread's pump, which repaints every window when
+    /// it finishes; the rail asks [`crate::plugin_host::view`] on each frame and
+    /// draws its placeholder until the view exists.
+    fn ensure_script_panel(&mut self, plugin_id: String) {
+        let Some(runtime) = self.runtime.clone() else {
+            return;
+        };
+        let Ok(plugins) = runtime.plugins().list() else {
+            return;
+        };
+        let Some(record) = plugins
+            .into_iter()
+            .find(|plugin| plugin.plugin_id == plugin_id)
+        else {
+            return;
+        };
+        crate::plugin_host::request_load(plugin_id, &record);
+    }
+
     fn right_rail_panel_open(&self) -> bool {
         if self.child_agent_panel_active {
             return if self.last_visibility.right_rail_docked {
@@ -46468,47 +46654,84 @@ impl VibexWorkbench {
             // The rail owns its element tree: see [`ChildAgentRailView`]. It is
             // embedded here rather than built inline because everything the rail
             // mounts that animates would otherwise repaint the whole workbench.
-            self.ensure_child_agent_rail_view(cx)
+            return self
+                .ensure_child_agent_rail_view(cx)
                 .cached(StyleRefinement::default().size_full())
-                .into_any_element()
-        } else {
-            self.code_right_rail
-                .clone()
-                .cached(StyleRefinement::default().size_full())
-                .into_any_element()
+                .into_any_element();
         }
+        if let Some(plugin_id) = self.right_rail_script_panel.clone() {
+            // A script panel is the plugin's own view. It is cached the same way
+            // the built-in panels are, so only the plugin's frames repaint it.
+            if let Some(view) = crate::plugin_host::view(cx, &plugin_id) {
+                return view
+                    .cached(StyleRefinement::default().size_full())
+                    .into_any_element();
+            }
+            return self.render_script_panel_placeholder(cx);
+        }
+        self.code_right_rail
+            .clone()
+            .cached(StyleRefinement::default().size_full())
+            .into_any_element()
+    }
+
+    /// What the rail shows while a script panel is starting.
+    ///
+    /// Starting a plugin runs its entry module, which may do real work; the
+    /// panel says so instead of showing the previous surface as if it were the
+    /// plugin's.
+    fn render_script_panel_placeholder(&self, cx: &mut Context<Self>) -> AnyElement {
+        let title = self
+            .right_rail_script_title
+            .clone()
+            .unwrap_or_else(|| locale::text("Plugin", "插件", "外掛").to_string());
+        v_flex()
+            .size_full()
+            .items_center()
+            .justify_center()
+            .gap_2()
+            .child(
+                Icon::new(IconName::LoaderCircle)
+                    .size(px(18.0))
+                    .text_color(cx.theme().muted_foreground),
+            )
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(title),
+            )
+            .into_any_element()
     }
 
     /// The activity bar buttons in the reader's order.
-    fn right_rail_activity_order(&self) -> Vec<RightRailActivity> {
-        let order = resolved_right_rail_activity_order(&self.ui_state.right_rail.activity_order);
-        let Some(enabled) = &self.right_rail_enabled_plugins else {
-            return order;
-        };
-        order
-            .into_iter()
-            .filter(|activity| {
-                right_rail_plugin_id(*activity)
-                    .map(|plugin_id| enabled.contains(plugin_id))
-                    .unwrap_or(true)
-            })
-            .collect()
+    ///
+    /// The bar draws the plugin catalog's `right_rail_activity` contributions,
+    /// not a list compiled into this file. A panel turned off in the Plugins
+    /// page is gone from the catalog and therefore from the bar, and a script
+    /// plugin that contributes one appears beside the first-party buttons.
+    fn right_rail_activity_order(&self) -> Vec<RightRailEntry> {
+        let persisted = &self.ui_state.right_rail.activity_order;
+        match &self.right_rail_activities {
+            None => resolved_right_rail_activity_order(persisted),
+            Some(contributions) => {
+                order_right_rail_entries(persisted, catalog_right_rail_entries(contributions))
+            }
+        }
     }
 
-    /// Reads which first-party plugins are enabled, so a panel turned off in
-    /// the Plugins page is not shown in the rail.
+    /// Reads the right rail's contributions from the plugin catalog.
+    ///
+    /// Called when the runtime becomes authoritative and again whenever the
+    /// Plugins page has changed a switch, so the bar follows the page without a
+    /// restart.
     pub(crate) fn refresh_right_rail_plugins(&mut self, cx: &mut Context<Self>) {
         let Some(runtime) = self.runtime.clone() else {
             return;
         };
-        match runtime.plugins().list() {
-            Ok(plugins) => {
-                let enabled = plugins
-                    .into_iter()
-                    .filter(|plugin| plugin.enabled)
-                    .map(|plugin| plugin.plugin_id)
-                    .collect();
-                self.right_rail_enabled_plugins = Some(enabled);
+        match runtime.plugins().contributions() {
+            Ok(contributions) => {
+                self.right_rail_activities = Some(contributions);
                 cx.notify();
             }
             Err(error) => {
@@ -46523,7 +46746,7 @@ impl VibexWorkbench {
     /// Remembers which side of a button a dragged activity would land on.
     fn track_right_rail_activity_drop(
         &mut self,
-        activity: RightRailActivity,
+        activity: RightRailEntry,
         bounds: gpui::Bounds<gpui::Pixels>,
         position: gpui::Point<gpui::Pixels>,
         cx: &mut Context<Self>,
@@ -46543,8 +46766,8 @@ impl VibexWorkbench {
     /// Moves a dropped activity button beside the one it landed on.
     fn drop_right_rail_activity(
         &mut self,
-        dragged: RightRailActivity,
-        target: RightRailActivity,
+        dragged: RightRailEntry,
+        target: RightRailEntry,
         position: RightRailActivityDropPosition,
         cx: &mut Context<Self>,
     ) {
@@ -46587,18 +46810,19 @@ impl VibexWorkbench {
             .then(|| self.right_rail_activity_drop_target.clone())
             .flatten();
 
-        let mut activities = Vec::with_capacity(RightRailActivity::ALL.len());
-        for activity in self.right_rail_activity_order() {
-            let available = match activity {
-                RightRailActivity::Git => git_available,
-                RightRailActivity::ChildAgents => child_agents_available,
+        let entries = self.right_rail_activity_order();
+        let mut activities = Vec::with_capacity(entries.len());
+        for activity in entries {
+            let available = match activity.builtin() {
+                Some(RightRailActivity::Git) => git_available,
+                Some(RightRailActivity::ChildAgents) => child_agents_available,
                 _ => true,
             };
             if !available {
                 continue;
             }
-            let button = match activity {
-                RightRailActivity::Editor => {
+            let button = match activity.builtin() {
+                Some(RightRailActivity::Editor) => {
                     right_rail_activity_button("activity-preview", activity.icon())
                         .tooltip(if preview_open {
                             locale::text("Collapse editor", "收起编辑器", "收起編輯器")
@@ -46609,7 +46833,7 @@ impl VibexWorkbench {
                         .on_click(cx.listener(|this, _, _, cx| this.toggle_preview(cx)))
                         .into_any_element()
                 }
-                RightRailActivity::Files => right_rail_activity_button(
+                Some(RightRailActivity::Files) => right_rail_activity_button(
                     "activity-files",
                     right_rail_mode_icon(RightRailMode::Files),
                 )
@@ -46619,7 +46843,7 @@ impl VibexWorkbench {
                     this.toggle_right_rail_mode(RightRailMode::Files, cx)
                 }))
                 .into_any_element(),
-                RightRailActivity::Git => {
+                Some(RightRailActivity::Git) => {
                     let git = right_rail_activity_button(
                         "activity-git",
                         right_rail_mode_icon(RightRailMode::Git),
@@ -46637,7 +46861,7 @@ impl VibexWorkbench {
                         })
                         .into_any_element()
                 }
-                RightRailActivity::ChildAgents => {
+                Some(RightRailActivity::ChildAgents) => {
                     right_rail_activity_button("activity-child-agents", Icon::new(IconName::Bot))
                         .tooltip(locale::text(
                             "Child Agent timelines",
@@ -46647,6 +46871,24 @@ impl VibexWorkbench {
                         .selected(panel_open && self.child_agent_panel_active)
                         .on_click(cx.listener(|this, _, _, cx| this.toggle_child_agent_panel(cx)))
                         .into_any_element()
+                }
+                None => {
+                    // A script plugin's panel. The view belongs to the plugin
+                    // host; the button only decides which panel the rail shows.
+                    let plugin_id = activity.plugin_id().unwrap_or_default().to_string();
+                    let title = activity.title().unwrap_or_default().to_string();
+                    let open = panel_open
+                        && self.right_rail_script_panel.as_deref() == Some(plugin_id.as_str());
+                    right_rail_activity_button(
+                        format!("activity-plugin-{plugin_id}"),
+                        activity.icon(),
+                    )
+                    .tooltip(title.clone())
+                    .selected(open)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.toggle_script_panel(plugin_id.clone(), title.clone(), cx)
+                    }))
+                    .into_any_element()
                 }
             };
             let drop_position = drop_target
@@ -46661,23 +46903,30 @@ impl VibexWorkbench {
                     .child(button)
                     // Dragging a button past its neighbours reorders the bar;
                     // the order is persisted, so it survives a restart.
-                    .on_drag(RightRailActivityDrag { activity }, |drag, _, _, cx| {
-                        cx.new(|_| drag.clone())
-                    })
-                    .on_drag_move(cx.listener(
-                        move |this, event: &DragMoveEvent<RightRailActivityDrag>, _, cx| {
-                            if !event.bounds.contains(&event.event.position) {
-                                return;
-                            }
-                            this.track_right_rail_activity_drop(
-                                activity,
-                                event.bounds,
-                                event.event.position,
-                                cx,
-                            );
+                    .on_drag(
+                        RightRailActivityDrag {
+                            activity: activity.clone(),
                         },
-                    ))
-                    .on_drop(
+                        |drag, _, _, cx| cx.new(|_| drag.clone()),
+                    )
+                    .on_drag_move({
+                        let activity = activity.clone();
+                        cx.listener(
+                            move |this, event: &DragMoveEvent<RightRailActivityDrag>, _, cx| {
+                                if !event.bounds.contains(&event.event.position) {
+                                    return;
+                                }
+                                this.track_right_rail_activity_drop(
+                                    activity.clone(),
+                                    event.bounds,
+                                    event.event.position,
+                                    cx,
+                                );
+                            },
+                        )
+                    })
+                    .on_drop({
+                        let activity = activity.clone();
                         cx.listener(move |this, drag: &RightRailActivityDrag, _, cx| {
                             let position = this
                                 .right_rail_activity_drop_target
@@ -46685,10 +46934,15 @@ impl VibexWorkbench {
                                 .filter(|target| target.activity == activity)
                                 .map(|target| target.position)
                                 .unwrap_or(RightRailActivityDropPosition::Before);
-                            this.drop_right_rail_activity(drag.activity, activity, position, cx);
+                            this.drop_right_rail_activity(
+                                drag.activity.clone(),
+                                activity.clone(),
+                                position,
+                                cx,
+                            );
                             cx.stop_propagation();
-                        }),
-                    )
+                        })
+                    })
                     .when_some(drop_position, |this, position| {
                         this.child(right_rail_activity_drop_line(position, cx))
                     })
@@ -104350,8 +104604,8 @@ mod tests {
             .expect("right rail activity renderer should remain inspectable");
 
         assert!(renderer.contains("selected_session_supports_git"));
-        assert!(renderer.contains("if git_available"));
-        assert!(renderer.contains("RightRailActivity::Git => git_available"));
+        assert!(renderer.contains("if !available"));
+        assert!(renderer.contains("Some(RightRailActivity::Git) => git_available"));
     }
 
     /// The editor button leads the bar and toggles the panel, which shares the
@@ -104432,6 +104686,10 @@ mod tests {
         assert!(!title_bar.contains("PanelLeftClose"));
     }
 
+    fn builtin(activity: RightRailActivity) -> RightRailEntry {
+        RightRailEntry::Builtin(activity)
+    }
+
     /// The bar keeps the order the reader dragged it into, and a button the
     /// persisted order does not name keeps its built-in place. Ids retired from
     /// the bar — the terminal and browser buttons — are simply dropped.
@@ -104440,10 +104698,10 @@ mod tests {
         assert_eq!(
             resolved_right_rail_activity_order(&[]),
             vec![
-                RightRailActivity::Editor,
-                RightRailActivity::Files,
-                RightRailActivity::Git,
-                RightRailActivity::ChildAgents,
+                builtin(RightRailActivity::Editor),
+                builtin(RightRailActivity::Files),
+                builtin(RightRailActivity::Git),
+                builtin(RightRailActivity::ChildAgents),
             ]
         );
 
@@ -104456,10 +104714,10 @@ mod tests {
         assert_eq!(
             resolved_right_rail_activity_order(&persisted),
             vec![
-                RightRailActivity::Git,
-                RightRailActivity::Editor,
-                RightRailActivity::Files,
-                RightRailActivity::ChildAgents,
+                builtin(RightRailActivity::Git),
+                builtin(RightRailActivity::Editor),
+                builtin(RightRailActivity::Files),
+                builtin(RightRailActivity::ChildAgents),
             ]
         );
     }
@@ -104471,40 +104729,94 @@ mod tests {
         assert_eq!(
             reordered_right_rail_activities(
                 &order,
-                RightRailActivity::Editor,
-                RightRailActivity::Git,
+                builtin(RightRailActivity::Editor),
+                builtin(RightRailActivity::Git),
                 RightRailActivityDropPosition::After,
             ),
             vec![
-                RightRailActivity::Files,
-                RightRailActivity::Git,
-                RightRailActivity::Editor,
-                RightRailActivity::ChildAgents,
+                builtin(RightRailActivity::Files),
+                builtin(RightRailActivity::Git),
+                builtin(RightRailActivity::Editor),
+                builtin(RightRailActivity::ChildAgents),
             ]
         );
         assert_eq!(
             reordered_right_rail_activities(
                 &order,
-                RightRailActivity::ChildAgents,
-                RightRailActivity::Files,
+                builtin(RightRailActivity::ChildAgents),
+                builtin(RightRailActivity::Files),
                 RightRailActivityDropPosition::Before,
             ),
             vec![
-                RightRailActivity::Editor,
-                RightRailActivity::ChildAgents,
-                RightRailActivity::Files,
-                RightRailActivity::Git,
+                builtin(RightRailActivity::Editor),
+                builtin(RightRailActivity::ChildAgents),
+                builtin(RightRailActivity::Files),
+                builtin(RightRailActivity::Git),
             ]
         );
         assert_eq!(
             reordered_right_rail_activities(
                 &order,
-                RightRailActivity::Git,
-                RightRailActivity::Git,
+                builtin(RightRailActivity::Git),
+                builtin(RightRailActivity::Git),
                 RightRailActivityDropPosition::After,
             ),
             order
         );
+    }
+
+    /// The bar is what the plugin catalog contributes, not a list compiled into
+    /// the workbench: a panel turned off contributes nothing and its button is
+    /// gone, and a script plugin's panel is appended without a code change.
+    #[test]
+    fn the_activity_bar_is_the_plugin_catalogs_contributions() {
+        let contribution = |plugin_id: &str, kind: &str, id: &str| PluginContribution {
+            plugin_id: plugin_id.to_string(),
+            kind: kind.to_string(),
+            contribution_id: id.to_string(),
+            title: Some(id.to_string()),
+            enabled: true,
+        };
+
+        let entries = catalog_right_rail_entries(&[
+            contribution(
+                "vibex.system.files",
+                vibex_plugin::native::RIGHT_RAIL_ACTIVITY,
+                "rail_plugin_system_files",
+            ),
+            contribution(
+                "acme.widgets",
+                vibex_plugin::native::RIGHT_RAIL_ACTIVITY,
+                "rail_plugin_acme_widgets",
+            ),
+            // A command is not a rail button and must not become one.
+            contribution(
+                "acme.widgets",
+                vibex_plugin::native::COMMAND,
+                "acme.widgets.refresh",
+            ),
+        ]);
+        assert_eq!(
+            entries,
+            vec![
+                builtin(RightRailActivity::Files),
+                RightRailEntry::Script {
+                    plugin_id: "acme.widgets".to_string(),
+                    contribution_id: "rail_plugin_acme_widgets".to_string(),
+                    title: "rail_plugin_acme_widgets".to_string(),
+                },
+            ]
+        );
+
+        // Reordering persists script buttons by the same key the drag uses.
+        let reordered = reordered_right_rail_activities(
+            &entries,
+            entries[1].clone(),
+            entries[0].clone(),
+            RightRailActivityDropPosition::Before,
+        );
+        assert_eq!(reordered[0], entries[1]);
+        assert_eq!(reordered[1], entries[0]);
     }
 
     /// The activity buttons are draggable and the drop target is persisted.
@@ -104517,7 +104829,8 @@ mod tests {
             .map(|(renderer, _)| renderer)
             .expect("right rail activity renderer should remain inspectable");
 
-        assert!(renderer.contains("on_drag(RightRailActivityDrag { activity }"));
+        assert!(renderer.contains("on_drag("));
+        assert!(renderer.contains("RightRailActivityDrag {"));
         assert!(renderer.contains("DragMoveEvent<RightRailActivityDrag>"));
         assert!(renderer.contains("on_drop("));
         assert!(renderer.contains("right_rail_activity_drop_line(position, cx)"));

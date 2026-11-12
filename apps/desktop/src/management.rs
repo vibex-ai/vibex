@@ -421,6 +421,12 @@ pub(crate) enum ManagementEvent {
     /// workbench answers by opening Settings on the computer-use page, where
     /// the switch and the driver install live.
     OpenComputerSettings,
+    /// A plugin was installed, uninstalled, enabled or disabled.
+    ///
+    /// The rail is built from the plugin catalog, so it has to re-read the
+    /// contributions after any of those. The page does not own the rail and
+    /// reports the change instead of refreshing it.
+    PluginsChanged,
     /// One Agent's route-group cards were dragged into a new order.
     ///
     /// The draft order lives in this view while the drag is in flight, but the
@@ -12201,6 +12207,7 @@ impl ManagementCenter {
                         this.plugin_market_installed
                             .retain(|plugin| plugin.plugin_id != result.plugin.plugin_id);
                         this.plugin_market_installed.push(result.plugin);
+                        cx.emit(ManagementEvent::PluginsChanged);
                     }
                     Ok(Err(error)) => {
                         this.plugin_market_error =
@@ -12240,6 +12247,7 @@ impl ManagementCenter {
                         {
                             *existing = plugin;
                         }
+                        cx.emit(ManagementEvent::PluginsChanged);
                     }
                     Ok(Err(error)) => {
                         this.plugin_market_error =
@@ -12271,7 +12279,10 @@ impl ManagementCenter {
             let outcome = runner.await;
             let _ = entity.update(cx, |this, cx| {
                 match outcome {
-                    Ok(Ok(())) => this.load_installed_plugins(cx),
+                    Ok(Ok(())) => {
+                        this.load_installed_plugins(cx);
+                        cx.emit(ManagementEvent::PluginsChanged);
+                    }
                     Ok(Err(error)) => {
                         this.plugin_market_error =
                             Some(management_market_error_text(&error.code, &error.message));

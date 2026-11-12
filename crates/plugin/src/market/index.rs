@@ -222,6 +222,28 @@ pub fn verify_signature(
         .map_err(|_| PluginError::IndexSignatureInvalid)
 }
 
+/// Verifies a publisher's detached signature over a package.
+///
+/// Unlike the index signature, a publisher signature is about who built the
+/// package, not about the catalog's integrity; a failure is reported as a
+/// package-signature failure so the two are never confused.
+pub fn verify_package_signature(
+    public_key_base64: &str,
+    signature_base64: &str,
+    package: &[u8],
+) -> Result<(), PluginError> {
+    let key = decode_verifying_key(public_key_base64).map_err(|_| PluginError::SignatureInvalid)?;
+    let signature =
+        decode_signature(signature_base64).map_err(|_| PluginError::SignatureInvalid)?;
+    key.verify_strict(package, &signature)
+        .map_err(|_| PluginError::SignatureInvalid)
+}
+
+/// Signs a package with a publisher's release key.
+pub fn sign_package(package: &[u8], signing_key: &SigningKey) -> String {
+    sign_document(package, signing_key)
+}
+
 /// Decodes a base64 Ed25519 public key.
 pub fn decode_verifying_key(public_key_base64: &str) -> Result<VerifyingKey, PluginError> {
     let bytes = BASE64

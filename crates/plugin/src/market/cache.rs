@@ -11,7 +11,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use vibex_core::{PluginMarketIndexResponse, PluginMarketVersion};
 
-use super::index::{PluginIndexEntry, PluginRevocations};
+use super::index::{PluginIndexEntry, PluginRevocations, PublisherKey};
 
 const INDEX_FILE: &str = "index.json";
 const INDEX_SIGNATURE_FILE: &str = "index.json.sig";
@@ -105,6 +105,15 @@ impl MarketCache {
 
     pub fn read_github_entries(&self) -> Option<Vec<PluginIndexEntry>> {
         self.read_json("github-entries.json")
+    }
+
+    /// Persists the publisher keys the signed index vouches for.
+    pub fn write_publisher_keys(&self, keys: &[PublisherKey]) -> std::io::Result<()> {
+        self.write_json("publisher-keys.json", &keys)
+    }
+
+    pub fn read_publisher_keys(&self) -> Option<Vec<PublisherKey>> {
+        self.read_json("publisher-keys.json")
     }
 
     /// How long ago the merged listing was written.

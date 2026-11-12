@@ -13,7 +13,8 @@ use vibex_computer::cli::run as run_computer_cli;
 use vibex_desktop::{
     DEFAULT_HEIGHT, DEFAULT_WIDTH, MIN_HEIGHT, MIN_WIDTH, app, assets,
     code_workbench::{CodeWorkbenchFixture, CodeWorkbenchFixtureKind},
-    first_frame_probe, hint_layer, selection_guard, system_tray, terminal_surface, theme,
+    first_frame_probe, hint_layer, plugin_host, selection_guard, system_tray, terminal_surface,
+    theme,
 };
 use vibex_desktop_model::{AppearanceUiState, ThemeMode};
 use vibex_terminal::run_terminal_feasibility;
@@ -471,6 +472,10 @@ fn run() {
             gpui_tokio::init(cx);
             gpui_component::init(cx);
             hint_layer::init(cx);
+            // The scripting host third-party plugins run in. It has to be up
+            // before the first window, because the market's runtime is looked
+            // up when a plugin is enabled, not when a window wants to draw one.
+            plugin_host::init(cx);
             // Every window root, the workbench and its detached panels alike:
             // a drag anywhere must not leave the selection layer armed.
             selection_guard::init(cx);

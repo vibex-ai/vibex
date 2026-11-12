@@ -18,6 +18,38 @@ pub struct LoadedPlugin {
     pub directory: PathBuf,
     /// The plugin's own data directory.
     pub data_directory: PathBuf,
+    /// The permission keys the user approved for this version.
+    ///
+    /// The host re-checks the generated manifest against this list before a
+    /// line of script runs. The installer already enforced consent; this is
+    /// the second layer, so a package swapped on disk after consent cannot
+    /// widen what the host grants.
+    pub granted_permissions: Vec<String>,
+}
+
+impl LoadedPlugin {
+    pub fn new(
+        plugin_id: impl Into<String>,
+        version: impl Into<String>,
+        directory: impl Into<PathBuf>,
+        data_directory: impl Into<PathBuf>,
+    ) -> Self {
+        Self {
+            plugin_id: plugin_id.into(),
+            version: version.into(),
+            directory: directory.into(),
+            data_directory: data_directory.into(),
+            granted_permissions: Vec::new(),
+        }
+    }
+
+    pub fn with_granted_permissions(
+        mut self,
+        permissions: impl IntoIterator<Item = String>,
+    ) -> Self {
+        self.granted_permissions = permissions.into_iter().collect();
+        self
+    }
 }
 
 /// Loads and unloads script plugins.
