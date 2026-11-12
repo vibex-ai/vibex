@@ -120,6 +120,7 @@
   ],
   "expressionNormalizations": {
     "Apache-2.0 / MIT": "Apache-2.0 OR MIT",
+    "BSD-3-Clause/MIT": "BSD-3-Clause OR MIT",
     "Apache-2.0/MIT": "Apache-2.0 OR MIT",
     "MIT / Apache-2.0": "MIT OR Apache-2.0",
     "MIT/Apache-2.0": "MIT OR Apache-2.0",
