@@ -19,8 +19,8 @@ use super::cache::MarketCache;
 use super::fetch::MarketHttpClient;
 use super::github::GithubTopicSource;
 use super::index::{
-    MAX_INDEX_BYTES, PluginIndexEntry, PluginIndexFile, PluginRevocations, encode_verifying_key,
-    verify_signature,
+    MAX_INDEX_BYTES, MAX_REVOCATIONS_BYTES, PluginIndexEntry, PluginIndexFile, PluginRevocations,
+    encode_verifying_key, verify_signature,
 };
 use super::merge::merge_entries;
 
@@ -286,6 +286,51 @@ impl MarketCatalog {
         self.config.cache.read_revocations()
     }
 
+    /// Refreshes the revocation list from the index's own host.
+    ///
+    /// The list is signed with the same root key as the index, and its
+    /// `revision` only moves forward: a replayed older document would
+    /// un-revoke a blocked plugin, so a list at or below the cached revision is
+    /// kept instead of written.
+    pub async fn refresh_revocations(&self) -> Result<PluginRevocations, PluginError> {
+        let Some(url) = self.revocation_url() else {
+            return Err(PluginError::NoCatalog);
+        };
+        let raw = self.client.fetch_bytes(&url, MAX_REVOCATIONS_BYTES).await?;
+        let signature = self
+            .client
+            .fetch_bytes(&signature_url(&url)?, MAX_SIGNATURE_BYTES)
+            .await?;
+        let signature = String::from_utf8_lossy(&signature).trim().to_string();
+        match &self.config.root_public_key {
+            Some(key) => verify_signature(&raw, &signature, &encode_verifying_key(key))?,
+            None if self.config.allow_unverified_index => {}
+            None => return Err(PluginError::IndexSignatureInvalid),
+        }
+        let revocations = PluginRevocations::parse(&raw)?;
+        if let Some(cached) = self.config.cache.read_revocations()
+            && cached.revision >= revocations.revision
+        {
+            return Ok(cached);
+        }
+        self.config
+            .cache
+            .write_revocations(&raw, &signature, &revocations);
+        Ok(revocations)
+    }
+
+    /// Where the revocation list lives, beside the first index that answers.
+    fn revocation_url(&self) -> Option<Url> {
+        let index = self.config.index_urls.first()?;
+        let mut url = index.clone();
+        // The index lives at `/dist/index.json` and the list beside it; a
+        // deployment that publishes the index at the root has both at the root.
+        let path = index.path();
+        let directory = path.rsplit_once('/').map(|(directory, _)| directory)?;
+        url.set_path(&format!("{directory}/revocations.json"));
+        Some(url)
+    }
+
     /// The revocation blocking a plugin version, if any.
     pub fn blocked(&self, plugin_id: &str, version: &str) -> Option<super::index::RevokedPlugin> {
         self.revocations()
@@ -338,6 +383,7 @@ fn signature_url(url: &Url) -> Result<Url, PluginError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::market::fetch::{MarketHttpClient, MarketUrlPolicy};
 
     #[test]
     fn the_signature_url_appends_to_the_path() {
@@ -346,6 +392,34 @@ mod tests {
             signature_url(&url).unwrap().as_str(),
             "https://plugins.example.com/dist/index.json.sig"
         );
+    }
+
+    /// The list sits beside the index, and a root-hosted index keeps it there
+    /// rather than reaching for `/revocations.json` at the domain root.
+    #[test]
+    fn the_revocation_url_follows_the_index_directory() {
+        let mut config = MarketConfig::empty(MarketCache::new("/tmp/does-not-matter"));
+        config.index_urls =
+            vec![Url::parse("https://plugins.example.com/dist/index.json").unwrap()];
+        let catalog = MarketCatalog::new(MarketHttpClient::new(MarketUrlPolicy::Testing), config);
+        assert_eq!(
+            catalog.revocation_url().unwrap().as_str(),
+            "https://plugins.example.com/dist/revocations.json"
+        );
+
+        let mut config = MarketConfig::empty(MarketCache::new("/tmp/does-not-matter"));
+        config.index_urls = vec![Url::parse("https://plugins.example.com/index.json").unwrap()];
+        let catalog = MarketCatalog::new(MarketHttpClient::new(MarketUrlPolicy::Testing), config);
+        assert_eq!(
+            catalog.revocation_url().unwrap().as_str(),
+            "https://plugins.example.com/revocations.json"
+        );
+
+        let catalog = MarketCatalog::new(
+            MarketHttpClient::new(MarketUrlPolicy::Testing),
+            MarketConfig::empty(MarketCache::new("/tmp/does-not-matter")),
+        );
+        assert!(catalog.revocation_url().is_none());
     }
 
     #[test]

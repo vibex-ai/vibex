@@ -77,6 +77,12 @@ impl PluginService {
 
     /// Fetches and merges the catalog, including first-party listings.
     pub async fn index(&self, request: &PluginMarketIndexRequest) -> PluginMarketIndexResponse {
+        // The kill list rides along with the catalog: a plugin revoked while
+        // this installation was offline must stop being installable as soon as
+        // the catalog refreshes, not at some later maintenance pass.
+        if request.refresh || self.market.revocations().is_none() {
+            let _ = self.market.refresh_revocations().await;
+        }
         let mut response = self.market.load(request).await;
         let mut bundled = self.native.market_entries(env!("CARGO_PKG_VERSION"));
         // First-party listings lead the catalog.
