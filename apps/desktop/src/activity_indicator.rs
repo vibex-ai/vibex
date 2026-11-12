@@ -21,13 +21,13 @@ const TIMELINE_CYCLE: Duration = Duration::from_millis(2100);
 /// Frames per second both marks are sampled at.
 ///
 /// The sidebar mark used to step through the TUI's eight spinner frames at
-/// their 100ms cadence. That cap never saved the workbench a frame — a running
-/// row already carries the title `ShimmerText`, which asks for one every display
-/// refresh — but it made the one moving thing in the row arrive on a timer, and
-/// a `with_max_fps` re-render lands some time *after* the interval it waits for.
-/// The phase read on arrival therefore skipped frames, so the rotation dropped
-/// dots and popped. A continuous sweep sampled at the timeline mark's budget
-/// costs the same frames the row was already spending and no longer steps.
+/// their 100ms cadence. That cap never saved the workbench a frame while the
+/// running title's sweep still asked for one every display refresh, and it made
+/// the one moving thing in the row arrive on a timer: a `with_max_fps`
+/// re-render lands some time *after* the interval it waits for, so the phase
+/// read on arrival skipped frames and the rotation dropped dots. The title
+/// sweep now shares this budget, and a continuous mark sampled at 30fps costs
+/// the same frames the row spends without stepping.
 const ACTIVITY_MAX_FPS: f32 = 30.0;
 
 /// How long the TUI holds one of its spinner frames.

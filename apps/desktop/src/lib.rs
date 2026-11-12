@@ -34,6 +34,7 @@ pub mod remote_client;
 pub mod resize_seam;
 pub mod responsive;
 pub mod selection_guard;
+pub mod shimmer;
 pub mod single_instance;
 pub mod skeleton;
 pub mod spinner;

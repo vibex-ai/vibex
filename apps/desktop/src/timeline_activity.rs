@@ -1,4 +1,5 @@
 use super::*;
+use crate::shimmer::ShimmerText;
 
 #[cfg(test)]
 #[path = "timeline_activity_tests.rs"]

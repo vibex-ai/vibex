@@ -85,7 +85,6 @@ use gpui_component::{
     scroll::{ScrollableElement as _, ScrollbarAxis},
     searchable_list::{SearchableListItem, SearchableVec},
     select::{Select, SelectDelegate, SelectEvent, SelectState},
-    shimmer::ShimmerText,
     switch::Switch,
     tab::{Tab, TabBar},
     tag::Tag,
@@ -256,6 +255,7 @@ use crate::remote_client::{
     RegisteredRuntime,
 };
 use crate::responsive::WorkbenchVisibility;
+use crate::shimmer::ShimmerText;
 use crate::single_instance::LaunchClaim;
 use crate::skeleton;
 use crate::spinner::Spinner;
@@ -877,7 +877,16 @@ const SUBMISSION_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const REMOTE_EVENT_RETRY_DELAY: Duration = Duration::from_secs(2);
 const RUNTIME_UI_SIGNAL_BATCH_LIMIT: usize = 256;
 const RUNTIME_UI_SIGNAL_QUEUE_CAPACITY: usize = RUNTIME_UI_SIGNAL_BATCH_LIMIT;
+/// How long the runtime event pump coalesces ordinary UI signals.
 const RUNTIME_UI_SIGNAL_COALESCE_DELAY: Duration = Duration::from_millis(16);
+/// How long a streaming-only timeline batch waits before it is applied.
+///
+/// The Markdown source those events feed advances at most once every
+/// [`TIMELINE_STREAMING_MARKDOWN_REFRESH_INTERVAL`], so painting at the display
+/// refresh would draw the same body two or three times for every visible
+/// update. One 30fps tick matches the app's repeating-animation budget and
+/// leaves the stream's own arrival rate, not the display, as the floor.
+const RUNTIME_UI_STREAMING_COALESCE_DELAY: Duration = Duration::from_millis(33);
 /// How long a passive ownership pass waits before it walks the pages again.
 /// A stale root page wakes the pass instead of waiting this out.
 const DELEGATED_REFRESH_INTERVAL: Duration = Duration::from_secs(3);
@@ -5300,6 +5309,23 @@ fn timeline_live_event_is_streaming_only(event: &TimelineLiveEvent) -> bool {
         TimelinePayload::Reasoning(reasoning) => !reasoning.is_final,
         _ => false,
     }
+}
+
+/// How long the event pump waits before applying a batch that starts with
+/// `signal`.
+///
+/// A batch that begins with a streaming-only timeline event is repainted on the
+/// animation budget instead of the display cadence. If a non-streaming event
+/// arrives during the wait it is folded into the same batch, so the only cost
+/// is up to one extra frame of latency for that event.
+fn runtime_ui_coalesce_delay(signal: Option<&RuntimeUiSignal>) -> Duration {
+    if let Some(RuntimeUiSignal::Event(event)) = signal
+        && let DesktopEvent::Timeline(timeline) = &**event
+        && timeline_live_event_is_streaming_only(timeline)
+    {
+        return RUNTIME_UI_STREAMING_COALESCE_DELAY;
+    }
+    RUNTIME_UI_SIGNAL_COALESCE_DELAY
 }
 
 fn timeline_batch_requires_auto_continue_refresh(events: &[TimelineLiveEvent]) -> bool {
@@ -15176,7 +15202,7 @@ impl VibexWorkbench {
                     let mut signals = vec![signal];
                     if !matches!(signals.first(), Some(RuntimeUiSignal::Shutdown)) {
                         cx.background_executor()
-                            .timer(RUNTIME_UI_SIGNAL_COALESCE_DELAY)
+                            .timer(runtime_ui_coalesce_delay(signals.first()))
                             .await;
                     }
                     while signals.len() < RUNTIME_UI_SIGNAL_BATCH_LIMIT {
@@ -19861,7 +19887,7 @@ impl VibexWorkbench {
                     let mut signals = vec![signal];
                     if !matches!(signals.first(), Some(RuntimeUiSignal::Shutdown)) {
                         cx.background_executor()
-                            .timer(RUNTIME_UI_SIGNAL_COALESCE_DELAY)
+                            .timer(runtime_ui_coalesce_delay(signals.first()))
                             .await;
                     }
                     while signals.len() < RUNTIME_UI_SIGNAL_BATCH_LIMIT {
@@ -52882,8 +52908,12 @@ impl VibexWorkbench {
             // sweep, at the same pace and spread, so the two surfaces read as
             // one state in two places. Only a tab that is actually generating
             // takes the animation; every other tab keeps static text that asks
-            // for no frames.
-            let title_element: AnyElement = if display_state == AgentSessionState::Running {
+            // for no frames. The sweep also yields to the timeline's frame
+            // gate, so a late workbench stops every running label together
+            // rather than keeping one surface at the display refresh.
+            let title_element: AnyElement = if display_state == AgentSessionState::Running
+                && timeline_activity::live_labels_animate()
+            {
                 ShimmerText::new(title.clone())
                     .id(format!("session-group-tab-title-{session_id}"))
                     .duration(TIMELINE_SHIMMER_SWEEP)
@@ -56953,16 +56983,18 @@ impl VibexWorkbench {
         // light on the text read as one state in two places. The sweep repeats
         // for as long as it is mounted, so only a row that is actually
         // generating takes it; every other row keeps a static title that asks
-        // for no frames.
-        let row_title: AnyElement = if session_generating {
-            ShimmerText::new(row_title)
-                .id(format!("sidebar-session-title-{session_id_string}"))
-                .duration(TIMELINE_SHIMMER_SWEEP)
-                .spread(TIMELINE_SHIMMER_SPREAD)
-                .into_any_element()
-        } else {
-            row_title.into_any_element()
-        };
+        // for no frames. Like the tab title, the sweep yields to the timeline's
+        // frame gate so every running label stops asking for frames together.
+        let row_title: AnyElement =
+            if session_generating && timeline_activity::live_labels_animate() {
+                ShimmerText::new(row_title)
+                    .id(format!("sidebar-session-title-{session_id_string}"))
+                    .duration(TIMELINE_SHIMMER_SWEEP)
+                    .spread(TIMELINE_SHIMMER_SPREAD)
+                    .into_any_element()
+            } else {
+                row_title.into_any_element()
+            };
         let reorder_offset = active_session_drag
             .as_ref()
             .filter(|drag| drag.flat_preview_enabled)
@@ -107585,6 +107617,39 @@ mod tests {
     }
 
     #[test]
+    fn streaming_only_batches_wait_for_the_animation_budget() {
+        let session_id = VibexSessionId::new();
+        let delta_item = timeline_item_with_payload(
+            &session_id,
+            1,
+            TimelineSource::Agent,
+            TimelinePayload::AgentMessageDelta(AgentMessageDeltaPayload {
+                text_delta: "token".into(),
+                chunk_index: 0,
+                phase: Some(AgentMessagePhase::FinalAnswer),
+            }),
+        );
+        let streaming =
+            RuntimeUiSignal::Event(Box::new(DesktopEvent::Timeline(TimelineLiveEvent {
+                session_id: session_id.clone(),
+                sequence: delta_item.sequence,
+                item: delta_item,
+            })));
+        assert_eq!(
+            runtime_ui_coalesce_delay(Some(&streaming)),
+            RUNTIME_UI_STREAMING_COALESCE_DELAY
+        );
+        assert_eq!(
+            runtime_ui_coalesce_delay(Some(&RuntimeUiSignal::SidebarInvalidated)),
+            RUNTIME_UI_SIGNAL_COALESCE_DELAY
+        );
+        assert_eq!(
+            runtime_ui_coalesce_delay(None),
+            RUNTIME_UI_SIGNAL_COALESCE_DELAY
+        );
+    }
+
+    #[test]
     fn hidden_timeline_streaming_work_waits_for_the_agent_surface() {
         assert!(!should_defer_timeline_streaming_work("agent", false));
         assert!(should_defer_timeline_streaming_work("agent", true));
@@ -112035,8 +112100,8 @@ mod tests {
             .map(|(body, _)| body)
             .expect("sidebar session renderer should remain inspectable");
         let title = sidebar_session
-            .split_once("        let row_title: AnyElement = if session_generating {")
-            .and_then(|(_, tail)| tail.split_once("        };\n"))
+            .split_once("        let row_title: AnyElement =\n            if session_generating && timeline_activity::live_labels_animate() {")
+            .and_then(|(_, tail)| tail.split_once("            };\n"))
             .map(|(body, _)| body)
             .expect("the session title should keep its own running gate");
 
@@ -112046,8 +112111,9 @@ mod tests {
         assert!(title.contains("TIMELINE_SHIMMER_SPREAD"));
         // The sweep repeats for as long as it is mounted, so it takes the same
         // gate the row's status column uses for "the Agent is working" — a
-        // parked, scheduled or idle row must not drive frames.
-        assert!(title.contains("} else {\n            row_title.into_any_element()\n"));
+        // parked, scheduled or idle row must not drive frames — and the
+        // timeline's frame gate, so a late workbench stops every sweep at once.
+        assert!(title.contains("row_title.into_any_element()"));
         assert!(
             sidebar_session
                 .contains("let session_generating = display_state == AgentSessionState::Running")

@@ -36,11 +36,16 @@ pub(crate) fn update_timeline_text(
 }
 
 pub(crate) fn timeline_text_motion(streaming: bool) -> gpui_base::text::TextViewMotion {
-    gpui_base::text::TextViewMotion::default().with_stream_fade(if streaming {
-        crate::motion::FADE_QUICK.total()
-    } else {
+    // A fade that outlives the gap between two streamed updates keeps its own
+    // 33ms tick alive for the whole answer. The body already arrives in 50ms
+    // chunks, so the fade adds a second, independent frame clock without adding
+    // readable motion. Settled text still fades.
+    let fade = if streaming {
         std::time::Duration::ZERO
-    })
+    } else {
+        crate::motion::FADE_QUICK.total()
+    };
+    gpui_base::text::TextViewMotion::default().with_stream_fade(fade)
 }
 pub use vibex_ui::markdown::{
     MarkdownLinkKind, MarkdownResource, base_path_for_file, escape_markdown_literal, is_file_url,
@@ -203,6 +208,21 @@ mod tests {
         let theme = themed_component_theme();
         let style = themed_text_view_style(&theme);
         assert_eq!(style.table_row_hover(), Some(theme.table_hover));
+    }
+
+    /// A live answer already repaints on its own 30fps stream clock. A 150ms
+    /// fade between those updates would keep a second 33ms clock alive for the
+    /// whole turn, so streaming text must not schedule one.
+    #[test]
+    fn streaming_text_does_not_schedule_a_fade_clock() {
+        assert_eq!(
+            timeline_text_motion(true).stream_fade(),
+            std::time::Duration::ZERO
+        );
+        assert_eq!(
+            timeline_text_motion(false).stream_fade(),
+            crate::motion::FADE_QUICK.total()
+        );
     }
 
     struct TooltipHost {
