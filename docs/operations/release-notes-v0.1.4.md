@@ -1,7 +1,7 @@
 # Vibex v0.1.4 Release Notes
 
 - **Release Date:** 2026-11-12
-- **Summary:** A release about work reaching every surface: Linux gains RPM packages, a shared Provider now fans out to every bound Agent, Codex honours declared reasoning efforts and context windows, WSL setup reports its progress, and mobile session sync carries far less traffic.
+- **Summary:** A release about work reaching every surface: Linux gains RPM packages, remote Markdown images load through a bounded HTTP client, a shared Provider fans out to every bound Agent, Codex honours declared reasoning efforts and context windows, WSL setup reports its progress, streaming repaints are capped, and mobile session sync carries far less traffic.
 
 ---
 
@@ -13,6 +13,8 @@
 - **A shared Provider reaches every Agent:** editing a Provider on the Providers page now updates every Agent bound to it, instead of only the Agent the record was first derived from.
 - **Codex honours your declared models:** an alias model with declared reasoning efforts or a context window is projected into a private Codex catalogue, so the effort is offered and the declared window applies.
 - **WSL runtime setup shows its progress:** adding a WSL runtime now reports each setup step and keeps the connection listed under **Remote connections** with its live status.
+- **Remote Markdown images load:** `http(s)` images in a conversation and in a rendered document now fetch through the application's own HTTP client, capped at 32 MiB per response, instead of being blanked by the platform's refusing client.
+- **Streaming costs less to watch:** while an answer streams, the desktop coalesces streaming-only timeline events and gates the sidebar and tab sweeps to a 30fps budget, so a long answer no longer redraws the window at 60fps.
 - **Mobile session sync is lighter:** the phone fetches attachment bytes only when a picture is opened, and reasoning updates carry only the new delta.
 
 ### 🐧 Linux packaging
@@ -24,6 +26,9 @@
 
 - **The update panel opens on demand:** a background update check no longer opens the title-bar panel by itself. The release still surfaces through the title-bar entry, and the panel opens on click. The panel is drawn as an in-tree layer so dialogs paint above it and Settings stays readable.
 - **WSL runtime setup shows its progress:** choosing **Connect WSL** now reports the distro check, download, install, start, forwarding, pairing, and connect steps as they happen, and keeps running if the dialog is closed. The connection stays under **Remote connections** with its live status, so a failed attempt can be retried or inspected there.
+- **Remote images load over HTTP:** a remote `http(s)` Markdown image or HTML `<img>` source now loads through the application HTTP client, which buffers each response under a 32 MiB cap with bounded connect and request timeouts and at most ten redirects. The platform constructor installs a client that refuses every request, so without this adapter every remote image rendered blank.
+- **Local file links open on Windows:** a rendered Markdown destination is classified before it is parsed as a URL. A `file:` URL or a drive path such as `C:\work\notes.md` is resolved as a local file (real paths compared, workspace root stripped), so clicking it opens the document instead of doing nothing; `http(s)` stays web and any other scheme is unsupported. The same routing fixes links in the Markdown preview.
+- **Streaming repaints are capped:** the title shimmer and streaming-only timeline batches are held to the app's 30fps repeating-animation budget, and the sidebar and session-group tab sweeps sit behind the live-label frame gate. The visible transcript advances at roughly 20fps, so the window no longer redraws at 60fps for it; reduced motion and an inactive window still render static.
 
 ### 🔌 Providers and Agents
 
@@ -31,6 +36,7 @@
 - Gateway-backed route groups and remote dispatcher writes now republish the catalogue too, so a Provider edit, a deleted Provider, or a Key change refreshes every affected Agent, including writes that arrive from a paired device.
 - **Codex gets a projected catalogue.** Codex answers `model/list` from a catalogue that only describes OpenAI's own model ids, so an alias with a declared context window or reasoning depth reported an empty effort list and an unprojected window. Vibex now writes a private `vibex-models.json` beside the Profile's `config.toml` that lists every enabled Model with its declared context window and thinking levels, and points `model_catalog_json` at it. A Profile that declares neither keeps its previous output unchanged.
 - **A managed Agent update no longer leaves a stale catalogue:** an install or rollback changes the launch fingerprint, and a stored snapshot is now treated as current only when it matches that fingerprint, so new sessions no longer fail with `runtime_switch_configuration_unavailable`.
+- **pi-acp resolves a provider-qualified model id:** pi-acp addresses a model as `<provider>/<model>` and reads the first path segment as the provider, so a product id that itself contains a slash was forwarded bare and rejected with `Model not found` whenever the projection had no entry for it. The projection now carries the provider namespace and applies it to an unmapped model without doubling an id that already spells it; read-back strips the namespace, so the confirmation still compares against the product id. An Agent whose own catalogue already carries native provider ids is left untouched.
 
 ### 📱 Mobile and remote
 
@@ -56,6 +62,8 @@ Install 0.1.4 over 0.1.3 as usual: sessions, workspaces, Provider configuration,
 - **共享 Provider 会同步到每个 Agent：** 在 Providers 页面修改 Provider 后，所有绑定它的 Agent 都会更新，而不再只有最初派生出该记录的 Agent。
 - **Codex 会采用你声明的模型：** 别名模型声明的推理档位或上下文窗口会写入 Codex 的私有模型目录，档位可选，声明的窗口也会生效。
 - **WSL 运行时安装显示进度：** 添加 WSL 运行时后会逐项报告安装步骤，连接也会以实时状态保留在 **远程连接** 列表中。
+- **远程 Markdown 图片可以直接加载：** 对话和渲染文档中的 `http(s)` 图片现在通过应用自己的 HTTP 客户端获取，单次响应上限 32 MiB，不再因为平台客户端拒绝所有请求而显示空白。
+- **流式输出更省资源：** 答案流式输出期间，桌面端会合并仅来自流式输出的时间线事件，并把侧边栏与标签页扫光限制在 30fps 预算内，长答案不再让整个窗口以 60fps 重绘。
 - **移动端会话同步更省流量：** 手机只在打开图片时才获取附件字节，推理更新只发送新增的增量。
 
 ### 🐧 Linux 打包
@@ -67,6 +75,9 @@ Install 0.1.4 over 0.1.3 as usual: sessions, workspaces, Provider configuration,
 
 - **更新面板按需打开：** 后台检查更新不再自动弹出标题栏面板，但仍会在标题栏入口提示，点击后才打开面板。面板改为树内图层绘制，对话框会盖在它之上，设置页也保持可读。
 - **WSL 运行时安装显示进度：** 点击 **连接 WSL** 后会依次报告发行版检查、下载、安装、启动、端口转发、配对和连接等步骤，关闭对话框也会继续执行。连接会以实时状态保留在 **远程连接** 列表中，失败的尝试可以从那里重试或查看。
+- **远程图片通过 HTTP 加载：** Markdown 中的 `http(s)` 图片和 HTML `<img>` 现在通过应用 HTTP 客户端加载，每次响应缓冲上限为 32 MiB，连接与请求超时以及重定向次数都有上限。平台构造的客户端默认拒绝所有请求，因此没有这个适配器时所有远程图片都会显示空白。
+- **Windows 上可以打开本地文件链接：** 渲染后的 Markdown 链接会先分类再解析：`file:` URL 或 `C:\work\notes.md` 这类盘符路径会按本地文件解析（比较真实路径并去掉工作区根目录），点击后能真正打开文档，而不是毫无反应；`http(s)` 仍按网页处理，其他协议视为不支持。Markdown 预览中的链接也走同一套逻辑。
+- **流式重绘有上限：** 标题闪字和仅来自流式输出的时间线批次被限制在应用 30fps 的重复动画预算内，侧边栏与会话分组标签的扫光也纳入实时标签帧门控。可见文本大约每 20fps 才推进一次，窗口不再为它保持 60fps 重绘；开启减少动态效果或窗口失焦时仍然静态渲染。
 
 ### 🔌 Provider 与 Agent
 
@@ -74,6 +85,7 @@ Install 0.1.4 over 0.1.3 as usual: sessions, workspaces, Provider configuration,
 - 由网关支撑的路由组和远程调度端写入也会重新发布目录，因此 Provider 的修改、删除或 Key 变化都会刷新所有受影响的 Agent，包括从已配对设备发来的写入。
 - **Codex 会得到投影后的模型目录。** Codex 的 `model/list` 只描述 OpenAI 自己的模型 id，因此声明了上下文窗口或推理深度的别名会报告空的档位列表，窗口也不会生效。Vibex 现在会在 Profile 的 `config.toml` 旁写入私有的 `vibex-models.json`，列出所有启用的 Model 及其声明的上下文窗口与思考档位，并让 `model_catalog_json` 指向它；两者都未声明的 Profile 保持原有输出不变。
 - **托管 Agent 更新后不再留下过期目录：** 安装或回滚会改变启动指纹，只有与当前指纹一致的完整快照才会被视为有效，因此新会话不会再以 `runtime_switch_configuration_unavailable` 失败。
+- **pi-acp 能正确解析带 provider 前缀的模型 id：** pi-acp 把模型表示为 `<provider>/<model>` 并取第一段作为 provider，因此本身带斜杠的产品 id 在投影中找不到条目时会以原样转发，随后被以 `Model not found` 拒绝。投影现在会携带 provider 命名空间，并在模型未被映射时套用它，同时不会给已经带前缀的 id 重复添加；回读时会去掉命名空间，确认信息仍然按产品 id 比对。自带有原生 provider id 的 Agent 目录不受影响。
 
 ### 📱 移动端与远程
 
