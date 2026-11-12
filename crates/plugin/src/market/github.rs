@@ -269,6 +269,12 @@ fn entry_for(item: &RepoItem, manifest: &PluginManifest) -> PluginIndexEntry {
             review: None,
         }],
         publisher_key_id: None,
+        // A discovered repository publishes no curated page; the README is
+        // fetched for the detail view instead.
+        description: None,
+        readme: None,
+        screenshots: Vec::new(),
+        reviews: None,
     }
 }
 

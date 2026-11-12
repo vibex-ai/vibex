@@ -199,6 +199,10 @@ mod tests {
             },
             versions: Vec::new(),
             publisher_key_id: None,
+            description: None,
+            readme: None,
+            screenshots: Vec::new(),
+            reviews: None,
         }
     }
 

@@ -2086,6 +2086,12 @@ pub struct ManagementCenter {
     plugin_market_loading: bool,
     plugin_market_error: Option<String>,
     plugin_market_generation: u64,
+    /// Pictures already loaded, by their URL.
+    ///
+    /// A plugin's mark and its screenshots are addressed by the catalog, and a
+    /// card is re-rendered on every scroll, so each one is fetched once.
+    plugin_market_icons: BTreeMap<String, Arc<gpui::Image>>,
+    plugin_market_icon_pending: BTreeSet<String>,
     /// The page of the index the grid is showing, as the runtime cut it.
     mcp_market_entries: Vec<vibex_core::McpMarketEntry>,
     /// Which page the grid is on. The runtime is asked for this page by offset,
@@ -3209,6 +3215,8 @@ impl ManagementCenter {
             plugin_market_loading: false,
             plugin_market_error: None,
             plugin_market_generation: 0,
+            plugin_market_icons: BTreeMap::new(),
+            plugin_market_icon_pending: BTreeSet::new(),
             mcp_validation: None,
             skill_validation: None,
             provider_display_order_drop_target: None,
@@ -12049,6 +12057,7 @@ impl ManagementCenter {
                     Ok(Ok(response)) => {
                         this.plugin_market_entries = response.entries;
                         this.plugin_market_error = response.partial_reason;
+                        this.load_plugin_market_icons(cx);
                     }
                     Ok(Err(error)) => {
                         this.plugin_market_error =
@@ -12154,7 +12163,10 @@ impl ManagementCenter {
             let outcome = runner.await;
             let _ = entity.update(cx, |this, cx| {
                 match outcome {
-                    Ok(Ok(detail)) => this.plugin_market_detail = Some(detail),
+                    Ok(Ok(detail)) => {
+                        this.plugin_market_detail = Some(detail);
+                        this.load_plugin_market_icons(cx);
+                    }
                     Ok(Err(error)) => {
                         this.plugin_market_error =
                             Some(management_market_error_text(&error.code, &error.message));
@@ -12553,7 +12565,8 @@ impl ManagementCenter {
             .any(|plugin| plugin.plugin_id == entry.id);
         let open_id = entry.id.clone();
         let button_id = entry.id.clone();
-        let name = entry.name.clone();
+        let locale = locale::current_locale().tag();
+        let name = entry.localized_name(locale).to_string();
         let summary = entry.summary.clone().unwrap_or_default();
         let meta = format!(
             "{} · {} · {}",
@@ -12561,6 +12574,23 @@ impl ManagementCenter {
             entry.trust.label(),
             entry.latest_version.clone().unwrap_or_default()
         );
+        let plate = match entry.icon_url.as_ref().and_then(|url| {
+            self.plugin_market_icons
+                .get(url)
+                .map(|image| (url.clone(), image.clone()))
+        }) {
+            Some((url, image)) => {
+                let _ = &url;
+                management_market_plate(
+                    gpui::img(image)
+                        .size_full()
+                        .object_fit(gpui::ObjectFit::Contain)
+                        .into_any_element(),
+                    cx,
+                )
+            }
+            None => management_market_glyph("icons/vibex/package.svg", cx),
+        };
         let action = Button::new(SharedString::from(format!(
             "management-plugin-action-{button_id}"
         )))
@@ -12583,6 +12613,7 @@ impl ManagementCenter {
             .rounded(cx.theme().radius)
             .border_1()
             .border_color(cx.theme().border.opacity(0.7))
+            .child(plate)
             .child(
                 v_flex()
                     .min_w_0()
@@ -12654,6 +12685,62 @@ impl ManagementCenter {
         );
         if let Some(description) = &detail.description {
             column = column.child(div().text_sm().child(description.clone()));
+        }
+        if let Some(reviews) = &detail.reviews
+            && reviews.count > 0
+        {
+            // Stars are published in half-star units, so the number the reader
+            // sees is that value halved and shown with one decimal.
+            let average = reviews
+                .average_half_stars
+                .map(|half| format!("{:.1}", f32::from(half) / 2.0))
+                .unwrap_or_else(|| "-".to_string());
+            column = column.child(
+                h_flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_semibold()
+                            .child(format!("{average} / 5")),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(management_locale_text("ratings", "条评分", "則評分")),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(format!("{}", reviews.count)),
+                    ),
+            );
+        }
+        if !detail.screenshots.is_empty() {
+            let mut strip = h_flex().w_full().gap_2().overflow_hidden();
+            for url in &detail.screenshots {
+                if let Some(image) = self.plugin_market_icons.get(url) {
+                    strip = strip.child(
+                        div()
+                            .flex_none()
+                            .w(px(160.0))
+                            .h(px(100.0))
+                            .overflow_hidden()
+                            .rounded(cx.theme().radius)
+                            .border_1()
+                            .border_color(cx.theme().border.opacity(0.6))
+                            .child(
+                                gpui::img(image.clone())
+                                    .size_full()
+                                    .object_fit(gpui::ObjectFit::Cover),
+                            ),
+                    );
+                }
+            }
+            column = column.child(strip);
         }
         if !detail.requested_permissions.is_empty() {
             let mut list = v_flex().gap_1();
@@ -13396,6 +13483,67 @@ impl ManagementCenter {
                 cx.notify();
             });
         }));
+    }
+
+    /// Load the pictures the Plugins page draws.
+    ///
+    /// A plugin's mark and its screenshots are ordinary https pictures the
+    /// catalog names; they go through the same runtime asset channel as every
+    /// other market picture, so a plugin cannot make the application read a
+    /// local file or a plaintext URL.
+    fn load_plugin_market_icons(&mut self, cx: &mut Context<Self>) {
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        let mut wanted = self
+            .plugin_market_entries
+            .iter()
+            .filter_map(|entry| entry.icon_url.clone())
+            .collect::<BTreeSet<_>>();
+        if let Some(detail) = &self.plugin_market_detail {
+            wanted.extend(detail.screenshots.iter().cloned());
+        }
+        let wanted = wanted
+            .into_iter()
+            .filter(|url| {
+                !self.plugin_market_icons.contains_key(url)
+                    && !self.plugin_market_icon_pending.contains(url)
+            })
+            .collect::<BTreeSet<_>>();
+        for url in wanted {
+            self.plugin_market_icon_pending.insert(url.clone());
+            let entity = cx.weak_entity();
+            let backend = backend.clone();
+            let request_url = url.clone();
+            // Reading a picture is blocking, so it starts on Tokio like every
+            // other market read.
+            let runner = gpui_tokio::Tokio::spawn(cx, async move {
+                backend.management().market_asset(request_url).await
+            });
+            cx.spawn(async move |_, cx| {
+                let loaded = runner.await.ok().and_then(Result::ok);
+                let _ = entity.update(cx, |this, cx| {
+                    this.plugin_market_icon_pending.remove(&url);
+                    let Some(asset) = loaded else {
+                        return;
+                    };
+                    let Some(format) = asset
+                        .mime
+                        .as_deref()
+                        .and_then(gpui::ImageFormat::from_mime_type)
+                    else {
+                        return;
+                    };
+                    if asset.bytes.is_empty() {
+                        return;
+                    }
+                    this.plugin_market_icons
+                        .insert(url, Arc::new(gpui::Image::from_bytes(format, asset.bytes)));
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
     }
 
     /// Load the owner picture each Skill card leads with.

@@ -34,6 +34,10 @@ pub struct PublisherKey {
 }
 
 /// One plugin entry in the index: the listing plus its versions.
+///
+/// Everything the detail page shows comes from here. An entry that publishes
+/// no screenshots or reviews simply omits them, which is why both are optional
+/// rather than empty placeholders the page has to hide.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PluginIndexEntry {
@@ -42,6 +46,20 @@ pub struct PluginIndexEntry {
     pub versions: Vec<PluginMarketVersion>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub publisher_key_id: Option<String>,
+    /// The long description, when the summary is too short for the page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// The page body. A topic-discovered entry reads its README from GitHub
+    /// instead; a reviewed entry carries the text here so the page does not
+    /// depend on the repository staying up.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub readme: Option<String>,
+    /// Screenshot addresses, at most [`vibex_core::MAX_PLUGIN_SCREENSHOTS`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub screenshots: Vec<String>,
+    /// What reviewers and users rated this plugin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviews: Option<vibex_core::PluginReviewsSummary>,
 }
 
 /// The signed index document.
@@ -125,6 +143,19 @@ impl PluginIndexFile {
             for version in &plugin.versions {
                 validate_version(version)?;
             }
+            if plugin.screenshots.len() > vibex_core::MAX_PLUGIN_SCREENSHOTS {
+                return Err(PluginError::Network(format!(
+                    "`{}` publishes more than {} screenshots",
+                    plugin.entry.id,
+                    vibex_core::MAX_PLUGIN_SCREENSHOTS
+                )));
+            }
+            for screenshot in &plugin.screenshots {
+                validate_asset_url(&plugin.entry.id, screenshot)?;
+            }
+            if let Some(icon) = &plugin.entry.icon_url {
+                validate_asset_url(&plugin.entry.id, icon)?;
+            }
         }
         Ok(())
     }
@@ -179,6 +210,23 @@ pub fn validate_version(version: &PluginMarketVersion) -> Result<(), PluginError
         )));
     }
     validate_version_url(&version.url)
+}
+
+/// Checks a picture address the same way a package address is checked.
+///
+/// Screenshots and icons are fetched by the application and drawn, so a
+/// `file://` or plain-`http` address in the index would be a way to read the
+/// local disk or a plaintext stream through the market.
+fn validate_asset_url(plugin_id: &str, url: &str) -> Result<(), PluginError> {
+    let parsed = Url::parse(url).map_err(|_| {
+        PluginError::Network(format!("`{plugin_id}` names a malformed asset `{url}`"))
+    })?;
+    if parsed.scheme() != "https" {
+        return Err(PluginError::Network(format!(
+            "`{plugin_id}` names an asset that is not https: `{url}`"
+        )));
+    }
+    Ok(())
 }
 
 fn validate_version_url(url: &str) -> Result<(), PluginError> {
@@ -312,6 +360,10 @@ mod tests {
                 featured: false,
                 i18n: Default::default(),
             },
+            description: None,
+            readme: None,
+            screenshots: Vec::new(),
+            reviews: None,
             versions: vec![PluginMarketVersion {
                 version: "1.0.0".to_string(),
                 published_at: None,
@@ -374,6 +426,44 @@ mod tests {
     fn a_non_https_package_address_is_rejected() {
         let mut index = index();
         index.plugins[0].versions[0].url = "http://example.com/x".to_string();
+        let bytes = serde_json::to_vec(&index).unwrap();
+        assert!(PluginIndexFile::parse(&bytes).is_err());
+    }
+
+    /// The detail page draws these, so the address has to be as trustworthy as
+    /// a package address: no plain http, no local files.
+    #[test]
+    fn a_non_https_screenshot_is_rejected() {
+        let mut index = index();
+        index.plugins[0].screenshots = vec!["http://example.com/shot.png".to_string()];
+        let bytes = serde_json::to_vec(&index).unwrap();
+        assert!(PluginIndexFile::parse(&bytes).is_err());
+
+        index.plugins[0].screenshots = vec!["file:///etc/passwd".to_string()];
+        let bytes = serde_json::to_vec(&index).unwrap();
+        assert!(PluginIndexFile::parse(&bytes).is_err());
+
+        index.plugins[0].screenshots = vec!["https://cdn.example/shot.png".to_string()];
+        let bytes = serde_json::to_vec(&index).unwrap();
+        assert!(PluginIndexFile::parse(&bytes).is_ok());
+    }
+
+    #[test]
+    fn too_many_screenshots_are_rejected() {
+        let mut index = index();
+        index.plugins[0].screenshots = (0..=vibex_core::MAX_PLUGIN_SCREENSHOTS)
+            .map(|index| format!("https://cdn.example/{index}.png"))
+            .collect();
+        let bytes = serde_json::to_vec(&index).unwrap();
+        assert!(PluginIndexFile::parse(&bytes).is_err());
+    }
+
+    /// A non-https icon is the same hazard as a screenshot, and the index is
+    /// the only place that can refuse it before the page renders it.
+    #[test]
+    fn a_non_https_icon_is_rejected() {
+        let mut index = index();
+        index.plugins[0].entry.icon_url = Some("http://example.com/icon.png".to_string());
         let bytes = serde_json::to_vec(&index).unwrap();
         assert!(PluginIndexFile::parse(&bytes).is_err());
     }

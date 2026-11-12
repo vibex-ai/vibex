@@ -237,8 +237,11 @@ impl MarketCatalog {
             .find(|entry| entry.entry.id == plugin_id)
             .ok_or_else(|| PluginError::NotFound(plugin_id.to_string()))?;
 
-        let mut readme = None;
-        if entry.entry.listing_source == vibex_core::PluginListingSource::Github
+        // A reviewed entry carries its own page text; only a topic-discovered
+        // one has to fetch a README, because its repository is all there is.
+        let mut readme = entry.readme.clone();
+        if readme.is_none()
+            && entry.entry.listing_source == vibex_core::PluginListingSource::Github
             && let Some(github) = &self.config.github
             && let Some(repo) = repository_spec(&entry)
         {
@@ -262,15 +265,18 @@ impl MarketCatalog {
 
         Ok(PluginMarketDetail {
             entry: entry.entry.clone(),
-            description: entry.entry.summary.clone(),
+            description: entry
+                .description
+                .clone()
+                .or_else(|| entry.entry.summary.clone()),
             readme,
             readme_bytes,
-            screenshots: Vec::new(),
+            screenshots: entry.screenshots.clone(),
             homepage: entry.entry.homepage.clone(),
             repository: entry.entry.repository.clone(),
             license: entry.entry.license.clone(),
             versions,
-            reviews: None,
+            reviews: entry.reviews.clone(),
             requested_permissions,
         })
     }
@@ -399,6 +405,10 @@ mod tests {
                 name: "Widgets".to_string(),
                 ..Default::default()
             },
+            description: None,
+            readme: None,
+            screenshots: Vec::new(),
+            reviews: None,
             versions: vec![PluginMarketVersion {
                 version: "1.0.0".to_string(),
                 published_at: None,
