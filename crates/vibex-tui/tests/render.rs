@@ -4477,7 +4477,7 @@ fn a_held_message_is_sent_once_the_turn_ends() {
     app.enqueue_message("held".to_string());
     let released = app.drain_queue();
     assert_eq!(
-        released.first().map(|(_, text, _)| text.as_str()),
+        released.first().map(|(_, text, _, _)| text.as_str()),
         Some("held")
     );
     assert_eq!(released[0].0, session.id);
@@ -4495,7 +4495,9 @@ fn a_held_message_is_sent_once_the_turn_ends() {
         .apply_sessions(Ok(vec![running]))
         .expect("sessions apply");
     assert_eq!(
-        app.drain_queue().first().map(|(_, text, _)| text.as_str()),
+        app.drain_queue()
+            .first()
+            .map(|(_, text, _, _)| text.as_str()),
         Some("waits")
     );
 }
