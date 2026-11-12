@@ -3487,6 +3487,16 @@ impl DesktopRuntime {
             home_lock: Mutex::new(home_lock),
             shutting_down: AtomicBool::new(false),
         });
+        // Reconcile a half-finished plugin install and apply the revocation
+        // list before any surface can list or load a plugin. A plugin failure
+        // must never stop the rest of the runtime from starting.
+        if let Err(error) = runtime.plugins().recover() {
+            tracing::warn!(
+                target: "vibex_plugin",
+                error_code = %error.code,
+                "plugin recovery failed; plugins stay on their stored state"
+            );
+        }
         // The endpoint is bound synchronously: a session created before it is
         // listening would otherwise be offered no browser tools at all, and the
         // race would look like a capability gap rather than a startup ordering

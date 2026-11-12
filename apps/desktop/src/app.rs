@@ -10836,6 +10836,8 @@ pub struct VibexWorkbench {
     /// The script plugin whose panel the rail shows, and its title.
     right_rail_script_panel: Option<String>,
     right_rail_script_title: Option<String>,
+    /// Why the script panel could not be started (revoked, broken, missing).
+    right_rail_script_error: Option<String>,
     /// Every right-rail activity the enabled plugins contribute.
     ///
     /// `None` until the catalog has been read once, which keeps the rail's
@@ -12613,6 +12615,7 @@ impl VibexWorkbench {
             right_rail_activity_drop_target: None,
             right_rail_script_panel: None,
             right_rail_script_title: None,
+            right_rail_script_error: None,
             right_rail_activities: None,
             session_group_view_loads: BTreeSet::new(),
             session_group_view_errors: BTreeMap::new(),
@@ -46422,6 +46425,7 @@ impl VibexWorkbench {
         self.right_rail_overlay_open = false;
         self.child_agent_panel_active = false;
         self.right_rail_script_panel = None;
+        self.right_rail_script_error = None;
         if visibility_changed {
             self.queue_ui_state();
         }
@@ -46452,6 +46456,7 @@ impl VibexWorkbench {
         }
         self.child_agent_panel_active = true;
         self.right_rail_script_panel = None;
+        self.right_rail_script_error = None;
         let visibility_changed = !self.ui_state.workbench.right_rail_visible;
         self.ui_state.workbench.right_rail_visible = true;
         if !self.right_rail_docks_when_open(cx) {
@@ -46521,6 +46526,7 @@ impl VibexWorkbench {
         }
         self.child_agent_panel_active = false;
         self.right_rail_script_panel = None;
+        self.right_rail_script_error = None;
         let activity_id = right_rail_activity_id(mode).to_string();
         let mode_changed =
             self.ui_state.right_rail.selected_activity_id.as_ref() != Some(&activity_id);
@@ -46588,6 +46594,7 @@ impl VibexWorkbench {
         }
         self.right_rail_script_panel = Some(plugin_id.clone());
         self.right_rail_script_title = Some(title);
+        self.right_rail_script_error = None;
         self.child_agent_panel_active = false;
         self.ui_state.right_rail.selected_activity_id = Some(format!("rail_plugin_{plugin_id}"));
         let visibility_changed = !self.ui_state.workbench.right_rail_visible;
@@ -46601,7 +46608,7 @@ impl VibexWorkbench {
         if visibility_changed {
             self.queue_ui_state();
         }
-        self.ensure_script_panel(plugin_id);
+        self.ensure_script_panel(plugin_id, cx);
         cx.notify();
     }
 
@@ -46611,19 +46618,39 @@ impl VibexWorkbench {
     /// The load runs on the UI thread's pump, which repaints every window when
     /// it finishes; the rail asks [`crate::plugin_host::view`] on each frame and
     /// draws its placeholder until the view exists.
-    fn ensure_script_panel(&mut self, plugin_id: String) {
+    fn ensure_script_panel(&mut self, plugin_id: String, cx: &mut Context<Self>) {
         let Some(runtime) = self.runtime.clone() else {
             return;
         };
-        let Ok(plugins) = runtime.plugins().list() else {
+        // A revoked plugin must not start just because its button is still in
+        // the persisted order. This also moves the durable record to Revoked.
+        if let Err(error) = runtime.plugins().ensure_loadable(&plugin_id) {
+            self.right_rail_script_error = Some(error.message);
+            self.refresh_right_rail_plugins(cx);
             return;
+        }
+        let plugins = match runtime.plugins().list() {
+            Ok(plugins) => plugins,
+            Err(error) => {
+                self.right_rail_script_error = Some(error.message);
+                return;
+            }
         };
         let Some(record) = plugins
             .into_iter()
             .find(|plugin| plugin.plugin_id == plugin_id)
         else {
+            self.right_rail_script_error = Some(
+                locale::text(
+                    "This plugin is no longer installed.",
+                    "这个插件已经不在已安装列表中。",
+                    "此外掛已經不在已安裝清單中。",
+                )
+                .to_string(),
+            );
             return;
         };
+        self.right_rail_script_error = None;
         crate::plugin_host::request_load(plugin_id, &record);
     }
 
@@ -46704,6 +46731,26 @@ impl VibexWorkbench {
             .right_rail_script_title
             .clone()
             .unwrap_or_else(|| locale::text("Plugin", "插件", "外掛").to_string());
+        if let Some(error) = &self.right_rail_script_error {
+            return v_flex()
+                .size_full()
+                .items_center()
+                .justify_center()
+                .gap_2()
+                .child(
+                    Icon::new(IconName::TriangleAlert)
+                        .size(px(18.0))
+                        .text_color(cx.theme().danger),
+                )
+                .child(div().text_sm().font_semibold().child(title))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().danger)
+                        .child(error.clone()),
+                )
+                .into_any_element();
+        }
         v_flex()
             .size_full()
             .items_center()

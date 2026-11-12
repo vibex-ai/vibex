@@ -12,16 +12,17 @@ use std::sync::{Arc, Mutex, OnceLock};
 use ed25519_dalek::VerifyingKey;
 use semver::Version;
 use vibex_core::{
-    InstalledPlugin, PluginAutoUpdateRequest, PluginEnabledRequest, PluginLocalInstallRequest,
-    PluginMarketDetail, PluginMarketDetailRequest, PluginMarketIndexRequest,
-    PluginMarketIndexResponse, PluginMarketInstallRequest, PluginMarketInstallResult,
-    PluginMarketSearchRequest, PluginMarketSearchResponse, PluginUninstallRequest,
-    PluginUpdateApplyRequest, PluginUpdateCheckRequest, PluginUpdateCheckResponse, VibexResult,
+    InstalledPlugin, InstalledPluginStatus, PluginAutoUpdateRequest, PluginEnabledRequest,
+    PluginLocalInstallRequest, PluginMarketDetail, PluginMarketDetailRequest,
+    PluginMarketIndexRequest, PluginMarketIndexResponse, PluginMarketInstallRequest,
+    PluginMarketInstallResult, PluginMarketSearchRequest, PluginMarketSearchResponse,
+    PluginUninstallRequest, PluginUpdateApplyRequest, PluginUpdateCheckRequest,
+    PluginUpdateCheckResponse, VibexResult,
 };
-use vibex_db::open_database;
+use vibex_db::{PluginRepository, open_database};
 use vibex_plugin::{
     MarketCache, MarketCatalog, MarketConfig, MarketHttpClient, MarketUrlPolicy, NullRuntime,
-    PluginRuntime, PluginService, PluginStore,
+    PluginError, PluginRuntime, PluginService, PluginStore,
 };
 
 /// The default index address.
@@ -130,7 +131,14 @@ impl PluginHandle {
         &self,
         request: PluginMarketIndexRequest,
     ) -> VibexResult<PluginMarketIndexResponse> {
-        Ok(self.service().index(&request).await)
+        let service = self.service();
+        let response = service.index(&request).await;
+        // A refresh can carry a new revocation list; apply it to what is
+        // already installed before the caller draws the catalog.
+        if let Ok(connection) = self.connection() {
+            let _ = service.apply_revocations(&connection);
+        }
+        Ok(response)
     }
 
     pub async fn search(
@@ -233,6 +241,42 @@ impl PluginHandle {
             results.push(self.service().install(connection, &install).await?);
         }
         Ok(results)
+    }
+
+    /// Refuses to load a plugin the market has revoked.
+    ///
+    /// The rail asks this before it posts a load to the UI thread, so a
+    /// revoked script never starts; the durable record is switched to
+    /// `Revoked` and the link is removed at the same time.
+    pub fn ensure_loadable(&self, plugin_id: &str) -> VibexResult<()> {
+        let connection = self.connection()?;
+        let record = PluginRepository::get(&connection, plugin_id)?
+            .filter(|record| record.deleted_at_ms.is_none())
+            .ok_or_else(|| {
+                vibex_core::VibexError::validation(
+                    "plugin_not_installed",
+                    format!("the plugin `{plugin_id}` is not installed"),
+                )
+            })?;
+        let service = self.service();
+        let Some(blocked) = service.market().blocked(plugin_id, &record.version) else {
+            return Ok(());
+        };
+        let now = vibex_core::unix_timestamp_ms();
+        let _ = self.runtime.unload(plugin_id);
+        let _ = service.store().deactivate(plugin_id);
+        PluginRepository::set_enabled(&connection, plugin_id, false, now)?;
+        PluginRepository::set_status(
+            &connection,
+            plugin_id,
+            InstalledPluginStatus::Revoked,
+            Some(&blocked.reason),
+            now,
+        )?;
+        Err(vibex_core::VibexError::from(PluginError::Blocked(
+            plugin_id.to_string(),
+            blocked.reason,
+        )))
     }
 
     /// Recovers an interrupted install.

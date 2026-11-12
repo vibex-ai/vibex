@@ -242,11 +242,38 @@ impl PluginService {
             if !self.store.has_version(plugin_id, &version) {
                 return Err(PluginError::NotInstalled(plugin_id.to_string()).into());
             }
-            let loaded = self.loaded_plugin_with_grants(&record)?;
-            self.runtime.load(&loaded).map_err(VibexError::from)?;
+            if let Some(blocked) = self.market.blocked(plugin_id, &version) {
+                let now = Self::now_ms();
+                let _ = self.runtime.unload(plugin_id);
+                let _ = self.store.deactivate(plugin_id);
+                PluginRepository::set_enabled(conn, plugin_id, false, now)?;
+                PluginRepository::set_status(
+                    conn,
+                    plugin_id,
+                    InstalledPluginStatus::Revoked,
+                    Some(&blocked.reason),
+                    now,
+                )?;
+                return Err(PluginError::Blocked(plugin_id.to_string(), blocked.reason).into());
+            }
+            // The host discovers plugins through `plugins/<id>`, so the link
+            // has to exist before the script is loaded. Put it back first and
+            // remove it again if the load fails.
             self.store
                 .activate(plugin_id, &version)
                 .map_err(VibexError::from)?;
+            let loaded = match self.loaded_plugin_with_grants(&record) {
+                Ok(loaded) => loaded,
+                Err(error) => {
+                    let _ = self.store.deactivate(plugin_id);
+                    return Err(error);
+                }
+            };
+            if let Err(error) = self.runtime.load(&loaded) {
+                let _ = self.store.deactivate(plugin_id);
+                return Err(error.into());
+            }
+            PluginRepository::set_active(conn, plugin_id, &version)?;
             PluginRepository::set_status(
                 conn,
                 plugin_id,
@@ -255,7 +282,12 @@ impl PluginService {
                 Self::now_ms(),
             )?;
         } else {
-            self.runtime.unload(plugin_id).map_err(VibexError::from)?;
+            // A failed unload must not trap the user in an enabled state: the
+            // link and the durable switch still go off. If the host is gone,
+            // there is no script left to unload anyway.
+            if let Err(error) = self.runtime.unload(plugin_id) {
+                eprintln!("vibex-plugin: unload failed for {plugin_id}: {error}");
+            }
             self.store.deactivate(plugin_id).map_err(VibexError::from)?;
             PluginRepository::set_status(
                 conn,
@@ -553,8 +585,13 @@ impl PluginService {
         auto_update: bool,
     ) -> VibexResult<PluginMarketInstallResult> {
         let existing = PluginRepository::get(conn, &entry.id)?;
-        let previous_version = existing.as_ref().map(|record| record.version.clone());
-        let created = existing.is_none();
+        let previous_record = existing
+            .clone()
+            .filter(|record| record.deleted_at_ms.is_none());
+        let previous_version = previous_record
+            .as_ref()
+            .map(|record| record.version.clone());
+        let created = previous_record.is_none();
 
         // Verify and unpack into staging.
         verify_checksums(bytes, &version.sha256, version.sha512.as_deref())
@@ -691,22 +728,30 @@ impl PluginService {
                 .ok_or_else(|| PluginError::NotInstalled(entry.id.clone()))?;
             let loaded = self.loaded_plugin_with_grants(&stored)?;
             if let Err(error) = self.runtime.load(&loaded) {
-                let _ = self.store.recover_pending();
-                PluginRepository::set_status(
+                if let Err(rollback) = self.rollback_failed_load(
                     conn,
-                    &entry.id,
-                    InstalledPluginStatus::Broken,
-                    Some(&error.to_string()),
-                    Self::now_ms(),
-                )?;
+                    entry,
+                    previous_record.as_ref(),
+                    &version.version,
+                ) {
+                    eprintln!(
+                        "vibex-plugin: rolling back {} after a failed load also failed: {rollback}",
+                        entry.id
+                    );
+                    let _ = PluginRepository::set_status(
+                        conn,
+                        &entry.id,
+                        InstalledPluginStatus::Broken,
+                        Some(&error.to_string()),
+                        Self::now_ms(),
+                    );
+                }
                 return Err(VibexError::from(error));
             }
         } else {
+            // Keep the version directory: a disabled plugin still has to be
+            // enable-able later. Only the link goes away.
             self.store.deactivate(&entry.id).map_err(VibexError::from)?;
-            let _ = self
-                .store
-                .remove_version(&entry.id, &version.version)
-                .map(|_| ());
         }
 
         self.store.clear_pending().map_err(VibexError::from)?;
@@ -722,6 +767,84 @@ impl PluginService {
             .ok_or_else(|| PluginError::NotInstalled(entry.id.clone()))?
             .to_installed();
         Ok(PluginMarketInstallResult { plugin, created })
+    }
+
+    /// Puts the previous version back after a new version failed to load.
+    ///
+    /// The install wrote the new record, grants and contributions before it
+    /// tried the load. All three are restored with the old version, and a
+    /// fresh install (no previous version) is hidden instead of being left as
+    /// a half-installed row.
+    fn rollback_failed_load(
+        &self,
+        conn: &rusqlite::Connection,
+        entry: &PluginMarketEntry,
+        previous: Option<&PluginRecord>,
+        failed_version: &str,
+    ) -> VibexResult<()> {
+        let _ = self.runtime.unload(&entry.id);
+        let now = Self::now_ms();
+        if let Some(previous) = previous {
+            if self.store.has_version(&entry.id, &previous.version) {
+                self.store
+                    .activate(&entry.id, &previous.version)
+                    .map_err(VibexError::from)?;
+                PluginRepository::upsert(conn, previous)?;
+                PluginRepository::set_active(conn, &entry.id, &previous.version)?;
+                PluginRepository::replace_grants(
+                    conn,
+                    &entry.id,
+                    &previous.granted_permissions,
+                    &previous.permissions,
+                    now,
+                )?;
+                PluginRepository::replace_contributions(
+                    conn,
+                    &entry.id,
+                    &contributions_for(entry, &previous.permissions),
+                )?;
+                if previous.version != failed_version {
+                    let _ = self.store.remove_version(&entry.id, failed_version);
+                    let _ = PluginRepository::delete_version(conn, &entry.id, failed_version);
+                }
+                self.store.clear_pending().map_err(VibexError::from)?;
+                if previous.enabled
+                    && let Err(error) = self
+                        .loaded_plugin_with_grants(previous)
+                        .and_then(|loaded| self.runtime.load(&loaded).map_err(VibexError::from))
+                {
+                    PluginRepository::set_status(
+                        conn,
+                        &entry.id,
+                        InstalledPluginStatus::Broken,
+                        Some(&error.to_string()),
+                        now,
+                    )?;
+                }
+                return Ok(());
+            }
+            // The old version is gone; the plugin cannot be brought back.
+            let _ = self.store.deactivate(&entry.id);
+            let _ = self.store.remove_version(&entry.id, failed_version);
+            let _ = PluginRepository::delete_version(conn, &entry.id, failed_version);
+            self.store.clear_pending().map_err(VibexError::from)?;
+            PluginRepository::set_status(
+                conn,
+                &entry.id,
+                InstalledPluginStatus::Broken,
+                Some("the previous version is missing"),
+                now,
+            )?;
+            return Ok(());
+        }
+
+        // A fresh install that never loaded is not a plugin the user has.
+        let _ = self.store.deactivate(&entry.id);
+        let _ = self.store.remove_version(&entry.id, failed_version);
+        let _ = PluginRepository::delete_version(conn, &entry.id, failed_version);
+        PluginRepository::soft_delete(conn, &entry.id, now)?;
+        self.store.clear_pending().map_err(VibexError::from)?;
+        Ok(())
     }
 
     // ---- updates ----
@@ -854,27 +977,44 @@ impl PluginService {
 
     // ---- recovery ----
 
-    /// Recovers an interrupted install.
+    /// Recovers an interrupted install, then applies the revocation list.
     pub fn recover(&self, conn: &rusqlite::Connection) -> VibexResult<RecoveryOutcome> {
         let outcome = self.store.recover_pending().map_err(VibexError::from)?;
+        let now = Self::now_ms();
         match &outcome {
             RecoveryOutcome::Completed { plugin_id, version }
             | RecoveryOutcome::RolledBack { plugin_id, version } => {
+                // Recompute the paths: a recovery must not wipe the record's
+                // install/data directories (the old code passed None and left
+                // the plugin unloadable from the rail).
+                let install_dir = self
+                    .store
+                    .version_dir(plugin_id, version)
+                    .to_string_lossy()
+                    .to_string();
+                let data_dir = self.store.data_dir(plugin_id).to_string_lossy().to_string();
+                let record = PluginRepository::get(conn, plugin_id)?;
+                let wanted = record.as_ref().is_some_and(|record| record.enabled);
+                if !wanted {
+                    // A disabled plugin may have crashed mid-install after the
+                    // record was written; the link must follow the switch.
+                    let _ = self.store.deactivate(plugin_id);
+                }
                 PluginRepository::set_active(conn, plugin_id, version)?;
-                let status = if self.store.current_version(plugin_id).is_some() {
+                let status = if wanted && self.store.current_version(plugin_id).is_some() {
                     InstalledPluginStatus::Enabled
                 } else {
                     InstalledPluginStatus::Disabled
                 };
-                PluginRepository::set_status(conn, plugin_id, status, None, Self::now_ms())?;
+                PluginRepository::set_status(conn, plugin_id, status, None, now)?;
                 PluginRepository::set_active_version(
                     conn,
                     plugin_id,
                     version,
-                    None,
-                    None,
-                    None,
-                    Self::now_ms(),
+                    Some(&install_dir),
+                    Some(&data_dir),
+                    record.as_ref().and_then(|record| record.size_bytes),
+                    now,
                 )?;
             }
             RecoveryOutcome::Broken { plugin_id } => {
@@ -883,12 +1023,45 @@ impl PluginService {
                     plugin_id,
                     InstalledPluginStatus::Broken,
                     Some("the install could not be recovered"),
-                    Self::now_ms(),
+                    now,
                 )?;
             }
             RecoveryOutcome::None => {}
         }
+        self.enforce_revocations(conn, now)?;
         Ok(outcome)
+    }
+
+    /// Applies the cached revocation list to installed plugins.
+    ///
+    /// Called on startup and again after the catalog refreshes, so a plugin
+    /// revoked while the app was running is switched off without waiting for
+    /// the next launch.
+    pub fn apply_revocations(&self, conn: &rusqlite::Connection) -> VibexResult<()> {
+        self.enforce_revocations(conn, Self::now_ms())
+    }
+
+    /// Turns off every installed version the market has revoked.
+    fn enforce_revocations(&self, conn: &rusqlite::Connection, now: i64) -> VibexResult<()> {
+        for record in PluginRepository::list(conn)? {
+            if record.kind == PluginKind::Native {
+                continue;
+            }
+            let Some(blocked) = self.market.blocked(&record.plugin_id, &record.version) else {
+                continue;
+            };
+            let _ = self.runtime.unload(&record.plugin_id);
+            let _ = self.store.deactivate(&record.plugin_id);
+            PluginRepository::set_enabled(conn, &record.plugin_id, false, now)?;
+            PluginRepository::set_status(
+                conn,
+                &record.plugin_id,
+                InstalledPluginStatus::Revoked,
+                Some(&blocked.reason),
+                now,
+            )?;
+        }
+        Ok(())
     }
 
     // ---- helpers ----
@@ -1030,6 +1203,7 @@ mod tests {
     use vibex_core::PluginPermissionRisk;
 
     use crate::install::PluginStore;
+    use crate::market::index::{PluginRevocations, RevokedPlugin};
     use crate::market::{MarketCache, MarketConfig, MarketHttpClient, MarketUrlPolicy};
     use crate::runtime::NullRuntime;
 
@@ -1304,5 +1478,246 @@ mod tests {
                 .set_auto_update(&connection, "vibex.system.git", true)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn a_disabled_install_keeps_its_version_for_a_later_enable() {
+        let directory = tempfile::tempdir().unwrap();
+        let service = service(directory.path());
+        let connection = connection();
+        let package_path = directory.path().join("acme.widgets.vibexplug");
+        std::fs::write(&package_path, package()).unwrap();
+
+        let result = service
+            .install_from_file(&connection, package_path.to_str().unwrap(), false)
+            .unwrap();
+        assert!(!result.plugin.enabled);
+        assert!(
+            service.store().has_version("acme.widgets", "1.0.0"),
+            "a disabled install must keep the version directory"
+        );
+        assert_eq!(service.store().current_version("acme.widgets"), None);
+
+        let enabled = service
+            .set_enabled(&connection, "acme.widgets", true)
+            .unwrap();
+        assert!(enabled.enabled);
+        assert_eq!(
+            service.store().current_version("acme.widgets").as_deref(),
+            Some("1.0.0")
+        );
+    }
+
+    #[test]
+    fn recovery_keeps_the_install_and_data_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        let service = service(directory.path());
+        let connection = connection();
+        let package_path = directory.path().join("acme.widgets.vibexplug");
+        std::fs::write(&package_path, package()).unwrap();
+        service
+            .install_from_file(&connection, package_path.to_str().unwrap(), true)
+            .unwrap();
+
+        let version_path = service.store().version_dir("acme.widgets", "1.0.0");
+        let data_path = service.store().data_dir("acme.widgets");
+        service
+            .store()
+            .write_pending(&PendingInstall {
+                plugin_id: "acme.widgets".to_string(),
+                previous_version: None,
+                new_version: "1.0.0".to_string(),
+                started_at_ms: 1,
+            })
+            .unwrap();
+
+        let outcome = service.recover(&connection).unwrap();
+        assert!(matches!(outcome, RecoveryOutcome::Completed { .. }));
+        let record = PluginRepository::get(&connection, "acme.widgets")
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.install_dir.as_deref(), version_path.to_str());
+        assert_eq!(record.data_dir.as_deref(), data_path.to_str());
+    }
+
+    struct LinkCheckingRuntime {
+        home: std::path::PathBuf,
+    }
+
+    impl crate::runtime::PluginRuntime for LinkCheckingRuntime {
+        fn load(&self, plugin: &LoadedPlugin) -> Result<(), PluginError> {
+            let link = self.home.join("plugins").join(&plugin.plugin_id);
+            if !link.exists() {
+                return Err(PluginError::Host(
+                    "the plugin link was missing while loading".to_string(),
+                ));
+            }
+            Ok(())
+        }
+
+        fn unload(&self, _plugin_id: &str) -> Result<(), PluginError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn enabling_a_disabled_plugin_puts_the_link_back_before_loading() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path().to_path_buf();
+        let cache = MarketCache::new(home.join("market"));
+        let catalog = MarketCatalog::new(
+            MarketHttpClient::new(MarketUrlPolicy::Testing),
+            MarketConfig::empty(cache),
+        );
+        let service = PluginService::new(
+            catalog,
+            PluginStore::new(&home),
+            Arc::new(LinkCheckingRuntime { home: home.clone() }),
+            Version::parse("0.1.2").unwrap(),
+        );
+        let connection = connection();
+        let package_path = directory.path().join("acme.widgets.vibexplug");
+        std::fs::write(&package_path, package()).unwrap();
+
+        service
+            .install_from_file(&connection, package_path.to_str().unwrap(), true)
+            .unwrap();
+        service
+            .set_enabled(&connection, "acme.widgets", false)
+            .unwrap();
+        service
+            .set_enabled(&connection, "acme.widgets", true)
+            .unwrap();
+        assert_eq!(
+            service.store().current_version("acme.widgets").as_deref(),
+            Some("1.0.0")
+        );
+    }
+
+    #[test]
+    fn a_failed_update_restores_the_previous_version() {
+        let directory = tempfile::tempdir().unwrap();
+        let service = service(directory.path());
+        let connection = connection();
+        let package_path = directory.path().join("acme.widgets.vibexplug");
+        std::fs::write(&package_path, package()).unwrap();
+        service
+            .install_from_file(&connection, package_path.to_str().unwrap(), true)
+            .unwrap();
+        let previous = PluginRepository::get(&connection, "acme.widgets")
+            .unwrap()
+            .unwrap();
+
+        let entry = PluginMarketEntry {
+            id: "acme.widgets".to_string(),
+            name: "Widgets".to_string(),
+            kind: PluginKind::Script,
+            bundled: false,
+            listing_source: PluginListingSource::Index,
+            summary: None,
+            icon_url: None,
+            publisher: vibex_core::PluginPublisher::from_login("acme"),
+            categories: Vec::new(),
+            tags: Vec::new(),
+            latest_version: Some("1.1.0".to_string()),
+            installs: 0,
+            rating: None,
+            updated_at: None,
+            license: None,
+            homepage: None,
+            repository: None,
+            trust: PluginTrust::Community,
+            permissions: previous.permissions.clone(),
+            compatibility: Default::default(),
+            size_bytes: None,
+            featured: false,
+            i18n: Default::default(),
+        };
+
+        let failed_version = "1.1.0";
+        let failed_path = service.store().version_dir("acme.widgets", failed_version);
+        std::fs::create_dir_all(&failed_path).unwrap();
+        let mut failed = previous.clone();
+        failed.version = failed_version.to_string();
+        failed.install_dir = Some(failed_path.to_string_lossy().to_string());
+        failed.status = InstalledPluginStatus::Enabled;
+        PluginRepository::upsert(&connection, &failed).unwrap();
+        PluginRepository::set_active_version(
+            &connection,
+            "acme.widgets",
+            failed_version,
+            failed.install_dir.as_deref(),
+            failed.data_dir.as_deref(),
+            failed.size_bytes,
+            1,
+        )
+        .unwrap();
+        PluginRepository::replace_grants(
+            &connection,
+            "acme.widgets",
+            &failed.granted_permissions,
+            &failed.permissions,
+            1,
+        )
+        .unwrap();
+        PluginRepository::replace_contributions(
+            &connection,
+            "acme.widgets",
+            &contributions_for(&entry, &failed.permissions),
+        )
+        .unwrap();
+
+        service
+            .rollback_failed_load(&connection, &entry, Some(&previous), failed_version)
+            .unwrap();
+        let restored = PluginRepository::get(&connection, "acme.widgets")
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored.version, "1.0.0");
+        assert_eq!(
+            service.store().current_version("acme.widgets").as_deref(),
+            Some("1.0.0")
+        );
+        assert!(!service.store().has_version("acme.widgets", failed_version));
+    }
+
+    #[test]
+    fn a_revoked_plugin_is_disabled_and_cannot_be_enabled() {
+        let directory = tempfile::tempdir().unwrap();
+        let service = service(directory.path());
+        let connection = connection();
+        let package_path = directory.path().join("acme.widgets.vibexplug");
+        std::fs::write(&package_path, package()).unwrap();
+        service
+            .install_from_file(&connection, package_path.to_str().unwrap(), true)
+            .unwrap();
+
+        service.market().config().cache.write_revocations(
+            b"{}",
+            "signature",
+            &PluginRevocations {
+                schema: 1,
+                revision: 1,
+                blocked_plugins: vec![RevokedPlugin {
+                    id: "acme.widgets".to_string(),
+                    versions: Vec::new(),
+                    reason: "security".to_string(),
+                    advisory_url: None,
+                }],
+            },
+        );
+
+        service.recover(&connection).unwrap();
+        let record = PluginRepository::get(&connection, "acme.widgets")
+            .unwrap()
+            .unwrap();
+        assert!(!record.enabled);
+        assert_eq!(record.status, InstalledPluginStatus::Revoked);
+        assert_eq!(service.store().current_version("acme.widgets"), None);
+
+        let error = service
+            .set_enabled(&connection, "acme.widgets", true)
+            .unwrap_err();
+        assert_eq!(error.code, "plugin_blocked");
     }
 }

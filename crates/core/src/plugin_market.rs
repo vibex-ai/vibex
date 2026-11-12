@@ -821,6 +821,8 @@ pub enum InstalledPluginStatus {
     Disabled,
     UpdateAvailable,
     Broken,
+    /// The market's revocation list blocks this version.
+    Revoked,
 }
 
 impl Default for InstalledPluginStatus {

@@ -13084,6 +13084,7 @@ impl ManagementCenter {
             let uninstall_id = plugin.plugin_id.clone();
             let enabled = plugin.enabled;
             let uninstallable = plugin.can_uninstall();
+            let status_tag = plugin_status_tag(plugin.status, cx);
             let mut row = h_flex()
                 .w_full()
                 .min_w_0()
@@ -13114,23 +13115,26 @@ impl ManagementCenter {
                                     }
                                 )),
                         ),
-                )
-                .child(
-                    Button::new(SharedString::from(format!(
-                        "management-plugin-toggle-{toggle_id}"
-                    )))
-                    .small()
-                    .outline()
-                    .label(if enabled {
-                        management_locale_text("Disable", "禁用", "停用")
-                    } else {
-                        management_locale_text("Enable", "启用", "啟用")
-                    })
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.set_plugin_enabled(toggle_id.clone(), !enabled, cx);
-                        cx.notify();
-                    })),
                 );
+            if let Some(tag) = status_tag {
+                row = row.child(tag);
+            }
+            row = row.child(
+                Button::new(SharedString::from(format!(
+                    "management-plugin-toggle-{toggle_id}"
+                )))
+                .small()
+                .outline()
+                .label(if enabled {
+                    management_locale_text("Disable", "禁用", "停用")
+                } else {
+                    management_locale_text("Enable", "启用", "啟用")
+                })
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.set_plugin_enabled(toggle_id.clone(), !enabled, cx);
+                    cx.notify();
+                })),
+            );
             if uninstallable {
                 row = row.child(
                     Button::new(SharedString::from(format!(
@@ -41196,6 +41200,33 @@ fn management_market_chip(label: impl Into<SharedString>) -> AnyElement {
         .xsmall()
         .child(label.into())
         .into_any_element()
+}
+
+/// A non-normal lifecycle state on an installed plugin.
+fn plugin_status_tag(status: vibex_core::InstalledPluginStatus, _cx: &App) -> Option<AnyElement> {
+    let (label, color) = match status {
+        vibex_core::InstalledPluginStatus::Enabled
+        | vibex_core::InstalledPluginStatus::Disabled => return None,
+        vibex_core::InstalledPluginStatus::UpdateAvailable => (
+            management_locale_text("Update available", "有可用更新", "有可用更新"),
+            ColorName::Green,
+        ),
+        vibex_core::InstalledPluginStatus::Broken => (
+            management_locale_text("Broken", "已损坏", "已損壞"),
+            ColorName::Red,
+        ),
+        vibex_core::InstalledPluginStatus::Revoked => (
+            management_locale_text("Revoked", "已吊销", "已吊銷"),
+            ColorName::Red,
+        ),
+    };
+    Some(
+        Tag::color(color)
+            .outline()
+            .xsmall()
+            .child(label)
+            .into_any_element(),
+    )
 }
 
 /// One permission in the Plugins consent sheet.
