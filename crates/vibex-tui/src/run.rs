@@ -327,7 +327,7 @@ fn event_loop(
         // session, which is not necessarily the one on screen. Checked here,
         // after worker results have been applied, because that is the only
         // moment a session's state can have changed.
-        for (session_id, text, attachments) in app.drain_queue() {
+        for (session_id, text, attachments, mentions) in app.drain_queue() {
             // A message released into the session on screen needs no
             // announcement — it is about to appear in the transcript. One
             // released elsewhere is the only way the reader can learn it went.
@@ -352,6 +352,7 @@ fn event_loop(
                 correlation_id: app.pending_sends[&send_id].correlation_id.clone(),
                 text,
                 attachments,
+                mentions,
             });
             dirty = true;
         }
@@ -1288,6 +1289,33 @@ fn completion_source_label(source_kind: vibex_core::AgentCommandSourceKind) -> &
         AgentCommandSourceKind::Reference => "Reference",
         AgentCommandSourceKind::ClientBuiltin => "Built-in",
     }
+}
+
+/// The typed `@` reference behind one delegation suggestion row.
+///
+/// The authority names the Agent and the exact runtime option in the row's
+/// metadata. The visible `@Agent` text alone cannot tell a later delegation
+/// which provider and model the reader chose, so the reference has to travel
+/// beside the insertion.
+fn delegation_mention(
+    entry: &vibex_core::AgentCommandEntry,
+) -> Option<vibex_core::VibexUseMention> {
+    let metadata = |key: &str| {
+        entry
+            .metadata
+            .iter()
+            .find(|metadata| metadata.key == key)
+            .map(|metadata| metadata.value.as_str())
+    };
+    let agent_id = metadata("vibexUseAgentReference")
+        .and_then(|value| vibex_core::AgentId::parse(value).ok())?;
+    let reference =
+        metadata("vibexUseSelectionReference").and_then(vibex_core::VibexUseRef::parse)?;
+    Some(vibex_core::VibexUseMention::agent(
+        &agent_id,
+        &reference,
+        Some(entry.label.as_str()),
+    ))
 }
 
 /// Composer editing keys. Returns `Some(true)` to exit the program.
@@ -3388,6 +3416,14 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
                             crate::composer::CompletionTrigger::At => {
                                 menu.lists.files = rows(&discovery.response.entries);
                                 menu.lists.delegation = rows(&discovery.delegation_entries);
+                                menu.delegation_mentions = discovery
+                                    .delegation_entries
+                                    .iter()
+                                    .filter_map(|entry| {
+                                        delegation_mention(entry)
+                                            .map(|mention| (entry.insertion_text.clone(), mention))
+                                    })
+                                    .collect();
                                 menu.lists.sessions = rows(&discovery.session_entries);
                             }
                             crate::composer::CompletionTrigger::Dollar => {

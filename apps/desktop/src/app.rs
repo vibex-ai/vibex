@@ -33369,8 +33369,10 @@ impl VibexWorkbench {
     /// row on screen.
     fn apply_delegation_edit_choice(
         &mut self,
+        target: ComposerTarget,
         agent_id: AgentId,
         selection_ref: String,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some(option) = self
@@ -33409,6 +33411,10 @@ impl VibexWorkbench {
         {
             apply_delegation_selection_to_entry(entry, &agent_id, &option);
         }
+        // A draft may already carry this Agent's chip. It names the same
+        // collaborator but still remembers the old configuration; leaving it
+        // would make the message disagree with the row the reader just edited.
+        self.rewrite_delegation_mention_tokens(target, &agent_id, &option, window, cx);
         self.suggestion_tab = ComposerSuggestionTab::Delegation;
         let edited = self
             .delegation_suggestions
@@ -33420,6 +33426,55 @@ impl VibexWorkbench {
             self.suggestion_scroll.scroll_to_item(index);
         }
         cx.notify();
+    }
+
+    /// Re-points every `@Agent` chip already in `target`'s draft at `option`.
+    ///
+    /// The chip's visible label is only `@Agent`; the configuration lives in
+    /// the encoded mention id. Editing the row must therefore rewrite that id
+    /// too, or the next send would carry the configuration the reader just
+    /// replaced.
+    fn rewrite_delegation_mention_tokens(
+        &mut self,
+        target: ComposerTarget,
+        agent_id: &AgentId,
+        option: &SessionRuntimeOption,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(input) = self.input_for_composer_target(target) else {
+            return;
+        };
+        let Some(reference) = vibex_core::VibexUseRef::parse(&runtime_option_ref(option)) else {
+            return;
+        };
+        let updates = input
+            .read(cx)
+            .tokens()
+            .iter()
+            .filter_map(|span| {
+                let mention = VibexUseMention::parse(span.token().id().as_ref())?;
+                if mention.kind != vibex_core::VibexUseMentionKind::Agent
+                    || mention.agent_id.as_ref() != Some(agent_id)
+                {
+                    return None;
+                }
+                let next = VibexUseMention::agent(agent_id, &reference, None);
+                Some((
+                    span.range(),
+                    InlineToken::new(next.encode(), span.token().text().clone())
+                        .with_label(span.token().label().to_string()),
+                ))
+            })
+            .collect::<Vec<_>>();
+        if updates.is_empty() {
+            return;
+        }
+        input.update(cx, |input, cx| {
+            for (range, token) in updates {
+                let _ = input.replace_range_with_token(range, token, window, cx);
+            }
+        });
     }
 
     fn apply_suggestion(
@@ -33434,7 +33489,7 @@ impl VibexWorkbench {
         // mention: it writes the Agent's explicit delegation choice and leaves
         // the draft untouched.
         if let Some((agent_id, selection_ref)) = delegation_edit_target(&entry) {
-            self.apply_delegation_edit_choice(agent_id, selection_ref, cx);
+            self.apply_delegation_edit_choice(target, agent_id, selection_ref, window, cx);
             return;
         }
         let Some(input) = self.input_for_composer_target(target) else {

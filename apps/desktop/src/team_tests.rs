@@ -3571,3 +3571,58 @@ fn a_group_pane_draws_a_terminal_session_as_a_terminal(cx: &mut TestAppContext) 
         "the group pane should paint the terminal page"
     );
 }
+
+#[gpui::test]
+async fn editing_the_delegation_row_rewrites_an_existing_agent_token(cx: &mut TestAppContext) {
+    let (workbench, cx, _) = fixture(cx, 1);
+    let agent_id = AgentId::parse("claude").expect("agent id");
+    let old = VibexUseRef::runtime_option("option-old");
+    let mention = VibexUseMention::agent(&agent_id, &old, Some("@Claude"));
+    let option = SessionRuntimeOption {
+        selection: SessionRuntimeSelection::provider(
+            agent_id.clone(),
+            ProviderProfileId::new(),
+            "sonnet",
+        ),
+        agent_label: "Claude".into(),
+        auth_source_label: "Profile".into(),
+        model_label: "Sonnet".into(),
+        reasoning_efforts: Vec::new(),
+        modes: Vec::new(),
+        features: Vec::new(),
+        availability: RuntimeOptionAvailability::Available,
+        member_count: 1,
+        auto_routes: false,
+    };
+    let expected = VibexUseRef::parse(&runtime_option_ref(&option)).expect("option reference");
+
+    cx.update(|window, cx| {
+        workbench.update(cx, |workbench, cx| {
+            let input = workbench.ensure_composer_input(window, cx);
+            input.update(cx, |input, cx| {
+                input.set_value("@Claude review", window, cx)
+            });
+            input.update(cx, |input, cx| {
+                let token = InlineToken::new(mention.encode(), "@Claude").with_label("@Claude");
+                input
+                    .replace_range_with_token(0.."@Claude".len(), token, window, cx)
+                    .expect("the token replaces its label");
+            });
+
+            workbench.rewrite_delegation_mention_tokens(
+                ComposerTarget::Session,
+                &agent_id,
+                &option,
+                window,
+                cx,
+            );
+
+            let mentions = composer_mentions(input.read(cx).tokens());
+            assert_eq!(mentions.len(), 1, "the chip was lost");
+            assert_eq!(
+                mentions[0].reference, expected,
+                "the chip still carries the row's previous configuration"
+            );
+        });
+    });
+}

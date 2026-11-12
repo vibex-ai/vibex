@@ -6,9 +6,11 @@
 //! only knows how to detect a trigger, present the returned candidates and
 //! splice an accepted candidate back into the text.
 
+use std::collections::BTreeMap;
+
 use unicode_segmentation::UnicodeSegmentation;
 
-use vibex_core::VibexSessionId;
+use vibex_core::{VibexSessionId, VibexUseMention};
 
 use crate::text::{display_width, take_width};
 
@@ -153,6 +155,13 @@ pub struct CompletionMenu {
     pub query: String,
     /// Every list the trigger's panels hold.
     pub lists: CompletionLists,
+    /// The typed reference behind each delegation row, keyed by the text the
+    /// row inserts.
+    ///
+    /// A collaborator row names an Agent and a configuration, but only this
+    /// value carries the stable runtime-option reference the authority can bind
+    /// a delegation to. Inserting the plain text would lose it.
+    pub delegation_mentions: BTreeMap<String, VibexUseMention>,
     /// Which panel is showing. Clamped into the trigger's own panels by
     /// [`Self::active_tab`], so a leftover choice cannot survive a new trigger.
     pub tab: CompletionTab,
@@ -335,6 +344,7 @@ struct Snapshot {
     cursor: usize,
     chips: Vec<Chip>,
     selection: Option<DraftSelection>,
+    mentions: Vec<VibexUseMention>,
 }
 
 /// A selection inside the draft, in byte offsets.
@@ -533,6 +543,8 @@ pub struct ComposerBuffer {
     kill_buffer: String,
     /// Collapsed pastes and attached images, in buffer order.
     chips: Vec<Chip>,
+    /// The typed `@` references this draft carries.
+    mentions: Vec<VibexUseMention>,
     /// The number the next attached image gets. Monotonic for the draft, so a
     /// label never refers to two different pictures.
     next_image_number: u32,
@@ -554,11 +566,13 @@ impl Default for ComposerBuffer {
                 cursor: 0,
                 chips: Vec::new(),
                 selection: None,
+                mentions: Vec::new(),
             }],
             history_index: 0,
             last_edit: None,
             kill_buffer: String::new(),
             chips: Vec::new(),
+            mentions: Vec::new(),
             next_image_number: 1,
             selection: None,
             last_display_width: 80,
@@ -576,6 +590,7 @@ impl ComposerBuffer {
                 cursor,
                 chips: Vec::new(),
                 selection: None,
+                mentions: Vec::new(),
             }],
             text,
             cursor,
@@ -584,6 +599,7 @@ impl ComposerBuffer {
             last_edit: None,
             kill_buffer: String::new(),
             chips: Vec::new(),
+            mentions: Vec::new(),
             next_image_number: 1,
             selection: None,
             last_display_width: 80,
@@ -857,6 +873,7 @@ impl ComposerBuffer {
             cursor: self.cursor,
             chips: self.chips.clone(),
             selection: self.selection,
+            mentions: self.mentions.clone(),
         };
         let coalesce = self.last_edit == Some(kind) && kind.coalesces();
         if coalesce && self.history_index < self.history.len() {
@@ -904,6 +921,7 @@ impl ComposerBuffer {
         self.text = snapshot.text;
         self.chips = snapshot.chips;
         self.selection = snapshot.selection;
+        self.mentions = snapshot.mentions;
         self.cursor = snapshot.cursor.min(self.text.len());
         self.preferred_column = None;
         self.break_batch();
@@ -1003,7 +1021,45 @@ impl ComposerBuffer {
             cursor = chip.end;
         }
         text.push_str(&self.text[cursor..]);
-        Outgoing { text, images }
+        // A mention is only live while the label the reader saw is still in the
+        // message. Deleting the text is how the TUI withdraws a reference; there
+        // are no inline token spans to carry it for us.
+        let mentions = self
+            .mentions
+            .iter()
+            .filter(|mention| {
+                mention
+                    .label
+                    .as_deref()
+                    .is_some_and(|label| text.contains(label))
+            })
+            .cloned()
+            .collect();
+        Outgoing {
+            text,
+            images,
+            mentions,
+        }
+    }
+
+    /// Remember one typed `@` reference for the draft's next send.
+    ///
+    /// The completion row and the `@Agent` text are two halves of the same
+    /// reference. Without this value the authority sees only the text and has to
+    /// guess, which is the mismatch the runtime now refuses.
+    pub fn remember_mention(&mut self, mention: VibexUseMention) {
+        self.mentions.retain(|existing| {
+            existing.reference != mention.reference
+                || existing.kind != mention.kind
+                || existing.agent_id != mention.agent_id
+        });
+        self.mentions.push(mention);
+        self.record(EditKind::Block);
+    }
+
+    /// The typed references the draft currently carries.
+    pub fn mentions(&self) -> &[VibexUseMention] {
+        &self.mentions
     }
 
     /// The images the draft carries, in the order they were attached.
@@ -1090,6 +1146,18 @@ impl ComposerBuffer {
         }
     }
 
+    /// Put a queued message back, including the typed references it carried.
+    pub fn set_draft_with_mentions(
+        &mut self,
+        text: impl Into<String>,
+        images: Vec<(ImageAttachment, u32)>,
+        mentions: Vec<VibexUseMention>,
+    ) {
+        self.set_draft(text, images);
+        self.mentions = mentions;
+        self.record(EditKind::Block);
+    }
+
     /// Take the text and the images out together, leaving an empty buffer.
     ///
     /// The two travel as one value because the message is one thing: a caller
@@ -1126,6 +1194,7 @@ impl ComposerBuffer {
         self.preferred_column = None;
         self.selection = None;
         self.chips.clear();
+        self.mentions.clear();
         self.next_image_number = 1;
         self.record(EditKind::Block);
     }
@@ -1187,6 +1256,7 @@ impl ComposerBuffer {
         self.preferred_column = None;
         self.selection = None;
         self.chips.clear();
+        self.mentions.clear();
         self.next_image_number = 1;
         self.record(EditKind::Block);
     }
@@ -1197,6 +1267,7 @@ impl ComposerBuffer {
         self.preferred_column = None;
         self.selection = None;
         self.chips.clear();
+        self.mentions.clear();
         self.next_image_number = 1;
         self.record(EditKind::Block);
     }
@@ -1901,6 +1972,8 @@ pub struct Outgoing {
     pub text: String,
     /// Each attached image and the UTF-16 offset in `text` where it sat.
     pub images: Vec<(ImageAttachment, u32)>,
+    /// The typed references the message addresses, if any.
+    pub mentions: Vec<VibexUseMention>,
 }
 
 /// The wire form of an attached image.
@@ -2314,6 +2387,23 @@ mod tests {
     }
 
     #[test]
+    fn a_remembered_mention_travels_with_the_message_until_the_draft_is_replaced() {
+        let mut buffer = buffer("@Claude please review");
+        let mention = VibexUseMention::agent(
+            &vibex_core::AgentId::parse("claude").expect("agent id"),
+            &vibex_core::VibexUseRef::runtime_option("option-claude"),
+            Some("@Claude"),
+        );
+        buffer.remember_mention(mention.clone());
+        assert_eq!(buffer.outgoing().mentions, vec![mention]);
+
+        // A programmatic replacement is a different draft: the old reference
+        // must not leak into it.
+        buffer.set_text("a fresh message");
+        assert!(buffer.outgoing().mentions.is_empty());
+    }
+
+    #[test]
     fn insertion_and_backspace_are_grapheme_correct() {
         let mut buffer = ComposerBuffer::default();
         for character in "e\u{301}clair".chars() {
@@ -2440,6 +2530,7 @@ mod tests {
                 ],
                 ..CompletionLists::default()
             },
+            delegation_mentions: BTreeMap::new(),
             tab: CompletionTab::Files,
             selected: 0,
             loading: false,
@@ -2531,6 +2622,7 @@ mod tests {
                 phrases: vec![row("/review")],
                 ..CompletionLists::default()
             },
+            delegation_mentions: BTreeMap::new(),
             tab: CompletionTab::Commands,
             selected: 1,
             loading: false,
@@ -2822,6 +2914,7 @@ mod tests {
                 ],
                 ..CompletionLists::default()
             },
+            delegation_mentions: BTreeMap::new(),
             tab: CompletionTab::Commands,
             selected: 0,
             loading: false,

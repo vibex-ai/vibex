@@ -1496,13 +1496,31 @@ impl Dispatch {
                 correlation_id,
                 text,
                 attachments,
+                mentions,
             } => {
                 let result = match self.session_runtime_selection(&session_id).await {
                     Ok(runtime) => {
-                        let mut request =
-                            payloads::send_message(session_id.clone(), text, attachments, runtime);
+                        let mut request = payloads::send_message(
+                            session_id.clone(),
+                            text,
+                            attachments,
+                            mentions.clone(),
+                            runtime,
+                        );
                         request.payload.correlation_id = Some(correlation_id);
-                        self.facade.agent().send_message(request).await
+                        if mentions.is_empty() {
+                            self.facade.agent().send_message(request).await
+                        } else {
+                            // The authority composes the route note and grants
+                            // the references; a client-supplied context string
+                            // is not an authorization credential.
+                            let human =
+                                MutationRequest::new(vibex_core::HumanAgentMessageRequest {
+                                    message: request.payload,
+                                    mentions,
+                                });
+                            self.facade.agent().send_message_with_mentions(human).await
+                        }
                     }
                     Err(error) => Err(error),
                 };
@@ -1542,14 +1560,16 @@ impl Dispatch {
                 session_id,
                 text,
                 attachments,
+                mentions,
                 fallback_to_resend,
             } => {
-                let supported = self
-                    .facade
-                    .agent()
-                    .native_steering_supported(session_id.clone())
-                    .await
-                    .unwrap_or(false);
+                let supported = mentions.is_empty()
+                    && self
+                        .facade
+                        .agent()
+                        .native_steering_supported(session_id.clone())
+                        .await
+                        .unwrap_or(false);
                 if supported {
                     let request = payloads::steer_message(session_id, text, attachments.clone());
                     match self.facade.agent().steer_message(request).await {
@@ -1558,7 +1578,10 @@ impl Dispatch {
                     }
                     return;
                 }
-                if !fallback_to_resend {
+                // A message that carries typed references cannot use the
+                // native steering RPC, which has no mention field. Interrupting
+                // and resending is the path that keeps them.
+                if !fallback_to_resend && mentions.is_empty() {
                     self.failure(
                         "steer_message",
                         BackendError::unsupported(
@@ -1581,9 +1604,23 @@ impl Dispatch {
                         return;
                     }
                 };
-                let request =
-                    payloads::send_message(session_id, text, attachments.clone(), runtime);
-                match self.facade.agent().send_message(request).await {
+                let request = payloads::send_message(
+                    session_id.clone(),
+                    text,
+                    attachments.clone(),
+                    mentions.clone(),
+                    runtime,
+                );
+                let result = if mentions.is_empty() {
+                    self.facade.agent().send_message(request).await
+                } else {
+                    let human = MutationRequest::new(vibex_core::HumanAgentMessageRequest {
+                        message: request.payload,
+                        mentions,
+                    });
+                    self.facade.agent().send_message_with_mentions(human).await
+                };
+                match result {
                     Ok(_) => self.ok("steer_message"),
                     Err(error) => self.failure("steer_message", error),
                 }

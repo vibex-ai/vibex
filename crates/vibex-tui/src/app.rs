@@ -915,6 +915,11 @@ pub struct QueuedMessage {
     /// composer restores exactly what was there — and where each of them sat in
     /// the text, which the wire needs to put the picture back in its place.
     pub images: Vec<(crate::composer::ImageAttachment, u32)>,
+    /// The typed `@` references the message addresses.
+    ///
+    /// A held message is still the reader's message: releasing it later must
+    /// carry the same collaborator and configuration it was written with.
+    pub mentions: Vec<vibex_core::VibexUseMention>,
     /// The local deadline of a scheduled message, in milliseconds since the
     /// epoch. `None` is an ordinary held message that only waits for the
     /// session to be ready — the same field, with the same meaning, the Desktop
@@ -6247,12 +6252,14 @@ impl App {
         let correlation_id = pending.correlation_id.clone();
         let attachments = self.wire_attachments(&creation.outgoing.images);
         self.history_log.push(creation.outgoing.text.clone());
+        let outgoing = creation.outgoing;
         Some(Effect::SendMessage {
             session_id,
             send_id: creation.send_id,
             correlation_id,
-            text: creation.outgoing.text,
+            text: outgoing.text,
             attachments,
+            mentions: outgoing.mentions,
         })
     }
 
@@ -6326,9 +6333,10 @@ impl App {
         self.new_session_runtime = failed.creation.runtime;
         self.workspace_path = Some(failed.creation.workspace_root);
         self.switch_composer(ComposerTarget::Draft(self.new_draft_id.clone()));
-        self.composer.set_draft(
+        self.composer.set_draft_with_mentions(
             failed.creation.outgoing.text,
             failed.creation.outgoing.images,
+            failed.creation.outgoing.mentions,
         );
         // A creation that failed on its way to a deadline comes back with the
         // deadline it had: the reader asked for a send time, and the retry is
@@ -7327,10 +7335,26 @@ impl App {
         images: Vec<(crate::composer::ImageAttachment, u32)>,
         scheduled_at_ms: Option<i64>,
     ) {
+        self.enqueue_scheduled_with_mentions(session_id, text, images, Vec::new(), scheduled_at_ms);
+    }
+
+    /// Hold a message that also carries typed `@` references.
+    ///
+    /// The references are the half of a mention the text cannot express, so a
+    /// held message keeps them until it is released.
+    pub fn enqueue_scheduled_with_mentions(
+        &mut self,
+        session_id: VibexSessionId,
+        text: String,
+        images: Vec<(crate::composer::ImageAttachment, u32)>,
+        mentions: Vec<vibex_core::VibexUseMention>,
+        scheduled_at_ms: Option<i64>,
+    ) {
         self.queued_messages.push(QueuedMessage {
             session_id,
             text,
             images,
+            mentions,
             scheduled_at_ms,
         });
         self.queue_selection = Some(self.queued_for_active().len().saturating_sub(1));
@@ -7397,6 +7421,7 @@ impl App {
         let outgoing = self.composer.outgoing();
         let draft = outgoing.text;
         let images = outgoing.images;
+        let mentions = outgoing.mentions;
         if !draft.trim().is_empty() || !images.is_empty() {
             self.queued_messages.insert(
                 index,
@@ -7404,11 +7429,13 @@ impl App {
                     session_id: queued.session_id.clone(),
                     text: draft,
                     images,
+                    mentions,
                     scheduled_at_ms: None,
                 },
             );
         }
-        self.composer.set_draft(queued.text, queued.images);
+        self.composer
+            .set_draft_with_mentions(queued.text, queued.images, queued.mentions);
         if let Some(target) = self.composer_target.clone() {
             match queued.scheduled_at_ms {
                 Some(at_ms) => {
@@ -7476,7 +7503,13 @@ impl App {
     }
 
     /// Take the selected queued message out, to be sent immediately.
-    pub fn take_queued_message(&mut self) -> Option<(String, Vec<vibex_core::MessageAttachment>)> {
+    pub fn take_queued_message(
+        &mut self,
+    ) -> Option<(
+        String,
+        Vec<vibex_core::MessageAttachment>,
+        Vec<vibex_core::VibexUseMention>,
+    )> {
         let index = self.selected_queued_index()?;
         let queued = self.queued_messages.remove(index);
         let remaining = self.queued_for_active().len();
@@ -7484,7 +7517,7 @@ impl App {
             (remaining > 0).then(|| self.queue_selection.unwrap_or(0).min(remaining - 1));
         let attachments = self.wire_attachments(&queued.images);
         self.save_queue();
-        Some((queued.text, attachments))
+        Some((queued.text, attachments, queued.mentions))
     }
 
     /// The messages whose session has finished its turn and can take another.
@@ -7503,7 +7536,12 @@ impl App {
     /// while the client is sitting still releases on the next pass.
     pub fn drain_queue(
         &mut self,
-    ) -> Vec<(VibexSessionId, String, Vec<vibex_core::MessageAttachment>)> {
+    ) -> Vec<(
+        VibexSessionId,
+        String,
+        Vec<vibex_core::MessageAttachment>,
+        Vec<vibex_core::VibexUseMention>,
+    )> {
         if !self.live.is_live() || self.queued_messages.is_empty() {
             return Vec::new();
         }
@@ -7540,7 +7578,7 @@ impl App {
             }
             self.history_log.push(queued.text.clone());
             let attachments = self.wire_attachments(&queued.images);
-            released.push((session_id, queued.text, attachments));
+            released.push((session_id, queued.text, attachments, queued.mentions));
         }
         if !released.is_empty() {
             // Only a pass that actually released something rewrote the queue:
@@ -9604,6 +9642,8 @@ pub enum Effect {
         text: String,
         /// Images the prompt carries, in the order they were attached.
         attachments: Vec<vibex_core::MessageAttachment>,
+        /// The typed `@` references the message addresses.
+        mentions: Vec<vibex_core::VibexUseMention>,
     },
     ContinueTurn {
         session_id: VibexSessionId,
@@ -9626,6 +9666,7 @@ pub enum Effect {
         session_id: VibexSessionId,
         text: String,
         attachments: Vec<vibex_core::MessageAttachment>,
+        mentions: Vec<vibex_core::VibexUseMention>,
         fallback_to_resend: bool,
     },
     ResolvePermission {
