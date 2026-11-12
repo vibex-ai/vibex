@@ -665,7 +665,11 @@ impl PluginService {
             },
         )?;
         PluginRepository::replace_grants(conn, &entry.id, granted, &version.permissions, now)?;
-        PluginRepository::replace_contributions(conn, &entry.id, &contributions_for(entry))?;
+        PluginRepository::replace_contributions(
+            conn,
+            &entry.id,
+            &contributions_for(entry, &version.permissions),
+        )?;
         PluginRepository::set_active_version(
             conn,
             &entry.id,
@@ -940,12 +944,26 @@ impl PluginService {
     }
 }
 
-/// The contribution rows a catalog listing owns.
-fn contributions_for(entry: &PluginMarketEntry) -> Vec<PluginContribution> {
+/// The contribution rows an installed script plugin owns.
+///
+/// A script that asked for `ui.panel` contributes one right-rail activity and
+/// nothing else: that is the surface the host can mount a script view in. A
+/// package that asked for no panel contributes nothing, so installing a
+/// background helper does not put a dead button on the bar.
+fn contributions_for(
+    entry: &PluginMarketEntry,
+    permissions: &[PluginPermission],
+) -> Vec<PluginContribution> {
+    if !permissions
+        .iter()
+        .any(|permission| permission.key == "ui.panel")
+    {
+        return Vec::new();
+    }
     vec![PluginContribution {
         plugin_id: entry.id.clone(),
-        kind: "panel".to_string(),
-        contribution_id: entry.id.clone(),
+        kind: crate::native::RIGHT_RAIL_ACTIVITY.to_string(),
+        contribution_id: format!("rail_plugin_{}", entry.id),
         title: Some(entry.name.clone()),
         enabled: true,
     }]
@@ -963,6 +981,7 @@ pub fn is_newer(candidate: &str, current: &str) -> bool {
 mod tests {
     use super::*;
     use std::io::Write;
+    use vibex_core::PluginPermissionRisk;
 
     use crate::install::PluginStore;
     use crate::market::{MarketCache, MarketConfig, MarketHttpClient, MarketUrlPolicy};
@@ -1137,6 +1156,29 @@ mod tests {
                 .contributions(&connection)
                 .unwrap()
                 .contains(&contribution("vibex.system.git"))
+        );
+    }
+
+    /// A script that asked for a panel gets one rail button; a background
+    /// script gets none, and neither is registered under the wrong kind.
+    #[test]
+    fn an_installed_script_contributes_the_panel_it_asked_for() {
+        let entry = PluginMarketEntry {
+            id: "acme.widgets".to_string(),
+            name: "Widgets".to_string(),
+            ..Default::default()
+        };
+        let panel = PluginPermission::new("ui.panel", PluginPermissionRisk::Low);
+        let contributions = contributions_for(&entry, std::slice::from_ref(&panel));
+        assert_eq!(contributions.len(), 1);
+        assert_eq!(contributions[0].kind, crate::native::RIGHT_RAIL_ACTIVITY);
+        assert_eq!(contributions[0].contribution_id, "rail_plugin_acme.widgets");
+        assert!(contributions[0].enabled);
+
+        let background = PluginPermission::new("storage", PluginPermissionRisk::Low);
+        assert!(
+            contributions_for(&entry, &[background]).is_empty(),
+            "a plugin that declared no panel must not reach the rail"
         );
     }
 
