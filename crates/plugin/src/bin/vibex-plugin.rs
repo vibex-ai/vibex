@@ -5,8 +5,15 @@
 //! vibex-plugin verify <package>                  read a package's manifest
 //! vibex-plugin hash <file>                       print sha256 and sha512
 //! vibex-plugin keygen [--output <file>]          make a signing key pair
+//! vibex-plugin sign <package> --key <seed>       sign a package with a release key
 //! vibex-plugin sign-index <index.json> --key <seed-base64> [--output <file>]
+//! vibex-plugin publish <dir> --key <seed>        sign and describe a submission
 //! ```
+//!
+//! `publish` is the author's side of the market: it builds the package,
+//! signs it, and prints the index entry a submission carries. It deliberately
+//! writes nothing into the index — the catalog is built and signed by whoever
+//! maintains it, so an author's tool cannot add itself to the marketplace.
 
 use std::path::PathBuf;
 
@@ -35,7 +42,9 @@ fn run() -> Result<(), String> {
         "verify" => verify(&arguments[1..]),
         "hash" => hash(&arguments[1..]),
         "keygen" => keygen(&arguments[1..]),
+        "sign" => sign(&arguments[1..]),
         "sign-index" => sign_index(&arguments[1..]),
+        "publish" => publish(&arguments[1..]),
         "--help" | "-h" | "help" => {
             usage();
             Ok(())
@@ -52,7 +61,9 @@ fn usage() {
            verify <package>                                      read a package's manifest\n\
            hash <file>                                           print sha256 and sha512\n\
            keygen [--output <file>]                              make a signing key pair\n\
-           sign-index <index.json> --key <seed-base64> [--output <file>]\n"
+           sign <package> --key <seed-base64> [--output <file>]  sign a package\n\
+           sign-index <index.json> --key <seed-base64> [--output <file>]\n\
+           publish <dir> --key <seed-base64> [--output <file>]   build and sign a submission\n"
     );
 }
 
@@ -140,16 +151,85 @@ fn keygen(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-fn sign_index(args: &[String]) -> Result<(), String> {
-    let path = positional(args).ok_or("sign-index needs an index file")?;
-    let key = option(args, "--key").ok_or("sign-index needs --key <seed-base64>")?;
+/// Reads a signing key from its base64 seed.
+fn signing_key(seed: &str) -> Result<SigningKey, String> {
     let seed = BASE64
-        .decode(key.trim())
+        .decode(seed.trim())
         .map_err(|_| "the signing key is not base64".to_string())?;
     let seed: [u8; 32] = seed
         .try_into()
         .map_err(|_| "the signing key must be a 32-byte seed".to_string())?;
-    let signing_key = SigningKey::from_bytes(&seed);
+    Ok(SigningKey::from_bytes(&seed))
+}
+
+fn sign(args: &[String]) -> Result<(), String> {
+    let path = positional(args).ok_or("sign needs a package file")?;
+    let key = option(args, "--key").ok_or("sign needs --key <seed-base64>")?;
+    let signing_key = signing_key(&key)?;
+    let bytes = std::fs::read(&path).map_err(|error| error.to_string())?;
+    let signature = vibex_plugin::market::sign_package(&bytes, &signing_key);
+    let output = option(args, "--output").unwrap_or_else(|| format!("{path}.sig"));
+    std::fs::write(&output, &signature).map_err(|error| error.to_string())?;
+    println!("signature: {output}");
+    println!("alg:       ed25519");
+    println!("keyId:     {}", key_id(&signing_key.verifying_key()));
+    println!("sha256:    {}", sha256_hex(&bytes));
+    Ok(())
+}
+
+/// Builds, signs and describes one submission.
+///
+/// The JSON printed at the end is the entry to submit: it names the package,
+/// its hashes, the key that signed it and the permissions it asks for. The
+/// index maintainer reviews it and rebuilds the catalog; this tool never edits
+/// the catalog itself.
+fn publish(args: &[String]) -> Result<(), String> {
+    let directory = positional(args).ok_or("publish needs a plugin directory")?;
+    let key = option(args, "--key").ok_or("publish needs --key <seed-base64>")?;
+    let signing_key = signing_key(&key)?;
+    let output = option(args, "--output").map(PathBuf::from);
+    let path = write_package(std::path::Path::new(&directory), output.as_deref())
+        .map_err(|error| error.to_string())?;
+    let bytes = std::fs::read(&path).map_err(|error| error.to_string())?;
+    let manifest = read_package_manifest(&bytes).map_err(|error| error.to_string())?;
+    let signature = vibex_plugin::market::sign_package(&bytes, &signing_key);
+    let signature_path = path.with_extension("vibexplug.sig");
+    std::fs::write(&signature_path, &signature).map_err(|error| error.to_string())?;
+
+    let entry = serde_json::json!({
+        "id": manifest.id,
+        "version": manifest.version,
+        "name": manifest.name,
+        "license": manifest.license,
+        "summary": manifest.description,
+        "homepage": manifest.homepage,
+        "categories": manifest.normalized_categories(),
+        "versions": [{
+            "version": manifest.version,
+            "url": path.file_name().map(|name| name.to_string_lossy().to_string()),
+            "sizeBytes": bytes.len(),
+            "sha256": sha256_hex(&bytes),
+            "sha512": sha512_hex(&bytes),
+            "minShell": manifest.shell_version,
+            "signature": {
+                "alg": "ed25519",
+                "keyId": key_id(&signing_key.verifying_key()),
+                "signature": signature,
+            },
+        }],
+    });
+    println!("package:   {}", path.display());
+    println!("signature: {}", signature_path.display());
+    println!("sha256:    {}", sha256_hex(&bytes));
+    println!();
+    println!("{}", serde_json::to_string_pretty(&entry).unwrap());
+    Ok(())
+}
+
+fn sign_index(args: &[String]) -> Result<(), String> {
+    let path = positional(args).ok_or("sign-index needs an index file")?;
+    let key = option(args, "--key").ok_or("sign-index needs --key <seed-base64>")?;
+    let signing_key = signing_key(&key)?;
     let bytes = std::fs::read(&path).map_err(|error| error.to_string())?;
     let signature = sign_document(&bytes, &signing_key);
     let output = option(args, "--output").unwrap_or_else(|| format!("{path}.sig"));

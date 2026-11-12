@@ -18,6 +18,6 @@ pub use github::{DEFAULT_TOPIC, GITHUB_API_BASE, GITHUB_RAW_BASE, GithubTopicSou
 pub use index::{
     INDEX_SCHEMA, MAX_INDEX_BYTES, MAX_REVOCATIONS_BYTES, PluginIndexEntry, PluginIndexFile,
     PluginRevocations, PublisherKey, REVOCATIONS_SCHEMA, RevokedPlugin, decode_verifying_key,
-    encode_verifying_key, sign_document, verify_signature,
+    encode_verifying_key, sign_document, sign_package, verify_package_signature, verify_signature,
 };
 pub use merge::{DEFAULT_SEARCH_LIMIT, MAX_SEARCH_LIMIT, merge_entries, search_entries};

@@ -4380,6 +4380,7 @@ fn order_right_rail_entries(
 
 /// Every activity the catalog contributes, in its own order.
 fn catalog_right_rail_entries(contributions: &[PluginContribution]) -> Vec<RightRailEntry> {
+    let native = vibex_plugin::native::default_native_plugins();
     let mut entries = Vec::new();
     for contribution in contributions {
         if contribution.kind != vibex_plugin::native::RIGHT_RAIL_ACTIVITY {
@@ -4390,6 +4391,11 @@ fn catalog_right_rail_entries(contributions: &[PluginContribution]) -> Vec<Right
             .find(|activity| activity.id() == contribution.contribution_id);
         let entry = match builtin {
             Some(activity) => RightRailEntry::Builtin(activity),
+            // A first-party panel this build draws in Rust but that has no
+            // button yet — the web panel, until the unified `panel.web`
+            // contribution lands — must not be offered as a script panel: it
+            // has no script to run, so the button would open nothing.
+            None if native.get(&contribution.plugin_id).is_some() => continue,
             None => RightRailEntry::Script {
                 plugin_id: contribution.plugin_id.clone(),
                 contribution_id: contribution.contribution_id.clone(),
