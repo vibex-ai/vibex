@@ -341,14 +341,17 @@ function validatePackaging() {
     releaseWorkflow.includes("has no English section"),
     "publish workflow does not require an English release-notes section"
   );
-  // The release page itself is composed from three inputs: the tagged notes, a
-  // Downloads table built from the assets this run publishes, and the
-  // changelog. Losing any of them ships a page without the part readers came
-  // for, and `--generate-notes` alone would drop the first two.
+  // The release page itself is composed from the tagged notes, a Downloads
+  // table built from the assets this run publishes, the generated changelog and
+  // the resolved contributor logins. Losing any of them ships a page without the
+  // part readers came for, and `--generate-notes` alone would drop the first
+  // two.
   for (const required of [
     "fetch-depth: 0",
     "releases/generate-notes",
     "scripts/release-body.mjs",
+    "scripts/release-contributors.mjs",
+    "--contributors target/release-body/contributors.txt",
     "--notes-file target/release-body/vibex-release-body.md"
   ]) {
     assert(
@@ -361,6 +364,14 @@ function validatePackaging() {
     "publish workflow still lets GitHub generate the whole body, which drops the notes and the Downloads table"
   );
   assert(existsSync(path("scripts/release-body.mjs")), "release body composer is missing");
+  assert(
+    existsSync(path("scripts/release-contributors.mjs")),
+    "release contributor resolver is missing"
+  );
+  assert(
+    existsSync(path("scripts/release-contributors.test.mjs")),
+    "release contributor resolver self-test is missing"
+  );
   assert(
     existsSync(path("scripts/release-body.test.mjs")),
     "release body composer self-test is missing"

@@ -5,7 +5,7 @@
 //
 //   1. the tagged bilingual notes, one level-two section per language;
 //   2. a Downloads table rendered from the assets this run is about to upload;
-//   3. the contributor credit and the comparison link that close the page.
+//   3. the contributor credits and the comparison link that close the page.
 //
 // English is the release's primary language. The notes carry one section per
 // language, while the Downloads table and the closing sections are English only
@@ -14,13 +14,19 @@
 //
 // The page deliberately carries no per-change list: a range of several hundred
 // commits makes one, and the bilingual notes above already say what changed in
-// the terms a reader cares about. Only the two facts a change list adds survive
-// here — who contributed for the first time, and where the full comparison is.
+// the terms a reader cares about. Only the facts a change list adds survive
+// here — who authored the release, who contributed for the first time, and
+// where the full comparison is.
 //
-// The contributor credit comes from the notes GitHub generates for the release
-// range, which names each new contributor's first pull request. A range built
-// from direct commits generates no entries, so the composer falls back to the
-// commit log and credits the author of a first commit in the range.
+// The credits come from two inputs. GitHub's generated notes name each new
+// contributor's first pull request, but only for merged pull requests; a range
+// built from direct commits generates none. The publish job therefore resolves
+// each range author's GitHub account and passes an email-to-login map in. The
+// composer names every author in a Contributors section — the release page
+// renders an avatar for each @ mention — and keeps the generated notes' pull
+// request links for the New Contributors section. Without a map, the composer
+// falls back to the generated notes and then to the commit log, crediting by
+// name when no login is known.
 //
 // Usage:
 //   node scripts/release-body.mjs \
@@ -28,12 +34,14 @@
 //     --notes docs/operations/release-notes-v0.1.1.md \
 //     --assets target/publish \
 //     --changelog target/release-body/generated-changelog.md \
+//     --contributors target/release-body/contributors.txt \
 //     --previous-tag v0.1.0 \
 //     --output target/release-body/vibex-release-body.md
 //
 // Every path is resolved against the repository root. `--output` is optional
-// and prints the body instead of writing it; `--assets` and `--changelog` are
-// optional so a local draft can be composed before any build exists.
+// and prints the body instead of writing it; `--assets`, `--changelog` and
+// `--contributors` are optional so a local draft can be composed before any
+// build exists.
 
 import { execFileSync } from "node:child_process";
 import {
@@ -51,6 +59,9 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const DEFAULT_REPOSITORY = "vibex-ai/vibex";
 const VERSION_PATTERN = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/u;
 const REPOSITORY_PATTERN = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u;
+// GitHub logins are alphanumeric with single hyphens and no leading or trailing
+// hyphen; bots carry a `[bot]` suffix and are not people to credit.
+const LOGIN_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/u;
 
 // Desktop platforms in the order the release page lists them. Each row pairs
 // the desktop package with the headless server tarball for the same operating
@@ -73,7 +84,8 @@ const USAGE = `usage: node scripts/release-body.mjs --version <version> --notes 
   --repository <owner/name> GitHub repository (default: $GITHUB_REPOSITORY or ${DEFAULT_REPOSITORY})
   --notes <file>            Tagged release notes document with one section per language
   --assets <directory>      Published asset directory used to render the Downloads table
-  --changelog <file>        GitHub generated release notes; its contributor credit is reused
+  --changelog <file>        GitHub generated release notes; its names and links are reused
+  --contributors <file>     Email-to-login map for the release range (email<TAB>login)
   --previous-tag <tag>      Tag the page compares against (default: git describe of the tag)
   --output <file>           Write the body here instead of printing it
 `;
@@ -103,6 +115,7 @@ function parseArguments(argv) {
       "--notes": "notes",
       "--assets": "assets",
       "--changelog": "changelog",
+      "--contributors": "contributors",
       "--previous-tag": "previousTag",
       "--output": "output"
     }[flag];
@@ -256,12 +269,17 @@ export function renderDownloads({ version, repository, tag, assetNames }) {
 }
 
 // Credits and the comparison link: the part of a generated changelog the notes
-// cannot state themselves. `contributors` holds ready-to-render list lines, so
-// a GitHub-generated credit keeps the pull request it points at.
-export function renderClosing({ repository, from, to, contributors = [], fullChangelog = "" }) {
+// cannot state themselves. `contributors` and `newContributors` hold
+// ready-to-render list lines, so a GitHub-generated credit keeps the pull
+// request it points at, while a resolved login is the @ mention that gives the
+// release page an avatar.
+export function renderClosing({ repository, from, to, contributors = [], newContributors = [], fullChangelog = "" }) {
   const lines = [];
   if (contributors.length > 0) {
-    lines.push("## New Contributors", "", ...contributors, "");
+    lines.push("## Contributors", "", ...contributors, "");
+  }
+  if (newContributors.length > 0) {
+    lines.push("## New Contributors", "", ...newContributors, "");
   }
   const comparison =
     fullChangelog.trim() ||
@@ -272,31 +290,73 @@ export function renderClosing({ repository, from, to, contributors = [], fullCha
   return lines.join("\n").trimEnd();
 }
 
-// The two parts of GitHub's generated notes this page keeps. Its "What's
-// Changed" list is dropped on purpose: several hundred commits per release make
-// it longer than everything a reader came for, and the notes already describe
-// the release in the terms a reader cares about.
-export function parseGeneratedNotes(body) {
-  const lines = body.replace(/\r\n?/gu, "\n").split("\n");
-  const contributors = [];
-  let inContributors = false;
-  for (const line of lines) {
-    if (/^##[ \t]+New Contributors[ \t]*$/u.test(line)) {
-      inContributors = true;
-      continue;
-    }
-    if (!inContributors) continue;
-    if (/^##[ \t]/u.test(line)) break;
-    if (/^\*[ \t]+\S/u.test(line)) contributors.push(line.trimEnd());
+// The publish job resolves each author email to a GitHub login and writes one
+// `email<TAB>login` line per account. Email is the identity because every
+// commit records one and a contributor keeps it across author-name changes.
+export function parseContributorMap(document) {
+  const map = new Map();
+  for (const line of document.replace(/\r\n?/gu, "\n").split("\n")) {
+    if (line.trim() === "" || line.trimStart().startsWith("#")) continue;
+    const [email, login] = line.split("\t");
+    const address = (email ?? "").trim().toLocaleLowerCase("en-US");
+    const handle = (login ?? "").trim().replace(/^@/u, "");
+    if (address === "" || !LOGIN_PATTERN.test(handle)) continue;
+    map.set(address, handle);
   }
-  const comparison = lines.find((line) => /^\*\*Full Changelog\*\*:/u.test(line.trim()));
-  return { contributors, fullChangelog: comparison?.trim() ?? "" };
+  return map;
 }
 
-// Authors that never appear before the previous tag contributed for the first
-// time. Email is the identity compared here, because a contributor keeps it
-// across author-name changes and every commit records one.
-function readGitRange({ from, to }) {
+// The parts of GitHub's generated notes this page keeps. Its "What's Changed"
+// list is dropped on purpose: several hundred commits per release make it
+// longer than everything a reader came for. The authors it names are still
+// collected, because a merged pull request is one more way a contributor
+// reaches the release, and its login may resolve where the commit email did
+// not.
+export function parseGeneratedNotes(body) {
+  const lines = body.replace(/\r\n?/gu, "\n").split("\n");
+  const authors = [];
+  const newContributors = [];
+  let section = null;
+  const remember = (login) => {
+    if (!LOGIN_PATTERN.test(login)) return;
+    if (authors.some((author) => author.toLocaleLowerCase("en-US") === login.toLocaleLowerCase("en-US"))) return;
+    authors.push(login);
+  };
+  for (const line of lines) {
+    if (/^##[ \t]+What's Changed[ \t]*$/u.test(line)) {
+      section = "changes";
+      continue;
+    }
+    if (/^##[ \t]+New Contributors[ \t]*$/u.test(line)) {
+      section = "new";
+      continue;
+    }
+    if (/^##[ \t]/u.test(line)) {
+      section = null;
+      continue;
+    }
+    if (section === "changes") {
+      // A generated change entry ends with ` by @author in <pull request>`;
+      // any other @ in the title is a mention, not the author.
+      const author =
+        / by @([A-Za-z0-9-]+(?:\[bot\])?) in https:\/\/github\.com\/[^/\s]+\/[^/\s]+\/pull\/\d+/u.exec(line);
+      if (author && !author[1].endsWith("[bot]")) remember(author[1]);
+    } else if (section === "new" && /^\*[ \t]+\S/u.test(line)) {
+      newContributors.push(line.trimEnd());
+      const mention = /^\*[ \t]+@([A-Za-z0-9-]+(?:\[bot\])?)/u.exec(line);
+      if (mention && !mention[1].endsWith("[bot]")) remember(mention[1]);
+    }
+  }
+  const comparison = lines.find((line) => /^\*\*Full Changelog\*\*:/u.test(line.trim()));
+  return { authors, newContributors, fullChangelog: comparison?.trim() ?? "" };
+}
+
+// Walk the range once and keep the first commit per author email, oldest
+// first. `contributors` is everyone who authored the release, and
+// `newContributors` is the subset with no commit before the previous tag. A
+// login from the email map is what renders an avatar; without one the author
+// is still credited by name.
+function readGitRange({ from, to, loginByEmail = new Map() }) {
   const range = from ? `${from}..${to}` : to;
   // A tag that has not been created yet — a local draft before the tag push —
   // leaves no range to read. The page then carries the comparison link alone
@@ -307,7 +367,7 @@ function readGitRange({ from, to }) {
     raw = git(["log", "--no-merges", "--format=%an%x00%ae", range]);
     history = from ? git(["log", "--format=%ae", from]) : "";
   } catch {
-    return [];
+    return { contributors: [], newContributors: [] };
   }
   const commits = raw
     .split("\n")
@@ -320,16 +380,24 @@ function readGitRange({ from, to }) {
 
   const known = new Set();
   for (const email of history.split("\n")) {
-    if (email !== "") known.add(email);
+    if (email !== "") known.add(email.toLocaleLowerCase("en-US"));
   }
   const seen = new Set();
+  const contributors = [];
   const newContributors = [];
   for (const commit of commits) {
-    if (known.has(commit.email) || seen.has(commit.email)) continue;
-    seen.add(commit.email);
-    newContributors.push(`* ${commit.name} made their first contribution`);
+    // Automated commits carry a `[bot]` author; they are not people to
+    // credit, and an unresolved bot would otherwise reach the list by name.
+    if (/\[bot\]/u.test(commit.name) || /\[bot\]/u.test(commit.email)) continue;
+    const key = commit.email.toLocaleLowerCase("en-US");
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const login = loginByEmail.get(key);
+    const entry = login ? { login } : { name: commit.name };
+    contributors.push(entry);
+    if (!known.has(key)) newContributors.push(entry);
   }
-  return newContributors;
+  return { contributors, newContributors };
 }
 
 function previousTagFor(to) {
@@ -356,6 +424,7 @@ export function buildReleaseBody({
   notesDocument,
   assetNames = [],
   changelog = "",
+  contributorMap = "",
   from = ""
 }) {
   const notes = pickNotesSections(notesDocument);
@@ -368,13 +437,59 @@ export function buildReleaseBody({
   if (downloads !== "") parts.push(downloads);
 
   const generated = parseGeneratedNotes(changelog);
-  const contributors =
-    generated.contributors.length > 0 ? generated.contributors : from ? readGitRange({ from, to: tag }) : [];
+  const loginByEmail = parseContributorMap(contributorMap);
+  const range =
+    from || loginByEmail.size > 0
+      ? readGitRange({ from, to: tag, loginByEmail })
+      : { contributors: [], newContributors: [] };
+
+  // Every author in the range, plus any pull-request author the generated
+  // notes name that the commit map did not resolve. A resolved login is an @
+  // mention and therefore an avatar on the release page; an unresolved author
+  // keeps their name rather than disappearing from the credit. Without a map
+  // the commit log can only offer names, and a generated @ login is strictly
+  // better than a name, so the login list replaces it instead of duplicating
+  // the same person twice.
+  const credits = [];
+  const seenLogins = new Set();
+  const seenNames = new Set();
+  const addCredit = (entry) => {
+    const handle = entry.login?.toLocaleLowerCase("en-US");
+    if (entry.login) {
+      if (seenLogins.has(handle) || seenNames.has(handle)) return;
+      seenLogins.add(handle);
+      credits.push(entry);
+      return;
+    }
+    const name = entry.name.toLocaleLowerCase("en-US");
+    if (seenNames.has(name) || seenLogins.has(name)) return;
+    seenNames.add(name);
+    credits.push(entry);
+  };
+  if (loginByEmail.size > 0 || generated.authors.length === 0) {
+    for (const entry of range.contributors) addCredit(entry);
+  }
+  for (const login of generated.authors) addCredit({ login });
+  const contributorLines = credits.map((entry) => `* ${entry.login ? `@${entry.login}` : entry.name}`);
+  const newContributorLines = [];
+  if (generated.newContributors.length > 0) {
+    newContributorLines.push(...generated.newContributors);
+  } else {
+    const seenNew = new Set();
+    for (const entry of range.newContributors) {
+      const key = entry.login ? `login:${entry.login.toLocaleLowerCase("en-US")}` : `name:${entry.name}`;
+      if (seenNew.has(key)) continue;
+      seenNew.add(key);
+      newContributorLines.push(`* ${entry.login ? `@${entry.login}` : entry.name} made their first contribution`);
+    }
+  }
+
   const closing = renderClosing({
     repository,
     from,
     to: tag,
-    contributors,
+    contributors: contributorLines,
+    newContributors: newContributorLines,
     fullChangelog: generated.fullChangelog
   });
   if (closing !== "") parts.push(closing);
@@ -405,10 +520,14 @@ function compose(options) {
   if (options.changelog && existsSync(resolve(ROOT, options.changelog))) {
     changelog = readFileSync(resolve(ROOT, options.changelog), "utf8");
   }
+  let contributorMap = "";
+  if (options.contributors && existsSync(resolve(ROOT, options.contributors))) {
+    contributorMap = readFileSync(resolve(ROOT, options.contributors), "utf8");
+  }
   const to = revisionFor(tag);
   const from = options.previousTag ?? previousTagFor(to);
 
-  return buildReleaseBody({ version, repository, tag, notesDocument, assetNames, changelog, from });
+  return buildReleaseBody({ version, repository, tag, notesDocument, assetNames, changelog, contributorMap, from });
 }
 
 function main(argv) {

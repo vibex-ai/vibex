@@ -622,11 +622,13 @@ jobs:
               xargs -0 -n1 sha256sum
           ) > target/publish/SHA256SUMS
       # The release page carries the tagged notes, a Downloads table built from
-      # the assets this run publishes, and a closing credit. GitHub knows which
-      # contributor is new to the project and which pull request carried them,
-      # so its generated notes supply the credit; the page drops the per-change
-      # list they also carry. A range that only has direct commits generates
-      # none, and the composer falls back to the commit log for the credit.
+      # the assets this run publishes, and two credits. GitHub knows which
+      # contributor is new and which pull request carried them, so its
+      # generated notes supply that section with links; the page drops the
+      # per-change list they also carry, and a range that only has direct
+      # commits generates nothing. The commit log then names every author of
+      # this release, and the commit API resolves each author email to a login
+      # so the page can mention them.
       - name: Generate changelog
         env:
           GH_TOKEN: ${{ github.token }}
@@ -649,6 +651,27 @@ jobs:
             -f previous_tag_name="${previous}" \
             --jq .body > target/release-body/generated-changelog.md || \
             : > target/release-body/generated-changelog.md
+      - name: Resolve release contributors
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target/release-body
+          tag="${GITHUB_REF_NAME}"
+          previous="$(git describe --tags --abbrev=0 "${tag}^" 2>/dev/null || true)"
+          args=(
+            --tag "${tag}"
+            --repository "${GITHUB_REPOSITORY}"
+            --output target/release-body/contributors.txt
+          )
+          if [[ -n "${previous}" ]]; then
+            args+=(--previous-tag "${previous}")
+          fi
+          # One commit lookup per distinct author email. A failure only costs
+          # that author their avatar; it never withholds the release.
+          node scripts/release-contributors.mjs "${args[@]}" || \
+            : > target/release-body/contributors.txt
       - name: Compose release body
         shell: bash
         run: |
@@ -660,6 +683,7 @@ jobs:
             --notes "docs/operations/release-notes-v${{ needs.release-meta.outputs.version }}.md" \
             --assets target/publish \
             --changelog target/release-body/generated-changelog.md \
+            --contributors target/release-body/contributors.txt \
             --output "${body}"
           # A body that lost a section would publish a page readers cannot use,
           # so every part has to be present before the release is created.
@@ -667,6 +691,9 @@ jobs:
           grep -qxF '## Downloads' "${body}"
           grep -qE '^## (简体中文|簡體中文|中文|繁體中文|繁体中文)$' "${body}"
           grep -qF '**Full Changelog**' "${body}"
+          if [[ -s target/release-body/contributors.txt ]]; then
+            grep -qxF '## Contributors' "${body}"
+          fi
           # The per-change list is deliberately absent: several hundred commits
           # per release make it longer than everything a reader came for.
           if grep -qxF "## What's Changed" "${body}"; then

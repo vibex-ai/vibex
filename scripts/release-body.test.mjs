@@ -4,7 +4,7 @@
 // The release body is assembled from inputs CI cannot re-derive once the release
 // is public: the tagged notes, the asset list and the generated changelog.
 // These cases pin the parts that would silently ship an unreadable release page
-// — language selection, the Downloads table, and the contributor credit.
+// — language selection, the Downloads table, and the contributor credits.
 //
 // Usage: node scripts/release-body.test.mjs
 
@@ -12,6 +12,7 @@ import assert from "node:assert/strict";
 
 import {
   buildReleaseBody,
+  parseContributorMap,
   parseGeneratedNotes,
   parseNotesSections,
   renderClosing,
@@ -58,8 +59,9 @@ assert.deepEqual(
 assert.ok(sections[0].body.includes("## 中文"), "the fenced heading was dropped from the body");
 assert.ok(!sections[0].body.endsWith("---"), "the section separator leaked into a language body");
 
-// The page keeps only the contributor credit and the comparison link from the
-// generated notes; the per-change list is dropped on purpose.
+// The page keeps the contributor names, the new-contributor credit and the
+// comparison link from the generated notes; the per-change list is dropped on
+// purpose.
 const generated = [
   "## What's Changed",
   "* feat(desktop): a change by @ada in https://github.com/vibex-ai/vibex/pull/1",
@@ -73,9 +75,14 @@ const generated = [
 ].join("\n");
 const parsed = parseGeneratedNotes(generated);
 assert.deepEqual(
-  parsed.contributors,
+  parsed.newContributors,
   ["* @ada made their first contribution in https://github.com/vibex-ai/vibex/pull/1"],
   "the contributor credit was not lifted from the generated notes"
+);
+assert.deepEqual(
+  parsed.authors,
+  ["ada", "grace"],
+  "the pull request authors were not collected from the generated notes"
 );
 assert.equal(
   parsed.fullChangelog,
@@ -94,8 +101,16 @@ const body = buildReleaseBody({
 assert.ok(body.startsWith("## English\n"), "the body must open with the English section");
 assert.ok(body.indexOf("## English") < body.indexOf("## 中文"), "Chinese must follow English");
 assert.ok(
-  body.indexOf("## 中文") < body.indexOf("## New Contributors"),
-  "the closing sections must follow both language sections"
+  body.indexOf("## 中文") < body.indexOf("## Contributors"),
+  "the contributor list must follow both language sections"
+);
+assert.ok(
+  body.includes("## Contributors\n\n* @ada\n* @grace\n"),
+  "the contributor list must name every pull request author with an @ mention"
+);
+assert.ok(
+  body.indexOf("## Contributors") < body.indexOf("## New Contributors"),
+  "the full contributor list must precede the new-contributor credit"
 );
 assert.ok(
   !body.includes("## What's Changed"),
@@ -120,14 +135,52 @@ const noCredit = renderClosing({
   repository: "vibex-ai/vibex",
   from: "v0.1.0",
   to: "v0.2.0",
-  contributors: []
+  newContributors: []
 });
-assert.ok(!noCredit.includes("New Contributors"), "an empty contributor section was rendered");
+assert.ok(!noCredit.includes("New Contributors"), "an empty new-contributor section was rendered");
 assert.ok(noCredit.startsWith("**Full Changelog**"), "the comparison link must still close the page");
 assert.ok(
   renderClosing({ repository: "vibex-ai/vibex", from: "", to: "v0.0.1" }).includes("/releases/tag/v0.0.1"),
   "the first release needs a comparison link that points at its own tag"
 );
+
+// Every release names all of its authors, even when nobody is new: that list
+// is what gives the release page's Contributors block every avatar.
+const veterans = renderClosing({
+  repository: "vibex-ai/vibex",
+  from: "v0.1.0",
+  to: "v0.2.0",
+  contributors: ["* @ada", "* @grace"]
+});
+assert.ok(veterans.startsWith("## Contributors\n\n* @ada\n* @grace\n"), "the contributor list is malformed");
+assert.ok(!veterans.includes("New Contributors"), "a release with no new contributor rendered the heading");
+assert.ok(veterans.trimEnd().endsWith("/compare/v0.1.0...v0.2.0"), "the comparison link was dropped");
+
+// The publish job writes an email-to-login map; only a valid person login is
+// accepted, and a bot or malformed line is ignored instead of rendering a
+// broken @ mention.
+const map = parseContributorMap(
+  [
+    "# resolved by scripts/release-contributors.mjs",
+    "peatboy@outlook.com\tPeatBoy",
+    "0xbet4@gmail.com\t@bet4it",
+    "",
+    "bot@example.com\tgithub-actions[bot]",
+    "broken@example.com",
+    "\tnobody"
+  ].join("\n")
+);
+assert.equal(map.get("peatboy@outlook.com"), "PeatBoy", "a resolved login was dropped");
+assert.equal(map.get("0xbet4@gmail.com"), "bet4it", "a leading @ was not stripped");
+assert.equal(map.size, 2, "a bot or malformed line entered the contributor map");
+const botNotes = parseGeneratedNotes(
+  [
+    "## What's Changed",
+    "* chore(deps): bump a dependency by @dependabot[bot] in https://github.com/vibex-ai/vibex/pull/9",
+    "* fix: a change by @ada in https://github.com/vibex-ai/vibex/pull/10"
+  ].join("\n")
+);
+assert.deepEqual(botNotes.authors, ["ada"], "a bot mention entered the contributor list");
 
 // The table lists only artifacts this release actually publishes, and pairs a
 // desktop package with the server tarball for the same OS and architecture.
