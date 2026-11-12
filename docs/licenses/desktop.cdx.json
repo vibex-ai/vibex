@@ -12725,7 +12725,7 @@
     },
     {
       "type": "library",
-      "bom-ref": "cargo:gpui-base@0.9.1:c19b7c6f923b580a",
+      "bom-ref": "cargo:gpui-base@0.9.1:21b891abfaccca05",
       "name": "gpui-base",
       "version": "0.9.1",
       "licenses": [
@@ -12737,7 +12737,7 @@
       "properties": [
         {
           "name": "vibex:cargo-source",
-          "value": "registry+https://github.com/rust-lang/crates.io-index"
+          "value": "git+https://github.com/PeatBoy/gpui-kit?rev=ed597a041d254d3cf44fae2a01e09b23e9ecdbf8#ed597a041d254d3cf44fae2a01e09b23e9ecdbf8"
         },
         {
           "name": "vibex:selected-license",
@@ -12761,7 +12761,7 @@
     },
     {
       "type": "library",
-      "bom-ref": "cargo:gpui-component@0.9.1:c19b7c6f923b580a",
+      "bom-ref": "cargo:gpui-component@0.9.1:21b891abfaccca05",
       "name": "gpui-component",
       "version": "0.9.1",
       "licenses": [
@@ -12773,7 +12773,7 @@
       "properties": [
         {
           "name": "vibex:cargo-source",
-          "value": "registry+https://github.com/rust-lang/crates.io-index"
+          "value": "git+https://github.com/PeatBoy/gpui-kit?rev=ed597a041d254d3cf44fae2a01e09b23e9ecdbf8#ed597a041d254d3cf44fae2a01e09b23e9ecdbf8"
         },
         {
           "name": "vibex:selected-license",
@@ -12797,7 +12797,7 @@
     },
     {
       "type": "library",
-      "bom-ref": "cargo:gpui-component-macros@0.9.1:c19b7c6f923b580a",
+      "bom-ref": "cargo:gpui-component-macros@0.9.1:21b891abfaccca05",
       "name": "gpui-component-macros",
       "version": "0.9.1",
       "licenses": [
@@ -12809,7 +12809,7 @@
       "properties": [
         {
           "name": "vibex:cargo-source",
-          "value": "registry+https://github.com/rust-lang/crates.io-index"
+          "value": "git+https://github.com/PeatBoy/gpui-kit?rev=ed597a041d254d3cf44fae2a01e09b23e9ecdbf8#ed597a041d254d3cf44fae2a01e09b23e9ecdbf8"
         },
         {
           "name": "vibex:selected-license",
@@ -12826,8 +12826,8 @@
       ],
       "externalReferences": [
         {
-          "type": "distribution",
-          "url": "https://crates.io/crates/gpui-component-macros/0.9.1"
+          "type": "vcs",
+          "url": "https://github.com/PeatBoy/gpui-kit?rev=ed597a041d254d3cf44fae2a01e09b23e9ecdbf8#ed597a041d254d3cf44fae2a01e09b23e9ecdbf8"
         }
       ]
     },
@@ -12905,7 +12905,7 @@
     },
     {
       "type": "library",
-      "bom-ref": "cargo:gpui-fps@0.9.1:c19b7c6f923b580a",
+      "bom-ref": "cargo:gpui-fps@0.9.1:21b891abfaccca05",
       "name": "gpui-fps",
       "version": "0.9.1",
       "licenses": [
@@ -12917,7 +12917,7 @@
       "properties": [
         {
           "name": "vibex:cargo-source",
-          "value": "registry+https://github.com/rust-lang/crates.io-index"
+          "value": "git+https://github.com/PeatBoy/gpui-kit?rev=ed597a041d254d3cf44fae2a01e09b23e9ecdbf8#ed597a041d254d3cf44fae2a01e09b23e9ecdbf8"
         },
         {
           "name": "vibex:selected-license",
@@ -12941,7 +12941,7 @@
     },
     {
       "type": "library",
-      "bom-ref": "cargo:gpui-kit@0.9.1:c19b7c6f923b580a",
+      "bom-ref": "cargo:gpui-kit@0.9.1:21b891abfaccca05",
       "name": "gpui-kit",
       "version": "0.9.1",
       "licenses": [
@@ -12953,7 +12953,7 @@
       "properties": [
         {
           "name": "vibex:cargo-source",
-          "value": "registry+https://github.com/rust-lang/crates.io-index"
+          "value": "git+https://github.com/PeatBoy/gpui-kit?rev=ed597a041d254d3cf44fae2a01e09b23e9ecdbf8#ed597a041d254d3cf44fae2a01e09b23e9ecdbf8"
         },
         {
           "name": "vibex:selected-license",
@@ -12977,7 +12977,7 @@
     },
     {
       "type": "library",
-      "bom-ref": "cargo:gpui-kit-assets@0.9.1:c19b7c6f923b580a",
+      "bom-ref": "cargo:gpui-kit-assets@0.9.1:21b891abfaccca05",
       "name": "gpui-kit-assets",
       "version": "0.9.1",
       "licenses": [
@@ -12989,7 +12989,7 @@
       "properties": [
         {
           "name": "vibex:cargo-source",
-          "value": "registry+https://github.com/rust-lang/crates.io-index"
+          "value": "git+https://github.com/PeatBoy/gpui-kit?rev=ed597a041d254d3cf44fae2a01e09b23e9ecdbf8#ed597a041d254d3cf44fae2a01e09b23e9ecdbf8"
         },
         {
           "name": "vibex:selected-license",
@@ -13805,7 +13805,7 @@
     },
     {
       "type": "library",
-      "bom-ref": "cargo:gpui-shell@0.9.1:c19b7c6f923b580a",
+      "bom-ref": "cargo:gpui-shell@0.9.1:21b891abfaccca05",
       "name": "gpui-shell",
       "version": "0.9.1",
       "licenses": [
@@ -13817,7 +13817,7 @@
       "properties": [
         {
           "name": "vibex:cargo-source",
-          "value": "registry+https://github.com/rust-lang/crates.io-index"
+          "value": "git+https://github.com/PeatBoy/gpui-kit?rev=ed597a041d254d3cf44fae2a01e09b23e9ecdbf8#ed597a041d254d3cf44fae2a01e09b23e9ecdbf8"
         },
         {
           "name": "vibex:selected-license",
@@ -47628,7 +47628,7 @@
       ]
     },
     {
-      "ref": "cargo:gpui-base@0.9.1:c19b7c6f923b580a",
+      "ref": "cargo:gpui-base@0.9.1:21b891abfaccca05",
       "dependsOn": [
         "cargo:aho-corasick@1.1.4:c19b7c6f923b580a",
         "cargo:anyhow@1.0.102:c19b7c6f923b580a",
@@ -47667,7 +47667,7 @@
       ]
     },
     {
-      "ref": "cargo:gpui-component-macros@0.9.1:c19b7c6f923b580a",
+      "ref": "cargo:gpui-component-macros@0.9.1:21b891abfaccca05",
       "dependsOn": [
         "cargo:proc-macro-crate@3.5.0:c19b7c6f923b580a",
         "cargo:proc-macro2@1.0.106:c19b7c6f923b580a",
@@ -47676,16 +47676,16 @@
       ]
     },
     {
-      "ref": "cargo:gpui-component@0.9.1:c19b7c6f923b580a",
+      "ref": "cargo:gpui-component@0.9.1:21b891abfaccca05",
       "dependsOn": [
         "cargo:anyhow@1.0.102:c19b7c6f923b580a",
         "cargo:chrono@0.4.45:c19b7c6f923b580a",
         "cargo:core-text@21.0.0:c19b7c6f923b580a",
         "cargo:enum-iterator@2.3.0:c19b7c6f923b580a",
-        "cargo:gpui-base@0.9.1:c19b7c6f923b580a",
-        "cargo:gpui-component-macros@0.9.1:c19b7c6f923b580a",
+        "cargo:gpui-base@0.9.1:21b891abfaccca05",
+        "cargo:gpui-component-macros@0.9.1:21b891abfaccca05",
         "cargo:gpui-fast@0.1.14:c19b7c6f923b580a",
-        "cargo:gpui-kit-assets@0.9.1:c19b7c6f923b580a",
+        "cargo:gpui-kit-assets@0.9.1:21b891abfaccca05",
         "cargo:gpui-pre-macros@0.3.12:c19b7c6f923b580a",
         "cargo:gpui-pre-sum-tree@0.3.12:c19b7c6f923b580a",
         "cargo:gpui-pre@0.3.12:c19b7c6f923b580a",
@@ -47825,7 +47825,7 @@
       ]
     },
     {
-      "ref": "cargo:gpui-fps@0.9.1:c19b7c6f923b580a",
+      "ref": "cargo:gpui-fps@0.9.1:21b891abfaccca05",
       "dependsOn": [
         "cargo:core-graphics@0.24.0:c19b7c6f923b580a",
         "cargo:gpui-pre@0.3.12:c19b7c6f923b580a",
@@ -47840,7 +47840,7 @@
       ]
     },
     {
-      "ref": "cargo:gpui-kit-assets@0.9.1:c19b7c6f923b580a",
+      "ref": "cargo:gpui-kit-assets@0.9.1:21b891abfaccca05",
       "dependsOn": [
         "asset:gpui-kit-lucide-icons:efafb5ab9a148d12",
         "cargo:anyhow@1.0.102:c19b7c6f923b580a",
@@ -47853,9 +47853,9 @@
       ]
     },
     {
-      "ref": "cargo:gpui-kit@0.9.1:c19b7c6f923b580a",
+      "ref": "cargo:gpui-kit@0.9.1:21b891abfaccca05",
       "dependsOn": [
-        "cargo:gpui-base@0.9.1:c19b7c6f923b580a",
+        "cargo:gpui-base@0.9.1:21b891abfaccca05",
         "cargo:gpui-pre-macros@0.3.12:c19b7c6f923b580a",
         "cargo:gpui-pre-platform@0.3.12:c19b7c6f923b580a",
         "cargo:gpui-pre-web@0.3.12:c19b7c6f923b580a",
@@ -48314,7 +48314,7 @@
       ]
     },
     {
-      "ref": "cargo:gpui-shell@0.9.1:c19b7c6f923b580a",
+      "ref": "cargo:gpui-shell@0.9.1:21b891abfaccca05",
       "dependsOn": [
         "cargo:anyhow@1.0.102:c19b7c6f923b580a",
         "cargo:async-channel@2.5.0:c19b7c6f923b580a",
@@ -48322,10 +48322,10 @@
         "cargo:chrono@0.4.45:c19b7c6f923b580a",
         "cargo:flate2@1.1.9:c19b7c6f923b580a",
         "cargo:fs2@0.4.3:c19b7c6f923b580a",
-        "cargo:gpui-base@0.9.1:c19b7c6f923b580a",
-        "cargo:gpui-component@0.9.1:c19b7c6f923b580a",
-        "cargo:gpui-fps@0.9.1:c19b7c6f923b580a",
-        "cargo:gpui-kit@0.9.1:c19b7c6f923b580a",
+        "cargo:gpui-base@0.9.1:21b891abfaccca05",
+        "cargo:gpui-component@0.9.1:21b891abfaccca05",
+        "cargo:gpui-fps@0.9.1:21b891abfaccca05",
+        "cargo:gpui-kit@0.9.1:21b891abfaccca05",
         "cargo:gpui-pre-platform@0.3.12:c19b7c6f923b580a",
         "cargo:gpui-pre-reqwest@0.12.15:c19b7c6f923b580a",
         "cargo:gpui-pre@0.3.12:c19b7c6f923b580a",
@@ -53575,14 +53575,14 @@
         "cargo:futures-channel@0.3.34:c19b7c6f923b580a",
         "cargo:futures-util@0.3.34:c19b7c6f923b580a",
         "cargo:glob@0.3.3:c19b7c6f923b580a",
-        "cargo:gpui-base@0.9.1:c19b7c6f923b580a",
-        "cargo:gpui-component@0.9.1:c19b7c6f923b580a",
-        "cargo:gpui-fps@0.9.1:c19b7c6f923b580a",
-        "cargo:gpui-kit-assets@0.9.1:c19b7c6f923b580a",
+        "cargo:gpui-base@0.9.1:21b891abfaccca05",
+        "cargo:gpui-component@0.9.1:21b891abfaccca05",
+        "cargo:gpui-fps@0.9.1:21b891abfaccca05",
+        "cargo:gpui-kit-assets@0.9.1:21b891abfaccca05",
         "cargo:gpui-pre-platform@0.3.12:c19b7c6f923b580a",
         "cargo:gpui-pre-wgpu@0.3.12:c19b7c6f923b580a",
         "cargo:gpui-pre@0.3.12:c19b7c6f923b580a",
-        "cargo:gpui-shell@0.9.1:c19b7c6f923b580a",
+        "cargo:gpui-shell@0.9.1:21b891abfaccca05",
         "cargo:gpui-tokio@0.1.3:a9a8ee941163297c",
         "cargo:gtk@0.19.0:c19b7c6f923b580a",
         "cargo:image@0.25.10:c19b7c6f923b580a",
@@ -53861,7 +53861,7 @@
         "asset:vibex-mobile-application-icons:b690a33c976cf781",
         "asset:vibex-mobile-brand-marks:84a77e160e305979",
         "asset:vibex-mobile-native-icons:60418f3d673b6ca6",
-        "cargo:gpui-component@0.9.1:c19b7c6f923b580a",
+        "cargo:gpui-component@0.9.1:21b891abfaccca05",
         "cargo:gpui-pre@0.3.12:c19b7c6f923b580a",
         "cargo:markdown@1.0.0:c19b7c6f923b580a",
         "cargo:percent-encoding@2.3.2:c19b7c6f923b580a",

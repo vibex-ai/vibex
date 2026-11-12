@@ -22,7 +22,7 @@
 //! between two frames.
 
 use std::cell::RefCell;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::mpsc::{SyncSender, sync_channel};
@@ -33,7 +33,9 @@ use futures_channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
 use futures_util::StreamExt as _;
 use gpui::{App, AsyncWindowContext, Entity, Global, Window};
 use gpui_shell::plugin::PluginManager;
-use gpui_shell::{FrozenComponentRegistry, ScriptView, ShellRuntime};
+use gpui_shell::{
+    FrozenComponentRegistry, HostError, HostModule, HostValue, ScriptView, ShellRuntime,
+};
 use vibex_plugin::{LoadedPlugin, PluginError, PluginManifest, PluginRuntime};
 
 /// The application id the host stores its own state under.
@@ -65,18 +67,26 @@ pub enum HostRequest {
 /// means the host never has to be told the installation's home twice.
 struct Host {
     runtime: Rc<ShellRuntime>,
-    manager: Option<PluginManager>,
+    /// One manager per loaded plugin, so each plugin's host modules can close
+    /// over that plugin's own grants.
+    managers: BTreeMap<String, PluginManager>,
+    session: Rc<RefCell<Option<PluginSessionSnapshot>>>,
 }
 
 impl Host {
-    fn manager(&mut self, plugin: &LoadedPlugin) -> &mut PluginManager {
-        if self.manager.is_none() {
-            let (plugins_root, data_root) = store_roots(plugin);
-            self.manager = Some(PluginManager::new(vec![plugins_root]).with_data_home(data_root));
-        }
-        self.manager
-            .as_mut()
-            .expect("the manager was just installed")
+    /// Builds a manager whose host modules answer only for this plugin.
+    fn manager_for(&self, plugin: &LoadedPlugin) -> Result<PluginManager, String> {
+        let (plugins_root, data_root) = store_roots(plugin);
+        let grants = plugin
+            .granted_permissions
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let modules = host_modules(plugin.plugin_id.clone(), grants, Rc::clone(&self.session));
+        PluginManager::new(vec![plugins_root])
+            .with_data_home(data_root)
+            .with_host_modules(modules)
+            .map_err(|error| format!("the plugin host modules are invalid: {error}"))
     }
 }
 
@@ -135,11 +145,11 @@ fn load(
     let directory = plugin.directory.clone();
     let plugin_id = plugin.plugin_id.clone();
     let runtime = Rc::clone(&host.runtime);
-    let manager = host.manager(plugin);
-    discover(manager)?;
-    // Re-enabling goes through this path too, and the manager refuses a second
-    // load of an id it already holds.
-    manager.unload(&plugin_id);
+    if let Some(mut previous) = host.managers.remove(&plugin_id) {
+        previous.unload(&plugin_id);
+    }
+    let mut manager = host.manager_for(plugin)?;
+    discover(&mut manager)?;
     manager
         .load(
             &runtime,
@@ -148,11 +158,13 @@ fn load(
             window,
             cx,
         )
-        .map_err(|error| format!("{error:#}"))
+        .map_err(|error| format!("{error:#}"))?;
+    host.managers.insert(plugin_id, manager);
+    Ok(())
 }
 
 fn unload(host: &mut Host, plugin_id: &str) -> Result<(), String> {
-    if let Some(manager) = host.manager.as_mut() {
+    if let Some(mut manager) = host.managers.remove(plugin_id) {
         manager.unload(plugin_id);
     }
     Ok(())
@@ -184,8 +196,8 @@ fn permits(directory: &Path, manifest_id: &str, approved: &BTreeSet<String>) -> 
 pub fn view(cx: &App, plugin_id: &str) -> Option<Entity<ScriptView>> {
     let host = cx.try_global::<HostState>()?;
     let host = host.0.borrow();
-    host.manager
-        .as_ref()?
+    host.managers
+        .get(plugin_id)?
         .plugin(plugin_id)
         .map(|plugin| plugin.view().clone())
 }
@@ -225,6 +237,34 @@ pub fn request_load(plugin_id: String, record: &vibex_core::InstalledPlugin) {
     }
 }
 
+/// What a plugin sees as the current Vibex session.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PluginSessionSnapshot {
+    pub id: String,
+    pub title: String,
+    pub workspace_id: String,
+    pub workspace_root: String,
+    pub agent_id: String,
+}
+
+struct SessionState(Rc<RefCell<Option<PluginSessionSnapshot>>>);
+
+impl Global for SessionState {}
+
+/// Updates the session the `vibex.session` / `vibex.workspace` modules expose.
+///
+/// The workbench calls this while it renders; the value is only stored when it
+/// actually changed, so a frame that draws the same session costs a comparison.
+pub fn set_session(cx: &App, session: Option<PluginSessionSnapshot>) {
+    let Some(state) = cx.try_global::<SessionState>() else {
+        return;
+    };
+    let mut current = state.0.borrow_mut();
+    if *current != session {
+        *current = session;
+    }
+}
+
 /// The UI thread's inbox, set once the first window starts its pump.
 static INBOX: OnceLock<UnboundedSender<HostRequest>> = OnceLock::new();
 
@@ -241,11 +281,15 @@ pub fn init(cx: &mut App) {
     gpui_shell::init_with_components(cx, &components);
     let _ = gpui_shell::set_bundle_id(BUNDLE_ID);
 
+    let session = Rc::new(RefCell::new(None));
+    cx.set_global(SessionState(session.clone()));
+
     match ShellRuntime::new_isolated_with_components(components) {
         Ok(runtime) => {
             cx.set_global(HostState(Rc::new(RefCell::new(Host {
                 runtime,
-                manager: None,
+                managers: BTreeMap::new(),
+                session: session.clone(),
             }))));
         }
         Err(error) => {
@@ -258,6 +302,99 @@ pub fn init(cx: &mut App) {
 
     if vibex_desktop_runtime::install_plugin_runtime(Arc::new(ShellPluginRuntime)).is_err() {
         eprintln!("vibex-plugin-host: a runtime was already installed");
+    }
+}
+
+/// The host modules a Vibex plugin may import.
+///
+/// The module is reachable from every plugin the manager loads; each function
+/// asks the host's grant map before answering, and the current plugin id comes
+/// from the policy frame `gpui-shell` puts around the call.
+fn host_modules(
+    plugin_id: String,
+    grants: BTreeSet<String>,
+    session: Rc<RefCell<Option<PluginSessionSnapshot>>>,
+) -> Vec<HostModule> {
+    let session_reader = {
+        let session = Rc::clone(&session);
+        let grants = grants.clone();
+        let plugin_id = plugin_id.clone();
+        HostModule::new("vibex.session")
+            .declarations(
+                "export function current(): { id: string; title: string; workspaceId: string; workspaceRoot: string; agentId: string } | null;",
+            )
+            .function("current", move |_| {
+                require_permission(&grants, "agent.read", &plugin_id)?;
+                let session = session.borrow();
+                let Some(session) = session.as_ref() else {
+                    return Ok(HostValue::Null);
+                };
+                Ok(HostValue::Object(vec![
+                    ("id".to_string(), HostValue::from(session.id.clone())),
+                    (
+                        "title".to_string(),
+                        HostValue::from(session.title.clone()),
+                    ),
+                    (
+                        "workspaceId".to_string(),
+                        HostValue::from(session.workspace_id.clone()),
+                    ),
+                    (
+                        "workspaceRoot".to_string(),
+                        HostValue::from(session.workspace_root.clone()),
+                    ),
+                    (
+                        "agentId".to_string(),
+                        HostValue::from(session.agent_id.clone()),
+                    ),
+                ]))
+            })
+    };
+
+    let workspace_reader = {
+        let session = Rc::clone(&session);
+        let grants = grants.clone();
+        let plugin_id = plugin_id.clone();
+        HostModule::new("vibex.workspace")
+            .declarations("export function current(): { id: string; root: string } | null;")
+            .function("current", move |_| {
+                require_permission(&grants, "agent.read", &plugin_id)?;
+                let session = session.borrow();
+                let Some(session) = session.as_ref() else {
+                    return Ok(HostValue::Null);
+                };
+                Ok(HostValue::Object(vec![
+                    (
+                        "id".to_string(),
+                        HostValue::from(session.workspace_id.clone()),
+                    ),
+                    (
+                        "root".to_string(),
+                        HostValue::from(session.workspace_root.clone()),
+                    ),
+                ]))
+            })
+    };
+
+    if grants.contains("agent.read") {
+        vec![session_reader, workspace_reader]
+    } else {
+        Vec::new()
+    }
+}
+
+/// Refuses a `vibex.*` call the current plugin did not ask to be allowed.
+fn require_permission(
+    grants: &BTreeSet<String>,
+    permission: &str,
+    plugin_id: &str,
+) -> Result<(), HostError> {
+    if grants.contains(permission) {
+        Ok(())
+    } else {
+        Err(HostError::new(format!(
+            "plugin `{plugin_id}` has not been granted `{permission}`"
+        )))
     }
 }
 
@@ -474,5 +611,39 @@ mod tests {
         let (plugins_root, data_root) = store_roots(&plugin);
         assert_eq!(plugins_root, PathBuf::from("/home/u/.vibex/plugins"));
         assert_eq!(data_root, PathBuf::from("/home/u/.vibex/plugin-data"));
+    }
+
+    #[test]
+    fn the_vibex_modules_are_only_offered_with_agent_read() {
+        let session = Rc::new(RefCell::new(None));
+        assert!(
+            host_modules("acme.widgets".to_string(), BTreeSet::new(), session.clone()).is_empty(),
+            "a plugin without agent.read must not get the session surface"
+        );
+
+        let modules = host_modules(
+            "acme.widgets".to_string(),
+            BTreeSet::from(["agent.read".to_string()]),
+            session,
+        );
+        assert_eq!(modules.len(), 2);
+        for module in modules {
+            module
+                .validate()
+                .expect("the built-in host modules must be valid");
+        }
+    }
+
+    #[test]
+    fn a_missing_grant_is_a_host_error() {
+        assert!(require_permission(&BTreeSet::new(), "agent.read", "acme.widgets").is_err());
+        assert!(
+            require_permission(
+                &BTreeSet::from(["agent.read".to_string()]),
+                "agent.read",
+                "acme.widgets"
+            )
+            .is_ok()
+        );
     }
 }

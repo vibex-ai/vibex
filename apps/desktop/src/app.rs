@@ -96506,6 +96506,16 @@ impl Render for VibexWorkbench {
         // still has a blend mid-flight is asked for its next frame directly, so
         // a fade inside a cached subtree advances without rebuilding the window.
         motion::schedule_hover_frames(window);
+        let plugin_session =
+            self.selected_session()
+                .map(|session| crate::plugin_host::PluginSessionSnapshot {
+                    id: session.id.as_str().to_string(),
+                    title: session.title.clone(),
+                    workspace_id: session.workspace_id.as_str().to_string(),
+                    workspace_root: session.workspace_root.clone(),
+                    agent_id: session.agent_id.as_str().to_string(),
+                });
+        crate::plugin_host::set_session(cx, plugin_session);
         self.present_persistence_note(window, cx);
         self.present_settings_operation_notice(window, cx);
         self.present_runtime_registry_error(window, cx);

@@ -366,14 +366,14 @@ This inventory records source and license provenance. The corresponding license 
 | glutin_wgl_sys | 0.6.1 | registry+https://github.com/rust-lang/crates.io-index | Apache-2.0 | Apache-2.0 | cargo-manifest |
 | gobject-sys | 0.22.9 | registry+https://github.com/rust-lang/crates.io-index | MIT | MIT | cargo-manifest |
 | gpu-allocator | 0.28.0 | registry+https://github.com/rust-lang/crates.io-index | MIT OR Apache-2.0 | MIT | cargo-manifest |
-| gpui-base | 0.9.1 | registry+https://github.com/rust-lang/crates.io-index | Apache-2.0 | Apache-2.0 | cargo-manifest |
-| gpui-component | 0.9.1 | registry+https://github.com/rust-lang/crates.io-index | Apache-2.0 | Apache-2.0 | cargo-manifest |
-| gpui-component-macros | 0.9.1 | registry+https://github.com/rust-lang/crates.io-index | Apache-2.0 | Apache-2.0 | cargo-manifest |
+| gpui-base | 0.9.1 | git+https://github.com/PeatBoy/gpui-kit?rev=ed597a041d254d3cf44fae2a01e09b23e9ecdbf8#ed597a041d254d3cf44fae2a01e09b23e9ecdbf8 | Apache-2.0 | Apache-2.0 | cargo-manifest |
+| gpui-component | 0.9.1 | git+https://github.com/PeatBoy/gpui-kit?rev=ed597a041d254d3cf44fae2a01e09b23e9ecdbf8#ed597a041d254d3cf44fae2a01e09b23e9ecdbf8 | Apache-2.0 | Apache-2.0 | cargo-manifest |
+| gpui-component-macros | 0.9.1 | git+https://github.com/PeatBoy/gpui-kit?rev=ed597a041d254d3cf44fae2a01e09b23e9ecdbf8#ed597a041d254d3cf44fae2a01e09b23e9ecdbf8 | Apache-2.0 | Apache-2.0 | cargo-manifest |
 | gpui-fast | 0.1.14 | registry+https://github.com/rust-lang/crates.io-index | Apache-2.0 | Apache-2.0 | cargo-manifest |
 | gpui-fast-macros | 0.1.14 | registry+https://github.com/rust-lang/crates.io-index | Apache-2.0 | Apache-2.0 | cargo-manifest |
-| gpui-fps | 0.9.1 | registry+https://github.com/rust-lang/crates.io-index | Apache-2.0 | Apache-2.0 | cargo-manifest |
-| gpui-kit | 0.9.1 | registry+https://github.com/rust-lang/crates.io-index | Apache-2.0 | Apache-2.0 | cargo-manifest |
-| gpui-kit-assets | 0.9.1 | registry+https://github.com/rust-lang/crates.io-index | Apache-2.0 | Apache-2.0 | cargo-manifest |
+| gpui-fps | 0.9.1 | git+https://github.com/PeatBoy/gpui-kit?rev=ed597a041d254d3cf44fae2a01e09b23e9ecdbf8#ed597a041d254d3cf44fae2a01e09b23e9ecdbf8 | Apache-2.0 | Apache-2.0 | cargo-manifest |
+| gpui-kit | 0.9.1 | git+https://github.com/PeatBoy/gpui-kit?rev=ed597a041d254d3cf44fae2a01e09b23e9ecdbf8#ed597a041d254d3cf44fae2a01e09b23e9ecdbf8 | Apache-2.0 | Apache-2.0 | cargo-manifest |
+| gpui-kit-assets | 0.9.1 | git+https://github.com/PeatBoy/gpui-kit?rev=ed597a041d254d3cf44fae2a01e09b23e9ecdbf8#ed597a041d254d3cf44fae2a01e09b23e9ecdbf8 | Apache-2.0 | Apache-2.0 | cargo-manifest |
 | gpui-pre | 0.3.12 | registry+https://github.com/rust-lang/crates.io-index | Apache-2.0 | Apache-2.0 | cargo-manifest |
 | gpui-pre-apple | 0.3.12 | registry+https://github.com/rust-lang/crates.io-index | Apache-2.0 | Apache-2.0 | cargo-manifest |
 | gpui-pre-bench-metrics | 0.3.12 | registry+https://github.com/rust-lang/crates.io-index | Apache-2.0 | Apache-2.0 | cargo-manifest |
@@ -396,7 +396,7 @@ This inventory records source and license provenance. The corresponding license 
 | gpui-pre-windows | 0.3.12 | registry+https://github.com/rust-lang/crates.io-index | Apache-2.0 | Apache-2.0 | cargo-manifest |
 | gpui-pre-ztracing | 0.3.12 | registry+https://github.com/rust-lang/crates.io-index | Apache-2.0 | Apache-2.0 | cargo-manifest |
 | gpui-pre-ztracing-macro | 0.3.12 | registry+https://github.com/rust-lang/crates.io-index | Apache-2.0 | Apache-2.0 | cargo-manifest |
-| gpui-shell | 0.9.1 | registry+https://github.com/rust-lang/crates.io-index | Apache-2.0 | Apache-2.0 | cargo-manifest |
+| gpui-shell | 0.9.1 | git+https://github.com/PeatBoy/gpui-kit?rev=ed597a041d254d3cf44fae2a01e09b23e9ecdbf8#ed597a041d254d3cf44fae2a01e09b23e9ecdbf8 | Apache-2.0 | Apache-2.0 | cargo-manifest |
 | gpui-tokio | 0.1.3 | path:crates/gpui-tokio | AGPL-3.0-or-later | AGPL-3.0-or-later | cargo-manifest |
 | granit-parser | 0.0.7 | registry+https://github.com/rust-lang/crates.io-index | MIT OR Apache-2.0 | MIT | cargo-manifest |
 | group | 0.14.0 | registry+https://github.com/rust-lang/crates.io-index | MIT OR Apache-2.0 | MIT | cargo-manifest |

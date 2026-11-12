@@ -3733,8 +3733,7 @@ dependencies = [
 [[package]]
 name = "gpui-base"
 version = "0.9.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f3e9ae5237737cfd110d0ff513fcd9c20f97d98ebabd0a73164068177f0aca4f"
+source = "git+https://github.com/PeatBoy/gpui-kit?rev=ed597a041d254d3cf44fae2a01e09b23e9ecdbf8#ed597a041d254d3cf44fae2a01e09b23e9ecdbf8"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -3775,8 +3774,7 @@ dependencies = [
 [[package]]
 name = "gpui-component"
 version = "0.9.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e155c4914bd809d966660610d596f7b57c5cd38979ca2c132215057a91f23f03"
+source = "git+https://github.com/PeatBoy/gpui-kit?rev=ed597a041d254d3cf44fae2a01e09b23e9ecdbf8#ed597a041d254d3cf44fae2a01e09b23e9ecdbf8"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3850,8 +3848,7 @@ dependencies = [
 [[package]]
 name = "gpui-component-macros"
 version = "0.9.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9676a5d12c59ce295b5c82cc18365ad8b96cb683682e2e74668a56fb92544300"
+source = "git+https://github.com/PeatBoy/gpui-kit?rev=ed597a041d254d3cf44fae2a01e09b23e9ecdbf8#ed597a041d254d3cf44fae2a01e09b23e9ecdbf8"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -3945,8 +3942,7 @@ dependencies = [
 [[package]]
 name = "gpui-fps"
 version = "0.9.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d8033fae208984a79b433f57a9844fa8e9fc419619597ec255d4971467f8dfce"
+source = "git+https://github.com/PeatBoy/gpui-kit?rev=ed597a041d254d3cf44fae2a01e09b23e9ecdbf8#ed597a041d254d3cf44fae2a01e09b23e9ecdbf8"
 dependencies = [
  "core-graphics 0.24.0",
  "gpui-pre",
@@ -3963,8 +3959,7 @@ dependencies = [
 [[package]]
 name = "gpui-kit"
 version = "0.9.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aca1dedfea73645b60b5893c9c16de0b1396f2cf4251d19e5f03a295c1b61879"
+source = "git+https://github.com/PeatBoy/gpui-kit?rev=ed597a041d254d3cf44fae2a01e09b23e9ecdbf8#ed597a041d254d3cf44fae2a01e09b23e9ecdbf8"
 dependencies = [
  "gpui-base",
  "gpui-pre",
@@ -3976,8 +3971,7 @@ dependencies = [
 [[package]]
 name = "gpui-kit-assets"
 version = "0.9.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cb5abe0bbd8f9226170c8726e529f6574519e297e9ed1bde86d5fd4d3536079a"
+source = "git+https://github.com/PeatBoy/gpui-kit?rev=ed597a041d254d3cf44fae2a01e09b23e9ecdbf8#ed597a041d254d3cf44fae2a01e09b23e9ecdbf8"
 dependencies = [
  "anyhow",
  "gpui-pre",
@@ -4541,8 +4535,7 @@ checksum = "85701631a9bbecf47e6d19f145e85e57767e7c50f7192d5b1bf65b5ef43cb373"
 [[package]]
 name = "gpui-shell"
 version = "0.9.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a813b32b9a8c27f56ea7ae112ff43c120abd3aa00005f205735e0bc37dce4db6"
+source = "git+https://github.com/PeatBoy/gpui-kit?rev=ed597a041d254d3cf44fae2a01e09b23e9ecdbf8#ed597a041d254d3cf44fae2a01e09b23e9ecdbf8"
 dependencies = [
  "anyhow",
  "async-channel",
