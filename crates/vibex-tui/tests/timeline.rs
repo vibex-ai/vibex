@@ -720,3 +720,258 @@ fn disclosures_reverse_from_the_visible_extent_and_stop_when_motion_is_off() {
     assert!(opened.contains("command-9"), "{opened}");
     assert!(!app.transcript.is_animating());
 }
+
+#[test]
+fn a_failed_turn_still_shows_the_answer_it_produced() {
+    // A provider can answer and then report a boundary error. The answer is
+    // what the turn produced; the error is work that belongs behind the fold.
+    // The projection used to name the later error as the conclusion, which
+    // dropped the final answer from the turn entirely — scrolling up loaded the
+    // error and the summary the reader was reading disappeared.
+    let mut app = app(
+        vec![
+            command("cargo test", CommandStatus::Completed),
+            TimelinePayload::AgentMessage(AgentMessagePayload {
+                text: "The answer survives the failure.".into(),
+                is_final: true,
+            }),
+            TimelinePayload::Error(TimelineErrorPayload {
+                code: "acp_rpc_error".into(),
+                message: "Internal error: turn failed: 502".into(),
+                recoverable: false,
+            }),
+        ],
+        AgentSessionState::Idle,
+    );
+
+    let screen = draw(&mut app, 100, 30);
+    assert!(
+        screen.contains("The answer survives the failure."),
+        "the turn's answer was dropped after it failed:\n{screen}"
+    );
+    assert!(
+        !screen.contains("Internal error: turn failed: 502"),
+        "the failure belongs behind the fold, with the turn's work:\n{screen}"
+    );
+
+    // Opening the fold reveals the failure without taking the answer away.
+    let control = app
+        .transcript
+        .blocks()
+        .iter()
+        .position(|block| {
+            block
+                .fold
+                .as_ref()
+                .is_some_and(vibex_tui::transcript::TurnFold::is_control)
+        })
+        .expect("the turn has a fold control");
+    app.transcript.toggle_fold_at(control);
+    let opened = draw(&mut app, 100, 30);
+    assert!(
+        opened.contains("Internal error: turn failed: 502"),
+        "the failure is not readable with the turn's work:\n{opened}"
+    );
+    assert!(
+        opened.contains("The answer survives the failure."),
+        "opening the fold hid the answer:\n{opened}"
+    );
+}
+
+#[test]
+fn older_history_does_not_strand_the_reader_above_a_failed_answer() {
+    // The screen after the failure: the turn's answer is the bottom of the
+    // transcript, even though a boundary error closed the turn. Loading older
+    // history must keep it there — a projection that folded the answer away
+    // left the previous turn as the last thing the reader could scroll to.
+    let mut app = app(
+        vec![
+            command("cargo test", CommandStatus::Completed),
+            TimelinePayload::AgentMessage(AgentMessagePayload {
+                text: "The answer survives the failure.".into(),
+                is_final: true,
+            }),
+            TimelinePayload::Error(TimelineErrorPayload {
+                code: "acp_rpc_error".into(),
+                message: "Internal error: turn failed: 502".into(),
+                recoverable: false,
+            }),
+        ],
+        AgentSessionState::Idle,
+    );
+    app.agent.state.timeline_has_older = true;
+    let _ = draw(&mut app, 100, 30);
+
+    // Park at the top and pull the page the reader was about to scroll into.
+    app.scroll.follow = false;
+    app.scroll.offset = 0;
+    let _ = draw(&mut app, 100, 30);
+
+    let session_id = app
+        .agent
+        .state
+        .timeline
+        .session_id
+        .clone()
+        .expect("the fixture has a session");
+    let before_sequence = app
+        .agent
+        .state
+        .timeline_oldest_sequence()
+        .expect("the fixture has an item");
+    let ticket = vibex_ui::AgentTimelineBeforeTicket {
+        generation: app.agent.state.generation,
+        session_id: session_id.clone(),
+        before_sequence,
+    };
+    let older = TimelineItem {
+        id: TimelineItemId::new(),
+        session_id: session_id.clone(),
+        sequence: 0,
+        timestamp_ms: 0,
+        source: TimelineSource::User,
+        kind: TimelineItemKind::UserMessage,
+        correlation_id: None,
+        provider_correlation_id: None,
+        redaction_state: TimelineRedactionState::None,
+        execution_attribution: None,
+        payload_depth: TimelinePayloadDepth::Detail,
+        payload: TimelinePayload::UserMessage(UserMessagePayload {
+            text: "the question that began this turn".into(),
+            ..Default::default()
+        }),
+    };
+    let page = TimelinePage {
+        session_id,
+        items: vec![older],
+        start_sequence: Some(0),
+        end_sequence: Some(0),
+        has_older: false,
+        has_newer: true,
+        starts_at_turn_start: true,
+        leading_turn_start: None,
+        omitted: None,
+    };
+    assert!(
+        app.agent
+            .apply_timeline_before(&ticket, Ok(page))
+            .expect("the page is valid")
+    );
+    app.sync_transcript();
+
+    // Walk back down the way the reader would.
+    for _ in 0..100 {
+        app.scroll_lines(3);
+        let _ = draw(&mut app, 100, 30);
+    }
+    let screen = draw(&mut app, 100, 30);
+    assert!(
+        screen.contains("The answer survives the failure."),
+        "the failed answer is not the bottom the reader can return to:\n{screen}"
+    );
+}
+
+#[test]
+fn an_older_page_keeps_the_row_the_reader_was_reading() {
+    // Scrolling up from the tail parks inside a long answer. Loading the page
+    // above must keep that row under the viewport, not snap back to the start
+    // of the answer — the reader was reading the row, not the block.
+    let long_answer = (0..40)
+        .map(|line| format!("answer line {line}\n\n"))
+        .collect::<String>();
+    let mut app = app(
+        vec![
+            TimelinePayload::AgentMessage(AgentMessagePayload {
+                text: long_answer,
+                is_final: true,
+            }),
+            TimelinePayload::Error(TimelineErrorPayload {
+                code: "acp_rpc_error".into(),
+                message: "Internal error: turn failed: 502".into(),
+                recoverable: false,
+            }),
+        ],
+        AgentSessionState::Idle,
+    );
+    app.agent.state.timeline_has_older = true;
+    let _ = draw(&mut app, 100, 30);
+    assert!(app.scroll.follow);
+
+    // A few rows up from the bottom, still inside the answer block.
+    app.scroll_lines(-3);
+    let _ = draw(&mut app, 100, 30);
+    let before_index = app
+        .transcript
+        .block_at_line(app.scroll.offset)
+        .expect("a block at the viewport top");
+    let before_id = app.transcript.block(before_index).unwrap().id.clone();
+    let before_row = app.scroll.offset - app.transcript.line_of_block(before_index);
+    assert!(before_row > 0, "the fixture must park inside a block");
+
+    let session_id = app
+        .agent
+        .state
+        .timeline
+        .session_id
+        .clone()
+        .expect("the fixture has a session");
+    let before_sequence = app
+        .agent
+        .state
+        .timeline_oldest_sequence()
+        .expect("the fixture has an item");
+    let ticket = vibex_ui::AgentTimelineBeforeTicket {
+        generation: app.agent.state.generation,
+        session_id: session_id.clone(),
+        before_sequence,
+    };
+    let older = TimelineItem {
+        id: TimelineItemId::new(),
+        session_id: session_id.clone(),
+        sequence: 0,
+        timestamp_ms: 0,
+        source: TimelineSource::User,
+        kind: TimelineItemKind::UserMessage,
+        correlation_id: None,
+        provider_correlation_id: None,
+        redaction_state: TimelineRedactionState::None,
+        execution_attribution: None,
+        payload_depth: TimelinePayloadDepth::Detail,
+        payload: TimelinePayload::UserMessage(UserMessagePayload {
+            text: "the question that began this turn".into(),
+            ..Default::default()
+        }),
+    };
+    let page = TimelinePage {
+        session_id,
+        items: vec![older],
+        start_sequence: Some(0),
+        end_sequence: Some(0),
+        has_older: false,
+        has_newer: true,
+        starts_at_turn_start: true,
+        leading_turn_start: None,
+        omitted: None,
+    };
+    assert!(
+        app.agent
+            .apply_timeline_before(&ticket, Ok(page))
+            .expect("the page is valid")
+    );
+    app.sync_transcript();
+
+    let after_index = app
+        .transcript
+        .block_at_line(app.scroll.offset)
+        .expect("a block at the viewport top");
+    assert_eq!(
+        app.transcript.block(after_index).unwrap().id,
+        before_id,
+        "the page moved the reader to a different block"
+    );
+    assert_eq!(
+        app.scroll.offset - app.transcript.line_of_block(after_index),
+        before_row,
+        "the page moved the reader within the block"
+    );
+}

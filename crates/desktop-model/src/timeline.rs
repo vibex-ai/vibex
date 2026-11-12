@@ -391,11 +391,25 @@ fn finish_turn_ref(turn: &mut TimelineTurnRef<'_>) {
         .response_items
         .iter()
         .any(|item| is_turn_boundary_error(item));
+    // A final answer is the turn's conclusion even when a boundary error
+    // followed it. The error explains why the turn stopped, but it is not the
+    // thing the turn produced: naming the error here dropped the answer from the
+    // turn entirely, because every final agent row is removed from the process
+    // rows below. A turn that answered and then failed then showed only the
+    // failure, and the reader could not scroll back to what was said. The error
+    // stays in the process rows and is read with the rest of the work; the
+    // answer stays the conclusion.
     turn.conclusion_item_id = turn
         .response_items
         .iter()
         .rev()
-        .find(|item| is_turn_boundary_error(item) || is_final_agent_message(item))
+        .find(|item| is_final_agent_message(item))
+        .or_else(|| {
+            turn.response_items
+                .iter()
+                .rev()
+                .find(|item| is_turn_boundary_error(item))
+        })
         .map(|item| item.id.to_string());
 }
 

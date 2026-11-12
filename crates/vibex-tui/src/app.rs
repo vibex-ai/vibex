@@ -6479,10 +6479,19 @@ impl App {
                 .iter()
                 .find(|block| !block.group.is_head())
                 .is_some_and(|head| blocks.first().is_some_and(|first| first.id != head.id));
+        // The anchor is the block the viewport starts on *and the row inside
+        // it*. A reader who scrolled a few rows into a long answer is reading
+        // that row, not the block's first line: restoring only the block would
+        // throw the view up to the start of the answer the moment an older page
+        // landed.
         let anchor = if prepended {
             self.transcript
                 .block_at_line(self.scroll.offset)
-                .and_then(|index| self.transcript.block(index).map(|block| block.id.clone()))
+                .and_then(|index| {
+                    let id = self.transcript.block(index)?.id.clone();
+                    let start = self.transcript.line_of_block(index);
+                    Some((id, self.scroll.offset.saturating_sub(start)))
+                })
         } else {
             None
         };
@@ -6513,12 +6522,12 @@ impl App {
             // New content resumes following unless the user scrolled away.
             if self.scroll.follow {
                 self.scroll.offset = 0;
-            } else if let Some(offset) = anchor
-                .as_deref()
-                .and_then(|id| self.transcript.index_of_block(id))
-                .map(|index| self.transcript.offset_of_block(index))
-            {
-                self.scroll.offset = offset;
+            } else if let Some((index, row)) = anchor.as_ref().and_then(|(id, row)| {
+                self.transcript
+                    .index_of_block(id)
+                    .map(|index| (index, *row))
+            }) {
+                self.scroll.offset = self.transcript.offset_of_block(index).saturating_add(row);
             }
         }
         // Streaming content can add or invalidate matches, so an open search
