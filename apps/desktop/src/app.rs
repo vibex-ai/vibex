@@ -252,7 +252,7 @@ use crate::platform::{
 use crate::remote_access_pairing::open_remote_access_pairing;
 use crate::remote_client::{
     DesktopRemoteCredential, DesktopRuntimeRegistry, DesktopRuntimeRegistryStore, LOCAL_RUNTIME_ID,
-    RegisteredRuntime,
+    RegisteredRuntime, claim_server_pairing_code, claim_server_pairing_link,
 };
 use crate::responsive::WorkbenchVisibility;
 use crate::shimmer::ShimmerText;
@@ -519,6 +519,10 @@ fn publish_wsl_provisioning_stage(
 struct WslProvisioningSnapshot {
     attempt_id: u64,
     distro: String,
+    /// The port this attempt installs and starts on. Retrying from the
+    /// progress dialog must keep it; picking a new one belongs to the add
+    /// dialog, where the reader can see the port they chose.
+    port: u16,
     step: WslProvisioningStep,
     status: ProvisioningStatus,
     detail: Option<String>,
@@ -526,10 +530,11 @@ struct WslProvisioningSnapshot {
 }
 
 impl WslProvisioningSnapshot {
-    fn running(attempt_id: u64, distro: String) -> Self {
+    fn running(attempt_id: u64, distro: String, port: u16) -> Self {
         Self {
             attempt_id,
             distro,
+            port,
             step: WslProvisioningStep::PreparingDistro,
             status: ProvisioningStatus::Running,
             detail: Some(WslProvisioningStage::default().detail),
@@ -10575,6 +10580,8 @@ pub struct VibexWorkbench {
     ssh_uninstall_error: Option<String>,
     #[allow(dead_code)]
     wsl_task: Option<Task<()>>,
+    /// The port preflight that runs before a WSL deployment starts.
+    wsl_port_check_task: Option<Task<()>>,
     wsl_error: Option<String>,
     /// The WSL deployment currently connected to the progress surface.
     ///
@@ -10640,6 +10647,9 @@ pub struct VibexWorkbench {
     runtime_edit_error: Option<String>,
     /// The runtime id a switch is connecting to; blocks a second switch.
     runtime_switch_pending: Option<String>,
+    /// A pairing link or code is being claimed; blocks a second claim while
+    /// the first is still talking to the server.
+    remote_pairing_pending: bool,
     /// The runtime a removal is confirming.
     runtime_remove_pending: Option<String>,
     /// The SSH profile whose upgrade is waiting for confirmation.
@@ -12545,6 +12555,7 @@ impl VibexWorkbench {
             ssh_uninstall_task: None,
             ssh_uninstall_error: None,
             wsl_task: None,
+            wsl_port_check_task: None,
             wsl_error: None,
             wsl_provisioning: None,
             wsl_provisioning_stage: None,
@@ -12582,6 +12593,7 @@ impl VibexWorkbench {
             runtime_edit_local_port_input,
             runtime_edit_error: None,
             runtime_switch_pending: None,
+            remote_pairing_pending: false,
             runtime_remove_pending: None,
             runtime_upgrade_pending: None,
             runtime_uninstall_pending: None,
@@ -15640,8 +15652,127 @@ impl VibexWorkbench {
         cx.notify();
     }
 
-    #[allow(dead_code)]
-    fn provision_wsl_distro(&mut self, distro: String, cx: &mut Context<Self>) {
+    /// Checks a chosen WSL port before the deployment spends minutes on the
+    /// artifact.
+    ///
+    /// The probe is the same fixed environment script the SSH path uses, run
+    /// on a blocking worker because `wsl.exe` is a process call. A busy port
+    /// keeps the add dialog open with the port number in the message, so the
+    /// reader changes one field instead of restarting the whole flow.
+    fn check_wsl_runtime_port(
+        &mut self,
+        distro: String,
+        port: u16,
+        generation: u64,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .wsl_provisioning
+            .as_ref()
+            .is_some_and(|snapshot| !snapshot.status.is_terminal())
+        {
+            self.open_wsl_progress_dialog(cx);
+            return;
+        }
+        let check_distro = distro.clone();
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            tokio::task::spawn_blocking(move || {
+                crate::ssh_connection::wsl::probe_environment(
+                    std::path::Path::new("wsl.exe"),
+                    &check_distro,
+                    port,
+                )
+                .map_err(|error| (error.code.to_string(), error.message))
+            })
+            .await
+            .map_err(|error| {
+                (
+                    "wsl_port_check_task_failed".to_string(),
+                    format!("the WSL port check stopped unexpectedly: {error}"),
+                )
+            })?
+        });
+        self.wsl_port_check_task = Some(cx.spawn(
+            async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let result = runner.await;
+                let _ = entity.update(cx, |this, cx| {
+                    // A closed dialog, or a newer check, owns the state this
+                    // result would write; dropping the stale answer is what
+                    // keeps a reopened dialog from starting a deployment the
+                    // reader did not ask for.
+                    let (current_generation, still_open) =
+                        this.settings_view.read_with(cx, |settings, _| {
+                            (
+                                settings.connections_wsl_check_generation,
+                                settings.connections_wsl_open,
+                            )
+                        });
+                    if current_generation != generation {
+                        return;
+                    }
+                    match result {
+                        Ok(Ok(_)) => {
+                            this.settings_view.update(cx, |settings, cx| {
+                                settings.connections_wsl_checking = false;
+                                settings.connections_wsl_check_error = None;
+                                cx.notify();
+                            });
+                            if still_open {
+                                this.settings_view.update(cx, |settings, cx| {
+                                    settings.connections_wsl_open = false;
+                                    cx.notify();
+                                });
+                                if let Some(window) = this.window_handle {
+                                    let _ = window.update(cx, |_, window, cx| {
+                                        window.close_dialog(cx);
+                                    });
+                                }
+                                this.provision_wsl_distro(distro, port, cx);
+                            }
+                        }
+                        Ok(Err((code, message))) => {
+                            let display = if code == "wsl_port_busy" {
+                                format!(
+                                    "{} {port} {}",
+                                    locale::text(
+                                        "The WSL runtime port",
+                                        "WSL 运行时端口",
+                                        "WSL 執行階段連接埠",
+                                    ),
+                                    locale::text(
+                                        "is already in use. Choose another port.",
+                                        "已被占用，请换一个端口。",
+                                        "已被占用，請換一個連接埠。",
+                                    )
+                                )
+                            } else {
+                                format!("{code}: {message}")
+                            };
+                            this.settings_view.update(cx, |settings, cx| {
+                                settings.connections_wsl_checking = false;
+                                settings.connections_wsl_check_error = Some(display);
+                                cx.notify();
+                            });
+                        }
+                        Err(_) => {
+                            this.settings_view.update(cx, |settings, cx| {
+                                settings.connections_wsl_checking = false;
+                                settings.connections_wsl_check_error = Some(
+                                    "wsl_port_check_task_failed: the WSL port check stopped unexpectedly"
+                                        .to_string(),
+                                );
+                                cx.notify();
+                            });
+                        }
+                    }
+                    cx.notify();
+                });
+            },
+        ));
+        cx.notify();
+    }
+
+    fn provision_wsl_distro(&mut self, distro: String, port: u16, cx: &mut Context<Self>) {
         // A deployment already owns the progress surface. A second click must
         // not start a competing install; reopen the run in flight instead.
         if self
@@ -15672,7 +15803,11 @@ impl VibexWorkbench {
         self.wsl_provisioning_attempt = attempt_id;
         let stage = Arc::new(std::sync::Mutex::new(WslProvisioningStage::default()));
         self.wsl_provisioning_stage = Some(stage.clone());
-        self.wsl_provisioning = Some(WslProvisioningSnapshot::running(attempt_id, distro.clone()));
+        self.wsl_provisioning = Some(WslProvisioningSnapshot::running(
+            attempt_id,
+            distro.clone(),
+            port,
+        ));
         self.sync_wsl_provisioning_settings(cx);
         // The dialog appears on the click that started the work, not after the
         // manifest and the artifact download have already spent minutes.
@@ -15721,7 +15856,7 @@ impl VibexWorkbench {
                 &remote_home,
                 &install_root,
                 std::slice::from_ref(&remote_home),
-                8765,
+                port,
                 &desktop_home,
             )
             .map_err(|error| format!("{}: {}", error.code, error.message))?;
@@ -15839,7 +15974,7 @@ impl VibexWorkbench {
                 remote_home: remote_home.clone(),
                 install_root: install_root.clone(),
                 workspace_roots: vec![remote_home.clone()],
-                remote_port: 8765,
+                remote_port: port,
                 registered_runtime_id: Some(runtime_id.clone()),
                 created_at_ms: now_ms,
                 last_connected_at_ms: Some(now_ms),
@@ -16091,11 +16226,11 @@ impl VibexWorkbench {
             return;
         };
         let Some(runtime_id) = profile.registered_runtime_id.clone() else {
-            self.provision_wsl_distro(profile.distro, cx);
+            self.provision_wsl_distro(profile.distro, profile.remote_port, cx);
             return;
         };
         let Some(runtime) = self.runtime_registry.remote(&runtime_id).cloned() else {
-            self.provision_wsl_distro(profile.distro, cx);
+            self.provision_wsl_distro(profile.distro, profile.remote_port, cx);
             return;
         };
         self.runtime_connect_errors.remove(&runtime_id);
@@ -16912,6 +17047,15 @@ impl VibexWorkbench {
         let profiles = SshProfileStore::at_home(&config.home_dir)
             .load()
             .unwrap_or_default();
+        let bound_runtime_ids = profiles
+            .iter()
+            .filter_map(|profile| profile.registered_runtime_id.clone())
+            .chain(
+                self.wsl_profiles
+                    .iter()
+                    .filter_map(|profile| profile.registered_runtime_id.clone()),
+            )
+            .collect::<std::collections::BTreeSet<_>>();
         let mut live = BTreeMap::new();
         for profile in profiles {
             let status = match profile.registered_runtime_id.as_deref() {
@@ -16995,6 +17139,44 @@ impl VibexWorkbench {
                 None => ConnectionRowStatus::Offline,
             };
             live.insert(profile.id.clone(), status);
+        }
+        // Directly paired runtimes have no profile store of their own, so the
+        // registry loop is what gives their Settings row a live status.
+        for runtime in &self.runtime_registry.runtimes {
+            if bound_runtime_ids.contains(runtime.id.as_str()) {
+                continue;
+            }
+            let status = if self.runtime_switch_pending.as_deref() == Some(runtime.id.as_str()) {
+                ConnectionRowStatus::Connecting
+            } else if self.runtime_registry.active_runtime_id() != runtime.id {
+                ConnectionRowStatus::Offline
+            } else {
+                match self
+                    .remote_client
+                    .as_ref()
+                    .filter(|client| client.runtime_id == runtime.id)
+                {
+                    Some(client) => match client.backend.connection_state().state {
+                        RemoteConnectionState::Online | RemoteConnectionState::Degraded => {
+                            ConnectionRowStatus::Connected
+                        }
+                        RemoteConnectionState::Reconnecting => ConnectionRowStatus::Connecting,
+                        RemoteConnectionState::Offline
+                        | RemoteConnectionState::Revoked
+                        | RemoteConnectionState::Incompatible => {
+                            ConnectionRowStatus::NeedsAttention
+                        }
+                        RemoteConnectionState::Idle
+                        | RemoteConnectionState::Resolving
+                        | RemoteConnectionState::Probing
+                        | RemoteConnectionState::Connecting
+                        | RemoteConnectionState::Authenticating
+                        | RemoteConnectionState::Syncing => ConnectionRowStatus::Connecting,
+                    },
+                    None => ConnectionRowStatus::Offline,
+                }
+            };
+            live.insert(runtime.id.clone(), status);
         }
         self.settings_view.update(cx, |settings, cx| {
             settings.connections_live_status = live;
@@ -17909,6 +18091,177 @@ impl VibexWorkbench {
             },
         ));
         cx.notify();
+    }
+
+    /// Claims a pairing link or code, registers the runtime, and connects it.
+    ///
+    /// The claim and the registry write run off the foreground executor
+    /// because both reach the network or the home directory. The Settings
+    /// dialog stays open while this runs: a rejected code or a bad address
+    /// belongs next to the field that produced it, and only a registered
+    /// runtime is worth closing the dialog for.
+    fn begin_pairing_entry_connect(
+        &mut self,
+        entry: String,
+        server_url: String,
+        cx: &mut Context<Self>,
+    ) {
+        if self.remote_pairing_pending {
+            self.report_pairing_entry_failure(
+                "remote_pairing_busy".to_string(),
+                locale::text(
+                    "A pairing is already in progress.",
+                    "已有配对正在进行中。",
+                    "已有配對正在進行中。",
+                )
+                .to_string(),
+                cx,
+            );
+            return;
+        }
+        if self.runtime_switch_pending.is_some() {
+            self.report_pairing_entry_failure(
+                "remote_pairing_busy".to_string(),
+                locale::text(
+                    "Another runtime is connecting. Try again in a moment.",
+                    "另一个运行时正在连接，请稍后再试。",
+                    "另一個執行階段正在連線，請稍後再試。",
+                )
+                .to_string(),
+                cx,
+            );
+            return;
+        }
+        let Some(home_dir) = self.config.as_ref().map(|config| config.home_dir.clone()) else {
+            self.report_pairing_entry_failure(
+                "desktop_home_unavailable".to_string(),
+                "the desktop home is unavailable".to_string(),
+                cx,
+            );
+            return;
+        };
+        self.remote_pairing_pending = true;
+        let link = pairing_entry_is_link(&entry);
+        let allow_insecure_local_dev = cfg!(debug_assertions);
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            let credential = if link {
+                claim_server_pairing_link(entry, allow_insecure_local_dev).await
+            } else {
+                claim_server_pairing_code(server_url, entry, allow_insecure_local_dev).await
+            }
+            .map_err(|error| (error.code, error.message))?;
+            credential
+                .validate()
+                .map_err(|error| (error.code, error.message))?;
+            let store = DesktopRuntimeRegistryStore::new(&home_dir);
+            let mut registry = store.load_or_migrate();
+            let runtime_id = registry.upsert(credential.clone(), unix_timestamp_ms());
+            store
+                .save(&registry)
+                .map_err(|error| (error.code, error.message))?;
+            Ok::<(String, DesktopRemoteCredential), (String, String)>((runtime_id, credential))
+        });
+        self.boot_task = Some(cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            let outcome = runner.await;
+            let _ = entity.update(cx, |this, cx| {
+                this.remote_pairing_pending = false;
+                match outcome {
+                    Ok(Ok((runtime_id, credential))) => {
+                        this.finish_pairing_entry_success(runtime_id, credential, cx)
+                    }
+                    Ok(Err((code, message))) => {
+                        this.report_pairing_entry_failure(code, message, cx)
+                    }
+                    Err(_) => this.report_pairing_entry_failure(
+                        "remote_pairing_task_failed".to_string(),
+                        "the pairing task stopped unexpectedly".to_string(),
+                        cx,
+                    ),
+                }
+                cx.notify();
+            });
+        }));
+        cx.notify();
+    }
+
+    /// Completes a successful pairing claim: the row appears in Settings, the
+    /// dialog closes, and the stored credential starts its handshake.
+    fn finish_pairing_entry_success(
+        &mut self,
+        runtime_id: String,
+        credential: DesktopRemoteCredential,
+        cx: &mut Context<Self>,
+    ) {
+        // The claim worker wrote the registry on another thread; this entity
+        // still holds the copy it read at boot, so reload before looking up
+        // the row.
+        if let Some(store) = self.runtime_registry_store.clone() {
+            self.runtime_registry = store.load_or_migrate();
+        }
+        if self.runtime_registry.remote(&runtime_id).is_none() {
+            self.runtime_registry
+                .upsert(credential, unix_timestamp_ms());
+            self.persist_runtime_registry(cx);
+        }
+        let dialog_open = self
+            .settings_view
+            .read_with(cx, |settings, _| settings.connections_pairing_open);
+        self.settings_view.update(cx, |settings, cx| {
+            settings.connections_pairing_busy = false;
+            settings.connections_pairing_error = None;
+            settings.connections_pairing_open = false;
+            settings.reload_connections_profiles();
+            cx.notify();
+        });
+        if dialog_open && let Some(window) = self.window_handle {
+            let _ = window.update(cx, |_, window, cx| {
+                window.close_dialog(cx);
+            });
+        }
+        let Some(runtime) = self.runtime_registry.remote(&runtime_id).cloned() else {
+            return;
+        };
+        let label = runtime.display_label();
+        self.queue_settings_operation_notice(
+            SettingsOperationNotice::success(format!(
+                "{} {label}",
+                locale::text("Paired", "已配对", "已配對")
+            )),
+            cx,
+        );
+        self.begin_remote_connect(runtime, RuntimeConnectOrigin::Switch, cx);
+    }
+
+    /// Puts a failed pairing into the open dialog, where the reader can fix
+    /// the value they typed. The raw transport code stays alongside an
+    /// actionable sentence so an unmapped failure is still diagnosable.
+    fn report_pairing_entry_failure(
+        &mut self,
+        code: String,
+        message: String,
+        cx: &mut Context<Self>,
+    ) {
+        let display = pairing_entry_error_copy(&code)
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("{code}: {message}"));
+        self.settings_view.update(cx, |settings, cx| {
+            settings.connections_pairing_busy = false;
+            settings.connections_pairing_error = Some(display);
+            cx.notify();
+        });
+    }
+
+    /// Reconnects a runtime that was paired directly, without a profile to
+    /// rebuild a tunnel from.
+    fn connect_paired_runtime(&mut self, runtime_id: String, cx: &mut Context<Self>) {
+        if self.runtime_switch_pending.is_some() {
+            return;
+        }
+        let Some(runtime) = self.runtime_registry.remote(&runtime_id).cloned() else {
+            return;
+        };
+        self.runtime_connect_errors.remove(&runtime_id);
+        self.begin_remote_connect(runtime, RuntimeConnectOrigin::Switch, cx);
     }
 
     /// Connects to a registered remote runtime and installs it once the
@@ -85210,6 +85563,9 @@ struct SshLogView {
 enum ConnectionTransport {
     Ssh,
     Wsl,
+    /// A runtime paired directly from a pairing link or a pairing code. It has
+    /// no SSH or WSL profile: the registry entry is the whole connection.
+    Direct,
 }
 
 #[derive(Debug, Clone)]
@@ -86356,17 +86712,23 @@ fn settings_search_candidates(strings: &'static Strings) -> Vec<SettingsSearchCa
             SettingsSection::Connections,
             locale::text("Remote instances", "远程实例", "遠端執行個體"),
             locale::text(
-                "Connect Vibex to a runtime on another machine over SSH.",
-                "通过 SSH 把 Vibex 连接到另一台机器上的运行时。",
-                "透過 SSH 把 Vibex 連線到另一台機器上的執行階段。",
+                "Connect with a pairing link, reach a runtime over SSH, or start one in WSL2.",
+                "使用配对链接连接，通过 SSH 连接远程运行时，或在 WSL2 中启动运行时。",
+                "使用配對連結連線，透過 SSH 連線遠端執行階段，或在 WSL2 中啟動執行階段。",
             ),
             &[
                 "ssh",
+                "pairing",
+                "pairing link",
+                "wsl",
+                "port",
                 "connection",
                 "remote",
                 "instance",
                 "host",
                 "server",
+                "配对",
+                "配對",
                 "连接",
                 "連線",
                 "远程",
@@ -86681,6 +87043,71 @@ fn ssh_profile_edit_fields(
             local_port.clone(),
         ))
         .into_any_element()
+}
+
+/// Parses the runtime port typed in the WSL add dialog.
+///
+/// The server binds inside the distro as the logged-in user, so the useful
+/// range is the unprivileged one. A value outside it fails here, with the same
+/// sentence the dialog shows, rather than surfacing later as a permission or
+/// launch error from inside WSL.
+fn parse_wsl_runtime_port(value: &str) -> Result<u16, String> {
+    let port = value.trim().parse::<u16>().map_err(|_| {
+        locale::text(
+            "Enter a port number between 1024 and 65535.",
+            "请输入 1024 到 65535 之间的端口号。",
+            "請輸入 1024 到 65535 之間的連接埠號。",
+        )
+        .to_string()
+    })?;
+    if !(1024..=65535).contains(&port) {
+        return Err(locale::text(
+            "Enter a port number between 1024 and 65535.",
+            "请输入 1024 到 65535 之间的端口号。",
+            "請輸入 1024 到 65535 之間的連接埠號。",
+        )
+        .to_string());
+    }
+    Ok(port)
+}
+
+/// True when the pairing entry carries its own address, so the separate server
+/// field is unnecessary.
+///
+/// Only the headless runtime's `vibex://pair#/code/<payload>` connection string
+/// is accepted here. A phone-pairing offer (`#/pair/`) is a different claim
+/// endpoint and belongs to the mobile client, not to this runtime registry.
+fn pairing_entry_is_link(value: &str) -> bool {
+    let value = value.trim();
+    value.starts_with("vibex://") || value.contains("#/code/")
+}
+
+/// Recovery copy for pairing failures a reader can act on.
+///
+/// The raw transport sentence describes the protocol, so it stays in the
+/// diagnostic path; the dialog shows what to do next instead.
+fn pairing_entry_error_copy(code: &str) -> Option<&'static str> {
+    match code {
+        "remote_pairing_code_invalid" | "remote_pairing_code_expired" => Some(locale::text(
+            "That pairing code is wrong or has expired. Print a new one on the runtime.",
+            "配对码不正确或已过期，请在运行时上重新生成。",
+            "配對碼不正確或已過期，請在執行階段上重新產生。",
+        )),
+        "remote_pairing_link_invalid"
+        | "remote_pairing_entry_invalid"
+        | "remote_pairing_entry_untrusted"
+        | "remote_pairing_fragment_invalid" => Some(locale::text(
+            "That is not a Vibex pairing entry. Paste the whole line that starts with vibex://",
+            "无法识别这段内容，请粘贴以 vibex:// 开头的完整一行。",
+            "無法辨識這段內容，請貼上以 vibex:// 開頭的完整一行。",
+        )),
+        "remote_secure_context_required" | "remote_url_invalid" => Some(locale::text(
+            "The server address must be an HTTPS URL, or HTTP on this machine in a debug build.",
+            "服务器地址必须是 HTTPS；调试版本中允许本机 HTTP。",
+            "伺服器位址必須是 HTTPS；偵錯版本中允許本機 HTTP。",
+        )),
+        _ => None,
+    }
 }
 
 fn connection_diagnostic_title(
@@ -87686,6 +88113,9 @@ struct FoundationSettings {
     connections_profiles: Vec<SshConnectionProfile>,
     /// Saved WSL connections, loaded from their own store beside the SSH list.
     connections_wsl_profiles: Vec<WslConnectionProfile>,
+    /// Registry runtimes paired directly from a link or code. They have no
+    /// SSH/WSL profile, so the page renders them from the registry itself.
+    connections_direct_runtimes: Vec<RegisteredRuntime>,
     /// The active provisioning snapshot/error mirrored from the workbench.
     connections_snapshot: Option<ProvisioningSnapshot>,
     connections_error: Option<String>,
@@ -87748,6 +88178,28 @@ struct FoundationSettings {
     /// The last read failed, with the child's own message. The dialog keeps it
     /// on screen; the hint layer carries the same text.
     connections_wsl_error: Option<String>,
+    /// The runtime port the add dialog will install on. WSL binds on the same
+    /// loopback port on both sides, so a port used inside the distro (or a
+    /// forwarding conflict on Windows) has to be changeable before the
+    /// deployment starts.
+    connections_wsl_port_input: Entity<InputState>,
+    /// A port preflight is running; the dialog says so and blocks a second
+    /// submit.
+    connections_wsl_checking: bool,
+    /// Why the preflight rejected the chosen port, kept in the dialog so the
+    /// reader can edit the port and retry without reopening anything.
+    connections_wsl_check_error: Option<String>,
+    /// Which preflight the dialog is waiting for. Closing the dialog or
+    /// starting a new check bumps this, so an older `wsl.exe` answer cannot
+    /// start a deployment for a dialog that has already moved on.
+    connections_wsl_check_generation: u64,
+    /// A pairing link or code is being claimed. The claim is the slow half of
+    /// adding a direct runtime, so the dialog owns its own busy state.
+    connections_pairing_open: bool,
+    connections_pairing_busy: bool,
+    connections_pairing_error: Option<String>,
+    connections_pairing_entry_input: Entity<InputState>,
+    connections_pairing_server_input: Entity<InputState>,
     /// Whether the Bootstrap SSH panel is showing. The command is generated
     /// only after the user names the Linux account it authorizes.
     bootstrap_open: bool,
@@ -87928,6 +88380,26 @@ impl FoundationSettings {
                 .placeholder(DEFAULT_NETWORK_PROXY_BYPASS)
         });
         let bootstrap_user_input = cx.new(|cx| InputState::new(window, cx).placeholder("ubuntu"));
+        let connections_wsl_port_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value("8765")
+                .placeholder("8765")
+                .submit_on_enter(true)
+        });
+        let connections_pairing_entry_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(locale::text(
+                    "vibex://pair#/code/… or 123-456-789",
+                    "vibex://pair#/code/… 或 123-456-789",
+                    "vibex://pair#/code/… 或 123-456-789",
+                ))
+                .submit_on_enter(true)
+        });
+        let connections_pairing_server_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("https://192.168.1.10:8765")
+                .submit_on_enter(true)
+        });
         let search = cx.new(|cx| {
             InputState::new(window, cx).placeholder(locale::text(
                 "Search settings",
@@ -87946,6 +88418,22 @@ impl FoundationSettings {
                         cx.notify();
                     }
                     InputEvent::PressEnter { .. } | InputEvent::Focus | InputEvent::Blur => {}
+                },
+            )
+            .detach();
+            // The pairing dialog decides whether to show the address field
+            // from the text in the entry field. Notify Settings on every change
+            // so the dialog's next frame reflects the new shape instead of
+            // waiting for an unrelated repaint.
+            cx.subscribe(
+                &connections_pairing_entry_input,
+                |this: &mut FoundationSettings, _, event: &InputEvent, cx| {
+                    if matches!(event, InputEvent::Change) {
+                        if !this.connections_pairing_busy {
+                            this.connections_pairing_error = None;
+                        }
+                        cx.notify();
+                    }
                 },
             )
             .detach();
@@ -88210,6 +88698,7 @@ impl FoundationSettings {
                 shortcut_note: None,
                 connections_profiles: Vec::new(),
                 connections_wsl_profiles: Vec::new(),
+                connections_direct_runtimes: Vec::new(),
                 connections_snapshot: None,
                 connections_error: None,
                 connections_live_status: BTreeMap::new(),
@@ -88234,6 +88723,15 @@ impl FoundationSettings {
                 connections_wsl_generation: 0,
                 connections_wsl_loading: false,
                 connections_wsl_error: None,
+                connections_wsl_port_input,
+                connections_wsl_checking: false,
+                connections_wsl_check_error: None,
+                connections_wsl_check_generation: 0,
+                connections_pairing_open: false,
+                connections_pairing_busy: false,
+                connections_pairing_error: None,
+                connections_pairing_entry_input,
+                connections_pairing_server_input,
                 bootstrap_open: false,
                 bootstrap_user_input,
                 bootstrap_command: None,
@@ -91726,6 +92224,19 @@ impl FoundationSettings {
             .map(WslProfileStore::at_home)
             .and_then(|store| store.load().ok())
             .unwrap_or_default();
+        // A runtime paired from a link or code has no profile of its own; the
+        // registry is the only record that it exists. The workbench reloads
+        // this after a pairing or a removal, so the list follows the action
+        // that produced it instead of waiting for the page to be reopened.
+        self.connections_direct_runtimes = self
+            .home_dir
+            .as_deref()
+            .map(|home| {
+                DesktopRuntimeRegistryStore::new(home)
+                    .load_or_migrate()
+                    .runtimes
+            })
+            .unwrap_or_default();
     }
 
     fn load_connections_discovery(&mut self, cx: &mut Context<Self>) {
@@ -92249,18 +92760,6 @@ impl FoundationSettings {
         cx.notify();
     }
 
-    fn connect_wsl_distro(&self, cx: &mut Context<Self>) {
-        let Some(distro) = self.connections_wsl_selected.clone() else {
-            return;
-        };
-        let workbench = self.workbench.clone();
-        cx.defer(move |cx| {
-            let _ = workbench.update(cx, |workbench, cx| {
-                workbench.provision_wsl_distro(distro.clone(), cx)
-            });
-        });
-    }
-
     /// Opens the add-SSH-connection dialog and starts host discovery.
     ///
     /// The list lives in the dialog rather than on the settings page: adding a
@@ -92586,18 +93085,32 @@ impl FoundationSettings {
     /// Opens the WSL distro dialog. The distro list is read once, when the
     /// dialog opens, because `wsl.exe` is a process call rather than a value.
     fn open_connections_wsl_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Every open starts from the documented default. The field keeps what
+        // the reader typed only while this dialog is on screen, so a port
+        // rejected by the preflight stays there for the correction.
+        self.connections_wsl_port_input.update(cx, |input, cx| {
+            input.set_value("8765", window, cx);
+        });
+        self.connections_wsl_checking = false;
+        self.connections_wsl_check_error = None;
+        self.connections_wsl_check_generation =
+            self.connections_wsl_check_generation.wrapping_add(1);
         self.load_wsl_distros(cx);
         let entity = cx.weak_entity();
+        let port_input = self.connections_wsl_port_input.clone();
         window.open_dialog(cx, move |dialog, _, cx| {
             let entity = entity.clone();
             let entity_for_footer = entity.clone();
-            let (distros, selected, loading, error) = entity
+            let entity_for_close = entity_for_footer.clone();
+            let (distros, selected, loading, error, checking, check_error) = entity
                 .update(cx, |this, _| {
                     (
                         this.connections_wsl_distros.clone(),
                         this.connections_wsl_selected.clone(),
                         this.connections_wsl_loading,
                         this.connections_wsl_error.clone(),
+                        this.connections_wsl_checking,
+                        this.connections_wsl_check_error.clone(),
                     )
                 })
                 .unwrap_or_default();
@@ -92613,7 +93126,7 @@ impl FoundationSettings {
                         "WSL2 在本機執行 Linux，不需要 sshd 或 SSH 金鑰。",
                     )),
             );
-            if let Some(error) = error {
+            if let Some(error) = error.as_ref() {
                 // The read failed and this dialog is what stays on screen. The
                 // hint layer carries the same text; the body repeats it because
                 // a hint is dismissed by a click, and a reader who looks down
@@ -92634,7 +93147,7 @@ impl FoundationSettings {
                                 .min_w_0()
                                 .text_xs()
                                 .whitespace_normal()
-                                .child(error),
+                                .child(error.clone()),
                         )
                         .child(
                             Button::new("connections-wsl-retry")
@@ -92688,6 +93201,7 @@ impl FoundationSettings {
                     let chosen = selected.as_deref() == Some(distro.as_str());
                     let row_entity = entity.clone();
                     let value = distro.clone();
+                    let row_checking = checking;
                     list = list.child(
                         h_flex()
                             .id(SharedString::from(format!("connections-wsl-{distro}")))
@@ -92702,6 +93216,12 @@ impl FoundationSettings {
                             .when(chosen, |this| this.bg(cx.theme().primary.opacity(0.14)))
                             .hover(|this| this.bg(cx.theme().muted.opacity(0.5)))
                             .on_click(move |_, _, cx| {
+                                // A check is already bound to the selection it
+                                // started with; switching distros mid-check
+                                // would deploy the previous one.
+                                if row_checking {
+                                    return;
+                                }
                                 let _ = row_entity.update(cx, |this, cx| {
                                     this.connections_wsl_selected = Some(value.clone());
                                     cx.notify();
@@ -92714,6 +93234,49 @@ impl FoundationSettings {
                     );
                 }
                 body = body.child(list);
+            }
+            // The port is chosen after the distro, because it only means
+            // something inside one. It stays editable after a rejected
+            // preflight so a busy 8765 costs one correction, not a reopened
+            // dialog.
+            if error.is_none() && !loading && !distros.is_empty() {
+                body = body.child(
+                    v_flex()
+                        .w_full()
+                        .min_w_0()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(locale::text(
+                                    "Runtime port",
+                                    "运行时端口",
+                                    "執行階段連接埠",
+                                )),
+                        )
+                        .child(Input::new(&port_input).small())
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .whitespace_normal()
+                                .child(locale::text(
+                                    "The runtime binds this port inside the distro. Change it when 8765 is already taken.",
+                                    "运行时会在发行版内绑定此端口。如果 8765 已被占用，请修改。",
+                                    "執行階段會在發行版內綁定此連接埠。若 8765 已被占用，請修改。",
+                                )),
+                        )
+                        .when_some(check_error, |this, error| {
+                            this.child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().danger)
+                                    .whitespace_normal()
+                                    .child(error),
+                            )
+                        }),
+                );
             }
             dialog
                 .title(locale::text(
@@ -92736,13 +93299,389 @@ impl FoundationSettings {
                             DialogAction::new().child(
                                 Button::new("connections-wsl-connect")
                                     .primary()
-                                    .label(locale::text("Connect WSL", "连接 WSL", "連線 WSL"))
-                                    .disabled(selected.is_none()),
+                                    .label(if checking {
+                                        locale::text(
+                                            "Checking port…",
+                                            "正在检查端口…",
+                                            "正在檢查連接埠…",
+                                        )
+                                    } else {
+                                        locale::text("Connect WSL", "连接 WSL", "連線 WSL")
+                                    })
+                                    .disabled(selected.is_none() || checking),
                             ),
                         ),
                 )
                 .on_ok(move |_, _, cx| {
-                    let _ = entity_for_footer.update(cx, |this, cx| this.connect_wsl_distro(cx));
+                    let _ = entity_for_footer
+                        .update(cx, |this, cx| this.start_wsl_connection(cx));
+                    // The dialog stays mounted while the port is checked. On
+                    // success the workbench closes it and opens the progress
+                    // dialog; on a busy port the same dialog shows the reason.
+                    false
+                })
+                .on_close({
+                    let close = entity_for_close;
+                    move |_, _, cx| {
+                        let _ = close.update(cx, |this, cx| {
+                            this.connections_wsl_open = false;
+                            this.connections_wsl_checking = false;
+                            this.connections_wsl_check_generation =
+                                this.connections_wsl_check_generation.wrapping_add(1);
+                            cx.notify();
+                        });
+                    }
+                })
+        });
+    }
+
+    /// Validates the port field and asks the workbench to check it before the
+    /// deployment starts.
+    ///
+    /// The range check is local and immediate; whether the port is free is a
+    /// fact inside the distro, so that half runs `wsl.exe` off the UI thread.
+    /// The dialog stays open either way until the answer arrives.
+    fn start_wsl_connection(&mut self, cx: &mut Context<Self>) {
+        if self.connections_wsl_checking {
+            return;
+        }
+        let Some(distro) = self.connections_wsl_selected.clone() else {
+            return;
+        };
+        let raw_port = self
+            .connections_wsl_port_input
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        let port = match parse_wsl_runtime_port(&raw_port) {
+            Ok(port) => port,
+            Err(error) => {
+                self.connections_wsl_check_error = Some(error);
+                cx.notify();
+                return;
+            }
+        };
+        self.connections_wsl_checking = true;
+        self.connections_wsl_check_error = None;
+        self.connections_wsl_check_generation =
+            self.connections_wsl_check_generation.wrapping_add(1);
+        let generation = self.connections_wsl_check_generation;
+        let workbench = self.workbench.clone();
+        let _ = workbench.update(cx, |workbench, cx| {
+            workbench.check_wsl_runtime_port(distro, port, generation, cx)
+        });
+        cx.notify();
+    }
+
+    /// Opens the one-field pairing entry: a `vibex://` link, or the runtime's
+    /// address plus the numeric code it printed.
+    ///
+    /// One field carries both shapes because they are unambiguous, and the
+    /// address field only appears for a bare code. A link already carries its
+    /// address and, for a self-signed runtime, the certificate to pin, so
+    /// asking which shape the reader holds would be asking them to read the
+    /// protocol.
+    fn open_connections_pairing_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.connections_pairing_open = true;
+        self.connections_pairing_busy = false;
+        self.connections_pairing_error = None;
+        self.connections_pairing_entry_input
+            .update(cx, |input, cx| {
+                input.set_value("", window, cx);
+                input.focus(window, cx);
+            });
+        self.connections_pairing_server_input
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        let entity = cx.weak_entity();
+        let entry_input = self.connections_pairing_entry_input.clone();
+        let server_input = self.connections_pairing_server_input.clone();
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let entity = entity.clone();
+            let entity_for_footer = entity.clone();
+            let entity_for_close = entity_for_footer.clone();
+            let (busy, error, entry) = entity
+                .read_with(cx, |this, _| {
+                    (
+                        this.connections_pairing_busy,
+                        this.connections_pairing_error.clone(),
+                        this.connections_pairing_entry_input
+                            .read(cx)
+                            .value()
+                            .to_string(),
+                    )
+                })
+                .unwrap_or_default();
+            let link = pairing_entry_is_link(&entry);
+            let mut body = v_flex()
+                .w_full()
+                .min_w_0()
+                .gap_2()
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .whitespace_normal()
+                        .child(locale::text(
+                            "Paste the pairing link printed by vibex-server, or enter the runtime's address and its one-time pairing code. No SSH setup is needed.",
+                            "粘贴 vibex-server 输出的配对链接，或填写运行时地址和一次性配对码。无需配置 SSH。",
+                            "貼上 vibex-server 輸出的配對連結，或填寫執行階段位址和一次性配對碼。無需設定 SSH。",
+                        )),
+                )
+                .child(
+                    v_flex()
+                        .w_full()
+                        .min_w_0()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(locale::text(
+                                    "Pairing link or code",
+                                    "配对链接或配对码",
+                                    "配對連結或配對碼",
+                                )),
+                        )
+                        .child(Input::new(&entry_input).small()),
+                );
+            if link {
+                body = body.child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .whitespace_normal()
+                        .child(locale::text(
+                            "The link already contains the server address and its certificate.",
+                            "链接中已经包含服务器地址和证书。",
+                            "連結中已經包含伺服器位址和憑證。",
+                        )),
+                );
+            } else {
+                body = body.child(
+                    v_flex()
+                        .w_full()
+                        .min_w_0()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(locale::text(
+                                    "Server address",
+                                    "服务器地址",
+                                    "伺服器位址",
+                                )),
+                        )
+                        .child(Input::new(&server_input).small())
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .whitespace_normal()
+                                .child(locale::text(
+                                    "Required with a bare code, for example https://192.168.1.10:8765.",
+                                    "使用配对码时必填，例如 https://192.168.1.10:8765。",
+                                    "使用配對碼時必填，例如 https://192.168.1.10:8765。",
+                                )),
+                        ),
+                );
+            }
+            if let Some(error) = error {
+                body = body.child(
+                    div()
+                        .w_full()
+                        .min_w_0()
+                        .text_xs()
+                        .text_color(cx.theme().danger)
+                        .whitespace_normal()
+                        .child(error),
+                );
+            }
+            dialog
+                .title(locale::text(
+                    "Connect with pairing link",
+                    "使用配对链接连接",
+                    "使用配對連結連線",
+                ))
+                .w(px(560.0))
+                .child(body)
+                .footer(
+                    DialogFooter::new()
+                        .child(
+                            DialogClose::new().child(
+                                Button::new("connections-pairing-cancel")
+                                    .outline()
+                                    .label(locale::text("Cancel", "取消", "取消")),
+                            ),
+                        )
+                        .child(
+                            DialogAction::new().child(
+                                Button::new("connections-pairing-connect")
+                                    .primary()
+                                    .label(if busy {
+                                        locale::text(
+                                            "Connecting…",
+                                            "正在连接…",
+                                            "正在連線…",
+                                        )
+                                    } else {
+                                        locale::text("Connect", "连接", "連線")
+                                    })
+                                    .disabled(busy),
+                            ),
+                        ),
+                )
+                .on_ok(move |_, _, cx| {
+                    let _ = entity_for_footer
+                        .update(cx, |this, cx| this.submit_pairing_entry(cx));
+                    // The claim keeps the dialog open: a rejected code or URL
+                    // is corrected here, and the workbench closes the dialog
+                    // itself once the runtime is registered and connecting.
+                    false
+                })
+                .on_close({
+                    let close = entity_for_close;
+                    move |_, _, cx| {
+                        let _ = close.update(cx, |this, cx| {
+                            this.connections_pairing_open = false;
+                            this.connections_pairing_busy = false;
+                            cx.notify();
+                        });
+                    }
+                })
+        });
+    }
+
+    /// Validates the pairing fields locally and hands the claim to the
+    /// workbench, which owns the registry and the client.
+    fn submit_pairing_entry(&mut self, cx: &mut Context<Self>) {
+        if self.connections_pairing_busy {
+            return;
+        }
+        let entry = self
+            .connections_pairing_entry_input
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        if entry.is_empty() {
+            self.connections_pairing_error = Some(
+                locale::text(
+                    "Paste the pairing link or code from the runtime.",
+                    "请粘贴运行时给出的配对链接或配对码。",
+                    "請貼上執行階段提供的配對連結或配對碼。",
+                )
+                .to_string(),
+            );
+            cx.notify();
+            return;
+        }
+        let server_url = self
+            .connections_pairing_server_input
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        if !pairing_entry_is_link(&entry) {
+            if server_url.is_empty() {
+                self.connections_pairing_error = Some(
+                    locale::text(
+                        "Enter the server address as well as the pairing code.",
+                        "请同时填写服务器地址和配对码。",
+                        "請同時填寫伺服器位址和配對碼。",
+                    )
+                    .to_string(),
+                );
+                cx.notify();
+                return;
+            }
+            if !(server_url.starts_with("http://") || server_url.starts_with("https://")) {
+                self.connections_pairing_error = Some(
+                    locale::text(
+                        "The server address must start with http:// or https://.",
+                        "服务器地址必须以 http:// 或 https:// 开头。",
+                        "伺服器位址必須以 http:// 或 https:// 開頭。",
+                    )
+                    .to_string(),
+                );
+                cx.notify();
+                return;
+            }
+        }
+        self.connections_pairing_busy = true;
+        self.connections_pairing_error = None;
+        let workbench = self.workbench.clone();
+        let _ = workbench.update(cx, |workbench, cx| {
+            workbench.begin_pairing_entry_connect(entry, server_url, cx)
+        });
+        cx.notify();
+    }
+
+    /// Asks before removing a runtime that was paired directly from a link.
+    ///
+    /// Unlike an SSH or WSL profile there is nothing left behind on a host:
+    /// the registry entry is the entire connection, so removing it only drops
+    /// this machine's grant.
+    fn confirm_remove_paired_runtime(
+        &mut self,
+        runtime_id: String,
+        runtime_name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let entity = cx.weak_entity();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let entity = entity.clone();
+            let runtime_id = runtime_id.clone();
+            let runtime_name = runtime_name.clone();
+            let title = locale::text(
+                "Remove this paired runtime?",
+                "移除此已配对运行时？",
+                "移除此已配對執行階段？",
+            );
+            let description = match locale::current_locale() {
+                locale::ResolvedLocale::ZhCn => format!(
+                    "“{runtime_name}”会从此电脑的运行时列表中移除，保存的配对凭据也会删除。远端运行时和工作区文件不受影响。"
+                ),
+                locale::ResolvedLocale::ZhTw => format!(
+                    "「{runtime_name}」會從此電腦的執行階段清單中移除，儲存的配對憑證也會刪除。遠端執行階段與工作區檔案不受影響。"
+                ),
+                locale::ResolvedLocale::En => format!(
+                    "The pairing for \u{201c}{runtime_name}\u{201d} is removed from this computer. The remote runtime and workspace files are left alone."
+                ),
+                locale => vibex_ui::locale_copy::fill(
+                    locale.shared(),
+                    "The pairing for \u{201c}{runtime_name}\u{201d} is removed from this computer. The remote runtime and workspace files are left alone.",
+                    &[("runtime_name", runtime_name.clone())],
+                ),
+            };
+            dialog
+                .title(title)
+                .child(div().whitespace_normal().child(description))
+                .footer(
+                    DialogFooter::new()
+                        .child(DialogClose::new().child(
+                            Button::new("connections-pairing-remove-cancel")
+                                .outline()
+                                .label(locale::text("Cancel", "取消", "取消")),
+                        ))
+                        .child(DialogAction::new().child(
+                            Button::new("connections-pairing-remove-confirm")
+                                .danger()
+                                .label(locale::text("Remove", "移除", "移除")),
+                        )),
+                )
+                .on_ok(move |_, _, cx| {
+                    let runtime_id = runtime_id.clone();
+                    let workbench = entity
+                        .read_with(cx, |this, _| this.workbench.clone())
+                        .ok();
+                    if let Some(workbench) = workbench {
+                        let _ = workbench.update(cx, |workbench, cx| {
+                            workbench.remove_runtime(runtime_id.clone(), cx)
+                        });
+                    }
                     true
                 })
         });
@@ -93013,6 +93952,7 @@ impl FoundationSettings {
             {
                 let retry_settings = settings;
                 let distro = snapshot.distro.clone();
+                let port = snapshot.port;
                 footer = footer.child(
                     Button::new("connections-wsl-progress-retry")
                         .primary()
@@ -93024,7 +93964,7 @@ impl FoundationSettings {
                                 let distro = distro.clone();
                                 cx.defer(move |cx| {
                                     let _ = workbench.update(cx, |workbench, cx| {
-                                        workbench.provision_wsl_distro(distro, cx)
+                                        workbench.provision_wsl_distro(distro, port, cx)
                                     });
                                 });
                             });
@@ -93094,7 +94034,7 @@ impl FoundationSettings {
                             .truncate()
                             .text_sm()
                             .font_medium()
-                            .child(format!("WSL · {}", snapshot.distro)),
+                            .child(format!("WSL · {} · :{}", snapshot.distro, snapshot.port)),
                     )
                     .child(
                         div()
@@ -93480,11 +94420,23 @@ impl FoundationSettings {
     }
 
     fn render_connections_page(&self, stacked: bool, cx: &mut Context<Self>) -> AnyElement {
-        // The three add flows are dialogs over the page, not sections inside
+        // The four add flows are dialogs over the page, not sections inside
         // it. A page that grew a section whenever a button was pressed pushed
         // its own list down the viewport and read as a different page; a
         // dialog keeps the list where the reader left it and dismisses back to
         // the same scroll position.
+        let pairing_button = Button::new("connections-pair")
+            .small()
+            .outline()
+            .icon(IconName::Globe)
+            .label(locale::text(
+                "Connect with pairing link",
+                "使用配对链接连接",
+                "使用配對連結連線",
+            ))
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.open_connections_pairing_dialog(window, cx);
+            }));
         let add_button = Button::new("connections-add")
             .small()
             .outline()
@@ -93581,10 +94533,10 @@ impl FoundationSettings {
                 locale::text("WSL runtime setup", "WSL 运行时配置", "WSL 執行階段設定"),
                 vec![setting_row(
                     locale::text("WSL runtime", "WSL 运行时", "WSL 執行階段"),
-                    div()
-                        .text_xs()
-                        .whitespace_normal()
-                        .child(format!("WSL · {} · {summary}", snapshot.distro)),
+                    div().text_xs().whitespace_normal().child(format!(
+                        "WSL · {} · :{} · {summary}",
+                        snapshot.distro, snapshot.port
+                    )),
                     Button::new("connections-wsl-progress-open")
                         .small()
                         .outline()
@@ -93612,9 +94564,11 @@ impl FoundationSettings {
             .items_center()
             .justify_end()
             .gap_2()
+            .flex_wrap()
             .child(bootstrap_button)
             .child(wsl_button)
             .child(add_button)
+            .child(pairing_button)
             .into_any_element();
         // A failure that outlives its dialog is a light hint, not a strip on the
         // page: Settings is itself a dialog, so a notice painted here competes
@@ -93630,9 +94584,9 @@ impl FoundationSettings {
         settings_page(
             locale::text("Remote instances", "远程实例", "遠端執行個體"),
             locale::text(
-                "Connect Vibex to a runtime on another machine over SSH, or start one inside a local WSL2 distro.",
-                "通过 SSH 把 Vibex 连接到另一台机器上的运行时，或在本机 WSL2 发行版中启动一个运行时。",
-                "透過 SSH 把 Vibex 連線到另一台機器上的執行階段，或在本機 WSL2 發行版中啟動一個執行階段。",
+                "Connect with a pairing link, reach a runtime over SSH, or start one inside a local WSL2 distro.",
+                "使用配对链接连接，或通过 SSH 连接到另一台机器上的运行时，也可以在本机 WSL2 发行版中启动一个运行时。",
+                "使用配對連結連線，或透過 SSH 連線到另一台機器上的執行階段，也可以在本機 WSL2 發行版中啟動一個執行階段。",
             ),
             groups,
             cx,
@@ -93676,14 +94630,30 @@ impl FoundationSettings {
                     .text_xs()
                     .text_color(muted)
                     .child(locale::text(
-                        "Add a host to install, start, and pair a runtime over SSH, or start one inside a local WSL2 distro.",
-                        "添加主机后，Vibex 会通过 SSH 安装、启动并配对运行时；也可以在本机 WSL2 发行版中启动一个。",
-                        "新增主機後，Vibex 會透過 SSH 安裝、啟動並配對執行階段；也可以在本機 WSL2 發行版中啟動一個。",
+                        "Paste a pairing link, add a host to install and pair a runtime over SSH, or start one inside a local WSL2 distro.",
+                        "粘贴配对链接，或添加主机以通过 SSH 安装并配对运行时；也可以在本机 WSL2 发行版中启动一个。",
+                        "貼上配對連結，或新增主機以透過 SSH 安裝並配對執行階段；也可以在本機 WSL2 發行版中啟動一個。",
                     )),
             )
             .child(
                 h_flex()
                     .gap_2()
+                    .flex_wrap()
+                    .justify_center()
+                    .child(
+                        Button::new("connections-empty-pair")
+                            .small()
+                            .outline()
+                            .icon(IconName::Globe)
+                            .label(locale::text(
+                                "Connect with pairing link",
+                                "使用配对链接连接",
+                                "使用配對連結連線",
+                            ))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_connections_pairing_dialog(window, cx);
+                            })),
+                    )
                     .child(add)
                     .child(
                         Button::new("connections-empty-add-wsl")
@@ -93741,6 +94711,44 @@ impl FoundationSettings {
                     }),
             }
         }));
+        // A direct pairing produces a registry entry without an SSH or WSL
+        // profile, so without this branch the runtime the reader just paired
+        // would be missing from the very page that paired it. A runtime a
+        // profile already owns is skipped: its row is the profile row, which
+        // carries the transport-specific actions.
+        let bound_runtime_ids = self
+            .connections_profiles
+            .iter()
+            .filter_map(|profile| profile.registered_runtime_id.as_deref())
+            .chain(
+                self.connections_wsl_profiles
+                    .iter()
+                    .filter_map(|profile| profile.registered_runtime_id.as_deref()),
+            )
+            .collect::<std::collections::BTreeSet<_>>();
+        rows.extend(
+            self.connections_direct_runtimes
+                .iter()
+                .filter(|runtime| !bound_runtime_ids.contains(runtime.id.as_str()))
+                .map(|runtime| ConnectionDisplayRow {
+                    id: runtime.id.clone(),
+                    name: runtime.display_label(),
+                    alias: String::new(),
+                    user: String::new(),
+                    host: runtime.credential.record.server_url.clone(),
+                    // The address carries its own port. `connection_detail`
+                    // renders a direct row from the URL, not from this field.
+                    port: 0,
+                    version: None,
+                    status: self
+                        .connections_live_status
+                        .get(runtime.id.as_str())
+                        .copied()
+                        .unwrap_or(ConnectionRowStatus::Offline),
+                    transport: ConnectionTransport::Direct,
+                    wsl_provisioning: false,
+                }),
+        );
         rows
     }
 
@@ -93971,6 +94979,9 @@ impl FoundationSettings {
             .text_color(muted)
             .child(match row.transport {
                 ConnectionTransport::Wsl => locale::text("WSL2", "WSL2", "WSL2").to_string(),
+                ConnectionTransport::Direct => {
+                    locale::text("Pairing link", "配对链接", "配對連結").to_string()
+                }
                 ConnectionTransport::Ssh => match row.version.as_deref() {
                     Some(version) => format!("v{version}"),
                     None => locale::text("Not installed", "未安装", "未安裝").to_string(),
@@ -93991,6 +95002,12 @@ impl FoundationSettings {
         .outline()
         .label(primary_label)
         .tooltip(Self::connection_primary_hint(row))
+        // A direct runtime has no cancellable provisioning run; while its
+        // handshake is in flight the only honest action is to wait.
+        .disabled(
+            row.transport == ConnectionTransport::Direct
+                && row.status == ConnectionRowStatus::Connecting,
+        )
         .on_click(move |_, window, cx| {
             let profile_id = primary_id.clone();
             let _ = primary_settings.update(cx, |this, cx| {
@@ -94001,6 +95018,8 @@ impl FoundationSettings {
         let remove_name = row.name.clone();
         let remove_settings = settings.clone();
         let wsl_menu = row.transport == ConnectionTransport::Wsl;
+        let direct_menu = row.transport == ConnectionTransport::Direct;
+        let direct_in_flight = direct_menu && row.status == ConnectionRowStatus::Connecting;
         let wsl_in_flight = row.wsl_provisioning;
         let menu = Button::new(SharedString::from(format!("connections-{}-menu", row.id)))
             .small()
@@ -94014,6 +95033,40 @@ impl FoundationSettings {
                 let remove_id = remove_id.clone();
                 let remove_name = remove_name.clone();
                 let remove_settings = remove_settings.clone();
+                if direct_menu {
+                    let reconnect_id = remove_id.clone();
+                    let reconnect_settings = remove_settings.clone();
+                    let menu = menu.item(
+                        PopupMenuItem::new(locale::text("Reconnect", "重新连接", "重新連線"))
+                            .on_click(move |_, window, cx| {
+                                let runtime_id = reconnect_id.clone();
+                                let _ = reconnect_settings.update(cx, |this, cx| {
+                                    this.run_connection_primary_action(runtime_id, window, cx)
+                                });
+                            }),
+                    );
+                    // Removing a runtime mid-handshake would let the connect
+                    // task re-register the credential it is still holding, so
+                    // the row would come back. Keep the destructive action out
+                    // until the attempt is terminal.
+                    if direct_in_flight {
+                        return menu;
+                    }
+                    return menu.separator().item(
+                        PopupMenuItem::new(locale::text("Remove", "移除", "移除")).on_click(
+                            move |_, window, cx| {
+                                let _ = remove_settings.update(cx, |this, cx| {
+                                    this.confirm_remove_paired_runtime(
+                                        remove_id.clone(),
+                                        remove_name.clone(),
+                                        window,
+                                        cx,
+                                    )
+                                });
+                            },
+                        ),
+                    );
+                }
                 if wsl_menu {
                     let reconnect_id = remove_id.clone();
                     let reconnect_settings = remove_settings.clone();
@@ -94134,6 +95187,9 @@ impl FoundationSettings {
     }
 
     fn connection_detail(row: &ConnectionDisplayRow) -> String {
+        if row.transport == ConnectionTransport::Direct {
+            return row.host.clone();
+        }
         if row.transport == ConnectionTransport::Wsl {
             return format!("{} · port {}", row.host, row.port);
         }
@@ -94165,6 +95221,17 @@ impl FoundationSettings {
     }
 
     fn connection_primary_label(row: &ConnectionDisplayRow) -> &'static str {
+        if row.transport == ConnectionTransport::Direct {
+            return match row.status {
+                ConnectionRowStatus::Connected => locale::text("Reconnect", "重新连接", "重新連線"),
+                ConnectionRowStatus::Connecting => {
+                    locale::text("Connecting…", "连接中…", "連線中…")
+                }
+                ConnectionRowStatus::Offline | ConnectionRowStatus::NeedsAttention => {
+                    locale::text("Connect", "连接", "連線")
+                }
+            };
+        }
         if row.transport == ConnectionTransport::Wsl {
             if row.wsl_provisioning {
                 return locale::text("Show progress", "查看进度", "檢視進度");
@@ -94186,6 +95253,30 @@ impl FoundationSettings {
     }
 
     fn connection_primary_hint(row: &ConnectionDisplayRow) -> &'static str {
+        if row.transport == ConnectionTransport::Direct {
+            return match row.status {
+                ConnectionRowStatus::Connected => locale::text(
+                    "Reconnect and make this runtime authoritative.",
+                    "重新连接并使该运行时成为当前运行时。",
+                    "重新連線並使該執行階段成為目前執行階段。",
+                ),
+                ConnectionRowStatus::Offline => locale::text(
+                    "Connect to the runtime this pairing added.",
+                    "连接此配对添加的运行时。",
+                    "連線此配對新增的執行階段。",
+                ),
+                ConnectionRowStatus::NeedsAttention => locale::text(
+                    "Retry the connection to the paired runtime.",
+                    "重试连接该已配对运行时。",
+                    "重試連線該已配對執行階段。",
+                ),
+                ConnectionRowStatus::Connecting => locale::text(
+                    "This runtime is already connecting.",
+                    "该运行时正在连接中。",
+                    "該執行階段正在連線中。",
+                ),
+            };
+        }
         if row.transport == ConnectionTransport::Wsl {
             if row.wsl_provisioning {
                 return locale::text(
@@ -94256,6 +95347,19 @@ impl FoundationSettings {
         let Some(row) = row else {
             return;
         };
+        if row.transport == ConnectionTransport::Direct {
+            // A direct runtime has no tunnel or provisioner to rebuild: the
+            // workbench reconnects the stored credential it already owns.
+            let pending = profile_id.clone();
+            let workbench = self.workbench.clone();
+            cx.defer(move |cx| {
+                let _ = workbench.update(cx, |workbench, cx| {
+                    workbench.connect_paired_runtime(pending, cx)
+                });
+            });
+            cx.notify();
+            return;
+        }
         if row.transport == ConnectionTransport::Wsl {
             if row.wsl_provisioning {
                 self.open_connections_wsl_progress_dialog(window, cx);
@@ -120943,7 +122047,7 @@ mod tests {
         let source = include_str!("app.rs");
         let loader = source
             .split_once("    fn load_wsl_distros(")
-            .and_then(|(_, tail)| tail.split_once("\n    fn connect_wsl_distro("))
+            .and_then(|(_, tail)| tail.split_once("\n    /// Opens the add-SSH-connection dialog"))
             .map(|(body, _)| body)
             .expect("the WSL distro loader should remain inspectable");
         assert!(
@@ -121180,23 +122284,40 @@ mod tests {
             );
         }
 
-        // Both dialogs close on submit, so parking the failure in their bodies
-        // would show it for one frame and then drop it.
-        for opener in [
-            "    fn open_connections_add_dialog(",
-            "    fn open_connections_wsl_dialog(",
-        ] {
-            let body = source
-                .split_once(opener)
-                .and_then(|(_, tail)| tail.split_once("\n    /// "))
-                .map(|(body, _)| body)
-                .unwrap_or_else(|| panic!("{opener} should remain inspectable"));
-            assert!(body.contains(".on_ok("), "{opener} must submit from Enter");
-            assert!(
-                !body.contains("text_color(cx.theme().danger)"),
-                "{opener} must not paint its failure inside the panel"
-            );
-        }
+        // The add dialog closes on submit, so parking a failure in its body
+        // would show it for one frame and then drop it. The WSL dialog is the
+        // exception: it stays mounted while the chosen port is checked, and a
+        // busy or invalid port belongs next to the field that produced it.
+        let add_dialog = source
+            .split_once("    fn open_connections_add_dialog(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// "))
+            .map(|(body, _)| body)
+            .expect("the add dialog should remain inspectable");
+        assert!(
+            add_dialog.contains(".on_ok("),
+            "the add dialog must submit from Enter"
+        );
+        assert!(
+            !add_dialog.contains("text_color(cx.theme().danger)"),
+            "the add dialog must not paint its failure inside the panel"
+        );
+        let wsl_dialog = source
+            .split_once("    fn open_connections_wsl_dialog(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// "))
+            .map(|(body, _)| body)
+            .expect("the WSL dialog should remain inspectable");
+        assert!(
+            wsl_dialog.contains(".on_ok("),
+            "the WSL dialog must submit from Enter"
+        );
+        assert!(
+            wsl_dialog.contains("connections_wsl_check_error"),
+            "a rejected port stays in the dialog that is still open"
+        );
+        assert!(
+            wsl_dialog.contains("text_color(cx.theme().danger)"),
+            "the port field's rejection is painted where it can be corrected"
+        );
     }
 
     /// The browser page is where a new tab's page and the address bar's engine
@@ -121757,6 +122878,131 @@ mod tests {
         assert!(!source.contains(concat!("ssh_connection::", "feature")));
         assert!(!source.contains(concat!("VIBEX_SSH_REMOTE", "_RUNTIME")));
         assert!(!source.contains(concat!("developer.ssh_remote", "_runtime")));
+    }
+
+    /// A pairing link and a bare code are two shapes of the same entry.
+    ///
+    /// The dialog decides from the text itself whether the address field is
+    /// needed, and the claim path picks the matching transport. A regression
+    /// that made a link require an address, or sent a bare code to the link
+    /// parser, would strand exactly the connection string this page restores.
+    #[test]
+    fn pairing_entries_are_classified_by_shape() {
+        assert!(pairing_entry_is_link("vibex://pair#/code/abc"));
+        assert!(pairing_entry_is_link("  #/code/abc  "));
+        assert!(!pairing_entry_is_link("123-456-789"));
+        assert!(
+            !pairing_entry_is_link("https://host/#/pair/offer"),
+            "a phone-pairing offer is not a runtime connection string"
+        );
+        assert!(!pairing_entry_is_link("https://192.168.1.10:8765"));
+        assert!(!pairing_entry_is_link(""));
+
+        assert!(
+            pairing_entry_error_copy("remote_pairing_code_invalid").is_some(),
+            "a wrong code has recovery copy"
+        );
+        assert!(
+            pairing_entry_error_copy("remote_pairing_link_invalid").is_some(),
+            "a malformed link has recovery copy"
+        );
+        assert!(pairing_entry_error_copy("remote_something_else").is_none());
+
+        let source = include_str!("app.rs");
+        let page = source
+            .split_once("    fn render_connections_page(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_connections_empty_state("))
+            .map(|(body, _)| body)
+            .expect("the Connections page should remain inspectable");
+        assert!(
+            page.contains("open_connections_pairing_dialog"),
+            "the page must route the pairing-link entry"
+        );
+        assert!(page.contains("\"Connect with pairing link\""));
+        let dialog = source
+            .split_once("    fn open_connections_pairing_dialog(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// Validates the pairing fields"))
+            .map(|(body, _)| body)
+            .expect("the pairing dialog should remain inspectable");
+        assert!(dialog.contains("connections_pairing_entry_input"));
+        assert!(dialog.contains("connections_pairing_server_input"));
+        assert!(dialog.contains("connections_pairing_error"));
+        let claim = source
+            .split_once("    fn begin_pairing_entry_connect(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// Completes a successful pairing claim"))
+            .map(|(body, _)| body)
+            .expect("the pairing claim should remain inspectable");
+        assert!(claim.contains("claim_server_pairing_link"));
+        assert!(claim.contains("claim_server_pairing_code"));
+        assert!(claim.contains("DesktopRuntimeRegistryStore"));
+        let success = source
+            .split_once("    fn finish_pairing_entry_success(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// Puts a failed pairing"))
+            .map(|(body, _)| body)
+            .expect("the pairing success path should remain inspectable");
+        assert!(success.contains("begin_remote_connect"));
+        assert!(success.contains("reload_connections_profiles"));
+    }
+
+    /// The WSL port is chosen before the deployment and checked before the
+    /// download.
+    ///
+    /// The issue this covers is a busy `8765` that made adding a distro fail
+    /// with no way to pick another port. The range is validated locally, the
+    /// occupancy is probed through `wsl.exe`, and a conflict keeps the dialog
+    /// open on the port field instead of closing into a progress dialog that
+    /// cannot change it.
+    #[test]
+    fn a_wsl_runtime_port_is_bounded_and_preflighted() {
+        assert_eq!(parse_wsl_runtime_port("8765"), Ok(8765));
+        assert_eq!(parse_wsl_runtime_port(" 18765 "), Ok(18765));
+        for invalid in ["", "0", "80", "1023", "65536", "abc", "-1"] {
+            assert!(
+                parse_wsl_runtime_port(invalid).is_err(),
+                "{invalid:?} must be rejected"
+            );
+        }
+
+        let source = include_str!("app.rs");
+        let dialog = source
+            .split_once("    fn open_connections_wsl_dialog(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// Validates the port field"))
+            .map(|(body, _)| body)
+            .expect("the WSL dialog should remain inspectable");
+        assert!(
+            dialog.contains("connections_wsl_port_input"),
+            "the dialog carries the port field"
+        );
+        assert!(
+            dialog.contains("connections_wsl_check_error"),
+            "a rejected port is shown where it can be corrected"
+        );
+        let check = source
+            .split_once("    fn check_wsl_runtime_port(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn provision_wsl_distro("))
+            .map(|(body, _)| body)
+            .expect("the port preflight should remain inspectable");
+        assert!(check.contains("tokio::task::spawn_blocking("));
+        assert!(check.contains("probe_environment"));
+        assert!(
+            check.contains("wsl_port_busy"),
+            "a busy port is distinguished from a generic probe failure"
+        );
+        assert!(
+            check.contains("this.provision_wsl_distro(distro, port, cx)"),
+            "the checked port is the one the deployment uses"
+        );
+        let start = source
+            .split_once("    fn provision_wsl_distro(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// Copies the latest deployment stage"))
+            .map(|(body, _)| body)
+            .expect("the WSL deployment should remain inspectable");
+        assert!(start.contains("WslProvisioner::new("));
+        assert!(
+            !start.contains("8765"),
+            "the deployment must not fall back to the fixed port"
+        );
+        assert!(start.contains("remote_port: port"));
     }
 
     #[test]
