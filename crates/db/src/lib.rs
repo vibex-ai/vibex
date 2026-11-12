@@ -48,8 +48,8 @@ use vibex_core::{
     SkillId, SkillProviderMatrix, SkillStatus, TerminalId, TerminalSession, TimelineItem,
     TimelineItemId, TimelineItemKind, TimelinePage, TimelinePayload, TimelinePayloadDepth,
     TimelineRedactionState, TimelineSequenceGap, TimelineSource, TimelineTurnStart,
-    TurnExecutionAttribution, VibexError, VibexExecutionId, VibexResult, VibexSessionId,
-    WorkspaceId, WorkspaceMode, WorkspaceRecord, agent_id_for_provider_kind,
+    TurnExecutionAttribution, UserMessagePayload, VibexError, VibexExecutionId, VibexResult,
+    VibexSessionId, WorkspaceId, WorkspaceMode, WorkspaceRecord, agent_id_for_provider_kind,
     legacy_status_for_phase, phase_for_legacy_status, unix_timestamp_ms,
 };
 
@@ -9349,6 +9349,45 @@ impl TimelineRepository {
                 "failed to decode timeline row",
             )),
             None => Ok(None),
+        }
+    }
+
+    /// The newest user message a session recorded, when it has one.
+    ///
+    /// A delegation target can be bound to the collaborator the reader
+    /// addressed in the turn that is running. That is the newest user-message
+    /// row, not the newest row of any kind, because the turn's own assistant and
+    /// tool rows follow it.
+    pub fn latest_user_message(
+        conn: &Connection,
+        session_id: &VibexSessionId,
+    ) -> VibexResult<Option<UserMessagePayload>> {
+        let user_message = enum_to_db(&TimelineItemKind::UserMessage)?;
+        let sequence = conn
+            .query_row(
+                "
+                SELECT sequence FROM agent_timeline_items
+                WHERE session_id = ?1 AND kind = ?2
+                ORDER BY sequence DESC
+                LIMIT 1
+                ",
+                params![session_id.as_str(), user_message],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(storage_err(
+                "timeline_latest_user_message_failed",
+                "failed to find the newest user message",
+            ))?;
+        let Some(sequence) = sequence else {
+            return Ok(None);
+        };
+        let Some(item) = Self::fetch_item(conn, session_id, sequence)? else {
+            return Ok(None);
+        };
+        match item.payload {
+            TimelinePayload::UserMessage(message) => Ok(Some(message)),
+            _ => Ok(None),
         }
     }
 
