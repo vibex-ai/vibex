@@ -68,6 +68,9 @@ base64.workspace = true
 uuid.workspace = true
 chrono = "0.4.45"
 futures-channel.workspace = true
+# `AsyncReadExt` bridges GPUI's request bodies; `StreamExt` reads response
+# bodies under the remote-resource byte cap.
+futures-util = { workspace = true, features = ["io"] }
 smallvec.workspace = true
 tokio.workspace = true
 tracing.workspace = true

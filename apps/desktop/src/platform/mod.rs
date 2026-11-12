@@ -14,22 +14,28 @@ use vibex_core::{VibexError, VibexResult};
 
 #[cfg(target_os = "linux")]
 pub mod bounded_text;
+mod http;
+
+// Only the regression tests name the client type; production code reaches it
+// through `http::client`.
+#[cfg(test)]
+pub(crate) use http::ReqwestHttpClient;
 
 pub const DESKTOP_UI_STATE_FILE: &str = "desktop-ui-state.json";
 
 /// The GPUI application entry point for the desktop shell.
 ///
 /// Linux gets a platform wrapper that keeps the process font database bounded
-/// (see [`bounded_text`]); every other platform uses the stock one.
+/// (see [`bounded_text`]); every other platform uses the stock one. The HTTP
+/// client is installed here rather than per surface: GPUI's asset loader reads
+/// it from the application, and the platform constructor leaves it refusing
+/// every request, which is what kept remote Markdown images from loading.
 pub fn application() -> gpui::Application {
     #[cfg(target_os = "linux")]
-    {
-        gpui::Application::with_platform(bounded_text::platform())
-    }
+    let application = gpui::Application::with_platform(bounded_text::platform());
     #[cfg(not(target_os = "linux"))]
-    {
-        gpui_platform::application()
-    }
+    let application = gpui_platform::application();
+    application.with_http_client(http::client())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

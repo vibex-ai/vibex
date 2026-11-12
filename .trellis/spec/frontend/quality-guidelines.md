@@ -1562,6 +1562,12 @@ gpui_base::text::TextViewState::set_range_highlights(highlights, cx) -> Result<(
   to its URI rather than to a Vibex-drawn placeholder. Preloading is bounded
   (`MARKDOWN_LOCAL_IMAGE_LIMIT` files, `MARKDOWN_LOCAL_IMAGE_TOTAL_BYTES`) and
   never fetches over the network.
+- Remote images load through the application HTTP client
+  (`apps/desktop/src/platform/http.rs`), installed in `platform::application()`.
+  GPUI's platform constructor installs a client that refuses every request, so
+  removing this adapter silently blanks every `http(s)` Markdown image and HTML
+  `<img>` source. The adapter buffers responses under a byte cap and runs
+  reqwest on a runtime of its own because GPUI polls asset loads outside Tokio.
 - User-authored text renders literally: `escape_markdown_literal` escapes ASCII
   punctuation before the text view sees it, so a message body cannot become a
   block or inline construct while selection copy still returns the typed text.
