@@ -237,6 +237,9 @@ jobs:
         env:
           VIBEX_UPDATE_SIGNING_ENABLED: ${{ vars.VIBEX_UPDATE_SIGNING_ENABLED || 'false' }}
           VIBEX_UPDATE_PUBLIC_KEY: ${{ vars.VIBEX_UPDATE_PUBLIC_KEY }}
+          # The public half of the plugin-index signing key. It is not a
+          # secret; a release without it ships a market that refuses to load.
+          VIBEX_PLUGIN_ROOT_KEY: ${{ vars.VIBEX_PLUGIN_ROOT_KEY }}
         run: >-
           node scripts/package-desktop-release.mjs
           --platform ${{ matrix.platform }}

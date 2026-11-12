@@ -134,6 +134,7 @@ impl PluginService {
                 versions: Vec::new(),
                 reviews: None,
                 requested_permissions: Vec::new(),
+                consent_fingerprint: None,
             });
         }
         self.market
@@ -375,34 +376,30 @@ impl PluginService {
             return Err(PluginError::Blocked(entry.id.clone(), blocked.reason).into());
         }
 
-        // Consent: the fingerprint the UI approved must be this version's.
+        // Consent: the fingerprint the UI approved must be this version's, and
+        // every permission must be named explicitly. A missing fingerprint is
+        // an unapproved install, not a reason to grant everything.
         let expected = consent_fingerprint_for(
             &entry.id,
             &version.version,
             SCRIPT_EXECUTION_MODEL,
             &version.permissions,
         );
-        if let Some(provided) = &request.consent_fingerprint
-            && provided != &expected
-        {
-            return Err(PluginError::PermissionDenied(
-                "the approved consent fingerprint does not match the package".to_string(),
-            )
-            .into());
-        }
-        let granted: Vec<PluginPermissionGrant> = if request.granted_permissions.is_empty() {
-            version
-                .permissions
-                .iter()
-                .map(PluginPermissionGrant::from)
-                .collect()
-        } else {
-            request.granted_permissions.clone()
-        };
-        for permission in &version.permissions {
-            if !granted.iter().any(|grant| grant.key == permission.key) {
-                return Err(PluginError::PermissionDenied(permission.key.clone()).into());
-            }
+        require_consent(&expected, request.consent_fingerprint.as_deref())?;
+        // Store only grants the reviewed version actually asks for. A stale
+        // grant from a previous version must not widen the new one.
+        let granted: Vec<PluginPermissionGrant> = request
+            .granted_permissions
+            .iter()
+            .filter(|grant| {
+                version.permissions.iter().any(|permission| {
+                    permission.key == grant.key && permission.scope == grant.scope
+                })
+            })
+            .cloned()
+            .collect();
+        if let Some(missing) = missing_grant(&version.permissions, &granted) {
+            return Err(PluginError::PermissionDenied(missing.key.clone()).into());
         }
 
         let bytes = self.download_package(&entry, &version).await?;
@@ -781,11 +778,29 @@ impl PluginService {
                     now,
                 )?;
             }
+            let requested_permissions = self
+                .store_entry(&record.plugin_id)
+                .and_then(|entry| {
+                    entry
+                        .versions
+                        .iter()
+                        .find(|candidate| candidate.version == latest)
+                        .map(|candidate| candidate.permissions.clone())
+                })
+                .unwrap_or_else(|| entry.permissions.clone());
+            let consent_fingerprint = consent_fingerprint_for(
+                &record.plugin_id,
+                latest,
+                SCRIPT_EXECUTION_MODEL,
+                &requested_permissions,
+            );
             updates.push(PluginUpdate {
                 plugin_id: record.plugin_id.clone(),
                 installed_version: record.version.clone(),
                 available_version: latest.to_string(),
                 permission_diff: diff,
+                requested_permissions,
+                consent_fingerprint: Some(consent_fingerprint),
                 yanked: self.market.blocked(&record.plugin_id, latest).is_some(),
                 changelog: None,
             });
@@ -975,6 +990,31 @@ fn contributions_for(
     }]
 }
 
+/// Refuses an install whose consent fingerprint is absent or stale.
+fn require_consent(expected: &str, provided: Option<&str>) -> Result<(), PluginError> {
+    match provided {
+        Some(provided) if provided == expected => Ok(()),
+        Some(_) => Err(PluginError::PermissionDenied(
+            "the approved consent fingerprint does not match the package".to_string(),
+        )),
+        None => Err(PluginError::PermissionDenied(
+            "the install has not been approved; review its permissions first".to_string(),
+        )),
+    }
+}
+
+/// The first permission the user did not explicitly grant.
+fn missing_grant<'a>(
+    permissions: &'a [PluginPermission],
+    granted: &[PluginPermissionGrant],
+) -> Option<&'a PluginPermission> {
+    permissions.iter().find(|permission| {
+        !granted
+            .iter()
+            .any(|grant| grant.key == permission.key && grant.scope == permission.scope)
+    })
+}
+
 /// Whether `candidate` is a newer semantic version than `current`.
 pub fn is_newer(candidate: &str, current: &str) -> bool {
     match (Version::parse(candidate), Version::parse(current)) {
@@ -992,6 +1032,44 @@ mod tests {
     use crate::install::PluginStore;
     use crate::market::{MarketCache, MarketConfig, MarketHttpClient, MarketUrlPolicy};
     use crate::runtime::NullRuntime;
+
+    #[test]
+    fn an_install_needs_a_matching_consent_fingerprint() {
+        assert!(require_consent("abc", None).is_err());
+        assert!(require_consent("abc", Some("def")).is_err());
+        assert!(require_consent("abc", Some("abc")).is_ok());
+    }
+
+    #[test]
+    fn every_requested_permission_needs_an_explicit_grant() {
+        let permissions = vec![
+            PluginPermission::new("ui.panel", PluginPermissionRisk::Low),
+            PluginPermission::new("net.fetch", PluginPermissionRisk::Medium),
+        ];
+        assert!(missing_grant(&permissions, &[]).is_some());
+        let one = vec![PluginPermissionGrant::from(&permissions[0])];
+        assert_eq!(
+            missing_grant(&permissions, &one).map(|permission| permission.key.as_str()),
+            Some("net.fetch")
+        );
+        let both: Vec<PluginPermissionGrant> = permissions
+            .iter()
+            .map(PluginPermissionGrant::from)
+            .collect();
+        assert!(missing_grant(&permissions, &both).is_none());
+
+        let scoped = PluginPermission {
+            key: "net.fetch".to_string(),
+            scope: Some("api.example.com".to_string()),
+            risk: PluginPermissionRisk::Medium,
+            reason: None,
+        };
+        let wrong_scope = vec![PluginPermissionGrant {
+            key: "net.fetch".to_string(),
+            scope: Some("evil.example.com".to_string()),
+        }];
+        assert!(missing_grant(std::slice::from_ref(&scoped), &wrong_scope).is_some());
+    }
 
     #[test]
     fn newer_versions_are_ordered_semantically() {

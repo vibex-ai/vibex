@@ -14,6 +14,7 @@ use vibex_core::{
 };
 
 use crate::error::PluginError;
+use crate::fingerprint::{SCRIPT_EXECUTION_MODEL, consent_fingerprint_for};
 
 use super::cache::MarketCache;
 use super::fetch::MarketHttpClient;
@@ -87,7 +88,16 @@ impl MarketCatalog {
 
     /// Loads the merged catalog, using and refreshing the cache as needed.
     pub async fn load(&self, request: &PluginMarketIndexRequest) -> PluginMarketIndexResponse {
-        let cached = self.config.cache.read_response();
+        // A cached catalog is only as trustworthy as the policy that wrote it.
+        // With no root key and no development opt-in, do not serve a snapshot
+        // that may have been read without a signature.
+        let cache_trusted =
+            self.config.root_public_key.is_some() || self.config.allow_unverified_index;
+        let cached = if cache_trusted {
+            self.config.cache.read_response()
+        } else {
+            None
+        };
         let fresh = self
             .config
             .cache
@@ -252,7 +262,23 @@ impl MarketCatalog {
                 .flatten();
         }
         let readme_bytes = readme.as_ref().map(|text| text.len() as u64).unwrap_or(0);
-        let requested_permissions = requested_permissions(&entry.versions);
+        let target = target_version(&entry.versions, version);
+        if version.is_some() && target.is_none() {
+            return Err(PluginError::NotFound(plugin_id.to_string()));
+        }
+        // The sheet must show the permissions of the version the install will
+        // take, not the union across every version the catalog remembers.
+        let requested_permissions = target
+            .map(|version| version.permissions.clone())
+            .unwrap_or_default();
+        let consent_fingerprint = target.map(|version| {
+            consent_fingerprint_for(
+                &entry.entry.id,
+                &version.version,
+                SCRIPT_EXECUTION_MODEL,
+                &version.permissions,
+            )
+        });
         let versions = match version {
             Some(version) => entry
                 .versions
@@ -278,6 +304,7 @@ impl MarketCatalog {
             versions,
             reviews: entry.reviews.clone(),
             requested_permissions,
+            consent_fingerprint,
         })
     }
 
@@ -343,20 +370,19 @@ impl MarketCatalog {
 }
 
 /// The union of every version's permissions, for the detail page.
-fn requested_permissions(versions: &[PluginMarketVersion]) -> Vec<vibex_core::PluginPermission> {
-    let mut permissions: Vec<vibex_core::PluginPermission> = Vec::new();
-    for version in versions {
-        for permission in &version.permissions {
-            if !permissions
-                .iter()
-                .any(|existing| existing.key == permission.key)
-            {
-                permissions.push(permission.clone());
-            }
-        }
+
+/// The version a detail page is about: the requested one, or the first
+/// non-yanked version a fresh install would take.
+fn target_version<'a>(
+    versions: &'a [PluginMarketVersion],
+    version: Option<&str>,
+) -> Option<&'a PluginMarketVersion> {
+    match version {
+        Some(version) => versions
+            .iter()
+            .find(|candidate| candidate.version == version),
+        None => versions.iter().find(|candidate| !candidate.yanked),
     }
-    permissions.sort_by(|left, right| left.key.cmp(&right.key));
-    permissions
 }
 
 /// The `owner/repo` a topic-discovered entry came from.
@@ -422,53 +448,62 @@ mod tests {
         assert!(catalog.revocation_url().is_none());
     }
 
+    #[tokio::test]
+    async fn a_cache_without_a_trust_anchor_is_not_served() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = MarketCache::new(directory.path());
+        cache
+            .write_response(&PluginMarketIndexResponse {
+                revision: 42,
+                ..Default::default()
+            })
+            .unwrap();
+        let catalog = MarketCatalog::new(
+            MarketHttpClient::new(MarketUrlPolicy::Testing),
+            MarketConfig::empty(cache),
+        );
+        let loaded = catalog.load(&PluginMarketIndexRequest::default()).await;
+        assert_eq!(loaded.revision, 0);
+        assert!(loaded.stale);
+    }
+
     #[test]
-    fn requested_permissions_are_the_union() {
-        let permission = |key: &str| vibex_core::PluginPermission::new(key, Default::default());
-        let versions = vec![
-            PluginMarketVersion {
-                version: "1.0.0".to_string(),
-                published_at: None,
-                size_bytes: None,
-                sha256: "a".repeat(64),
-                sha512: None,
-                url: "https://example.com/a".to_string(),
-                changelog: None,
-                min_vibex: None,
-                min_shell: None,
-                permissions: vec![permission("ui.panel"), permission("storage")],
-                platforms: Vec::new(),
-                yanked: false,
-                yanked_reason: None,
-                signature: None,
-                provenance: None,
-                review: None,
-            },
-            PluginMarketVersion {
-                version: "1.1.0".to_string(),
-                published_at: None,
-                size_bytes: None,
-                sha256: "b".repeat(64),
-                sha512: None,
-                url: "https://example.com/b".to_string(),
-                changelog: None,
-                min_vibex: None,
-                min_shell: None,
-                permissions: vec![permission("storage"), permission("net.fetch")],
-                platforms: Vec::new(),
-                yanked: false,
-                yanked_reason: None,
-                signature: None,
-                provenance: None,
-                review: None,
-            },
-        ];
-        let permissions = requested_permissions(&versions);
-        let keys: Vec<&str> = permissions
-            .iter()
-            .map(|permission| permission.key.as_str())
-            .collect();
-        assert_eq!(keys, vec!["net.fetch", "storage", "ui.panel"]);
+    fn the_detail_targets_the_requested_or_latest_version() {
+        let mut first = PluginMarketVersion {
+            version: "1.0.0".to_string(),
+            published_at: None,
+            size_bytes: None,
+            sha256: "a".repeat(64),
+            sha512: None,
+            url: "https://example.com/a".to_string(),
+            changelog: None,
+            min_vibex: None,
+            min_shell: None,
+            permissions: Vec::new(),
+            platforms: Vec::new(),
+            yanked: true,
+            yanked_reason: None,
+            signature: None,
+            provenance: None,
+            review: None,
+        };
+        let latest = PluginMarketVersion {
+            version: "1.1.0".to_string(),
+            yanked: false,
+            ..first.clone()
+        };
+        first.version = "0.9.0".to_string();
+        let versions = vec![first, latest];
+
+        assert_eq!(
+            target_version(&versions, None).map(|version| version.version.as_str()),
+            Some("1.1.0"),
+        );
+        assert_eq!(
+            target_version(&versions, Some("0.9.0")).map(|version| version.version.as_str()),
+            Some("0.9.0"),
+        );
+        assert!(target_version(&versions, Some("2.0.0")).is_none());
     }
 
     #[test]

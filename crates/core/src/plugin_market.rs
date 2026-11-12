@@ -585,6 +585,12 @@ pub struct PluginMarketDetail {
     pub reviews: Option<PluginReviewsSummary>,
     #[serde(default)]
     pub requested_permissions: Vec<PluginPermission>,
+    /// The fingerprint of the version the detail page is offering.
+    ///
+    /// A market install must send this back; the service recomputes it from
+    /// the catalog and refuses the install when the two differ.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consent_fingerprint: Option<String>,
 }
 
 impl PluginMarketDetail {
@@ -742,8 +748,12 @@ impl PluginPermissionDiff {
         self.added.is_empty() && self.removed.is_empty() && !self.fingerprint_changed
     }
 
+    /// Whether the new version asks for a permission the user has not granted.
+    ///
+    /// The fingerprint changes on every version, so it cannot be the trigger:
+    /// otherwise every update would demand a fresh consent screen.
     pub fn requires_consent(&self) -> bool {
-        !self.added.is_empty() || self.fingerprint_changed
+        !self.added.is_empty()
     }
 }
 
@@ -756,6 +766,13 @@ pub struct PluginUpdate {
     pub available_version: String,
     #[serde(default)]
     pub permission_diff: PluginPermissionDiff,
+    /// Everything the available version asks for, so the consent sheet can
+    /// show the full request rather than only the newly added keys.
+    #[serde(default)]
+    pub requested_permissions: Vec<PluginPermission>,
+    /// The fingerprint of the available version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consent_fingerprint: Option<String>,
     #[serde(default)]
     pub yanked: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -780,9 +797,20 @@ pub struct PluginUpdateCheckResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PluginUpdateApplyRequest {
-    pub plugin_ids: Vec<String>,
+    #[serde(default)]
+    pub consents: Vec<PluginUpdateConsent>,
+}
+
+/// The user's approval of one update.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginUpdateConsent {
+    pub plugin_id: String,
+    /// The exact version the user reviewed.
+    pub version: String,
     #[serde(default)]
     pub granted_permissions: Vec<PluginPermissionGrant>,
+    pub consent_fingerprint: String,
 }
 
 /// The lifecycle state one installed plugin is in.
@@ -966,6 +994,11 @@ mod tests {
             ..Default::default()
         };
         assert!(added.requires_consent());
+        let version_only = PluginPermissionDiff {
+            fingerprint_changed: true,
+            ..Default::default()
+        };
+        assert!(!version_only.requires_consent());
     }
 
     #[test]

@@ -76,16 +76,38 @@ impl PluginHandle {
     /// The service for this installation.
     fn service(&self) -> PluginService {
         let home = self.home();
+        let (root_key, root_key_invalid) = match configured_root_key() {
+            Ok(key) => (key, false),
+            Err(error) => {
+                eprintln!("vibex-plugin-market: the configured root key is invalid: {error}");
+                (None, true)
+            }
+        };
+        let allow_unverified = !root_key_invalid
+            && allow_unverified_index(
+                root_key.as_ref(),
+                std::env::var(ALLOW_UNVERIFIED_INDEX_ENV).ok().as_deref(),
+            );
+        if !root_key_invalid && root_key.is_none() && !allow_unverified {
+            // `service()` runs per plugin operation; warn once per process.
+            static WARNED: OnceLock<()> = OnceLock::new();
+            WARNED.get_or_init(|| {
+                eprintln!(
+                    "vibex-plugin-market: no root key; set {ROOT_KEY_ENV} to the index signer's public key, \
+                     or {ALLOW_UNVERIFIED_INDEX_ENV}=1 to read a development index"
+                );
+            });
+        }
         let config = MarketConfig {
             index_urls: index_urls(),
-            root_public_key: embedded_root_key(),
+            root_public_key: root_key,
             github: Some(vibex_plugin::GithubTopicSource::new(MarketHttpClient::new(
                 MarketUrlPolicy::Public,
             ))),
             cache: MarketCache::new(home.join("plugin-market")),
             index_ttl: vibex_plugin::market::INDEX_TTL,
             github_ttl: vibex_plugin::market::GITHUB_TTL,
-            allow_unverified_index: embedded_root_key().is_none(),
+            allow_unverified_index: allow_unverified,
         };
         let catalog = MarketCatalog::new(MarketHttpClient::new(MarketUrlPolicy::Public), config);
         PluginService::new(
@@ -189,24 +211,22 @@ impl PluginHandle {
         request: PluginUpdateApplyRequest,
     ) -> VibexResult<Vec<PluginMarketInstallResult>> {
         let mut results = Vec::new();
-        for plugin_id in &request.plugin_ids {
+        for consent in &request.consents {
             let connection = self.connection()?;
-            let record =
-                vibex_db::PluginRepository::get(&connection, plugin_id)?.ok_or_else(|| {
+            let record = vibex_db::PluginRepository::get(&connection, &consent.plugin_id)?
+                .ok_or_else(|| {
                     vibex_core::VibexError::validation(
                         "plugin_not_installed",
-                        format!("the plugin `{plugin_id}` is not installed"),
+                        format!("the plugin `{}` is not installed", consent.plugin_id),
                     )
                 })?;
             let install = PluginMarketInstallRequest {
-                entry_id: plugin_id.clone(),
-                version: None,
-                granted_permissions: if request.granted_permissions.is_empty() {
-                    record.granted_permissions.clone()
-                } else {
-                    request.granted_permissions.clone()
-                },
-                consent_fingerprint: None,
+                entry_id: consent.plugin_id.clone(),
+                // Install the exact version the sheet showed, not whatever the
+                // catalog happens to call latest by the time the request lands.
+                version: Some(consent.version.clone()),
+                granted_permissions: consent.granted_permissions.clone(),
+                consent_fingerprint: Some(consent.consent_fingerprint.clone()),
                 enable: record.enabled,
                 auto_update: record.auto_update,
             };
@@ -230,9 +250,40 @@ fn index_urls() -> Vec<url::Url> {
         .collect()
 }
 
-fn embedded_root_key() -> Option<VerifyingKey> {
-    let encoded = option_env!("VIBEX_PLUGIN_ROOT_KEY")?;
-    vibex_plugin::market::decode_verifying_key(encoded).ok()
+/// The environment variable carrying the index signer's public key.
+pub const ROOT_KEY_ENV: &str = "VIBEX_PLUGIN_ROOT_KEY";
+
+/// The explicit development opt-in for an unsigned index.
+pub const ALLOW_UNVERIFIED_INDEX_ENV: &str = "VIBEX_PLUGIN_ALLOW_UNVERIFIED_INDEX";
+
+/// The root key, preferring a build-time value and falling back to the
+/// developer's environment.
+///
+/// A configured but malformed key is an error rather than "no key": silently
+/// treating it as absent is how a release ends up accepting anything.
+fn configured_root_key() -> Result<Option<VerifyingKey>, String> {
+    let compiled = option_env!("VIBEX_PLUGIN_ROOT_KEY").unwrap_or("");
+    let encoded = if compiled.trim().is_empty() {
+        match std::env::var(ROOT_KEY_ENV) {
+            Ok(value) if !value.trim().is_empty() => value,
+            _ => return Ok(None),
+        }
+    } else {
+        compiled.to_string()
+    };
+    vibex_plugin::market::decode_verifying_key(&encoded)
+        .map(Some)
+        .map_err(|error| error.to_string())
+}
+
+/// Whether an unsigned index may be read.
+///
+/// Never when a root key exists; otherwise only with the explicit development
+/// opt-in. The default is closed.
+fn allow_unverified_index(root_key: Option<&VerifyingKey>, override_value: Option<&str>) -> bool {
+    root_key.is_none()
+        && override_value
+            .is_some_and(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "YES"))
 }
 
 /// Seeds the first-party plugin rows once per database in this process.
@@ -250,4 +301,29 @@ fn seed_once(
         return;
     }
     let _ = service.seed_native_plugins(connection);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn verifying_key() -> VerifyingKey {
+        ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]).verifying_key()
+    }
+
+    #[test]
+    fn an_unsigned_index_needs_an_explicit_development_opt_in() {
+        assert!(!allow_unverified_index(None, None));
+        assert!(!allow_unverified_index(None, Some("0")));
+        assert!(!allow_unverified_index(None, Some("")));
+        assert!(allow_unverified_index(None, Some("1")));
+        assert!(allow_unverified_index(None, Some("true")));
+    }
+
+    #[test]
+    fn a_root_key_always_disables_the_unsigned_fallback() {
+        let key = verifying_key();
+        assert!(!allow_unverified_index(Some(&key), None));
+        assert!(!allow_unverified_index(Some(&key), Some("1")));
+    }
 }

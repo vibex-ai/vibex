@@ -504,6 +504,31 @@ impl PluginTab {
     }
 }
 
+/// The permissions the user is reviewing before a market install or update.
+#[derive(Debug, Clone)]
+struct PluginConsent {
+    plugin_id: String,
+    name: String,
+    publisher: String,
+    trust: String,
+    version: String,
+    updating: bool,
+    /// Everything the version asks for.
+    permissions: Vec<vibex_core::PluginPermission>,
+    /// The permissions this update adds; empty for a fresh install.
+    added: Vec<vibex_core::PluginPermission>,
+    fingerprint: String,
+}
+
+impl PluginConsent {
+    fn grants(&self) -> Vec<vibex_core::PluginPermissionGrant> {
+        self.permissions
+            .iter()
+            .map(vibex_core::PluginPermissionGrant::from)
+            .collect()
+    }
+}
+
 /// What one Model editor renders, resolved from the Agent projection once per
 /// frame instead of per row.
 struct ProfileModelEditorContext {
@@ -2080,6 +2105,8 @@ pub struct ManagementCenter {
     plugin_market_installed: Vec<vibex_core::InstalledPlugin>,
     plugin_market_updates: Vec<vibex_core::PluginUpdate>,
     plugin_market_detail: Option<vibex_core::PluginMarketDetail>,
+    /// The install/update the user is reviewing before approving it.
+    plugin_consent: Option<PluginConsent>,
     /// The plugin whose detail page is open.
     plugin_market_selected: Option<String>,
     plugin_market_category: Option<vibex_core::PluginCategory>,
@@ -3210,6 +3237,7 @@ impl ManagementCenter {
             plugin_market_installed: Vec::new(),
             plugin_market_updates: Vec::new(),
             plugin_market_detail: None,
+            plugin_consent: None,
             plugin_market_selected: None,
             plugin_market_category: None,
             plugin_market_loading: false,
@@ -12023,6 +12051,7 @@ impl ManagementCenter {
         self.plugin_market_tab = PluginTab::Discover;
         self.plugin_market_selected = None;
         self.plugin_market_detail = None;
+        self.plugin_consent = None;
         self.load_plugin_catalog(cx);
         self.load_installed_plugins(cx);
     }
@@ -12148,6 +12177,7 @@ impl ManagementCenter {
         };
         self.plugin_market_selected = Some(plugin_id.clone());
         self.plugin_market_detail = None;
+        self.plugin_consent = None;
         let entity = cx.weak_entity();
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
             backend
@@ -12178,32 +12208,82 @@ impl ManagementCenter {
         }));
     }
 
-    fn install_plugin(&mut self, plugin_id: String, cx: &mut Context<Self>) {
-        let Some(backend) = self.backend.clone() else {
-            return;
-        };
-        let granted: Vec<vibex_core::PluginPermissionGrant> = self
+    fn begin_plugin_install(&mut self, plugin_id: String, cx: &mut Context<Self>) {
+        let Some(detail) = self
             .plugin_market_detail
             .as_ref()
             .filter(|detail| detail.entry.id == plugin_id)
-            .map(|detail| {
-                detail
-                    .requested_permissions
-                    .iter()
-                    .map(vibex_core::PluginPermissionGrant::from)
-                    .collect()
-            })
-            .unwrap_or_default();
+        else {
+            self.plugin_market_error = Some(management_market_error_text(
+                "plugin_detail_missing",
+                "Open the plugin again before installing it.",
+            ));
+            return;
+        };
+        let Some(fingerprint) = detail.consent_fingerprint.clone() else {
+            self.plugin_market_error = Some(management_market_error_text(
+                "plugin_consent_missing",
+                "This listing has no consent fingerprint; it cannot be installed.",
+            ));
+            return;
+        };
+        let Some(version) = detail
+            .latest_version()
+            .map(|version| version.version.clone())
+        else {
+            self.plugin_market_error = Some(management_market_error_text(
+                "plugin_version_missing",
+                "This listing has no installable version.",
+            ));
+            return;
+        };
+        let name = detail
+            .entry
+            .localized_name(locale::current_locale().tag())
+            .to_string();
+        let publisher = detail.entry.publisher.display_name.clone();
+        let trust = detail.entry.trust.label().to_string();
+        self.plugin_market_error = None;
+        self.plugin_consent = Some(PluginConsent {
+            plugin_id,
+            name,
+            publisher,
+            trust,
+            version,
+            updating: false,
+            permissions: detail.requested_permissions.clone(),
+            added: Vec::new(),
+            fingerprint,
+        });
+        cx.notify();
+    }
+
+    fn confirm_plugin_consent(&mut self, cx: &mut Context<Self>) {
+        let Some(consent) = self.plugin_consent.clone() else {
+            return;
+        };
+        if consent.updating {
+            self.apply_plugin_update(consent, cx);
+        } else {
+            self.install_plugin(consent, cx);
+        }
+    }
+
+    fn install_plugin(&mut self, consent: PluginConsent, cx: &mut Context<Self>) {
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
         let entity = cx.weak_entity();
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
             backend
                 .management()
                 .install_plugin_market_entry(MutationRequest::new(
                     vibex_core::PluginMarketInstallRequest {
-                        entry_id: plugin_id,
-                        version: None,
-                        granted_permissions: granted,
-                        consent_fingerprint: None,
+                        entry_id: consent.plugin_id.clone(),
+                        // Pin the version the sheet showed.
+                        version: Some(consent.version.clone()),
+                        granted_permissions: consent.grants(),
+                        consent_fingerprint: Some(consent.fingerprint.clone()),
                         enable: true,
                         auto_update: false,
                     },
@@ -12216,6 +12296,7 @@ impl ManagementCenter {
             let _ = entity.update(cx, |this, cx| {
                 match outcome {
                     Ok(Ok(result)) => {
+                        this.plugin_consent = None;
                         this.plugin_market_installed
                             .retain(|plugin| plugin.plugin_id != result.plugin.plugin_id);
                         this.plugin_market_installed.push(result.plugin);
@@ -12339,17 +12420,65 @@ impl ManagementCenter {
         }));
     }
 
-    fn apply_plugin_update(&mut self, plugin_id: String, cx: &mut Context<Self>) {
+    fn begin_plugin_update(&mut self, update: vibex_core::PluginUpdate, cx: &mut Context<Self>) {
+        let Some(fingerprint) = update.consent_fingerprint.clone() else {
+            self.plugin_market_error = Some(management_market_error_text(
+                "plugin_consent_missing",
+                "This update has no consent fingerprint; it cannot be installed.",
+            ));
+            return;
+        };
+        let installed = self
+            .plugin_market_installed
+            .iter()
+            .find(|plugin| plugin.plugin_id == update.plugin_id);
+        let name = installed
+            .map(|plugin| plugin.name.clone())
+            .unwrap_or_else(|| update.plugin_id.clone());
+        let publisher = installed
+            .map(|plugin| plugin.publisher.display_name.clone())
+            .unwrap_or_default();
+        let trust = installed
+            .map(|plugin| plugin.trust.label().to_string())
+            .unwrap_or_default();
+        let consent = PluginConsent {
+            plugin_id: update.plugin_id.clone(),
+            name,
+            publisher,
+            trust,
+            version: update.available_version.clone(),
+            updating: true,
+            permissions: update.requested_permissions.clone(),
+            added: update.permission_diff.added.clone(),
+            fingerprint,
+        };
+        self.plugin_market_error = None;
+        if update.permission_diff.requires_consent() {
+            self.plugin_consent = Some(consent);
+            cx.notify();
+        } else {
+            // No new permission: the click on Update is the approval. The
+            // fingerprint still pins the exact version.
+            self.apply_plugin_update(consent, cx);
+        }
+    }
+
+    fn apply_plugin_update(&mut self, consent: PluginConsent, cx: &mut Context<Self>) {
         let Some(backend) = self.backend.clone() else {
             return;
         };
         let entity = cx.weak_entity();
+        let updated_id = consent.plugin_id.clone();
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
             backend
                 .management()
                 .apply_plugin_updates(MutationRequest::new(vibex_core::PluginUpdateApplyRequest {
-                    plugin_ids: vec![plugin_id],
-                    granted_permissions: Vec::new(),
+                    consents: vec![vibex_core::PluginUpdateConsent {
+                        plugin_id: consent.plugin_id.clone(),
+                        version: consent.version.clone(),
+                        granted_permissions: consent.grants(),
+                        consent_fingerprint: consent.fingerprint.clone(),
+                    }],
                 }))
                 .await
                 .map_err(crate::app::remote_error_into_vibex)
@@ -12359,12 +12488,15 @@ impl ManagementCenter {
             let _ = entity.update(cx, |this, cx| {
                 match outcome {
                     Ok(Ok(results)) => {
+                        this.plugin_consent = None;
                         for result in results {
                             this.plugin_market_installed
                                 .retain(|plugin| plugin.plugin_id != result.plugin.plugin_id);
                             this.plugin_market_installed.push(result.plugin);
                         }
-                        this.plugin_market_updates.clear();
+                        this.plugin_market_updates
+                            .retain(|update| update.plugin_id != updated_id);
+                        cx.emit(ManagementEvent::PluginsChanged);
                     }
                     Ok(Err(error)) => {
                         this.plugin_market_error =
@@ -12434,6 +12566,7 @@ impl ManagementCenter {
                 }
                 this.plugin_market_tab = candidate;
                 this.plugin_market_error = None;
+                this.plugin_consent = None;
                 match candidate {
                     PluginTab::Discover => this.load_plugin_catalog(cx),
                     PluginTab::Installed => this.load_installed_plugins(cx),
@@ -12451,7 +12584,9 @@ impl ManagementCenter {
             ));
         }
 
-        if let Some(plugin_id) = self.plugin_market_selected.clone() {
+        if let Some(consent) = self.plugin_consent.clone() {
+            content = content.child(self.render_plugin_consent(&consent, cx));
+        } else if let Some(plugin_id) = self.plugin_market_selected.clone() {
             content = content.child(self.render_plugin_detail(&plugin_id, cx));
         } else {
             content = content.child(match tab {
@@ -12461,6 +12596,128 @@ impl ManagementCenter {
             });
         }
         content.into_any_element()
+    }
+
+    /// The consent sheet: what the plugin is, which version, and every
+    /// permission the user is about to grant.
+    fn render_plugin_consent(
+        &mut self,
+        consent: &PluginConsent,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let mut column = v_flex().w_full().gap_3();
+        column = column.child(
+            h_flex()
+                .w_full()
+                .items_center()
+                .gap_2()
+                .child(
+                    Button::new("management-plugin-consent-back")
+                        .xsmall()
+                        .link()
+                        .label(management_locale_text("Back", "返回", "返回"))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.plugin_consent = None;
+                            cx.notify();
+                        })),
+                )
+                .child(div().text_lg().font_semibold().child(if consent.updating {
+                    management_locale_text("Review update", "确认更新", "確認更新")
+                } else {
+                    management_locale_text("Review install", "确认安装", "確認安裝")
+                })),
+        );
+        column = column.child(div().text_sm().font_semibold().child(consent.name.clone()));
+        column = column.child(
+            div()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(format!(
+                    "{} · {} · {} {}",
+                    consent.publisher,
+                    consent.trust,
+                    management_locale_text("Version", "版本", "版本"),
+                    consent.version
+                )),
+        );
+
+        if !consent.added.is_empty() {
+            column = column.child(
+                div()
+                    .text_sm()
+                    .font_semibold()
+                    .child(management_locale_text(
+                        "New permissions",
+                        "新增权限",
+                        "新增權限",
+                    )),
+            );
+            for permission in &consent.added {
+                column = column.child(plugin_permission_row(permission, true, cx));
+            }
+        }
+
+        column = column.child(div().text_sm().font_semibold().child(if consent.updating {
+            management_locale_text(
+                "Permissions after this update",
+                "更新后的全部权限",
+                "更新後的全部權限",
+            )
+        } else {
+            management_locale_text(
+                "This plugin asks for",
+                "此插件申请以下权限",
+                "此外掛申請以下權限",
+            )
+        }));
+        if consent.permissions.is_empty() {
+            column = column.child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(management_locale_text(
+                        "No permissions.",
+                        "没有权限。",
+                        "沒有權限。",
+                    )),
+            );
+        } else {
+            for permission in &consent.permissions {
+                column = column.child(plugin_permission_row(permission, false, cx));
+            }
+        }
+
+        column = column.child(
+            h_flex()
+                .w_full()
+                .justify_end()
+                .gap_2()
+                .child(
+                    Button::new("management-plugin-consent-cancel")
+                        .small()
+                        .outline()
+                        .label(management_locale_text("Cancel", "取消", "取消"))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.plugin_consent = None;
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    Button::new("management-plugin-consent-agree")
+                        .small()
+                        .primary()
+                        .label(if consent.updating {
+                            management_locale_text("Agree & update", "同意并更新", "同意並更新")
+                        } else {
+                            management_locale_text("Agree & install", "同意并安装", "同意並安裝")
+                        })
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.confirm_plugin_consent(cx);
+                            cx.notify();
+                        })),
+                ),
+        );
+        column.into_any_element()
     }
 
     fn render_plugins_sidebar(&mut self, cx: &mut Context<Self>) -> AnyElement {
@@ -12789,9 +13046,13 @@ impl ManagementCenter {
                 Button::new("management-plugin-install")
                     .small()
                     .primary()
-                    .label(management_locale_text("Install", "安装", "安裝"))
+                    .label(management_locale_text(
+                        "Review & install",
+                        "查看权限并安装",
+                        "查看權限並安裝",
+                    ))
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.install_plugin(install_id.clone(), cx);
+                        this.begin_plugin_install(install_id.clone(), cx);
                         cx.notify();
                     })),
             );
@@ -12906,6 +13167,8 @@ impl ManagementCenter {
         }
         for update in updates {
             let plugin_id = update.plugin_id.clone();
+            let update_for_click = update.clone();
+            let needs_consent = update.permission_diff.requires_consent();
             let mut row = h_flex()
                 .w_full()
                 .min_w_0()
@@ -12931,7 +13194,7 @@ impl ManagementCenter {
                                 )),
                         ),
                 );
-            if update.permission_diff.requires_consent() {
+            if needs_consent {
                 row = row.child(management_market_chip(management_locale_text(
                     "New permissions",
                     "需要新权限",
@@ -12939,14 +13202,20 @@ impl ManagementCenter {
                 )));
             }
             row = row.child(
-                Button::new("management-plugin-update")
-                    .small()
-                    .primary()
-                    .label(management_locale_text("Update", "更新", "更新"))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.apply_plugin_update(plugin_id.clone(), cx);
-                        cx.notify();
-                    })),
+                Button::new(SharedString::from(format!(
+                    "management-plugin-update-{plugin_id}"
+                )))
+                .small()
+                .primary()
+                .label(if needs_consent {
+                    management_locale_text("Review update", "确认更新", "確認更新")
+                } else {
+                    management_locale_text("Update", "更新", "更新")
+                })
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.begin_plugin_update(update_for_click.clone(), cx);
+                    cx.notify();
+                })),
             );
             column = column.child(row);
         }
@@ -40927,6 +41196,77 @@ fn management_market_chip(label: impl Into<SharedString>) -> AnyElement {
         .xsmall()
         .child(label.into())
         .into_any_element()
+}
+
+/// One permission in the Plugins consent sheet.
+///
+/// The key is the contract the service checks; the risk and scope are what
+/// lets a reader decide whether to agree without opening the manifest.
+fn plugin_permission_row(
+    permission: &vibex_core::PluginPermission,
+    is_new: bool,
+    cx: &App,
+) -> AnyElement {
+    let (risk, color) = match permission.risk {
+        vibex_core::PluginPermissionRisk::Low => (
+            management_locale_text("Low risk", "低风险", "低風險"),
+            ColorName::Green,
+        ),
+        vibex_core::PluginPermissionRisk::Medium => (
+            management_locale_text("Medium risk", "中风险", "中風險"),
+            ColorName::Amber,
+        ),
+        vibex_core::PluginPermissionRisk::High => (
+            management_locale_text("High risk", "高风险", "高風險"),
+            ColorName::Red,
+        ),
+    };
+    let mut head = h_flex().w_full().items_center().gap_2().child(
+        div()
+            .text_xs()
+            .font_semibold()
+            .child(permission.key.clone()),
+    );
+    if is_new {
+        head = head.child(management_market_chip(management_locale_text(
+            "New", "新增", "新增",
+        )));
+    }
+    head = head.child(Tag::color(color).outline().xsmall().child(risk));
+
+    let mut row = v_flex()
+        .w_full()
+        .gap(px(2.0))
+        .p_2()
+        .rounded(cx.theme().radius)
+        .border_1()
+        .border_color(cx.theme().border.opacity(0.6))
+        .child(head);
+    if let Some(scope) = permission
+        .scope
+        .as_deref()
+        .filter(|scope| !scope.is_empty())
+    {
+        row = row.child(
+            div()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(scope.to_string()),
+        );
+    }
+    if let Some(reason) = permission
+        .reason
+        .as_deref()
+        .filter(|reason| !reason.is_empty())
+    {
+        row = row.child(
+            div()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(reason.to_string()),
+        );
+    }
+    row.into_any_element()
 }
 
 /// The state tag on a market card, in the one tone its meaning deserves.
