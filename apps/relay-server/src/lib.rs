@@ -30,6 +30,14 @@ pub type RelayServerRouter = Router;
 #[derive(Clone)]
 pub struct RelayServerConfig {
     pub bind_addr: SocketAddr,
+    /// The largest WebSocket message the Relay accepts.
+    ///
+    /// Kept separate from the HTTP body limit: a peer frame carries an E2EE
+    /// envelope whose ciphertext is base64 encoded, so the wire message is
+    /// roughly a third larger than the JSON page it transports. When this
+    /// limit equals the page budget, a legal page becomes an oversized frame
+    /// and the Relay closes the PC socket.
+    pub max_websocket_frame_bytes: usize,
     pub service_name: String,
     pub server_version: String,
     pub room_ttl_ms: i64,
@@ -75,6 +83,7 @@ impl std::fmt::Debug for RelayServerConfig {
             .field("max_connections_per_room", &self.max_connections_per_room)
             .field("max_devices_per_room", &self.max_devices_per_room)
             .field("max_body_bytes", &self.max_body_bytes)
+            .field("max_websocket_frame_bytes", &self.max_websocket_frame_bytes)
             .field("rate_limit_window_ms", &self.rate_limit_window_ms)
             .field(
                 "max_requests_per_window_per_room",
@@ -148,6 +157,10 @@ impl RelayServerConfig {
             "VIBEX_RELAY_MAX_DEVICES_PER_ROOM",
         )?;
         apply_env_usize(&mut config.max_body_bytes, "VIBEX_RELAY_MAX_BODY_BYTES")?;
+        apply_env_usize(
+            &mut config.max_websocket_frame_bytes,
+            "VIBEX_RELAY_MAX_WEBSOCKET_FRAME_BYTES",
+        )?;
         apply_env_i64(
             &mut config.rate_limit_window_ms,
             "VIBEX_RELAY_RATE_LIMIT_WINDOW_MS",
@@ -233,6 +246,7 @@ impl RelayServerConfig {
             || self.max_connections_per_room == 0
             || self.max_devices_per_room == 0
             || self.max_body_bytes == 0
+            || self.max_websocket_frame_bytes == 0
             || self.max_requests_per_window_per_room == 0
             || self.max_queue_bytes_per_connection == 0
             || self.max_bandwidth_bytes_per_window == 0
@@ -359,6 +373,10 @@ impl Default for RelayServerConfig {
             max_connections_per_room: 1,
             max_devices_per_room: 8,
             max_body_bytes: 1024 * 1024,
+            // A 1 MiB timeline page becomes a ~1.4 MiB E2EE frame; leave
+            // headroom for the envelope while keeping one connection's
+            // buffered bytes bounded by the queue limit below.
+            max_websocket_frame_bytes: 2 * 1024 * 1024,
             rate_limit_window_ms: 1000,
             max_requests_per_window_per_room: 120,
             max_queue_bytes_per_connection: 4 * 1024 * 1024,
@@ -426,6 +444,7 @@ pub struct RelayServerFeatures {
 #[serde(rename_all = "camelCase")]
 pub struct RelayServerLimits {
     pub room_ttl_ms: i64,
+    pub max_websocket_frame_bytes: usize,
     pub bridge_timeout_ms: i64,
     pub heartbeat_timeout_ms: i64,
     pub max_rooms: usize,
@@ -843,6 +862,7 @@ impl RelayServerState {
             },
             limits: RelayServerLimits {
                 room_ttl_ms: config.room_ttl_ms,
+                max_websocket_frame_bytes: config.max_websocket_frame_bytes,
                 bridge_timeout_ms: config.bridge_timeout_ms,
                 heartbeat_timeout_ms: config.heartbeat_timeout_ms,
                 max_rooms: config.max_rooms,
@@ -1013,7 +1033,7 @@ impl RelayServerState {
                 "relay peer message could not be serialized",
             )
         })?;
-        if encoded.len() > self.config().max_body_bytes {
+        if encoded.len() > self.config().max_websocket_frame_bytes {
             return Err(RelayServerError::new(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 RelayErrorCode::InvalidFrame,
@@ -1789,7 +1809,7 @@ async fn ws(
         Ok(guard) => guard,
         Err(error) => return error.into_response(),
     };
-    let max_message_bytes = state.config().max_body_bytes;
+    let max_message_bytes = state.config().max_websocket_frame_bytes;
     upgrade
         .max_message_size(max_message_bytes)
         .max_frame_size(max_message_bytes)
@@ -2422,6 +2442,7 @@ mod tests {
         let mut config = test_config();
         config.max_total_connections = 1;
         config.max_body_bytes = 1024;
+        config.max_websocket_frame_bytes = 1024;
         let router = build_router(config);
         let url = spawn_ws_server(router.clone()).await;
         let (mut first, _) = connect_async(url.clone()).await.unwrap();
@@ -2457,6 +2478,74 @@ mod tests {
         // violation is observed, the peer may receive a protocol read error
         // instead of a decoded Close frame. Both are a bounded rejection; a
         // normal data frame would indicate that the hard limit was bypassed.
+        assert!(matches!(
+            closed,
+            None | Some(Ok(ClientMessage::Close(_))) | Some(Err(_))
+        ));
+        wait_for_active_rooms(router, 0).await;
+    }
+
+    #[tokio::test]
+    async fn websocket_frames_use_the_websocket_limit_not_the_http_body_limit() {
+        let mut config = test_config();
+        config.max_body_bytes = 1024;
+        config.max_websocket_frame_bytes = 4096;
+        let router = build_router(config);
+        let url = spawn_ws_server(router.clone()).await;
+        let (mut pc, _) = connect_async(url).await.unwrap();
+
+        let room_id = RelayRoomId::new();
+        let peer_id = RelayPeerId::new();
+        pc.send(ClientMessage::Text(
+            serde_json::to_string(&RelayControlMessage::Hello(RelayHandshakeHello::new(
+                room_id.clone(),
+                peer_id.clone(),
+                "pc-public",
+            )))
+            .unwrap()
+            .into(),
+        ))
+        .await
+        .unwrap();
+        wait_for_active_rooms(router.clone(), 1).await;
+
+        // Larger than the HTTP body limit, still a legal peer frame. The PC
+        // must stay registered: closing here is what made a phone reconnect
+        // into an empty room while the desktop was still running.
+        pc.send(ClientMessage::Text("x".repeat(2048).into()))
+            .await
+            .unwrap();
+        pc.send(ClientMessage::Text(
+            serde_json::to_string(&RelayControlMessage::Heartbeat(RelayHeartbeat {
+                room_id: room_id.clone(),
+                peer_id: peer_id.clone(),
+                connection_id: None,
+                sequence: 1,
+                sent_at_ms: unix_timestamp_ms(),
+            }))
+            .unwrap()
+            .into(),
+        ))
+        .await
+        .unwrap();
+        let ack = tokio::time::timeout(Duration::from_secs(1), pc.next())
+            .await
+            .expect("the PC socket was closed by a frame under the websocket limit")
+            .expect("the PC socket ended while waiting for its heartbeat ack")
+            .expect("the heartbeat ack frame was invalid");
+        assert!(matches!(
+            ack,
+            ClientMessage::Text(text) if text.contains("heartbeat_ack")
+        ));
+        wait_for_active_rooms(router.clone(), 1).await;
+
+        // The websocket limit still bounds the frame.
+        pc.send(ClientMessage::Text("x".repeat(8192).into()))
+            .await
+            .unwrap();
+        let closed = tokio::time::timeout(Duration::from_secs(1), pc.next())
+            .await
+            .expect("oversized websocket frame was not rejected");
         assert!(matches!(
             closed,
             None | Some(Ok(ClientMessage::Close(_))) | Some(Err(_))

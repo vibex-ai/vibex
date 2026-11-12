@@ -2880,10 +2880,21 @@ impl AgentManager {
     /// attachment, because the desktop can open it from the item. A phone
     /// pays for that payload on every page, so the remote answer replaces it
     /// with a bounded marker; the detail read still carries the bytes.
+    ///
+    /// The page is also clamped to [`vibex_core::REMOTE_TIMELINE_PAGE_MAX_BYTES`].
+    /// The caller's budget describes what it can render; it does not know the
+    /// Relay's frame limit, and the E2EE envelope is larger than the page.
     pub async fn fetch_timeline_remote(
         &self,
-        request: FetchTimelineRequest,
+        mut request: FetchTimelineRequest,
     ) -> VibexResult<TimelinePage> {
+        request.max_bytes = Some(
+            request
+                .max_bytes
+                .map_or(vibex_core::REMOTE_TIMELINE_PAGE_MAX_BYTES, |bytes| {
+                    bytes.min(vibex_core::REMOTE_TIMELINE_PAGE_MAX_BYTES)
+                }),
+        );
         let mut page = self.fetch_timeline(request).await?;
         page.items = page
             .items
