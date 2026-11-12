@@ -332,7 +332,7 @@ Vibex 使用 [Agent Client Protocol](https://agentclientprotocol.com/)（ACP）�
 
 从 [GitHub Releases](https://github.com/vibex-ai/vibex/releases/latest) 下载与你平台匹配的安装包：
 
-- **Linux：** x86_64 使用 `.deb` 或 AppImage；aarch64 使用 `.deb`。
+- **Linux：** x86_64 使用 `.deb`、`.rpm` 或 AppImage；aarch64 使用 `.deb` 或 `.rpm`。
 - **macOS：** Apple 芯片或 Intel 使用 `.dmg`。
 - **Windows：** x86_64 或 ARM64 使用 NSIS `.exe`。
 

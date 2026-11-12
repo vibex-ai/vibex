@@ -12,6 +12,7 @@ import {
 import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { buildRpmPackage } from "./build-rpm.mjs";
 import { compressDebPackage } from "./compress-deb.mjs";
 import { verifyMacosDmg } from "./sign-macos-app.mjs";
 
@@ -224,12 +225,26 @@ function hostArchitecture() {
 function normalizedArtifacts(platform, arch, version, packageDirectory) {
   const files = filesUnder(packageDirectory);
   if (platform === "linux") {
-    const deb = exactlyOne(files.filter((path) => path.endsWith(".deb")), "Linux deb package");
+    const deb = exactlyOne(
+      files.filter((path) => path.endsWith(".deb")),
+      "Linux deb package"
+    );
+    const rpm = exactlyOne(
+      files.filter((path) => path.endsWith(".rpm")),
+      "Linux rpm package"
+    );
     const artifacts = [
       {
         source: deb,
         name: `vibex-${version}-linux-${arch}-deb.deb`,
         package: "deb",
+        os: "linux",
+        arch
+      },
+      {
+        source: rpm,
+        name: `vibex-${version}-linux-${arch}-rpm.rpm`,
+        package: "rpm",
         os: "linux",
         arch
       }
@@ -345,6 +360,20 @@ function main() {
           console.log(`${entry}: ${result.before} -> ${result.after} bytes`);
         }
       }
+      // cargo-packager 0.11.8 has no rpm bundler, so the reviewed deb payload is
+      // repacked by scripts/build-rpm.mjs. The channel configuration supplies
+      // the package metadata; the generated cross config only moves the
+      // binaries and drops the PDFium resources for the deferred architectures.
+      const deb = exactlyOne(
+        readdirSync(packageDirectory).filter((entry) => entry.endsWith(".deb")),
+        "Linux deb package"
+      );
+      buildRpmPackage({
+        deb: join(packageDirectory, deb),
+        outDir: packageDirectory,
+        configPath: `apps/desktop/Packager.${channel}.toml`,
+        target: triple
+      });
     }
   } finally {
     if (generatedConfig) rmSync(generatedConfig, { force: true });

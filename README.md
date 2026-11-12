@@ -332,7 +332,7 @@ Mobile never starts a local Agent, owns a workspace filesystem, mutates local Gi
 
 Download the package for your platform from [GitHub Releases](https://github.com/vibex-ai/vibex/releases/latest):
 
-- **Linux:** `.deb` or AppImage (x86_64); `.deb` for aarch64.
+- **Linux:** `.deb`, `.rpm`, or AppImage (x86_64); `.deb` or `.rpm` for aarch64.
 - **macOS:** `.dmg` for Apple silicon or Intel.
 - **Windows:** NSIS `.exe` for x86_64 or ARM64.
 

@@ -152,6 +152,83 @@ excludedLibs = ["libpdfium.so", "libwayland*"]
 static contract -> build -> extract and inspect -> isolated Wayland startup -> publish
 ```
 
+## Scenario: Linux RPM Packaging
+
+### 1. Scope / Trigger
+
+- Trigger: changing the Linux desktop package commands, `scripts/build-rpm.mjs`,
+  the updater manifest, or a tagged/candidate Linux release workflow.
+- The pinned cargo-packager (0.11.8) has no RPM bundler, so the RPM is derived
+  from the reviewed `.deb` rather than from the packager itself.
+
+### 2. Signatures
+
+```text
+scripts/build-rpm.mjs --config apps/desktop/Packager.<channel>.toml --out-dir <dir>
+rpmbuild -bb <generated.spec> --target <triple> --define "_topdir <dir>"
+pnpm package:{preview,rc,stable}
+node scripts/check-release.mjs
+```
+
+### 3. Contracts
+
+- `scripts/build-rpm.mjs` extracts `data.tar.*` from the `.deb` ar archive and
+  drives `rpmbuild`; the installed files, modes, and embedded PDFium runtime stay
+  byte-identical to the reviewed `.deb`.
+- The generated spec sets `__strip` and `__objcopy` to `/bin/true`. Stripping
+  would rewrite the reviewed ELF payload and cannot process the cross-built
+  aarch64 binaries.
+- `rpmbuild` derives library `Requires` from ELF `NEEDED`; `/bin/sh` is required
+  explicitly for the `vibex-tui` launcher. Never hand-translate Debian package
+  names into RPM names.
+- A prerelease `-` becomes RPM's `~`, so `0.1.0-preview.1` sorts below `0.1.0`.
+- The GPU/channel identity comes from the same `build-channel.mjs` build as the
+  deb and AppImage, so `vibex status` reports `channel-source=packaged`.
+- The release publishes `vibex-<version>-linux-<arch>-rpm.rpm` for x86_64 and
+  aarch64 and binds it in the updater manifest as `rpm`/`system_installer`.
+
+### 4. Validation & Error Matrix
+
+| Condition | Required result |
+| --- | --- |
+| `rpmbuild` is missing on the packaging host | `build-rpm.mjs` fails with the host requirement. |
+| The `.deb` carries no `data.tar` | Fail before staging. |
+| The staged tree is empty | Fail instead of emitting an empty RPM. |
+| `__strip` is left at the host `strip` | Reject: it rewrites reviewed bytes and fails on aarch64. |
+| The release lacks `*-linux-*-rpm.rpm` | `require_artifact_class` fails the publish job. |
+| The manifest omits the rpm artifact | `pnpm check:release` fails. |
+
+### 5. Good / Base / Bad Cases
+
+- Good: the x86_64 RPM contains the same PDFium runtime as the `.deb`, carries
+  `libc.so.6()(64bit)` requirements, and installs on an RPM distro.
+- Base: the aarch64 RPM is cross-built on the x86_64 runner without the PDFium
+  payload and still carries the SONAME requirements from the aarch64 ELF.
+- Bad: running the host `strip` over the aarch64 payload, which aborts the build
+  and would have altered the reviewed binaries.
+
+### 6. Tests Required
+
+- Run `pnpm check:release` and `node scripts/release-body.test.mjs`.
+- Build the affected channel `.deb`, run `scripts/build-rpm.mjs`, and assert
+  `rpm -qp --qf '%{ARCH}'` reports the expected architecture.
+- Assert the RPM dependency set matches the deb's runtime libraries by SONAME,
+  not by distro package name.
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```text
+deb -> hand-written Requires mapping -> rpmbuild with the host strip
+```
+
+#### Correct
+
+```text
+reviewed deb -> extract data.tar -> spec with __strip=/bin/true -> rpmbuild -> SHA-256 sidecar
+```
+
 ## Scenario: Shared GPUI Backend Facade, Terminal Reset, And Safe Debug
 
 ### 1. Scope / Trigger
@@ -2051,7 +2128,7 @@ approved deviation ids, in order -> [
   rely on POSIX-only inline env syntax or a previously cached binary. The current
   release validates Linux only and makes no macOS/Windows buildability claim.
 - Linux release evidence binds the exact source-input tree, Cargo.lock, retained
-  channel binaries, `.deb`/AppImage artifacts, compiled app-id/home probes, and
+  channel binaries, `.deb`/AppImage/RPM artifacts, compiled app-id/home probes, and
   retained Tauri rollback binary. Its only platform dispositions are passed Linux
   Wayland/XWayland and explicit `accepted_deviation` for macOS/Windows, with
   `crossPlatformBuildClaim=false`.

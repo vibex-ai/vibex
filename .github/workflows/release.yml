@@ -133,7 +133,8 @@ jobs:
             libx11-xcb-dev \
             libxkbcommon-x11-dev \
             libzstd-dev \
-            patchelf
+            patchelf \
+            rpm
       - name: Install Linux arm64 cross dependencies
         if: matrix.platform == 'linux' && matrix.arch == 'aarch64'
         run: |
@@ -206,7 +207,8 @@ jobs:
             libwebkit2gtk-4.1-dev:arm64 \
             libx11-xcb-dev:arm64 \
             libxkbcommon-x11-dev:arm64 \
-            libzstd-dev:arm64
+            libzstd-dev:arm64 \
+            rpm
       - name: Configure Linux arm64 cross environment
         if: matrix.platform == 'linux' && matrix.arch == 'aarch64'
         shell: bash
@@ -570,6 +572,13 @@ jobs:
             fi
           done
           require_artifact_class '*-linux-*-appimage.AppImage' 'Linux AppImage'
+          for arch in aarch64 x86_64; do
+            rpm="target/publish/vibex-${version}-linux-${arch}-rpm.rpm"
+            if [[ -f "${rpm}" ]]; then
+              manifest_args+=(--artifact "linux|$(manifest_arch "${arch}")|rpm|system_installer|${rpm}|${repository_url}/$(basename "${rpm}")")
+            fi
+          done
+          require_artifact_class '*-linux-*-rpm.rpm' 'Linux rpm'
           # Headless runtime artifacts are built in the pinned Debian 12 image
           # and checked against the glibc 2.35 floor before publishing.
           for arch in aarch64 x86_64; do

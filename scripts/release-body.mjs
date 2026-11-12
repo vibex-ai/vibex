@@ -205,7 +205,8 @@ function desktopArtifacts(version, { os, arch }) {
   }
   return [
     { name: `vibex-${version}-linux-${arch}-appimage.AppImage`, label: "AppImage" },
-    { name: `vibex-${version}-linux-${arch}-deb.deb`, label: "deb" }
+    { name: `vibex-${version}-linux-${arch}-deb.deb`, label: "deb" },
+    { name: `vibex-${version}-linux-${arch}-rpm.rpm`, label: "RPM" }
   ];
 }
 

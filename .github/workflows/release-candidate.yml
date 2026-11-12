@@ -62,7 +62,8 @@ jobs:
             libx11-xcb-dev \
             libxkbcommon-x11-dev \
             libzstd-dev \
-            patchelf
+            patchelf \
+            rpm
       - name: Install dependencies and packager
         run: |
           pnpm install --frozen-lockfile
@@ -79,6 +80,11 @@ jobs:
         run: NO_STRIP=1 cargo packager --config "apps/desktop/Packager.${{ inputs.channel }}.toml" --formats deb,appimage
       - name: Compress deb payload with xz
         run: node scripts/compress-deb.mjs "target/release-packages/${{ inputs.channel }}"
+      - name: Build rpm package
+        run: >-
+          node scripts/build-rpm.mjs
+          --config "apps/desktop/Packager.${{ inputs.channel }}.toml"
+          --out-dir "target/release-packages/${{ inputs.channel }}"
       - name: Upload exact Linux candidate for native lifecycle gates
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:

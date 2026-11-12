@@ -6,16 +6,16 @@ embeds the other product's assets.
 
 | Product | Artifact | Build command | Determinism | Required validation |
 | --- | --- | --- | --- | --- |
-| Desktop Preview | Linux `.deb`/AppImage | `pnpm package:preview` | Source, Cargo lock, PDFium lock | `pnpm check:release`, package smoke, native content gates |
-| Desktop RC/Stable Linux x86_64 | `.deb`/AppImage | `pnpm package:rc` / `pnpm package:stable` | Source, Cargo lock, release channel, reviewed Linux PDFium | Release runbook, signing, install and rollback evidence |
-| Desktop RC/Stable Linux aarch64 | `.deb` (cross-built, no PDFium payload) | `node scripts/package-desktop-release.mjs --platform linux --arch aarch64` | Source, Cargo lock, release channel, cross toolchain | Package existence and checksum; native validation deferred with the PDFium review |
+| Desktop Preview | Linux `.deb`/AppImage/`.rpm` | `pnpm package:preview` | Source, Cargo lock, PDFium lock | `pnpm check:release`, package smoke, native content gates |
+| Desktop RC/Stable Linux x86_64 | `.deb`/AppImage/`.rpm` | `pnpm package:rc` / `pnpm package:stable` | Source, Cargo lock, release channel, reviewed Linux PDFium | Release runbook, signing, install and rollback evidence |
+| Desktop RC/Stable Linux aarch64 | `.deb`/`.rpm` (cross-built, no PDFium payload) | `node scripts/package-desktop-release.mjs --platform linux --arch aarch64` | Source, Cargo lock, release channel, cross toolchain | Package existence and checksum; native validation deferred with the PDFium review |
 | Desktop RC/Stable macOS aarch64/x86_64 | `.dmg` | `node scripts/package-desktop-release.mjs --platform macos --arch aarch64\|x86_64` | Source, Cargo lock, native macOS runner | Package existence and checksum; ad-hoc bundle signature read back from the dmg; Developer ID signing and notarization when credentials exist |
 | Desktop RC/Stable Windows x86_64/aarch64 | NSIS `.exe` | `node scripts/package-desktop-release.mjs --platform windows --arch x86_64\|aarch64` | Source, Cargo lock, native Windows runner (aarch64 via cross-compile) | Package existence and checksum; Authenticode when credentials exist |
 | Android mobile | Signed native GPUI APK + AAB | `pnpm package:mobile:android` locally; tagged workflow signs before upload | Rust source, Cargo lock, pinned gpui-pre/gpui-pre-mobile revisions, Gradle wrapper, Android API 35/NDK, release key | `pnpm check:mobile-native`, `apksigner`/`jarsigner` verification, APK/AAB checksum, device validation |
 | iOS mobile | Unsigned simulator app + unsigned device IPA + XCFramework | `pnpm build:mobile:ios` and `pnpm package:mobile:ios` on macOS | Rust source, Cargo lock, pinned gpui-pre/gpui-pre-mobile revisions, XcodeGen project | `pnpm check:mobile-native`, simulator/device validation; the installer re-signs the IPA, see [Installing the Unsigned iOS Build](./ios-unsigned-install.md) |
 | Headless server Linux x86_64/aarch64 | `vibex-server-<version>-linux-<arch>.tar.gz` + `.sha256` | `deploy/server/Dockerfile.build` in the tagged workflow; the link step runs inside the pinned Debian 12 image | Debian 12 base digest, Rust 1.99.1, Cargo lock, deterministic tar | `scripts/check-server-artifact.mjs` (ELF arch, no `libdbus`/`libsystemd`, `GLIBC_*` ≤ 2.35), `sha256sum -c`, clean Ubuntu 22.04/24.04 `--version` and `config-check` |
 | Relay | Transport container | `pnpm smoke:relay:local` plus deployment scripts | Rust source and Cargo lock | Health/API smoke, TLS/NAT/operator validation |
-| Terminal (TUI) | Ships inside the desktop packages as a second, non-main `vibex` binary, plus the `vibex-tui` launcher on Linux and Windows | Same package commands as the desktop channel | Same as the desktop channel, including the compiled channel the binary answers from | `vibex status` must report the channel the package was built as (`channel-source=packaged`), `/usr/bin/vibex-tui` and `/usr/bin/vibex` must both be present in the `.deb` and AppImage, the NSIS installer must put its directory on the user `PATH`, and the console subsystem must be verified on Windows. |
+| Terminal (TUI) | Ships inside the desktop packages as a second, non-main `vibex` binary, plus the `vibex-tui` launcher on Linux and Windows | Same package commands as the desktop channel | Same as the desktop channel, including the compiled channel the binary answers from | `vibex status` must report the channel the package was built as (`channel-source=packaged`), `/usr/bin/vibex-tui` and `/usr/bin/vibex` must both be present in the `.deb`, AppImage, and RPM, the NSIS installer must put its directory on the user `PATH`, and the console subsystem must be verified on Windows. |
 | AUR `vibex-bin` | `PKGBUILD` + `.SRCINFO` that unpack the published Linux `.deb` | `.github/workflows/publish-aur.yml`; local dry run is `node scripts/publish-aur.mjs --version <x.y.z> --dry-run` | Stable only; the checksums of the release `.deb` payloads | `makepkg` must build the package from the release assets, `namcap` runs on it, and `publish-aur.mjs` refuses a prerelease or a version that is not newer than the AUR's |
 
 ## Linux AppImage Packaging Rules
@@ -48,6 +48,28 @@ embeds the other product's assets.
   `.deb` (the 0.1.0-rc.8 preview payload drops from 119.8 MB to 69.8 MB).
 - Building a `.deb` requires `xz` on the packaging host; the repacked package
   must still extract with `dpkg-deb -x`/`-e`.
+
+## Linux rpm Packaging Rules
+
+- cargo-packager 0.11.8 has no RPM bundler and the project pins no separate RPM
+  tool, so `scripts/build-rpm.mjs` repacks the reviewed `.deb` payload with
+  `rpmbuild`. The installed files, modes, and embedded PDFium runtime stay
+  byte-identical to the `.deb`; only the package metadata is new.
+- The generated spec neutralizes rpmbuild's `brp-strip` scripts by pointing
+  `__strip` and `__objcopy` at `/bin/true`. Stripping would rewrite the already
+  reviewed ELF payload and cannot process the cross-built aarch64 binaries.
+- `rpmbuild` derives library `Requires` from the ELF `NEEDED` entries, so the
+  native x86_64 and cross-built aarch64 packages carry the same SONAME-based
+  dependencies; `/bin/sh` is required explicitly for the `vibex-tui` launcher.
+- A prerelease version keeps its ordering: the first `-` becomes RPM's `~`, so
+  `0.1.0-preview.1` orders below the final `0.1.0`.
+- Building an `.rpm` requires `rpmbuild` on the packaging host: the `rpm`
+  package on Debian/Ubuntu (installed on the release runners) and `rpm-tools`
+  on Arch.
+- The release publishes `vibex-<version>-linux-<arch>-rpm.rpm` beside the deb.
+  The updater manifest binds it as an `rpm`/`system_installer` artifact, and the
+  app-update crate already detects an RPM installation and hands the verified
+  package to the system installer.
 
 ## Terminal Client Rules
 
