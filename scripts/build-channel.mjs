@@ -29,14 +29,22 @@ const LINUX_X86_64_LINK_FLAGS =
 // `vibex-desktop` only depends on `vibex-client` as a library, so building the
 // desktop package alone never produces `target/release/vibex` and cargo
 // packager fails to copy it into the package.
+//
+// The Windows NSIS template delegates that package's PATH edits to
+// `vibex-installer-env`, so it is built for Windows targets too. Linux and
+// macOS have no use for a Windows registry helper and keep their existing
+// package contents.
+const needsInstallerEnv = target?.includes("windows") ?? process.platform === "win32";
+const packages = [
+  "vibex-desktop",
+  "vibex-client",
+  ...(needsInstallerEnv ? ["vibex-installer-env"] : [])
+];
 const nativeBuildResult = spawnSync(
   process.env.CARGO || "cargo",
   [
     "build",
-    "-p",
-    "vibex-desktop",
-    "-p",
-    "vibex-client",
+    ...packages.flatMap((name) => ["-p", name]),
     "--release",
     "--locked",
     ...(target ? ["--target", target] : []),

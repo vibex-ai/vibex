@@ -22,6 +22,7 @@ members = [
   "crates/fs",
   "crates/git",
   "crates/gpui-tokio",
+  "crates/installer-env",
   "crates/model-catalog",
   "crates/model-gateway",
   "crates/relay",

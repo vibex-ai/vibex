@@ -8,7 +8,7 @@ use crate::{
     CorrelationId, DeviceId, ErrorCategory, EventId, RemoteActionClass, RemoteAuthProof,
     RemoteDeleteDeviceRequest, RemoteDeviceDetail, RemoteDevicePermissionLevel,
     RemoteOperationKind, RemoteRenameDeviceRequest, RemoteRenameRuntimeRequest,
-    RemoteRestoreDeviceRequest, RemoteRevokeDeviceRequest, RequestId, VibexError,
+    RemoteRestoreDeviceRequest, RemoteRevokeDeviceRequest, RequestId, VibexError, VibexSessionId,
     unix_timestamp_ms,
 };
 
@@ -394,6 +394,14 @@ pub struct RemoteSubscribeRequestV2 {
     pub subscription_id: String,
     #[serde(default)]
     pub topics: Vec<String>,
+    /// Which sessions' timeline events this connection wants.
+    ///
+    /// `None` keeps the historical behavior — every session the device may
+    /// read — so an older client that never sends the field is unchanged.
+    /// `Some([])` asks for no timeline session at all, which is what a phone
+    /// uses while it is in the background.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_ids: Option<Vec<VibexSessionId>>,
     #[serde(default)]
     pub cursors: Vec<RemoteStreamCursor>,
 }
