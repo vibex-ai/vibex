@@ -15932,11 +15932,9 @@ impl VibexWorkbench {
                                     "WSL 執行階段已連線"
                                 )
                             ));
-                            let progress_open = this
-                                .settings_view
-                                .read_with(cx, |settings, _| {
-                                    settings.connections_wsl_progress_open
-                                });
+                            let progress_open = this.settings_view.read_with(cx, |settings, _| {
+                                settings.connections_wsl_progress_open
+                            });
                             this.settings_view.update(cx, |settings, cx| {
                                 settings.reload_connections_profiles();
                                 settings.connections_wsl_progress_open = false;
@@ -15947,9 +15945,7 @@ impl VibexWorkbench {
                             // row and the success hint; leaving the progress
                             // dialog behind would ask the reader to close a run
                             // that has already finished.
-                            if progress_open
-                                && let Some(window) = this.window_handle
-                            {
+                            if progress_open && let Some(window) = this.window_handle {
                                 let _ = window.update(cx, |_, window, cx| {
                                     window.close_dialog(cx);
                                 });
@@ -121448,9 +121444,7 @@ mod tests {
         let source = include_str!("app.rs");
         let resolve = source
             .split_once("    fn resolve_ssh_profile_provisioning(")
-            .and_then(|(_, tail)| {
-                tail.split_once("\n    /// Makes the preparing window visible")
-            })
+            .and_then(|(_, tail)| tail.split_once("\n    /// Makes the preparing window visible"))
             .map(|(body, _)| body)
             .expect("the start path should remain inspectable");
         let placeholder = resolve
@@ -121498,13 +121492,13 @@ mod tests {
         // dialog reopen by itself at step one.
         let sync = source
             .split_once("    fn sync_ssh_provisioning_settings(")
-            .and_then(|(_, tail)| {
-                tail.split_once("\n    fn finish_ssh_provisioning(")
-            })
+            .and_then(|(_, tail)| tail.split_once("\n    fn finish_ssh_provisioning("))
             .map(|(body, _)| body)
             .expect("the settings sync should remain inspectable");
         assert!(
-            sync.contains("connections_progress_dismissed = Some((profile_id.clone(), attempt_id))"),
+            sync.contains(
+                "connections_progress_dismissed = Some((profile_id.clone(), attempt_id))"
+            ),
             "a dismissed placeholder has to suppress the run it became"
         );
     }
@@ -121529,9 +121523,7 @@ mod tests {
             .expect("the install path must reload the registry the pairing wrote");
         let activate = install
             .find("self.mark_runtime_active(&runtime_id, cx);")
-            .unwrap_or_else(|| {
-                panic!("the install path must still activate the runtime")
-            });
+            .unwrap_or_else(|| panic!("the install path must still activate the runtime"));
         assert!(
             reload < activate,
             "the registry has to contain the runtime before it becomes active"
