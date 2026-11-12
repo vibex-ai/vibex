@@ -3266,7 +3266,10 @@ impl ManagementBackend for NativeBackend {
                 .providers()
                 .service()
                 .add_model_provider_credential(request.payload)?;
-            runtime.model_gateway().invalidate_snapshot();
+            // A Key is part of what a route group's members resolve through, so
+            // the catalogue a bound Agent sees is rebuilt here for the same
+            // reason an edit rebuilds it.
+            refresh_gateway_catalog(&runtime)?;
             Ok(profile)
         })
     }
@@ -3283,7 +3286,10 @@ impl ManagementBackend for NativeBackend {
                 .providers()
                 .service()
                 .remove_model_provider_credential(request.payload)?;
-            runtime.model_gateway().invalidate_snapshot();
+            // A Key is part of what a route group's members resolve through, so
+            // the catalogue a bound Agent sees is rebuilt here for the same
+            // reason an edit rebuilds it.
+            refresh_gateway_catalog(&runtime)?;
             Ok(profile)
         })
     }
@@ -3402,8 +3408,12 @@ impl ManagementBackend for NativeBackend {
                 .management()
                 .providers()
                 .management()
-                .delete_model_provider_profile(&request.payload)
-                .map_err(Into::into)
+                .delete_model_provider_profile(&request.payload)?;
+            // A deleted Provider's Models leave the catalogue its bound route
+            // groups serve, so the hidden per-Agent gateway Profiles have to be
+            // rebuilt as well.
+            refresh_gateway_catalog(&runtime)?;
+            Ok(())
         })
     }
 
@@ -3444,12 +3454,19 @@ impl ManagementBackend for NativeBackend {
         Box::pin(async move {
             request.validate()?;
             runtime.ensure_accepting_actions()?;
-            runtime
+            let profile = runtime
                 .management()
                 .providers()
                 .management()
                 .update_model_provider_profile(request.payload)
-                .map_err(Into::into)
+                .map_err(BackendError::from)?;
+            // A route group serves the Models of the Providers its members name,
+            // so a Provider edit changes what every bound group publishes. The
+            // hidden per-Agent gateway Profiles are that published catalogue;
+            // without this they keep the list they were built from, and the
+            // Agent behind the group never sees the Model the Provider gained.
+            refresh_gateway_catalog(&runtime)?;
+            Ok(profile)
         })
     }
 
@@ -3659,12 +3676,16 @@ impl ManagementBackend for NativeBackend {
         Box::pin(async move {
             request.validate()?;
             runtime.ensure_accepting_actions()?;
-            runtime
+            let profile = runtime
                 .management()
                 .providers()
                 .management()
-                .mutate_provider_credential_secret(request.payload)
-                .map_err(Into::into)
+                .mutate_provider_credential_secret(request.payload)?;
+            // A replaced or cleared Key is what a gateway member resolves its
+            // upstream authentication from, so the catalogue a bound Agent sees
+            // has to be rebuilt with it.
+            refresh_gateway_catalog(&runtime)?;
+            Ok(profile)
         })
     }
 

@@ -1470,9 +1470,9 @@ impl ManagementCenter {
                 "management-provider-models-section",
                 management_locale_text("Models", "模型", "模型"),
                 Some(management_locale_text(
-                    "What this Provider offers to the Agents that use it. Turned-off models stay out of every picker.",
-                    "该供应商提供给 Agent 的模型；停用的模型不会出现在任何选择器中。",
-                    "該供應商提供給 Agent 的模型；停用的模型不會出現在任何選擇器中。",
+                    "What this Provider offers to every Agent that uses it. A change here reaches all of them; turned-off models stay out of every picker.",
+                    "该供应商提供给所有使用它的 Agent。此处的修改会同步到每一个 Agent；停用的模型不会出现在任何选择器中。",
+                    "該供應商提供給所有使用它的 Agent。此處的修改會同步到每一個 Agent；停用的模型不會出現在任何選擇器中。",
                 )),
                 Some(
                     div()

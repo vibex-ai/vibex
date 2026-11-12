@@ -826,7 +826,16 @@ impl ProviderProjectionCompatibilityRepository {
             display_name: candidate.display_name,
             vendor_hint: candidate.vendor_hint,
             endpoints: candidate.endpoints,
-            configured_models: candidate.configured_models,
+            // One launch row is one Agent's view of the catalogue, and that view
+            // is filtered by the protocols the Agent speaks. Taking it wholesale
+            // would delete every Model the other Agents can reach but this one
+            // cannot, so the record keeps its own list and the copy only
+            // contributes what it knows: a new Model, and each Model's label,
+            // capabilities and visibility.
+            configured_models: merge_model_catalog(
+                &existing.configured_models,
+                &candidate.configured_models,
+            ),
             default_model_id: candidate.default_model_id,
             headers: candidate.headers,
             // The note and the website are the fields an Agent-page edit can
@@ -1040,37 +1049,326 @@ impl ProviderProjectionCompatibilityRepository {
         let Some(legacy_id) = provider.legacy_provider_profile_id.as_ref() else {
             return Ok(false);
         };
+        Ok(
+            match Self::project_shared_provider_onto_legacy(conn, provider, legacy_id, None)? {
+                Some((_, changed)) => changed,
+                None => false,
+            },
+        )
+    }
+
+    /// Projects a shared Provider onto one specific launch row.
+    ///
+    /// [`Self::project_model_provider_to_legacy`] can only reach the row the
+    /// record was derived from, because `legacy_provider_profile_id` is unique
+    /// and names exactly one Agent. A Provider bound to a second Agent has no
+    /// such pointer — the binding is the only link — so the fan-out passes the
+    /// row explicitly. Everything else is the same projection: the shared
+    /// record owns the name, status, address, catalogue, default and Keys, and
+    /// the launch row is its Agent-facing copy.
+    ///
+    /// `configured_models` is supplied by the caller when the Agent's protocol
+    /// decided which Models it can actually reach; `None` derives the list from
+    /// the record, keeping each Model's declared protocol.
+    ///
+    /// Returns the row and whether it changed, or `None` when the row is gone.
+    pub fn project_shared_provider_onto_legacy(
+        conn: &Connection,
+        provider: &ModelProviderProfile,
+        legacy_id: &ProviderProfileId,
+        configured_models: Option<&[ProviderConfiguredModel]>,
+    ) -> VibexResult<Option<(ProviderProfile, bool)>> {
         let Some(mut legacy) = ProviderProfileRepository::get(conn, legacy_id)? else {
+            return Ok(None);
+        };
+        let changed = apply_shared_provider_to_legacy(&mut legacy, provider, configured_models);
+        if changed {
+            ProviderProfileRepository::update(conn, &legacy)?;
+            ProviderSecretReferenceRepository::replace_for_profile(
+                conn,
+                legacy_id,
+                &legacy.secrets,
+            )?;
+        }
+        Ok(Some((legacy, changed)))
+    }
+
+    /// Projects a shared Provider onto every Agent that binds it.
+    ///
+    /// The single-row projection above reaches one launch row, and only the one
+    /// the record happened to be derived from. A Provider bound to a second
+    /// Agent has no such pointer — `legacy_provider_profile_id` is `UNIQUE` and
+    /// already names the first Agent's row — so the binding is the only link,
+    /// and this walks it.
+    ///
+    /// Every Agent gets the same Provider-owned content: the name, status,
+    /// address, Keys, note and default. What stays per Agent is what describes
+    /// how that Agent launches: the ACP config's command and args, the protocol
+    /// pin, the import markers and the Agent's own sandbox defaults. Which
+    /// Models an Agent is offered is the intersection of the record's catalogue
+    /// with the protocols that Agent declares.
+    ///
+    /// Returns the launch rows that actually changed, so the caller can restale
+    /// the bindings and announce them.
+    pub fn sync_shared_provider_to_bindings(
+        conn: &Connection,
+        provider: &ModelProviderProfile,
+    ) -> VibexResult<Vec<ProviderProfile>> {
+        let registry = AgentProviderProjectionRegistry::builtin()?;
+        let mut touched_rows = Vec::new();
+        let mut changed_rows = Vec::new();
+        for binding in
+            AgentModelProviderBindingRepository::list_for_model_provider(conn, &provider.id)?
+        {
+            let Some(legacy_id) = binding.legacy_provider_profile_id.as_ref() else {
+                // A binding written natively on v2 has no launch row of its own;
+                // the projection engine reads the record through the binding. Its
+                // configured models are still a copy of the catalogue taken when
+                // it was written, so they are rebuilt in place below.
+                continue;
+            };
+            let Some(runtime) =
+                AgentRuntimeProfileRepository::get(conn, &binding.runtime_profile_id)?
+            else {
+                continue;
+            };
+            let Some(mut legacy) = ProviderProfileRepository::get(conn, legacy_id)? else {
+                continue;
+            };
+            // The hidden gateway row is written from the route catalogue, and
+            // its model ids are the listener's `group/<route>/<model>` names.
+            // Projecting the upstream catalogue onto it would leave the Agent
+            // pointed at a gateway that does not serve those ids.
+            if is_model_gateway_row(&legacy) {
+                continue;
+            }
+            let before = legacy.clone();
+            let interfaces = registry
+                .resolve(&runtime.version_identity)?
+                .descriptor
+                .model_interfaces;
+            let secrets = legacy_secrets_linked_by_lookup_key(provider, &before);
+            apply_shared_provider_fields(&mut legacy, provider, secrets);
+            sync_protocol_pins(&mut legacy, provider);
+            legacy.configured_models =
+                configured_models_for_agent(provider, &before, &legacy, &interfaces);
+            repair_legacy_default_model(&mut legacy);
+            let models =
+                enabled_model_ids(&legacy.configured_models, legacy.default_model.as_deref());
+            write_acp_models(&mut legacy.provider_options, &models)?;
+            let changed = finish_legacy_row(&mut legacy, &before);
+            if changed {
+                ProviderProfileRepository::update(conn, &legacy)?;
+                ProviderSecretReferenceRepository::replace_for_profile(
+                    conn,
+                    legacy_id,
+                    &legacy.secrets,
+                )?;
+                // The ACP catalogue the launch path reads from the runtime
+                // Profile is a second copy of the same list, and a Model this
+                // Agent gained is invisible until it names that Model too. A
+                // runtime Profile can in principle serve several bindings, and
+                // then its `models` is not this Provider's to write.
+                let shared_runtime =
+                    AgentModelProviderBindingRepository::list_for_runtime(conn, &runtime.id)?.len()
+                        > 1;
+                if !shared_runtime && runtime.models != models {
+                    let mut next = runtime.clone();
+                    next.models = models;
+                    next.revision = runtime.revision.saturating_add(1);
+                    next.updated_at_ms =
+                        unix_timestamp_ms().max(runtime.updated_at_ms.saturating_add(1));
+                    AgentRuntimeProfileRepository::update(conn, &next, runtime.revision)?;
+                }
+                changed_rows.push(legacy.clone());
+            }
+            touched_rows.push(legacy);
+        }
+        // Every binding is rebuilt, not only the ones behind a row that moved: a
+        // binding written before this fan-out existed still carries the model
+        // list it was created with, and nothing else would ever repair it.
+        let mut notified: Vec<ProviderProfileId> =
+            changed_rows.iter().map(|row| row.id.clone()).collect();
+        for legacy in &touched_rows {
+            if Self::rebuild_binding_models(conn, provider, legacy)?
+                && !notified.iter().any(|id| id == &legacy.id)
+            {
+                // The row itself did not move, but what the Agent may select did.
+                // A page that only hears about the record's own pointer would keep
+                // showing the list it had.
+                notified.push(legacy.id.clone());
+                changed_rows.push(legacy.clone());
+            }
+        }
+        Ok(changed_rows)
+    }
+
+    /// Rewrites a binding's configured models from the record's catalogue.
+    ///
+    /// Used for a binding that has no launch row — one written directly on v2.
+    /// Its models are a copy of the catalogue, and a Model added on the shared
+    /// page has to reach it the same way it reaches a bound Agent's row.
+    ///
+    /// Returns whether the binding changed.
+    pub fn sync_v2_binding_models(
+        conn: &Connection,
+        provider: &ModelProviderProfile,
+    ) -> VibexResult<bool> {
+        let registry = AgentProviderProjectionRegistry::builtin()?;
+        let mut changed = false;
+        for binding in
+            AgentModelProviderBindingRepository::list_for_model_provider(conn, &provider.id)?
+        {
+            if binding.legacy_provider_profile_id.is_some() {
+                continue;
+            }
+            let Some(runtime) =
+                AgentRuntimeProfileRepository::get(conn, &binding.runtime_profile_id)?
+            else {
+                continue;
+            };
+            let interfaces = registry
+                .resolve(&runtime.version_identity)?
+                .descriptor
+                .model_interfaces;
+            let mut models: Vec<AgentConfiguredModelBinding> = Vec::new();
+            for model in &provider.configured_models {
+                let wire_api = shared_model_wire_api_of(model);
+                let wire_protocol_id =
+                    legacy_wire_protocol_for(&binding.agent_id, wire_api, &interfaces);
+                if !interfaces.is_empty()
+                    && !interfaces
+                        .iter()
+                        .any(|interface| interface.wire_protocol_id == wire_protocol_id)
+                {
+                    continue;
+                }
+                let sdk_adapter_id = interfaces
+                    .iter()
+                    .find(|interface| interface.wire_protocol_id == wire_protocol_id)
+                    .and_then(|interface| interface.sdk_adapter_id.clone())
+                    .or_else(|| legacy_sdk_adapter(&binding.agent_id, &wire_protocol_id));
+                let process_scoped = interfaces
+                    .iter()
+                    .find(|interface| {
+                        interface.wire_protocol_id == wire_protocol_id
+                            && interface.sdk_adapter_id == sdk_adapter_id
+                    })
+                    .is_some_and(|interface| interface.process_scoped);
+                if models
+                    .iter()
+                    .any(|existing| existing.agent_model_id == model.id)
+                {
+                    continue;
+                }
+                let id = binding
+                    .configured_models
+                    .iter()
+                    .find(|existing| existing.provider_model_id == model.id)
+                    .map(|existing| existing.id.clone())
+                    .unwrap_or_else(AgentConfiguredModelBindingId::new);
+                models.push(AgentConfiguredModelBinding {
+                    id,
+                    provider_model_id: model.id.clone(),
+                    agent_model_id: model.id.clone(),
+                    wire_protocol_id,
+                    sdk_adapter_id,
+                    deployment: None,
+                    enabled: model.enabled,
+                    process_scoped,
+                });
+            }
+            if models == binding.configured_models {
+                continue;
+            }
+            let mut next = binding.clone();
+            next.configured_models = models;
+            next.revision = binding.revision.saturating_add(1);
+            next.updated_at_ms = unix_timestamp_ms().max(binding.updated_at_ms.saturating_add(1));
+            AgentModelProviderBindingRepository::update(conn, &next, binding.revision)?;
+            changed = true;
+        }
+        Ok(changed)
+    }
+
+    /// Rewrites one binding's configured models from its launch row.
+    ///
+    /// The binding is what the projection engine reads, so a Model the row
+    /// gained is not selectable until the binding names it. Ids are reused by
+    /// `provider_model_id`: `projection_overrides.default_model_binding_id`
+    /// points at one of them, and renumbering the list would silently unpin the
+    /// Agent's default.
+    fn rebuild_binding_models(
+        conn: &Connection,
+        provider: &ModelProviderProfile,
+        legacy: &ProviderProfile,
+    ) -> VibexResult<bool> {
+        let Some(binding) =
+            AgentModelProviderBindingRepository::get_by_legacy_profile(conn, &legacy.id)?
+        else {
             return Ok(false);
         };
-        let before = legacy.clone();
-
-        legacy.display_name = provider.display_name.clone();
-        legacy.status = match provider.status {
-            ModelProviderProfileStatus::Enabled => ProviderProfileStatus::Enabled,
-            ModelProviderProfileStatus::Disabled => ProviderProfileStatus::Disabled,
-        };
-        legacy.base_url = primary_legacy_base_url(provider);
-        legacy.default_model = provider.default_model_id.clone();
-        legacy.configured_models = legacy_configured_models_from_model_provider(provider, &before);
-        legacy.secrets = legacy_secrets_from_model_provider(provider, &before, legacy_id);
-        // The note and the website live on different fields in each shape; the
-        // shared record owns them now, so this direction writes them back where
-        // the launch row and the import markers keep reading them.
-        legacy.account_alias = provider.metadata.note.clone();
-        legacy.provider_options = legacy_options_with_website(provider, &before);
-
-        // `updated_at_ms` is part of the comparison the launch contract hashes, so a
-        // projection that changes nothing must not move it: every binding reading
-        // this Profile would otherwise go stale on a no-op.
-        legacy.updated_at_ms = before.updated_at_ms;
-        if legacy == before {
+        if binding.model_provider_profile_id.as_ref() != Some(&provider.id) {
             return Ok(false);
         }
-        legacy.updated_at_ms =
-            vibex_core::unix_timestamp_ms().max(before.updated_at_ms.saturating_add(1));
-        ProviderProfileRepository::update(conn, &legacy)?;
-        ProviderSecretReferenceRepository::replace_for_profile(conn, legacy_id, &legacy.secrets)?;
+        let Some(runtime) = AgentRuntimeProfileRepository::get(conn, &binding.runtime_profile_id)?
+        else {
+            return Ok(false);
+        };
+        let interfaces = AgentProviderProjectionRegistry::builtin()?
+            .resolve(&runtime.version_identity)?
+            .descriptor
+            .model_interfaces;
+        let mut models: Vec<AgentConfiguredModelBinding> = Vec::new();
+        for model in &legacy.configured_models {
+            let wire_protocol_id = legacy_wire_protocol(legacy, model.wire_api, &interfaces);
+            let sdk_adapter_id = interfaces
+                .iter()
+                .find(|interface| interface.wire_protocol_id == wire_protocol_id)
+                .and_then(|interface| interface.sdk_adapter_id.clone())
+                .or_else(|| legacy_sdk_adapter(&legacy.agent_id, &wire_protocol_id));
+            let process_scoped = interfaces
+                .iter()
+                .find(|interface| {
+                    interface.wire_protocol_id == wire_protocol_id
+                        && interface.sdk_adapter_id == sdk_adapter_id
+                })
+                .is_some_and(|interface| interface.process_scoped);
+            let agent_model_id = legacy_agent_model_id(legacy, &model.id);
+            // Two Provider models can collapse onto one Agent model id — the
+            // Claude aliases do exactly that — and the binding requires the
+            // Agent model ids to be unique. The first one wins.
+            if models
+                .iter()
+                .any(|existing| existing.agent_model_id == agent_model_id)
+            {
+                continue;
+            }
+            let id = binding
+                .configured_models
+                .iter()
+                .find(|existing| existing.provider_model_id == model.id)
+                .map(|existing| existing.id.clone())
+                .unwrap_or_else(AgentConfiguredModelBindingId::new);
+            models.push(AgentConfiguredModelBinding {
+                id,
+                provider_model_id: model.id.clone(),
+                agent_model_id,
+                wire_protocol_id,
+                sdk_adapter_id,
+                deployment: None,
+                enabled: model.enabled,
+                process_scoped,
+            });
+        }
+        if models == binding.configured_models {
+            return Ok(false);
+        }
+        let mut next = binding.clone();
+        next.configured_models = models;
+        next.revision = binding.revision.saturating_add(1);
+        next.updated_at_ms = unix_timestamp_ms().max(binding.updated_at_ms.saturating_add(1));
+        AgentModelProviderBindingRepository::update(conn, &next, binding.revision)?;
         Ok(true)
     }
 
@@ -1171,6 +1469,413 @@ fn legacy_options_with_website(
         });
     }
     options
+}
+
+/// Copies the Provider-owned half of a shared record onto one launch row.
+///
+/// These are the fields both shapes share: who the Provider is, whether it is
+/// on, where it is, which Models it offers and how it authenticates. Everything
+/// the launch row owns — `provider_options` beyond the website link, the
+/// protocol pin, the ACP config, the import markers, the Agent's own defaults —
+/// is left exactly as it is, because it describes how *this* Agent launches.
+///
+/// `configured_models` lets the caller pass the list the Agent's protocol can
+/// actually reach. `None` derives it from the record, which is what the
+/// single-row projection has always done.
+///
+/// The row's timestamp only moves when something actually changed: it is part
+/// of the launch revision, and a no-op projection that moved it would restale
+/// every session reading the row.
+fn apply_shared_provider_to_legacy(
+    legacy: &mut ProviderProfile,
+    provider: &ModelProviderProfile,
+    configured_models: Option<&[ProviderConfiguredModel]>,
+) -> bool {
+    let before = legacy.clone();
+    let legacy_id = before.id.clone();
+    // The row this record was derived from is the one row allowed to keep the
+    // shared credential ids: `secret_ref_id` is a global primary key, so every
+    // other Agent's row has to own a distinct id per Key.
+    let secrets = legacy_secrets_from_model_provider(provider, &before, &legacy_id);
+    apply_shared_provider_fields(legacy, provider, secrets);
+    sync_protocol_pins(legacy, provider);
+    legacy.configured_models = match configured_models {
+        Some(models) => models.to_vec(),
+        None => legacy_configured_models_from_model_provider(provider, &before),
+    };
+    finish_legacy_row(legacy, &before)
+}
+
+/// The launch-row fields a shared Provider owns outright.
+///
+/// Split from the catalogue because the fan-out derives the Agent's model list
+/// from the row this writes: which protocol a Model is called with depends on
+/// the address the row ends up with, and the Claude alias rule reads `base_url`.
+/// `secrets` is passed in because the id each Key gets is per Agent, not per
+/// Provider: see [`legacy_secrets_linked_by_lookup_key`].
+fn apply_shared_provider_fields(
+    legacy: &mut ProviderProfile,
+    provider: &ModelProviderProfile,
+    secrets: Vec<vibex_core::ProviderSecretReference>,
+) {
+    let provider_options = legacy_options_with_website(provider, legacy);
+    legacy.display_name = provider.display_name.clone();
+    legacy.status = match provider.status {
+        ModelProviderProfileStatus::Enabled => ProviderProfileStatus::Enabled,
+        ModelProviderProfileStatus::Disabled => ProviderProfileStatus::Disabled,
+    };
+    legacy.base_url = primary_legacy_base_url(provider);
+    legacy.default_model = provider.default_model_id.clone();
+    legacy.secrets = secrets;
+    // The note and the website live on different fields in each shape; the
+    // shared record owns them now, so this direction writes them back where the
+    // launch row and the import markers keep reading them.
+    legacy.account_alias = provider.metadata.note.clone();
+    legacy.provider_options = provider_options;
+}
+
+/// The credential rows one Agent's launch row owns for a shared record's Keys.
+///
+/// `provider_secret_references.secret_ref_id` is a global primary key, so two
+/// launch rows can never name the same secret id: the second insert would take
+/// the first Agent's Key away. The shared record's credential ids therefore stay
+/// with the row the record was derived from, and every other Agent gets an id of
+/// its own.
+///
+/// The link is `lookup_key`, which is the reference to the stored value: two
+/// rows sharing it resolve the same Secret, and re-running this keeps the id it
+/// gave that Key last time. That stability is what lets `launch_revision` stay
+/// put when a Provider write changed nothing.
+fn legacy_secrets_linked_by_lookup_key(
+    provider: &ModelProviderProfile,
+    previous: &ProviderProfile,
+) -> Vec<vibex_core::ProviderSecretReference> {
+    let now = vibex_core::unix_timestamp_ms().max(1);
+    provider
+        .credentials
+        .iter()
+        .filter_map(|credential| {
+            let reference = credential.credential.secret_reference()?;
+            let existing = previous
+                .secrets
+                .iter()
+                .find(|secret| secret.lookup_key == reference.lookup_key)
+                .cloned();
+            let secret_kind = match credential.credential {
+                AgentCredential::OAuth { .. } => ProviderSecretKind::OAuthAccount,
+                _ => ProviderSecretKind::ApiKey,
+            };
+            let display_label = credential.display_label();
+            let unchanged = existing.as_ref().is_some_and(|secret| {
+                secret.secret_kind == secret_kind
+                    && secret.backend == reference.backend
+                    && secret.setup_state == reference.setup_state
+                    && secret.display_label == display_label
+                    && secret.redacted_hint == reference.redacted_hint
+            });
+            Some(vibex_core::ProviderSecretReference {
+                id: existing
+                    .as_ref()
+                    .map(|secret| secret.id.clone())
+                    .unwrap_or_else(vibex_core::RequestId::new),
+                provider_profile_id: previous.id.clone(),
+                secret_kind,
+                backend: reference.backend,
+                setup_state: reference.setup_state,
+                lookup_key: reference.lookup_key.clone(),
+                display_label,
+                redacted_hint: reference.redacted_hint.clone(),
+                created_at_ms: existing
+                    .as_ref()
+                    .map(|secret| secret.created_at_ms.max(1))
+                    .unwrap_or(now),
+                updated_at_ms: match existing.as_ref() {
+                    Some(secret) if unchanged => secret.updated_at_ms,
+                    Some(_) => now.max(1),
+                    None => now,
+                },
+            })
+        })
+        .collect()
+}
+
+/// Whether a launch row is the hidden one the gateway publishes.
+///
+/// Those rows are written from the route catalogue by `attach_gateway_to_agents`,
+/// not from the shared record's own Model list: their configured models are the
+/// `group/<route>/<model>` ids the listener serves. Projecting a Provider onto
+/// them would replace that catalogue with the upstream provider's model ids and
+/// leave the Agent pointed at a gateway that does not serve them.
+fn is_model_gateway_row(legacy: &ProviderProfile) -> bool {
+    legacy
+        .provider_options
+        .entries
+        .iter()
+        .find(|entry| entry.key.trim() == "vibex.internal.profileRole")
+        .map(|entry| entry.value.trim() == "model_gateway")
+        .unwrap_or(false)
+}
+
+/// The record's Model list as one Agent can actually call it.
+///
+/// A shared Provider is one catalogue for every Agent that binds it, and the
+/// Agents do not all speak the same protocols: which wire a Model is called with
+/// is a property of the Agent's binding, not of the record. So a Model keeps the
+/// protocol it already had on this row, a new one inherits the row's own pin,
+/// and anything that resolves to a protocol this Agent does not declare is left
+/// out — one unreachable Model must not make the whole binding unsupported.
+///
+/// `interfaces` is empty for an Agent with no registered descriptor. That reads
+/// as "unknown, do not narrow": the record's whole list is offered.
+fn configured_models_for_agent(
+    provider: &ModelProviderProfile,
+    previous: &ProviderProfile,
+    current: &ProviderProfile,
+    interfaces: &[vibex_core::AgentModelInterfaceDescriptor],
+) -> Vec<ProviderConfiguredModel> {
+    let pinned = provider_option(previous, LEGACY_WIRE_API_OPTION_KEY)
+        .and_then(|value| ProviderModelWireApi::from_wire_protocol_id(&value));
+    let mut models: Vec<ProviderConfiguredModel> = Vec::new();
+    for model in &provider.configured_models {
+        let wire_api = previous
+            .configured_models
+            .iter()
+            .find(|known| known.id == model.id)
+            .and_then(|known| known.wire_api)
+            .or_else(|| model.metadata.iter().find_map(shared_model_wire_api))
+            .or(pinned);
+        if !interfaces.is_empty() {
+            let protocol = legacy_wire_protocol(current, wire_api, interfaces);
+            if !interfaces
+                .iter()
+                .any(|interface| interface.wire_protocol_id == protocol)
+            {
+                continue;
+            }
+        }
+        models.push(ProviderConfiguredModel {
+            id: model.id.clone(),
+            display_name: model.display_name.clone(),
+            enabled: model.enabled,
+            wire_api,
+            capabilities: model.capabilities.clone(),
+        });
+    }
+    models
+}
+
+/// The protocol a shared Model declares for itself, if it declares one.
+fn shared_model_wire_api(metadata: &ProviderBindingMetadata) -> Option<ProviderModelWireApi> {
+    (metadata.key.trim() == LEGACY_WIRE_API_OPTION_KEY)
+        .then(|| ProviderModelWireApi::from_wire_protocol_id(&metadata.value))
+        .flatten()
+}
+
+/// Keeps a launch row's default Model inside the list it offers.
+///
+/// The Provider's default can name a Model this Agent cannot call, and the
+/// Model can be removed from the record outright. Either way the row must not
+/// keep pointing at it: the launch path selects the default by id, so a dangling
+/// default silently launches whatever the Agent falls back to.
+fn repair_legacy_default_model(legacy: &mut ProviderProfile) {
+    let usable = |model: &ProviderConfiguredModel| model.enabled;
+    if legacy.default_model.as_deref().is_some_and(|default| {
+        legacy
+            .configured_models
+            .iter()
+            .any(|model| model.id == default && usable(model))
+    }) {
+        return;
+    }
+    legacy.default_model = legacy
+        .configured_models
+        .iter()
+        .find(|model| usable(model))
+        .map(|model| model.id.clone());
+}
+
+/// The enabled Model ids a launch row's ACP catalogue should carry.
+fn enabled_model_ids(
+    models: &[ProviderConfiguredModel],
+    default_model: Option<&str>,
+) -> Vec<String> {
+    let mut ids = Vec::new();
+    for model in models.iter().filter(|model| model.enabled) {
+        let model = model.id.trim();
+        if !model.is_empty() && !ids.iter().any(|existing| existing == model) {
+            ids.push(model.to_string());
+        }
+    }
+    if ids.is_empty()
+        && let Some(model) = default_model
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+    {
+        ids.push(model.to_string());
+    }
+    ids
+}
+
+/// Rewrites the ACP catalogue a launch row carries inside its options.
+///
+/// The ACP runtime reads the selectable Models out of the typed config, so a
+/// Model added to the Provider is not offered until this list names it. A row
+/// with no typed config is left alone: inventing one would claim an ACP launch
+/// contract the row never had.
+fn write_acp_models(options: &mut ProviderOptions, models: &[String]) -> VibexResult<()> {
+    let Some(entry) = options
+        .entries
+        .iter_mut()
+        .find(|entry| entry.key.trim() == LEGACY_ACP_CONFIG_OPTION_KEY)
+    else {
+        return Ok(());
+    };
+    let Ok(mut config) = serde_json::from_str::<AcpProviderConfig>(&entry.value) else {
+        return Ok(());
+    };
+    if config.models == models {
+        return Ok(());
+    }
+    config.models = models.to_vec();
+    entry.value = serde_json::to_string(&config).map_err(|error| {
+        VibexError::storage(
+            "provider_projection_acp_config_encode_failed",
+            format!("failed to encode the ACP catalogue for a launch row: {error}"),
+        )
+    })?;
+    Ok(())
+}
+
+/// Keeps a launch row's per-protocol addresses and pin in step with the record.
+///
+/// A shared Provider publishes one address per protocol, and the launch path
+/// reads them out of `provider_options` under `protocolBaseUrl.<id>` — the pin
+/// shadows `base_url`, so an address the record moved is invisible until these
+/// entries move with it.
+///
+/// The pin itself (`wireApi`) is the Agent's own choice of protocol and stays,
+/// unless the record no longer publishes it: then the row has to fall back to a
+/// protocol both sides speak, exactly the way binding chose one in the first
+/// place. When the record publishes a single address with no protocol at all,
+/// the pin is left alone — it is the only thing saying what that address speaks.
+fn sync_protocol_pins(legacy: &mut ProviderProfile, provider: &ModelProviderProfile) {
+    let mut pins: Vec<(String, String)> = Vec::new();
+    for endpoint in &provider.endpoints {
+        let Some(protocol) = endpoint.wire_protocol_id.as_deref() else {
+            continue;
+        };
+        let Some(wire_api) = ProviderModelWireApi::from_wire_protocol_id(protocol) else {
+            continue;
+        };
+        let key = wire_api.protocol_base_url_option_key();
+        if pins.iter().any(|(existing, _)| existing == &key) {
+            continue;
+        }
+        pins.push((key, endpoint.url.clone()));
+    }
+    if pins.is_empty() {
+        return;
+    }
+    let supported: Vec<String> = pins
+        .iter()
+        .filter_map(|(key, _)| key.strip_prefix("protocolBaseUrl."))
+        .map(ToString::to_string)
+        .collect();
+    let pinned = provider_option(legacy, LEGACY_WIRE_API_OPTION_KEY);
+    let usable = pinned
+        .as_deref()
+        .and_then(ProviderModelWireApi::from_wire_protocol_id)
+        .filter(|wire_api| supported.iter().any(|id| id == wire_api.wire_protocol_id()));
+    let chosen = usable.or_else(|| {
+        ProviderModelWireApi::ALL.into_iter().find(|wire_api| {
+            supported.iter().any(|id| id == wire_api.wire_protocol_id())
+                && agent_speaks(legacy, *wire_api)
+        })
+    });
+    legacy.provider_options.entries.retain(|entry| {
+        !entry.key.trim().starts_with("protocolBaseUrl.")
+            && entry.key.trim() != LEGACY_WIRE_API_OPTION_KEY
+    });
+    for (key, url) in pins {
+        legacy
+            .provider_options
+            .entries
+            .push(ProviderBindingMetadata { key, value: url });
+    }
+    if let Some(chosen) = chosen {
+        legacy
+            .provider_options
+            .entries
+            .push(ProviderBindingMetadata {
+                key: LEGACY_WIRE_API_OPTION_KEY.to_string(),
+                value: chosen.wire_protocol_id().to_string(),
+            });
+        if let Some((_, url)) = provider.endpoints.iter().find_map(|endpoint| {
+            (endpoint.wire_protocol_id.as_deref() == Some(chosen.wire_protocol_id()))
+                .then(|| (String::new(), endpoint.url.clone()))
+        }) {
+            legacy.base_url = Some(url);
+        }
+    }
+}
+
+/// Whether the Agent this row launches declares the given protocol.
+///
+/// An Agent with no registered descriptor accepts anything: its interfaces are
+/// unknown, so narrowing here would refuse a protocol it may well speak.
+fn agent_speaks(legacy: &ProviderProfile, wire_api: ProviderModelWireApi) -> bool {
+    let Ok(registry) = AgentProviderProjectionRegistry::builtin() else {
+        return true;
+    };
+    let mut descriptors = registry.descriptors_for_agent(&legacy.agent_id).peekable();
+    if descriptors.peek().is_none() {
+        return true;
+    }
+    descriptors
+        .flat_map(|descriptor| descriptor.model_interfaces.iter())
+        .any(|interface| interface.wire_protocol_id == wire_api.wire_protocol_id())
+}
+
+/// Whether the row is different, advancing its timestamp only when it is.
+fn finish_legacy_row(legacy: &mut ProviderProfile, before: &ProviderProfile) -> bool {
+    legacy.updated_at_ms = before.updated_at_ms;
+    if *legacy == *before {
+        return false;
+    }
+    legacy.updated_at_ms =
+        vibex_core::unix_timestamp_ms().max(before.updated_at_ms.saturating_add(1));
+    true
+}
+
+/// Folds one Agent's catalogue into the record's own list.
+///
+/// The record is authoritative, and each Agent's copy is a filtered view of it,
+/// so a copy cannot simply replace the list: that is what shrank a Provider when
+/// a Model was edited from an Agent page whose Agent could not speak the other
+/// Models' protocols. So the record keeps its Models, in its order, and the copy
+/// contributes the two things it alone knows: a Model the record has not seen
+/// yet, and each known Model's label, capabilities and visibility — the fields
+/// the Agent page edits.
+///
+/// A Model absent from the copy is therefore kept. Deleting one is the shared
+/// page's job, and it writes the whole catalogue through
+/// [`ModelProviderProfileRepository::update`] rather than through this merge.
+fn merge_model_catalog(
+    existing: &[ModelProviderCatalogEntry],
+    candidate: &[ModelProviderCatalogEntry],
+) -> Vec<ModelProviderCatalogEntry> {
+    let mut merged = existing.to_vec();
+    for model in candidate {
+        match merged.iter_mut().find(|known| known.id == model.id) {
+            Some(known) => {
+                known.display_name = model.display_name.clone();
+                known.enabled = model.enabled;
+                known.capabilities = model.capabilities.clone();
+            }
+            None => merged.push(model.clone()),
+        }
+    }
+    merged
 }
 
 fn primary_legacy_base_url(provider: &ModelProviderProfile) -> Option<String> {
@@ -2512,6 +3217,51 @@ fn legacy_wire_protocol(
             .unwrap_or(WIRE_PROTOCOL_OPENAI_RESPONSES),
     }
     .to_string()
+}
+
+/// The protocol a shared record's Model declares for itself.
+fn shared_model_wire_api_of(model: &ModelProviderCatalogEntry) -> Option<ProviderModelWireApi> {
+    model.metadata.iter().find_map(shared_model_wire_api)
+}
+
+/// The protocol a Model is called with when there is no launch row to ask.
+///
+/// [`legacy_wire_protocol`] reads the pin out of `provider_options`, which only
+/// a launch row has. A binding written directly on v2 has none, so the answer
+/// comes from what the Agent declares, with the two Agents that resolve a
+/// protocol from their own identity handled first.
+fn legacy_wire_protocol_for(
+    agent_id: &AgentId,
+    wire_api: Option<ProviderModelWireApi>,
+    interfaces: &[vibex_core::AgentModelInterfaceDescriptor],
+) -> String {
+    if let Some(wire_api) = wire_api {
+        return match wire_api {
+            ProviderModelWireApi::OpenaiResponses => WIRE_PROTOCOL_OPENAI_RESPONSES,
+            ProviderModelWireApi::OpenaiChatCompletions => WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS,
+            ProviderModelWireApi::AnthropicMessages => WIRE_PROTOCOL_ANTHROPIC_MESSAGES,
+            ProviderModelWireApi::MistralConversations => {
+                vibex_core::WIRE_PROTOCOL_MISTRAL_CONVERSATIONS
+            }
+            ProviderModelWireApi::GoogleGenerativeAi => {
+                vibex_core::WIRE_PROTOCOL_GOOGLE_GENERATIVE_AI
+            }
+            ProviderModelWireApi::GoogleVertex => vibex_core::WIRE_PROTOCOL_GOOGLE_VERTEX,
+            ProviderModelWireApi::AwsBedrockConverse => {
+                vibex_core::WIRE_PROTOCOL_AWS_BEDROCK_CONVERSE
+            }
+        }
+        .to_string();
+    }
+    if agent_id.as_str() == "claude" {
+        return WIRE_PROTOCOL_ANTHROPIC_MESSAGES.to_string();
+    }
+    interfaces
+        .iter()
+        .find(|interface| interface.wire_protocol_id == WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS)
+        .or_else(|| interfaces.first())
+        .map(|interface| interface.wire_protocol_id.clone())
+        .unwrap_or_else(|| WIRE_PROTOCOL_OPENAI_RESPONSES.to_string())
 }
 
 fn legacy_opencode_default_wire_protocol(profile: &ProviderProfile) -> &'static str {

@@ -3225,6 +3225,11 @@ impl DesktopRuntime {
             &(vibex_use.clone() as Arc<dyn vibex_core::VibexUseToolHost>),
         )?;
         let remote_dispatcher = remote_dispatcher
+            // The same service the desktop writes through, listeners and all.
+            // Without this a paired client's Provider write lands in the
+            // database but publishes no `ProviderConfigChanged`, so this
+            // machine's Agent pages keep showing the catalogue they had.
+            .with_provider_config_service(provider_config_service.clone())
             .with_runtime_option_catalog_source(runtime_catalog.clone())
             .with_agent_auth_context_source(auth_contexts.clone())
             .with_scheduled_task_source(Arc::new(ScheduledTaskSource::new(ScheduledHandle {

@@ -843,7 +843,23 @@ impl ProviderConfigService {
         provider_id: &ModelProviderProfileId,
     ) -> VibexResult<()> {
         let conn = self.open_connection()?;
+        // The delete retires every launch row behind this Provider, and those
+        // rows are what each Agent's pages and selectors read. Announcing only a
+        // record the caller never listed left those rows alive in the UI.
+        let mut retired =
+            AgentModelProviderBindingRepository::list_for_model_provider(&conn, provider_id)?
+                .into_iter()
+                .filter_map(|binding| binding.legacy_provider_profile_id)
+                .collect::<Vec<_>>();
+        if let Some(legacy_id) = ModelProviderProfileRepository::get(&conn, provider_id)?
+            .and_then(|profile| profile.legacy_provider_profile_id)
+        {
+            retired.push(legacy_id);
+        }
         ModelProviderProfileRepository::soft_delete(&conn, provider_id, unix_timestamp_ms())?;
+        for legacy_id in &retired {
+            self.notify_profile_deleted(legacy_id);
+        }
         Ok(())
     }
 
@@ -1521,13 +1537,21 @@ impl ProviderConfigService {
             })
     }
 
-    /// Mirrors a v2 write onto the legacy record, then restales its bindings.
+    /// Mirrors a v2 write onto every Agent that binds the Provider, then
+    /// restales those bindings and announces their launch rows.
     ///
     /// Every v2 mutation funnels through here so the two shapes cannot drift.
     /// The legacy Profile is what the launch path reads for its protocol, its
     /// `provider_options` and its Keys, so a v2 edit that never reached it would
     /// be invisible to the Agent and would be reverted by the next v1 write.
-    fn sync_model_provider_to_legacy(
+    ///
+    /// One Provider has one launch row per Agent that bound it, and the record
+    /// names only the first of them — `legacy_provider_profile_id` is `UNIQUE`.
+    /// Projecting just that row is why a Model added on the global Providers page
+    /// showed up for the Agent the record was derived from and for nobody else.
+    /// The fan-out walks the bindings, because they are the only link to the
+    /// other Agents' rows.
+    pub(crate) fn refresh_bindings_for_model_provider(
         &self,
         conn: &vibex_db::DbConnection,
         provider_id: &ModelProviderProfileId,
@@ -1535,22 +1559,30 @@ impl ProviderConfigService {
         let Some(provider) = ModelProviderProfileRepository::get(conn, provider_id)? else {
             return Ok(());
         };
+        // The one row the record names is projected first, so a Provider whose
+        // credential list changed keeps the ids its own binding already uses.
         vibex_db::ProviderProjectionCompatibilityRepository::project_model_provider_to_legacy(
             conn, &provider,
         )?;
-        Ok(())
-    }
-
-    pub(crate) fn refresh_bindings_for_model_provider(
-        &self,
-        conn: &vibex_db::DbConnection,
-        provider_id: &ModelProviderProfileId,
-    ) -> VibexResult<()> {
-        self.sync_model_provider_to_legacy(conn, provider_id)?;
+        let rows =
+            vibex_db::ProviderProjectionCompatibilityRepository::sync_shared_provider_to_bindings(
+                conn, &provider,
+            )?;
+        // A binding written directly on v2 has no launch row to project onto, so
+        // its copy of the catalogue is rebuilt on its own.
+        vibex_db::ProviderProjectionCompatibilityRepository::sync_v2_binding_models(
+            conn, &provider,
+        )?;
         for binding in
             AgentModelProviderBindingRepository::list_for_model_provider(conn, provider_id)?
         {
             self.refresh_one_binding(conn, binding)?;
+        }
+        // Each row is a Profile the Agent selects its Provider through, so it is
+        // also what the desktop reloads: a Model the row gained is not in any
+        // picker until the listener hears about it.
+        for row in &rows {
+            self.notify_profile_saved(row);
         }
         Ok(())
     }
@@ -12996,5 +13028,338 @@ mod workspace_key_tests {
         let other = workspace_projection_key(Path::new("/code/vibex-other"));
         assert_eq!(a, b);
         assert_ne!(a, other);
+    }
+}
+
+#[cfg(test)]
+mod shared_provider_fanout_tests {
+    use super::*;
+    use crate::acp_config_from_options;
+
+    /// A Provider created on an Agent page, with that Agent's launch row behind
+    /// it, plus a second Agent bound to the same record.
+    fn shared_with_two_agents(
+        service: &ProviderConfigService,
+    ) -> (
+        vibex_core::ProviderProfile,
+        vibex_core::ProviderProfile,
+        ModelProviderProfile,
+    ) {
+        let first = service
+            .create_agent_model_provider_profile(
+                vibex_core::AgentModelProviderProfileCreateRequest {
+                    agent_id: vibex_core::AgentId::parse("claude").unwrap(),
+                    display_name: "Team".to_string(),
+                    account_alias: None,
+                    base_url: Some("https://api.example.invalid".to_string()),
+                    default_model: Some("alpha".to_string()),
+                    small_model: None,
+                    large_model: None,
+                    configured_models: vec![vibex_core::ProviderConfiguredModel {
+                        id: "alpha".to_string(),
+                        display_name: None,
+                        enabled: true,
+                        wire_api: Some(vibex_core::ProviderModelWireApi::AnthropicMessages),
+                        capabilities: Default::default(),
+                    }],
+                    reasoning_effort: None,
+                    sandbox_defaults: None,
+                    network_defaults: None,
+                    permission_defaults: None,
+                    provider_options: None,
+                    secret_references: Vec::new(),
+                },
+            )
+            .unwrap();
+        let second = service
+            .bind_provider_to_agent(vibex_core::AgentModelProviderBindRequest {
+                provider_profile_id: vibex_core::ProviderProfileId::new(),
+                model_provider_profile_id: service
+                    .list_model_provider_profiles()
+                    .unwrap()
+                    .into_iter()
+                    .find(|profile| profile.legacy_provider_profile_id.as_ref() == Some(&first.id))
+                    .map(|profile| profile.id),
+                agent_id: vibex_core::AgentId::parse("deepseek-harness").unwrap(),
+                make_default: false,
+            })
+            .unwrap();
+        let shared = service
+            .list_model_provider_profiles()
+            .unwrap()
+            .into_iter()
+            .find(|profile| profile.legacy_provider_profile_id.as_ref() == Some(&first.id))
+            .expect("the Agent page's Provider is a shared record");
+        (first, second, shared)
+    }
+
+    fn model_ids(profile: &vibex_core::ProviderProfile) -> Vec<String> {
+        profile
+            .configured_models
+            .iter()
+            .map(|model| model.id.clone())
+            .collect()
+    }
+
+    /// The report: a Model added on the Providers page never reached the Agents.
+    ///
+    /// The record names one launch row and the second Agent's row was reached
+    /// only through its binding, so projecting the record's own pointer updated
+    /// one Agent and silently skipped the other. Both rows, both bindings and
+    /// both ACP catalogues have to gain the Model.
+    #[test]
+    fn a_model_added_on_the_providers_page_reaches_every_agent() {
+        let dir = std::env::temp_dir().join(format!(
+            "vibex-shared-fanout-{}",
+            vibex_core::RequestId::new().as_str()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let service = ProviderConfigService::new(dir.join("state.db"));
+        service.open_connection().unwrap();
+        let (first, second, shared) = shared_with_two_agents(&service);
+
+        let mut next = shared.clone();
+        next.configured_models
+            .push(vibex_core::ModelProviderCatalogEntry {
+                id: "beta".to_string(),
+                display_name: Some("Beta".to_string()),
+                enabled: true,
+                metadata: Vec::new(),
+                capabilities: Default::default(),
+            });
+        next.display_name = "Team renamed".to_string();
+        service
+            .update_model_provider_profile(vibex_core::ModelProviderProfileUpdateRequest {
+                profile: next,
+                expected_revision: shared.revision,
+            })
+            .unwrap();
+
+        let conn = service.open_connection().unwrap();
+        for row in [&first, &second] {
+            let legacy = vibex_db::ProviderProfileRepository::get(&conn, &row.id)
+                .unwrap()
+                .expect("the launch row must still exist");
+            assert!(
+                model_ids(&legacy).contains(&"beta".to_string()),
+                "{} must be offered the Model the Provider gained, has {:?}",
+                row.agent_id.as_str(),
+                model_ids(&legacy)
+            );
+            assert_eq!(legacy.display_name, "Team renamed");
+            assert!(
+                acp_config_from_options(&legacy.provider_options)
+                    .unwrap()
+                    .expect("the row keeps its ACP config")
+                    .models
+                    .contains(&"beta".to_string()),
+                "the ACP catalogue is what a session reads its Models from"
+            );
+            let binding = vibex_db::AgentModelProviderBindingRepository::get_by_legacy_profile(
+                &conn, &row.id,
+            )
+            .unwrap()
+            .expect("the row must still have a binding");
+            assert!(
+                binding
+                    .configured_models
+                    .iter()
+                    .any(|model| model.provider_model_id == "beta" && model.enabled),
+                "the binding is what the projection engine reads, got {:?}",
+                binding
+                    .configured_models
+                    .iter()
+                    .map(|model| model.provider_model_id.clone())
+                    .collect::<Vec<_>>()
+            );
+            let runtime =
+                vibex_db::AgentRuntimeProfileRepository::get_by_legacy_profile(&conn, &row.id)
+                    .unwrap()
+                    .expect("the row must still have a runtime");
+            assert!(
+                runtime.models.contains(&"beta".to_string()),
+                "the runtime Profile carries a second copy of the catalogue, got {:?}",
+                runtime.models
+            );
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The mirror case: removing a Model on the Providers page takes it away
+    /// from every Agent, not just the one the record points at.
+    #[test]
+    fn a_model_removed_on_the_providers_page_leaves_every_agent() {
+        let dir = std::env::temp_dir().join(format!(
+            "vibex-shared-fanout-remove-{}",
+            vibex_core::RequestId::new().as_str()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let service = ProviderConfigService::new(dir.join("state.db"));
+        service.open_connection().unwrap();
+        let (first, second, shared) = shared_with_two_agents(&service);
+
+        let mut next = shared.clone();
+        next.configured_models.clear();
+        next.default_model_id = None;
+        service
+            .update_model_provider_profile(vibex_core::ModelProviderProfileUpdateRequest {
+                profile: next,
+                expected_revision: shared.revision,
+            })
+            .unwrap();
+
+        let conn = service.open_connection().unwrap();
+        for row in [&first, &second] {
+            let legacy = vibex_db::ProviderProfileRepository::get(&conn, &row.id)
+                .unwrap()
+                .expect("the launch row must still exist");
+            assert!(
+                legacy.configured_models.is_empty(),
+                "{} must lose the Model the Provider dropped, has {:?}",
+                row.agent_id.as_str(),
+                model_ids(&legacy)
+            );
+            assert!(
+                legacy.default_model.is_none(),
+                "a default naming a Model that no longer exists would launch something else"
+            );
+            let binding = vibex_db::AgentModelProviderBindingRepository::get_by_legacy_profile(
+                &conn, &row.id,
+            )
+            .unwrap()
+            .expect("the row must still have a binding");
+            assert!(binding.configured_models.is_empty());
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An edit made on an Agent page must not shrink the Provider.
+    ///
+    /// The Agent's list is a view narrowed to the protocols that Agent speaks,
+    /// so folding it back wholesale deleted every Model the other Agents could
+    /// reach. This is the regression the merge exists for.
+    #[test]
+    fn an_agent_page_edit_does_not_shrink_the_shared_catalogue() {
+        let dir = std::env::temp_dir().join(format!(
+            "vibex-shared-narrow-{}",
+            vibex_core::RequestId::new().as_str()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let service = ProviderConfigService::new(dir.join("state.db"));
+        service.open_connection().unwrap();
+
+        let shared = service
+            .create_model_provider_profile(vibex_core::ModelProviderProfileCreateRequest {
+                display_name: "Two protocols".to_string(),
+                vendor_hint: None,
+                endpoints: vec![
+                    vibex_core::ModelProviderEndpoint {
+                        id: "api-chat".to_string(),
+                        kind: vibex_core::ModelProviderEndpointKind::Api,
+                        url: "https://chat.example.invalid".to_string(),
+                        wire_protocol_id: Some(
+                            vibex_core::WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS.to_string(),
+                        ),
+                    },
+                    vibex_core::ModelProviderEndpoint {
+                        id: "api-messages".to_string(),
+                        kind: vibex_core::ModelProviderEndpointKind::Api,
+                        url: "https://messages.example.invalid".to_string(),
+                        wire_protocol_id: Some(
+                            vibex_core::WIRE_PROTOCOL_ANTHROPIC_MESSAGES.to_string(),
+                        ),
+                    },
+                ],
+                proxy_policy: vibex_core::ModelProviderProxyPolicy::InheritSystem,
+                credentials: Vec::new(),
+                configured_models: vec![
+                    vibex_core::ModelProviderCatalogEntry {
+                        id: "chat-model".to_string(),
+                        display_name: None,
+                        enabled: true,
+                        metadata: vec![vibex_core::ProviderBindingMetadata {
+                            key: "wireApi".to_string(),
+                            value: vibex_core::WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS.to_string(),
+                        }],
+                        capabilities: Default::default(),
+                    },
+                    vibex_core::ModelProviderCatalogEntry {
+                        id: "claude-model".to_string(),
+                        display_name: None,
+                        enabled: true,
+                        metadata: vec![vibex_core::ProviderBindingMetadata {
+                            key: "wireApi".to_string(),
+                            value: vibex_core::WIRE_PROTOCOL_ANTHROPIC_MESSAGES.to_string(),
+                        }],
+                        capabilities: Default::default(),
+                    },
+                ],
+                default_model_id: Some("chat-model".to_string()),
+                headers: Vec::new(),
+                metadata: Default::default(),
+                status: vibex_core::ModelProviderProfileStatus::Enabled,
+            })
+            .unwrap();
+
+        // goose speaks Chat only, so its view of the record is the narrower one.
+        let goose = service
+            .bind_provider_to_agent(vibex_core::AgentModelProviderBindRequest {
+                provider_profile_id: vibex_core::ProviderProfileId::new(),
+                model_provider_profile_id: Some(shared.id.clone()),
+                agent_id: vibex_core::AgentId::parse("goose").unwrap(),
+                make_default: false,
+            })
+            .unwrap();
+        // Saving a narrower list from the Agent page is what used to delete the
+        // other Model from the record. The list it saves is the record's Models
+        // filtered to the protocols this Agent speaks, which is exactly the view
+        // the Agent's editor shows.
+        let narrowed = goose
+            .configured_models
+            .iter()
+            .filter(|model| model.id == "chat-model")
+            .cloned()
+            .collect::<Vec<_>>();
+        service
+            .update_agent_model_provider_profile(
+                vibex_core::AgentModelProviderProfileUpdateRequest {
+                    agent_id: goose.agent_id.clone(),
+                    provider_profile_id: goose.id.clone(),
+                    display_name: None,
+                    status: None,
+                    account_alias: None,
+                    base_url: None,
+                    default_model: None,
+                    small_model: None,
+                    large_model: None,
+                    configured_models: Some(narrowed),
+                    reasoning_effort: None,
+                    sandbox_defaults: None,
+                    network_defaults: None,
+                    permission_defaults: None,
+                    provider_options: None,
+                },
+            )
+            .unwrap();
+
+        let after = service
+            .list_model_provider_profiles()
+            .unwrap()
+            .into_iter()
+            .find(|profile| profile.id == shared.id)
+            .expect("the record must still be listed");
+        let ids = after
+            .configured_models
+            .iter()
+            .map(|model| model.id.clone())
+            .collect::<Vec<_>>();
+        assert!(
+            ids.contains(&"claude-model".to_string()),
+            "an Agent's narrower view must not delete a Model the others can reach, got {ids:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

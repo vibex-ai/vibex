@@ -4344,6 +4344,45 @@ ProviderConfigService::{
   binding whose effective process fingerprint changed becomes
   `stale_restart_required`; saving never stops an active process or advances a
   runtime generation.
+- A shared Provider is one recorded catalogue with one launch row per bound
+  Agent, and `model_provider_profiles.legacy_provider_profile_id` is `UNIQUE`, so
+  it names at most one of those rows. Any mutation on the Providers page
+  therefore fans out through `agent_model_provider_bindings_v2`, not through
+  that pointer: every binding's `configured_models`, every launch row's
+  `configured_models` + ACP `models` (inside `acp.config.v1`), and each runtime
+  Profile's `models` are rebuilt from the record. Missing the binding loop is
+  what made a Model added on the Providers page appear for the Agent the record
+  was derived from and for nobody else.
+- Each Agent's copy of the catalogue is that record filtered by the protocols
+  the Agent declares (`model_interfaces`), so it is a *view*, not a second
+  authority. A v1 edit that reaches `merge_into_shared` therefore merges — new
+  Models and per-Model label/capability/visibility — and never prunes. Writing
+  the narrower view back wholesale is what deleted Models the other Agents could
+  still reach. Deleting a Model is the Providers page's job, where the full
+  catalogue is the input.
+- The projection keeps the Agent-owned half of a launch row: `wireApi` pin,
+  `protocolBaseUrl.<id>` entries, the ACP command/args/env, import markers,
+  `account_alias`, `reasoning_effort`, `sandbox/network/permission` defaults and
+  `projection_overrides`. `provider_secret_references.secret_ref_id` is a global
+  primary key, so every bound Agent gets its own id per Key — sharing one would
+  let the second Agent's insert take the first Agent's Secret away. The link
+  across rows is `lookup_key`, and ids are reused by it so `launch_revision`
+  stays put when nothing changed.
+- The hidden `vibex.internal.profileRole = model_gateway` row is *not* projected
+  from the upstream record: its Model ids are the listener's
+  `group/<route>/<model>` names, written by `attach_gateway_to_agents` /
+  `refresh_gateway_profiles`. A shared Provider edit still changes which route
+  groups resolve, so every native `NativeBackend` write path that touches shared
+  Provider Models or Keys calls `refresh_gateway_catalog` after the facade call.
+  A paired client's write reaches the same `ProviderConfigService` through the
+  remote dispatcher and publishes the same `ProviderConfigChanged` events, but
+  it does not run that republication: it has the database, not the listener's
+  address. The desktop runtime republishes on the next route or gateway write.
+- `ProviderConfigChanged` is published per launch row, so a paired client's
+  write must go through the runtime-owned `ProviderConfigService` — the one
+  carrying the profile-change listeners — rather than a fresh instance opened on
+  the same path. Without `.with_provider_config_service(...)` the write landed in
+  SQLite and published nothing, leaving this machine's pages on the old list.
 - `NativeBackend` may expose the typed entity CRUD, preview, capability, and
   explicit Secret mutation methods. `WebRemoteBackend` exposes only bounded
   capability and redacted preview; raw entities and Secret mutation fail with a
