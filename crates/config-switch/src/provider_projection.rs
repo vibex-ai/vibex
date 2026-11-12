@@ -1227,6 +1227,46 @@ impl ProviderConfigService {
         )))
     }
 
+    /// The provider key an Agent's projected model ids are namespaced under.
+    ///
+    /// pi's adapter addresses a model as `<provider>/<id>` and reads the first
+    /// path segment as the provider. A Model the binding's projection does not
+    /// carry — a selection that survived a Model edit — would otherwise travel
+    /// bare and pi would resolve it against the wrong provider, or reject it
+    /// when the id itself contains a `/`. Returning the namespace lets the
+    /// runtime qualify such an id.
+    pub fn legacy_agent_provider_model_id_namespace(
+        &self,
+        provider_profile_id: &vibex_core::ProviderProfileId,
+    ) -> VibexResult<Option<String>> {
+        let conn = self.open_connection()?;
+        let Some(binding) =
+            AgentModelProviderBindingRepository::get_by_legacy_profile(&conn, provider_profile_id)?
+        else {
+            return Ok(None);
+        };
+        let (provider, _, _, descriptor) = load_projection_input(&conn, &binding.id)?;
+        if !matches!(
+            descriptor.provider_control,
+            AgentProviderControl::ManagedConfigOverlay {
+                strategy: ConfigOverlayStrategy::PiModelsJson
+            }
+        ) && !matches!(
+            descriptor.model_control,
+            AgentModelControl::ManagedConfigOverlay {
+                strategy: ConfigOverlayStrategy::PiModelsJson
+            }
+        ) {
+            return Ok(None);
+        }
+        Ok(Some(sanitize_provider_id(
+            provider
+                .vendor_hint
+                .as_deref()
+                .unwrap_or_else(|| provider.id.as_str()),
+        )))
+    }
+
     pub fn plan_legacy_agent_provider_projection(
         &self,
         provider_profile_id: &vibex_core::ProviderProfileId,
@@ -5414,13 +5454,13 @@ fn pi_overlay(
     model: Option<&AgentConfiguredModelBinding>,
     secret_env_key: &str,
 ) -> VibexResult<String> {
-    let model_id = projection_model_id(model).unwrap_or("vibex-model");
     let provider_id = sanitize_provider_id(
         provider
             .vendor_hint
             .as_deref()
             .unwrap_or_else(|| provider.id.as_str()),
     );
+    let model_id = pi_registry_model_id(&provider_id, model);
     let mut entry = serde_json::Map::new();
     json_string_if_present(
         &mut entry,
@@ -5439,13 +5479,13 @@ fn pi_overlay(
 
     let group = overlay_model_group(binding, model, |model| pi_api_kind(Some(model)));
     let models: Vec<serde_json::Value> = if group.is_empty() {
-        vec![pi_model_registry_entry(provider, model, model_id)]
+        vec![pi_model_registry_entry(provider, model, &model_id)]
     } else {
         group
             .iter()
             .map(|model_binding| {
-                let model_id = projection_model_id(Some(model_binding)).unwrap_or("vibex-model");
-                pi_model_registry_entry(provider, Some(model_binding), model_id)
+                let model_id = pi_registry_model_id(&provider_id, Some(model_binding));
+                pi_model_registry_entry(provider, Some(model_binding), &model_id)
             })
             .collect()
     };
@@ -5453,6 +5493,21 @@ fn pi_overlay(
     serialized_json(serde_json::json!({
         "providers": {provider_id: entry},
     }))
+}
+
+/// The model id pi's `models.json` registers for a Provider Profile.
+///
+/// pi's ACP adapter addresses a model as `<provider>/<id>`, so the registry
+/// entry stays unqualified. Stripping the prefix here keeps the entry and the
+/// ACP option id the projection sends in one vocabulary: a product id that
+/// already spells the provider would otherwise be read back as
+/// `<provider>/<provider>/<id>` while the wire form is `<provider>/<id>`.
+fn pi_registry_model_id(provider_id: &str, model: Option<&AgentConfiguredModelBinding>) -> String {
+    let model_id = projection_model_id(model).unwrap_or("vibex-model");
+    model_id
+        .strip_prefix(&format!("{provider_id}/"))
+        .unwrap_or(model_id)
+        .to_string()
 }
 
 fn pi_model_reasoning(
@@ -9545,6 +9600,28 @@ mod tests {
             projected_runtime_model_id(&provider, &descriptor, &prequalified),
             "fake/model-a"
         );
+    }
+
+    #[test]
+    fn pi_overlay_entry_ids_are_not_provider_qualified() {
+        let (provider, _, mut binding, _) = fixture(ConfigOverlayStrategy::PiModelsJson);
+        let endpoint = provider.endpoints.first().cloned().unwrap();
+        binding.configured_models[0].agent_model_id = "fake/model-a".to_string();
+
+        let content = pi_overlay(
+            &provider,
+            &binding,
+            Some(&endpoint),
+            binding.configured_models.first(),
+            "PI_API_KEY",
+        )
+        .unwrap();
+        let overlay: serde_json::Value = serde_json::from_str(&content).unwrap();
+        // pi's adapter addresses the model as `fake/model-a`, matching the ACP
+        // projection; an entry that kept the prefix would be reported back as
+        // `fake/fake/model-a`.
+        assert_eq!(overlay["providers"]["fake"]["models"][0]["id"], "model-a");
+        assert_eq!(overlay["providers"]["fake"]["models"][0]["name"], "model-a");
     }
 
     #[test]

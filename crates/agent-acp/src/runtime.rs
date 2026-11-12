@@ -2695,6 +2695,10 @@ struct ProcessShared {
 struct AcpModelIdProjection {
     product_to_runtime: BTreeMap<String, String>,
     runtime_to_product: BTreeMap<String, String>,
+    /// The provider key an Agent that addresses a model as `<provider>/<model>`
+    /// expects, used for a Model the projection carries no entry for. `None`
+    /// for every other Agent, which keeps a bare id bare.
+    namespace: Option<String>,
 }
 
 impl AcpModelIdProjection {
@@ -2757,6 +2761,19 @@ impl AcpModelIdProjection {
         self
     }
 
+    /// The provider key a Model the projection does not carry must be
+    /// qualified by. Only Agents that address a model as `<provider>/<model>`
+    /// pass one; every other Agent leaves the namespace unset.
+    fn with_namespace(mut self, namespace: Option<String>) -> Self {
+        self.namespace = namespace;
+        self
+    }
+
+    /// Whether the projection maps no product Model at all.
+    fn is_empty(&self) -> bool {
+        self.product_to_runtime.is_empty()
+    }
+
     fn insert_runtime_id(
         &mut self,
         runtime_model_id: &str,
@@ -2776,17 +2793,27 @@ impl AcpModelIdProjection {
     }
 
     fn runtime_id(&self, product_model_id: &str) -> String {
-        self.product_to_runtime
-            .get(product_model_id)
-            .cloned()
-            .unwrap_or_else(|| product_model_id.to_string())
+        if let Some(runtime_id) = self.product_to_runtime.get(product_model_id) {
+            return runtime_id.clone();
+        }
+        if let Some(namespace) = self.namespace.as_deref()
+            && !product_model_id.starts_with(&format!("{namespace}/"))
+        {
+            return format!("{namespace}/{product_model_id}");
+        }
+        product_model_id.to_string()
     }
 
     fn product_id(&self, runtime_model_id: &str) -> String {
-        self.runtime_to_product
-            .get(runtime_model_id)
-            .cloned()
-            .unwrap_or_else(|| runtime_model_id.to_string())
+        if let Some(product_id) = self.runtime_to_product.get(runtime_model_id) {
+            return product_id.clone();
+        }
+        if let Some(namespace) = self.namespace.as_deref()
+            && let Some(bare) = runtime_model_id.strip_prefix(&format!("{namespace}/"))
+        {
+            return bare.to_string();
+        }
+        runtime_model_id.to_string()
     }
 }
 
@@ -13598,11 +13625,24 @@ impl AcpRuntimeClient {
                 let profile_id = self.source_profile_id(&agent_id, source)?.ok_or_else(|| {
                     runtime_configuration_unavailable("model_route_not_launchable")
                 })?;
-                AcpModelIdProjection::new(
+                let projection = AcpModelIdProjection::new(
                     self.config_service
                         .legacy_agent_provider_model_id_projections(&profile_id)?
                         .unwrap_or_default(),
-                )?
+                )?;
+                // pi's adapter reads the provider from the first path segment,
+                // so a Model the projection carries no entry for — a selection
+                // that survived a Model edit — still has to travel qualified.
+                // A Profile that projects no models at all is left alone: the
+                // Agent's own catalogue is its only vocabulary then, and those
+                // ids already carry their native provider.
+                let namespace = if projection.is_empty() {
+                    None
+                } else {
+                    self.config_service
+                        .legacy_agent_provider_model_id_namespace(&profile_id)?
+                };
+                projection.with_namespace(namespace)
             }
         }
         .with_alias_slots(claude_alias_slots);
@@ -22988,6 +23028,39 @@ mod tests {
         assert_eq!(projection.runtime_id("gpt-5.6-sol"), "custom:gpt-5.6-sol");
         assert_eq!(projection.product_id("custom:gpt-5.6-sol"), "gpt-5.6-sol");
         assert_eq!(projection.product_id("unmapped"), "unmapped");
+    }
+
+    #[test]
+    fn model_id_projection_qualifies_an_unmapped_pi_model_under_its_namespace() {
+        let projection = AcpModelIdProjection::default().with_namespace(Some("acp".to_string()));
+
+        assert_eq!(
+            projection.runtime_id("deepseek/deepseek-chat"),
+            "acp/deepseek/deepseek-chat"
+        );
+        // An id that already spells the namespace is never doubled.
+        assert_eq!(
+            projection.runtime_id("acp/deepseek/deepseek-chat"),
+            "acp/deepseek/deepseek-chat"
+        );
+        // A slashless id is qualified too, so the adapter never has to resolve
+        // the provider from its own catalogue.
+        assert_eq!(projection.runtime_id("deepseek-chat"), "acp/deepseek-chat");
+        assert_eq!(
+            projection.product_id("acp/deepseek/deepseek-chat"),
+            "deepseek/deepseek-chat"
+        );
+        assert_eq!(
+            projection.product_id("deepseek/deepseek-chat"),
+            "deepseek/deepseek-chat"
+        );
+
+        // An Agent with no namespace keeps a bare id bare.
+        let bare = AcpModelIdProjection::default();
+        assert_eq!(
+            bare.runtime_id("deepseek/deepseek-chat"),
+            "deepseek/deepseek-chat"
+        );
     }
 
     #[test]
@@ -40270,6 +40343,85 @@ for line in sys.stdin:
             .expect("Hermes model probe must select its target model");
         assert_eq!(model_request["params"]["configId"], "model");
         assert_eq!(model_request["params"]["value"], "custom:mock/model-2");
+        unsafe {
+            std::env::remove_var(SECRET_ENV);
+        }
+        fixture.cleanup();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pi_model_probe_qualifies_a_slashed_model_id_with_its_provider() {
+        let Some(fixture) = MockAcpFixture::create_for_agent(
+            "pi-model-probe",
+            Some(AgentId::parse(PI_AGENT_ID).unwrap()),
+        ) else {
+            return;
+        };
+        const SECRET_ENV: &str = "VIBEX_TEST_PI_PROVIDER_KEY";
+        let service = fixture.service();
+        let mut config = service
+            .get_acp_profile_config_for_launch(fixture.profile_id.clone())
+            .unwrap();
+        config.models = vec!["mock/model-1".to_string(), "mock/model-2".to_string()];
+        let conn = open_database(&fixture.db_path).unwrap();
+        persist_managed_runtime(&conn, PI_AGENT_ID, PI_AGENT_ID, "0.0.34", &config);
+        vibex_db::ProviderSecretReferenceRepository::replace_for_profile(
+            &conn,
+            &fixture.profile_id,
+            &[vibex_core::ProviderSecretReference {
+                id: RequestId::new(),
+                provider_profile_id: fixture.profile_id.clone(),
+                secret_kind: vibex_core::ProviderSecretKind::ApiKey,
+                backend: ProviderSecretBackend::Environment,
+                setup_state: vibex_core::ProviderSecretSetupState::Available,
+                lookup_key: SECRET_ENV.to_string(),
+                display_label: "VIBEX_PI_API_KEY".to_string(),
+                redacted_hint: "test environment".to_string(),
+                created_at_ms: 1,
+                updated_at_ms: 1,
+            }],
+        )
+        .unwrap();
+        drop(conn);
+        unsafe {
+            std::env::set_var(SECRET_ENV, "pi-test-secret");
+        }
+        service
+            .update_acp_profile_config(vibex_core::AcpProviderProfileUpdateRequest {
+                provider_profile_id: fixture.profile_id.clone(),
+                config,
+            })
+            .unwrap();
+        // The mock Agent qualifies its option ids with the overlay provider key
+        // exactly as pi-acp does.
+        fixture.set_model_prefix("acp");
+
+        let client = AcpRuntimeClient::new(service);
+        let _ = client
+            .probe_runtime_session_config_for_model(&fixture.profile_id, "mock/model-2")
+            .await
+            .unwrap();
+        let request = fixture
+            .request_log()
+            .into_iter()
+            .rev()
+            .find(|entry| {
+                matches!(
+                    entry["method"].as_str(),
+                    Some("session/set_model" | "session/set_config_option")
+                )
+            })
+            .expect("the Pi model probe must select its target model");
+        let value = request["params"]
+            .get("modelId")
+            .or_else(|| request["params"].get("value"))
+            .and_then(serde_json::Value::as_str)
+            .expect("the selection names the model");
+        assert_eq!(
+            value, "acp/mock/model-2",
+            "pi-acp reads the first path segment as the provider, so a model id \
+             that itself contains `/` must arrive qualified by the provider key"
+        );
         unsafe {
             std::env::remove_var(SECRET_ENV);
         }
