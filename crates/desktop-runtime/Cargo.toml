@@ -49,6 +49,7 @@ vibex-desktop-model = { path = "../desktop-model" }
 vibex-diagnostics = { path = "../diagnostics" }
 vibex-fs = { path = "../fs" }
 vibex-git = { path = "../git" }
+vibex-im-channel = { path = "../im-channel" }
 vibex-model-catalog = { path = "../model-catalog" }
 vibex-model-gateway = { path = "../model-gateway" }
 vibex-relay = { path = "../relay" }

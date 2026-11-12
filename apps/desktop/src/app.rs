@@ -11436,6 +11436,12 @@ fn subscribe_composer_input(
 /// Only genuinely application-scoped state (the session list, the sidebar, the
 /// runtime handles, tasks) stays on `VibexWorkbench` itself.
 impl VibexWorkbench {
+    /// The active backend facade, for the settings surfaces that own their own
+    /// async state instead of mirroring it on the workbench.
+    pub(crate) fn backend_facade(&self) -> Option<BackendFacade> {
+        self.backend.clone()
+    }
+
     /// Fetches one page of history above what the view already holds.
     ///
     /// The desktop used to read whole histories, so it had no older-history
@@ -85515,6 +85521,7 @@ enum SettingsSection {
     Appearance,
     Workbench,
     Connections,
+    Channels,
     Session,
     Archived,
     Terminal,
@@ -85986,6 +85993,27 @@ fn settings_section_for_query(query: &str) -> Option<SettingsSection> {
         "主機",
     ]) {
         Some(SettingsSection::Connections)
+    } else if matches(&[
+        "im channel",
+        "im channels",
+        "im 频道",
+        "telegram",
+        "lark",
+        "feishu",
+        "wechat",
+        "wecom",
+        "bot",
+        "channel",
+        "频道",
+        "頻道",
+        "机器人",
+        "機器人",
+        "飞书",
+        "飛書",
+        "企业微信",
+        "企業微信",
+    ]) {
+        Some(SettingsSection::Channels)
     } else if matches(&[
         "archived", "archive", "restore", "归档", "封存", "復原", "复原",
     ]) {
@@ -86738,6 +86766,35 @@ fn settings_search_candidates(strings: &'static Strings) -> Vec<SettingsSearchCa
             ],
         ),
         settings_search_candidate(
+            SettingsSection::Channels,
+            locale::text("IM channels", "IM 频道", "IM 頻道"),
+            locale::text(
+                "Chat with Vibex and approve tool calls from Telegram.",
+                "通过 Telegram 和 Vibex 对话并批准工具调用。",
+                "透過 Telegram 和 Vibex 對話並批准工具呼叫。",
+            ),
+            &[
+                "im channel",
+                "im channels",
+                "im 频道",
+                "telegram",
+                "lark",
+                "feishu",
+                "wechat",
+                "wecom",
+                "bot",
+                "channel",
+                "频道",
+                "頻道",
+                "机器人",
+                "機器人",
+                "飞书",
+                "飛書",
+                "企业微信",
+                "企業微信",
+            ],
+        ),
+        settings_search_candidate(
             SettingsSection::Terminal,
             locale::text("Default shell", "默认 Shell", "預設 Shell"),
             locale::text(
@@ -87185,6 +87242,7 @@ fn settings_section_label(section: SettingsSection) -> &'static str {
         SettingsSection::Connections => {
             locale::text("Remote instances", "远程实例", "遠端執行個體")
         }
+        SettingsSection::Channels => locale::text("IM channels", "IM 频道", "IM 頻道"),
         SettingsSection::Session => locale::text("Session", "会话", "會話"),
         SettingsSection::Archived => locale::text("Archived sessions", "已归档会话", "已封存會話"),
         SettingsSection::Terminal => locale::text("Terminal", "终端", "終端機"),
@@ -88205,6 +88263,7 @@ struct FoundationSettings {
     bootstrap_command: Option<crate::ssh_connection::bootstrap::BootstrapCommand>,
     bootstrap_error: Option<String>,
     active_section: SettingsSection,
+    im_channels_view: Entity<crate::im_channels::ImChannelsView>,
     /// Release notes selected for the About page, kept across frames so the
     /// Markdown source is not re-selected and re-compared on every render.
     about_notes: Option<AboutReleaseNotes>,
@@ -88658,6 +88717,8 @@ impl FoundationSettings {
                 },
             )
             .detach();
+            let im_channels_view =
+                cx.new(|cx| crate::im_channels::ImChannelsView::new(workbench.clone(), window, cx));
             Self {
                 workbench,
                 home_dir,
@@ -88735,6 +88796,7 @@ impl FoundationSettings {
                 bootstrap_command: None,
                 bootstrap_error: None,
                 active_section: SettingsSection::General,
+                im_channels_view,
                 about_notes: None,
                 about_notes_scroll: ScrollHandle::new(),
             }
@@ -88766,6 +88828,10 @@ impl FoundationSettings {
         if section == SettingsSection::Connections {
             self.reload_connections_profiles();
             self.resume_unprovisioned_connections(cx);
+        }
+        if section == SettingsSection::Channels {
+            self.im_channels_view
+                .update(cx, |view, cx| view.reload_public(cx));
         }
     }
 
@@ -90842,6 +90908,7 @@ impl FoundationSettings {
                 &[
                     (SettingsSection::Workbench, IconName::LayoutDashboard),
                     (SettingsSection::Connections, IconName::Network),
+                    (SettingsSection::Channels, IconName::Bot),
                     (SettingsSection::Session, IconName::Bot),
                     (SettingsSection::Archived, IconName::Inbox),
                     (SettingsSection::Terminal, IconName::SquareTerminal),
@@ -98031,6 +98098,7 @@ impl Render for FoundationSettings {
             SettingsSection::Archived => self.render_archived_page(stacked_rows, cx),
             SettingsSection::Workbench => self.render_workbench_page(&workbench, stacked_rows, cx),
             SettingsSection::Connections => self.render_connections_page(stacked_rows, cx),
+            SettingsSection::Channels => self.im_channels_view.clone().into_any_element(),
             SettingsSection::Terminal => self.render_terminal_page(&terminal, stacked_rows, cx),
             SettingsSection::Browser => self.render_browser_page(stacked_rows, cx),
             SettingsSection::Computer => self.render_computer_page(stacked_rows, cx),

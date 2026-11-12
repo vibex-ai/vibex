@@ -11,6 +11,11 @@ use vibex_core::{
 #[cfg(all(not(test), feature = "os-keychain"))]
 const VIBEX_SECRET_SERVICE: &str = "dev.vibex.provider-secrets";
 
+#[cfg(all(not(test), feature = "os-keychain"))]
+const VIBEX_IM_SECRET_SERVICE: &str = "dev.vibex.im-secrets";
+
+const IM_HOST_SECRET_FILE: &str = "im-secrets.json";
+
 /// Host-side secret file used when no usable OS keychain exists.
 const HOST_SECRET_FILE: &str = "provider-secrets.json";
 
@@ -517,6 +522,267 @@ fn validate_lookup_key(lookup_key: &str) -> VibexResult<&str> {
         ));
     }
     Ok(lookup_key)
+}
+
+/// Where the runtime writes newly stored IM channel secrets.  This shares the
+/// same process-wide selection as Provider secrets: a desktop keeps the OS
+/// keychain, a headless server keeps a host-owned file.
+pub fn im_secret_write_backend() -> ProviderSecretBackend {
+    provider_secret_write_backend()
+}
+
+pub fn store_im_secret(lookup_key: &str, secret: &str) -> VibexResult<()> {
+    let lookup_key = validate_lookup_key(lookup_key)?;
+    if secret.is_empty() {
+        return Err(VibexError::validation(
+            "im_secret_empty",
+            "IM channel secret must not be empty",
+        ));
+    }
+
+    #[cfg(test)]
+    {
+        test_secret_store()
+            .lock()
+            .map_err(|_| {
+                VibexError::storage(
+                    "im_secret_store_lock_failed",
+                    "failed to lock IM secret test store",
+                )
+            })?
+            .insert(lookup_key.to_string(), secret.to_string());
+        Ok(())
+    }
+
+    #[cfg(not(test))]
+    {
+        match provider_secret_store().store() {
+            ProviderSecretStore::HostFile => {
+                let root = host_file_root()?;
+                store_im_host_file_secret(&root, lookup_key, secret)
+            }
+            ProviderSecretStore::OsKeychain => {
+                #[cfg(feature = "os-keychain")]
+                {
+                    im_keyring_entry(lookup_key)?
+                        .set_password(secret)
+                        .map_err(|error| {
+                            VibexError::storage(
+                                "im_secret_keychain_store_failed",
+                                "failed to store IM channel secret in OS keychain",
+                            )
+                            .with_diagnostic("backend", "os_keychain")
+                            .with_diagnostic("error", error.to_string())
+                        })
+                }
+                #[cfg(not(feature = "os-keychain"))]
+                {
+                    Err(os_keychain_unavailable())
+                }
+            }
+        }
+    }
+}
+
+pub fn resolve_im_secret(lookup_key: &str) -> VibexResult<Option<String>> {
+    let lookup_key = validate_lookup_key(lookup_key)?;
+
+    #[cfg(test)]
+    {
+        return Ok(test_secret_store()
+            .lock()
+            .map_err(|_| {
+                VibexError::storage(
+                    "im_secret_store_lock_failed",
+                    "failed to lock IM secret test store",
+                )
+            })?
+            .get(lookup_key)
+            .cloned());
+    }
+
+    #[cfg(not(test))]
+    {
+        match provider_secret_store().store() {
+            ProviderSecretStore::HostFile => {
+                let root = host_file_root()?;
+                load_im_host_file_secret(&root, lookup_key)
+            }
+            ProviderSecretStore::OsKeychain => {
+                #[cfg(feature = "os-keychain")]
+                {
+                    match im_keyring_entry(lookup_key)?.get_password() {
+                        Ok(secret) => Ok(Some(secret)),
+                        Err(keyring::Error::NoEntry) => Ok(None),
+                        Err(error) => Err(VibexError::storage(
+                            "im_secret_keychain_read_failed",
+                            "failed to read IM channel secret from OS keychain",
+                        )
+                        .with_diagnostic("backend", "os_keychain")
+                        .with_diagnostic("error", error.to_string())),
+                    }
+                }
+                #[cfg(not(feature = "os-keychain"))]
+                {
+                    Err(os_keychain_unavailable())
+                }
+            }
+        }
+    }
+}
+
+pub fn delete_im_secret(lookup_key: &str) -> VibexResult<()> {
+    let lookup_key = validate_lookup_key(lookup_key)?;
+
+    #[cfg(test)]
+    {
+        test_secret_store()
+            .lock()
+            .map_err(|_| {
+                VibexError::storage(
+                    "im_secret_store_lock_failed",
+                    "failed to lock IM secret test store",
+                )
+            })?
+            .remove(lookup_key);
+        Ok(())
+    }
+
+    #[cfg(not(test))]
+    {
+        match provider_secret_store().store() {
+            ProviderSecretStore::HostFile => {
+                let root = host_file_root()?;
+                delete_im_host_file_secret(&root, lookup_key)
+            }
+            ProviderSecretStore::OsKeychain => {
+                #[cfg(feature = "os-keychain")]
+                {
+                    match im_keyring_entry(lookup_key)?.delete_credential() {
+                        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+                        Err(error) => Err(VibexError::storage(
+                            "im_secret_keychain_delete_failed",
+                            "failed to delete IM channel secret from OS keychain",
+                        )
+                        .with_diagnostic("backend", "os_keychain")
+                        .with_diagnostic("error", error.to_string())),
+                    }
+                }
+                #[cfg(not(feature = "os-keychain"))]
+                {
+                    Err(os_keychain_unavailable())
+                }
+            }
+        }
+    }
+}
+
+#[cfg(all(not(test), feature = "os-keychain"))]
+fn im_keyring_entry(lookup_key: &str) -> VibexResult<keyring::Entry> {
+    keyring::Entry::new(VIBEX_IM_SECRET_SERVICE, lookup_key).map_err(|error| {
+        VibexError::storage(
+            "im_secret_keychain_entry_failed",
+            "failed to open IM channel secret keychain entry",
+        )
+        .with_diagnostic("backend", "os_keychain")
+        .with_diagnostic("error", error.to_string())
+    })
+}
+
+fn im_host_secret_path(root: &Path) -> PathBuf {
+    root.join(IM_HOST_SECRET_FILE)
+}
+
+fn store_im_host_file_secret(root: &Path, lookup_key: &str, secret: &str) -> VibexResult<()> {
+    let mut secrets = read_im_host_secret_file(root)?;
+    secrets.insert(lookup_key.to_string(), secret.to_string());
+    write_im_host_secret_file(root, &secrets)
+}
+
+fn load_im_host_file_secret(root: &Path, lookup_key: &str) -> VibexResult<Option<String>> {
+    Ok(read_im_host_secret_file(root)?
+        .get(lookup_key)
+        .cloned()
+        .filter(|secret| !secret.is_empty()))
+}
+
+fn delete_im_host_file_secret(root: &Path, lookup_key: &str) -> VibexResult<()> {
+    let mut secrets = read_im_host_secret_file(root)?;
+    if secrets.remove(lookup_key).is_none() {
+        return Ok(());
+    }
+    write_im_host_secret_file(root, &secrets)
+}
+
+fn read_im_host_secret_file(root: &Path) -> VibexResult<BTreeMap<String, String>> {
+    let path = im_host_secret_path(root);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(error) => return Err(im_host_secret_file_error("read", &path, &error)),
+    };
+    if bytes.iter().all(u8::is_ascii_whitespace) {
+        return Ok(BTreeMap::new());
+    }
+    serde_json::from_slice(&bytes).map_err(|error| {
+        VibexError::storage(
+            "im_secret_host_file_read_failed",
+            "IM secret file is not valid JSON",
+        )
+        .with_diagnostic("backend", "host_file")
+        .with_diagnostic("path", path.display().to_string())
+        .with_diagnostic("error", error.to_string())
+    })
+}
+
+fn write_im_host_secret_file(root: &Path, secrets: &BTreeMap<String, String>) -> VibexResult<()> {
+    std::fs::create_dir_all(root)
+        .map_err(|error| im_host_secret_file_error("create", root, &error))?;
+    let path = im_host_secret_path(root);
+    let temp_path = path.with_extension("json.tmp");
+    let bytes = serde_json::to_vec_pretty(secrets).map_err(|error| {
+        VibexError::storage(
+            "im_secret_host_file_write_failed",
+            "IM secret file could not be encoded",
+        )
+        .with_diagnostic("backend", "host_file")
+        .with_diagnostic("error", error.to_string())
+    })?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let result = (|| -> std::io::Result<()> {
+        let mut file = options.open(&temp_path)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&temp_path, &path)?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(im_host_secret_file_error("write", &path, &error));
+    }
+    Ok(())
+}
+
+fn im_host_secret_file_error(
+    action: &'static str,
+    path: &Path,
+    error: &std::io::Error,
+) -> VibexError {
+    let code = match action {
+        "read" => "im_secret_host_file_read_failed",
+        "create" => "im_secret_host_file_create_failed",
+        _ => "im_secret_host_file_write_failed",
+    };
+    VibexError::storage(code, "IM secret file could not be accessed")
+        .with_diagnostic("backend", "host_file")
+        .with_diagnostic("path", path.display().to_string())
+        .with_diagnostic("error", error.to_string())
 }
 
 #[cfg(all(not(test), feature = "os-keychain"))]

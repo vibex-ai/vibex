@@ -22,6 +22,7 @@ pub mod file;
 pub mod git;
 pub mod goal;
 pub mod ids;
+pub mod im;
 pub mod local_history;
 pub mod market;
 pub mod model_gateway;
@@ -234,14 +235,15 @@ pub use ids::{
     AgentProviderProjectionDescriptorId, AgentRuntimeProbeId, AgentRuntimeProfileId,
     AutomationEdgeId, AutomationGraphId, AutomationNodeId, AutomationRunId, AutomationRunStepId,
     BrowserSessionId, BrowserTabId, ChannelId, ComputerSessionId, CorrelationId, DeviceId, EventId,
-    HookId, McpServerId, MessageSubmissionId, ModelProviderProfileId, ModelRouteId,
-    ModelRouteMemberId, NativeStateHomeId, ProjectId, PromptId, ProviderProfileId,
-    RelayConnectionId, RelayFrameId, RelayPeerId, RelayRoomId, RelaySessionId, RequestId,
-    RuntimeBindingId, RuntimeClientId, RuntimeLeaseId, RuntimeProcessId, RuntimeStreamId,
-    RuntimeSwitchId, RuntimeSwitchOperationId, ScheduledTaskId, ScheduledTaskRunId, SessionGroupId,
-    SkillId, TerminalId, TimelineItemId, UsageExecutionId, VibexExecutionId, VibexOperationId,
-    VibexSessionId, WorkspaceId,
+    HookId, ImActionId, ImBindingId, ImChannelId, ImMessageId, ImPairingId, ImPrincipalId,
+    McpServerId, MessageSubmissionId, ModelProviderProfileId, ModelRouteId, ModelRouteMemberId,
+    NativeStateHomeId, ProjectId, PromptId, ProviderProfileId, RelayConnectionId, RelayFrameId,
+    RelayPeerId, RelayRoomId, RelaySessionId, RequestId, RuntimeBindingId, RuntimeClientId,
+    RuntimeLeaseId, RuntimeProcessId, RuntimeStreamId, RuntimeSwitchId, RuntimeSwitchOperationId,
+    ScheduledTaskId, ScheduledTaskRunId, SessionGroupId, SkillId, TerminalId, TimelineItemId,
+    UsageExecutionId, VibexExecutionId, VibexOperationId, VibexSessionId, WorkspaceId,
 };
+pub use im::*;
 pub use local_history::{
     LocalHistoryImportRecord, LocalHistoryImportResult, LocalHistoryImportStatus, LocalHistoryKey,
     LocalHistoryMaterializedSession, LocalHistoryScanDiagnostic, LocalHistoryScanFolder,

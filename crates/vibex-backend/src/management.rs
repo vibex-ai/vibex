@@ -28,6 +28,8 @@ use vibex_core::{
     DiagnosticExportPayload, GatewayAgentUpdateRequest, GatewayCapabilitySuggestion,
     GatewayRequestSummary, GatewaySettingsUpdateRequest, GatewaySnapshot, Hook, HookCreateRequest,
     HookDeleteRequest, HookInstallPreview, HookInstallPreviewRequest, HookUpdateRequest,
+    ImBindingId, ImBindingSummary, ImChannelDraft, ImChannelId, ImChannelSummary,
+    ImChannelTestReport, ImPairingCodeInfo, ImPairingRequest, ImPrincipalId, ImPrincipalSummary,
     ManagementSnapshotPayload, MarketIcon, McpMarketIcon, McpMarketInstallRequest,
     McpMarketInstallResult, McpMarketSearchRequest, McpMarketSearchResponse, McpServer,
     McpServerAgentMatrix, McpServerAgentMatrixListRequest, McpServerCreateRequest,
@@ -95,6 +97,30 @@ pub struct ManagementProfileSelectionRequest {
     /// scope; a paired client passes the workspace it is managing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<vibex_core::ProviderProfileDefaultScope>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImChannelEnabledRequest {
+    pub channel_id: ImChannelId,
+    pub enabled: bool,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImChannelSecretUpdateRequest {
+    pub channel_id: ImChannelId,
+    pub bot_token: String,
+}
+
+impl std::fmt::Debug for ImChannelSecretUpdateRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ImChannelSecretUpdateRequest")
+            .field("channel_id", &self.channel_id)
+            .field("bot_token", &"<redacted>")
+            .finish()
+    }
 }
 
 pub trait ManagementBackend: BackendBound {
@@ -893,4 +919,133 @@ pub trait ManagementBackend: BackendBound {
         &self,
         request: ProviderNativeExportListRequest,
     ) -> BackendFuture<'_, Vec<ProviderNativeExportRecordSummary>>;
+    fn list_im_channels(&self) -> BackendFuture<'_, Vec<ImChannelSummary>> {
+        Box::pin(async {
+            Err(BackendError::unsupported(
+                "im_channels_unavailable",
+                "IM channels are unavailable on this backend",
+            ))
+        })
+    }
+
+    fn create_im_channel(
+        &self,
+        request: MutationRequest<ImChannelDraft>,
+    ) -> BackendFuture<'_, ImChannelSummary> {
+        let _ = request;
+        Box::pin(async {
+            Err(BackendError::unsupported(
+                "im_channels_unavailable",
+                "IM channels are unavailable on this backend",
+            ))
+        })
+    }
+
+    fn set_im_channel_enabled(
+        &self,
+        request: MutationRequest<ImChannelEnabledRequest>,
+    ) -> BackendFuture<'_, ImChannelSummary> {
+        let _ = request;
+        Box::pin(async {
+            Err(BackendError::unsupported(
+                "im_channels_unavailable",
+                "IM channels are unavailable on this backend",
+            ))
+        })
+    }
+
+    fn set_im_channel_bot_token(
+        &self,
+        request: MutationRequest<ImChannelSecretUpdateRequest>,
+    ) -> BackendFuture<'_, ()> {
+        let _ = request;
+        Box::pin(async {
+            Err(BackendError::unsupported(
+                "im_channels_unavailable",
+                "IM channels are unavailable on this backend",
+            ))
+        })
+    }
+
+    fn delete_im_channel(&self, request: MutationRequest<ImChannelId>) -> BackendFuture<'_, ()> {
+        let _ = request;
+        Box::pin(async {
+            Err(BackendError::unsupported(
+                "im_channels_unavailable",
+                "IM channels are unavailable on this backend",
+            ))
+        })
+    }
+
+    fn test_im_channel(&self, channel_id: ImChannelId) -> BackendFuture<'_, ImChannelTestReport> {
+        let _ = channel_id;
+        Box::pin(async {
+            Err(BackendError::unsupported(
+                "im_channels_unavailable",
+                "IM channels are unavailable on this backend",
+            ))
+        })
+    }
+
+    fn create_im_pairing_code(
+        &self,
+        request: MutationRequest<ImPairingRequest>,
+    ) -> BackendFuture<'_, ImPairingCodeInfo> {
+        let _ = request;
+        Box::pin(async {
+            Err(BackendError::unsupported(
+                "im_channels_unavailable",
+                "IM channels are unavailable on this backend",
+            ))
+        })
+    }
+
+    fn list_im_principals(
+        &self,
+        channel_id: ImChannelId,
+    ) -> BackendFuture<'_, Vec<ImPrincipalSummary>> {
+        let _ = channel_id;
+        Box::pin(async {
+            Err(BackendError::unsupported(
+                "im_channels_unavailable",
+                "IM channels are unavailable on this backend",
+            ))
+        })
+    }
+
+    fn revoke_im_principal(
+        &self,
+        request: MutationRequest<ImPrincipalId>,
+    ) -> BackendFuture<'_, ()> {
+        let _ = request;
+        Box::pin(async {
+            Err(BackendError::unsupported(
+                "im_channels_unavailable",
+                "IM channels are unavailable on this backend",
+            ))
+        })
+    }
+
+    fn list_im_bindings(
+        &self,
+        channel_id: ImChannelId,
+    ) -> BackendFuture<'_, Vec<ImBindingSummary>> {
+        let _ = channel_id;
+        Box::pin(async {
+            Err(BackendError::unsupported(
+                "im_channels_unavailable",
+                "IM channels are unavailable on this backend",
+            ))
+        })
+    }
+
+    fn revoke_im_binding(&self, request: MutationRequest<ImBindingId>) -> BackendFuture<'_, ()> {
+        let _ = request;
+        Box::pin(async {
+            Err(BackendError::unsupported(
+                "im_channels_unavailable",
+                "IM channels are unavailable on this backend",
+            ))
+        })
+    }
 }

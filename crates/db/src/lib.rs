@@ -53,6 +53,8 @@ use vibex_core::{
     legacy_status_for_phase, phase_for_legacy_status, unix_timestamp_ms,
 };
 
+mod im;
+pub use im::*;
 mod remote_v2;
 pub use remote_v2::*;
 mod provider_projection;
@@ -97,7 +99,7 @@ pub use runtime::{
     SwitchOperationJournalRepository, SwitchOperationRecord,
 };
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 88;
+pub const CURRENT_SCHEMA_VERSION: i64 = 89;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Copy)]
@@ -12740,6 +12742,7 @@ pub fn apply_migrations(conn: &mut Connection) -> VibexResult<Vec<String>> {
     // terminal they run in beside it, so the column and the link table are
     // recorded last and independent of the ACP tables above.
     apply_session_transport(conn, &mut applied)?;
+    apply_im_chat_channels(conn, &mut applied)?;
     Ok(applied)
 }
 
@@ -19589,6 +19592,7 @@ mod tests {
                 "86:agent_session_tool_settings",
                 "87:opencode_session_header",
                 "88:agent_session_transport",
+                "89:im_chat_channels",
             ]
         );
         let agent_models: (Option<String>, Option<String>) = conn
@@ -19761,6 +19765,7 @@ mod tests {
                 "86:agent_session_tool_settings",
                 "87:opencode_session_header",
                 "88:agent_session_transport",
+                "89:im_chat_channels",
             ]
         );
         let activation_completed_at_ms: Option<i64> = conn
@@ -19918,6 +19923,7 @@ mod tests {
                 "86:agent_session_tool_settings",
                 "87:opencode_session_header",
                 "88:agent_session_transport",
+                "89:im_chat_channels",
             ]
         );
         let stored: (String, Option<String>, Option<i64>) = conn
@@ -20109,6 +20115,7 @@ mod tests {
                 "86:agent_session_tool_settings",
                 "87:opencode_session_header",
                 "88:agent_session_transport",
+                "89:im_chat_channels",
             ]
         );
         assert_eq!(
@@ -21569,6 +21576,7 @@ mod tests {
                 "86:agent_session_tool_settings",
                 "87:opencode_session_header",
                 "88:agent_session_transport",
+                "89:im_chat_channels",
             ]
         );
         let managed = ManagedWorktreeRepository::get_by_id(&conn, &worktree_id)
@@ -28391,4 +28399,184 @@ fn map_session_terminal(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionTerm
             completed_at_ms: row.get(14)?,
         },
     })
+}
+
+/// Creates the IM channel tables.
+///
+/// Recorded after the long-lived ad-hoc tail so a migrated database reports an
+/// ascending version list. The tables are independent of the ACP schema above.
+fn apply_im_chat_channels(conn: &mut Connection, applied: &mut Vec<String>) -> VibexResult<()> {
+    const VERSION: i64 = 89;
+    const NAME: &str = "im_chat_channels";
+    if migration_applied(conn, VERSION)? {
+        return Ok(());
+    }
+    let tx = conn.transaction().map_err(storage_err(
+        "migration_transaction_failed",
+        "failed to start the IM channel migration transaction",
+    ))?;
+    tx.execute_batch(
+        r#"
+            CREATE TABLE IF NOT EXISTS im_channels (
+                channel_id TEXT PRIMARY KEY,
+                display_name TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 0,
+                config_json TEXT NOT NULL,
+                event_filter_json TEXT,
+                locale TEXT,
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS im_channel_secrets (
+                channel_id TEXT NOT NULL REFERENCES im_channels(channel_id) ON DELETE CASCADE,
+                secret_kind TEXT NOT NULL,
+                backend TEXT NOT NULL,
+                lookup_key TEXT NOT NULL,
+                setup_state TEXT NOT NULL,
+                redacted_hint TEXT NOT NULL,
+                updated_at_ms INTEGER NOT NULL,
+                PRIMARY KEY (channel_id, secret_kind)
+            );
+
+            CREATE TABLE IF NOT EXISTS im_principals (
+                principal_id TEXT PRIMARY KEY,
+                channel_id TEXT NOT NULL REFERENCES im_channels(channel_id) ON DELETE CASCADE,
+                external_user_id TEXT NOT NULL,
+                display_name TEXT NOT NULL,
+                role TEXT NOT NULL,
+                status TEXT NOT NULL,
+                paired_at_ms INTEGER,
+                last_seen_at_ms INTEGER,
+                revoked_at_ms INTEGER,
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL,
+                UNIQUE (channel_id, external_user_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS im_pairing_codes (
+                pairing_id TEXT PRIMARY KEY,
+                channel_id TEXT NOT NULL REFERENCES im_channels(channel_id) ON DELETE CASCADE,
+                code_hash TEXT NOT NULL UNIQUE,
+                role TEXT NOT NULL,
+                scope TEXT NOT NULL,
+                target_chat_id TEXT,
+                created_by_principal_id TEXT,
+                expires_at_ms INTEGER NOT NULL,
+                claimed_principal_id TEXT,
+                created_at_ms INTEGER NOT NULL,
+                claimed_at_ms INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS idx_im_pairing_expiry
+                ON im_pairing_codes(expires_at_ms, claimed_at_ms);
+
+            CREATE TABLE IF NOT EXISTS im_bindings (
+                binding_id TEXT PRIMARY KEY,
+                channel_id TEXT NOT NULL REFERENCES im_channels(channel_id) ON DELETE CASCADE,
+                external_chat_id TEXT NOT NULL,
+                thread_key TEXT NOT NULL DEFAULT '',
+                thread_kind TEXT,
+                session_id TEXT NOT NULL REFERENCES agent_sessions(session_id) ON DELETE CASCADE,
+                created_by_principal_id TEXT,
+                status TEXT NOT NULL,
+                last_delivered_sequence INTEGER NOT NULL DEFAULT 0,
+                title TEXT,
+                title_sync_enabled INTEGER NOT NULL DEFAULT 1,
+                provider_payload_json TEXT,
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL,
+                UNIQUE (channel_id, external_chat_id, thread_key)
+            );
+            CREATE INDEX IF NOT EXISTS idx_im_bindings_session
+                ON im_bindings(session_id);
+
+            CREATE TABLE IF NOT EXISTS im_approval_cards (
+                card_id TEXT PRIMARY KEY,
+                binding_id TEXT NOT NULL REFERENCES im_bindings(binding_id) ON DELETE CASCADE,
+                session_id TEXT NOT NULL,
+                request_id TEXT NOT NULL,
+                external_message_id TEXT,
+                status TEXT NOT NULL,
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL,
+                UNIQUE (binding_id, request_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_im_approval_request
+                ON im_approval_cards(session_id, request_id);
+
+            CREATE TABLE IF NOT EXISTS im_actions (
+                action_id TEXT PRIMARY KEY,
+                short_code TEXT NOT NULL,
+                card_id TEXT REFERENCES im_approval_cards(card_id) ON DELETE CASCADE,
+                channel_id TEXT NOT NULL,
+                binding_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                expires_at_ms INTEGER NOT NULL,
+                consumed_at_ms INTEGER,
+                consumed_by_principal_id TEXT,
+                created_at_ms INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_im_actions_expiry
+                ON im_actions(expires_at_ms, consumed_at_ms);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_im_actions_short_code_pending
+                ON im_actions(binding_id, short_code)
+                WHERE consumed_at_ms IS NULL;
+
+            CREATE TABLE IF NOT EXISTS im_messages (
+                message_id TEXT PRIMARY KEY,
+                channel_id TEXT NOT NULL,
+                direction TEXT NOT NULL,
+                provider_update_id TEXT,
+                external_message_id TEXT,
+                binding_id TEXT,
+                principal_id TEXT,
+                kind TEXT NOT NULL,
+                content_preview TEXT,
+                content_sha256 TEXT,
+                status TEXT NOT NULL,
+                error_code TEXT,
+                error_detail TEXT,
+                created_at_ms INTEGER NOT NULL
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_im_messages_update
+                ON im_messages(channel_id, provider_update_id)
+                WHERE provider_update_id IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS idx_im_messages_created
+                ON im_messages(channel_id, created_at_ms);
+
+            CREATE TABLE IF NOT EXISTS im_audit_logs (
+                audit_id TEXT PRIMARY KEY,
+                channel_id TEXT NOT NULL,
+                principal_id TEXT,
+                action TEXT NOT NULL,
+                target_kind TEXT,
+                target_id TEXT,
+                outcome TEXT NOT NULL,
+                detail_json TEXT,
+                created_at_ms INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_im_audit_created
+                ON im_audit_logs(channel_id, created_at_ms);
+        "#,
+    )
+    .map_err(storage_err(
+        "migration_apply_failed",
+        "failed to apply the IM channel migration",
+    ))?;
+    tx.execute(
+        "INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
+        params![VERSION, NAME, unix_timestamp_ms()],
+    )
+    .map_err(storage_err(
+        "migration_record_failed",
+        "failed to record the IM channel migration",
+    ))?;
+    tx.commit().map_err(storage_err(
+        "migration_commit_failed",
+        "failed to commit the IM channel migration",
+    ))?;
+    applied.push(format!("{VERSION}:{NAME}"));
+    Ok(())
 }

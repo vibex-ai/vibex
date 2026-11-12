@@ -12,6 +12,7 @@ mod computer;
 mod events;
 mod fixture;
 mod home_lock;
+mod im_channel;
 mod lan_pairing;
 mod management;
 pub mod network_proxy;
@@ -2641,6 +2642,7 @@ pub struct ManagementHandle {
     providers: ProviderHandle,
     model_gateway: Arc<ModelGatewayService>,
     model_catalog: Arc<CatalogCache>,
+    im_channels: Arc<vibex_im_channel::ImChannelService>,
     scheduled: ScheduledHandle,
     automation: AutomationHandle,
     diagnostics: DiagnosticsHandle,
@@ -2658,6 +2660,10 @@ impl ManagementHandle {
     /// The advisory model catalogue.
     pub fn model_catalog(&self) -> Arc<CatalogCache> {
         Arc::clone(&self.model_catalog)
+    }
+
+    pub fn im_channels(&self) -> Arc<vibex_im_channel::ImChannelService> {
+        Arc::clone(&self.im_channels)
     }
 
     pub fn model_catalog_status(&self) -> vibex_core::ModelCatalogStatus {
@@ -2922,6 +2928,7 @@ pub struct DesktopRuntime {
     model_gateway: Arc<ModelGatewayService>,
     /// The advisory model catalogue. Its absence only means "no suggestions".
     model_catalog: Arc<CatalogCache>,
+    im_channels: Arc<vibex_im_channel::ImChannelService>,
     providers: ProviderHandle,
     workspace: WorkspaceHandle,
     files: FileHandle,
@@ -3397,6 +3404,18 @@ impl DesktopRuntime {
         // The gateway's event sink outlives this scope, so it gets its own
         // handle rather than borrowing the one moved into the runtime.
         let gateway_events = events.clone();
+        let im_channels = Arc::new(vibex_im_channel::ImChannelService::new(
+            vibex_im_channel::ImChannelServiceConfig {
+                db_path: db_path.clone(),
+                home_dir: config.home_dir.clone(),
+                agent: Arc::new(im_channel::AgentManagerImPort::new(
+                    manager.clone(),
+                    runtime_selection.clone(),
+                )),
+                telegram_api_base: None,
+                locale: std::env::var("VIBEX_IM_DEFAULT_LOCALE").ok(),
+            },
+        )?);
         let agent = AgentHandle {
             manager: manager.clone(),
             runtime_selection,
@@ -3480,11 +3499,26 @@ impl DesktopRuntime {
             computer: computer.clone(),
             model_gateway: model_gateway.clone(),
             model_catalog: Arc::clone(&model_catalog),
+            im_channels: Arc::clone(&im_channels),
             events,
             tasks: Mutex::new(Vec::new()),
             home_lock: Mutex::new(home_lock),
             shutting_down: AtomicBool::new(false),
         });
+        // IM channels connect after the runtime owns its Agent manager. A
+        // channel that cannot connect degrades to a status row; it never blocks
+        // the desktop from starting.
+        startup_stage_async("im_channels_start", async {
+            if let Err(error) = runtime.im_channels.start().await {
+                tracing::warn!(
+                    target: "vibex_im",
+                    error_code = %error.code,
+                    "IM channel service could not start; the rest of the runtime is unaffected"
+                );
+            }
+            Ok(())
+        })
+        .await?;
         // The endpoint is bound synchronously: a session created before it is
         // listening would otherwise be offered no browser tools at all, and the
         // race would look like a capability gap rather than a startup ordering
@@ -4665,6 +4699,10 @@ impl DesktopRuntime {
         self.agent.clone()
     }
 
+    pub fn im_channels(&self) -> Arc<vibex_im_channel::ImChannelService> {
+        Arc::clone(&self.im_channels)
+    }
+
     /// The computer-use runtime: the engine helper, its loopback MCP endpoint
     /// and the redacted audit ledger.
     pub fn computer(&self) -> Arc<ComputerRuntime> {
@@ -5130,6 +5168,7 @@ impl DesktopRuntime {
             providers: self.providers.clone(),
             model_gateway: Arc::clone(&self.model_gateway),
             model_catalog: Arc::clone(&self.model_catalog),
+            im_channels: Arc::clone(&self.im_channels),
             scheduled: self.scheduled.clone(),
             automation: self.automation.clone(),
             diagnostics: self.diagnostics.clone(),
@@ -5171,6 +5210,7 @@ impl DesktopRuntime {
             return Ok(());
         }
         let mut first_error = None;
+        self.im_channels.stop().await;
         if let Err(error) = self.relay.stop().await {
             record_shutdown_error(&mut first_error, error);
         }

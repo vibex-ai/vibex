@@ -10453,6 +10453,7 @@ dependencies = [
  "vibex-diagnostics",
  "vibex-fs",
  "vibex-git",
+ "vibex-im-channel",
  "vibex-model-catalog",
  "vibex-model-gateway",
  "vibex-relay",
@@ -10503,6 +10504,25 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "vibex-core",
+]
+
+[[package]]
+name = "vibex-im-channel"
+version = "0.1.5"
+dependencies = [
+ "async-trait",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "uuid",
+ "vibex-config-switch",
+ "vibex-core",
+ "vibex-db",
 ]
 
 [[package]]

@@ -47,6 +47,8 @@ use vibex_core::{
     GitWorktreeOperationRecord, GitWorktreeOperationRequest, GitWorktreeReadinessRecord,
     GitWorktreeReadinessRequest, GitWorktreeRestoreRequest, Hook, HookCreateRequest,
     HookDeleteRequest, HookInstallPreview, HookInstallPreviewRequest, HookUpdateRequest,
+    ImBindingId, ImBindingSummary, ImChannelDraft, ImChannelId, ImChannelSummary,
+    ImChannelTestReport, ImPairingCodeInfo, ImPairingRequest, ImPrincipalId, ImPrincipalSummary,
     ManagementSnapshotPayload, MarketIcon, McpMarketIcon, McpMarketInstallRequest,
     McpMarketInstallResult, McpMarketSearchRequest, McpMarketSearchResponse, McpServer,
     McpServerAgentMatrix, McpServerAgentMatrixListRequest, McpServerCreateRequest,
@@ -96,10 +98,10 @@ use crate::{
     BackendOperation, BackendProjection, BackendRefetch, BackendResult, BrowserBackend,
     BrowserDialogResolution, BrowserFrameBatch, BrowserFrameSubscription, BrowserInputRequest,
     BrowserSessionOpenRequest, BrowserTabOpenRequest, BrowserTabSelection, BrowserViewportRequest,
-    DeviceBackend, FileBackend, GitBackend, ManagementBackend, ManagementProfileSelectionRequest,
-    MutationRequest, RelayConnectionState, RelayStatusSummary, SidebarBackend, TerminalBackend,
-    TerminalFrame, TerminalFrameBatch, TerminalFrameSubscription, WorkspaceBackend,
-    WorkspaceSummary,
+    DeviceBackend, FileBackend, GitBackend, ImChannelEnabledRequest, ImChannelSecretUpdateRequest,
+    ManagementBackend, ManagementProfileSelectionRequest, MutationRequest, RelayConnectionState,
+    RelayStatusSummary, SidebarBackend, TerminalBackend, TerminalFrame, TerminalFrameBatch,
+    TerminalFrameSubscription, WorkspaceBackend, WorkspaceSummary,
 };
 use vibex_desktop_model::{SidebarMutationOutcome, SidebarOrganizationView, UiStateStore};
 
@@ -5231,6 +5233,177 @@ impl ManagementBackend for NativeBackend {
                 next_retry_at_ms: status.next_retry_at_ms,
                 last_error: status.last_error,
             })
+        })
+    }
+
+    fn list_im_channels(&self) -> BackendFuture<'_, Vec<ImChannelSummary>> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .im_channels()
+                .list_channels()
+                .await
+                .map_err(Into::into)
+        })
+    }
+
+    fn create_im_channel(
+        &self,
+        request: MutationRequest<ImChannelDraft>,
+    ) -> BackendFuture<'_, ImChannelSummary> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .im_channels()
+                .create_channel(request.payload)
+                .await
+                .map_err(Into::into)
+        })
+    }
+
+    fn set_im_channel_enabled(
+        &self,
+        request: MutationRequest<ImChannelEnabledRequest>,
+    ) -> BackendFuture<'_, ImChannelSummary> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .im_channels()
+                .set_channel_enabled(&request.payload.channel_id, request.payload.enabled)
+                .await
+                .map_err(Into::into)
+        })
+    }
+
+    fn set_im_channel_bot_token(
+        &self,
+        request: MutationRequest<ImChannelSecretUpdateRequest>,
+    ) -> BackendFuture<'_, ()> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .im_channels()
+                .set_bot_token(&request.payload.channel_id, &request.payload.bot_token)
+                .await
+                .map_err(Into::into)
+        })
+    }
+
+    fn delete_im_channel(&self, request: MutationRequest<ImChannelId>) -> BackendFuture<'_, ()> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .im_channels()
+                .delete_channel(&request.payload)
+                .await
+                .map_err(Into::into)
+        })
+    }
+
+    fn test_im_channel(&self, channel_id: ImChannelId) -> BackendFuture<'_, ImChannelTestReport> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .im_channels()
+                .test_channel(&channel_id)
+                .await
+                .map_err(Into::into)
+        })
+    }
+
+    fn create_im_pairing_code(
+        &self,
+        request: MutationRequest<ImPairingRequest>,
+    ) -> BackendFuture<'_, ImPairingCodeInfo> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .im_channels()
+                .create_pairing_code(request.payload)
+                .await
+                .map_err(Into::into)
+        })
+    }
+
+    fn list_im_principals(
+        &self,
+        channel_id: ImChannelId,
+    ) -> BackendFuture<'_, Vec<ImPrincipalSummary>> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .im_channels()
+                .list_principals(&channel_id)
+                .await
+                .map_err(Into::into)
+        })
+    }
+
+    fn revoke_im_principal(
+        &self,
+        request: MutationRequest<ImPrincipalId>,
+    ) -> BackendFuture<'_, ()> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .im_channels()
+                .revoke_principal(&request.payload)
+                .await
+                .map_err(Into::into)
+        })
+    }
+
+    fn list_im_bindings(
+        &self,
+        channel_id: ImChannelId,
+    ) -> BackendFuture<'_, Vec<ImBindingSummary>> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .im_channels()
+                .list_bindings(&channel_id)
+                .await
+                .map_err(Into::into)
+        })
+    }
+
+    fn revoke_im_binding(&self, request: MutationRequest<ImBindingId>) -> BackendFuture<'_, ()> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .im_channels()
+                .revoke_binding(&request.payload)
+                .await
+                .map_err(Into::into)
         })
     }
 }
