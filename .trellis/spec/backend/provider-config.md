@@ -3842,7 +3842,22 @@ ManagedAcpAdapterStore::install_or_verify(descriptor)
 
 VerifiedAcpAdapterActivation::verify(
   descriptor, installation, health_report, bridge_contract_report,
-) -> VerifiedAcpAdapterActivation
+) -> VerifiedAcpAdapterActivation          // release-time baseline tooling
+
+VerifiedAcpAdapterActivation::verify_installed(
+  descriptor, activation_evidence, observed_artifact,
+) -> VerifiedAcpAdapterActivation          // production activation gate
+
+AcpAdapterActivationEvidence {             // <install-root>/vibex-activation.json
+  schemaVersion,
+  adapterId,
+  adapterVersion,
+  compatibilityIdentity,
+  entrypoint,                              // install-root-relative
+  entrypointHash,                          // "sha256:<hex>"
+  runtimeVersions,
+  verifiedAtMs,
+}
 
 BridgeContractReport {
   schemaVersion: 2,
@@ -3895,13 +3910,36 @@ BridgeContractReport {
 - Quirks, config aliases, and event enricher factories match exact
   compatibility identity. Adjacent versions must not inherit workarounds.
 - Real Bridge Version Contract evidence is required before a managed baseline is
-  treated as verified. Mock/fixture reports may test aggregation logic, but
-  cannot validate production baselines.
-- A version is activatable only through `VerifiedAcpAdapterActivation`. Install,
-  health, and real contract evidence must describe the same adapter, version,
-  compatibility identity, and binary identity. Verification recomputes the
-  contract summary from the descriptor case matrix and case results; it never
-  trusts a mutable public `gatePassed` field by itself.
+  treated as verified, and it is produced at release time. Mock/fixture reports
+  may test aggregation logic, but cannot validate production baselines. A
+  descriptor that declares no contract cases claims identity only; it does not
+  claim behavioural evidence.
+- A managed baseline has two evidence stages. Release time runs the descriptor's
+  Bridge Contract case matrix (`pnpm smoke:acp:bridge-contract`) and `verify`
+  joins installation, health, and contract reports for one exact identity.
+  Activation time is local and offline: the installer writes
+  `vibex-activation.json` into the immutable version directory recording the
+  adapter id, exact version, compatibility identity, install-relative
+  entrypoint, its SHA-256, and the resolved runtime dependency versions.
+- `VerifiedAcpAdapterActivation::verify_installed` is the only producer of an
+  exact descriptor in `effective_adapter_identity`. It requires the recorded
+  identity to equal the descriptor's expected identity and the artifact observed
+  now to equal the recorded hash. `verify` remains the release-time tool entry
+  point; it never runs at startup.
+- Missing, unreadable, mismatched, or drifted evidence degrades the route to the
+  conservative surface with `acp_adapter_activation_evidence_missing`,
+  `acp_adapter_activation_evidence_invalid`,
+  `acp_adapter_activation_identity_mismatch`, or
+  `acp_adapter_activation_artifact_drift`. The session still starts; typed
+  projection, config-option aliases, wire quirks, and the descriptor event
+  enricher are what is withheld.
+- Startup repair backfills missing evidence once for an existing usable
+  installation. A drifted entrypoint is quarantined as
+  `vibex-activation.drift.json` and is never re-blessed by a restart; the
+  installation stays conservative until it is replaced.
+- Unmanaged commands and managed installations whose version differs from the
+  compiled pin keep the pre-existing fallback. They have no pinned baseline to
+  verify and are not routed through this gate.
 
 ### 4. Validation & Error Matrix
 
@@ -3925,6 +3963,15 @@ BridgeContractReport {
 - Required Bridge Contract case fails or is blocked -> gate fails.
 - Install/health/contract identity mismatch ->
   `validation/acp_adapter_activation_identity_mismatch`.
+- Activation evidence missing or unreadable ->
+  `validation/acp_adapter_activation_evidence_missing` or
+  `validation/acp_adapter_activation_evidence_invalid`; the route stays
+  conservative instead of failing the session.
+- Recorded activation identity differs from the descriptor ->
+  `validation/acp_adapter_activation_identity_mismatch`; conservative.
+- Installed entrypoint hash differs from the recorded hash ->
+  `validation/acp_adapter_activation_artifact_drift`; startup quarantines the
+  evidence and the route stays conservative.
 - Fixture evidence, forged summary, or recomputed failed case ->
   `capability/acp_adapter_activation_contract_gate_failed`.
 - `when_advertised` Bridge Contract case is not advertised -> case is skipped;
@@ -3984,21 +4031,25 @@ if command("--version").success() {
 #### Correct
 
 ```rust
-let verified = store.install_or_verify(descriptor).await?;
-let identity = verified.compatibility_identity();
-probe.node_version().await?;
-probe.adapter_version(&verified).await?;
-probe.initialize(&verified).await?;
-let activation = VerifiedAcpAdapterActivation::verify(
-    descriptor,
-    &verified,
-    &health,
-    &contract,
-)?;
+// Release time: prove the pinned identity behaves as the descriptor says.
+let installation = store.install_or_verify(descriptor).await?;
+let health = probe.run(&installation).await?;
+let contract = bridge_contract.run(&installation).await?;
+VerifiedAcpAdapterActivation::verify(descriptor, &installation, &health, &contract)?;
+// The installer publishes <install_root>/vibex-activation.json beside the artifact.
+
+// Activation time: local and offline; no process spawn, no network.
+let evidence = read_activation_evidence(&install_root)?;
+let observed = AcpAdapterArtifactObservation::observe(&install_root, &evidence)?;
+let activation =
+    VerifiedAcpAdapterActivation::verify_installed(descriptor, &evidence, &observed)?;
+let identity = activation.compatibility_identity();
 ```
 
-Runtime readiness is based on registry intent plus managed install inspection
-plus health/contract evidence, not on PATH lookup or command exit status.
+Runtime readiness is based on registry intent, managed install inspection, and
+activation evidence that agrees with the descriptor identity. The release-time
+health and contract report is what makes that descriptor trustworthy; a version
+string alone never unlocks it.
 
 ## Scenario: Desktop Management Facade And Automation CAS
 

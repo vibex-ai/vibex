@@ -22,7 +22,11 @@ use tokio::process::Command;
 use tokio::sync::{Mutex, OwnedMutexGuard};
 use tokio::time::timeout;
 use url::Url;
-use vibex_agent_acp::sanitize_inherited_appimage_environment;
+use vibex_agent_acp::{
+    ACP_ACTIVATION_EVIDENCE_FILE, ACP_ACTIVATION_EVIDENCE_SCHEMA_VERSION,
+    AcpAdapterActivationEvidence, AcpAdapterArtifactObservation, AcpCompatibilityRegistry,
+    read_activation_evidence, sanitize_inherited_appimage_environment,
+};
 use vibex_config_switch::ProviderConfigService;
 use vibex_core::{
     AgentCommandConfig, AgentId, AgentListRequest, AgentManagedDistributionKind,
@@ -40,6 +44,10 @@ const ZCODE_MINIMUM_NODE_VERSION: semver::Version = semver::Version::new(22, 0, 
 
 const ACP_REGISTRY_URL: &str =
     "https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json";
+/// Quarantine marker beside an installation whose entrypoint changed after
+/// activation evidence was recorded. Its presence keeps the Agent conservative
+/// across restarts until the installation is replaced.
+const ACTIVATION_DRIFT_FILE: &str = "vibex-activation.drift.json";
 const NPM_REGISTRY_BASE_URL: &str = "https://registry.npmjs.org";
 const KIRO_MANIFEST_URL: &str = "https://prod.download.cli.kiro.dev/stable/latest/manifest.json";
 const KIRO_DOWNLOAD_BASE_URL: &str = "https://prod.download.cli.kiro.dev/stable/latest";
@@ -489,6 +497,12 @@ impl AgentInstallService {
             && managed_uvx_runtime_dependencies_are_current(&agent_id, &record)
             && windows_npm_installation_is_current(&record)
         {
+            if let (Some(root), Some(version)) = (
+                record.install_root.as_deref(),
+                record.state.installed_version.as_deref(),
+            ) {
+                self.reconcile_activation_evidence(&agent_id, Path::new(root), version);
+            }
             self.config_service.reconcile_agent_acp_runtime(
                 agent_id,
                 record
@@ -500,6 +514,157 @@ impl AgentInstallService {
         }
         self.install_locked(agent_id, ManagedInstallTarget::Latest)
             .await
+    }
+
+    /// Writes fresh activation evidence for a pinned managed installation.
+    ///
+    /// The installer may write this because it just published the artifact from
+    /// a verified distribution. A failure is logged, never propagated: missing
+    /// evidence degrades the runtime to the conservative surface instead of
+    /// failing an otherwise usable installation.
+    fn write_activation_evidence(
+        &self,
+        agent_id: &AgentId,
+        install_root: &Path,
+        installed_version: &str,
+    ) {
+        match self.build_activation_evidence(agent_id, install_root, installed_version) {
+            Ok(Some(evidence)) => {
+                let path = install_root.join(ACP_ACTIVATION_EVIDENCE_FILE);
+                if let Err(error) = write_json_private_atomic(&path, &evidence) {
+                    tracing::warn!(
+                        target: "vibex_desktop",
+                        agent_id = %agent_id,
+                        error_code = %error.code,
+                        "managed Agent activation evidence could not be written"
+                    );
+                }
+            }
+            Ok(None) => {
+                let _ = fs::remove_file(install_root.join(ACP_ACTIVATION_EVIDENCE_FILE));
+            }
+            Err(error) => {
+                tracing::warn!(
+                    target: "vibex_desktop",
+                    agent_id = %agent_id,
+                    error_code = %error.code,
+                    "managed Agent activation evidence could not be derived"
+                );
+            }
+        }
+    }
+
+    /// Startup path: backfills missing evidence once and quarantines evidence
+    /// whose artifact no longer matches. Matching evidence is never rewritten,
+    /// and a quarantined installation never re-blesses itself.
+    fn reconcile_activation_evidence(
+        &self,
+        agent_id: &AgentId,
+        install_root: &Path,
+        installed_version: &str,
+    ) {
+        let path = install_root.join(ACP_ACTIVATION_EVIDENCE_FILE);
+        let drift = install_root.join(ACTIVATION_DRIFT_FILE);
+        if drift.exists() {
+            // The artifact changed after it was verified. Stay conservative
+            // until the installation is replaced; a restart must not accept
+            // the changed file as a new baseline.
+            return;
+        }
+        let expected =
+            match self.build_activation_evidence(agent_id, install_root, installed_version) {
+                Ok(Some(evidence)) => evidence,
+                Ok(None) => {
+                    let _ = fs::remove_file(&path);
+                    return;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        target: "vibex_desktop",
+                        agent_id = %agent_id,
+                        error_code = %error.code,
+                        "managed Agent activation evidence could not be derived"
+                    );
+                    return;
+                }
+            };
+        match read_activation_evidence(install_root) {
+            Ok(recorded) => {
+                let intact = AcpAdapterArtifactObservation::observe(install_root, &recorded)
+                    .is_ok_and(|observed| observed.entrypoint_hash == recorded.entrypoint_hash);
+                if !intact {
+                    let _ = fs::rename(&path, &drift);
+                    tracing::warn!(
+                        target: "vibex_desktop",
+                        agent_id = %agent_id,
+                        "managed Agent activation evidence was quarantined: the installed entrypoint changed"
+                    );
+                }
+            }
+            Err(_) => {
+                if let Err(error) = write_json_private_atomic(&path, &expected) {
+                    tracing::warn!(
+                        target: "vibex_desktop",
+                        agent_id = %agent_id,
+                        error_code = %error.code,
+                        "managed Agent activation evidence could not be backfilled"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Builds evidence for a descriptor-backed, exact-version installation.
+    /// Returns `None` for every route without a pinned baseline.
+    fn build_activation_evidence(
+        &self,
+        agent_id: &AgentId,
+        install_root: &Path,
+        installed_version: &str,
+    ) -> VibexResult<Option<AcpAdapterActivationEvidence>> {
+        let registry = AcpCompatibilityRegistry::builtin()?;
+        let Some(descriptor) = registry.for_agent(agent_id) else {
+            return Ok(None);
+        };
+        if descriptor.distribution.exact_version.to_string() != installed_version {
+            return Ok(None);
+        }
+        let manifest = read_install_manifest(install_root).ok_or_else(|| {
+            VibexError::validation(
+                "agent_install_manifest_invalid",
+                "managed Agent manifest was invalid",
+            )
+        })?;
+        let entrypoint = match &manifest.launch {
+            ManifestLaunch::Binary { command, .. } => command.clone(),
+            ManifestLaunch::Node { script, .. } | ManifestLaunch::Python { script, .. } => {
+                script.clone()
+            }
+        };
+        let entrypoint_path =
+            install_root.join(safe_relative_path(&entrypoint, "activation entrypoint")?);
+        ensure_regular_file(
+            install_root,
+            &entrypoint_path,
+            "agent_activation_entrypoint_missing",
+        )?;
+        let bytes = fs::read(&entrypoint_path).map_err(|error| {
+            storage_error(
+                "agent_activation_entrypoint_read_failed",
+                "managed Agent activation entrypoint could not be read",
+                error,
+            )
+        })?;
+        Ok(Some(AcpAdapterActivationEvidence {
+            schema_version: ACP_ACTIVATION_EVIDENCE_SCHEMA_VERSION,
+            adapter_id: descriptor.adapter_id.as_str().to_string(),
+            adapter_version: installed_version.to_string(),
+            compatibility_identity: descriptor.expected_compatibility_identity().to_string(),
+            entrypoint,
+            entrypoint_hash: format!("sha256:{:x}", Sha256::digest(&bytes)),
+            runtime_versions: manifest.runtime_dependencies.clone(),
+            verified_at_ms: unix_timestamp_ms(),
+        }))
     }
 
     pub async fn check_update(&self, agent_id: AgentId) -> VibexResult<AgentManagedInstallState> {
@@ -784,6 +949,12 @@ impl AgentInstallService {
                 })
         }) {
             let mut record = previous.expect("matching managed record exists");
+            if let (Some(root), Some(version)) = (
+                record.install_root.as_deref(),
+                record.state.installed_version.as_deref(),
+            ) {
+                self.reconcile_activation_evidence(&agent_id, Path::new(root), version);
+            }
             self.config_service.reconcile_agent_acp_runtime(
                 agent_id,
                 record
@@ -915,6 +1086,7 @@ impl AgentInstallService {
                     }
                     return Err(error);
                 }
+                self.write_activation_evidence(&agent_id, &installed.root, &entry.version);
                 let state = AgentManagedInstallState {
                     managed: true,
                     status: AgentManagedInstallStatus::Installed,
@@ -5038,9 +5210,7 @@ fn release_version(value: &str) -> Option<semver::Version> {
 }
 
 fn read_manifest_runtime_version(root: &Path) -> Option<String> {
-    let bytes = fs::read(root.join("vibex-install.json")).ok()?;
-    let manifest = serde_json::from_slice::<InstallManifest>(&bytes).ok()?;
-    manifest.runtime_version
+    read_install_manifest(root)?.runtime_version
 }
 
 fn command_is_available(command: &AgentCommandConfig) -> bool {
@@ -7773,5 +7943,118 @@ printf '%s\n' '{"version":"1.2.3","scripts":["test-package"]}'
             &metadata,
             1_000 + REGISTRY_CACHE_MAX_AGE_MS + 1
         ));
+    }
+
+    fn write_activation_fixture(install_root: &Path, version: &str, entrypoint: &str) -> PathBuf {
+        let adapter = install_root.join(entrypoint);
+        fs::create_dir_all(adapter.parent().unwrap()).unwrap();
+        fs::write(&adapter, b"// adapter").unwrap();
+        let mut runtime_dependencies = BTreeMap::new();
+        runtime_dependencies.insert("@openai/codex".to_string(), "0.165.0".to_string());
+        write_json_private(
+            &install_root.join("vibex-install.json"),
+            &InstallManifest {
+                registry_agent_id: "codex-acp".to_string(),
+                version: version.to_string(),
+                fingerprint: "fixture".to_string(),
+                runtime_version: None,
+                runtime_dependencies,
+                distribution_kind: AgentManagedDistributionKind::Npm,
+                launch: ManifestLaunch::Node {
+                    node: "/managed/node".to_string(),
+                    script: entrypoint.to_string(),
+                    args: Vec::new(),
+                },
+            },
+        )
+        .unwrap();
+        adapter
+    }
+
+    fn activation_test_service(temp: &Path) -> (AgentInstallService, AgentId) {
+        let db_path = temp.join("vibex.db");
+        let root = temp.join("managed-agents");
+        let service =
+            AgentInstallService::new(&db_path, &root, ProviderConfigService::new(&db_path))
+                .unwrap();
+        (service, AgentId::parse("codex").unwrap())
+    }
+
+    #[test]
+    fn activation_evidence_is_written_for_a_pinned_installation() {
+        let temp = tempfile::tempdir().unwrap();
+        let (service, codex) = activation_test_service(temp.path());
+        let install_root = temp
+            .path()
+            .join("managed-agents/agents/codex/2.5.0-fixture");
+        let entrypoint = "node_modules/@agentclientprotocol/codex-acp/dist/index.js";
+        write_activation_fixture(&install_root, "2.5.0", entrypoint);
+
+        service.write_activation_evidence(&codex, &install_root, "2.5.0");
+
+        let evidence = read_activation_evidence(&install_root).unwrap();
+        assert_eq!(evidence.adapter_id, "codex-acp");
+        assert_eq!(evidence.adapter_version, "2.5.0");
+        assert_eq!(evidence.entrypoint, entrypoint);
+        assert_eq!(
+            evidence.compatibility_identity,
+            "adapter=codex-acp@2.5.0;runtime=@openai/codex@0.165.0"
+        );
+        assert_eq!(
+            evidence
+                .runtime_versions
+                .get("@openai/codex")
+                .map(String::as_str),
+            Some("0.165.0")
+        );
+        assert!(evidence.entrypoint_hash.starts_with("sha256:"));
+    }
+
+    #[test]
+    fn activation_evidence_is_not_written_for_an_unpinned_version() {
+        let temp = tempfile::tempdir().unwrap();
+        let (service, codex) = activation_test_service(temp.path());
+        let install_root = temp
+            .path()
+            .join("managed-agents/agents/codex/9.9.9-fixture");
+        write_activation_fixture(&install_root, "9.9.9", "adapter.js");
+
+        service.write_activation_evidence(&codex, &install_root, "9.9.9");
+
+        assert!(!install_root.join(ACP_ACTIVATION_EVIDENCE_FILE).exists());
+    }
+
+    #[test]
+    fn activation_evidence_backfills_once_and_quarantines_drift() {
+        let temp = tempfile::tempdir().unwrap();
+        let (service, codex) = activation_test_service(temp.path());
+        let install_root = temp
+            .path()
+            .join("managed-agents/agents/codex/2.5.0-fixture");
+        let entrypoint = "node_modules/@agentclientprotocol/codex-acp/dist/index.js";
+        let adapter = write_activation_fixture(&install_root, "2.5.0", entrypoint);
+        let evidence_path = install_root.join(ACP_ACTIVATION_EVIDENCE_FILE);
+
+        service.reconcile_activation_evidence(&codex, &install_root, "2.5.0");
+        assert!(evidence_path.is_file());
+        let recorded = fs::read_to_string(&evidence_path).unwrap();
+
+        service.reconcile_activation_evidence(&codex, &install_root, "2.5.0");
+        assert_eq!(
+            fs::read_to_string(&evidence_path).unwrap(),
+            recorded,
+            "matching evidence must never be rewritten"
+        );
+
+        fs::write(&adapter, b"// tampered").unwrap();
+        service.reconcile_activation_evidence(&codex, &install_root, "2.5.0");
+        assert!(!evidence_path.exists());
+        assert!(install_root.join(ACTIVATION_DRIFT_FILE).is_file());
+
+        service.reconcile_activation_evidence(&codex, &install_root, "2.5.0");
+        assert!(
+            !evidence_path.exists(),
+            "a quarantined installation must not re-bless a changed artifact on restart"
+        );
     }
 }
