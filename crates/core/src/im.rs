@@ -75,6 +75,55 @@ pub struct ImLarkConfig {
     pub chat_id: Option<String>,
     #[serde(default)]
     pub transport: ImLarkTransport,
+    /// Which Lark deployment hosts the app.
+    ///
+    /// The two are separate services with separate app registrations, not two
+    /// names for one API: an app created at open.feishu.cn does not exist at
+    /// open.larksuite.com. The tenant picks this once when the channel is made.
+    #[serde(default)]
+    pub region: ImLarkRegion,
+}
+
+impl ImLarkConfig {
+    /// The API root for this app's deployment.
+    pub const fn api_base(&self) -> &'static str {
+        self.region.api_base()
+    }
+}
+
+/// The two Lark deployments.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImLarkRegion {
+    /// 飞书, the mainland deployment.
+    #[default]
+    Feishu,
+    /// Lark, the international deployment.
+    Lark,
+}
+
+impl ImLarkRegion {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Feishu => "feishu",
+            Self::Lark => "lark",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "feishu" | "cn" => Some(Self::Feishu),
+            "lark" | "intl" => Some(Self::Lark),
+            _ => None,
+        }
+    }
+
+    pub const fn api_base(self) -> &'static str {
+        match self {
+            Self::Feishu => "https://open.feishu.cn",
+            Self::Lark => "https://open.larksuite.com",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

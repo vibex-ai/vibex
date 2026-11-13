@@ -20,8 +20,9 @@ use gpui_component::{
 use vibex_backend::BackendError;
 use vibex_core::{
     AgentSession, ImBindingSummary, ImChannelConfig, ImChannelDraft, ImChannelId, ImChannelKind,
-    ImChannelSummary, ImLarkConfig, ImLarkTransport, ImPairingCodeInfo, ImPairingRequest,
-    ImPrincipalId, ImPrincipalRole, ImPrincipalSummary, ImSessionDefaults, ImTelegramConfig,
+    ImChannelSummary, ImLarkConfig, ImLarkRegion, ImLarkTransport, ImPairingCodeInfo,
+    ImPairingRequest, ImPrincipalId, ImPrincipalRole, ImPrincipalSummary, ImSessionDefaults,
+    ImTelegramConfig,
 };
 
 use crate::app::VibexWorkbench;
@@ -38,6 +39,8 @@ pub struct ImChannelsView {
     telegram_topic_mode: bool,
     /// The role a newly minted pairing code grants.
     pairing_role: ImPrincipalRole,
+    /// Which Lark deployment the app was created in.
+    lark_region: ImLarkRegion,
     channels: Vec<ImChannelSummary>,
     selected: Option<ImChannelId>,
     principals: Vec<ImPrincipalSummary>,
@@ -78,6 +81,7 @@ impl ImChannelsView {
             lark_chat_input,
             telegram_topic_mode: false,
             pairing_role: ImPrincipalRole::Operator,
+            lark_region: ImLarkRegion::Feishu,
             channels: Vec::new(),
             selected: None,
             principals: Vec::new(),
@@ -228,6 +232,7 @@ impl ImChannelsView {
         let app_id = self.lark_app_id_input.read(cx).value().to_string();
         let app_secret = self.lark_app_secret_input.read(cx).value().to_string();
         let chat_id = self.lark_chat_input.read(cx).value().to_string();
+        let region = self.lark_region;
         if app_id.trim().is_empty() || app_secret.trim().is_empty() {
             self.error = Some("Lark app id and app secret are required.".to_string());
             cx.notify();
@@ -255,6 +260,7 @@ impl ImChannelsView {
                         chat_id: (!chat_id.trim().is_empty())
                             .then(|| chat_id.trim().to_string()),
                         transport: ImLarkTransport::LongConnection,
+                        region,
                     }),
                     default_session: None,
                     event_filter: Vec::new(),
@@ -945,10 +951,61 @@ impl Render for ImChannelsView {
             .child(
                 h_flex()
                     .gap_2()
+                    .items_center()
                     .child(Input::new(&self.lark_app_id_input).small().w_full())
                     .child(Input::new(&self.lark_chat_input).small().w_full()),
             )
             .child(Input::new(&self.lark_app_secret_input).small().w_full())
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(muted)
+                            .child(locale::text(
+                                "Deployment (the app must exist there)",
+                                "部署区域（应用必须在该区域注册）",
+                                "部署區域（應用必須在該區域註冊）",
+                            )),
+                    )
+                    .child(
+                        Button::new("im-lark-region-feishu")
+                            .small()
+                            .outline()
+                            .label(locale::text("飞书 中国", "飞书 中国", "飛書 中國"))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.lark_region = ImLarkRegion::Feishu;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("im-lark-region-lark")
+                            .small()
+                            .outline()
+                            .label(locale::text("Lark 国际", "Lark 国际", "Lark 國際"))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.lark_region = ImLarkRegion::Lark;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(muted)
+                            .child(match self.lark_region {
+                                ImLarkRegion::Feishu => {
+                                    locale::text("open.feishu.cn", "open.feishu.cn", "open.feishu.cn")
+                                }
+                                ImLarkRegion::Lark => locale::text(
+                                    "open.larksuite.com",
+                                    "open.larksuite.com",
+                                    "open.larksuite.com",
+                                ),
+                            }),
+                    ),
+            )
             .child(
                 h_flex()
                     .justify_between()

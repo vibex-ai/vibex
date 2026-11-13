@@ -607,12 +607,19 @@ impl ImChannelService {
                     ));
                 }
                 let (app_secret, _) = self.channel_secret(&conn, &record, "app_secret")?;
+                let api_base = Some(
+                    self.inner
+                        .config
+                        .lark_api_base
+                        .clone()
+                        .unwrap_or_else(|| config.region.api_base().to_string()),
+                );
                 LarkAdapter::new(
                     record.channel_id.clone(),
                     config.app_id,
                     app_secret,
                     config.chat_id,
-                    self.inner.config.lark_api_base.clone(),
+                    api_base,
                     status,
                 )
                 .map_err(im_error_to_vibex)?
@@ -871,13 +878,22 @@ impl ImChannelService {
                     ));
                 }
                 let (app_secret, _) = self.channel_secret(&conn, record, "app_secret")?;
+                // The channel's own deployment wins; the test override exists
+                // only so a fake can stand in for the real service.
+                let api_base = Some(
+                    self.inner
+                        .config
+                        .lark_api_base
+                        .clone()
+                        .unwrap_or_else(|| config.region.api_base().to_string()),
+                );
                 let adapter = Arc::new(
                     LarkAdapter::new(
                         record.channel_id.clone(),
                         config.app_id,
                         app_secret,
                         config.chat_id,
-                        self.inner.config.lark_api_base.clone(),
+                        api_base,
                         Arc::clone(&status),
                     )
                     .map_err(im_error_to_vibex)?,
@@ -2727,6 +2743,7 @@ mod tests {
                 app_id: "cli_test".to_string(),
                 chat_id: None,
                 transport: ImLarkTransport::LongConnection,
+                region: vibex_core::ImLarkRegion::Feishu,
             }),
             default_session: None,
             event_filter: Vec::new(),

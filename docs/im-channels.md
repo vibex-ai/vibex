@@ -42,6 +42,19 @@ settings or on the command line.
 
 ### Lark / 飞书
 
+Lark has two deployments, and they are separate services with separate app
+registrations:
+
+| | China | International |
+| --- | --- | --- |
+| Console | [open.feishu.cn](https://open.feishu.cn) | [open.larksuite.com](https://open.larksuite.com) |
+| API root | `https://open.feishu.cn` | `https://open.larksuite.com` |
+
+**A 飞书 app and a Lark app are different apps.** An app id created on one does
+not exist on the other; the token endpoint answers `10014 app id not exists`.
+Pick the deployment in the channel form before testing, and create the app on
+the matching console. If you are in China and using 飞书, choose 飞书 中国.
+
 1. In the [Lark open platform](https://open.feishu.cn), create a self-built app.
 2. Enable the bot capability, and grant the message and chat permissions the
    adapter needs (`im:message`, `im:message:send_as_bot`, `im:chat:readonly`).
@@ -49,7 +62,8 @@ settings or on the command line.
    `card.action.trigger`. No public callback URL is needed.
 4. Publish the app and add it to the target chat.
 5. In Vibex, open **Settings → IM channels**, add a Lark channel with the app id,
-   the app secret, and optionally the chat id, then test and enable it.
+   the app secret, the deployment, and optionally the chat id, then test and
+   enable it.
 
 The app secret is written to the OS keychain on a desktop, or to the runtime's
 host secret file on a headless deployment. Deleting the channel erases it.

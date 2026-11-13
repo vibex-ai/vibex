@@ -16,7 +16,7 @@ use tokio::sync::{RwLock, mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::Message;
 use vibex_core::{
-    ImChannelId, ImChannelKind, ImChannelState, ImChannelStatus, ImChannelTestReport,
+    ImChannelId, ImChannelKind, ImChannelState, ImChannelStatus, ImChannelTestReport, ImLarkRegion,
     unix_timestamp_ms,
 };
 
@@ -25,8 +25,6 @@ use crate::error::{ImError, ImResult};
 use crate::types::{
     ImAttachment, ImButton, ImChatType, ImInboundEvent, ImSentMessage, ImTarget, ImThreadTarget,
 };
-
-const LARK_API_BASE: &str = "https://open.feishu.cn";
 
 /// The largest file a Lark message may bring in.
 const MAX_ATTACHMENT_BYTES: usize = 10 * 1024 * 1024;
@@ -72,7 +70,7 @@ impl LarkAdapter {
             app_secret,
             chat_id,
             client,
-            api_base: api_base.unwrap_or_else(|| LARK_API_BASE.to_string()),
+            api_base: api_base.unwrap_or_else(|| ImLarkRegion::Feishu.api_base().to_string()),
             tenant_token: RwLock::new(None),
             status,
         })
@@ -455,7 +453,21 @@ impl LarkAdapter {
         else {
             return Vec::new();
         };
-        let Some(file_key) = content.get("file_key").and_then(Value::as_str) else {
+        // An image message names `image_key`; a file message names `file_key`.
+        // The resource endpoint wants the key under a `type` that matches.
+        let (file_key, resource_type) = if let Some(key) = content
+            .get("file_key")
+            .and_then(Value::as_str)
+            .filter(|key| !key.is_empty())
+        {
+            (key, "file")
+        } else if let Some(key) = content
+            .get("image_key")
+            .and_then(Value::as_str)
+            .filter(|key| !key.is_empty())
+        {
+            (key, "image")
+        } else {
             return Vec::new();
         };
         let Ok(token) = self.tenant_token().await else {
@@ -464,7 +476,7 @@ impl LarkAdapter {
         let response = self
             .client
             .get(format!(
-                "{}/open-apis/im/v1/messages/{message_id}/resources/{file_key}?type=file",
+                "{}/open-apis/im/v1/messages/{message_id}/resources/{file_key}?type={resource_type}",
                 self.api_base
             ))
             .bearer_auth(token)
@@ -483,13 +495,25 @@ impl LarkAdapter {
             file_name: content
                 .get("file_name")
                 .and_then(Value::as_str)
-                .unwrap_or("lark-file")
-                .to_string(),
+                .map(str::to_string)
+                .unwrap_or_else(|| {
+                    if resource_type == "image" {
+                        format!("image-{}.jpg", file_key)
+                    } else {
+                        "lark-file".to_string()
+                    }
+                }),
             mime_type: content
                 .get("mime_type")
                 .and_then(Value::as_str)
-                .unwrap_or("application/octet-stream")
-                .to_string(),
+                .map(str::to_string)
+                .unwrap_or_else(|| {
+                    if resource_type == "image" {
+                        "image/jpeg".to_string()
+                    } else {
+                        "application/octet-stream".to_string()
+                    }
+                }),
             bytes: bytes.to_vec(),
         }]
     }

@@ -26,13 +26,13 @@ use tokio::sync::{Notify, broadcast};
 use vibex_core::{
     AgentId, AgentNotificationIntent, AgentSession, AgentSessionRuntimeSelectionState,
     AgentSessionSafety, AgentSessionState, CreateAgentSessionRequest, FetchTimelineRequest,
-    ImChannelConfig, ImChannelDraft, ImLarkConfig, ImLarkTransport, PermissionActionDetail,
-    PermissionRequest, PermissionRequestStatus, PermissionResolution, PermissionResponseKind,
-    PermissionResponseOption, ProjectId, ProviderProfileId, ResolveElicitationRequest,
-    ResolvePermissionRequest, SendAgentMessageRequest, SessionRuntimeSelection,
-    SessionRuntimeSelectionStatus, TimelineItem, TimelineItemId, TimelineLiveEvent, TimelinePage,
-    TimelinePayload, TimelinePayloadDepth, TimelineRedactionState, TimelineSource, VibexResult,
-    VibexSessionId, WorkspaceId, WorkspaceMode, unix_timestamp_ms,
+    ImChannelConfig, ImChannelDraft, ImLarkConfig, ImLarkRegion, ImLarkTransport,
+    PermissionActionDetail, PermissionRequest, PermissionRequestStatus, PermissionResolution,
+    PermissionResponseKind, PermissionResponseOption, ProjectId, ProviderProfileId,
+    ResolveElicitationRequest, ResolvePermissionRequest, SendAgentMessageRequest,
+    SessionRuntimeSelection, SessionRuntimeSelectionStatus, TimelineItem, TimelineItemId,
+    TimelineLiveEvent, TimelinePage, TimelinePayload, TimelinePayloadDepth, TimelineRedactionState,
+    TimelineSource, VibexResult, VibexSessionId, WorkspaceId, WorkspaceMode, unix_timestamp_ms,
 };
 use vibex_im_channel::{ImAgentPort, ImChannelService, ImChannelServiceConfig};
 
@@ -41,6 +41,9 @@ struct FakeLark {
     events: Mutex<VecDeque<Value>>,
     sent: Mutex<Vec<Value>>,
     edited: Mutex<Vec<Value>>,
+    /// The query string of every resource download, so a test can assert the
+    /// adapter asked for the right resource type.
+    resource_queries: Mutex<Vec<HashMap<String, String>>>,
     notify: Notify,
 }
 
@@ -51,6 +54,7 @@ impl FakeLark {
             events: Mutex::new(VecDeque::new()),
             sent: Mutex::new(Vec::new()),
             edited: Mutex::new(Vec::new()),
+            resource_queries: Mutex::new(Vec::new()),
             notify: Notify::new(),
         }
     }
@@ -151,11 +155,13 @@ async fn fake_lark(
 
 /// Lark serves chat metadata and message resources on GET.
 async fn fake_lark_get(
-    State(_state): State<Arc<FakeLark>>,
+    State(state): State<Arc<FakeLark>>,
     Path(path): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse as _;
     if path.contains("/resources/") {
+        state.resource_queries.lock().expect("queries").push(query);
         return vec![0xff, 0xd8, 0xff, 0xe0, 0x00].into_response();
     }
     Json(json!({ "code": 0, "data": { "name": "Fake Lark chat" } })).into_response()
@@ -554,6 +560,7 @@ async fn lark_long_connection_round_trip() {
                 app_id: "cli_test".to_string(),
                 chat_id: Some("oc_chat".to_string()),
                 transport: ImLarkTransport::LongConnection,
+                region: ImLarkRegion::Feishu,
             }),
             default_session: None,
             event_filter: Vec::new(),
@@ -615,7 +622,7 @@ async fn lark_long_connection_round_trip() {
                 "chat_id": "oc_chat",
                 "chat_type": "p2p",
                 "message_type": "image",
-                "content": json!({ "image_key": "img_1", "file_key": "file_1" }).to_string(),
+                "content": json!({ "image_key": "img_1" }).to_string(),
                 "mentions": []
             }
         }
@@ -639,6 +646,16 @@ async fn lark_long_connection_round_trip() {
             .as_deref()
             .is_some_and(|uri| uri.starts_with("data:") && uri.contains(";base64,")),
         "image bytes travel as a data URL"
+    );
+    assert_eq!(
+        sent[0].mime_type.as_deref(),
+        Some("image/jpeg"),
+        "an image message is described as an image"
+    );
+    assert_eq!(
+        fake.resource_queries.lock().expect("queries").first(),
+        Some(&HashMap::from([("type".to_string(), "image".to_string())])),
+        "the resource endpoint is asked for an image, not a file"
     );
 
     // An approval goes out as an interactive card with one button per option.
