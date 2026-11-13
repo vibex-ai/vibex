@@ -26,7 +26,12 @@ use vibex_plugin::{
 };
 
 /// The default index address.
-pub const DEFAULT_PLUGIN_INDEX: &str = "https://plugins.peatboy.com/index.json";
+/// The official catalog, tried in order.
+///
+/// The raw address is authoritative and answers immediately; jsDelivr is the
+/// CDN copy behind it. A deployment replaces the list with
+/// `VIBEX_PLUGIN_INDEX` (comma-separated).
+pub const DEFAULT_PLUGIN_INDEX: &str = "https://raw.githubusercontent.com/vibex-ai/vibex-plugin/main/dist/index.json,https://cdn.jsdelivr.net/gh/vibex-ai/vibex-plugin@main/dist/index.json";
 
 /// The runtime the desktop installs once its scripting host is up.
 ///
@@ -377,6 +382,11 @@ impl PluginHandle {
 fn index_urls() -> Vec<url::Url> {
     let configured = std::env::var("VIBEX_PLUGIN_INDEX").ok();
     let raw = configured.unwrap_or_else(|| DEFAULT_PLUGIN_INDEX.to_string());
+    parse_index_urls(&raw)
+}
+
+/// Splits a comma-separated index list, keeping the absolute addresses.
+fn parse_index_urls(raw: &str) -> Vec<url::Url> {
     raw.split(',')
         .filter_map(|url| url::Url::parse(url.trim()).ok())
         .collect()
@@ -457,5 +467,31 @@ mod tests {
         let key = verifying_key();
         assert!(!allow_unverified_index(Some(&key), None));
         assert!(!allow_unverified_index(Some(&key), Some("1")));
+    }
+
+    #[test]
+    fn the_default_catalog_is_an_ordered_list_of_https_addresses() {
+        let urls = parse_index_urls(DEFAULT_PLUGIN_INDEX);
+        assert_eq!(
+            urls.len(),
+            2,
+            "the official catalog has a primary and a mirror"
+        );
+        assert!(urls.iter().all(|url| url.scheme() == "https"));
+        assert!(
+            urls[0]
+                .as_str()
+                .starts_with("https://raw.githubusercontent.com/vibex-ai/vibex-plugin/")
+        );
+    }
+
+    #[test]
+    fn a_configured_catalog_replaces_the_default_list() {
+        let urls =
+            parse_index_urls("https://one.example/index.json, https://two.example/index.json");
+        assert_eq!(urls.len(), 2);
+        assert_eq!(urls[1].as_str(), "https://two.example/index.json");
+        // A malformed entry is dropped rather than failing the whole list.
+        assert_eq!(parse_index_urls("not a url").len(), 0);
     }
 }

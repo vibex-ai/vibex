@@ -113,12 +113,17 @@ An empty `versions` list blocks every version. Sign it with the root key and
 publish `revocations.json.sig` beside it; the client refreshes it with the
 catalog and only accepts a higher `revision`.
 
-## Mirrors
+## The official catalog
 
-The client tries addresses in order, so a catalog may be mirrored:
+`vibex-ai/vibex-plugin` is the official catalog. Its `README.md` documents the
+submission flow, and `.github/workflows/index.yml` validates every pull request
+and builds and signs `dist/` on `main`. A release desktop embeds the matching
+root public key and reads the index from:
 
-1. `https://plugins.peatboy.com/index.json`
-2. `https://raw.githubusercontent.com/<owner>/<repo>/dist/index.json`
-3. a jsDelivr copy of the same path
+1. `https://raw.githubusercontent.com/vibex-ai/vibex-plugin/main/dist/index.json`
+2. `https://cdn.jsdelivr.net/gh/vibex-ai/vibex-plugin@main/dist/index.json`
 
-Every address must serve the same `index.json.sig`.
+`VIBEX_PLUGIN_INDEX` replaces the list with any comma-separated addresses, and
+the client tries them in order, so a catalog may be mirrored anywhere. Every
+address must serve the same `index.json.sig`.
+
