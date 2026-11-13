@@ -207,7 +207,7 @@ use vibex_ui::{
 
 use crate::markdown::{
     MarkdownLinkKind, MarkdownPresentation, RangeHighlight, RenderedText, TextView, TextViewState,
-    escape_markdown_literal, is_file_url, is_windows_drive_path, markdown_link_kind,
+    escape_markdown_literal, is_file_url, is_windows_drive_path, local_file_path, markdown_link_kind,
     plain_text as markdown_plain_text, resolve_workspace_path, resources as markdown_resources,
     text_view_style, utf8_prefix,
 };
@@ -38529,9 +38529,11 @@ impl VibexWorkbench {
         // A `file:` URL or a Windows drive path is a platform path, not a
         // workspace link: the first parses as its own scheme and the second as
         // a one-letter scheme, and `resolve_workspace_path` rejects the drive's
-        // `:`. Both are handed to the resolver that compares real paths.
+        // `:`. Both are handed to the resolver that compares real paths, with
+        // any editor location and POSIX drive slash removed first.
         if is_file_url(url) || is_windows_drive_path(url) {
-            if let Some(target) = agent_file_operation_preview_path(url, workspace_root) {
+            let destination = local_file_path(url);
+            if let Some(target) = agent_file_operation_preview_path(&destination, workspace_root) {
                 self.open_code_file(target, window, cx);
             }
             return;
@@ -100544,7 +100546,11 @@ fn agent_file_operation_preview_path(path: &str, workspace_root: Option<&str>) -
         Err(_) => std::path::PathBuf::from(path),
     };
     let path = if path.is_absolute() {
-        path.strip_prefix(std::path::Path::new(workspace_root?))
+        // The root may itself have been written from a POSIX shell with a
+        // leading `/` before the drive; normalizing both sides keeps the
+        // prefix comparison working for either spelling.
+        let root = local_file_path(workspace_root?);
+        path.strip_prefix(std::path::Path::new(&root))
             .ok()?
             .to_path_buf()
     } else {
