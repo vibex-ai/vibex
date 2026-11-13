@@ -7,7 +7,7 @@ build can point elsewhere with `VIBEX_PLUGIN_INDEX`.
 
 ## The two sides
 
-- **Authors** build a `.vibexplug` package, sign it with their own release key,
+- **Authors** build a `.vplug` package, sign it with their own release key,
   and print the entry to submit. `vibex-plugin publish` never edits the catalog.
 - **Maintainers** review submissions, add them to the catalog repository, and
   rebuild the signed index. `vibex-plugin index build` never touches packages.
@@ -21,7 +21,7 @@ and a maintainer cannot sign a package it did not build.
 vibex-plugin publish ./my-plugin --key "$PUBLISHER_KEY"
 ```
 
-It writes `my-plugin.vibexplug` and `my-plugin.vibexplug.sig`, then prints the
+It writes `my-plugin.vplug` and `my-plugin.vplug.sig`, then prints the
 catalog entry:
 
 ```json
@@ -34,7 +34,7 @@ catalog entry:
   "versions": [
     {
       "version": "1.2.0",
-      "url": "com.example.widgets-1.2.0.vibexplug",
+      "url": "com.example.widgets-1.2.0.vplug",
       "sizeBytes": 12345,
       "sha256": "…",
       "sha512": "…",
@@ -127,3 +127,42 @@ root public key and reads the index from:
 the client tries them in order, so a catalog may be mirrored anywhere. Every
 address must serve the same `index.json.sig`.
 
+
+## Catalogs a reader adds
+
+The three sources are fixed — the official index, GitHub topic discovery, and
+the catalogs the reader types into **Plugins → Discover → Catalogs you added** —
+but only the first two are the application's. A reader may add up to
+`MAX_PLUGIN_USER_SOURCES` (8) catalogs of their own:
+
+- The address must be absolute `https`. A plaintext or local address is
+  refused before it is stored, because the catalog is fetched under the same
+  public-https policy as the official one.
+- The reader supplies the index signer's public key. Leaving it empty means
+  accepting an **unsigned** catalog, and the form says so; the acceptance is
+  stored, not implied, so a key that later turns out malformed disables the
+  source instead of silently reading it unchecked.
+- The source id is `sha256(indexUrl)[..8]` in hex, so re-adding the same
+  address renames and updates the row instead of listing the catalog twice.
+
+What a user catalog can and cannot claim is the point of the feature:
+
+| It can | It cannot |
+| --- | --- |
+| List plugins with its own categories, screenshots and README | Mint `Official` or `Verified` — both are rewritten to `Community` |
+| Sign its packages with keys it publishes | Borrow the official index's publisher keys; the two lists are stored apart |
+| Fail on its own without emptying the catalog | Hide the failure: its reason is appended to the response's `partialReason` |
+
+Entries it lists carry `listingSource: "user"` and a `sourceName`, which the
+card and the detail page show, so two catalogs listing the same plugin id are
+told apart. Merging is still by plugin id, and the official index wins, then a
+user catalog, then topic discovery.
+
+## Ratings
+
+There is no review service yet, so a rating is local: **Plugins → a plugin →
+Your rating** stores one to five stars in `plugin_reviews`, keyed by plugin id.
+Clicking the star already given clears it. The detail page draws the reader's
+own rating beside the catalog's published aggregate rather than folding the two
+into one number nobody could verify — `PluginLocalReview` is the shape a
+service would later publish, and nothing else has to change when one exists.

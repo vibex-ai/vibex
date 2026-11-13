@@ -329,6 +329,20 @@ const VIBEX_ASSETS: &[(&str, &[u8])] = &[
         include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/icons/pin.svg")),
     ),
     (
+        "icons/vibex/star.svg",
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/icons/star.svg"
+        )),
+    ),
+    (
+        "icons/vibex/star-filled.svg",
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/icons/star-filled.svg"
+        )),
+    ),
+    (
         "icons/vibex/pin-filled.svg",
         include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),

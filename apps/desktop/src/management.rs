@@ -2105,6 +2105,12 @@ pub struct ManagementCenter {
     plugin_market_installed: Vec<vibex_core::InstalledPlugin>,
     plugin_market_updates: Vec<vibex_core::PluginUpdate>,
     plugin_market_detail: Option<vibex_core::PluginMarketDetail>,
+    /// The ratings this machine left, keyed by plugin id.
+    ///
+    /// There is no review service yet, so a rating is local: the detail page
+    /// draws it beside the catalog's published aggregate instead of folding the
+    /// two into one number nobody could verify.
+    plugin_local_reviews: BTreeMap<String, vibex_core::PluginLocalReview>,
     /// The install/update the user is reviewing before approving it.
     plugin_consent: Option<PluginConsent>,
     /// The plugin whose detail page is open.
@@ -2113,6 +2119,13 @@ pub struct ManagementCenter {
     plugin_market_loading: bool,
     plugin_market_error: Option<String>,
     plugin_market_generation: u64,
+    /// The catalogs the reader added, in the order they were added.
+    plugin_user_sources: Vec<vibex_core::PluginUserSource>,
+    /// Whether the "add a catalog" form is showing.
+    plugin_user_source_form_open: bool,
+    plugin_user_source_name: Entity<InputState>,
+    plugin_user_source_url: Entity<InputState>,
+    plugin_user_source_key: Entity<InputState>,
     /// The addresses pinned to the right rail.
     ///
     /// They are not plugins: the embedded browser draws them, so this page only
@@ -2541,6 +2554,22 @@ impl ManagementCenter {
         });
         let right_rail_web_url =
             cx.new(|cx| InputState::new(window, cx).placeholder("https://example.com/"));
+        let plugin_user_source_name = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(management_locale_text(
+                "Catalog name, for example Acme",
+                "目录名称，例如 Acme",
+                "目錄名稱，例如 Acme",
+            ))
+        });
+        let plugin_user_source_url =
+            cx.new(|cx| InputState::new(window, cx).placeholder("https://example.com/index.json"));
+        let plugin_user_source_key = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(management_locale_text(
+                "Index signer's public key (base64)",
+                "索引签名公钥（base64）",
+                "索引簽名公鑰（base64）",
+            ))
+        });
         let mcp_name_draft = cx.new(|cx| {
             InputState::new(window, cx).placeholder(management_locale_text(
                 "Server name, for example filesystem",
@@ -3254,12 +3283,18 @@ impl ManagementCenter {
             plugin_market_installed: Vec::new(),
             plugin_market_updates: Vec::new(),
             plugin_market_detail: None,
+            plugin_local_reviews: BTreeMap::new(),
             plugin_consent: None,
             plugin_market_selected: None,
             plugin_market_category: None,
             plugin_market_loading: false,
             plugin_market_error: None,
             plugin_market_generation: 0,
+            plugin_user_sources: Vec::new(),
+            plugin_user_source_form_open: false,
+            plugin_user_source_name,
+            plugin_user_source_url,
+            plugin_user_source_key,
             right_rail_web_panels: Vec::new(),
             right_rail_web_form_open: false,
             right_rail_web_title,
@@ -12075,7 +12110,286 @@ impl ManagementCenter {
         self.plugin_consent = None;
         self.load_plugin_catalog(cx);
         self.load_installed_plugins(cx);
+        self.load_plugin_local_reviews(cx);
+        self.load_plugin_user_sources(cx);
         self.load_right_rail_web_panels(cx);
+    }
+
+    /// Reads the ratings this machine left.
+    ///
+    /// They are local, so one call covers every plugin; the page then looks a
+    /// rating up by id instead of asking again for each detail page.
+    fn load_plugin_local_reviews(&mut self, cx: &mut Context<Self>) {
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        let entity = cx.weak_entity();
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            backend
+                .management()
+                .plugin_local_reviews()
+                .await
+                .map_err(crate::app::remote_error_into_vibex)
+        });
+        self.mutation_task = Some(cx.spawn(async move |_, cx| {
+            let outcome = runner.await;
+            let _ = entity.update(cx, |this, cx| {
+                if let Ok(Ok(reviews)) = outcome {
+                    this.plugin_local_reviews = reviews
+                        .into_iter()
+                        .map(|review| (review.plugin_id.clone(), review))
+                        .collect();
+                }
+                cx.notify();
+            });
+        }));
+    }
+
+    /// Reads the catalogs the reader added.
+    fn load_plugin_user_sources(&mut self, cx: &mut Context<Self>) {
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        let entity = cx.weak_entity();
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            backend
+                .management()
+                .plugin_user_sources()
+                .await
+                .map_err(crate::app::remote_error_into_vibex)
+        });
+        self.mutation_task = Some(cx.spawn(async move |_, cx| {
+            let outcome = runner.await;
+            let _ = entity.update(cx, |this, cx| {
+                if let Ok(Ok(sources)) = outcome {
+                    this.plugin_user_sources = sources;
+                }
+                cx.notify();
+            });
+        }));
+    }
+
+    /// Adds a catalog the reader typed, then refreshes the catalog it lists.
+    fn add_plugin_user_source(&mut self, cx: &mut Context<Self>) {
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        let name = self
+            .plugin_user_source_name
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        let index_url = self
+            .plugin_user_source_url
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        let public_key = self
+            .plugin_user_source_key
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        if name.is_empty() || index_url.is_empty() {
+            self.plugin_market_error = Some(management_market_error_text(
+                "plugin_source_invalid",
+                "A catalog needs a name and an https index address.",
+            ));
+            return;
+        }
+        // No key means the reader is accepting an unsigned catalog, which the
+        // consent text on the form says out loud.
+        let allow_unsigned = public_key.is_empty();
+        let entity = cx.weak_entity();
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            backend
+                .management()
+                .add_plugin_user_source(MutationRequest::new(
+                    vibex_core::PluginUserSourceAddRequest {
+                        name,
+                        index_url,
+                        public_key: (!public_key.is_empty()).then_some(public_key),
+                        allow_unsigned,
+                    },
+                ))
+                .await
+                .map_err(crate::app::remote_error_into_vibex)
+        });
+        self.mutation_task = Some(cx.spawn(async move |_, cx| {
+            let outcome = runner.await;
+            let _ = entity.update(cx, |this, cx| {
+                match outcome {
+                    Ok(Ok(source)) => {
+                        this.plugin_user_sources
+                            .retain(|known| known.source_id != source.source_id);
+                        this.plugin_user_sources.push(source);
+                        this.plugin_user_source_form_open = false;
+                        this.plugin_market_error = None;
+                        this.load_plugin_catalog(cx);
+                    }
+                    Ok(Err(error)) => {
+                        this.plugin_market_error =
+                            Some(management_market_error_text(&error.code, &error.message));
+                    }
+                    Err(error) => this.plugin_market_error = Some(format!("{error}")),
+                }
+                cx.notify();
+            });
+        }));
+    }
+
+    /// Turns one catalog on or off, then refreshes what it lists.
+    fn set_plugin_user_source_enabled(
+        &mut self,
+        source_id: String,
+        enabled: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        let entity = cx.weak_entity();
+        let request_id = source_id.clone();
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            backend
+                .management()
+                .set_plugin_user_source_enabled(MutationRequest::new(
+                    vibex_core::PluginUserSourceEnabledRequest {
+                        source_id: request_id,
+                        enabled,
+                    },
+                ))
+                .await
+                .map_err(crate::app::remote_error_into_vibex)
+        });
+        self.mutation_task = Some(cx.spawn(async move |_, cx| {
+            let outcome = runner.await;
+            let _ = entity.update(cx, |this, cx| {
+                match outcome {
+                    Ok(Ok(_)) => {
+                        if let Some(source) = this
+                            .plugin_user_sources
+                            .iter_mut()
+                            .find(|source| source.source_id == source_id)
+                        {
+                            source.enabled = enabled;
+                        }
+                        this.plugin_market_error = None;
+                        this.load_plugin_catalog(cx);
+                    }
+                    Ok(Err(error)) => {
+                        this.plugin_market_error =
+                            Some(management_market_error_text(&error.code, &error.message));
+                    }
+                    Err(error) => this.plugin_market_error = Some(format!("{error}")),
+                }
+                cx.notify();
+            });
+        }));
+    }
+
+    /// Removes one catalog, then refreshes the list it contributed to.
+    fn remove_plugin_user_source(&mut self, source_id: String, cx: &mut Context<Self>) {
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        let entity = cx.weak_entity();
+        let request_id = source_id.clone();
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            backend
+                .management()
+                .remove_plugin_user_source(MutationRequest::new(
+                    vibex_core::PluginUserSourceRemoveRequest {
+                        source_id: request_id,
+                    },
+                ))
+                .await
+                .map_err(crate::app::remote_error_into_vibex)
+        });
+        self.mutation_task = Some(cx.spawn(async move |_, cx| {
+            let outcome = runner.await;
+            let _ = entity.update(cx, |this, cx| {
+                match outcome {
+                    Ok(Ok(_)) => {
+                        this.plugin_user_sources
+                            .retain(|source| source.source_id != source_id);
+                        this.plugin_market_error = None;
+                        this.load_plugin_catalog(cx);
+                    }
+                    Ok(Err(error)) => {
+                        this.plugin_market_error =
+                            Some(management_market_error_text(&error.code, &error.message));
+                    }
+                    Err(error) => this.plugin_market_error = Some(format!("{error}")),
+                }
+                cx.notify();
+            });
+        }));
+    }
+
+    /// Stores one rating, or clears it when the reader clicks the same star.
+    fn rate_plugin(&mut self, plugin_id: String, rating: u8, cx: &mut Context<Self>) {
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        // Clicking the star already given is how a rating is withdrawn; a
+        // dedicated "clear" button would be a second way to say the same thing.
+        let clear = self
+            .plugin_local_reviews
+            .get(&plugin_id)
+            .is_some_and(|review| review.rating == rating);
+        let entity = cx.weak_entity();
+        let request_id = plugin_id.clone();
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            if clear {
+                backend
+                    .management()
+                    .clear_plugin_review(MutationRequest::new(
+                        vibex_core::PluginReviewClearRequest {
+                            plugin_id: request_id,
+                        },
+                    ))
+                    .await
+                    .map(|_| None)
+                    .map_err(crate::app::remote_error_into_vibex)
+            } else {
+                backend
+                    .management()
+                    .submit_plugin_review(MutationRequest::new(
+                        vibex_core::PluginReviewSubmitRequest {
+                            plugin_id: request_id,
+                            rating,
+                        },
+                    ))
+                    .await
+                    .map(Some)
+                    .map_err(crate::app::remote_error_into_vibex)
+            }
+        });
+        self.mutation_task = Some(cx.spawn(async move |_, cx| {
+            let outcome = runner.await;
+            let _ = entity.update(cx, |this, cx| {
+                match outcome {
+                    Ok(Ok(Some(review))) => {
+                        this.plugin_local_reviews
+                            .insert(review.plugin_id.clone(), review);
+                        this.plugin_market_error = None;
+                    }
+                    Ok(Ok(None)) => {
+                        this.plugin_local_reviews.remove(&plugin_id);
+                        this.plugin_market_error = None;
+                    }
+                    Ok(Err(error)) => {
+                        this.plugin_market_error =
+                            Some(management_market_error_text(&error.code, &error.message));
+                    }
+                    Err(error) => this.plugin_market_error = Some(format!("{error}")),
+                }
+                cx.notify();
+            });
+        }));
     }
 
     fn load_plugin_catalog(&mut self, cx: &mut Context<Self>) {
@@ -12511,7 +12825,7 @@ impl ManagementCenter {
                     "选择 Vibex 插件包",
                     "選擇 Vibex 外掛包",
                 ))
-                .add_filter("Vibex plugin", &["vibexplug"])
+                .add_filter("Vibex plugin", &["vplug"])
                 .pick_file()
                 .await
             else {
@@ -13116,7 +13430,188 @@ impl ManagementCenter {
                 column = column.child(self.render_plugin_row(&entry, cx));
             }
         }
+        column = column.child(self.render_plugin_user_sources(cx));
         column.into_any_element()
+    }
+
+    /// The catalogs the reader added, and the form that adds one.
+    ///
+    /// The official index is not listed here: it is not the reader's to remove,
+    /// and a row that only ever said "on" would be noise. What this manages is
+    /// the third-party catalogs they typed.
+    fn render_plugin_user_sources(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let sources = self.plugin_user_sources.clone();
+        let form_open = self.plugin_user_source_form_open;
+        let mut card = v_flex()
+            .w_full()
+            .gap_2()
+            .p_3()
+            .rounded(cx.theme().radius)
+            .border_1()
+            .border_color(cx.theme().border.opacity(0.7))
+            .child(
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        v_flex()
+                            .min_w_0()
+                            .flex_1()
+                            .gap(px(2.0))
+                            .child(
+                                div().text_sm().font_semibold().child(management_locale_text(
+                                    "Catalogs you added",
+                                    "我添加的目录",
+                                    "我新增的目錄",
+                                )),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(management_locale_text(
+                                        "A signed index of your own. Its plugins show as Community, never Official.",
+                                        "你自己的签名索引。其中的插件只会显示为社区，不会变成官方。",
+                                        "你自己的簽名索引。其中的外掛只會顯示為社群，不會變成官方。",
+                                    )),
+                            ),
+                    )
+                    .child(
+                        Button::new("management-plugin-source-add")
+                            .small()
+                            .outline()
+                            .label(if form_open {
+                                management_locale_text("Cancel", "取消", "取消")
+                            } else {
+                                management_locale_text("Add a catalog", "添加目录", "新增目錄")
+                            })
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.plugin_user_source_form_open =
+                                    !this.plugin_user_source_form_open;
+                                cx.notify();
+                            })),
+                    ),
+            );
+        if form_open {
+            card = card.child(
+                v_flex()
+                    .w_full()
+                    .gap_2()
+                    .child(Input::new(&self.plugin_user_source_name).small())
+                    .child(Input::new(&self.plugin_user_source_url).small())
+                    .child(Input::new(&self.plugin_user_source_key).small())
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(management_locale_text(
+                                "Leave the key empty to accept an unsigned catalog. Only the address you type is fetched, over https.",
+                                "公钥留空即表示接受未签名的目录。只会以 https 访问你填写的地址。",
+                                "公鑰留空即表示接受未簽名的目錄。只會以 https 存取你填寫的位址。",
+                            )),
+                    )
+                    .child(
+                        h_flex().w_full().justify_end().child(
+                            Button::new("management-plugin-source-save")
+                                .small()
+                                .primary()
+                                .label(management_locale_text("Add", "添加", "新增"))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.add_plugin_user_source(cx);
+                                    cx.notify();
+                                })),
+                        ),
+                    ),
+            );
+        }
+        if sources.is_empty() {
+            card = card.child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(management_locale_text(
+                        "No catalogs added. The official catalog and GitHub topic discovery are always on.",
+                        "还没有添加目录。官方目录与 GitHub topic 发现始终开启。",
+                        "還沒有新增目錄。官方目錄與 GitHub topic 發現始終開啟。",
+                    )),
+            );
+        }
+        for source in sources {
+            let source_id = source.source_id.clone();
+            let toggle_id = source.source_id.clone();
+            let remove_id = source.source_id.clone();
+            let enabled = source.enabled;
+            let mut row = h_flex()
+                .id(SharedString::from(format!(
+                    "management-plugin-source-{}",
+                    source.source_id
+                )))
+                .w_full()
+                .min_w_0()
+                .items_center()
+                .gap_3()
+                .child(
+                    v_flex()
+                        .min_w_0()
+                        .flex_1()
+                        .gap(px(2.0))
+                        .child(
+                            h_flex()
+                                .min_w_0()
+                                .items_center()
+                                .gap_2()
+                                .child(div().text_sm().font_semibold().child(source.name.clone()))
+                                .child(management_market_chip(if enabled {
+                                    management_locale_text("On", "已启用", "已啟用")
+                                } else {
+                                    management_locale_text("Off", "已停用", "已停用")
+                                })),
+                        )
+                        .child(
+                            div()
+                                .min_w_0()
+                                .truncate()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(source.index_url.clone()),
+                        )
+                        .when_some(source.last_error.clone(), |column, error| {
+                            column.child(div().text_xs().text_color(cx.theme().danger).child(error))
+                        }),
+                )
+                .child(
+                    Button::new(SharedString::from(format!(
+                        "management-plugin-source-toggle-{toggle_id}"
+                    )))
+                    .small()
+                    .outline()
+                    .label(if enabled {
+                        management_locale_text("Disable", "停用", "停用")
+                    } else {
+                        management_locale_text("Enable", "启用", "啟用")
+                    })
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.set_plugin_user_source_enabled(source_id.clone(), !enabled, cx);
+                        cx.notify();
+                    })),
+                )
+                .child(
+                    Button::new(SharedString::from(format!(
+                        "management-plugin-source-remove-{remove_id}"
+                    )))
+                    .small()
+                    .outline()
+                    .label(management_locale_text("Remove", "移除", "移除"))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.remove_plugin_user_source(remove_id.clone(), cx);
+                        cx.notify();
+                    })),
+                );
+            card = card.child(row);
+        }
+        card.into_any_element()
     }
 
     fn render_plugin_row(
@@ -13137,10 +13632,17 @@ impl ManagementCenter {
             .unwrap_or_default()
             .to_string();
         let meta = format!(
-            "{} · {} · {}",
+            "{} · {} · {}{}",
             entry.publisher.display_name,
             entry.trust.label(),
-            entry.latest_version.clone().unwrap_or_default()
+            entry.latest_version.clone().unwrap_or_default(),
+            // An entry from a catalog the reader added says which one, so two
+            // catalogs listing the same plugin are told apart on the card.
+            entry
+                .source_name
+                .as_deref()
+                .map(|name| format!(" · {name}"))
+                .unwrap_or_default()
         );
         let plate = match entry.icon_url.as_ref().and_then(|url| {
             self.plugin_market_icons
@@ -13297,6 +13799,7 @@ impl ManagementCenter {
                     ),
             );
         }
+        column = column.child(self.render_plugin_review_stars(&entry.id, cx));
         if !detail.screenshots.is_empty() {
             let mut strip = h_flex().w_full().gap_2().overflow_hidden();
             for url in &detail.screenshots {
@@ -13366,6 +13869,74 @@ impl ManagementCenter {
             );
         }
         column.into_any_element()
+    }
+
+    /// The reader's own rating, as five clickable stars.
+    ///
+    /// The rating is stored on this machine only — there is no review service
+    /// yet — so it is drawn apart from the catalog's published average instead
+    /// of being mixed into it. Clicking the star already given withdraws it.
+    fn render_plugin_review_stars(
+        &mut self,
+        plugin_id: &str,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let current = self
+            .plugin_local_reviews
+            .get(plugin_id)
+            .map(|review| review.rating);
+        let mut row = h_flex().items_center().gap_2().child(
+            div()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(management_locale_text(
+                    "Your rating",
+                    "我的评分",
+                    "我的評分",
+                )),
+        );
+        for star in 1..=vibex_core::MAX_PLUGIN_REVIEW_RATING {
+            let filled = current.is_some_and(|rating| rating >= star);
+            let target_id = plugin_id.to_string();
+            row = row.child(
+                h_flex()
+                    .id(SharedString::from(format!(
+                        "management-plugin-star-{plugin_id}-{star}"
+                    )))
+                    .cursor_pointer()
+                    .hover(|style| style.opacity(0.7))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.rate_plugin(target_id.clone(), star, cx);
+                        cx.notify();
+                    }))
+                    .child(
+                        Icon::default()
+                            .path(if filled {
+                                "icons/vibex/star-filled.svg"
+                            } else {
+                                "icons/vibex/star.svg"
+                            })
+                            .size(px(14.0))
+                            .text_color(if filled {
+                                cx.theme().yellow
+                            } else {
+                                cx.theme().muted_foreground
+                            }),
+                    ),
+            );
+        }
+        if let Some(rating) = current {
+            row = row.child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(format!(
+                        "{rating} / {}",
+                        vibex_core::MAX_PLUGIN_REVIEW_RATING
+                    )),
+            );
+        }
+        row.into_any_element()
     }
 
     /// The right rail's pinned pages, and the form that adds one.
