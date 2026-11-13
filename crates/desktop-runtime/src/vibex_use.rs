@@ -2785,7 +2785,7 @@ impl VibexUseService {
         arguments: &serde_json::Value,
         bind_human_mentions: bool,
     ) -> VibexResult<SessionRuntimeSelection> {
-        let target = arguments.get("target").cloned().unwrap_or_default();
+        let mut target = arguments.get("target").cloned().unwrap_or_default();
         let mut selection_ref = optional_string(&target, "selectionRef", 512)
             .or_else(|| optional_string(arguments, "selectionRef", 512));
         let mut bound_mention = false;
@@ -2795,6 +2795,20 @@ impl VibexUseService {
             if let Some(reference) =
                 bound_mention_target(&mentions, &target, selection_ref.as_deref())?
             {
+                // The chip's tuning is part of what the user chose, and the
+                // reference alone cannot carry it: a tuned reference fingerprints
+                // a selection the catalogue never publishes, so resolving it
+                // needs the same overrides the chip holds. Without this the
+                // delegation either failed to find the entry or silently ran at
+                // the option's default depth while the composer showed the
+                // reader's.
+                if let Some(tuning) = mentions
+                    .iter()
+                    .find(|mention| mention.reference == reference)
+                    .and_then(|mention| mention.tuning.as_ref())
+                {
+                    apply_mention_tuning(&mut target, tuning)?;
+                }
                 selection_ref = Some(reference.as_uri());
                 bound_mention = true;
             }
@@ -4875,6 +4889,42 @@ fn latest_agent_mentions(
         .collect())
 }
 
+/// Copies a chip's tuning into a delegation target.
+///
+/// The chip's reference fingerprints a complete selection, so a tuned reference
+/// names a configuration the catalogue never publishes as its own entry. The
+/// resolver applies the target's overrides before comparing fingerprints, which
+/// is why the tuning has to travel here: without it the entry is either not
+/// found or found at the option's default depth, and the child would run
+/// differently from what the composer showed.
+fn apply_mention_tuning(
+    target: &mut serde_json::Value,
+    tuning: &vibex_core::MentionTuning,
+) -> VibexResult<()> {
+    let Some(object) = target.as_object_mut() else {
+        return Ok(());
+    };
+    if let Some(effort) = tuning.reasoning_effort.as_ref() {
+        object.insert(
+            "reasoningEffort".to_string(),
+            serde_json::Value::String(effort.clone()),
+        );
+    }
+    if let Some(mode_id) = tuning.mode_id.as_ref() {
+        object.insert(
+            "modeId".to_string(),
+            serde_json::Value::String(mode_id.clone()),
+        );
+    }
+    if !tuning.config_values.is_empty() {
+        object.insert(
+            "configValues".to_string(),
+            serde_json::to_value(&tuning.config_values).map_err(internal_encode_error)?,
+        );
+    }
+    Ok(())
+}
+
 /// The reference a user's Agent mention binds one delegation to.
 ///
 /// `None` means the newest user message addressed no collaborator, so the
@@ -5756,6 +5806,41 @@ mod tests {
             bound_mention_target(std::slice::from_ref(&mention), &serde_json::json!({}), None)
                 .unwrap();
         assert_eq!(bound, Some(mention.reference));
+    }
+
+    /// A tuned chip's tuning reaches the delegation target.
+    ///
+    /// The reference fingerprints a complete selection, so resolving a tuned
+    /// chip needs the same overrides the chip holds. Without them the entry is
+    /// either not found or found at the option's default depth, and the child
+    /// runs differently from what the composer showed.
+    #[test]
+    fn a_tuned_mention_hands_its_tuning_to_the_delegation_target() {
+        let mut target = serde_json::json!({ "selectionRef": "vibex://runtime-option/a" });
+        let tuning = vibex_core::MentionTuning {
+            reasoning_effort: Some("high".to_string()),
+            mode_id: Some("build".to_string()),
+            config_values: BTreeMap::from([("auto_approve".to_string(), "true".to_string())]),
+        };
+        apply_mention_tuning(&mut target, &tuning).unwrap();
+        assert_eq!(
+            target.get("reasoningEffort").and_then(|v| v.as_str()),
+            Some("high")
+        );
+        assert_eq!(target.get("modeId").and_then(|v| v.as_str()), Some("build"));
+        assert_eq!(
+            target
+                .get("configValues")
+                .and_then(|v| v.get("auto_approve"))
+                .and_then(|v| v.as_str()),
+            Some("true")
+        );
+
+        // An empty tuning adds nothing, so an untuned chip's target stays the
+        // exact object it always was.
+        let mut bare = serde_json::json!({ "selectionRef": "vibex://runtime-option/a" });
+        apply_mention_tuning(&mut bare, &vibex_core::MentionTuning::default()).unwrap();
+        assert_eq!(bare.as_object().map(serde_json::Map::len), Some(1));
     }
 
     #[test]
