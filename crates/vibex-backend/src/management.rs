@@ -30,18 +30,19 @@ use vibex_core::{
     HookDeleteRequest, HookInstallPreview, HookInstallPreviewRequest, HookUpdateRequest,
     ImBindingId, ImBindingSummary, ImChannelDraft, ImChannelId, ImChannelSummary,
     ImChannelTestReport, ImPairingCodeInfo, ImPairingRequest, ImPrincipalId, ImPrincipalSummary,
-    ManagementSnapshotPayload, MarketIcon, McpMarketIcon, McpMarketInstallRequest,
-    McpMarketInstallResult, McpMarketSearchRequest, McpMarketSearchResponse, McpServer,
-    McpServerAgentMatrix, McpServerAgentMatrixListRequest, McpServerCreateRequest,
-    McpServerDeleteRequest, McpServerDiscoverRequest, McpServerDiscoveryResponse,
-    McpServerImportRequest, McpServerImportResult, McpServerSetAgentMatrixRequest,
-    McpServerUpdateRequest, McpServerValidateRequest, McpServerValidationResult,
-    ModelCapabilitySuggestionRequest, ModelProviderCredentialSecretRequest,
-    ModelProviderCredentialSecretResponse, ModelProviderProfile, ModelProviderProfileCreateRequest,
-    ModelProviderProfileUpdateRequest, Prompt, PromptCreateRequest, PromptDeleteRequest,
-    PromptUpdateRequest, PromptUsage, PromptUsageRecordRequest, PromptValidateRequest,
-    PromptValidationResult, ProviderCapabilitySummary, ProviderCredentialSecretMutationRequest,
-    ProviderHealthSummary, ProviderNativeExportApplyRequest, ProviderNativeExportApplyResult,
+    ImSessionDefaults, ManagementSnapshotPayload, MarketIcon, McpMarketIcon,
+    McpMarketInstallRequest, McpMarketInstallResult, McpMarketSearchRequest,
+    McpMarketSearchResponse, McpServer, McpServerAgentMatrix, McpServerAgentMatrixListRequest,
+    McpServerCreateRequest, McpServerDeleteRequest, McpServerDiscoverRequest,
+    McpServerDiscoveryResponse, McpServerImportRequest, McpServerImportResult,
+    McpServerSetAgentMatrixRequest, McpServerUpdateRequest, McpServerValidateRequest,
+    McpServerValidationResult, ModelCapabilitySuggestionRequest,
+    ModelProviderCredentialSecretRequest, ModelProviderCredentialSecretResponse,
+    ModelProviderProfile, ModelProviderProfileCreateRequest, ModelProviderProfileUpdateRequest,
+    Prompt, PromptCreateRequest, PromptDeleteRequest, PromptUpdateRequest, PromptUsage,
+    PromptUsageRecordRequest, PromptValidateRequest, PromptValidationResult,
+    ProviderCapabilitySummary, ProviderCredentialSecretMutationRequest, ProviderHealthSummary,
+    ProviderNativeExportApplyRequest, ProviderNativeExportApplyResult,
     ProviderNativeExportListRequest, ProviderNativeExportPreview,
     ProviderNativeExportPreviewRequest, ProviderNativeExportRecordSummary,
     ProviderNativeExportRollbackRequest, ProviderNativeExportRollbackResult,
@@ -121,6 +122,13 @@ impl std::fmt::Debug for ImChannelSecretUpdateRequest {
             .field("bot_token", &"<redacted>")
             .finish()
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImChannelDefaultSessionUpdate {
+    pub channel_id: ImChannelId,
+    pub default_session: Option<ImSessionDefaults>,
 }
 
 pub trait ManagementBackend: BackendBound {
@@ -968,6 +976,19 @@ pub trait ManagementBackend: BackendBound {
     }
 
     fn delete_im_channel(&self, request: MutationRequest<ImChannelId>) -> BackendFuture<'_, ()> {
+        let _ = request;
+        Box::pin(async {
+            Err(BackendError::unsupported(
+                "im_channels_unavailable",
+                "IM channels are unavailable on this backend",
+            ))
+        })
+    }
+
+    fn set_im_channel_default_session(
+        &self,
+        request: MutationRequest<ImChannelDefaultSessionUpdate>,
+    ) -> BackendFuture<'_, ImChannelSummary> {
         let _ = request;
         Box::pin(async {
             Err(BackendError::unsupported(

@@ -45,3 +45,9 @@ pub struct ImTarget {
     pub chat_id: String,
     pub thread_key: String,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImThreadTarget {
+    pub thread_key: String,
+    pub thread_kind: String,
+}

@@ -13,7 +13,7 @@ use vibex_core::{
     ImBindingSummary, ImChannelConfig, ImChannelConfigEnvelope, ImChannelDraft, ImChannelId,
     ImChannelKind, ImChannelState, ImChannelStatus, ImChannelSummary, ImChannelTestReport,
     ImMessageId, ImPairingCodeInfo, ImPairingId, ImPairingRequest, ImPrincipalId, ImPrincipalRole,
-    ImPrincipalStatus, ImPrincipalSummary, MessageProvenance, PermissionRequest,
+    ImPrincipalStatus, ImPrincipalSummary, ImSessionDefaults, MessageProvenance, PermissionRequest,
     PermissionRequestStatus, PermissionResolution, PermissionResponseKind,
     PermissionResponseOption, ResolvePermissionRequest, SendAgentMessageRequest, TimelineLiveEvent,
     TimelinePayload, VibexError, VibexResult, VibexSessionId, unix_timestamp_ms,
@@ -26,6 +26,7 @@ use vibex_db::{
     ImPrincipalRepository,
 };
 
+use crate::adapter::ImAdapter;
 use crate::agent_port::ImAgentPort;
 use crate::error::ImError;
 use crate::i18n::ImLocale;
@@ -51,6 +52,11 @@ pub struct ImChannelService {
     inner: Arc<Inner>,
 }
 
+#[path = "service_approvals.rs"]
+mod approvals;
+#[path = "service_events.rs"]
+mod events;
+
 struct Inner {
     config: ImChannelServiceConfig,
     agent: Arc<dyn ImAgentPort>,
@@ -65,7 +71,7 @@ struct Inner {
 }
 
 struct ChannelRuntime {
-    adapter: Arc<TelegramAdapter>,
+    adapter: Arc<dyn ImAdapter>,
     task: JoinHandle<()>,
     send_lock: Arc<AsyncMutex<()>>,
 }
@@ -311,6 +317,39 @@ impl ImChannelService {
         Ok(())
     }
 
+    pub async fn set_default_session(
+        &self,
+        channel_id: &ImChannelId,
+        default_session: Option<ImSessionDefaults>,
+    ) -> VibexResult<ImChannelSummary> {
+        let conn = self.open()?;
+        let record = ImChannelRepository::get(&conn, channel_id)?.ok_or_else(|| {
+            VibexError::validation("im_channel_not_found", "IM channel was not found")
+        })?;
+        let mut envelope: ImChannelConfigEnvelope = serde_json::from_str(&record.config_json)
+            .map_err(|_| {
+                VibexError::validation(
+                    "im_channel_config_invalid",
+                    "IM channel configuration is not valid",
+                )
+            })?;
+        envelope.default_session = default_session;
+        let updated = ImChannelRecord {
+            config_json: serde_json::to_string(&envelope).map_err(|_| {
+                VibexError::validation(
+                    "im_channel_config_invalid",
+                    "IM channel configuration could not be encoded",
+                )
+            })?,
+            updated_at_ms: unix_timestamp_ms(),
+            ..record
+        };
+        ImChannelRepository::update(&conn, &updated)?;
+        self.reload_channel(channel_id).await?;
+        let status = self.status_for(&updated.channel_id, updated.enabled).await;
+        self.summary_for(&conn, &updated, status)
+    }
+
     pub async fn test_channel(&self, channel_id: &ImChannelId) -> VibexResult<ImChannelTestReport> {
         let conn = self.open()?;
         let record = ImChannelRepository::get(&conn, channel_id)?.ok_or_else(|| {
@@ -474,6 +513,9 @@ impl ImChannelService {
         let configured = secrets
             .iter()
             .any(|secret| secret.secret_kind == "bot_token" && secret.setup_state == "configured");
+        let default_session = serde_json::from_str::<ImChannelConfigEnvelope>(&record.config_json)
+            .ok()
+            .and_then(|envelope| envelope.default_session);
         let event_filter = record
             .event_filter_json
             .as_deref()
@@ -491,6 +533,7 @@ impl ImChannelService {
             kind: record.kind,
             enabled: record.enabled,
             configured,
+            default_session,
             event_filter,
             locale: record.locale.clone(),
             status,
@@ -569,6 +612,7 @@ impl ImChannelService {
             self.inner.inbound_tx.clone(),
             self.inner.shutdown.subscribe(),
         );
+        let adapter: Arc<dyn ImAdapter> = adapter;
         let runtime = ChannelRuntime {
             adapter,
             task,
@@ -1197,6 +1241,10 @@ impl ImChannelService {
                     "IM channel configuration is not valid",
                 )
             })?;
+        let topic_mode = matches!(
+            &envelope.config,
+            ImChannelConfig::Telegram(config) if config.topic_mode
+        );
         let (workspace_root, workspace_mode, runtime_selection, safety) = if let Some(defaults) =
             envelope.default_session
         {
@@ -1243,11 +1291,29 @@ impl ImChannelService {
                 tools: Default::default(),
             })
             .await?;
-        let binding = self.make_binding(event, principal, &session, None);
+        let mut reply_event = event.clone();
+        if topic_mode && event.chat_type == ImChatType::Group && event.thread_key.is_empty() {
+            match runtime.adapter.create_thread(&topic_title(prompt)).await {
+                Ok(thread) => {
+                    reply_event.thread_key = thread.thread_key;
+                    reply_event.thread_kind = Some(thread.thread_kind);
+                }
+                Err(error) => {
+                    self.reply(
+                        event,
+                        runtime,
+                        &format!("Could not create a Telegram topic: {error}"),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            }
+        }
+        let binding = self.make_binding(&reply_event, principal, &session, None);
         ImBindingRepository::upsert(&conn, &binding)?;
-        self.send_prompt(event, &session.id, prompt).await?;
+        self.send_prompt(&reply_event, &session.id, prompt).await?;
         self.reply(
-            event,
+            &reply_event,
             runtime,
             &format!(
                 "Created #{} · {}\nSend /status to follow it.",
@@ -1472,439 +1538,6 @@ impl ImChannelService {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
-    async fn apply_resolution(
-        &self,
-        event: &ImInboundEvent,
-        runtime: &ChannelRuntime,
-        binding: &ImBindingRecord,
-        request: &PermissionRequest,
-        option: &PermissionResponseOption,
-        principal: &ImPrincipalRecord,
-        card_id: Option<&str>,
-    ) -> VibexResult<String> {
-        let resolution = PermissionResolution {
-            request_id: request.id.clone(),
-            session_id: request.session_id.clone(),
-            response: option.response,
-            responder_device_id: None,
-            provider_resolution_id: Some(option.option_id.clone()),
-            note: Some(format!(
-                "via telegram ({}, {})",
-                principal.display_name,
-                principal.principal_id.as_str()
-            )),
-            resolved_at_ms: unix_timestamp_ms(),
-        };
-        self.inner
-            .agent
-            .resolve_permission(ResolvePermissionRequest {
-                session_id: request.session_id.clone(),
-                request_id: request.id.clone(),
-                resolution,
-            })
-            .await?;
-        let status = match option.response {
-            PermissionResponseKind::Approve => "approved",
-            PermissionResponseKind::Deny => "denied",
-            PermissionResponseKind::AlwaysAllowForSession => "approved for this session",
-        };
-        let conn = self.open()?;
-        if let Some(card_id) = card_id.filter(|id| !id.is_empty()) {
-            ImApprovalCardRepository::set_status(&conn, card_id, status, unix_timestamp_ms())?;
-            ImActionRepository::invalidate_for_card(&conn, card_id, unix_timestamp_ms())?;
-        }
-        let cards = ImApprovalCardRepository::list_for_request(
-            &conn,
-            &request.session_id,
-            request.id.as_str(),
-        )?;
-        for card in cards {
-            ImApprovalCardRepository::set_status(
-                &conn,
-                &card.card_id,
-                status,
-                unix_timestamp_ms(),
-            )?;
-            ImActionRepository::invalidate_for_card(&conn, &card.card_id, unix_timestamp_ms())?;
-            if let Some(message_id) = card.external_message_id.as_deref() {
-                let _ = runtime
-                    .adapter
-                    .edit_text(
-                        &ImTarget {
-                            chat_id: binding.external_chat_id.clone(),
-                            thread_key: binding.thread_key.clone(),
-                        },
-                        message_id,
-                        &format!("{}: {}\n{}", status, request.title, principal.display_name),
-                        &[],
-                    )
-                    .await;
-            }
-        }
-        let _ = event;
-        Ok(format!("{status}: {}", request.title))
-    }
-
-    async fn send_approval_card(
-        &self,
-        binding: &ImBindingRecord,
-        request: &PermissionRequest,
-        sequence: i64,
-    ) -> VibexResult<()> {
-        let conn = self.open()?;
-        let existing_card = ImApprovalCardRepository::get_by_request(
-            &conn,
-            &binding.binding_id,
-            request.id.as_str(),
-        )?;
-        if let Some(card) = existing_card.as_ref()
-            && (card.external_message_id.is_some() || card.status != "pending")
-        {
-            return Ok(());
-        }
-        let Some(runtime) = self
-            .inner
-            .channels
-            .read()
-            .await
-            .get(&binding.channel_id)
-            .cloned()
-        else {
-            return Ok(());
-        };
-        let card_id = existing_card
-            .as_ref()
-            .map(|card| card.card_id.clone())
-            .unwrap_or_else(|| format!("imcard_{}", Uuid::new_v4().simple()));
-        let now = unix_timestamp_ms();
-        ImApprovalCardRepository::upsert(
-            &conn,
-            &ImApprovalCardRecord {
-                card_id: card_id.clone(),
-                binding_id: binding.binding_id.clone(),
-                session_id: binding.session_id.clone(),
-                request_id: request.id.as_str().to_string(),
-                external_message_id: None,
-                status: "pending".to_string(),
-                created_at_ms: existing_card
-                    .as_ref()
-                    .map(|card| card.created_at_ms)
-                    .unwrap_or(now),
-                updated_at_ms: now,
-            },
-        )?;
-        if existing_card.is_some() {
-            ImActionRepository::invalidate_for_card(&conn, &card_id, now)?;
-        }
-        let mut buttons = Vec::new();
-        let mut codes = Vec::new();
-        for (choice, kind, label) in [
-            (
-                ApprovalChoice::Approve,
-                PermissionResponseKind::Approve,
-                "Approve",
-            ),
-            (
-                ApprovalChoice::Always,
-                PermissionResponseKind::AlwaysAllowForSession,
-                "Always allow",
-            ),
-            (ApprovalChoice::Deny, PermissionResponseKind::Deny, "Deny"),
-        ] {
-            let Some(option) = request
-                .response_options
-                .iter()
-                .find(|option| option.response == kind)
-            else {
-                continue;
-            };
-            let action_id = ImActionId::new();
-            let short_code = action_short_code(&action_id);
-            let payload = ApprovalActionPayload {
-                request_id: request.id.as_str().to_string(),
-                option_id: option.option_id.clone(),
-                choice: choice.as_str().to_string(),
-            };
-            ImActionRepository::insert(
-                &conn,
-                &ImActionRecord {
-                    action_id: action_id.clone(),
-                    short_code: short_code.clone(),
-                    card_id: Some(card_id.clone()),
-                    channel_id: binding.channel_id.clone(),
-                    binding_id: binding.binding_id.clone(),
-                    kind: choice.as_str().to_string(),
-                    payload_json: serde_json::to_string(&payload).map_err(|_| {
-                        VibexError::validation(
-                            "im_action_payload_invalid",
-                            "approval action payload could not be encoded",
-                        )
-                    })?,
-                    expires_at_ms: request
-                        .expires_at_ms
-                        .unwrap_or_else(|| now.saturating_add(PAIRING_TTL_MS)),
-                    consumed_at_ms: None,
-                    consumed_by_principal_id: None,
-                    created_at_ms: now,
-                },
-            )?;
-            buttons.push(ImButton {
-                action_id,
-                label: format!("{label} ({short_code})"),
-            });
-            codes.push(format!("{label}: {short_code}"));
-        }
-        if buttons.is_empty() {
-            return Ok(());
-        }
-        let mut text =
-            render::permission_text(request, self.locale_for_channel(&binding.channel_id));
-        text.push('\n');
-        text.push_str(&codes.join(" · "));
-        let target = ImTarget {
-            chat_id: binding.external_chat_id.clone(),
-            thread_key: binding.thread_key.clone(),
-        };
-        if let Ok(sent) = runtime.adapter.send_text(&target, &text, &buttons).await {
-            ImApprovalCardRepository::set_message_id(
-                &conn,
-                &card_id,
-                &sent.message_id,
-                unix_timestamp_ms(),
-            )?;
-        }
-        ImBindingRepository::set_delivered_sequence(
-            &conn,
-            &binding.binding_id,
-            sequence,
-            unix_timestamp_ms(),
-        )?;
-        Ok(())
-    }
-
-    async fn update_approval_cards(
-        &self,
-        session_id: &VibexSessionId,
-        request_id: &str,
-        response: PermissionResponseKind,
-    ) -> VibexResult<()> {
-        let conn = self.open()?;
-        let cards = ImApprovalCardRepository::list_for_request(&conn, session_id, request_id)?;
-        let status = match response {
-            PermissionResponseKind::Approve => "approved",
-            PermissionResponseKind::Deny => "denied",
-            PermissionResponseKind::AlwaysAllowForSession => "approved for this session",
-        };
-        for card in cards {
-            ImApprovalCardRepository::set_status(
-                &conn,
-                &card.card_id,
-                status,
-                unix_timestamp_ms(),
-            )?;
-            ImActionRepository::invalidate_for_card(&conn, &card.card_id, unix_timestamp_ms())?;
-            let Some(binding) = ImBindingRepository::get(&conn, &card.binding_id)? else {
-                continue;
-            };
-            if let Some(message_id) = card.external_message_id.as_deref()
-                && let Some(runtime) = self
-                    .inner
-                    .channels
-                    .read()
-                    .await
-                    .get(&binding.channel_id)
-                    .cloned()
-            {
-                let _ = runtime
-                    .adapter
-                    .edit_text(
-                        &ImTarget {
-                            chat_id: binding.external_chat_id.clone(),
-                            thread_key: binding.thread_key.clone(),
-                        },
-                        message_id,
-                        &format!("{status}: approval request {}", request_id),
-                        &[],
-                    )
-                    .await;
-            }
-        }
-        Ok(())
-    }
-
-    async fn event_loop(this: Weak<Self>, mut shutdown: watch::Receiver<bool>) {
-        let Some(service) = this.upgrade() else {
-            return;
-        };
-        let mut timeline = service.inner.agent.subscribe_timeline();
-        let mut sessions = service.inner.agent.subscribe_session_updates();
-        let mut notifications = service.inner.agent.subscribe_notifications();
-        drop(service);
-        loop {
-            let Some(service) = this.upgrade() else {
-                break;
-            };
-            tokio::select! {
-                _ = shutdown.changed() => break,
-                event = timeline.recv() => {
-                    match event {
-                        Ok(event) => {
-                            if let Err(error) = service.handle_timeline_event(event).await {
-                                tracing::warn!(target: "vibex_im", error_code = %error.code, "IM timeline event failed");
-                            }
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                    }
-                }
-                event = sessions.recv() => {
-                    if let Ok(session) = event {
-                        let _ = service.handle_session_update(session).await;
-                    }
-                }
-                event = notifications.recv() => {
-                    if let Ok(notification) = event {
-                        let _ = service.handle_notification(notification).await;
-                    }
-                }
-            }
-        }
-    }
-
-    async fn handle_timeline_event(&self, event: TimelineLiveEvent) -> VibexResult<()> {
-        let conn = self.open()?;
-        let bindings = ImBindingRepository::list_active_for_session(&conn, &event.session_id)?;
-        if bindings.is_empty() {
-            return Ok(());
-        }
-        let event_id = timeline_event_id(&event.item.payload);
-        for binding in bindings {
-            let Some(record) = ImChannelRepository::get(&conn, &binding.channel_id)? else {
-                continue;
-            };
-            if !record.enabled {
-                continue;
-            }
-            if let Some(event_id) = event_id
-                && !event_allowed(&record, event_id)
-            {
-                continue;
-            }
-            match &event.item.payload {
-                TimelinePayload::AgentMessage(message) if message.is_final => {
-                    let text = render::final_answer(&message.text);
-                    if !text.trim().is_empty() {
-                        self.send_to_binding(&binding, &text).await?;
-                    }
-                    ImBindingRepository::set_delivered_sequence(
-                        &conn,
-                        &binding.binding_id,
-                        event.sequence,
-                        unix_timestamp_ms(),
-                    )?;
-                }
-                TimelinePayload::PermissionRequest(request)
-                    if request.status == PermissionRequestStatus::Pending =>
-                {
-                    self.send_approval_card(&binding, request, event.sequence)
-                        .await?;
-                }
-                TimelinePayload::PermissionResolution(resolution) => {
-                    self.update_approval_cards(
-                        &resolution.session_id,
-                        resolution.request_id.as_str(),
-                        resolution.response,
-                    )
-                    .await?;
-                }
-                TimelinePayload::Error(error) => {
-                    let text = render::error_message(&error.code, &error.message);
-                    self.send_to_binding(&binding, &text).await?;
-                    ImBindingRepository::set_delivered_sequence(
-                        &conn,
-                        &binding.binding_id,
-                        event.sequence,
-                        unix_timestamp_ms(),
-                    )?;
-                }
-                TimelinePayload::ElicitationRequest(request) => {
-                    self.send_to_binding(
-                        &binding,
-                        &format!(
-                            "The Agent needs an answer: {}\nOpen Vibex to answer this question.",
-                            request.message
-                        ),
-                    )
-                    .await?;
-                }
-                _ => {}
-            }
-        }
-        Ok(())
-    }
-
-    async fn handle_session_update(&self, session: AgentSession) -> VibexResult<()> {
-        let conn = self.open()?;
-        let bindings = ImBindingRepository::list_active_for_session(&conn, &session.id)?;
-        for binding in bindings {
-            if binding.title.as_deref() != Some(session.title.as_str()) {
-                ImBindingRepository::update_title(
-                    &conn,
-                    &binding.binding_id,
-                    &session.title,
-                    unix_timestamp_ms(),
-                )?;
-            }
-        }
-        Ok(())
-    }
-
-    async fn handle_notification(&self, notification: AgentNotificationIntent) -> VibexResult<()> {
-        if let AgentNotificationKind::ApprovalRequired { request_id } = notification.kind {
-            let conn = self.open()?;
-            let bindings =
-                ImBindingRepository::list_active_for_session(&conn, &notification.session_id)?;
-            for binding in bindings {
-                if let Some(request) = self
-                    .pending_permission(&notification.session_id, Some(request_id.as_str()))
-                    .await?
-                {
-                    self.send_approval_card(&binding, &request, 0).await?;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    async fn pending_permission(
-        &self,
-        session_id: &VibexSessionId,
-        request_id: Option<&str>,
-    ) -> VibexResult<Option<PermissionRequest>> {
-        let page = self
-            .inner
-            .agent
-            .fetch_timeline(FetchTimelineRequest {
-                session_id: session_id.clone(),
-                after_sequence: None,
-                before_sequence: None,
-                limit: 100,
-                max_turns: None,
-                max_bytes: None,
-            })
-            .await?;
-        for item in page.items.iter().rev() {
-            if let TimelinePayload::PermissionRequest(request) = &item.payload
-                && request.status == PermissionRequestStatus::Pending
-                && request_id.is_none_or(|id| request.id.as_str() == id)
-            {
-                return Ok(Some(request.clone()));
-            }
-        }
-        Ok(None)
-    }
-
     fn binding_for(
         &self,
         conn: &vibex_db::DbConnection,
@@ -2085,6 +1718,13 @@ fn choose_option(
 
 const fn choice_is_always(choice: ApprovalChoice) -> bool {
     matches!(choice, ApprovalChoice::Always)
+}
+
+fn topic_title(prompt: &str) -> String {
+    format!("Vibex · {}", render::truncate(prompt.trim(), 112))
+        .chars()
+        .take(128)
+        .collect()
 }
 
 fn role_label(role: ImPrincipalRole, locale: ImLocale) -> &'static str {

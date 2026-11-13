@@ -10511,7 +10511,9 @@ name = "vibex-im-channel"
 version = "0.1.5"
 dependencies = [
  "async-trait",
+ "axum",
  "reqwest",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2 0.10.9",

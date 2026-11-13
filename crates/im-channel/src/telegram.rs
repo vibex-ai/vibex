@@ -10,8 +10,11 @@ use vibex_core::{
     unix_timestamp_ms,
 };
 
+use crate::adapter::ImAdapter;
 use crate::error::{ImError, ImResult};
-use crate::types::{ImButton, ImCallback, ImChatType, ImInboundEvent, ImSentMessage, ImTarget};
+use crate::types::{
+    ImButton, ImCallback, ImChatType, ImInboundEvent, ImSentMessage, ImTarget, ImThreadTarget,
+};
 
 const TELEGRAM_API_BASE: &str = "https://api.telegram.org";
 
@@ -359,6 +362,36 @@ impl TelegramAdapter {
         Ok(())
     }
 
+    pub async fn create_forum_topic(&self, title: &str) -> ImResult<String> {
+        let value = self
+            .call(
+                "createForumTopic",
+                json!({ "chat_id": self.chat_id, "name": truncate_title(title) }),
+            )
+            .await?;
+        value
+            .get("message_thread_id")
+            .and_then(Value::as_i64)
+            .map(|id| id.to_string())
+            .ok_or(ImError::ProviderRejected {
+                code: "telegram_missing_thread_id".to_string(),
+                message: "Telegram did not return a forum topic id".to_string(),
+            })
+    }
+
+    pub async fn edit_forum_topic(&self, thread_id: &str, title: &str) -> ImResult<()> {
+        self.call(
+            "editForumTopic",
+            json!({
+                "chat_id": self.chat_id,
+                "message_thread_id": thread_id,
+                "name": truncate_title(title),
+            }),
+        )
+        .await?;
+        Ok(())
+    }
+
     pub async fn probe(&self) -> ImResult<ImChannelTestReport> {
         let me = self.call("getMe", json!({})).await?;
         let chat = self
@@ -456,6 +489,67 @@ fn provider_error(value: &Value) -> ImError {
         .unwrap_or("Telegram rejected the request")
         .to_string();
     ImError::ProviderRejected { code, message }
+}
+
+#[async_trait::async_trait]
+impl ImAdapter for TelegramAdapter {
+    fn kind(&self) -> vibex_core::ImChannelKind {
+        vibex_core::ImChannelKind::Telegram
+    }
+
+    async fn send_text(
+        &self,
+        target: &ImTarget,
+        text: &str,
+        buttons: &[ImButton],
+    ) -> ImResult<ImSentMessage> {
+        TelegramAdapter::send_text(self, target, text, buttons).await
+    }
+
+    async fn edit_text(
+        &self,
+        target: &ImTarget,
+        message_id: &str,
+        text: &str,
+        buttons: &[ImButton],
+    ) -> ImResult<()> {
+        TelegramAdapter::edit_text(self, target, message_id, text, buttons).await
+    }
+
+    async fn answer_callback(&self, callback_query_id: &str, text: Option<&str>) -> ImResult<()> {
+        TelegramAdapter::answer_callback(self, callback_query_id, text).await
+    }
+
+    async fn probe(&self) -> ImResult<ImChannelTestReport> {
+        TelegramAdapter::probe(self).await
+    }
+
+    async fn is_group_trigger(&self, text: &str) -> bool {
+        TelegramAdapter::is_group_trigger(self, text).await
+    }
+
+    fn mark_inbound(&self) {
+        TelegramAdapter::mark_inbound(self);
+    }
+
+    fn requires_group_mention(&self) -> bool {
+        TelegramAdapter::requires_group_mention(self)
+    }
+
+    async fn create_thread(&self, title: &str) -> ImResult<ImThreadTarget> {
+        Ok(ImThreadTarget {
+            thread_key: self.create_forum_topic(title).await?,
+            thread_kind: "telegram_forum_topic".to_string(),
+        })
+    }
+
+    async fn edit_thread_title(&self, thread_key: &str, title: &str) -> ImResult<()> {
+        self.edit_forum_topic(thread_key, title).await
+    }
+}
+
+fn truncate_title(title: &str) -> String {
+    title.chars().take(128).collect()
 }
 
 #[cfg(test)]

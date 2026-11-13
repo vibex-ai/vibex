@@ -19,9 +19,9 @@ use gpui_component::{
 };
 use vibex_backend::BackendError;
 use vibex_core::{
-    ImBindingSummary, ImChannelConfig, ImChannelDraft, ImChannelId, ImChannelSummary,
+    AgentSession, ImBindingSummary, ImChannelConfig, ImChannelDraft, ImChannelId, ImChannelSummary,
     ImPairingCodeInfo, ImPairingRequest, ImPrincipalId, ImPrincipalRole, ImPrincipalSummary,
-    ImTelegramConfig,
+    ImSessionDefaults, ImTelegramConfig,
 };
 
 use crate::app::VibexWorkbench;
@@ -35,6 +35,7 @@ pub struct ImChannelsView {
     selected: Option<ImChannelId>,
     principals: Vec<ImPrincipalSummary>,
     bindings: Vec<ImBindingSummary>,
+    default_sessions: Vec<AgentSession>,
     pairing: Option<ImPairingCodeInfo>,
     notice: Option<String>,
     error: Option<String>,
@@ -63,6 +64,7 @@ impl ImChannelsView {
             selected: None,
             principals: Vec::new(),
             bindings: Vec::new(),
+            default_sessions: Vec::new(),
             pairing: None,
             notice: None,
             error: None,
@@ -164,10 +166,21 @@ impl ImChannelsView {
                     .map_err(backend_error)
             }
         });
+        let sessions = gpui_tokio::Tokio::spawn(cx, {
+            let backend = backend.clone();
+            async move {
+                backend
+                    .agent()
+                    .list_sessions(false)
+                    .await
+                    .map_err(backend_error)
+            }
+        });
         self.task = Some(cx.spawn(
             async move |weak: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
                 let principals = principals.await;
                 let bindings = bindings.await;
+                let sessions = sessions.await;
                 let _ = weak.update(cx, |this, cx| {
                     match principals {
                         Ok(Ok(principals)) => this.principals = principals,
@@ -176,6 +189,11 @@ impl ImChannelsView {
                     }
                     match bindings {
                         Ok(Ok(bindings)) => this.bindings = bindings,
+                        Ok(Err(error)) => this.error = Some(error),
+                        Err(error) => this.error = Some(error.to_string()),
+                    }
+                    match sessions {
+                        Ok(Ok(sessions)) => this.default_sessions = sessions,
                         Ok(Err(error)) => this.error = Some(error),
                         Err(error) => this.error = Some(error.to_string()),
                     }
@@ -357,6 +375,100 @@ impl ImChannelsView {
                                     .unwrap_or_default()
                             ));
                             this.error = None;
+                        }
+                        Err(error) => this.error = Some(error),
+                    }
+                    cx.notify();
+                });
+            },
+        ));
+    }
+
+    fn set_default_session(
+        &mut self,
+        channel_id: ImChannelId,
+        session: AgentSession,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(backend) = self.backend(cx) else {
+            return;
+        };
+        self.busy = true;
+        self.task = Some(cx.spawn(
+            async move |weak: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let result = async {
+                    let selection = backend
+                        .agent()
+                        .runtime_selection(session.id.clone())
+                        .await
+                        .map_err(backend_error)?;
+                    let defaults = ImSessionDefaults {
+                        workspace_root: session.workspace_root.clone(),
+                        workspace_mode: session.workspace_mode,
+                        agent_id: selection.desired.agent_id.clone(),
+                        auth_source: selection.desired.auth_source.clone(),
+                        model: selection.desired.model.clone(),
+                        reasoning_effort: selection.desired.reasoning_effort.clone(),
+                        mode_id: selection.desired.mode_id.clone(),
+                        config_values: selection.desired.config_values.clone(),
+                    };
+                    backend
+                        .management()
+                        .set_im_channel_default_session(vibex_backend::MutationRequest::new(
+                            vibex_backend::ImChannelDefaultSessionUpdate {
+                                channel_id,
+                                default_session: Some(defaults),
+                            },
+                        ))
+                        .await
+                        .map(|_| ())
+                        .map_err(backend_error)
+                }
+                .await;
+                let _ = weak.update(cx, |this, cx| {
+                    this.busy = false;
+                    match result {
+                        Ok(()) => {
+                            this.notice = Some(format!(
+                                "Default session set from “{}” for /new.",
+                                session.title
+                            ));
+                            this.loaded = false;
+                            this.loading = false;
+                            this.reload(cx);
+                        }
+                        Err(error) => this.error = Some(error),
+                    }
+                    cx.notify();
+                });
+            },
+        ));
+    }
+
+    fn clear_default_session(&mut self, channel_id: ImChannelId, cx: &mut Context<Self>) {
+        let Some(backend) = self.backend(cx) else {
+            return;
+        };
+        self.task = Some(cx.spawn(
+            async move |weak: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let result = backend
+                    .management()
+                    .set_im_channel_default_session(vibex_backend::MutationRequest::new(
+                        vibex_backend::ImChannelDefaultSessionUpdate {
+                            channel_id,
+                            default_session: None,
+                        },
+                    ))
+                    .await
+                    .map(|_| ())
+                    .map_err(backend_error);
+                let _ = weak.update(cx, |this, cx| {
+                    match result {
+                        Ok(()) => {
+                            this.notice = Some("Default session cleared.".to_string());
+                            this.loaded = false;
+                            this.loading = false;
+                            this.reload(cx);
                         }
                         Err(error) => this.error = Some(error),
                     }
@@ -715,6 +827,82 @@ impl Render for ImChannelsView {
                         .text_color(muted)
                         .child(format!("Session bindings: {}", self.bindings.len())),
                 );
+                panel = panel.child(
+                    h_flex()
+                        .justify_between()
+                        .items_center()
+                        .child(
+                            v_flex()
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(foreground)
+                                        .child("Default session for /new"),
+                                )
+                                .child(div().text_xs().text_color(muted).child(
+                                    if channel.default_session.is_some() {
+                                        "Configured. /new can start without a bound session."
+                                    } else {
+                                        "Pick a recent session to reuse its workspace and Agent."
+                                    },
+                                )),
+                        )
+                        .when(channel.default_session.is_some(), |this| {
+                            this.child(
+                                Button::new("im-default-clear")
+                                    .small()
+                                    .ghost()
+                                    .label("Clear")
+                                    .on_click(cx.listener({
+                                        let channel_id = channel_id.clone();
+                                        move |this, _, _, cx| {
+                                            this.clear_default_session(channel_id.clone(), cx)
+                                        }
+                                    })),
+                            )
+                        }),
+                );
+                for session in self.default_sessions.iter().take(5) {
+                    let session = session.clone();
+                    let short = session
+                        .id
+                        .as_str()
+                        .rsplit('_')
+                        .next()
+                        .unwrap_or_default()
+                        .chars()
+                        .take(8)
+                        .collect::<String>();
+                    panel = panel.child(
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .text_xs()
+                                    .text_color(muted)
+                                    .child(format!("#{short} · {}", session.title)),
+                            )
+                            .child(
+                                Button::new(format!("im-default-use-{}", session.id.as_str()))
+                                    .small()
+                                    .outline()
+                                    .label("Use as default")
+                                    .disabled(self.busy)
+                                    .on_click(cx.listener({
+                                        let channel_id = channel_id.clone();
+                                        move |this, _, _, cx| {
+                                            this.set_default_session(
+                                                channel_id.clone(),
+                                                session.clone(),
+                                                cx,
+                                            )
+                                        }
+                                    })),
+                            ),
+                    );
+                }
             }
             panel.into_any_element()
         } else {

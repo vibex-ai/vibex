@@ -98,10 +98,11 @@ use crate::{
     BackendOperation, BackendProjection, BackendRefetch, BackendResult, BrowserBackend,
     BrowserDialogResolution, BrowserFrameBatch, BrowserFrameSubscription, BrowserInputRequest,
     BrowserSessionOpenRequest, BrowserTabOpenRequest, BrowserTabSelection, BrowserViewportRequest,
-    DeviceBackend, FileBackend, GitBackend, ImChannelEnabledRequest, ImChannelSecretUpdateRequest,
-    ManagementBackend, ManagementProfileSelectionRequest, MutationRequest, RelayConnectionState,
-    RelayStatusSummary, SidebarBackend, TerminalBackend, TerminalFrame, TerminalFrameBatch,
-    TerminalFrameSubscription, WorkspaceBackend, WorkspaceSummary,
+    DeviceBackend, FileBackend, GitBackend, ImChannelDefaultSessionUpdate, ImChannelEnabledRequest,
+    ImChannelSecretUpdateRequest, ManagementBackend, ManagementProfileSelectionRequest,
+    MutationRequest, RelayConnectionState, RelayStatusSummary, SidebarBackend, TerminalBackend,
+    TerminalFrame, TerminalFrameBatch, TerminalFrameSubscription, WorkspaceBackend,
+    WorkspaceSummary,
 };
 use vibex_desktop_model::{SidebarMutationOutcome, SidebarOrganizationView, UiStateStore};
 
@@ -5309,6 +5310,23 @@ impl ManagementBackend for NativeBackend {
                 .management()
                 .im_channels()
                 .delete_channel(&request.payload)
+                .await
+                .map_err(Into::into)
+        })
+    }
+
+    fn set_im_channel_default_session(
+        &self,
+        request: MutationRequest<ImChannelDefaultSessionUpdate>,
+    ) -> BackendFuture<'_, ImChannelSummary> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .im_channels()
+                .set_default_session(&request.payload.channel_id, request.payload.default_session)
                 .await
                 .map_err(Into::into)
         })

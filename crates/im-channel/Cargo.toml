@@ -21,4 +21,6 @@ vibex-core = { path = "../core" }
 vibex-db = { path = "../db" }
 
 [dev-dependencies]
+axum.workspace = true
+rusqlite = { version = "0.37", features = ["bundled"] }
 tempfile = "3"

@@ -392,6 +392,8 @@ pub struct ImChannelSummary {
     pub enabled: bool,
     /// Whether every required secret is present.
     pub configured: bool,
+    #[serde(default)]
+    pub default_session: Option<ImSessionDefaults>,
     pub event_filter: Vec<String>,
     pub locale: Option<String>,
     pub status: ImChannelStatus,
