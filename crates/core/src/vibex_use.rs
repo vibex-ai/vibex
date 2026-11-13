@@ -356,6 +356,34 @@ pub struct VibexUseMention {
     /// The name the user saw, kept for the route note only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    /// How the named option runs, when the reader tuned it.
+    ///
+    /// A reference is a fingerprint of a complete selection, so a tuned chip
+    /// names a configuration the catalogue never publishes as its own entry.
+    /// Keeping the tuning beside the reference is what lets a surface show the
+    /// controls exactly as the reader left them, instead of falling back to the
+    /// Agent's first entry and silently misreporting the choice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tuning: Option<MentionTuning>,
+}
+
+/// The depth, mode and feature values a mention carries on top of its option.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MentionTuning {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode_id: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub config_values: BTreeMap<String, String>,
+}
+
+impl MentionTuning {
+    /// Whether this tuning says anything at all.
+    pub fn is_empty(&self) -> bool {
+        self.reasoning_effort.is_none() && self.mode_id.is_none() && self.config_values.is_empty()
+    }
 }
 
 impl VibexUseMention {
@@ -366,6 +394,20 @@ impl VibexUseMention {
             reference: option.clone(),
             agent_id: Some(agent_id.clone()),
             label: label.map(str::to_string),
+            tuning: None,
+        }
+    }
+
+    /// A collaborator mention that also carries how its option was tuned.
+    pub fn tuned_agent(
+        agent_id: &AgentId,
+        option: &VibexUseRef,
+        label: Option<&str>,
+        tuning: MentionTuning,
+    ) -> Self {
+        Self {
+            tuning: (!tuning.is_empty()).then_some(tuning),
+            ..Self::agent(agent_id, option, label)
         }
     }
 
@@ -376,6 +418,7 @@ impl VibexUseMention {
             reference: VibexUseRef::session(id),
             agent_id: None,
             label: label.map(str::to_string),
+            tuning: None,
         }
     }
 
@@ -387,14 +430,23 @@ impl VibexUseMention {
     pub fn encode(&self) -> String {
         let option = self.reference.id.as_str();
         match self.kind {
-            VibexUseMentionKind::Agent => format!(
-                "{VIBEX_USE_MENTION_PREFIX}agent/{}:{}",
-                self.agent_id
-                    .as_ref()
-                    .map(AgentId::as_str)
-                    .unwrap_or_default(),
-                option
-            ),
+            VibexUseMentionKind::Agent => {
+                let base = format!(
+                    "{VIBEX_USE_MENTION_PREFIX}agent/{}:{}",
+                    self.agent_id
+                        .as_ref()
+                        .map(AgentId::as_str)
+                        .unwrap_or_default(),
+                    option
+                );
+                // The tuning is appended only when it says something, so an
+                // untuned chip keeps the exact id it always had and a draft
+                // written by an older build still parses.
+                match self.tuning.as_ref().filter(|tuning| !tuning.is_empty()) {
+                    Some(tuning) => format!("{base}?{}", encode_tuning(tuning)),
+                    None => base,
+                }
+            }
             VibexUseMentionKind::Session => {
                 format!("{VIBEX_USE_MENTION_PREFIX}session/{}", self.reference.id)
             }
@@ -407,7 +459,13 @@ impl VibexUseMention {
         let (kind, body) = rest.split_once('/')?;
         match kind {
             "agent" => {
-                let (agent_id, option_id) = body.split_once(':')?;
+                let (agent_id, rest) = body.split_once(':')?;
+                // `?` separates the option from its tuning; an id without it is
+                // the older shape and carries no tuning.
+                let (option_id, tuning) = match rest.split_once('?') {
+                    Some((option_id, encoded)) => (option_id, decode_tuning(encoded)),
+                    None => (rest, None),
+                };
                 if option_id.is_empty() {
                     return None;
                 }
@@ -417,6 +475,7 @@ impl VibexUseMention {
                     reference: VibexUseRef::runtime_option(option_id),
                     agent_id: Some(agent_id),
                     label: None,
+                    tuning,
                 })
             }
             "session" => {
@@ -426,11 +485,90 @@ impl VibexUseMention {
                     reference: VibexUseRef::session(&session_id),
                     agent_id: None,
                     label: None,
+                    tuning: None,
                 })
             }
             _ => None,
         }
     }
+}
+
+/// Encodes a tuning into the token id's query part.
+///
+/// The alphabet is deliberately narrow: the id is a token id, so it must not
+/// carry control characters, and it has to survive a JSON round trip through a
+/// draft and a clipboard. Percent-encoding keeps every value legal without
+/// inventing an escaping scheme of its own.
+fn encode_tuning(tuning: &MentionTuning) -> String {
+    let mut parts = Vec::new();
+    if let Some(effort) = tuning.reasoning_effort.as_ref() {
+        parts.push(format!("effort={}", percent_encode(effort)));
+    }
+    if let Some(mode) = tuning.mode_id.as_ref() {
+        parts.push(format!("mode={}", percent_encode(mode)));
+    }
+    // Sorted, so the same tuning always encodes to the same id and two chips
+    // that differ only in map order stay identical.
+    for (key, value) in &tuning.config_values {
+        parts.push(format!(
+            "config.{}={}",
+            percent_encode(key),
+            percent_encode(value)
+        ));
+    }
+    parts.join("&")
+}
+
+/// Reads a tuning back out of the token id's query part.
+///
+/// An unreadable part yields `None` rather than a partial tuning: a chip that
+/// half-decoded would show a configuration the reader never chose, and the
+/// reference already carries the authoritative selection.
+fn decode_tuning(encoded: &str) -> Option<MentionTuning> {
+    let mut tuning = MentionTuning::default();
+    for part in encoded.split('&').filter(|part| !part.is_empty()) {
+        let (key, value) = part.split_once('=')?;
+        let value = percent_decode(value)?;
+        match key {
+            "effort" => tuning.reasoning_effort = Some(value),
+            "mode" => tuning.mode_id = Some(value),
+            _ => {
+                let name = percent_decode(key.strip_prefix("config.")?)?;
+                tuning.config_values.insert(name, value);
+            }
+        }
+    }
+    (!tuning.is_empty()).then_some(tuning)
+}
+
+fn percent_encode(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    for byte in value.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                output.push(*byte as char)
+            }
+            _ => output.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    output
+}
+
+fn percent_decode(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    let mut output = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let hex = value.get(index + 1..index + 3)?;
+            output.push(u8::from_str_radix(hex, 16).ok()?);
+            index += 3;
+        } else {
+            output.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(output).ok()
 }
 
 /// Builds the provider-only route note for the mentions of one prompt.
@@ -2719,6 +2857,64 @@ mod tests {
         assert!(VibexUseMention::parse("reference:file:src/main.rs").is_none());
         assert!(VibexUseMention::parse("vibex-use:agent/").is_none());
         assert!(VibexUseMention::parse("vibex-use:unknown/thing").is_none());
+    }
+
+    /// A tuned chip carries its tuning through the token id.
+    ///
+    /// The reference fingerprints a complete selection, so a tuned chip names a
+    /// configuration the catalogue never publishes as its own entry. If the
+    /// tuning did not survive the id, the controls would fall back to the
+    /// Agent's first entry and report a provider and model the reader never
+    /// picked.
+    #[test]
+    fn a_tuned_mention_carries_its_tuning_through_the_token_id() {
+        let agent_id = AgentId::parse("codex").unwrap();
+        let option = VibexUseRef::runtime_option("option_a");
+        let tuning = MentionTuning {
+            reasoning_effort: Some("high".to_string()),
+            mode_id: Some("build".to_string()),
+            config_values: BTreeMap::from([("auto_approve".to_string(), "true".to_string())]),
+        };
+        let mention =
+            VibexUseMention::tuned_agent(&agent_id, &option, Some("@Codex"), tuning.clone());
+        let parsed = VibexUseMention::parse(&mention.encode()).unwrap();
+        assert_eq!(parsed.reference, option);
+        assert_eq!(parsed.agent_id, Some(agent_id.clone()));
+        assert_eq!(parsed.tuning, Some(tuning));
+
+        // An untuned chip keeps the older id shape exactly, so a draft written
+        // by an earlier build still parses and nothing changes for it.
+        let bare = VibexUseMention::agent(&agent_id, &option, None);
+        assert_eq!(bare.encode(), "vibex-use:agent/codex:option_a");
+        assert_eq!(VibexUseMention::parse(&bare.encode()).unwrap().tuning, None);
+
+        // An empty tuning is not encoded: it would add a `?` that says nothing.
+        let empty =
+            VibexUseMention::tuned_agent(&agent_id, &option, None, MentionTuning::default());
+        assert_eq!(empty.encode(), bare.encode());
+    }
+
+    /// A value that needs escaping survives the trip.
+    #[test]
+    fn a_tuning_value_with_reserved_characters_round_trips() {
+        let agent_id = AgentId::parse("codex").unwrap();
+        let mention = VibexUseMention::tuned_agent(
+            &agent_id,
+            &VibexUseRef::runtime_option("option_a"),
+            None,
+            MentionTuning {
+                reasoning_effort: None,
+                mode_id: Some("a&b=c?d".to_string()),
+                config_values: BTreeMap::from([("k.e y".to_string(), "1 2".to_string())]),
+            },
+        );
+        let parsed = VibexUseMention::parse(&mention.encode()).unwrap();
+        let tuning = parsed.tuning.unwrap();
+        assert_eq!(tuning.mode_id.as_deref(), Some("a&b=c?d"));
+        assert_eq!(
+            tuning.config_values.get("k.e y").map(String::as_str),
+            Some("1 2")
+        );
     }
 
     #[test]

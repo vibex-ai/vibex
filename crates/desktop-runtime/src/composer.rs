@@ -359,17 +359,6 @@ fn preferred_delegation_option<'a>(
     if available.is_empty() {
         return None;
     }
-    // An explicit edit is the reader's answer, so it outranks every rule below
-    // even when the Agent has a default source.
-    if let Some(preferred) = preferences.delegation_by_agent.get(agent_id)
-        && let Some(option) = available
-            .iter()
-            .copied()
-            .find(|option| delegation_selection_matches(&option.selection, preferred))
-    {
-        return Some(option);
-    }
-
     if let Some(source) = selection.default_sources.get(agent_id) {
         let scoped = available
             .iter()
@@ -988,29 +977,6 @@ mod tests {
         assert_eq!(
             commands[0].description.as_deref(),
             Some("provider_b · model-b")
-        );
-    }
-
-    #[test]
-    fn an_explicit_delegation_choice_outranks_the_default_source() {
-        let agent_id = AgentId::parse("codex").unwrap();
-        let default = option("provider_main", "model-default");
-        let chosen = option("provider_other", "model-chosen");
-        let mut selection = DelegationSelection::default();
-        selection.default_sources.insert(
-            agent_id.clone(),
-            AgentModelSourceRef::provider(ProviderProfileId::parse("provider_main").unwrap()),
-        );
-        selection
-            .preferences
-            .delegation_by_agent
-            .insert(agent_id, chosen.selection.clone());
-
-        let commands = runtime_reference_commands(&[default, chosen], &request("", 50), &selection);
-        assert_eq!(commands.len(), 1);
-        assert_eq!(
-            commands[0].description.as_deref(),
-            Some("provider_other · model-chosen")
         );
     }
 

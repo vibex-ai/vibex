@@ -58,8 +58,6 @@ pub struct RuntimeComposerPreferences {
     /// Most recently chosen last.
     pub by_model: Vec<SessionRuntimeSelection>,
     pub usage: BTreeMap<String, u64>,
-    /// What the reader picked with the delegation row's edit button.
-    pub delegation_by_agent: BTreeMap<AgentId, SessionRuntimeSelection>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -165,7 +163,6 @@ impl RuntimeOptionCatalogService {
             by_agent: composer.runtime_selections_by_agent,
             by_model: composer.runtime_selections_by_model,
             usage: composer.runtime_selection_usage,
-            delegation_by_agent: composer.delegation_runtime_selections_by_agent,
         }
     }
 

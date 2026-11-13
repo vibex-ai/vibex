@@ -28757,7 +28757,7 @@ impl VibexWorkbench {
             return self.view_runtime_selection();
         };
         let catalog = self.runtime_catalog.as_deref()?;
-        delegation_chip_option(catalog, &mention).map(|option| option.selection.clone())
+        delegation_chip_selection(catalog, &mention)
     }
 
     /// The runtime selection a session renders, selected or not.
@@ -34516,20 +34516,15 @@ impl VibexWorkbench {
         // reference and its overrides from disagreeing; a side table keyed by
         // Agent could only hold one configuration no matter how many times the
         // draft named that Agent.
-        let chip_selection = self
-            .runtime_catalog
-            .as_deref()
-            .and_then(|catalog| {
-                composer_mentions(composer_input.read(cx).tokens())
-                    .into_iter()
-                    .find(|mention| {
-                        mention.kind == vibex_core::VibexUseMentionKind::Agent
-                            && mention.agent_id.as_ref().map(AgentId::as_str)
-                                == Some(agent_id.as_str())
-                    })
-                    .and_then(|mention| delegation_chip_option(catalog, &mention))
-            })
-            .map(|option| option.selection.clone());
+        let chip_selection = self.runtime_catalog.as_deref().and_then(|catalog| {
+            composer_mentions(composer_input.read(cx).tokens())
+                .into_iter()
+                .find(|mention| {
+                    mention.kind == vibex_core::VibexUseMentionKind::Agent
+                        && mention.agent_id.as_ref().map(AgentId::as_str) == Some(agent_id.as_str())
+                })
+                .and_then(|mention| delegation_chip_selection(catalog, &mention))
+        });
         if let Some(selection) = chip_selection {
             request.runtime_option_ref = Some(vibex_core::VibexUseRef::runtime_option(
                 &vibex_desktop_runtime::selection_fingerprint(&selection),
@@ -42686,6 +42681,15 @@ impl VibexWorkbench {
         let reference = vibex_core::VibexUseRef::runtime_option(
             &vibex_desktop_runtime::selection_fingerprint(selection),
         );
+        // The tuning rides in the chip so the controls can show it back exactly.
+        // Without it a tuned chip matches no catalogue entry, and the next
+        // frame would report the Agent's first entry as if the reader had
+        // chosen it.
+        let tuning = vibex_core::MentionTuning {
+            reasoning_effort: selection.reasoning_effort.clone(),
+            mode_id: selection.mode_id.clone(),
+            config_values: selection.config_values.clone(),
+        };
         let updates = input
             .read(cx)
             .tokens()
@@ -42697,7 +42701,7 @@ impl VibexWorkbench {
                 {
                     return None;
                 }
-                let next = VibexUseMention::agent(agent_id, &reference, None);
+                let next = VibexUseMention::tuned_agent(agent_id, &reference, None, tuning.clone());
                 Some((
                     span.range(),
                     InlineToken::new(next.encode(), span.token().text().clone())
@@ -83694,18 +83698,49 @@ fn delegation_chip_option<'a>(
     mention: &VibexUseMention,
 ) -> Option<&'a SessionRuntimeOption> {
     let reference = mention.reference.as_uri();
-    let exact = catalog
+    if let Some(exact) = catalog
         .options
         .iter()
-        .find(|option| runtime_option_ref(option) == reference);
-    if exact.is_some() {
-        return exact;
+        .find(|option| runtime_option_ref(option) == reference)
+    {
+        return Some(exact);
     }
-    let agent_id = mention.agent_id.as_ref()?;
-    catalog
-        .options
-        .iter()
-        .find(|option| &option.selection.agent_id == agent_id)
+    // A tuned chip names a selection the catalogue never publishes, so the
+    // entry it came from is found by replaying the tuning: apply it to each
+    // candidate and compare fingerprints. That recovers the exact entry instead
+    // of guessing the Agent's first one.
+    let tuning = mention.tuning.as_ref()?;
+    catalog.options.iter().find(|option| {
+        let mut candidate = option.selection.clone();
+        candidate.reasoning_effort = tuning.reasoning_effort.clone();
+        candidate.mode_id = tuning.mode_id.clone();
+        candidate.config_values = tuning.config_values.clone();
+        vibex_core::VibexUseRef::runtime_option(&vibex_desktop_runtime::selection_fingerprint(
+            &candidate,
+        ))
+        .as_uri()
+            == reference
+    })
+}
+
+/// The exact selection one `@Agent` chip names.
+///
+/// The chip's reference fingerprints a complete selection, so a tuned chip
+/// matches no catalogue entry as-is. Its tuning is carried beside the reference
+/// precisely so the controls can show what the reader chose instead of falling
+/// back to the Agent's first entry — which would silently report a provider and
+/// model they never picked.
+fn delegation_chip_selection(
+    catalog: &SessionRuntimeOptionCatalog,
+    mention: &VibexUseMention,
+) -> Option<SessionRuntimeSelection> {
+    let mut selection = delegation_chip_option(catalog, mention)?.selection.clone();
+    if let Some(tuning) = mention.tuning.as_ref() {
+        selection.reasoning_effort = tuning.reasoning_effort.clone();
+        selection.mode_id = tuning.mode_id.clone();
+        selection.config_values = tuning.config_values.clone();
+    }
+    Some(selection)
 }
 
 /// Rebuilds editing tokens only from references the user already selected.
@@ -102745,14 +102780,14 @@ mod tests {
         );
     }
 
-    /// A tuned chip still resolves to the catalogue entry it came from.
+    /// A tuned chip shows back the exact configuration the reader chose.
     ///
-    /// The chip's reference fingerprints the whole selection, so a chip the
-    /// reader set to `high` names a configuration the catalogue never publishes
-    /// as its own entry. Falling back to the Agent's entry keeps the controls
-    /// usable; the reference itself still carries the tuning to the authority.
+    /// The reference fingerprints a complete selection, so a tuned chip matches
+    /// no catalogue entry. Its tuning rides in the token id for exactly this
+    /// reason: falling back to the Agent's first entry would report a provider
+    /// and model the reader never picked.
     #[test]
-    fn a_tuned_chip_resolves_to_the_entry_it_tunes() {
+    fn a_tuned_chip_shows_back_the_selection_it_names() {
         let agent_id = AgentId::parse("codex").unwrap();
         let option = SessionRuntimeOption {
             selection: SessionRuntimeSelection::provider(
@@ -102763,10 +102798,16 @@ mod tests {
             agent_label: "Codex".to_string(),
             auth_source_label: "Local".to_string(),
             model_label: "gpt-5".to_string(),
-            reasoning_efforts: vec![SessionConfigValue {
-                value: "high".to_string(),
-                label: None,
-            }],
+            reasoning_efforts: vec![
+                SessionConfigValue {
+                    value: "low".to_string(),
+                    label: None,
+                },
+                SessionConfigValue {
+                    value: "high".to_string(),
+                    label: None,
+                },
+            ],
             modes: Vec::new(),
             features: Vec::new(),
             availability: RuntimeOptionAvailability::Available,
@@ -102780,29 +102821,35 @@ mod tests {
             options: vec![option.clone()],
         };
 
-        // The bare reference matches exactly.
+        // The bare chip matches its entry exactly.
         let bare = VibexUseMention::agent(
             &agent_id,
             &vibex_core::VibexUseRef::parse(&runtime_option_ref(&option)).unwrap(),
             None,
         );
-        assert!(delegation_chip_option(&catalog, &bare).is_some());
+        assert_eq!(
+            delegation_chip_selection(&catalog, &bare),
+            Some(option.selection.clone())
+        );
 
-        // A tuned reference falls back to the Agent's entry rather than
-        // disappearing from the controls entirely.
+        // The tuned chip reports `high`, not the entry's own unset depth.
         let mut tuned = option.selection.clone();
         tuned.reasoning_effort = Some("high".to_string());
-        let tuned_mention = VibexUseMention::agent(
+        let tuned_mention = VibexUseMention::tuned_agent(
             &agent_id,
             &vibex_core::VibexUseRef::runtime_option(
                 &vibex_desktop_runtime::selection_fingerprint(&tuned),
             ),
             None,
+            vibex_core::MentionTuning {
+                reasoning_effort: Some("high".to_string()),
+                ..Default::default()
+            },
         );
         assert_eq!(
-            delegation_chip_option(&catalog, &tuned_mention)
-                .map(|entry| entry.selection.model_id().map(str::to_string)),
-            Some(Some("gpt-5".to_string()))
+            delegation_chip_selection(&catalog, &tuned_mention),
+            Some(tuned),
+            "the controls must show the depth the reader picked"
         );
     }
 

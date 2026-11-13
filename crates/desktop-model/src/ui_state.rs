@@ -1582,16 +1582,6 @@ pub struct ComposerUiState {
     pub terminal_ids: Vec<String>,
     #[serde(default)]
     pub runtime_selections_by_agent: BTreeMap<AgentId, SessionRuntimeSelection>,
-    /// The configuration the reader chose for one Agent in the delegation
-    /// panel.
-    ///
-    /// This is not the last session selection: editing a collaborator's route
-    /// is a choice about the next hand-off, not about running a session with
-    /// that Agent. The authority reads this map when it picks the one entry per
-    /// Agent, and it outranks both the default source and the Agent's last used
-    /// pair.
-    #[serde(default)]
-    pub delegation_runtime_selections_by_agent: BTreeMap<AgentId, SessionRuntimeSelection>,
     #[serde(default)]
     pub runtime_selections_by_model: Vec<SessionRuntimeSelection>,
     #[serde(default)]
@@ -2058,19 +2048,6 @@ impl DesktopUiStateV1 {
         self.browser.normalize();
         self.composer.runtime_selections_by_agent =
             std::mem::take(&mut self.composer.runtime_selections_by_agent)
-                .into_iter()
-                .filter_map(|(agent_id, mut selection)| {
-                    if selection.agent_id != agent_id
-                        || !normalize_runtime_selection(&mut selection)
-                    {
-                        return None;
-                    }
-                    Some((agent_id, selection))
-                })
-                .take(64)
-                .collect();
-        self.composer.delegation_runtime_selections_by_agent =
-            std::mem::take(&mut self.composer.delegation_runtime_selections_by_agent)
                 .into_iter()
                 .filter_map(|(agent_id, mut selection)| {
                     if selection.agent_id != agent_id
