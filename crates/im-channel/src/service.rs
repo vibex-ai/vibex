@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, Weak};
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex as AsyncMutex, RwLock, mpsc, watch};
@@ -1609,10 +1611,11 @@ impl ImChannelService {
             .await?;
             return Ok(());
         };
-        if text.trim().is_empty() {
+        if text.trim().is_empty() && event.attachments.is_empty() {
             return Ok(());
         }
-        self.send_prompt(event, &binding.session_id, text).await?;
+        self.send_prompt_with_attachments(event, &binding.session_id, text, &event.attachments)
+            .await?;
         self.reply(event, runtime, "Sent. I will report back here.")
             .await?;
         Ok(())
@@ -1624,11 +1627,41 @@ impl ImChannelService {
         session_id: &VibexSessionId,
         text: &str,
     ) -> VibexResult<()> {
+        self.send_prompt_with_attachments(event, session_id, text, &[])
+            .await
+    }
+
+    /// Sends a user prompt, carrying the files the message brought in.
+    ///
+    /// The bytes travel as a `data:` URI, which is the one attachment form the
+    /// Agent materializes without needing a path this process can read. The
+    /// label is the file name so the transcript names it, and the MIME type is
+    /// the provider's or a guess from the extension.
+    async fn send_prompt_with_attachments(
+        &self,
+        event: &ImInboundEvent,
+        session_id: &VibexSessionId,
+        text: &str,
+        files: &[crate::types::ImAttachment],
+    ) -> VibexResult<()> {
         let runtime = self.inner.agent.runtime_selection(session_id).await?;
         let key = sha256_hex(&format!(
             "{}:{}:{}",
             event.channel_id, event.provider_update_id, session_id
         ));
+        let attachments = files
+            .iter()
+            .map(|file| vibex_core::MessageAttachment {
+                label: file.file_name.clone(),
+                mime_type: Some(file.mime_type.clone()),
+                uri: Some(format!(
+                    "data:{};base64,{}",
+                    file.mime_type,
+                    BASE64.encode(&file.bytes)
+                )),
+                inline_text_offset: None,
+            })
+            .collect();
         self.inner
             .agent
             .send_message(SendAgentMessageRequest {
@@ -1636,7 +1669,7 @@ impl ImChannelService {
                 message_idempotency_key: key,
                 desired_runtime: runtime.desired,
                 text: text.to_string(),
-                attachments: Vec::new(),
+                attachments,
                 mentions: Vec::new(),
                 reasoning_effort: None,
                 correlation_id: Some(CorrelationId::new()),
@@ -1697,6 +1730,27 @@ impl ImChannelService {
     ) -> VibexResult<Option<ImSentMessage>> {
         self.send_to_binding_with(binding, text, OutboundPriority::Normal)
             .await
+    }
+
+    /// Sends one answer, split into as many chat messages as it needs.
+    ///
+    /// The parts go out in order on the same outbox, so a provider rate limit
+    /// delays the tail instead of reordering it. Only the last part's id is
+    /// returned: it is the one a caller could edit later.
+    async fn send_answer_to_binding(
+        &self,
+        binding: &ImBindingRecord,
+        text: &str,
+    ) -> VibexResult<Option<ImSentMessage>> {
+        let locale = self.locale_for_channel(&binding.channel_id);
+        let parts = render::final_answer_parts(text, locale);
+        let mut last = None;
+        for part in parts {
+            last = self
+                .send_to_binding_with(binding, &part, OutboundPriority::Normal)
+                .await?;
+        }
+        Ok(last)
     }
 
     async fn send_to_binding_with(

@@ -194,9 +194,8 @@ impl ImChannelService {
             }
             match &event.item.payload {
                 TimelinePayload::AgentMessage(message) if message.is_final => {
-                    let text = render::final_answer(&message.text);
-                    if !text.trim().is_empty() {
-                        self.send_to_binding(&binding, &text).await?;
+                    if !message.text.trim().is_empty() {
+                        self.send_answer_to_binding(&binding, &message.text).await?;
                     }
                     ImBindingRepository::set_delivered_sequence(
                         &conn,

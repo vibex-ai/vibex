@@ -13,7 +13,8 @@ use async_trait::async_trait;
 use axum::{
     Json, Router,
     extract::{Path, State},
-    routing::post,
+    response::IntoResponse,
+    routing::{get, post},
 };
 use serde_json::{Value, json};
 use tokio::sync::{Notify, broadcast};
@@ -79,6 +80,14 @@ impl FakeTelegram {
     }
 }
 
+/// The bytes `getFile` points at.
+async fn fake_file(
+    Path((_token, _path)): Path<(String, String)>,
+    State(_state): State<Arc<FakeTelegram>>,
+) -> impl IntoResponse {
+    vec![0xff, 0xd8, 0xff, 0xe0, 0x00]
+}
+
 async fn fake_telegram(
     State(state): State<Arc<FakeTelegram>>,
     Path((_token, method)): Path<(String, String)>,
@@ -87,6 +96,7 @@ async fn fake_telegram(
     let result = match method.as_str() {
         "getMe" => json!({ "username": "fake_vibex_bot", "first_name": "Fake" }),
         "getChat" => json!({ "id": 42, "type": "private", "title": "Fake DM" }),
+        "getFile" => json!({ "file_path": "documents/file_1.jpg", "file_size": 5 }),
         "getUpdates" => {
             if state.updates.lock().expect("updates").is_empty() {
                 let _ =
@@ -135,6 +145,7 @@ struct MockAgent {
     selection: SessionRuntimeSelection,
     pending: Mutex<Option<PermissionRequest>>,
     prompts: Mutex<Vec<String>>,
+    attachments: Mutex<Vec<Vec<vibex_core::MessageAttachment>>>,
     resolutions: Mutex<Vec<PermissionResolution>>,
 }
 
@@ -176,6 +187,7 @@ impl MockAgent {
             selection,
             pending: Mutex::new(None),
             prompts: Mutex::new(Vec::new()),
+            attachments: Mutex::new(Vec::new()),
             resolutions: Mutex::new(Vec::new()),
         }
     }
@@ -273,6 +285,10 @@ impl ImAgentPort for MockAgent {
         request: SendAgentMessageRequest,
     ) -> VibexResult<Vec<TimelineItem>> {
         self.prompts.lock().expect("prompts").push(request.text);
+        self.attachments
+            .lock()
+            .expect("attachments")
+            .push(request.attachments);
         Ok(Vec::new())
     }
 
@@ -398,6 +414,7 @@ async fn telegram_pairing_commands_and_approval_round_trip() {
         .expect("bind");
     let address = listener.local_addr().expect("addr");
     let router = Router::new()
+        .route("/file/bot{token}/{*path}", get(fake_file))
         .route("/bot{token}/{method}", post(fake_telegram))
         .with_state(Arc::clone(&fake));
     let server = tokio::spawn(async move {
@@ -496,6 +513,53 @@ async fn telegram_pairing_commands_and_approval_round_trip() {
     )
     .await;
 
+    // A photo with a caption is one prompt carrying one file.
+    fake.push(json!({
+        "update_id": 51,
+        "message": {
+            "message_id": 51,
+            "date": 1,
+            "caption": "look at this",
+            "photo": [
+                { "file_id": "small", "file_size": 1, "width": 90, "height": 90 },
+                { "file_id": "large", "file_size": 5, "width": 1280, "height": 1280 }
+            ],
+            "chat": { "id": 42, "type": "private" },
+            "from": { "id": 42, "is_bot": false, "first_name": "Tester" }
+        }
+    }));
+    wait_for(
+        || async { agent.attachments.lock().expect("attachments").len() >= 2 },
+        "attachment prompt",
+    )
+    .await;
+    let sent = agent
+        .attachments
+        .lock()
+        .expect("attachments")
+        .last()
+        .cloned()
+        .expect("attachment prompt");
+    assert_eq!(sent.len(), 1, "one photo is one attachment");
+    assert_eq!(sent[0].label, "photo-1.jpg");
+    assert_eq!(sent[0].mime_type.as_deref(), Some("image/jpeg"));
+    assert!(
+        sent[0]
+            .uri
+            .as_deref()
+            .is_some_and(|uri| uri.starts_with("data:image/jpeg;base64,")),
+        "attachment bytes travel as a data URL"
+    );
+    assert_eq!(
+        agent
+            .prompts
+            .lock()
+            .expect("prompts")
+            .last()
+            .map(String::as_str),
+        Some("look at this")
+    );
+
     let request = PermissionRequest {
         id: vibex_core::RequestId::new(),
         session_id: agent.session.id.clone(),
@@ -581,7 +645,7 @@ async fn telegram_pairing_commands_and_approval_round_trip() {
         .await
         .expect("bindings");
     assert_eq!(bindings.len(), 1);
-    assert_eq!(agent.prompts.lock().expect("prompts").len(), 1);
+    assert_eq!(agent.prompts.lock().expect("prompts").len(), 2);
     assert_eq!(agent.resolutions.lock().expect("resolutions").len(), 1);
 
     service.stop().await;

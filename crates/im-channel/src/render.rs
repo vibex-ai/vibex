@@ -2,7 +2,14 @@ use vibex_core::{AgentSession, PermissionRequest};
 
 use crate::i18n::ImLocale;
 
+/// The most characters one chat message carries.
+///
+/// Telegram's hard limit is 4096 UTF-16 code units; 3800 leaves room for the
+/// part marker and keeps a multi-byte character from pushing a message over.
 const MAX_MESSAGE_CHARS: usize = 3800;
+
+/// Extra room reserved for the `(3/7)` prefix on a continued answer.
+const PART_MARKER_RESERVE: usize = 24;
 
 pub fn truncate(text: &str, max_chars: usize) -> String {
     let mut chars = text.chars();
@@ -14,8 +21,63 @@ pub fn truncate(text: &str, max_chars: usize) -> String {
     }
 }
 
-pub fn final_answer(text: &str) -> String {
-    truncate(text.trim(), MAX_MESSAGE_CHARS)
+/// Splits one answer into ordered parts a chat can actually deliver.
+///
+/// A long answer used to be cut at the limit with a single ellipsis, so the
+/// reader lost the rest of it. The answer is instead split on paragraph, then
+/// line, then word boundaries, and each part is labelled `(n/total)`. A single
+/// unbroken run — a minified file, a long URL — is cut at the limit because
+/// there is no boundary to prefer.
+pub fn final_answer_parts(text: &str, locale: ImLocale) -> Vec<String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Vec::new();
+    }
+    if text.chars().count() <= MAX_MESSAGE_CHARS {
+        return vec![text.to_string()];
+    }
+    let budget = MAX_MESSAGE_CHARS - PART_MARKER_RESERVE;
+    let chunks = split_message(text, budget);
+    let total = chunks.len();
+    chunks
+        .into_iter()
+        .enumerate()
+        .map(|(index, chunk)| {
+            let marker = match locale {
+                ImLocale::En => format!("({}/{})", index + 1, total),
+                ImLocale::ZhCn => format!("（{}/{})", index + 1, total),
+                ImLocale::ZhTw => format!("（{}/{}）", index + 1, total),
+            };
+            format!(
+                "{marker}
+{chunk}"
+            )
+        })
+        .collect()
+}
+
+/// Splits on the largest boundary that fits: blank line, then newline, then
+/// whitespace, then a hard cut.
+fn split_message(text: &str, budget: usize) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut rest = text;
+    while rest.chars().count() > budget {
+        let window: String = rest.chars().take(budget).collect();
+        let cut = window
+            .rfind("\n\n")
+            .map(|index| index + 2)
+            .or_else(|| window.rfind('\n').map(|index| index + 1))
+            .or_else(|| window.rfind(char::is_whitespace).map(|index| index + 1))
+            .filter(|cut| *cut > budget / 4)
+            .unwrap_or(window.len());
+        let (head, tail) = rest.split_at(cut);
+        parts.push(head.trim_end().to_string());
+        rest = tail.trim_start();
+    }
+    if !rest.trim().is_empty() {
+        parts.push(rest.trim_end().to_string());
+    }
+    parts
 }
 
 pub fn error_message(code: &str, message: &str) -> String {
@@ -236,5 +298,61 @@ fn risk_label(request: &PermissionRequest, locale: ImLocale) -> &'static str {
         (PermissionRiskCategory::CustomTool, ImLocale::ZhCn) => "自定义工具",
         (PermissionRiskCategory::CustomTool, ImLocale::ZhTw) => "自訂工具",
         (PermissionRiskCategory::CustomTool, _) => "custom tool",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_short_answer_stays_one_message() {
+        let parts = final_answer_parts("All done.", ImLocale::En);
+        assert_eq!(parts, vec!["All done.".to_string()]);
+    }
+
+    #[test]
+    fn a_long_answer_is_split_on_a_boundary_and_labelled() {
+        let paragraph = "Sentence that keeps going. ".repeat(60);
+        let text = format!("{paragraph}\n\n{paragraph}\n\n{paragraph}");
+        let parts = final_answer_parts(&text, ImLocale::En);
+        assert!(parts.len() > 1, "expected more than one part");
+        for (index, part) in parts.iter().enumerate() {
+            assert!(part.starts_with(&format!("({}/", index + 1)));
+            assert!(part.chars().count() <= MAX_MESSAGE_CHARS);
+        }
+        // Every word survives: splitting must not drop content.
+        let rejoined: String = parts
+            .iter()
+            .map(|part| part.split_once('\n').map(|(_, body)| body).unwrap_or(part))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(
+            rejoined.split_whitespace().count(),
+            text.split_whitespace().count()
+        );
+    }
+
+    #[test]
+    fn an_unbroken_run_is_cut_at_the_limit() {
+        let text = "x".repeat(MAX_MESSAGE_CHARS * 2 + 10);
+        let parts = final_answer_parts(&text, ImLocale::En);
+        assert!(parts.len() >= 2, "a run longer than one message is split");
+        assert!(
+            parts
+                .iter()
+                .all(|part| part.chars().count() <= MAX_MESSAGE_CHARS)
+        );
+        // Nothing is lost: the parts carry every character of the original.
+        let body: String = parts
+            .iter()
+            .map(|part| part.split_once('\n').map(|(_, body)| body).unwrap_or(part))
+            .collect();
+        assert_eq!(body.chars().count(), text.chars().count());
+    }
+
+    #[test]
+    fn whitespace_only_answers_produce_no_parts() {
+        assert!(final_answer_parts("   \n\n  ", ImLocale::En).is_empty());
     }
 }
