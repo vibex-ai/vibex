@@ -769,7 +769,7 @@ impl Render for ImChannelsView {
                         div()
                             .text_xs()
                             .text_color(muted)
-                            .child("The app secret is stored in the OS keychain (or the runtime's host secret file). Lark approvals use the text fallback for now."),
+                            .child("The app secret is stored in the OS keychain (or the runtime's host secret file). Subscribe the app to card.action.trigger so approval cards can be answered with a button."),
                     )
                     .child(
                         Button::new("im-lark-create")
@@ -1141,7 +1141,7 @@ impl Render for ImChannelsView {
                 div()
                     .text_xs()
                     .text_color(muted)
-                    .child("P0 supports Telegram direct messages, groups, and existing forum topics. No attachments; approvals use the buttons on the card or /approve <code>."),
+                    .child("Telegram and Lark are supported. Approvals use the buttons on the card, or the printed short code. Images and documents up to 10 MB are accepted; long answers are split across messages."),
             )
     }
 }

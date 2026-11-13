@@ -19,7 +19,7 @@ impl ImChannelService {
             responder_device_id: None,
             provider_resolution_id: Some(option.option_id.clone()),
             note: Some(format!(
-                "via telegram ({}, {})",
+                "via IM channel ({}, {})",
                 principal.display_name,
                 principal.principal_id.as_str()
             )),

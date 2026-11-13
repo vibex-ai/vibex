@@ -60,23 +60,61 @@ impl FakeLark {
         self.notify.notify_waiters();
     }
 
+    /// Every outbound body flattened to the text a reader would see.
     fn sent_texts(&self) -> Vec<String> {
         self.sent
             .lock()
             .expect("sent")
             .iter()
             .filter_map(|body| {
-                body.get("content")
-                    .and_then(Value::as_str)
-                    .and_then(|content| serde_json::from_str::<Value>(content).ok())
-                    .and_then(|content| {
-                        content
-                            .get("text")
-                            .and_then(Value::as_str)
-                            .map(str::to_string)
-                    })
+                let content = body.get("content").and_then(Value::as_str)?;
+                let content: Value = serde_json::from_str(content).ok()?;
+                if let Some(text) = content.get("text").and_then(Value::as_str) {
+                    return Some(text.to_string());
+                }
+                // An interactive card carries its prose in a div element.
+                let elements = content.get("elements")?.as_array()?;
+                let mut rendered = String::new();
+                for element in elements {
+                    if let Some(text) = element.pointer("/text/content").and_then(Value::as_str) {
+                        rendered.push_str(text);
+                    }
+                    if let Some(actions) = element.get("actions").and_then(Value::as_array) {
+                        for action in actions {
+                            if let Some(label) =
+                                action.pointer("/text/content").and_then(Value::as_str)
+                            {
+                                rendered.push('[');
+                                rendered.push_str(label);
+                                rendered.push(']');
+                            }
+                        }
+                    }
+                }
+                Some(rendered)
             })
             .collect()
+    }
+
+    /// The value a card button sends back when pressed.
+    fn first_card_action(&self) -> Option<String> {
+        self.sent.lock().expect("sent").iter().find_map(|body| {
+            let content = body.get("content").and_then(Value::as_str)?;
+            let content: Value = serde_json::from_str(content).ok()?;
+            content
+                .get("elements")?
+                .as_array()?
+                .iter()
+                .find_map(|element| {
+                    element
+                        .get("actions")?
+                        .as_array()?
+                        .first()?
+                        .pointer("/value/vibex_action")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+        })
     }
 }
 
@@ -109,6 +147,18 @@ async fn fake_lark(
         }
         other => Json(json!({ "code": 404, "msg": format!("unhandled path {other}") })),
     }
+}
+
+/// Lark serves chat metadata and message resources on GET.
+async fn fake_lark_get(
+    State(_state): State<Arc<FakeLark>>,
+    Path(path): Path<String>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+    if path.contains("/resources/") {
+        return vec![0xff, 0xd8, 0xff, 0xe0, 0x00].into_response();
+    }
+    Json(json!({ "code": 0, "data": { "name": "Fake Lark chat" } })).into_response()
 }
 
 async fn ws_handler(
@@ -174,6 +224,7 @@ struct MockAgent {
     selection: SessionRuntimeSelection,
     pending: Mutex<Option<PermissionRequest>>,
     prompts: Mutex<Vec<String>>,
+    attachments: Mutex<Vec<Vec<vibex_core::MessageAttachment>>>,
     resolutions: Mutex<Vec<PermissionResolution>>,
 }
 
@@ -215,6 +266,7 @@ impl MockAgent {
             selection,
             pending: Mutex::new(None),
             prompts: Mutex::new(Vec::new()),
+            attachments: Mutex::new(Vec::new()),
             resolutions: Mutex::new(Vec::new()),
         }
     }
@@ -309,6 +361,10 @@ impl ImAgentPort for MockAgent {
         request: SendAgentMessageRequest,
     ) -> VibexResult<Vec<TimelineItem>> {
         self.prompts.lock().expect("prompts").push(request.text);
+        self.attachments
+            .lock()
+            .expect("attachments")
+            .push(request.attachments);
         Ok(Vec::new())
     }
 
@@ -470,6 +526,7 @@ async fn lark_long_connection_round_trip() {
     *fake.ws_url.lock().expect("ws url") = format!("ws://{address}/ws");
     let router = Router::new()
         .route("/ws", get(ws_handler))
+        .route("/{*path}", get(fake_lark_get))
         .route("/{*path}", post(fake_lark))
         .route("/{*path}", put(fake_lark))
         .with_state(Arc::clone(&fake));
@@ -548,8 +605,43 @@ async fn lark_long_connection_round_trip() {
         Some("hello vibex")
     );
 
-    // An approval goes out as text with the short codes inline, because this
-    // adapter has no card callbacks yet.
+    // An image message is one prompt carrying one downloaded file.
+    fake.push(json!({
+        "header": { "event_type": "im.message.receive_v1", "event_id": "evt-image" },
+        "event": {
+            "sender": { "sender_type": "user", "sender_id": { "open_id": "ou_user" } },
+            "message": {
+                "message_id": "om_image",
+                "chat_id": "oc_chat",
+                "chat_type": "p2p",
+                "message_type": "image",
+                "content": json!({ "image_key": "img_1", "file_key": "file_1" }).to_string(),
+                "mentions": []
+            }
+        }
+    }));
+    wait_for(
+        || async { agent.attachments.lock().expect("attachments").len() >= 2 },
+        "image prompt",
+    )
+    .await;
+    let sent = agent
+        .attachments
+        .lock()
+        .expect("attachments")
+        .last()
+        .cloned()
+        .expect("image prompt");
+    assert_eq!(sent.len(), 1, "one image is one attachment");
+    assert!(
+        sent[0]
+            .uri
+            .as_deref()
+            .is_some_and(|uri| uri.starts_with("data:") && uri.contains(";base64,")),
+        "image bytes travel as a data URL"
+    );
+
+    // An approval goes out as an interactive card with one button per option.
     let request = PermissionRequest {
         id: vibex_core::RequestId::new(),
         session_id: agent.session.id.clone(),
@@ -595,31 +687,30 @@ async fn lark_long_connection_round_trip() {
         || async {
             fake.sent_texts()
                 .iter()
-                .any(|text| text.contains("Approve:"))
+                .any(|text| text.contains("Run fake command"))
         },
         "approval card",
     )
     .await;
+    let approved_by_button = fake.first_card_action().expect("card action");
+    assert!(
+        fake.sent
+            .lock()
+            .expect("sent")
+            .iter()
+            .any(|body| body.get("msg_type").and_then(Value::as_str) == Some("interactive")),
+        "approval was sent as a card"
+    );
 
-    // The card text ends with `Approve: <code>`; typing that code back is the
-    // documented fallback and must resolve the request.
-    let card = fake
-        .sent_texts()
-        .into_iter()
-        .find(|text| text.contains("Approve:"))
-        .expect("card text");
-    let code = card
-        .split("Approve:")
-        .nth(1)
-        .and_then(|rest| rest.split_whitespace().next())
-        .expect("short code")
-        .to_string();
-    fake.push(message_event(
-        "evt-3",
-        "om_3",
-        "p2p",
-        &format!("/approve {code}"),
-    ));
+    // A card press arrives as its own event carrying the button value.
+    fake.push(json!({
+        "header": { "event_type": "card.action.trigger", "event_id": "evt-3" },
+        "event": {
+            "operator": { "operator_id": { "open_id": "ou_user" } },
+            "action": { "value": { "vibex_action": approved_by_button } },
+            "context": { "open_chat_id": "oc_chat" }
+        }
+    }));
     wait_for(
         || async { !agent.resolutions.lock().expect("resolutions").is_empty() },
         "approval resolution",

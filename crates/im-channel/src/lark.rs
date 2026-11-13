@@ -1,8 +1,10 @@
-//! Lark / Feishu adapter (text-first P1).
+//! Lark / Feishu adapter.
 //!
 //! The adapter uses the long-connection event stream, so a desktop behind NAT
-//! needs no public callback URL. Approval actions use the text command fallback
-//! (`/approve <code>`); interactive card callbacks are a later increment.
+//! needs no public callback URL. Approval prompts go out as interactive cards
+//! whose buttons carry the same one-shot action token the text fallback prints;
+//! a press arrives as a `card.action.trigger` event and resolves through the
+//! shared approval path.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -20,9 +22,14 @@ use vibex_core::{
 
 use crate::adapter::ImAdapter;
 use crate::error::{ImError, ImResult};
-use crate::types::{ImButton, ImChatType, ImInboundEvent, ImSentMessage, ImTarget, ImThreadTarget};
+use crate::types::{
+    ImAttachment, ImButton, ImChatType, ImInboundEvent, ImSentMessage, ImTarget, ImThreadTarget,
+};
 
 const LARK_API_BASE: &str = "https://open.feishu.cn";
+
+/// The largest file a Lark message may bring in.
+const MAX_ATTACHMENT_BYTES: usize = 10 * 1024 * 1024;
 
 pub struct LarkAdapter {
     channel_id: ImChannelId,
@@ -132,7 +139,7 @@ impl LarkAdapter {
                             .then_some(frame.payload)
                             .and_then(|payload| String::from_utf8(payload).ok())
                             .and_then(|text| serde_json::from_str::<Value>(&text).ok())
-                    }) && let Some(inbound) = self.parse_event(&event)
+                    }) && let Some(inbound) = self.parse_event(&event).await
                     {
                         self.mark_inbound();
                         if inbound_tx.send(inbound).await.is_err() {
@@ -142,7 +149,7 @@ impl LarkAdapter {
                 }
                 Message::Text(text) => {
                     if let Ok(event) = serde_json::from_str::<Value>(&text)
-                        && let Some(inbound) = self.parse_event(&event)
+                        && let Some(inbound) = self.parse_event(&event).await
                     {
                         self.mark_inbound();
                         if inbound_tx.send(inbound).await.is_err() {
@@ -221,17 +228,7 @@ impl LarkAdapter {
         buttons: &[ImButton],
     ) -> ImResult<ImSentMessage> {
         let token = self.tenant_token().await?;
-        let mut text = text.to_string();
-        if !buttons.is_empty() {
-            text.push_str("\n\n");
-            text.push_str(
-                &buttons
-                    .iter()
-                    .map(|button| format!("[{}]", button.label))
-                    .collect::<Vec<_>>()
-                    .join("  "),
-            );
-        }
+        let body = message_body(text, buttons);
         let response = self
             .client
             .post(format!(
@@ -241,8 +238,8 @@ impl LarkAdapter {
             .bearer_auth(token)
             .json(&json!({
                 "receive_id": target.chat_id,
-                "msg_type": "text",
-                "content": json!({ "text": text }).to_string(),
+                "msg_type": body.msg_type,
+                "content": body.content,
             }))
             .send()
             .await
@@ -272,17 +269,7 @@ impl LarkAdapter {
             return Ok(());
         }
         let token = self.tenant_token().await?;
-        let mut text = text.to_string();
-        if !buttons.is_empty() {
-            text.push_str("\n\n");
-            text.push_str(
-                &buttons
-                    .iter()
-                    .map(|button| format!("[{}]", button.label))
-                    .collect::<Vec<_>>()
-                    .join("  "),
-            );
-        }
+        let body = message_body(text, buttons);
         let response = self
             .client
             .put(format!(
@@ -291,8 +278,8 @@ impl LarkAdapter {
             ))
             .bearer_auth(token)
             .json(&json!({
-                "msg_type": "text",
-                "content": json!({ "text": text }).to_string(),
+                "msg_type": body.msg_type,
+                "content": body.content,
             }))
             .send()
             .await
@@ -328,11 +315,14 @@ impl LarkAdapter {
             ok: true,
             bot_name: Some(self.app_id.clone()),
             chat_title,
-            warnings: vec!["Lark approvals currently use the text command fallback.".to_string()],
+            warnings: Vec::new(),
         })
     }
 
-    fn parse_event(&self, event: &Value) -> Option<ImInboundEvent> {
+    async fn parse_event(&self, event: &Value) -> Option<ImInboundEvent> {
+        if let Some(action) = self.parse_card_action(event) {
+            return Some(action);
+        }
         let event_type = event.pointer("/header/event_type")?.as_str()?;
         if event_type != "im.message.receive_v1" {
             return None;
@@ -342,18 +332,27 @@ impl LarkAdapter {
             return None;
         }
         let message = event.pointer("/event/message")?;
-        if message.get("message_type").and_then(Value::as_str) != Some("text") {
+        let message_type = message.get("message_type").and_then(Value::as_str)?;
+        if !matches!(message_type, "text" | "image" | "file") {
             return None;
         }
         let content = message.get("content").and_then(Value::as_str)?;
         let content: Value = serde_json::from_str(content).ok()?;
-        let mut text = content.get("text").and_then(Value::as_str)?.to_string();
+        let mut text = content
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
         if let Some(mentions) = message.get("mentions").and_then(Value::as_array) {
             for mention in mentions {
                 if let Some(key) = mention.get("key").and_then(Value::as_str) {
                     text = text.replace(key, "");
                 }
             }
+        }
+        let attachments = self.download_lark_attachments(message).await;
+        if text.trim().is_empty() && attachments.is_empty() {
+            return None;
         }
         let text = text.trim().to_string();
         let chat_id = message.get("chat_id")?.as_str()?.to_string();
@@ -388,9 +387,111 @@ impl LarkAdapter {
                 .and_then(Value::as_str)
                 .map(str::to_string),
             text,
+            attachments,
             callback: None,
             received_at_ms: unix_timestamp_ms(),
         })
+    }
+
+    /// A card button press arrives as its own event with the button's `value`.
+    fn parse_card_action(&self, event: &Value) -> Option<ImInboundEvent> {
+        let event_type = event.pointer("/header/event_type")?.as_str()?;
+        if event_type != "card.action.trigger" {
+            return None;
+        }
+        let action = event.pointer("/event/action")?;
+        let value = action.get("value")?;
+        let action_id = value
+            .get("vibex_action")
+            .and_then(Value::as_str)
+            .and_then(|value| vibex_core::ImActionId::parse(value).ok())?;
+        let operator = event.pointer("/event/operator")?;
+        let chat_id = event
+            .pointer("/event/context/open_chat_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        Some(ImInboundEvent {
+            channel_id: self.channel_id.clone(),
+            provider_update_id: event.pointer("/header/event_id")?.as_str()?.to_string(),
+            external_chat_id: chat_id,
+            chat_type: ImChatType::Direct,
+            thread_key: String::new(),
+            thread_kind: None,
+            external_user_id: operator
+                .pointer("/operator_id/open_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            sender_display_name: operator
+                .pointer("/operator_id/open_id")
+                .and_then(Value::as_str)
+                .unwrap_or("Lark user")
+                .to_string(),
+            external_message_id: None,
+            text: String::new(),
+            attachments: Vec::new(),
+            callback: Some(crate::types::ImCallback {
+                callback_query_id: None,
+                action_id: Some(action_id),
+            }),
+            received_at_ms: unix_timestamp_ms(),
+        })
+    }
+
+    /// Downloads the image or file a Lark message carried.
+    ///
+    /// The resource endpoint needs the message id and the file key, both of
+    /// which the message content names. A failure is reported as no attachment
+    /// rather than dropping the whole message: the text may still be useful.
+    async fn download_lark_attachments(&self, message: &Value) -> Vec<ImAttachment> {
+        let Some(message_id) = message.get("message_id").and_then(Value::as_str) else {
+            return Vec::new();
+        };
+        let Some(content) = message
+            .get("content")
+            .and_then(Value::as_str)
+            .and_then(|content| serde_json::from_str::<Value>(content).ok())
+        else {
+            return Vec::new();
+        };
+        let Some(file_key) = content.get("file_key").and_then(Value::as_str) else {
+            return Vec::new();
+        };
+        let Ok(token) = self.tenant_token().await else {
+            return Vec::new();
+        };
+        let response = self
+            .client
+            .get(format!(
+                "{}/open-apis/im/v1/messages/{message_id}/resources/{file_key}?type=file",
+                self.api_base
+            ))
+            .bearer_auth(token)
+            .send()
+            .await;
+        let Ok(response) = response else {
+            return Vec::new();
+        };
+        let Ok(bytes) = response.bytes().await else {
+            return Vec::new();
+        };
+        if bytes.is_empty() || bytes.len() > MAX_ATTACHMENT_BYTES {
+            return Vec::new();
+        }
+        vec![ImAttachment {
+            file_name: content
+                .get("file_name")
+                .and_then(Value::as_str)
+                .unwrap_or("lark-file")
+                .to_string(),
+            mime_type: content
+                .get("mime_type")
+                .and_then(Value::as_str)
+                .unwrap_or("application/octet-stream")
+                .to_string(),
+            bytes: bytes.to_vec(),
+        }]
     }
 
     fn set_state(&self, state: ImChannelState, error_code: Option<String>, retry_after_ms: u64) {
@@ -468,6 +569,48 @@ impl ImAdapter for LarkAdapter {
 
     async fn edit_thread_title(&self, _thread_key: &str, _title: &str) -> ImResult<()> {
         Err(ImError::Unsupported)
+    }
+}
+
+/// One outbound message body: an interactive card when there are actions to
+/// take, plain text otherwise.
+struct MessageBody {
+    msg_type: &'static str,
+    content: String,
+}
+
+fn message_body(text: &str, buttons: &[ImButton]) -> MessageBody {
+    if buttons.is_empty() {
+        return MessageBody {
+            msg_type: "text",
+            content: json!({ "text": text }).to_string(),
+        };
+    }
+    // The action value is the same one-shot token the text fallback prints, so
+    // a card press and a typed code resolve through one path.
+    let actions: Vec<Value> = buttons
+        .iter()
+        .map(|button| {
+            json!({
+                "tag": "button",
+                "text": { "tag": "plain_text", "content": button.label },
+                "type": "default",
+                "value": {
+                    "vibex_action": button.action_id.as_str(),
+                },
+            })
+        })
+        .collect();
+    let card = json!({
+        "config": { "wide_screen_mode": true },
+        "elements": [
+            { "tag": "div", "text": { "tag": "plain_text", "content": text } },
+            { "tag": "action", "actions": actions },
+        ],
+    });
+    MessageBody {
+        msg_type: "interactive",
+        content: card.to_string(),
     }
 }
 
@@ -591,8 +734,8 @@ mod tests {
         out.extend_from_slice(payload);
     }
 
-    #[test]
-    fn parses_a_text_message_and_strips_mentions() {
+    #[tokio::test]
+    async fn parses_a_text_message_and_strips_mentions() {
         let adapter = LarkAdapter::new(
             ImChannelId::new(),
             "cli_test".to_string(),
@@ -623,7 +766,7 @@ mod tests {
                 }
             }
         });
-        let inbound = adapter.parse_event(&event).expect("event");
+        let inbound = adapter.parse_event(&event).await.expect("event");
         assert_eq!(inbound.text, "/status");
         assert_eq!(inbound.external_chat_id, "oc_chat");
         assert_eq!(inbound.external_user_id, "ou_user");
