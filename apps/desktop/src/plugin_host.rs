@@ -58,6 +58,16 @@ pub enum HostRequest {
         plugin_id: String,
         reply: SyncSender<Result<(), String>>,
     },
+    /// Queues a tool call for a plugin's panel.
+    ///
+    /// The answer is not on `reply`: the script answers when it renders, so
+    /// the caller polls the reply slot instead of blocking the UI thread.
+    QueueToolCall {
+        plugin_id: String,
+        name: String,
+        arguments: String,
+        call_id: SyncSender<String>,
+    },
 }
 
 /// A write a plugin asked the desktop to perform.
@@ -99,6 +109,8 @@ pub(crate) struct PluginChannels {
     tools: Rc<RefCell<BTreeMap<String, Vec<RegisteredTool>>>>,
     /// Tool calls the Agent made, waiting for the plugin to take them.
     tool_calls: Rc<RefCell<BTreeMap<String, Vec<PluginToolCall>>>>,
+    /// Answers a plugin gave, keyed by plugin and call id.
+    tool_replies: Rc<RefCell<BTreeMap<(String, String), PluginToolReply>>>,
 }
 
 /// A tool a plugin contributes to the Agent.
@@ -110,10 +122,23 @@ pub struct RegisteredTool {
 }
 
 /// One invocation of a plugin's tool, waiting to be answered.
+///
+/// The `id` pairs the answer with the call: the script reads the queue, does
+/// its work, and replies with `respond(id, text)`. Without it two calls in
+/// flight could not be told apart, and the Agent would get the wrong answer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PluginToolCall {
+    pub id: String,
     pub name: String,
     pub arguments: String,
+}
+
+/// The answer a plugin gave to one tool call.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PluginToolReply {
+    pub plugin_id: String,
+    pub id: String,
+    pub text: String,
 }
 
 impl PluginChannels {
@@ -123,6 +148,9 @@ impl PluginChannels {
         self.dispatched.borrow_mut().remove(plugin_id);
         self.tools.borrow_mut().remove(plugin_id);
         self.tool_calls.borrow_mut().remove(plugin_id);
+        self.tool_replies
+            .borrow_mut()
+            .retain(|(owner, _), _| owner != plugin_id);
     }
 
     /// Registers a tool; `false` when the name is already taken.
@@ -149,16 +177,41 @@ impl PluginChannels {
             .collect()
     }
 
-    /// Queues one call for the plugin that owns the tool.
-    pub(crate) fn queue_tool_call(&self, plugin_id: &str, name: &str, arguments: &str) {
+    /// Queues one call for the plugin that owns the tool, returning its id.
+    ///
+    /// The id is monotonic per process, so a reply can never be matched to an
+    /// earlier call that happened to use the same tool name.
+    pub(crate) fn queue_tool_call(&self, plugin_id: &str, name: &str, arguments: &str) -> String {
+        let id = next_tool_call_id();
         self.tool_calls
             .borrow_mut()
             .entry(plugin_id.to_string())
             .or_default()
             .push(PluginToolCall {
+                id: id.clone(),
                 name: name.to_string(),
                 arguments: arguments.to_string(),
             });
+        id
+    }
+
+    /// Records a plugin's answer to one call.
+    pub(crate) fn reply_tool_call(&self, plugin_id: &str, id: &str, text: &str) {
+        self.tool_replies.borrow_mut().insert(
+            (plugin_id.to_string(), id.to_string()),
+            PluginToolReply {
+                plugin_id: plugin_id.to_string(),
+                id: id.to_string(),
+                text: text.to_string(),
+            },
+        );
+    }
+
+    /// Takes one reply, if the plugin has given it.
+    pub(crate) fn take_tool_reply(&self, plugin_id: &str, id: &str) -> Option<PluginToolReply> {
+        self.tool_replies
+            .borrow_mut()
+            .remove(&(plugin_id.to_string(), id.to_string()))
     }
 
     /// Takes the tool calls waiting for a plugin, clearing the queue.
@@ -210,6 +263,21 @@ impl PluginChannels {
 struct PluginActions(PluginChannels);
 
 impl Global for PluginActions {}
+
+/// The application-global bridge the MCP endpoint reads through.
+///
+/// It is published once at startup and never replaced, because the endpoint
+/// holds an `Arc` to it and a replacement would leave the endpoint reading a
+/// dead copy.
+struct ToolBridgeState(Arc<SharedToolBridge>);
+
+impl Global for ToolBridgeState {}
+
+/// The bridge the endpoint reads, once the host has published one.
+pub fn tool_bridge(cx: &App) -> Option<Arc<SharedToolBridge>> {
+    cx.try_global::<ToolBridgeState>()
+        .map(|state| Arc::clone(&state.0))
+}
 
 /// The runtime and, once a plugin has been loaded, the manager over it.
 ///
@@ -432,6 +500,53 @@ pub fn set_session(cx: &App, session: Option<PluginSessionSnapshot>) {
 }
 
 /// Takes the writes plugins asked for since the last drain.
+/// Starts the plugin-tool MCP endpoint and publishes it to the runtime.
+///
+/// Called once the runtime is attached: before that there is no Agent manager
+/// to install the server on, and an endpoint nobody can reach is just an open
+/// port. A failure is logged rather than fatal — plugin tools are a capability,
+/// not a reason to refuse to launch.
+pub fn start_tool_endpoint(
+    cx: &mut App,
+    runtime: &Arc<vibex_desktop_runtime::DesktopRuntime>,
+) -> Option<Arc<SharedToolBridge>> {
+    let bridge = Arc::new(SharedToolBridge::default());
+    cx.set_global(ToolBridgeState(Arc::clone(&bridge)));
+
+    let host = Arc::new(DesktopPluginToolHost::new(
+        Arc::clone(&bridge) as Arc<dyn PluginToolBridge>
+    ));
+    let handle = gpui_tokio::Tokio::handle(cx);
+    let endpoint =
+        handle.block_on(async move { vibex_plugin::tools::PluginToolEndpoint::start(host).await });
+    let endpoint = match endpoint {
+        Ok(endpoint) => endpoint,
+        Err(error) => {
+            eprintln!("vibex-plugin-host: the plugin tool endpoint could not start: {error}");
+            return None;
+        }
+    };
+    let installed = vibex_desktop_runtime::InstalledPluginToolEndpoint {
+        url: endpoint.url(),
+        capability_token: endpoint.capability_token().to_string(),
+    };
+    if let Err(error) = runtime.plugin_tools().install(installed, &runtime.agent()) {
+        eprintln!("vibex-plugin-host: the plugin tool server could not be installed: {error}");
+        return None;
+    }
+    // The endpoint serves for the life of the process; leaking it here is the
+    // point, because a dropped handle stops the listener and the Agent's MCP
+    // configuration would then point at a closed socket.
+    std::mem::forget(endpoint);
+    // The bridge hands a call to the UI thread through the same inbox `post`
+    // uses; installing it here means the endpoint works as soon as a window
+    // starts pumping.
+    bridge.install_queue(PluginToolQueue {
+        send: Box::new(|request| post(request).is_ok()),
+    });
+    Some(bridge)
+}
+
 pub fn take_pending_actions(cx: &App) -> Vec<PluginAction> {
     let Some(state) = cx.try_global::<PluginActions>() else {
         return Vec::new();
@@ -490,15 +605,178 @@ pub fn runtime_tools(cx: &App) -> Vec<RegisteredTool> {
     state.0.tools()
 }
 
-/// Queues one tool call for the plugin that owns it.
+/// Queues one tool call for the plugin that owns it, returning the call id.
 ///
-/// The script answers with `vibex.agent.tools.take()`, the same queue shape
-/// `vibex.commands` uses, because the host cannot call into the script.
-pub fn dispatch_tool_call(cx: &App, plugin_id: &str, name: &str, arguments: &str) {
-    let Some(state) = cx.try_global::<PluginActions>() else {
-        return;
-    };
-    state.0.queue_tool_call(plugin_id, name, arguments);
+/// The script answers with `vibex.agent.tools.respond(id, text)`, the same
+/// queue shape `vibex.commands` uses, because the host cannot call into the
+/// script.
+pub fn dispatch_tool_call(
+    cx: &App,
+    plugin_id: &str,
+    name: &str,
+    arguments: &str,
+) -> Option<String> {
+    let state = cx.try_global::<PluginActions>()?;
+    Some(state.0.queue_tool_call(plugin_id, name, arguments))
+}
+
+/// Takes the reply a plugin gave to one call.
+pub fn take_tool_reply(cx: &App, plugin_id: &str, id: &str) -> Option<PluginToolReply> {
+    let state = cx.try_global::<PluginActions>()?;
+    state.0.take_tool_reply(plugin_id, id)
+}
+
+/// The desktop's implementation of the plugin-tool MCP host.
+///
+/// A tool call arrives on a Tokio worker, has to reach the UI thread to be
+/// queued for the script, and then has to wait for the script to answer on its
+/// next render. Both hops go through the same channels the rest of the host
+/// uses; nothing here touches GPUI directly, which is what lets the endpoint
+/// live in the plugin crate.
+pub struct DesktopPluginToolHost {
+    /// Reads the tool list and the reply slot from the UI thread.
+    bridge: Arc<dyn PluginToolBridge>,
+}
+
+impl DesktopPluginToolHost {
+    pub fn new(bridge: Arc<dyn PluginToolBridge>) -> Self {
+        Self { bridge }
+    }
+}
+
+/// What the desktop exposes to the endpoint without handing it an `App`.
+///
+/// The endpoint runs off the UI thread and must not hold one, so the two things
+/// it needs — the tool list and the reply for one call — are behind this trait.
+pub trait PluginToolBridge: Send + Sync + 'static {
+    /// The tools every enabled plugin contributes, as the Agent sees them.
+    fn tools(&self) -> Vec<vibex_plugin::tools::PluginToolDescriptor>;
+    /// Queues a call and returns its id.
+    fn queue(&self, plugin_id: &str, name: &str, arguments: &str) -> Option<String>;
+    /// Takes the reply for one call, if the script has given it.
+    fn take_reply(&self, plugin_id: &str, id: &str) -> Option<String>;
+}
+
+impl vibex_plugin::tools::PluginToolHost for DesktopPluginToolHost {
+    fn tools(&self) -> Vec<vibex_plugin::tools::PluginToolDescriptor> {
+        self.bridge.tools()
+    }
+
+    fn call_tool(
+        &self,
+        plugin_id: &str,
+        name: &str,
+        arguments: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send>> {
+        let plugin_id = plugin_id.to_string();
+        let name = name.to_string();
+        let arguments = arguments.to_string();
+        let bridge = Arc::clone(&self.bridge);
+        Box::pin(async move {
+            let id = bridge
+                .queue(&plugin_id, &name, &arguments)
+                .ok_or_else(|| "the plugin host is not running".to_string())?;
+            // The script answers when it renders, so the wait is a poll rather
+            // than a channel receive: there is no thread to hand a sender to.
+            let deadline = std::time::Instant::now() + vibex_plugin::tools::TOOL_CALL_TIMEOUT;
+            loop {
+                if let Some(text) = bridge.take_reply(&plugin_id, &id) {
+                    return Ok(text);
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err(format!(
+                        "the plugin `{plugin_id}` did not answer `{name}` in time"
+                    ));
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+    }
+}
+
+/// The bridge the endpoint reads through.
+///
+/// It holds a snapshot of the tool list and the replies, both behind mutexes:
+/// the endpoint runs on a Tokio worker and cannot touch the UI thread, so the
+/// host publishes what it knows into here whenever it changes.
+#[derive(Default)]
+pub struct SharedToolBridge {
+    tools: std::sync::Mutex<Vec<vibex_plugin::tools::PluginToolDescriptor>>,
+    replies: std::sync::Mutex<BTreeMap<(String, String), String>>,
+    queue: std::sync::Mutex<Option<PluginToolQueue>>,
+}
+
+/// How the bridge hands a call to the UI thread.
+///
+/// A channel to the window that runs plugins: the same inbox `post` uses. It is
+/// separate from `post` only so the bridge can be built before a window exists.
+pub struct PluginToolQueue {
+    pub send: Box<dyn Fn(HostRequest) -> bool + Send + Sync>,
+}
+
+impl SharedToolBridge {
+    /// Replaces the published tool list.
+    pub fn publish_tools(&self, tools: Vec<vibex_plugin::tools::PluginToolDescriptor>) {
+        if let Ok(mut slot) = self.tools.lock() {
+            *slot = tools;
+        }
+    }
+
+    /// Records a reply the plugin gave.
+    pub fn publish_reply(&self, plugin_id: &str, id: &str, text: &str) {
+        if let Ok(mut replies) = self.replies.lock() {
+            replies.insert((plugin_id.to_string(), id.to_string()), text.to_string());
+        }
+    }
+
+    /// Installs the channel that reaches the UI thread.
+    pub fn install_queue(&self, queue: PluginToolQueue) {
+        if let Ok(mut slot) = self.queue.lock() {
+            *slot = Some(queue);
+        }
+    }
+}
+
+impl PluginToolBridge for SharedToolBridge {
+    fn tools(&self) -> Vec<vibex_plugin::tools::PluginToolDescriptor> {
+        self.tools
+            .lock()
+            .map(|slot| slot.clone())
+            .unwrap_or_default()
+    }
+
+    fn queue(&self, plugin_id: &str, name: &str, arguments: &str) -> Option<String> {
+        let queue = self.queue.lock().ok()?;
+        let queue = queue.as_ref()?;
+        let (reply, answer) = std::sync::mpsc::sync_channel(1);
+        let sent = (queue.send)(HostRequest::QueueToolCall {
+            plugin_id: plugin_id.to_string(),
+            name: name.to_string(),
+            arguments: arguments.to_string(),
+            call_id: reply,
+        });
+        if !sent {
+            return None;
+        }
+        answer.recv_timeout(std::time::Duration::from_secs(5)).ok()
+    }
+
+    fn take_reply(&self, plugin_id: &str, id: &str) -> Option<String> {
+        self.replies
+            .lock()
+            .ok()?
+            .remove(&(plugin_id.to_string(), id.to_string()))
+    }
+}
+
+/// The next tool call id.
+///
+/// Process-wide and monotonic: a reply names the call it answers, so two calls
+/// of the same tool must never share an id.
+fn next_tool_call_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    format!("tool-{}", NEXT.fetch_add(1, Ordering::Relaxed))
 }
 
 /// The UI thread's inbox, set once the first window starts its pump.
@@ -942,6 +1220,16 @@ fn execute(window: &mut Window, cx: &mut App, request: HostRequest) {
         match &request {
             HostRequest::Load { plugin, .. } => load(&mut host, plugin, window, cx),
             HostRequest::Unload { plugin_id, .. } => unload(&mut host, plugin_id),
+            HostRequest::QueueToolCall {
+                plugin_id,
+                name,
+                arguments,
+                call_id,
+            } => {
+                let id = host.channels.queue_tool_call(plugin_id, name, arguments);
+                let _ = call_id.send(id);
+                Ok(())
+            }
         }
     };
     finish(request, outcome);
@@ -956,6 +1244,9 @@ fn finish(request: HostRequest, outcome: Result<(), String>) {
         HostRequest::Load { reply, .. } | HostRequest::Unload { reply, .. } => {
             let _ = reply.send(outcome);
         }
+        // The call id was sent by the handler; a failure to queue is reported
+        // through the empty id rather than a second channel.
+        HostRequest::QueueToolCall { .. } => {}
     }
 }
 

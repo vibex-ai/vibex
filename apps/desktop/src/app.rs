@@ -18642,6 +18642,11 @@ impl VibexWorkbench {
         );
         self.runtime = Some(runtime.clone());
         self.refresh_right_rail_plugins(cx);
+        // The plugin-tool MCP endpoint can only be installed once the runtime
+        // owns an Agent manager, so it starts here rather than with the host.
+        if crate::plugin_host::start_tool_endpoint(cx, &runtime).is_some() {
+            self.publish_plugin_tools(cx);
+        }
         self.sync_timeline_display_settings_to_runtime();
         self.start_sidebar_organization_bridge(&runtime, cx);
         self.start_session_group_presentation_bridge(&runtime, cx);
@@ -48480,6 +48485,30 @@ impl VibexWorkbench {
         order_right_rail_entries(persisted, available)
     }
 
+    /// Publishes the tools plugins registered to the MCP bridge.
+    ///
+    /// The endpoint reads this snapshot rather than the channels directly,
+    /// because it runs off the UI thread. Called whenever a plugin loads,
+    /// unloads or is enabled/disabled, which is when the list can change.
+    fn publish_plugin_tools(&self, cx: &mut Context<Self>) {
+        let Some(bridge) = crate::plugin_host::tool_bridge(cx) else {
+            return;
+        };
+        let tools = crate::plugin_host::runtime_tools(cx)
+            .into_iter()
+            .map(|tool| vibex_plugin::tools::PluginToolDescriptor {
+                qualified_name: vibex_plugin::tools::PluginToolDescriptor::qualified(
+                    &tool.plugin_id,
+                    &tool.name,
+                ),
+                plugin_id: tool.plugin_id,
+                name: tool.name,
+                description: tool.description,
+            })
+            .collect();
+        bridge.publish_tools(tools);
+    }
+
     /// Reads the right rail's contributions from the plugin catalog.
     ///
     /// Called when the runtime becomes authoritative and again whenever the
@@ -48489,6 +48518,11 @@ impl VibexWorkbench {
         let Some(runtime) = self.runtime.clone() else {
             return;
         };
+        // Plugin tools travel with the same read: a plugin that was enabled or
+        // disabled changes both what the rail offers and what the Agent may
+        // call, and doing them apart would leave the two out of step for a
+        // frame.
+        self.publish_plugin_tools(cx);
         match runtime.plugins().contributions() {
             Ok(contributions) => {
                 self.right_rail_activities = Some(contributions);

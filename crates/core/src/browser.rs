@@ -27,6 +27,13 @@ pub const BROWSER_MCP_SERVER_ID: &str = "vibex-browser";
 /// Stable id of the built-in Agent delegation MCP server.
 pub const AGENT_DELEGATION_MCP_SERVER_ID: &str = "vibex-agent-delegation";
 
+/// Stable id of the built-in plugin-tool MCP server.
+///
+/// The tools it offers come from the desktop plugins the reader installed and
+/// enabled; the id is stable so an Agent's tool list names it the same way on
+/// every run.
+pub const PLUGIN_MCP_SERVER_ID: &str = "vibex-plugins";
+
 /// MCP servers the runtime provides itself rather than the user configuring
 /// them.
 ///
@@ -39,6 +46,7 @@ pub const BUILTIN_MCP_SERVER_IDS: &[&str] = &[
     AGENT_DELEGATION_MCP_SERVER_ID,
     BROWSER_MCP_SERVER_ID,
     crate::computer::COMPUTER_MCP_SERVER_ID,
+    PLUGIN_MCP_SERVER_ID,
 ];
 
 /// True when an MCP server id belongs to the runtime itself.

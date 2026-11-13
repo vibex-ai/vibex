@@ -27,6 +27,7 @@ pub mod permission;
 pub mod runtime;
 pub mod service;
 pub mod shell;
+pub mod tools;
 
 pub use error::{ManifestError, PluginError};
 pub use fingerprint::consent_fingerprint;

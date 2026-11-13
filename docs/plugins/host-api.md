@@ -147,21 +147,43 @@ seconds.
 ## `vibex.agent.tools` (requires `agent.tool`)
 
 ```js
-import { register, take } from "vibex.agent.tools";
+import { register, take, respond } from "vibex.agent.tools";
 
 register("search-notes", "Search the notes in this workspace");
 
 // Invocations the Agent made since the last call, cleared as they are returned.
 for (const call of take()) {
-  // call.name, call.arguments (a JSON string)
+  const result = search(call.arguments);   // your own work
+  respond(call.id, result);                // the Agent is waiting on this
 }
 ```
 
 The queue shape is the same one `vibex.commands` uses, and for the same reason:
 `gpui-shell` has no function value, so the host cannot call back into the
-script. The Agent's tool list is assembled from what plugins registered; an
-invocation lands in the owning plugin's queue and the panel answers it on its
-next render.
+script. An invocation lands in the owning plugin's queue, and `respond` is what
+hands the answer back — the Agent's `tools/call` stays open until it arrives.
+
+### How the Agent reaches the tools
+
+The desktop starts a loopback MCP server and installs it on the Agent manager as
+the built-in server `vibex-plugins`, beside `vibex-browser` and the computer
+tool. It is bound to `127.0.0.1` on an ephemeral port, requires a bearer token
+minted at startup, and rejects any request whose `Host` is not loopback.
+
+A tool's name as the Agent sees it is `plugin_<owner>_<name>`, so two plugins
+may both register `search`. The endpoint asks the plugin for the unqualified
+name it actually registered.
+
+### What the Agent sees when a call goes wrong
+
+| Situation | The Agent gets |
+| --- | --- |
+| No plugin offers that tool | `isError` with "not a tool any plugin offers" |
+| The plugin answers | its text, as content |
+| No answer within 30 s | `isError` naming the plugin and tool |
+
+A timeout is reported, never an empty success: an Agent that got a blank result
+would conclude the tool found nothing rather than that it never ran.
 
 ## Panels
 

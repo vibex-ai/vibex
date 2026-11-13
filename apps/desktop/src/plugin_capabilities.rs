@@ -91,6 +91,11 @@ pub const MAX_PLUGIN_FILE_BYTES: u64 = 8 * 1024 * 1024;
 pub const MAX_PLUGIN_RESPONSE_BYTES: u64 = 8 * 1024 * 1024;
 /// The longest a plugin's process may run.
 pub const MAX_PLUGIN_PROCESS_MILLIS: u64 = 30_000;
+/// The largest tool result a plugin may hand back.
+///
+/// A tool result goes into the Agent's context, so an unbounded one would spend
+/// the conversation's budget on a single call.
+pub const MAX_PLUGIN_TOOL_REPLY_BYTES: usize = 256 * 1024;
 
 /// The clipboard, as text.
 ///
@@ -464,6 +469,7 @@ pub(crate) fn agent_tools_module(
                     .into_iter()
                     .map(|call| {
                         HostValue::Object(vec![
+                            ("id".to_string(), HostValue::from(call.id)),
                             ("name".to_string(), HostValue::from(call.name)),
                             ("arguments".to_string(), HostValue::from(call.arguments)),
                         ])
@@ -472,12 +478,42 @@ pub(crate) fn agent_tools_module(
             ))
         }
     };
+    // The answer. Without it a call would sit in the queue for ever and the
+    // Agent would wait on a promise nothing resolves.
+    let respond = {
+        let plugin_id = plugin_id.clone();
+        let grants = grants.clone();
+        let channels = channels.clone();
+        move |arguments: &HostArguments| {
+            require(&grants, "agent.tool", &plugin_id)?;
+            let id = arguments.string(0)?.trim().to_string();
+            let text = arguments.string(1)?.to_string();
+            if id.is_empty() {
+                return Err(HostError::new("a reply needs the call id"));
+            }
+            if text.len() > MAX_PLUGIN_TOOL_REPLY_BYTES {
+                return Err(HostError::new(
+                    "the reply is larger than an Agent tool result may be".to_string(),
+                ));
+            }
+            channels.reply_tool_call(&plugin_id, &id, &text);
+            // The MCP endpoint polls the bridge from a Tokio worker, so the
+            // answer has to be published there as well as recorded here.
+            if let Some(Some(bridge)) =
+                gpui_shell::with_current_app(|cx| crate::plugin_host::tool_bridge(cx))
+            {
+                bridge.publish_reply(&plugin_id, &id, &text);
+            }
+            Ok(HostValue::Bool(true))
+        }
+    };
     HostModule::new("vibex.agent.tools")
         .declarations(
-            "export function register(name: string, description: string): boolean;\nexport function take(): { name: string; arguments: string }[];",
+            "export function register(name: string, description: string): boolean;\nexport function take(): { id: string; name: string; arguments: string }[];\nexport function respond(id: string, text: string): boolean;",
         )
         .function("register", register)
         .function("take", take)
+        .function("respond", respond)
 }
 
 /// Refuses a call the plugin was not granted.

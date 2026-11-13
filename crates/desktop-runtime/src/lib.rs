@@ -2920,6 +2920,12 @@ pub struct DesktopRuntime {
     /// process, the CDP connection and the audit ledger all belong to the
     /// runtime; clients only subscribe.
     browser: Arc<BrowserRuntime>,
+    /// The loopback MCP endpoint that hands plugin tools to Agents.
+    ///
+    /// `None` until the desktop host that answers for the plugins installs
+    /// itself, which is why it is a lock rather than a value: the runtime is
+    /// built before any window exists.
+    plugin_tools: Arc<PluginToolEndpointSlot>,
     /// The local model gateway. It owns one loopback listener and the
     /// request-level routing state Agents never see; the durable Provider
     /// configuration stays in the Provider service.
@@ -2947,6 +2953,59 @@ pub struct DesktopRuntime {
     tasks: Mutex<Vec<JoinHandle<()>>>,
     home_lock: Mutex<Option<DesktopHomeLock>>,
     shutting_down: AtomicBool,
+}
+
+/// The runtime's handle to the plugin-tool MCP endpoint.
+///
+/// The endpoint is started by the desktop host, not by the runtime: the tools
+/// it offers are answered by scripts running in the UI process, so a runtime
+/// without a window has nothing to serve. The slot exists so the runtime can
+/// hand an Agent the endpoint when one is installed and stay silent when none
+/// is.
+#[derive(Debug, Default)]
+pub struct PluginToolEndpointSlot {
+    endpoint: std::sync::Mutex<Option<InstalledPluginToolEndpoint>>,
+}
+
+/// One running endpoint, as the runtime needs it.
+#[derive(Debug, Clone)]
+pub struct InstalledPluginToolEndpoint {
+    pub url: String,
+    pub capability_token: String,
+}
+
+impl PluginToolEndpointSlot {
+    /// Publishes a running endpoint, installing it on the Agent manager.
+    ///
+    /// A second publish replaces the first: the host may rebuild after a
+    /// restart within one process, and an Agent that kept the old address
+    /// would call a socket nobody serves.
+    pub fn install(
+        &self,
+        endpoint: InstalledPluginToolEndpoint,
+        agent: &AgentHandle,
+    ) -> VibexResult<()> {
+        let config = vibex_agent::PluginMcpToolConfig {
+            endpoint: endpoint.url.clone(),
+            capability_token: endpoint.capability_token.clone(),
+        };
+        match agent.manager().install_plugin_mcp_tool(config) {
+            Ok(()) => {}
+            // A rebuild in one process is expected; the manager keeps the
+            // first config, which points at the same endpoint.
+            Err(error) if error.code == "plugin_mcp_tool_already_installed" => {}
+            Err(error) => return Err(error),
+        }
+        if let Ok(mut slot) = self.endpoint.lock() {
+            *slot = Some(endpoint);
+        }
+        Ok(())
+    }
+
+    /// The installed endpoint, if the host has published one.
+    pub fn current(&self) -> Option<InstalledPluginToolEndpoint> {
+        self.endpoint.lock().ok().and_then(|slot| slot.clone())
+    }
 }
 
 /// Where the embedded browser keeps its isolated profile.
@@ -3481,6 +3540,7 @@ impl DesktopRuntime {
             timeline_display_settings,
             polling: DesktopPollingPolicy::default(),
             browser: browser.clone(),
+            plugin_tools: Arc::new(PluginToolEndpointSlot::default()),
             computer: computer.clone(),
             model_gateway: model_gateway.clone(),
             model_catalog: Arc::clone(&model_catalog),
@@ -4734,6 +4794,11 @@ impl DesktopRuntime {
     /// The plugin market and lifecycle handle.
     pub fn plugins(&self) -> PluginHandle {
         PluginHandle::new(self.config.database_path.clone())
+    }
+
+    /// The plugin-tool MCP endpoint the desktop host publishes into.
+    pub fn plugin_tools(&self) -> Arc<PluginToolEndpointSlot> {
+        Arc::clone(&self.plugin_tools)
     }
 
     /// The right rail's pinned web panels.

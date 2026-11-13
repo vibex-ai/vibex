@@ -199,6 +199,7 @@ pub struct AgentManager {
     /// database alive through the Agent manager.
     vibex_use_host: OnceLock<Weak<dyn VibexUseToolHost>>,
     browser_mcp_tool: OnceLock<BrowserMcpToolConfig>,
+    plugin_mcp_tool: OnceLock<PluginMcpToolConfig>,
     /// The installed computer-use MCP launch configuration.
     ///
     /// Replaced rather than set once: the endpoint is bound to a fresh loopback
@@ -339,6 +340,17 @@ pub struct BrowserMcpToolConfig {
 /// configuration. `endpoint` is the runtime's own loopback MCP endpoint and
 /// `command` is the Vibex binary in `--computer-mcp` sidecar mode, used only as
 /// the fallback for Agents that cannot speak HTTP MCP.
+/// Per-desktop-process launch metadata for the plugin-tool MCP server.
+///
+/// Runtime-only, like the browser and computer tools: it is never persisted
+/// with the reader's own MCP configuration, and it exists only while the
+/// desktop host that answers for the plugins is running.
+#[derive(Debug, Clone)]
+pub struct PluginMcpToolConfig {
+    pub endpoint: String,
+    pub capability_token: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct ComputerMcpToolConfig {
     pub command: PathBuf,
@@ -442,6 +454,28 @@ fn browser_mcp_descriptors(
             headers: Vec::new(),
         },
     ]
+}
+
+/// The MCP server descriptor for the plugin-tool endpoint.
+fn plugin_mcp_descriptor(
+    tool: &PluginMcpToolConfig,
+    session_id: &VibexSessionId,
+) -> ProviderRuntimeMcpServer {
+    let session_token =
+        vibex_core::browser_mcp_session_token(&tool.capability_token, session_id.as_str());
+    ProviderRuntimeMcpServer {
+        id: vibex_core::PLUGIN_MCP_SERVER_ID.to_string(),
+        display_name: "Vibex plugins".to_string(),
+        transport: ProviderRuntimeMcpTransport::Http,
+        command: None,
+        args: Vec::new(),
+        env: Vec::new(),
+        url: Some(tool.endpoint.clone()),
+        headers: vec![(
+            "Authorization".to_string(),
+            format!("Bearer {session_token}"),
+        )],
+    }
 }
 
 #[derive(Clone)]
@@ -678,6 +712,7 @@ impl AgentManager {
             delegation_tool: OnceLock::new(),
             vibex_use_host: OnceLock::new(),
             browser_mcp_tool: OnceLock::new(),
+            plugin_mcp_tool: OnceLock::new(),
             computer_mcp_tool: StdMutex::new(None),
             timeline_compaction_sweep: StdMutex::new(TimelineCompactionSweep::default()),
             agent_tool_preferences: StdMutex::new(vibex_core::AgentToolPreferences::default()),
@@ -921,6 +956,33 @@ impl AgentManager {
         self.browser_mcp_tool.get()
     }
 
+    /// Installs the plugin-tool MCP launch configuration.
+    ///
+    /// Validated like the browser tool: a loopback `http://` endpoint and a
+    /// token that cannot be truncated or spoofed on the wire.
+    pub fn install_plugin_mcp_tool(&self, config: PluginMcpToolConfig) -> VibexResult<()> {
+        if !config.endpoint.starts_with("http://")
+            || config.capability_token.len() < 24
+            || config.capability_token.chars().any(char::is_whitespace)
+        {
+            return Err(VibexError::validation(
+                "plugin_mcp_tool_config_invalid",
+                "plugin tool MCP launch configuration is invalid",
+            ));
+        }
+        self.plugin_mcp_tool.set(config).map_err(|_| {
+            VibexError::conflict(
+                "plugin_mcp_tool_already_installed",
+                "the plugin tool MCP server is already installed",
+            )
+        })
+    }
+
+    /// The installed plugin-tool MCP launch configuration, if any.
+    pub fn plugin_mcp_tool(&self) -> Option<&PluginMcpToolConfig> {
+        self.plugin_mcp_tool.get()
+    }
+
     /// Installs the built-in computer-use MCP launch configuration.
     ///
     /// Validated exactly like the browser tool: a loopback `http://` endpoint
@@ -1113,6 +1175,17 @@ impl AgentManager {
             resources
                 .mcp_servers
                 .extend(browser_mcp_descriptors(tool, session_id));
+        }
+        // Plugin tools are a third built-in server. It is offered whenever the
+        // desktop host is running, because which tools exist is the plugins'
+        // answer, not this layer's: an empty list is a valid answer and costs
+        // the Agent nothing.
+        if provider_kind == ProviderKind::Acp
+            && let Some(tool) = self.plugin_mcp_tool.get()
+        {
+            resources
+                .mcp_servers
+                .push(plugin_mcp_descriptor(tool, session_id));
         }
         // Computer use is a second built-in server, not a second copy of the
         // browser one: an Agent that cannot use it simply never lists the

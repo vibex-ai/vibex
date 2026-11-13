@@ -11892,9 +11892,11 @@ name = "vibex-plugin"
 version = "0.1.2"
 dependencies = [
  "async-trait",
+ "axum",
  "base64",
  "ed25519-dalek 2.2.0",
  "futures-util",
+ "getrandom 0.3.4",
  "rand_core 0.6.4",
  "reqwest",
  "rusqlite",
