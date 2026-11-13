@@ -249,12 +249,7 @@ impl AgentManager {
             && let Some(task) = self.get_agent_delegation_by_id(&task_id)?
         {
             let mut conn = self.open_migrated()?;
-            self.append_delegation_timeline(
-                &mut conn,
-                &task,
-                task.status,
-                task.result_summary.as_deref(),
-            )?;
+            self.append_delegation_timeline(&mut conn, &task, task.result_summary.as_deref())?;
         }
         Ok(())
     }

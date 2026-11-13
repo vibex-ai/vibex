@@ -11285,9 +11285,13 @@ pub struct VibexWorkbench {
     composer_queue_ready_after_continuation_session_ids: BTreeSet<String>,
     composer_queue_interrupted_session_ids: BTreeSet<String>,
     composer_queue_steering_session_ids: BTreeSet<String>,
-    /// The queued message whose turn the queue is waiting on before it may hand
-    /// over the next entry. See [`ComposerQueueDispatchFence`].
-    composer_queue_dispatch_fence: Option<ComposerQueueDispatchFence>,
+    /// One fence per session whose handed-over message the queue is still
+    /// waiting on. See [`ComposerQueueDispatchFence`].
+    ///
+    /// One entry per session rather than a single slot: a turn that never
+    /// settles used to freeze every other session's queue with it, so a stuck
+    /// child Agent stopped the reader from sending anything anywhere.
+    composer_queue_dispatch_fences: BTreeMap<String, ComposerQueueDispatchFence>,
     /// Sessions whose live Agent runtime advertised native steering. The queue
     /// exposes the native steer action only for these sessions.
     native_steering_supported_session_ids: BTreeSet<String>,
@@ -12896,7 +12900,7 @@ impl VibexWorkbench {
             composer_queue_ready_after_continuation_session_ids: BTreeSet::new(),
             composer_queue_interrupted_session_ids: BTreeSet::new(),
             composer_queue_steering_session_ids: BTreeSet::new(),
-            composer_queue_dispatch_fence: None,
+            composer_queue_dispatch_fences: BTreeMap::new(),
             native_steering_supported_session_ids: BTreeSet::new(),
             native_steering_probed_generations: BTreeMap::new(),
             optimistic_user_messages: BTreeMap::new(),
@@ -21767,6 +21771,30 @@ impl VibexWorkbench {
         }
     }
 
+    /// Releases the optimistic dispatch flags of sessions whose submission
+    /// never reached the provider.
+    ///
+    /// The flag exists to paint a locally dispatched turn as running before the
+    /// authority admits it, and only an authoritative snapshot can normally
+    /// answer it. A submission that failed or was cancelled before
+    /// `dispatched_at_ms` is that same authority saying the turn never started:
+    /// no snapshot will follow to release the flag, so the queue it holds would
+    /// wait for a turn that does not exist.
+    fn release_unadmitted_turn_flags(&mut self, session_ids: &BTreeSet<String>) {
+        if session_ids.is_empty() {
+            return;
+        }
+        for session_id in session_ids {
+            let Ok(session_id) = VibexSessionId::parse(session_id.clone()) else {
+                continue;
+            };
+            if self.session_turn_pending(&session_id) {
+                self.set_session_turn_pending(&session_id, false);
+            }
+            self.mark_composer_queue_for_recheck(&session_id);
+        }
+    }
+
     fn release_initial_turn_interrupt_lock(&mut self, interrupted: bool) {
         if interrupted {
             self.agent_action_pending = false;
@@ -22016,9 +22044,8 @@ impl VibexWorkbench {
         // turn the queue is waiting on has to wake the same re-evaluation as a
         // session that still holds an entry.
         let holds_the_fence = self
-            .composer_queue_dispatch_fence
-            .as_ref()
-            .is_some_and(|fence| fence.session_id == *session_id);
+            .composer_queue_dispatch_fences
+            .contains_key(session_id.as_str());
         if holds_an_entry || holds_the_fence {
             self.composer_queue_ready_after_continuation_session_ids
                 .insert(session_id.as_str().to_string());
@@ -22040,9 +22067,11 @@ impl VibexWorkbench {
             .iter()
             .map(|message| message.session_id.clone())
             .collect::<BTreeSet<_>>();
-        if let Some(fence) = self.composer_queue_dispatch_fence.as_ref() {
-            referenced.insert(fence.session_id.clone());
-        }
+        referenced.extend(
+            self.composer_queue_dispatch_fences
+                .values()
+                .map(|fence| fence.session_id.clone()),
+        );
         for session_id in referenced {
             let Some((state, revision)) = self
                 .registered_session(session_id.as_str())
@@ -35014,13 +35043,8 @@ impl VibexWorkbench {
                 // A remote submission that never landed cannot produce the
                 // completion the pre-send queue is waiting on, so it releases the
                 // fence instead of stranding every message behind it.
-                if !completed
-                    && this
-                        .composer_queue_dispatch_fence
-                        .as_ref()
-                        .is_some_and(|fence| fence.message_id == message_id)
-                {
-                    this.composer_queue_dispatch_fence = None;
+                if !completed {
+                    this.release_composer_queue_fence(message_id);
                 }
                 let _ = window;
                 cx.notify();
@@ -35317,13 +35341,8 @@ impl VibexWorkbench {
                 // conversational turn of its own, cannot produce the completion
                 // the pre-send queue is waiting on. Releasing the fence here
                 // keeps one failed send from stranding every message behind it.
-                if (!completed || is_command)
-                    && this
-                        .composer_queue_dispatch_fence
-                        .as_ref()
-                        .is_some_and(|fence| fence.message_id == message_id)
-                {
-                    this.composer_queue_dispatch_fence = None;
+                if !completed || is_command {
+                    this.release_composer_queue_fence(message_id);
                 }
                 if completed || steering || interrupted {
                     this.maybe_dispatch_next_composer_queue_message(
@@ -35466,20 +35485,13 @@ impl VibexWorkbench {
         // front of it.
         //
         // The fence keeps the queue one-at-a-time behind the turn the last
-        // hand-over started. A schedule is a promise about a moment, and a turn
-        // running in a *different* session has no claim on that moment: waiting
-        // for it can hold the due message for as long as the other Agent runs,
-        // which is how a schedule misses its time while its own session is
-        // settled. The target session's own state and pending flag below already
-        // keep a schedule from overlapping a turn in the session it sends to.
-        let schedule_overtakes_another_sessions_turn = scheduled_at_ms.is_some()
-            && self
-                .composer_queue_dispatch_fence
-                .as_ref()
-                .is_some_and(|fence| fence.session_id != session_id);
+        // hand-over started, and it is scoped to the session that hand-over
+        // belongs to. A turn running in another session has no claim on this
+        // message: waiting for it could hold a due schedule for as long as the
+        // other Agent runs, and — before the fence was per-session — let one
+        // stuck child Agent freeze every session's queue.
         let fence_blocks = !composer_queue_behavior_is_explicit(behavior)
-            && !schedule_overtakes_another_sessions_turn
-            && self.composer_queue_fence_blocks();
+            && self.composer_queue_fence_blocks(&session_id);
         // An unobserved revision is not proof of a normal completion, so the
         // queue asks for a verdict. When nothing can judge the boundary right
         // now, the session's own settled state is the best evidence the queue
@@ -35505,11 +35517,14 @@ impl VibexWorkbench {
         }
         let message = self.composer_queue.remove(index);
         let message_id = message.id;
-        self.composer_queue_dispatch_fence = Some(ComposerQueueDispatchFence {
-            session_id: message.session_id.clone(),
-            message_id,
-            awaits_turn: message.command_invocation.is_none(),
-        });
+        self.composer_queue_dispatch_fences.insert(
+            message.session_id.as_str().to_string(),
+            ComposerQueueDispatchFence {
+                session_id: message.session_id.clone(),
+                message_id,
+                awaits_turn: message.command_invocation.is_none(),
+            },
+        );
         self.publish_sidebar_invalidation();
         self.dispatch_admitted_composer_message(message, behavior, window, cx);
         // The one hand-over the submission path still refuses — a local runtime
@@ -35526,7 +35541,7 @@ impl VibexWorkbench {
                 let message = self.composer_queue.remove(bounced);
                 self.composer_queue.insert(0, message);
             }
-            self.composer_queue_dispatch_fence = None;
+            self.release_composer_queue_fence(message_id);
         }
         // The send left the queue, so its name no longer stands and the
         // persisted queue must not bring the message back on the next launch.
@@ -35539,14 +35554,18 @@ impl VibexWorkbench {
     }
 
     /// Whether the pre-send queue is still waiting for the turn of the message it
-    /// handed over last.
+    /// handed over last in `session_id`.
     ///
     /// The queue advances one message at a time: after an entry leaves it, the
     /// entries behind it wait while that message's turn still occupies its
     /// session. The fence never waits on an asynchronous verdict, so a session
     /// that cannot answer a probe still releases the queue once it settles.
-    fn composer_queue_fence_blocks(&self) -> bool {
-        let Some(fence) = self.composer_queue_dispatch_fence.as_ref() else {
+    ///
+    /// Only the target session's own fence can hold its next entry. A turn
+    /// running in another session used to hold every session's queue, so one
+    /// stuck child Agent stopped the reader from sending anywhere.
+    fn composer_queue_fence_blocks(&self, session_id: &VibexSessionId) -> bool {
+        let Some(fence) = self.composer_queue_dispatch_fences.get(session_id.as_str()) else {
             return false;
         };
         if !fence.awaits_turn {
@@ -35557,6 +35576,16 @@ impl VibexWorkbench {
             self.registered_session(fence.session_id.as_str())
                 .map(|session| session.state),
         )
+    }
+
+    /// Drops the fence of the handed-over message `message_id`.
+    ///
+    /// Keyed by message rather than by session: a completion may arrive after a
+    /// newer hand-over replaced the entry, and that newer fence must not be
+    /// released by the older message's settle.
+    fn release_composer_queue_fence(&mut self, message_id: u64) {
+        self.composer_queue_dispatch_fences
+            .retain(|_, fence| fence.message_id != message_id);
     }
 
     /// Re-evaluates the pre-send queue after a turn outcome became known.
@@ -36215,6 +36244,13 @@ impl VibexWorkbench {
     ) {
         let mut completed_session_ids = BTreeSet::new();
         let mut ambiguous_any = false;
+        // A submission that ended before it ever reached the provider proves no
+        // turn was admitted for its session. The local dispatch flag was armed
+        // optimistically, though, and only an authoritative snapshot written
+        // after the dispatch is allowed to answer it — a failed or cancelled
+        // submission writes no such snapshot. The flag then outlived the
+        // message it spoke for and held that session's queue forever.
+        let mut unadmitted_session_ids = BTreeSet::new();
         for state in &states {
             if matches!(
                 state.status,
@@ -36227,11 +36263,20 @@ impl VibexWorkbench {
                         && locator.message_idempotency_key == state.message_idempotency_key)
                 });
             }
+            if state.dispatched_at_ms.is_none()
+                && matches!(
+                    state.status,
+                    MessageSubmissionStatus::Failed | MessageSubmissionStatus::Cancelled
+                )
+            {
+                unadmitted_session_ids.insert(state.session_id.as_str().to_string());
+            }
             if state.status == MessageSubmissionStatus::Completed {
                 completed_session_ids.insert(state.session_id.as_str().to_string());
             }
             ambiguous_any |= state.status == MessageSubmissionStatus::AmbiguousPromptDispatch;
         }
+        self.release_unadmitted_turn_flags(&unadmitted_session_ids);
         if ambiguous_any {
             hint_layer::push(
                 window,
@@ -36284,6 +36329,26 @@ impl VibexWorkbench {
         self.composer_submission_states
             .retain(|state| state.message_idempotency_key != message_idempotency_key);
         cx.notify();
+    }
+
+    /// Dismisses an unsent message's status row and the row it painted.
+    ///
+    /// Dismissing alone left the optimistic user message on the timeline with
+    /// nothing behind it: the submission is terminal, so no authoritative row
+    /// will ever replace it. Discarding the draft is the other half of the
+    /// reader's answer that this message is gone.
+    fn discard_failed_submission(
+        &mut self,
+        session_id: &VibexSessionId,
+        message_idempotency_key: String,
+        cx: &mut Context<Self>,
+    ) {
+        // A newer dispatch owns the session's optimistic row now; the row being
+        // dismissed belongs to the failed message, which has no other trace.
+        if !self.session_turn_pending(session_id) {
+            self.discard_optimistic_user_message(session_id);
+        }
+        self.dismiss_submission_status(message_idempotency_key, cx);
     }
 
     fn submission_runtime_label(&self, selection: &SessionRuntimeSelection) -> String {
@@ -36371,6 +36436,22 @@ impl VibexWorkbench {
                             .to_string(),
                     };
                     let dismiss_key = state.message_idempotency_key.clone();
+                    let dismiss_session = state.session_id.clone();
+                    // A row that only reports "not sent" leaves the reader with
+                    // nothing to do about it: the text is gone from the composer
+                    // and the durable submission will never be delivered. The
+                    // draft is still held in the optimistic message, so it can
+                    // be handed back to the composer as an ordinary draft and
+                    // sent again under a fresh key.
+                    let recoverable = terminal
+                        && self
+                            .optimistic_user_messages
+                            .get(state.session_id.as_str())
+                            .is_some_and(|message| {
+                                !message.text.trim().is_empty() || !message.attachments.is_empty()
+                            });
+                    let recover_key = state.message_idempotency_key.clone();
+                    let recover_session = state.session_id.clone();
                     h_flex()
                         .w_full()
                         .min_w_0()
@@ -36405,7 +36486,32 @@ impl VibexWorkbench {
                                 .child(label),
                         )
                         .when(terminal, |this| {
-                            this.child(
+                            this.when(recoverable, |this| {
+                                this.child(
+                                    Button::new(SharedString::from(format!(
+                                        "retry-submission-{}",
+                                        state.message_idempotency_key
+                                    )))
+                                    .xsmall()
+                                    .ghost()
+                                    .compact()
+                                    .label(locale::text("Retry", "重试", "重試"))
+                                    .tooltip(locale::text(
+                                        "Put this message back in the composer",
+                                        "把这条消息放回输入框",
+                                        "把這則訊息放回輸入框",
+                                    ))
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.requeue_failed_submission(
+                                            &recover_session,
+                                            &recover_key,
+                                            window,
+                                            cx,
+                                        );
+                                    })),
+                                )
+                            })
+                            .child(
                                 Button::new(SharedString::from(format!(
                                     "dismiss-submission-{}",
                                     state.message_idempotency_key
@@ -36416,13 +36522,17 @@ impl VibexWorkbench {
                                 .size(px(24.0))
                                 .icon(IconName::Close)
                                 .tooltip(locale::text(
-                                    "Dismiss submission status",
-                                    "关闭提交状态",
-                                    "關閉提交狀態",
+                                    "Discard this unsent message",
+                                    "丢弃这条未发送的消息",
+                                    "丟棄這則未傳送的訊息",
                                 ))
                                 .on_click(cx.listener(
                                     move |this, _, _, cx| {
-                                        this.dismiss_submission_status(dismiss_key.clone(), cx)
+                                        this.discard_failed_submission(
+                                            &dismiss_session,
+                                            dismiss_key.clone(),
+                                            cx,
+                                        )
                                     },
                                 )),
                             )
@@ -36431,6 +36541,69 @@ impl VibexWorkbench {
                 }))
                 .into_any_element(),
         )
+    }
+
+    /// Hands one unsent message back to the composer as an ordinary draft.
+    ///
+    /// The durable submission is already terminal, so it will never be
+    /// delivered; the text lives only in the optimistic row the failed dispatch
+    /// installed. Restoring it — mentions included — is what makes the row's
+    /// "not sent" a recoverable state instead of a dead end, and the retry goes
+    /// out under a fresh idempotency key because the old one is spent.
+    fn requeue_failed_submission(
+        &mut self,
+        session_id: &VibexSessionId,
+        message_idempotency_key: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(message) = self
+            .optimistic_user_messages
+            .get(session_id.as_str())
+            .cloned()
+        else {
+            self.dismiss_submission_status(message_idempotency_key.to_string(), cx);
+            return;
+        };
+        self.discard_optimistic_user_message(session_id);
+        self.dismiss_submission_status(message_idempotency_key.to_string(), cx);
+        // The text an unsent message carries may refer to its attachments by
+        // marker, so the two have to be rebuilt together: a bare text restore
+        // would show `attachment_1_…_vbx` instead of the picture.
+        let (text, attachments, serial) = composer_queue_edit_insertion(
+            &message.text,
+            &message.attachments,
+            self.composer_attachment_serial,
+        );
+        let content = composer_content_with_mentions(&text, &message.mentions);
+        if self.selected_session_id.as_ref() != Some(session_id) {
+            // The row belongs to a session that is not on screen; the draft is
+            // what the reader will find when they go back to it.
+            self.composer_attachment_serial = serial;
+            self.composer_drafts.save(
+                session_id.as_str(),
+                ComposerDraft {
+                    content,
+                    attachments,
+                    command_entry: None,
+                    attachment_serial: serial,
+                    schedule: None,
+                },
+            );
+            cx.notify();
+            return;
+        }
+        self.composer_attachment_serial = serial;
+        let input = self.ensure_composer_input(window, cx);
+        input.update(cx, |input, cx| {
+            input.set_value(content, window, cx);
+            input.focus(window, cx);
+        });
+        self.composer_attachments = attachments;
+        self.composer_command_entry = None;
+        self.agent_error = None;
+        self.remember_composer_draft(cx);
+        cx.notify();
     }
 
     fn sync_inline_composer_attachments(&mut self, new_session: bool, cx: &App) {

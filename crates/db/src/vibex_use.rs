@@ -524,11 +524,38 @@ pub fn settle_vibex_use_execution(
     let terminal_submission =
         crate::MessageSubmissionRepository::get(&tx, &completed.submission_id)?
             .is_some_and(|submission| submission.status.is_terminal());
-    let confirmed_cancel =
-        cancelling && terminal_submission && completed.outcome != ExecutionOutcome::Ambiguous;
+    // A stop that is accepted before a round settles owns that round's
+    // outcome: the work was already spoken for, and reporting it as completed
+    // would let a stopped task look finished.
+    //
+    // A round that had already settled before the stop was recorded is a
+    // different fact. The provider finished first, and rewriting that result
+    // into `Cancelled` throws away the only record of what actually ran — the
+    // parent then keeps waiting for an answer the ledger claims never existed.
+    // The cut is the moment the stop was requested, not the moment its
+    // observer happened to run.
+    let stop_requested_at_ms = task
+        .as_ref()
+        .and_then(|task| task.cancellation_requested_at_ms)
+        .or_else(|| {
+            VibexUseCancellationRepository::requested_at(&tx, &completed.id)
+                .ok()
+                .flatten()
+        });
+    // The cut is strictly before the capture: a round that finished in the same
+    // millisecond the stop was recorded is ambiguous, and the stop wins that
+    // tie because it is the side the reader asked for.
+    let settled_before_the_stop = stop_requested_at_ms
+        .zip(completed.finished_at_ms)
+        .is_some_and(|(stop, finished)| finished < stop);
+    let confirmed_cancel = cancelling
+        && terminal_submission
+        && completed.outcome != ExecutionOutcome::Ambiguous
+        && !settled_before_the_stop;
     let confirmed_interrupt = !cancelling
         && terminal_submission
         && completed.outcome != ExecutionOutcome::Ambiguous
+        && !settled_before_the_stop
         && VibexUseInterruptRepository::is_requested(&tx, &completed.id)?;
     let outcome = if confirmed_cancel || confirmed_interrupt {
         ExecutionOutcome::Cancelled
@@ -640,6 +667,13 @@ pub fn settle_vibex_use_execution(
                 DelegationTaskEventKind::ExecutionFinished,
                 DelegationTaskEventKind::TaskResultAvailable,
             ] {
+                // A result that landed before its task was stopped is still a
+                // result: the caller has to be able to tell "stopped with
+                // nothing" from "stopped, but the round had already finished",
+                // because only the second one is worth reading.
+                let late = kind == DelegationTaskEventKind::TaskResultAvailable
+                    && task.phase().is_terminal()
+                    && settled_before_the_stop;
                 VibexUseEventRepository::append(
                     &tx,
                     &kind.stable_id(&task.id, Some(&execution.id)),
@@ -650,7 +684,11 @@ pub fn settle_vibex_use_execution(
                     Some(&task.id),
                     task.child_session_id.as_ref(),
                     task.revision,
-                    &serde_json::json!({"executionRef": execution.execution_ref.as_uri(), "outcome": execution.outcome}),
+                    &serde_json::json!({
+                        "executionRef": execution.execution_ref.as_uri(),
+                        "outcome": execution.outcome,
+                        "lateResult": late,
+                    }),
                 )?;
             }
         } else if let Some(session_id) = execution.session_ref.session_id() {
