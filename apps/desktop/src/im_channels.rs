@@ -25,6 +25,7 @@ use vibex_core::{
 };
 
 use crate::app::VibexWorkbench;
+use crate::locale;
 
 pub struct ImChannelsView {
     workbench: WeakEntity<VibexWorkbench>,
@@ -594,6 +595,8 @@ impl ImChannelsView {
                     channel_id,
                     role,
                     ttl_ms: Some(600_000),
+                    scope: vibex_core::ImPairingScope::Direct,
+                    target_chat_id: None,
                 }))
                 .await
                 .map_err(backend_error);
@@ -601,7 +604,14 @@ impl ImChannelsView {
                 this.busy = false;
                 match result {
                     Ok(pairing) => {
-                        this.notice = Some("Pairing code created. Send /pair <code> in a direct message within 10 minutes.".to_string());
+                        this.notice = Some(
+                            locale::text(
+                                "Pairing code created. Send /pair <code> in a direct message within 10 minutes.",
+                                "配对码已生成。请在 10 分钟内私聊发送 /pair <配对码>。",
+                                "配對碼已產生。請在 10 分鐘內私聊傳送 /pair <配對碼>。",
+                            )
+                            .to_string(),
+                        );
                         this.pairing = Some(pairing);
                         this.error = None;
                     }
@@ -780,10 +790,10 @@ impl ImChannelsView {
 
     fn role_label(role: ImPrincipalRole) -> &'static str {
         match role {
-            ImPrincipalRole::Observer => "Observer",
-            ImPrincipalRole::Approver => "Approver",
-            ImPrincipalRole::Operator => "Operator",
-            ImPrincipalRole::Admin => "Admin",
+            ImPrincipalRole::Observer => locale::text("Observer", "只读", "唯讀"),
+            ImPrincipalRole::Approver => locale::text("Approver", "审批", "審批"),
+            ImPrincipalRole::Operator => locale::text("Operator", "操作员", "操作員"),
+            ImPrincipalRole::Admin => locale::text("Admin", "管理员", "管理員"),
         }
     }
 
@@ -826,11 +836,15 @@ impl ImChannelsView {
 
     fn status_label(&self, channel: &ImChannelSummary) -> &'static str {
         match channel.status.state {
-            vibex_core::ImChannelState::Connected => "Connected",
-            vibex_core::ImChannelState::Starting => "Starting",
-            vibex_core::ImChannelState::Degraded => "Needs attention",
-            vibex_core::ImChannelState::Stopped => "Stopped",
-            vibex_core::ImChannelState::Disabled => "Disabled",
+            vibex_core::ImChannelState::Connected => locale::text("Connected", "已连接", "已連線"),
+            vibex_core::ImChannelState::Starting => {
+                locale::text("Starting", "正在连接", "正在連線")
+            }
+            vibex_core::ImChannelState::Degraded => {
+                locale::text("Needs attention", "需要处理", "需要處理")
+            }
+            vibex_core::ImChannelState::Stopped => locale::text("Stopped", "已停止", "已停止"),
+            vibex_core::ImChannelState::Disabled => locale::text("Disabled", "未启用", "未啟用"),
         }
     }
 }
@@ -857,7 +871,7 @@ impl Render for ImChannelsView {
                     .text_sm()
                     .font_semibold()
                     .text_color(foreground)
-                    .child("Add Telegram channel"),
+                    .child(locale::text("Add Telegram channel", "添加 Telegram 频道", "新增 Telegram 頻道")),
             )
             .child(
                 h_flex()
@@ -883,7 +897,11 @@ impl Render for ImChannelsView {
                         div()
                             .text_xs()
                             .text_color(muted)
-                            .child("Forum topic mode: create one topic per /new session. The bot must be a forum admin."),
+                            .child(locale::text(
+                                "Forum topic mode: create one topic per /new session. The bot must be a forum admin.",
+                                "话题模式：每个 /new 会话创建一个话题。机器人必须是论坛管理员。",
+                                "話題模式：每個 /new 工作階段建立一個話題。機器人必須是論壇管理員。",
+                            )),
                     ),
             )
             .child(
@@ -894,7 +912,11 @@ impl Render for ImChannelsView {
                         div()
                             .text_xs()
                             .text_color(muted)
-                            .child("The bot token is stored in the OS keychain (or the runtime's host secret file)."),
+                            .child(locale::text(
+                                "The bot token is stored in the OS keychain (or the runtime's host secret file).",
+                                "Bot token 存在操作系统钥匙串（或运行时的主机密钥文件）中。",
+                                "Bot token 存在作業系統鑰匙圈（或執行時的主機密鑰檔案）中。",
+                            )),
                     )
                     .child(
                         Button::new("im-channel-create")
@@ -918,7 +940,7 @@ impl Render for ImChannelsView {
                     .text_sm()
                     .font_semibold()
                     .text_color(foreground)
-                    .child("Add Lark / Feishu channel"),
+                    .child(locale::text("Add Lark / Feishu channel", "添加 Lark / 飞书频道", "新增 Lark / 飛書頻道")),
             )
             .child(
                 h_flex()
@@ -935,7 +957,11 @@ impl Render for ImChannelsView {
                         div()
                             .text_xs()
                             .text_color(muted)
-                            .child("The app secret is stored in the OS keychain (or the runtime's host secret file). Subscribe the app to card.action.trigger so approval cards can be answered with a button."),
+                            .child(locale::text(
+                                "The app secret is stored in the OS keychain (or the runtime's host secret file). Subscribe the app to card.action.trigger so approval cards can be answered with a button.",
+                                "App secret 存在操作系统钥匙串（或运行时的主机密钥文件）中。请为应用订阅 card.action.trigger，这样审批卡片就能用按钮回答。",
+                                "App secret 存在作業系統鑰匙圈（或執行時的主機密鑰檔案）中。請為應用訂閱 card.action.trigger，這樣審批卡片就能用按鈕回答。",
+                            )),
                     )
                     .child(
                         Button::new("im-lark-create")
@@ -1011,7 +1037,7 @@ impl Render for ImChannelsView {
                             ))
                             .small()
                             .ghost()
-                            .label("Open")
+                            .label(locale::text("Open", "打开", "開啟"))
                             .on_click(cx.listener({
                                 let channel_id = channel_id.clone();
                                 move |this, _, _, cx| this.select_channel(channel_id.clone(), cx)
@@ -1054,7 +1080,7 @@ impl Render for ImChannelsView {
                                         Button::new("im-channel-test")
                                             .small()
                                             .outline()
-                                            .label("Test connection")
+                                            .label(locale::text("Test connection", "测试连接", "測試連線"))
                                             .disabled(self.busy)
                                             .on_click(cx.listener({
                                                 let channel_id = channel_id.clone();
@@ -1065,7 +1091,7 @@ impl Render for ImChannelsView {
                                         Button::new("im-channel-delete")
                                             .small()
                                             .ghost()
-                                            .label("Delete")
+                                            .label(locale::text("Delete", "删除", "刪除"))
                                             .disabled(self.busy)
                                             .on_click(cx.listener({
                                                 let channel_id = channel_id.clone();
@@ -1092,7 +1118,7 @@ impl Render for ImChannelsView {
                                 Button::new("im-channel-pair")
                                     .small()
                                     .primary()
-                                    .label("Generate pairing code")
+                                    .label(locale::text("Generate pairing code", "生成配对码", "產生配對碼"))
                                     .disabled(self.busy)
                                     .on_click(cx.listener({
                                         let channel_id = channel_id.clone();
@@ -1113,21 +1139,28 @@ impl Render for ImChannelsView {
                         div()
                             .text_xs()
                             .text_color(muted)
-                            .child("Send /pair <code> to the bot in a direct message. The code expires in 10 minutes."),
+                            .child(locale::text(
+                        "Send /pair <code> to the bot in a direct message. The code expires in 10 minutes.",
+                        "在私聊中向机器人发送 /pair <配对码>。配对码 10 分钟后过期。",
+                        "在私聊中向機器人傳送 /pair <配對碼>。配對碼 10 分鐘後過期。",
+                    )),
                     )
                     .child(
                         div()
                             .text_sm()
                             .text_color(foreground)
-                            .child(format!("Paired identities ({})", self.principals.len())),
+                            .child(format!(
+                                "{} ({})",
+                                locale::text("Paired identities", "已配对身份", "已配對身分"),
+                                self.principals.len()
+                            )),
                     );
                 if self.principals.is_empty() {
-                    panel = panel.child(
-                        div()
-                            .text_xs()
-                            .text_color(muted)
-                            .child("No identities have paired with this channel yet."),
-                    );
+                    panel = panel.child(div().text_xs().text_color(muted).child(locale::text(
+                        "No identities have paired with this channel yet.",
+                        "还没有身份配对这个频道。",
+                        "還沒有身分配對這個頻道。",
+                    )));
                 } else {
                     for principal in &self.principals {
                         let principal_id = principal.principal_id.clone();
@@ -1172,7 +1205,7 @@ impl Render for ImChannelsView {
                                     ))
                                     .small()
                                     .ghost()
-                                    .label("Revoke")
+                                    .label(locale::text("Revoke", "撤销", "撤銷"))
                                     .on_click(cx.listener(
                                         move |this, _, _, cx| {
                                             this.revoke_principal(principal_id.clone(), cx)
@@ -1182,16 +1215,17 @@ impl Render for ImChannelsView {
                         );
                     }
                 }
-                panel = panel.child(
-                    div()
-                        .text_sm()
-                        .text_color(foreground)
-                        .child(format!("Session bindings ({})", self.bindings.len())),
-                );
+                panel = panel.child(div().text_sm().text_color(foreground).child(format!(
+                    "{} ({})",
+                    locale::text("Session bindings", "会话绑定", "工作階段綁定"),
+                    self.bindings.len()
+                )));
                 if self.bindings.is_empty() {
-                    panel = panel.child(div().text_xs().text_color(muted).child(
+                    panel = panel.child(div().text_xs().text_color(muted).child(locale::text(
                         "No chat is bound to a session yet. Use /use in the chat, or /new.",
-                    ));
+                        "还没有聊天绑定到会话。可在聊天里用 /use，或用 /new。",
+                        "還沒有聊天綁定到工作階段。可在聊天裡用 /use，或用 /new。",
+                    )));
                 } else {
                     for binding in &self.bindings {
                         let binding_id = binding.binding_id.clone();
@@ -1233,7 +1267,7 @@ impl Render for ImChannelsView {
                                     ))
                                     .small()
                                     .ghost()
-                                    .label("Unbind")
+                                    .label(locale::text("Unbind", "解绑", "解除綁定"))
                                     .on_click(cx.listener(
                                         move |this, _, _, cx| {
                                             this.revoke_binding(binding_id.clone(), cx)
@@ -1253,13 +1287,17 @@ impl Render for ImChannelsView {
                                     div()
                                         .text_sm()
                                         .text_color(foreground)
-                                        .child("Default session for /new"),
+                                        .child(locale::text("Default session for /new", "/new 的默认会话", "/new 的預設工作階段")),
                                 )
                                 .child(div().text_xs().text_color(muted).child(
                                     if channel.default_session.is_some() {
                                         "Configured. /new can start without a bound session."
                                     } else {
-                                        "Pick a recent session to reuse its workspace and Agent."
+                                        locale::text(
+                                        "Pick a recent session to reuse its workspace and Agent.",
+                                        "选一个最近的会话，复用它当时的工作区和 Agent。",
+                                        "選一個最近的工作階段，重複使用它當時的工作區和 Agent。",
+                                    )
                                     },
                                 )),
                         )
@@ -1268,7 +1306,7 @@ impl Render for ImChannelsView {
                                 Button::new("im-default-clear")
                                     .small()
                                     .ghost()
-                                    .label("Clear")
+                                    .label(locale::text("Clear", "清除", "清除"))
                                     .on_click(cx.listener({
                                         let channel_id = channel_id.clone();
                                         move |this, _, _, cx| {
@@ -1304,7 +1342,7 @@ impl Render for ImChannelsView {
                                 Button::new(format!("im-default-use-{}", session.id.as_str()))
                                     .small()
                                     .outline()
-                                    .label("Use as default")
+                                    .label(locale::text("Use as default", "设为默认", "設為預設"))
                                     .disabled(self.busy)
                                     .on_click(cx.listener({
                                         let channel_id = channel_id.clone();
@@ -1329,7 +1367,7 @@ impl Render for ImChannelsView {
                             div()
                                 .text_sm()
                                 .text_color(foreground)
-                                .child("Events sent to this chat"),
+                                .child(locale::text("Events sent to this chat", "发送到这个聊天的活动", "傳送到這個聊天的活動")),
                         )
                         .child(div().text_xs().text_color(muted).child(
                             "Approvals and errors are the default set. Turning one off stops it for every binding on this channel.",
@@ -1378,12 +1416,11 @@ impl Render for ImChannelsView {
                         .items_center()
                         .child(
                             v_flex()
-                                .child(
-                                    div()
-                                        .text_sm()
-                                        .text_color(foreground)
-                                        .child("Reply language"),
-                                )
+                                .child(div().text_sm().text_color(foreground).child(locale::text(
+                                    "Reply language",
+                                    "回复语言",
+                                    "回覆語言",
+                                )))
                                 .child(div().text_xs().text_color(muted).child(format!(
                                     "{} (host default when unset)",
                                     channel
@@ -1431,7 +1468,7 @@ impl Render for ImChannelsView {
                                     Button::new(format!("im-locale-auto-{}", channel_id.as_str()))
                                         .small()
                                         .ghost()
-                                        .label("Host")
+                                        .label(locale::text("Host", "跟随系统", "跟隨系統"))
                                         .on_click(cx.listener({
                                             let channel_id = channel_id.clone();
                                             move |this, _, _, cx| {
@@ -1466,20 +1503,24 @@ impl Render for ImChannelsView {
                                     .text_lg()
                                     .font_semibold()
                                     .text_color(foreground)
-                                    .child("IM channels"),
+                                    .child(locale::text("IM channels", "IM 频道", "IM 頻道")),
                             )
                             .child(
                                 div()
                                     .text_xs()
                                     .text_color(muted)
-                                    .child("Chat with Vibex and approve tool calls from Telegram."),
+                                    .child(locale::text(
+                                "Chat with Vibex and approve tool calls from Telegram.",
+                                "通过 IM 与 Vibex 对话并批准工具调用。",
+                                "透過 IM 與 Vibex 對話並批准工具呼叫。",
+                            )),
                             ),
                     )
                     .child(
                         Button::new("im-channels-refresh")
                             .small()
                             .ghost()
-                            .label("Refresh")
+                            .label(locale::text("Refresh", "刷新", "重新整理"))
                             .disabled(self.loading)
                             .on_click(cx.listener(|this, _, _, cx| this.reload(cx))),
                     ),
@@ -1514,7 +1555,11 @@ impl Render for ImChannelsView {
                 div()
                     .text_xs()
                     .text_color(muted)
-                    .child("Telegram and Lark are supported. Approvals use the buttons on the card, or the printed short code. Images and documents up to 10 MB are accepted; long answers are split across messages."),
+                    .child(locale::text(
+                        "Telegram and Lark are supported. Approvals use the buttons on the card, or the printed short code. Images and documents up to 10 MB are accepted; long answers are split across messages.",
+                        "支持 Telegram 和 Lark。审批可通过卡片按钮或卡片上的短码完成。接受不超过 10 MB 的图片和文档；超长回答会自动分段发送。",
+                        "支援 Telegram 和 Lark。審批可透過卡片按鈕或卡片上的短碼完成。接受不超過 10 MB 的圖片和文件；超長回覆會自動分段傳送。",
+                    )),
             )
     }
 }

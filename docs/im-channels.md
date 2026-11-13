@@ -63,8 +63,26 @@ A channel refuses everyone until an identity is paired.
 2. Send `/pair VBX-ABC12-DEF34` to the bot in a direct message.
 3. The bot replies with your role.
 
-Pairing codes are accepted in direct messages only. A second person cannot reuse
-a code that was already claimed.
+A code is bound to the kind of chat it was minted for. A code generated in the
+app is a direct-message code, and sending it in a group is refused; a group code
+names one chat and is refused anywhere else. A second person cannot reuse a code
+that was already claimed.
+
+### Pairing a group
+
+A group needs its own code, because a direct code pasted into a group would
+otherwise pair everyone who saw it. Mint one from the command line, naming the
+chat:
+
+```bash
+vibex-server im pair --channel "Team bot" --chat -1001234567890 --role operator
+```
+
+Then send `/pair <code>` in that group. The claimed identity is the person who
+sent it; other members still have to be paired individually.
+
+An unpaired group is otherwise ignored: the bot does not answer non-command
+messages there, so it stays quiet in a busy room.
 
 ### Roles
 
@@ -178,12 +196,24 @@ its next start.
 | --- | --- |
 | Channels, pairings, bindings, cards | the runtime SQLite database |
 | Bot tokens and app secrets | OS keychain, or `<home>/im-secrets.json` headless |
-| Audit of pairing and approval | `im_audit_logs` |
+| Audit of pairing and approval | `im_audit_logs`, kept 180 days |
+| Delivered and received messages | `im_messages`, kept 14 days |
 | Approval outcome | the session timeline, as a `PermissionResolution` |
 
 Every approval writes both places: the timeline records who resolved it and
 that it came through IM, and the audit log records the channel, binding, and
 principal.
+
+Old rows are pruned at start-up and every six hours. The transcript is the
+session timeline, so a message that was delivered is still readable there after
+the log entry is gone.
+
+### Diagnostics
+
+A diagnostic bundle includes an `imChannels` section: one row per channel with
+its kind, whether it is enabled and configured, and the connection state. It
+carries no chat id, session id, or message text, because a bundle is meant to be
+shared with support.
 
 ## Troubleshooting
 
@@ -197,6 +227,20 @@ principal.
 | Bot offline after closing the desktop | the desktop hosted the connection; run `vibex-server` |
 | Lark channel degrades with an auth error | the app secret was rotated, or the app is unpublished |
 
+### Rate limits
+
+A chat that sends faster than a person is throttled rather than served:
+
+| Scope | Limit |
+| --- | --- |
+| One identity | 20 messages per minute |
+| One chat | 40 messages per minute |
+| Pairing attempts | 5 per chat per 10 minutes |
+
+A refused message gets one reply with the retry delay. Approval and answer
+buttons are never throttled: a press is a response to a card that was already
+delivered.
+
 Timestamped delivery problems are visible in the channel's status: last inbound,
 last outbound, pending sends, and the last error with its retry time.
 
@@ -204,8 +248,9 @@ last outbound, pending sends, and the last error with its retry time.
 
 - One runtime per home directory owns the connections. A second process cannot
   serve the same channels.
-- Elicitation forms are not answered in chat; the bot sends a notice and the
-  answer happens in Vibex.
+- A question with exactly one boolean field, or one field restricted to a fixed
+  option list, is answered with a button. Any other form — several fields, free
+  text, numbers, multi-select — sends a notice and the answer happens in Vibex.
 - Reasoning and tool progress are never forwarded, only final answers, errors,
   approvals, and notices.
 - Lark card buttons require the `card.action.trigger` event subscription; without
