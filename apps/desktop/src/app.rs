@@ -28743,6 +28743,27 @@ impl VibexWorkbench {
         delegation_edit_subject(input.tokens(), input.cursor())
     }
 
+    /// The byte range of the chip one composer's controls are tuning.
+    ///
+    /// The renderer cannot see the caret, so the caret's verdict is resolved
+    /// here, once per frame, and handed to it. That keeps the chip's highlight
+    /// and the controls pointed at exactly the same chip.
+    fn delegation_chip_range_for(
+        &self,
+        target: ComposerTarget,
+        cx: &App,
+    ) -> Option<std::ops::Range<usize>> {
+        self.delegation_subject_for(target, cx)?;
+        let input = self.input_for_composer_target(target)?;
+        let input = input.read(cx);
+        let cursor = input.cursor();
+        input
+            .tokens()
+            .iter()
+            .map(|span| span.range())
+            .find(|range| delegation_chip_is_active(range, cursor))
+    }
+
     /// The selection one composer's runtime controls should show.
     fn composer_runtime_selection_for(
         &self,
@@ -41343,6 +41364,29 @@ impl VibexWorkbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // A draft that names a collaborator tunes that collaborator. Taking the
+        // page's branch instead would repoint the page's Agent at the choice —
+        // the very overwrite the chip exists to avoid — and leave the chip
+        // showing a configuration nobody asked for.
+        if let Some(agent_id) = self
+            .delegation_subject_for(ComposerTarget::NewSession, cx)
+            .and_then(|mention| mention.agent_id)
+        {
+            self.clear_runtime_provider_keyboard_selection();
+            self.runtime_choice_menu_open = None;
+            self.new_session_runtime_menu_auth_source = None;
+            self.begin_runtime_menu_close(window, cx);
+            self.record_runtime_selection_use(&selection);
+            self.apply_delegation_chip_selection_for(
+                ComposerTarget::NewSession,
+                &agent_id,
+                &selection,
+                window,
+                cx,
+            );
+            self.new_session_error = None;
+            return;
+        }
         // The runtime cascade is the page's main way to change Agent, so a
         // choice made here is the one that most needs the sentence's mark to
         // cross rather than blink: the same cut the chips start, from the Agent
@@ -42662,8 +42706,15 @@ impl VibexWorkbench {
         cx.notify();
     }
 
+    /// Commits one runtime choice made in a composer's cascade.
+    ///
+    /// `target` is which composer the choice came from. It used to be implied —
+    /// always the session — which meant the new-session page's own controls
+    /// wrote to the session the reader happened to have selected: opening the
+    /// page and changing a provider silently moved the conversation behind it.
     fn choose_runtime_selection(
         &mut self,
+        target: ComposerTarget,
         selection: SessionRuntimeSelection,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -42678,21 +42729,32 @@ impl VibexWorkbench {
         self.begin_runtime_menu_close(window, cx);
         self.record_runtime_selection_use(&selection);
         // A draft that is tuning a collaborator owns this choice: it rewrites
-        // the chip the caret is on, and the session keeps the runtime it had.
-        // Switching the session instead would silently move the reader's own
+        // the chip the caret is on, and the composer's own runtime keeps what it
+        // had. Switching the session instead would silently move the reader's
         // conversation while they were configuring somebody else's work.
         if let Some(agent_id) = self
-            .composer_delegation_subject(cx)
+            .delegation_subject_for(target, cx)
             .and_then(|mention| mention.agent_id)
         {
-            self.apply_delegation_chip_selection(&agent_id, &selection, window, cx);
+            self.apply_delegation_chip_selection_for(target, &agent_id, &selection, window, cx);
             return;
         }
-        if self.selected_session_runtime_uninitialized() {
-            self.initialize_uninitialized_session_runtime(selection, cx);
-            return;
+        match target {
+            ComposerTarget::Session => {
+                if self.selected_session_runtime_uninitialized() {
+                    self.initialize_uninitialized_session_runtime(selection, cx);
+                    return;
+                }
+                self.request_runtime_selection(selection, false, cx);
+            }
+            ComposerTarget::NewSession => {
+                self.set_new_session_runtime_selection(Some(selection.clone()));
+                self.remember_runtime_selection(&selection);
+                self.new_session_error = None;
+                self.refresh_active_suggestions(ComposerTarget::NewSession, cx);
+                cx.notify();
+            }
         }
-        self.request_runtime_selection(selection, false, cx);
     }
 
     /// Writes one tuned selection into the chip the reader is editing.
@@ -42702,22 +42764,6 @@ impl VibexWorkbench {
     /// travels with the mention instead of living in a side table keyed by
     /// Agent — which could only ever hold one configuration per Agent, no
     /// matter how many times the draft named it.
-    fn apply_delegation_chip_selection(
-        &mut self,
-        agent_id: &AgentId,
-        selection: &SessionRuntimeSelection,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.apply_delegation_chip_selection_for(
-            ComposerTarget::Session,
-            agent_id,
-            selection,
-            window,
-            cx,
-        )
-    }
-
     /// Writes one tuned selection into the chip of one composer.
     ///
     /// Both composers carry the same kind of chip, so both write it the same
@@ -58373,7 +58419,12 @@ impl VibexWorkbench {
                             this.choose_new_session_runtime(selection.clone(), window, cx)
                         }
                         RuntimeChoiceMenuAction::ActiveSession(selection) => {
-                            this.choose_runtime_selection(selection.clone(), window, cx)
+                            this.choose_runtime_selection(
+                                ComposerTarget::Session,
+                                selection.clone(),
+                                window,
+                                cx,
+                            )
                         }
                         RuntimeChoiceMenuAction::Feature {
                             target,
@@ -59055,7 +59106,7 @@ impl VibexWorkbench {
                 if new_session {
                     self.choose_new_session_runtime(selection, window, cx);
                 } else {
-                    self.choose_runtime_selection(selection, window, cx);
+                    self.choose_runtime_selection(ComposerTarget::Session, selection, window, cx);
                 }
                 cx.stop_propagation();
             }
@@ -59469,6 +59520,7 @@ impl VibexWorkbench {
                                     );
                                 } else {
                                     this.choose_runtime_selection(
+                                        ComposerTarget::Session,
                                         click_selection.clone(),
                                         window,
                                         cx,
@@ -59633,7 +59685,12 @@ impl VibexWorkbench {
                                     cx,
                                 );
                             } else {
-                                this.choose_runtime_selection(click_selection.clone(), window, cx);
+                                this.choose_runtime_selection(
+                                    ComposerTarget::Session,
+                                    click_selection.clone(),
+                                    window,
+                                    cx,
+                                );
                             }
                         }))
                         .child(icon)
@@ -62190,9 +62247,17 @@ impl VibexWorkbench {
                                                             .token({
                                                                 let agents = self
                                                                     .composer_agent_token_identities();
+                                                                let active = self
+                                                                    .delegation_chip_range_for(
+                                                                        ComposerTarget::NewSession,
+                                                                        cx,
+                                                                    );
                                                                 move |context, _, cx| {
                                                                     render_composer_inline_token(
-                                                                        context, &agents, cx,
+                                                                        context,
+                                                                        &agents,
+                                                                        active.clone(),
+                                                                        cx,
                                                                     )
                                                                 }
                                                             })
@@ -62308,6 +62373,47 @@ impl VibexWorkbench {
                                                         .flex_none()
                                                         .items_center()
                                                         .gap_1()
+                                                        // Same badge as the session composer:
+                                                        // without it the reader cannot tell
+                                                        // that these controls are tuning the
+                                                        // chip rather than the page.
+                                                        .when_some(
+                                                            delegation_subject
+                                                                .as_ref()
+                                                                .and_then(|mention| {
+                                                                    mention.agent_id.as_ref().map(
+                                                                        |agent_id| {
+                                                                            mention
+                                                                                .label
+                                                                                .clone()
+                                                                                .unwrap_or_else(
+                                                                                    || {
+                                                                                        agent_id
+                                                                                            .to_string()
+                                                                                    },
+                                                                                )
+                                                                        },
+                                                                    )
+                                                                }),
+                                                            |row, agent_label| {
+                                                                row.child(
+                                                                    Tag::color(ColorName::Blue)
+                                                                        .xsmall()
+                                                                        .rounded_full()
+                                                                        .h(px(20.0))
+                                                                        .px_2()
+                                                                        .font_medium()
+                                                                        .child(locale::text(
+                                                                            "Delegating to",
+                                                                            "委派给",
+                                                                            "委派給",
+                                                                        ))
+                                                                        .child(format!(
+                                                                            " {agent_label}"
+                                                                        )),
+                                                                )
+                                                            },
+                                                        )
                                                         .child(runtime_controls_cascade),
                                                 )
                                                 .child(
@@ -63802,7 +63908,12 @@ impl VibexWorkbench {
                         )
                         .on_click(cx.listener(
                             move |this, _, window, cx| {
-                                this.choose_runtime_selection(selection.clone(), window, cx)
+                                this.choose_runtime_selection(
+                                    ComposerTarget::Session,
+                                    selection.clone(),
+                                    window,
+                                    cx,
+                                )
                             },
                         ))
                     })
@@ -76663,9 +76774,16 @@ impl VibexWorkbench {
                                                     .token({
                                                         let agents = self
                                                             .composer_agent_token_identities();
+                                                        let active = self.delegation_chip_range_for(
+                                                            ComposerTarget::Session,
+                                                            cx,
+                                                        );
                                                         move |context, _, cx| {
                                                             render_composer_inline_token(
-                                                                context, &agents, cx,
+                                                                context,
+                                                                &agents,
+                                                                active.clone(),
+                                                                cx,
                                                             )
                                                         }
                                                     })
@@ -83305,6 +83423,13 @@ fn composer_entry_mention(entry: &AgentCommandEntry) -> Option<VibexUseMention> 
 /// The label is the fast path; a restored mention also carries a
 /// `vibex://runtime-option/...` id, which survives a rename of the visible
 /// label. A file or session token returns `None` and keeps the stock chip.
+/// Whether one token names a collaborator, by its typed id.
+fn composer_token_is_collaborator(token: &InlineToken) -> bool {
+    VibexUseMention::parse(token.id()).is_some_and(|mention| {
+        mention.kind == vibex_core::VibexUseMentionKind::Agent && mention.agent_id.is_some()
+    })
+}
+
 fn composer_token_agent_identity(
     token: &InlineToken,
     agents: &[(String, String)],
@@ -83334,13 +83459,24 @@ fn composer_token_agent_identity(
 fn render_composer_inline_token(
     context: &InlineTokenContext,
     agents: &[(String, String)],
+    active: Option<std::ops::Range<usize>>,
     cx: &mut App,
 ) -> AnyElement {
     let Some(identity) = composer_token_agent_identity(context.token(), agents) else {
         return InputToken::new(context).into_any_element();
     };
     let theme = cx.theme();
-    let selected = context.is_selected();
+    // A collaborator chip lights up whenever the controls below are pointed at
+    // it, which is a superset of the input's own range-overlap highlight: that
+    // one leaves both edges dark, so the chip being edited looked inert with the
+    // caret resting against it. Every other token keeps the input's answer.
+    let selected = if composer_token_is_collaborator(context.token()) {
+        active
+            .as_ref()
+            .is_some_and(|range| *range == context.range())
+    } else {
+        context.is_selected()
+    };
     div()
         .id("input-token")
         .flex()
@@ -83676,18 +83812,33 @@ fn delegation_edit_subject(tokens: &[InlineTokenSpan], cursor: usize) -> Option<
     // controls to the session, so the reader could not get back to their own
     // runtime without deleting the chip.
     //
-    // Containment wins over adjacency, so a caret sitting between two chips
-    // belongs to the one it is inside rather than to the one before it.
-    if let Some((_, mention)) =
-        agent_mentions().find(|(range, _)| cursor >= range.start && cursor <= range.end)
-    {
-        return Some(mention);
-    }
-    // Adjacency covers the single separator character an insertion appends, so
-    // a chip the reader has just picked is immediately tunable.
+    // The chip owns its own characters and nothing past them. A token covers
+    // `start..end`, so `end` is the caret that sits immediately after its last
+    // character and still reads as "on the chip". One byte further is the
+    // separator an insertion appends — that position belongs to the sentence,
+    // not to the chip, and the reader who pressed Right past it has left.
+    //
+    // This used to accept `end + 1` as well, which kept the controls pointed at
+    // the chip after the caret had visibly moved off it: the reader had to walk
+    // two characters away before the composer was theirs again.
     agent_mentions()
-        .find(|(range, _)| cursor == range.end + 1)
+        .find(|(range, _)| cursor >= range.start && cursor <= range.end)
         .map(|(_, mention)| mention)
+}
+
+/// Whether one chip should paint its selected state for `cursor`.
+///
+/// The chip's highlight and the runtime controls have to agree, or the reader
+/// sees a chip that is not lit while the controls below it edit that chip. The
+/// input's own highlight is a range overlap (`start < caret && caret < end`),
+/// which leaves both edges dark — and `start` is exactly where a caret rests
+/// after the chip when the reader walks left into it, so the chip that *is*
+/// being edited looked inert.
+///
+/// `delegation_edit_subject` is the authority here: whatever it returns is what
+/// the controls edit, so it is also what the chip must show as selected.
+fn delegation_chip_is_active(range: &std::ops::Range<usize>, cursor: usize) -> bool {
+    cursor >= range.start && cursor <= range.end
 }
 
 /// The catalogue entry an `@Agent` chip's reference names.
@@ -102722,6 +102873,42 @@ mod tests {
         }
     }
 
+    /// The chip lights up exactly when the controls edit it.
+    ///
+    /// The input's own highlight is a strict range overlap, which leaves both
+    /// edges dark. A caret resting against the chip is still editing it, so a
+    /// chip drawn from that rule looked inert while the controls below were
+    /// pointed at it.
+    #[test]
+    fn the_chip_lights_up_exactly_when_the_controls_edit_it() {
+        let codex = AgentId::parse("codex").unwrap();
+        let mention = VibexUseMention::agent(
+            &codex,
+            &vibex_core::VibexUseRef::runtime_option("option_codex"),
+            Some("@Codex"),
+        );
+        let content = composer_content_with_mentions("@Codex rest", &[mention]);
+        let chip = content.tokens()[0].range();
+
+        for cursor in chip.clone() {
+            assert!(
+                delegation_chip_is_active(&chip, cursor),
+                "a caret at {cursor} inside {chip:?} edits the chip, so it must light up"
+            );
+            assert!(
+                delegation_edit_subject(content.tokens(), cursor).is_some(),
+                "the highlight and the subject must agree at {cursor}"
+            );
+        }
+        // The right edge is the caret after the last character: still editing.
+        assert!(delegation_chip_is_active(&chip, chip.end));
+        assert!(delegation_edit_subject(content.tokens(), chip.end).is_some());
+
+        // One byte past it is the separator, and both must agree it has left.
+        assert!(!delegation_chip_is_active(&chip, chip.end + 1));
+        assert!(delegation_edit_subject(content.tokens(), chip.end + 1).is_none());
+    }
+
     /// A new-session draft runs on the chip it names, tuning included.
     ///
     /// The page's own selection describes the Agent being started; the chip
@@ -102814,8 +103001,8 @@ mod tests {
         );
         assert_eq!(
             delegation_edit_subject(single.tokens(), chip.end + 1).and_then(|m| m.agent_id),
-            Some(codex.clone()),
-            "a caret just past the chip still edits it, so a freshly picked chip is tunable"
+            None,
+            "one byte past the chip is the separator: the caret has left it"
         );
 
         // The escape hatch: with one chip, moving the caret away returns the
@@ -102846,8 +103033,8 @@ mod tests {
         );
         assert_eq!(
             delegation_edit_subject(both.tokens(), second.end + 1).and_then(|m| m.agent_id),
-            Some(claude),
-            "the chip just picked stays tunable"
+            None,
+            "the separator past the last chip belongs to the sentence"
         );
         assert_eq!(
             delegation_edit_subject(both.tokens(), 20).and_then(|m| m.agent_id),
@@ -106765,7 +106952,9 @@ mod tests {
             let textarea = match self.agent_identity.clone() {
                 Some(identity) => textarea.token({
                     let agents = vec![("Claude Code".to_string(), identity)];
-                    move |context, _, cx| render_composer_inline_token(context, &agents, cx)
+                    // The probe pins the chip's own rendering, not the caret
+                    // rule, so it passes no active range.
+                    move |context, _, cx| render_composer_inline_token(context, &agents, None, cx)
                 }),
                 None => textarea,
             };
