@@ -633,14 +633,30 @@ impl ImChannelService {
             let Some(service) = this.upgrade() else {
                 break;
             };
-            if let Err(error) = service.handle_inbound(event).await {
+            if let Err(error) = service.handle_inbound(event.clone()).await {
                 tracing::warn!(
                     target: "vibex_im",
                     error_code = %error.code,
                     "IM inbound message handling failed"
                 );
+                service.reply_error(&event, &error).await;
             }
         }
+    }
+
+    async fn reply_error(&self, event: &ImInboundEvent, error: &VibexError) {
+        let Some(runtime) = self
+            .inner
+            .channels
+            .read()
+            .await
+            .get(&event.channel_id)
+            .cloned()
+        else {
+            return;
+        };
+        let text = format!("Vibex error ({}): {}", error.code, error.message);
+        let _ = self.reply(event, &runtime, &text).await;
     }
 
     async fn handle_inbound(&self, event: ImInboundEvent) -> VibexResult<()> {
