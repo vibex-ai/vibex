@@ -13,11 +13,14 @@ use ed25519_dalek::VerifyingKey;
 use semver::Version;
 use vibex_core::{
     InstalledPlugin, InstalledPluginStatus, PluginAutoUpdateRequest, PluginEnabledRequest,
-    PluginLocalInstallRequest, PluginMarketDetail, PluginMarketDetailRequest,
+    PluginLocalInstallRequest, PluginLocalReview, PluginMarketDetail, PluginMarketDetailRequest,
     PluginMarketIndexRequest, PluginMarketIndexResponse, PluginMarketInstallRequest,
     PluginMarketInstallResult, PluginMarketSearchRequest, PluginMarketSearchResponse,
-    PluginRollbackRequest, PluginUninstallRequest, PluginUpdateApplyRequest,
-    PluginUpdateCheckRequest, PluginUpdateCheckResponse, PluginVersionPinRequest, VibexResult,
+    PluginReviewClearRequest, PluginReviewSubmitRequest, PluginRollbackRequest,
+    PluginUninstallRequest, PluginUpdateApplyRequest, PluginUpdateCheckRequest,
+    PluginUpdateCheckResponse, PluginUserSource, PluginUserSourceAddRequest,
+    PluginUserSourceEnabledRequest, PluginUserSourceRemoveRequest, PluginVersionPinRequest,
+    VibexError, VibexResult, validate_plugin_review_rating,
 };
 use vibex_db::{PluginRepository, open_database};
 use vibex_plugin::{
@@ -110,6 +113,7 @@ impl PluginHandle {
             github: Some(vibex_plugin::GithubTopicSource::new(MarketHttpClient::new(
                 MarketUrlPolicy::Public,
             ))),
+            user_sources: self.market_user_sources(),
             cache: MarketCache::new(home.join("plugin-market")),
             index_ttl: vibex_plugin::market::INDEX_TTL,
             github_ttl: vibex_plugin::market::GITHUB_TTL,
@@ -122,6 +126,46 @@ impl PluginHandle {
             self.runtime.clone(),
             Version::parse(env!("CARGO_PKG_VERSION")).unwrap_or_else(|_| Version::new(0, 0, 0)),
         )
+    }
+
+    /// The catalogs the reader added, resolved for the catalog's own config.
+    ///
+    /// A source whose stored key is malformed is skipped rather than allowed
+    /// through unsigned: a broken key is a reason not to read the catalog, not
+    /// a reason to read it without checking anything.
+    fn market_user_sources(&self) -> Vec<vibex_plugin::market::UserSourceConfig> {
+        // `service()` must not call `connection()`, which calls `service()`;
+        // the sources are read through a plain connection of their own.
+        let Ok(connection) = open_database(&self.database_path) else {
+            return Vec::new();
+        };
+        let Ok(sources) = PluginRepository::list_enabled_sources(&connection) else {
+            return Vec::new();
+        };
+        sources
+            .into_iter()
+            .filter_map(|source| {
+                let url = url::Url::parse(&source.index_url).ok()?;
+                let public_key = match source.public_key.as_deref() {
+                    Some(key) => match vibex_plugin::market::decode_verifying_key(key) {
+                        Ok(key) => Some(key),
+                        Err(error) => {
+                            eprintln!(
+                                "vibex-plugin-market: the catalog `{}` has an invalid key: {error}",
+                                source.name
+                            );
+                            return None;
+                        }
+                    },
+                    None => None,
+                };
+                Some(vibex_plugin::market::UserSourceConfig {
+                    name: source.name,
+                    url,
+                    public_key,
+                })
+            })
+            .collect()
     }
 
     fn connection(&self) -> VibexResult<rusqlite::Connection> {
@@ -175,6 +219,73 @@ impl PluginHandle {
     /// one turned off in the Plugins page disappears.
     pub fn contributions(&self) -> VibexResult<Vec<vibex_core::PluginContribution>> {
         self.service().contributions(&self.connection()?)
+    }
+
+    /// The ratings this machine left, oldest first.
+    pub fn local_reviews(&self) -> VibexResult<Vec<PluginLocalReview>> {
+        PluginRepository::list_reviews(&self.connection()?)
+    }
+
+    /// Sets or replaces one rating.
+    pub fn submit_review(
+        &self,
+        request: PluginReviewSubmitRequest,
+    ) -> VibexResult<PluginLocalReview> {
+        validate_plugin_review_rating(request.rating)
+            .map_err(|message| VibexError::validation("plugin_review_rating_invalid", message))?;
+        let connection = self.connection()?;
+        let now = vibex_core::unix_timestamp_ms();
+        let review = PluginLocalReview {
+            plugin_id: request.plugin_id.clone(),
+            rating: request.rating,
+            updated_at_ms: now,
+        };
+        PluginRepository::upsert_review(&connection, &review, now)?;
+        PluginRepository::get_review(&connection, &request.plugin_id)?.ok_or_else(|| {
+            VibexError::storage(
+                "plugin_review_read_failed",
+                "the rating was written but could not be read back",
+            )
+        })
+    }
+
+    /// Clears one rating; `false` when there was none.
+    pub fn clear_review(&self, request: PluginReviewClearRequest) -> VibexResult<bool> {
+        PluginRepository::delete_review(&self.connection()?, &request.plugin_id)
+    }
+
+    // ---- catalogs the reader added ----
+
+    /// Every catalog the reader added, in the order they were added.
+    pub fn user_sources(&self) -> VibexResult<Vec<PluginUserSource>> {
+        self.service().user_sources(&self.connection()?)
+    }
+
+    /// Adds or updates one catalog the reader typed.
+    pub fn add_user_source(
+        &self,
+        request: PluginUserSourceAddRequest,
+    ) -> VibexResult<PluginUserSource> {
+        self.service()
+            .add_user_source(&self.connection()?, &request)
+    }
+
+    /// Turns one catalog on or off; `false` when there was no such catalog.
+    pub fn set_user_source_enabled(
+        &self,
+        request: PluginUserSourceEnabledRequest,
+    ) -> VibexResult<bool> {
+        self.service().set_user_source_enabled(
+            &self.connection()?,
+            &request.source_id,
+            request.enabled,
+        )
+    }
+
+    /// Removes one catalog; `false` when there was none.
+    pub fn remove_user_source(&self, request: PluginUserSourceRemoveRequest) -> VibexResult<bool> {
+        self.service()
+            .remove_user_source(&self.connection()?, &request.source_id)
     }
 
     pub fn set_enabled(&self, request: PluginEnabledRequest) -> VibexResult<InstalledPlugin> {

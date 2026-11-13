@@ -99,11 +99,13 @@ pub struct ManagementProfileSelectionRequest {
 
 use vibex_core::{
     InstalledPlugin, PluginAutoUpdateRequest, PluginEnabledRequest, PluginLocalInstallRequest,
-    PluginMarketDetail, PluginMarketDetailRequest, PluginMarketIndexRequest,
+    PluginLocalReview, PluginMarketDetail, PluginMarketDetailRequest, PluginMarketIndexRequest,
     PluginMarketIndexResponse, PluginMarketInstallRequest, PluginMarketInstallResult,
-    PluginMarketSearchRequest, PluginMarketSearchResponse, PluginRollbackRequest,
-    PluginUninstallRequest, PluginUpdateApplyRequest, PluginUpdateCheckRequest,
-    PluginUpdateCheckResponse, PluginVersionPinRequest, RightRailWebPanel,
+    PluginMarketSearchRequest, PluginMarketSearchResponse, PluginReviewClearRequest,
+    PluginReviewSubmitRequest, PluginRollbackRequest, PluginUninstallRequest,
+    PluginUpdateApplyRequest, PluginUpdateCheckRequest, PluginUpdateCheckResponse,
+    PluginUserSource, PluginUserSourceAddRequest, PluginUserSourceEnabledRequest,
+    PluginUserSourceRemoveRequest, PluginVersionPinRequest, RightRailWebPanel,
     RightRailWebPanelAddRequest, RightRailWebPanelRemoveRequest,
 };
 
@@ -980,5 +982,36 @@ pub trait ManagementBackend: BackendBound {
     fn remove_right_rail_web_panel(
         &self,
         request: MutationRequest<RightRailWebPanelRemoveRequest>,
+    ) -> BackendFuture<'_, bool>;
+
+    /// The ratings this machine left for plugins.
+    fn plugin_local_reviews(&self) -> BackendFuture<'_, Vec<PluginLocalReview>>;
+
+    fn submit_plugin_review(
+        &self,
+        request: MutationRequest<PluginReviewSubmitRequest>,
+    ) -> BackendFuture<'_, PluginLocalReview>;
+
+    fn clear_plugin_review(
+        &self,
+        request: MutationRequest<PluginReviewClearRequest>,
+    ) -> BackendFuture<'_, bool>;
+
+    /// The catalogs the reader added themselves.
+    fn plugin_user_sources(&self) -> BackendFuture<'_, Vec<PluginUserSource>>;
+
+    fn add_plugin_user_source(
+        &self,
+        request: MutationRequest<PluginUserSourceAddRequest>,
+    ) -> BackendFuture<'_, PluginUserSource>;
+
+    fn set_plugin_user_source_enabled(
+        &self,
+        request: MutationRequest<PluginUserSourceEnabledRequest>,
+    ) -> BackendFuture<'_, bool>;
+
+    fn remove_plugin_user_source(
+        &self,
+        request: MutationRequest<PluginUserSourceRemoveRequest>,
     ) -> BackendFuture<'_, bool>;
 }

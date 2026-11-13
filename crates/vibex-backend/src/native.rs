@@ -5439,6 +5439,92 @@ impl ManagementBackend for NativeBackend {
                 .map_err(Into::into)
         })
     }
+
+    fn plugin_local_reviews(&self) -> BackendFuture<'_, Vec<vibex_core::PluginLocalReview>> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime.plugins().local_reviews().map_err(Into::into)
+        })
+    }
+
+    fn submit_plugin_review(
+        &self,
+        request: MutationRequest<vibex_core::PluginReviewSubmitRequest>,
+    ) -> BackendFuture<'_, vibex_core::PluginLocalReview> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .plugins()
+                .submit_review(request.payload)
+                .map_err(Into::into)
+        })
+    }
+
+    fn clear_plugin_review(
+        &self,
+        request: MutationRequest<vibex_core::PluginReviewClearRequest>,
+    ) -> BackendFuture<'_, bool> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .plugins()
+                .clear_review(request.payload)
+                .map_err(Into::into)
+        })
+    }
+
+    fn plugin_user_sources(&self) -> BackendFuture<'_, Vec<vibex_core::PluginUserSource>> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime.plugins().user_sources().map_err(Into::into)
+        })
+    }
+
+    fn add_plugin_user_source(
+        &self,
+        request: MutationRequest<vibex_core::PluginUserSourceAddRequest>,
+    ) -> BackendFuture<'_, vibex_core::PluginUserSource> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .plugins()
+                .add_user_source(request.payload)
+                .map_err(Into::into)
+        })
+    }
+
+    fn set_plugin_user_source_enabled(
+        &self,
+        request: MutationRequest<vibex_core::PluginUserSourceEnabledRequest>,
+    ) -> BackendFuture<'_, bool> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .plugins()
+                .set_user_source_enabled(request.payload)
+                .map_err(Into::into)
+        })
+    }
+
+    fn remove_plugin_user_source(
+        &self,
+        request: MutationRequest<vibex_core::PluginUserSourceRemoveRequest>,
+    ) -> BackendFuture<'_, bool> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .plugins()
+                .remove_user_source(request.payload)
+                .map_err(Into::into)
+        })
+    }
 }
 
 fn map_relay_state(state: RelayClientConnectionState) -> RelayConnectionState {

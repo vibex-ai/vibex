@@ -2081,6 +2081,49 @@ mod tests {
             error_future()
         }
 
+        fn plugin_local_reviews(&self) -> BackendFuture<'_, Vec<vibex_core::PluginLocalReview>> {
+            error_future()
+        }
+
+        fn submit_plugin_review(
+            &self,
+            _request: MutationRequest<vibex_core::PluginReviewSubmitRequest>,
+        ) -> BackendFuture<'_, vibex_core::PluginLocalReview> {
+            error_future()
+        }
+
+        fn clear_plugin_review(
+            &self,
+            _request: MutationRequest<vibex_core::PluginReviewClearRequest>,
+        ) -> BackendFuture<'_, bool> {
+            error_future()
+        }
+
+        fn plugin_user_sources(&self) -> BackendFuture<'_, Vec<vibex_core::PluginUserSource>> {
+            error_future()
+        }
+
+        fn add_plugin_user_source(
+            &self,
+            _request: MutationRequest<vibex_core::PluginUserSourceAddRequest>,
+        ) -> BackendFuture<'_, vibex_core::PluginUserSource> {
+            error_future()
+        }
+
+        fn set_plugin_user_source_enabled(
+            &self,
+            _request: MutationRequest<vibex_core::PluginUserSourceEnabledRequest>,
+        ) -> BackendFuture<'_, bool> {
+            error_future()
+        }
+
+        fn remove_plugin_user_source(
+            &self,
+            _request: MutationRequest<vibex_core::PluginUserSourceRemoveRequest>,
+        ) -> BackendFuture<'_, bool> {
+            error_future()
+        }
+
         fn model_capability_suggestion(
             &self,
             _request: vibex_core::ModelCapabilitySuggestionRequest,

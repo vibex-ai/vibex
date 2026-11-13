@@ -7419,6 +7419,70 @@ impl ManagementBackend for WebRemoteBackend {
             "The right rail's web panels belong to the local desktop",
         )
     }
+
+    fn plugin_local_reviews(&self) -> BackendFuture<'_, Vec<vibex_core::PluginLocalReview>> {
+        self.unsupported(
+            "plugin_remote_unsupported",
+            "Plugin management belongs to the local desktop runtime",
+        )
+    }
+
+    fn submit_plugin_review(
+        &self,
+        _request: MutationRequest<vibex_core::PluginReviewSubmitRequest>,
+    ) -> BackendFuture<'_, vibex_core::PluginLocalReview> {
+        self.unsupported(
+            "plugin_remote_unsupported",
+            "Plugin management belongs to the local desktop runtime",
+        )
+    }
+
+    fn clear_plugin_review(
+        &self,
+        _request: MutationRequest<vibex_core::PluginReviewClearRequest>,
+    ) -> BackendFuture<'_, bool> {
+        self.unsupported(
+            "plugin_remote_unsupported",
+            "Plugin management belongs to the local desktop runtime",
+        )
+    }
+
+    fn plugin_user_sources(&self) -> BackendFuture<'_, Vec<vibex_core::PluginUserSource>> {
+        self.unsupported(
+            "plugin_remote_unsupported",
+            "Plugin management belongs to the local desktop runtime",
+        )
+    }
+
+    fn add_plugin_user_source(
+        &self,
+        _request: MutationRequest<vibex_core::PluginUserSourceAddRequest>,
+    ) -> BackendFuture<'_, vibex_core::PluginUserSource> {
+        self.unsupported(
+            "plugin_remote_unsupported",
+            "Plugin management belongs to the local desktop runtime",
+        )
+    }
+
+    fn set_plugin_user_source_enabled(
+        &self,
+        _request: MutationRequest<vibex_core::PluginUserSourceEnabledRequest>,
+    ) -> BackendFuture<'_, bool> {
+        self.unsupported(
+            "plugin_remote_unsupported",
+            "Plugin management belongs to the local desktop runtime",
+        )
+    }
+
+    fn remove_plugin_user_source(
+        &self,
+        _request: MutationRequest<vibex_core::PluginUserSourceRemoveRequest>,
+    ) -> BackendFuture<'_, bool> {
+        self.unsupported(
+            "plugin_remote_unsupported",
+            "Plugin management belongs to the local desktop runtime",
+        )
+    }
 }
 
 impl DeviceBackend for WebRemoteBackend {
