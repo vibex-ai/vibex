@@ -2156,6 +2156,13 @@ mod tests {
     }
 
     #[test]
+    fn topic_title_is_bounded_and_prefixed() {
+        let title = topic_title(&"x".repeat(300));
+        assert!(title.starts_with("Vibex · "));
+        assert!(title.chars().count() <= 128);
+    }
+
+    #[test]
     fn pairing_code_shape_is_stable() {
         let code = generate_pairing_code();
         assert_eq!(code.len(), 15);

@@ -34,6 +34,7 @@ pub struct ImChannelsView {
     lark_app_id_input: Entity<InputState>,
     lark_app_secret_input: Entity<InputState>,
     lark_chat_input: Entity<InputState>,
+    telegram_topic_mode: bool,
     channels: Vec<ImChannelSummary>,
     selected: Option<ImChannelId>,
     principals: Vec<ImPrincipalSummary>,
@@ -72,6 +73,7 @@ impl ImChannelsView {
             lark_app_id_input,
             lark_app_secret_input,
             lark_chat_input,
+            telegram_topic_mode: false,
             channels: Vec::new(),
             selected: None,
             principals: Vec::new(),
@@ -307,6 +309,7 @@ impl ImChannelsView {
         let name = self.name_input.read(cx).value().to_string();
         let token = self.token_input.read(cx).value().to_string();
         let chat_id = self.chat_input.read(cx).value().to_string();
+        let topic_mode = self.telegram_topic_mode;
         if name.trim().is_empty() || token.trim().is_empty() || chat_id.trim().is_empty() {
             self.error = Some("Name, bot token, and chat id are required.".to_string());
             cx.notify();
@@ -325,7 +328,7 @@ impl ImChannelsView {
                 display_name: name.trim().to_string(),
                 config: ImChannelConfig::Telegram(ImTelegramConfig {
                     chat_id: chat_id.trim().to_string(),
-                    topic_mode: false,
+                    topic_mode,
                     require_mention_in_groups: true,
                 }),
                 default_session: None,
@@ -699,6 +702,26 @@ impl Render for ImChannelsView {
                     .child(Input::new(&self.chat_input).small().w_full()),
             )
             .child(Input::new(&self.token_input).small().w_full())
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        Switch::new("im-telegram-topic-mode")
+                            .small()
+                            .checked(self.telegram_topic_mode)
+                            .on_click(cx.listener(|this, enabled, _, cx| {
+                                this.telegram_topic_mode = *enabled;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(muted)
+                            .child("Forum topic mode: create one topic per /new session. The bot must be a forum admin."),
+                    ),
+            )
             .child(
                 h_flex()
                     .justify_between()
