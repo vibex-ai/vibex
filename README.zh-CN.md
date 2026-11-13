@@ -431,6 +431,16 @@ pnpm check:mobile-native   # 移动端 crate 与原生项目契约
 
 ---
 
+## Star 历史
+
+<a href="https://www.star-history.com/?repos=vibex-ai%2Fvibex&type=date&legend=bottom-right">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=vibex-ai/vibex&type=date&theme=dark&legend=bottom-right" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=vibex-ai/vibex&type=date&legend=bottom-right" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=vibex-ai/vibex&type=date&legend=bottom-right" />
+ </picture>
+</a>
+
 ## 参与贡献
 感谢每一位为 Vibex 提供帮助的开发者，使用中存在问题时欢迎提交 Issue 和 Pull Request
 
