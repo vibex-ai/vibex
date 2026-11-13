@@ -46,7 +46,7 @@ use gpui::{
     WindowControls, WindowDecorations, WindowId, WindowKind, WindowOptions, div, img,
     linear_color_stop, linear_gradient, point, prelude::*, px, relative, rgb, size,
 };
-use gpui_base::text::MarkdownExtensions;
+use gpui_base::{TextSelection, text::MarkdownExtensions};
 use gpui_component::{
     ActiveTheme as _, ColorName, Colorize as _, Disableable as _, ElementExt as _, Icon, IconName,
     IndexPath, InteractiveElementExt as _, Root, Selectable as _, Sizable as _, StyledExt as _,
@@ -207,9 +207,9 @@ use vibex_ui::{
 
 use crate::markdown::{
     MarkdownLinkKind, MarkdownPresentation, RangeHighlight, RenderedText, TextView, TextViewState,
-    escape_markdown_literal, is_file_url, is_windows_drive_path, local_file_path, markdown_link_kind,
-    plain_text as markdown_plain_text, resolve_workspace_path, resources as markdown_resources,
-    text_view_style, utf8_prefix,
+    escape_markdown_literal, is_file_url, is_windows_drive_path, local_file_path,
+    markdown_link_kind, plain_text as markdown_plain_text, resolve_workspace_path,
+    resources as markdown_resources, text_view_style, utf8_prefix,
 };
 use crate::typography::{apply_code_font_weight, apply_terminal_visuals, code_font_weight};
 
@@ -7526,6 +7526,67 @@ enum UserMessageEditActionState {
     Hidden,
     Disabled,
     Enabled,
+}
+
+#[derive(Clone)]
+struct UserMessageMenuContext {
+    row: TimelineRow,
+    row_id: String,
+    session_id: Option<VibexSessionId>,
+    turn_id: Option<String>,
+    first_sequence: i64,
+    last_sequence: i64,
+    authoritative_end_sequence: i64,
+    latest_user_message: bool,
+    turn_complete: bool,
+    edit_action_state: UserMessageEditActionState,
+    row_is_live_view: bool,
+    child_session: Option<String>,
+    copy_item: ClipboardItem,
+    attachments: Vec<MessageAttachment>,
+    mentions: Vec<VibexUseMention>,
+    timestamp: Option<i64>,
+}
+
+#[derive(Clone)]
+struct AgentMessageMenuContext {
+    row: TimelineRow,
+    row_id: String,
+    session_id: Option<VibexSessionId>,
+    turn_id: Option<String>,
+    last_sequence: i64,
+    streaming: bool,
+    foldable: bool,
+    row_is_live_view: bool,
+    child_session: Option<String>,
+    timestamp: Option<i64>,
+}
+
+#[derive(Clone)]
+struct TurnMenuContext {
+    turn_id: String,
+    session_id: Option<VibexSessionId>,
+    fork_sequence: i64,
+    process_collapsible: bool,
+    process_expanded: bool,
+    row_is_live_view: bool,
+    fork_disabled: bool,
+}
+
+#[derive(Clone)]
+struct SelectionMenuContext {
+    text: String,
+    markdown: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActivityCopyMode {
+    Primary,
+    Input,
+    Output,
+    Details,
+    Diff,
+    Path,
 }
 
 #[derive(Clone)]
@@ -62789,6 +62850,7 @@ impl VibexWorkbench {
             .when(!turns.is_empty(), |this| {
                 this.child(
                     v_flex()
+                        .id("agent-timeline-context")
                         .size_full()
                         .min_h_0()
                         .min_w_0()
@@ -62936,7 +62998,18 @@ impl VibexWorkbench {
                             .py_4()
                             .gap_0(),
                         )
-                        .pinned_scrollbar(&self.timeline_scroll, ScrollbarAxis::Vertical),
+                        .pinned_scrollbar(&self.timeline_scroll, ScrollbarAxis::Vertical)
+                        .context_menu({
+                            let menu_entity = cx.weak_entity();
+                            move |menu, _, cx| {
+                                let Some(entity) = menu_entity.upgrade() else {
+                                    return menu;
+                                };
+                                entity.update(cx, |this, _| {
+                                    this.build_timeline_context_menu(menu, menu_entity.clone())
+                                })
+                            }
+                        }),
                 )
             });
         let runtime_controls = self.render_runtime_controls(live_session_id.as_ref(), cx);
@@ -65631,7 +65704,41 @@ impl VibexWorkbench {
             content = content.child(file_changes);
         }
 
-        content.into_any_element()
+        let fork_sequence = turn
+            .conclusion_row
+            .as_ref()
+            .map(|row| row.last_sequence)
+            .or_else(|| turn.process_rows.last().map(|row| row.last_sequence))
+            .or_else(|| turn.user_row.as_ref().map(|row| row.last_sequence))
+            .unwrap_or(0);
+        let menu_entity = cx.weak_entity();
+        let menu_context = TurnMenuContext {
+            turn_id: turn.id.clone(),
+            session_id: self.timeline.session_id.clone(),
+            fork_sequence,
+            process_collapsible,
+            process_expanded,
+            row_is_live_view: self.timeline.session_id.as_ref() == self.view_session_id.as_ref(),
+            fork_disabled: self.agent_action_pending
+                || self.fork_session_pending
+                || self.timeline.needs_authoritative_refetch,
+        };
+        // The child Agent rail reads a transcript that is not the borrowed view,
+        // so its turn commands would copy or toggle the focused session's turn.
+        // The rail keeps the per-message copy and quote menus instead.
+        if self.rendering_child_agent_timeline() {
+            return content.into_any_element();
+        }
+        content
+            .context_menu(move |menu, _, cx| {
+                let Some(entity) = menu_entity.upgrade() else {
+                    return menu;
+                };
+                entity.update(cx, |this, _| {
+                    this.build_turn_context_menu(menu, menu_entity.clone(), menu_context.clone())
+                })
+            })
+            .into_any_element()
     }
 
     fn render_turn_file_changes_card(
@@ -67186,6 +67293,43 @@ impl VibexWorkbench {
         } else {
             element
         };
+        // Process rows in the child Agent rail belong to a transcript that is
+        // not the borrowed view, so the activity menu could not read the row it
+        // was opened on. The rail stays read-only for process lines.
+        let element = if self.rendering_child_agent_timeline()
+            || matches!(
+                row.kind,
+                TimelineRowKind::UserMessage | TimelineRowKind::AgentMessage
+            ) {
+            element
+        } else {
+            let menu_entity = cx.weak_entity();
+            let menu_row_id = row.id.clone();
+            let menu_row_is_live_view =
+                self.timeline.session_id.as_ref() == self.view_session_id.as_ref();
+            div()
+                .id(format!("timeline-row-context:{}", row.id))
+                .w_full()
+                .min_w_0()
+                .context_menu(move |menu, window, cx| {
+                    let Some(entity) = menu_entity.upgrade() else {
+                        return menu;
+                    };
+                    let row_id = menu_row_id.clone();
+                    entity.update(cx, |this, cx| {
+                        this.build_activity_context_menu(
+                            menu,
+                            window,
+                            cx,
+                            menu_entity.clone(),
+                            row_id,
+                            menu_row_is_live_view,
+                        )
+                    })
+                })
+                .child(element)
+                .into_any_element()
+        };
         self.highlight_session_search_rows(std::slice::from_ref(row), element, cx)
     }
 
@@ -67768,6 +67912,1281 @@ impl VibexWorkbench {
         if let Some(body) = body {
             cx.write_to_clipboard(ClipboardItem::new_string(body));
         }
+    }
+
+    /// The row with `row_id` in the conversation this view is drawing.
+    fn timeline_row_by_id(&self, row_id: &str) -> Option<&TimelineRow> {
+        self.conversation_turns_cache.iter().find_map(|turn| {
+            turn.user_row
+                .as_ref()
+                .filter(|row| row.id == row_id)
+                .or_else(|| turn.process_rows.iter().find(|row| row.id == row_id))
+                .or_else(|| turn.conclusion_row.as_ref().filter(|row| row.id == row_id))
+        })
+    }
+
+    /// Copy the conversation as prose: user messages and Agent answers only.
+    ///
+    /// Process rows are deliberately left out. A reader asking for the
+    /// conversation wants a transcript they can paste into an issue or a
+    /// document, not every command the Agent ran on the way there.
+    fn copy_conversation(&mut self, cx: &mut Context<Self>) {
+        let title = self
+            .view_session()
+            .map(|session| session.title.trim().to_string())
+            .filter(|title| !title.is_empty());
+        let turns = self.conversation_turns_cached();
+        let mut out = String::new();
+        if let Some(title) = title {
+            out.push_str("# ");
+            out.push_str(&title);
+            out.push_str("\n\n");
+        }
+        for turn in turns.iter() {
+            if let Some(row) = turn.user_row.as_ref() {
+                push_conversation_row(&mut out, "You", &row.body);
+            }
+            if let Some(row) = turn.conclusion_row.as_ref() {
+                push_conversation_row(&mut out, "Agent", &row.body);
+            }
+        }
+        if !out.trim().is_empty() {
+            cx.write_to_clipboard(ClipboardItem::new_string(out.trim_end().to_string()));
+        }
+    }
+
+    /// Copy one turn's user message and final answer.
+    fn copy_turn(&mut self, turn_id: &str, cx: &mut Context<Self>) {
+        let turns = self.conversation_turns_cached();
+        let Some(turn) = turns.iter().find(|turn| turn.id == turn_id) else {
+            return;
+        };
+        let mut out = String::new();
+        if let Some(row) = turn.user_row.as_ref() {
+            push_conversation_row(&mut out, "You", &row.body);
+        }
+        if let Some(row) = turn.conclusion_row.as_ref() {
+            push_conversation_row(&mut out, "Agent", &row.body);
+        }
+        if !out.trim().is_empty() {
+            cx.write_to_clipboard(ClipboardItem::new_string(out.trim_end().to_string()));
+        }
+    }
+
+    /// Insert `text` as a Markdown blockquote at the composer caret.
+    ///
+    /// The quote is inserted rather than replacing the draft: a reader can
+    /// select a paragraph, quote it, and keep writing around it. The composer
+    /// keeps the keyboard afterwards so the follow-up can be typed straight
+    /// away.
+    fn quote_in_composer(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let quoted = context_menu_blockquote(text);
+        if quoted.is_empty() {
+            return;
+        }
+        let input = self.ensure_composer_input(window, cx);
+        let existing = input.read(cx).value().to_string();
+        let prefix = if existing.trim().is_empty() || existing.ends_with("\n\n") {
+            ""
+        } else if existing.ends_with('\n') {
+            "\n"
+        } else {
+            "\n\n"
+        };
+        let insertion = format!("{prefix}{quoted}\n\n");
+        input.update(cx, |input, cx| {
+            input.insert(insertion, window, cx);
+            input.focus(window, cx);
+        });
+        cx.notify();
+    }
+
+    /// Open the conversation find bar, optionally seeded with a query.
+    fn open_conversation_find_with_query(
+        &mut self,
+        query: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.conversation_context_active() {
+            return;
+        }
+        self.conversation_find_open = true;
+        self.conversation_find.update(cx, |input, cx| {
+            if let Some(query) = query.as_ref().filter(|query| !query.trim().is_empty()) {
+                input.set_value(query.clone(), window, cx);
+            }
+            input.focus(window, cx);
+        });
+        self.reveal_active_conversation_find_match(cx);
+        cx.notify();
+    }
+
+    /// The Markdown source behind a selection that stays inside one surface.
+    ///
+    /// A selection spanning rows has no single source range, so it copies as
+    /// plain text. User messages are escaped for rendering, so their source is
+    /// not useful as Markdown and they are deliberately excluded by the caller.
+    fn selected_markdown_source(
+        &self,
+        child_session: Option<&str>,
+        prefixes: &[String],
+        window_text: &str,
+        cx: &App,
+    ) -> Option<String> {
+        let table = match child_session {
+            Some(session_id) => self.child_agent_markdown_states.get(session_id)?,
+            None => &self.markdown_text_states,
+        };
+        let mut matches = 0;
+        let mut source = None;
+        for (id, entry) in table {
+            if !markdown_surface_matches(id, prefixes) {
+                continue;
+            }
+            let (selected, range) = {
+                let state = entry.state.read(cx);
+                (state.selected_text(), state.selected_source_range())
+            };
+            if selected.is_empty() {
+                continue;
+            }
+            matches += 1;
+            if selected.trim() != window_text.trim() {
+                continue;
+            }
+            if let Some(range) = range
+                && let Some(text) = entry.source.get(range)
+            {
+                source = Some(text.to_string());
+            }
+        }
+        (matches == 1).then_some(source).flatten()
+    }
+
+    /// Whether the right-clicked row participates in the current selection.
+    fn row_has_markdown_selection(
+        &self,
+        child_session: Option<&str>,
+        prefixes: &[String],
+        cx: &App,
+    ) -> bool {
+        let table = match child_session {
+            Some(session_id) => self.child_agent_markdown_states.get(session_id),
+            None => Some(&self.markdown_text_states),
+        };
+        table.is_some_and(|table| {
+            table.iter().any(|(id, entry)| {
+                markdown_surface_matches(id, prefixes)
+                    && !entry.state.read(cx).selected_text().is_empty()
+            })
+        })
+    }
+
+    /// The shared readable detail projection behind an activity row.
+    fn activity_details(&self, row: &TimelineRow) -> Vec<vibex_ui::tool_detail::Detail> {
+        let payload = self.timeline_row_latest_item(row).map(|item| &item.payload);
+        let workspace_root = self
+            .view_session()
+            .map(|session| session.workspace_root.as_str());
+        vibex_ui::tool_detail::project(
+            row,
+            payload,
+            workspace_root,
+            locale::current_locale().shared(),
+        )
+    }
+
+    /// Copy the text an activity row is asking about.
+    fn copy_activity_text(&mut self, row_id: &str, mode: ActivityCopyMode, cx: &mut Context<Self>) {
+        let Some(row) = self.timeline_row_by_id(row_id).cloned() else {
+            return;
+        };
+        let payload = self
+            .timeline_row_latest_item(&row)
+            .map(|item| item.payload.clone());
+        let details = self.activity_details(&row);
+        let text = match mode {
+            ActivityCopyMode::Primary => match payload.as_ref() {
+                Some(TimelinePayload::Command(command)) => command.command.clone(),
+                Some(TimelinePayload::FileOperation(operation)) => operation.path.clone(),
+                _ => row.body.clone(),
+            },
+            ActivityCopyMode::Path => match payload.as_ref() {
+                Some(TimelinePayload::FileOperation(operation)) => operation.path.clone(),
+                _ => row.body.clone(),
+            },
+            ActivityCopyMode::Diff => match payload.as_ref() {
+                Some(TimelinePayload::FileOperation(operation)) => operation
+                    .canonical_patch()
+                    .map(|patch| patch.text)
+                    .unwrap_or_default(),
+                _ => String::new(),
+            },
+            ActivityCopyMode::Output => match payload.as_ref() {
+                Some(TimelinePayload::Command(command)) => timeline_tool_detail::output(
+                    command.raw_extension.as_ref(),
+                    command.output_summary.as_deref(),
+                    command.exit_code,
+                )
+                .unwrap_or_default(),
+                Some(TimelinePayload::ToolCall(_)) | Some(TimelinePayload::WebSearch(_)) => {
+                    let label = locale::text("Output", "输出", "輸出");
+                    details
+                        .iter()
+                        .find(|detail| detail.label() == label)
+                        .map(|detail| detail.text())
+                        .unwrap_or_default()
+                }
+                _ => String::new(),
+            },
+            ActivityCopyMode::Input => match payload.as_ref() {
+                Some(TimelinePayload::Command(command)) => command.command.clone(),
+                Some(TimelinePayload::ToolCall(_)) | Some(TimelinePayload::WebSearch(_)) => {
+                    let label = locale::text("Input", "输入", "輸入");
+                    details
+                        .iter()
+                        .find(|detail| detail.label() == label)
+                        .map(|detail| detail.copy_text())
+                        .unwrap_or_default()
+                }
+                _ => String::new(),
+            },
+            ActivityCopyMode::Details => {
+                let text = vibex_ui::tool_detail::text(&details);
+                if text.trim().is_empty() {
+                    row.body.clone()
+                } else {
+                    text
+                }
+            }
+        };
+        if !text.trim().is_empty() {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        }
+    }
+
+    /// The selection a right-click on `row` should act on, if any.
+    fn selection_menu_context_for_row(
+        &self,
+        window: &mut Window,
+        cx: &mut App,
+        child_session: Option<&str>,
+        prefixes: &[String],
+        allow_markdown: bool,
+    ) -> Option<SelectionMenuContext> {
+        if !TextSelection::has_selection(window, cx)
+            || !TextSelection::is_selectable_at(window.mouse_position(), window, cx)
+        {
+            return None;
+        }
+        let text = TextSelection::selected_text(window, cx);
+        if text.trim().is_empty() || !self.row_has_markdown_selection(child_session, prefixes, cx) {
+            return None;
+        }
+        let markdown = allow_markdown
+            .then(|| self.selected_markdown_source(child_session, prefixes, &text, cx))
+            .flatten();
+        Some(SelectionMenuContext { text, markdown })
+    }
+
+    fn build_selection_context_menu(
+        &mut self,
+        menu: PopupMenu,
+        entity: WeakEntity<Self>,
+        selection: SelectionMenuContext,
+    ) -> PopupMenu {
+        let count = selection.text.chars().count();
+        let mut menu = menu
+            .min_w(px(220.0))
+            .max_w(px(320.0))
+            .item(PopupMenuItem::label(selection_menu_header(count)))
+            .separator();
+
+        let copy_text = selection.text.clone();
+        menu = menu.item(
+            PopupMenuItem::new(locale::text("Copy", "复制", "複製"))
+                .icon(IconName::Copy)
+                .on_click(move |_, _, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(copy_text.clone()));
+                }),
+        );
+
+        if let Some(markdown) = selection.markdown.clone() {
+            menu = menu.item(
+                PopupMenuItem::new(locale::text(
+                    "Copy as Markdown",
+                    "复制为 Markdown",
+                    "複製為 Markdown",
+                ))
+                .on_click(move |_, _, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(markdown.clone()));
+                }),
+            );
+        }
+
+        let quote_entity = entity.clone();
+        let quote_text = selection
+            .markdown
+            .clone()
+            .unwrap_or_else(|| selection.text.clone());
+        menu = menu.item(
+            PopupMenuItem::new(locale::text(
+                "Quote in Composer",
+                "引用到输入框",
+                "引用到輸入框",
+            ))
+            .on_click(move |_, window, cx| {
+                let text = quote_text.clone();
+                let _ = quote_entity.update(cx, |this, cx| {
+                    this.quote_in_composer(&text, window, cx);
+                });
+            }),
+        );
+
+        let find_entity = entity.clone();
+        let find_query = selection_find_query(&selection.text);
+        menu = menu.separator().item(
+            PopupMenuItem::new(locale::text(
+                "Find in Conversation",
+                "在会话中查找",
+                "在工作階段中尋找",
+            ))
+            .icon(IconName::Search)
+            .disabled(find_query.is_empty())
+            .on_click(move |_, window, cx| {
+                let query = find_query.clone();
+                let _ = find_entity.update(cx, |this, cx| {
+                    this.open_conversation_find_with_query(Some(query), window, cx);
+                });
+            }),
+        );
+
+        if let Some(url) = single_external_url(&selection.text) {
+            menu = menu.item(
+                PopupMenuItem::new(locale::text("Open Link", "打开链接", "開啟連結")).on_click(
+                    move |_, _, cx| {
+                        cx.open_url(&url);
+                    },
+                ),
+            );
+        }
+
+        menu
+    }
+
+    fn build_user_message_context_menu(
+        &mut self,
+        menu: PopupMenu,
+        window: &mut Window,
+        cx: &mut App,
+        entity: WeakEntity<Self>,
+        context: UserMessageMenuContext,
+    ) -> PopupMenu {
+        let prefixes = vec![format!("user-message-text:{}", context.row_id)];
+        if let Some(selection) = self.selection_menu_context_for_row(
+            window,
+            cx,
+            context.child_session.as_deref(),
+            &prefixes,
+            false,
+        ) {
+            return self.build_selection_context_menu(menu, entity, selection);
+        }
+
+        let has_body = !context.row.body.trim().is_empty();
+        let has_attachments = !context.attachments.is_empty();
+        let timestamp = context.timestamp;
+        let locale = self.resolved_locale();
+        let mut header = locale::text("You", "你", "你").to_string();
+        if let Some(timestamp) = timestamp {
+            header.push_str(" · ");
+            header.push_str(&format_timeline_hover_time(timestamp, locale));
+        }
+        if !context.row_is_live_view {
+            header.push_str(" · ");
+            header.push_str(locale::text("Read only", "只读", "唯讀"));
+        }
+
+        let mut menu = menu
+            .min_w(px(220.0))
+            .max_w(px(320.0))
+            .item(PopupMenuItem::label(header))
+            .separator();
+
+        if has_body || has_attachments {
+            let copy_item = context.copy_item.clone();
+            menu = menu.item(
+                PopupMenuItem::new(locale::text("Copy", "复制", "複製"))
+                    .icon(IconName::Copy)
+                    .on_click(move |_, _, cx| {
+                        cx.write_to_clipboard(copy_item.clone());
+                    }),
+            );
+        }
+
+        if has_body {
+            let quote_entity = entity.clone();
+            let quote_text = context.row.body.clone();
+            menu = menu.item(
+                PopupMenuItem::new(locale::text(
+                    "Quote in Composer",
+                    "引用到输入框",
+                    "引用到輸入框",
+                ))
+                .on_click(move |_, window, cx| {
+                    let text = quote_text.clone();
+                    let _ = quote_entity.update(cx, |this, cx| {
+                        this.quote_in_composer(&text, window, cx);
+                    });
+                }),
+            );
+        }
+
+        let fork_disabled = self.agent_action_pending
+            || self.fork_session_pending
+            || self.timeline.needs_authoritative_refetch
+            || !context.turn_complete;
+        let show_fork =
+            context.session_id.is_some() && context.row_is_live_view && context.last_sequence > 0;
+        let show_edit = context.latest_user_message
+            && context.row_is_live_view
+            && context.edit_action_state != UserMessageEditActionState::Hidden;
+
+        if show_fork || show_edit {
+            menu = menu.separator();
+        }
+        if show_fork {
+            let fork_entity = entity.clone();
+            let fork_session_id = context.session_id.clone();
+            let fork_sequence = context.last_sequence;
+            menu = menu.item(
+                PopupMenuItem::new(locale::text("Fork from Here", "从此处分叉", "從此處分支"))
+                    .icon(Icon::default().path("icons/vibex/git-branch.svg"))
+                    .disabled(fork_disabled)
+                    .on_click(move |_, window, cx| {
+                        let Some(session_id) = fork_session_id.clone() else {
+                            return;
+                        };
+                        let _ = fork_entity.update(cx, |this, cx| {
+                            this.fork_session_at(session_id, fork_sequence, window, cx);
+                        });
+                    }),
+            );
+        }
+        if show_edit {
+            if show_fork {
+                menu = menu.separator();
+            }
+            let edit_entity = entity.clone();
+            let edit_row_id = context.row.id.clone();
+            let edit_turn_id = context
+                .turn_id
+                .clone()
+                .unwrap_or_else(|| context.row.id.clone());
+            let edit_session_id = context.session_id.clone();
+            let edit_user_sequence = context.first_sequence;
+            let edit_end_sequence = context.authoritative_end_sequence;
+            let edit_body = context.row.body.clone();
+            let edit_attachments = context.attachments.clone();
+            let edit_mentions = context.mentions.clone();
+            menu = menu.item(
+                PopupMenuItem::new(locale::text(
+                    "Edit and Resend",
+                    "编辑并重新发送",
+                    "編輯並重新傳送",
+                ))
+                .icon(Icon::default().path("icons/vibex/pencil.svg"))
+                .disabled(context.edit_action_state != UserMessageEditActionState::Enabled)
+                .on_click(move |_, window, cx| {
+                    let Some(source_session_id) = edit_session_id.clone() else {
+                        return;
+                    };
+                    let row_id = edit_row_id.clone();
+                    let turn_id = edit_turn_id.clone();
+                    let body = edit_body.clone();
+                    let attachments = edit_attachments.clone();
+                    let mentions = edit_mentions.clone();
+                    let _ = edit_entity.update(cx, |this, cx| {
+                        this.begin_inline_user_message_edit(
+                            turn_id,
+                            row_id,
+                            source_session_id,
+                            edit_user_sequence,
+                            edit_end_sequence,
+                            body,
+                            attachments,
+                            mentions,
+                            window,
+                            cx,
+                        );
+                    });
+                }),
+            );
+        }
+
+        menu
+    }
+
+    fn build_agent_message_context_menu(
+        &mut self,
+        menu: PopupMenu,
+        window: &mut Window,
+        cx: &mut App,
+        entity: WeakEntity<Self>,
+        context: AgentMessageMenuContext,
+    ) -> PopupMenu {
+        let prefixes = vec![
+            format!("markdown:{}", context.row_id),
+            format!("markdown-chunk:{}", context.row_id),
+        ];
+        if let Some(selection) = self.selection_menu_context_for_row(
+            window,
+            cx,
+            context.child_session.as_deref(),
+            &prefixes,
+            true,
+        ) {
+            return self.build_selection_context_menu(menu, entity, selection);
+        }
+
+        let has_body = !context.row.body.trim().is_empty();
+        let timestamp = context.timestamp;
+        let locale = self.resolved_locale();
+        let mut header = locale::text("Agent", "Agent", "Agent").to_string();
+        if let Some(timestamp) = timestamp {
+            header.push_str(" · ");
+            header.push_str(&format_timeline_hover_time(timestamp, locale));
+        }
+        if context.streaming {
+            header.push_str(" · ");
+            header.push_str(locale::text("Responding…", "响应中…", "回應中…"));
+        }
+
+        let mut menu = menu
+            .min_w(px(220.0))
+            .max_w(px(320.0))
+            .item(PopupMenuItem::label(header))
+            .separator();
+
+        if has_body {
+            let copy_body = context.row.body.clone();
+            menu = menu.item(
+                PopupMenuItem::new(if context.streaming {
+                    locale::text("Copy Current Text", "复制当前内容", "複製目前內容")
+                } else {
+                    locale::text("Copy", "复制", "複製")
+                })
+                .icon(IconName::Copy)
+                .on_click(move |_, _, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(copy_body.clone()));
+                }),
+            );
+        }
+
+        if has_body && !context.streaming {
+            let plain_body = markdown_plain_text(&context.row.body);
+            menu = menu.item(
+                PopupMenuItem::new(locale::text(
+                    "Copy as Plain Text",
+                    "复制为纯文本",
+                    "複製為純文字",
+                ))
+                .on_click(move |_, _, cx| {
+                    if !plain_body.trim().is_empty() {
+                        cx.write_to_clipboard(ClipboardItem::new_string(plain_body.clone()));
+                    }
+                }),
+            );
+
+            let quote_entity = entity.clone();
+            let quote_text = context.row.body.clone();
+            menu = menu.item(
+                PopupMenuItem::new(locale::text(
+                    "Quote in Composer",
+                    "引用到输入框",
+                    "引用到輸入框",
+                ))
+                .on_click(move |_, window, cx| {
+                    let text = quote_text.clone();
+                    let _ = quote_entity.update(cx, |this, cx| {
+                        this.quote_in_composer(&text, window, cx);
+                    });
+                }),
+            );
+        }
+
+        if context.foldable && !context.streaming && context.child_session.is_none() {
+            let toggle_entity = entity.clone();
+            let toggle_row_id = context.row.id.clone();
+            let toggle_turn_id = context.turn_id.clone();
+            let revealed = self.timeline_row_body_revealed(&context.row.id);
+            menu = menu.separator().item(
+                PopupMenuItem::new(if revealed {
+                    locale::text("Collapse Answer", "收起回答", "收合回答")
+                } else {
+                    locale::text("Expand Answer", "展开回答", "展開回答")
+                })
+                .on_click(move |_, _, cx| {
+                    let row_id = toggle_row_id.clone();
+                    let turn_id = toggle_turn_id.clone();
+                    let _ = toggle_entity.update(cx, |this, cx| {
+                        this.toggle_timeline_row_body(row_id, turn_id, cx);
+                    });
+                }),
+            );
+        }
+
+        let fork_disabled = self.agent_action_pending
+            || self.fork_session_pending
+            || self.timeline.needs_authoritative_refetch;
+        // The child Agent rail is a read-only transcript: forking or stopping
+        // from it would act on the focused session instead of the one on screen.
+        if !context.streaming
+            && context.row_is_live_view
+            && context.last_sequence > 0
+            && context.child_session.is_none()
+        {
+            let fork_entity = entity.clone();
+            let fork_session_id = context.session_id.clone();
+            let fork_sequence = context.last_sequence;
+            menu = menu.separator().item(
+                PopupMenuItem::new(locale::text("Fork from Here", "从此处分叉", "從此處分支"))
+                    .icon(Icon::default().path("icons/vibex/git-branch.svg"))
+                    .disabled(fork_disabled)
+                    .on_click(move |_, window, cx| {
+                        let Some(session_id) = fork_session_id.clone() else {
+                            return;
+                        };
+                        let _ = fork_entity.update(cx, |this, cx| {
+                            this.fork_session_at(session_id, fork_sequence, window, cx);
+                        });
+                    }),
+            );
+        }
+
+        if context.streaming && context.row_is_live_view && context.child_session.is_none() {
+            let stop_entity = entity.clone();
+            let stop_session_id = context.session_id.clone();
+            menu = menu.separator().item(
+                PopupMenuItem::new(locale::text("Stop Response", "停止响应", "停止回應")).on_click(
+                    move |_, window, cx| {
+                        let _ = stop_entity.update(cx, |this, cx| {
+                            // Act on the session whose menu was opened, not on
+                            // whichever view the workbench currently borrows.
+                            this.with_session_view_for_render(stop_session_id.as_ref(), |this| {
+                                this.interrupt_session(window, cx)
+                            });
+                        });
+                    },
+                ),
+            );
+        }
+
+        menu
+    }
+
+    fn activity_copy_item(
+        entity: WeakEntity<Self>,
+        row_id: &str,
+        label: &'static str,
+        mode: ActivityCopyMode,
+    ) -> PopupMenuItem {
+        let row_id = row_id.to_string();
+        PopupMenuItem::new(label)
+            .icon(IconName::Copy)
+            .on_click(move |_, _, cx| {
+                let row_id = row_id.clone();
+                let _ = entity.update(cx, |this, cx| {
+                    this.copy_activity_text(&row_id, mode, cx);
+                });
+            })
+    }
+
+    fn build_activity_context_menu(
+        &mut self,
+        menu: PopupMenu,
+        window: &mut Window,
+        cx: &mut App,
+        entity: WeakEntity<Self>,
+        row_id: String,
+        row_is_live_view: bool,
+    ) -> PopupMenu {
+        let Some(row) = self.timeline_row_by_id(&row_id).cloned() else {
+            return menu;
+        };
+
+        if matches!(
+            row.kind,
+            TimelineRowKind::Reasoning | TimelineRowKind::Plan | TimelineRowKind::TodoUpdate
+        ) {
+            let prefixes = vec![format!("thought:{}", row.id)];
+            if let Some(selection) = self.selection_menu_context_for_row(
+                window,
+                cx,
+                self.child_agent_render_session
+                    .as_ref()
+                    .map(|session_id| session_id.as_str()),
+                &prefixes,
+                true,
+            ) {
+                return self.build_selection_context_menu(menu, entity, selection);
+            }
+        }
+
+        let payload = self
+            .timeline_row_latest_item(&row)
+            .map(|item| item.payload.clone());
+        let details = self.activity_details(&row);
+        let input_label = locale::text("Input", "输入", "輸入");
+        let output_label = locale::text("Output", "输出", "輸出");
+        let has_input = details.iter().any(|detail| detail.label() == input_label);
+        let has_output = details.iter().any(|detail| detail.label() == output_label);
+        let has_details = !details.is_empty() || !row.body.trim().is_empty();
+        let timestamp = self.timeline_row_timestamp(&row);
+        let locale = self.resolved_locale();
+        let mut header = activity_row_kind_label(row.kind).to_string();
+        if let Some(timestamp) = timestamp {
+            header.push_str(" · ");
+            header.push_str(&format_timeline_hover_time(timestamp, locale));
+        }
+
+        let mut menu = menu
+            .min_w(px(220.0))
+            .max_w(px(320.0))
+            .item(PopupMenuItem::label(header))
+            .separator();
+
+        match row.kind {
+            TimelineRowKind::Reasoning => {
+                let open = self.reasoning_row_open(&row.id);
+                let toggle_entity = entity.clone();
+                let toggle_row_id = row.id.clone();
+                let toggle_turn_id = row.turn_id.clone();
+                menu = menu
+                    .item(Self::activity_copy_item(
+                        entity.clone(),
+                        &row.id,
+                        locale::text("Copy Thought", "复制思考", "複製思考"),
+                        ActivityCopyMode::Primary,
+                    ))
+                    .when(row_is_live_view && !row.body.trim().is_empty(), |menu| {
+                        let quote_entity = entity.clone();
+                        let quote_row_id = row.id.clone();
+                        menu.item(
+                            PopupMenuItem::new(locale::text(
+                                "Quote in Composer",
+                                "引用到输入框",
+                                "引用到輸入框",
+                            ))
+                            .on_click(move |_, window, cx| {
+                                let row_id = quote_row_id.clone();
+                                let _ = quote_entity.update(cx, |this, cx| {
+                                    let body = this
+                                        .timeline_row_by_id(&row_id)
+                                        .map(|row| row.body.clone())
+                                        .unwrap_or_default();
+                                    this.quote_in_composer(&body, window, cx);
+                                });
+                            }),
+                        )
+                    })
+                    .separator()
+                    .item(
+                        PopupMenuItem::new(if open {
+                            locale::text("Collapse Thought", "收起思考", "收合思考")
+                        } else {
+                            locale::text("Expand Thought", "展开思考", "展開思考")
+                        })
+                        .on_click(move |_, _, cx| {
+                            let row_id = toggle_row_id.clone();
+                            let turn_id = toggle_turn_id.clone();
+                            let _ = toggle_entity.update(cx, |this, cx| {
+                                this.toggle_reasoning_expansion(row_id, turn_id, open, cx);
+                            });
+                        }),
+                    );
+            }
+            TimelineRowKind::Plan | TimelineRowKind::TodoUpdate => {
+                let open = self
+                    .timeline_command_expansion
+                    .get(&row.id)
+                    .copied()
+                    .unwrap_or(false);
+                let toggle_entity = entity.clone();
+                let toggle_row_id = row.id.clone();
+                let toggle_turn_id = row.turn_id.clone();
+                menu = menu
+                    .item(Self::activity_copy_item(
+                        entity.clone(),
+                        &row.id,
+                        locale::text("Copy Plan", "复制计划", "複製計畫"),
+                        ActivityCopyMode::Primary,
+                    ))
+                    .when(row_is_live_view && !row.body.trim().is_empty(), |menu| {
+                        let quote_entity = entity.clone();
+                        let quote_row_id = row.id.clone();
+                        menu.item(
+                            PopupMenuItem::new(locale::text(
+                                "Quote in Composer",
+                                "引用到输入框",
+                                "引用到輸入框",
+                            ))
+                            .on_click(move |_, window, cx| {
+                                let row_id = quote_row_id.clone();
+                                let _ = quote_entity.update(cx, |this, cx| {
+                                    let body = this
+                                        .timeline_row_by_id(&row_id)
+                                        .map(|row| row.body.clone())
+                                        .unwrap_or_default();
+                                    this.quote_in_composer(&body, window, cx);
+                                });
+                            }),
+                        )
+                    })
+                    .separator()
+                    .item(
+                        PopupMenuItem::new(if open {
+                            locale::text("Collapse Plan", "收起计划", "收合計畫")
+                        } else {
+                            locale::text("Expand Plan", "展开计划", "展開計畫")
+                        })
+                        .on_click(move |_, _, cx| {
+                            let row_id = toggle_row_id.clone();
+                            let turn_id = toggle_turn_id.clone();
+                            let _ = toggle_entity.update(cx, |this, cx| {
+                                this.set_timeline_disclosure(row_id, turn_id.as_deref(), !open);
+                                cx.notify();
+                            });
+                        }),
+                    );
+            }
+            TimelineRowKind::Command => {
+                let open = self
+                    .timeline_command_expansion
+                    .get(&row.id)
+                    .copied()
+                    .unwrap_or(false);
+                let toggle_entity = entity.clone();
+                let toggle_row_id = row.id.clone();
+                let toggle_turn_id = row.turn_id.clone();
+                menu = menu
+                    .item(Self::activity_copy_item(
+                        entity.clone(),
+                        &row.id,
+                        locale::text("Copy Command", "复制命令", "複製命令"),
+                        ActivityCopyMode::Primary,
+                    ))
+                    .when(has_output, |menu| {
+                        menu.item(Self::activity_copy_item(
+                            entity.clone(),
+                            &row.id,
+                            locale::text("Copy Output", "复制输出", "複製輸出"),
+                            ActivityCopyMode::Output,
+                        ))
+                    })
+                    .item(Self::activity_copy_item(
+                        entity.clone(),
+                        &row.id,
+                        locale::text("Copy Details", "复制详情", "複製詳細資料"),
+                        ActivityCopyMode::Details,
+                    ))
+                    .separator()
+                    .item(
+                        PopupMenuItem::new(if open {
+                            locale::text("Hide Details", "隐藏详情", "隱藏詳細資料")
+                        } else {
+                            locale::text("Show Details", "显示详情", "顯示詳細資料")
+                        })
+                        .on_click(move |_, _, cx| {
+                            let row_id = toggle_row_id.clone();
+                            let turn_id = toggle_turn_id.clone();
+                            let _ = toggle_entity.update(cx, |this, cx| {
+                                this.set_timeline_disclosure(row_id, turn_id.as_deref(), !open);
+                                cx.notify();
+                            });
+                        }),
+                    );
+            }
+            TimelineRowKind::FileOperation => {
+                let open = self
+                    .timeline_command_expansion
+                    .get(&row.id)
+                    .copied()
+                    .unwrap_or(false);
+                let file_path = payload.as_ref().and_then(|payload| match payload {
+                    TimelinePayload::FileOperation(operation) => Some(operation.path.clone()),
+                    _ => None,
+                });
+                let workspace_root = self
+                    .view_session()
+                    .map(|session| session.workspace_root.clone())
+                    .unwrap_or_default();
+                let open_path = file_path.as_deref().and_then(|path| {
+                    agent_file_operation_preview_path(path, Some(workspace_root.as_str()))
+                });
+                let has_diff = payload.as_ref().is_some_and(|payload| {
+                    matches!(
+                        payload,
+                        TimelinePayload::FileOperation(operation)
+                            if operation.canonical_patch().is_some()
+                    )
+                });
+                let toggle_entity = entity.clone();
+                let toggle_row_id = row.id.clone();
+                let toggle_turn_id = row.turn_id.clone();
+                let open_entity = entity.clone();
+                let reveal_entity = entity.clone();
+                let reveal_path = open_path.clone();
+                menu = menu
+                    .when_some(open_path.clone(), |menu, path| {
+                        let open_path = path.clone();
+                        menu.item(
+                            PopupMenuItem::new(locale::text(
+                                "Open in Editor",
+                                "在编辑器中打开",
+                                "在編輯器中開啟",
+                            ))
+                            .icon(IconName::FolderOpen)
+                            .on_click(move |_, window, cx| {
+                                let path = open_path.clone();
+                                let _ = open_entity.update(cx, |this, cx| {
+                                    this.open_code_file(path, window, cx);
+                                });
+                            }),
+                        )
+                    })
+                    .when_some(reveal_path, |menu, path| {
+                        let reveal_path = path.clone();
+                        menu.item(
+                            PopupMenuItem::new(locale::text(
+                                "Reveal in Files",
+                                "在文件树中显示",
+                                "在檔案樹中顯示",
+                            ))
+                            .on_click(move |_, window, cx| {
+                                let path = reveal_path.clone();
+                                let _ = reveal_entity.update(cx, |this, cx| {
+                                    this.reveal_session_image_in_files(&path, window, cx);
+                                });
+                            }),
+                        )
+                    })
+                    .item(Self::activity_copy_item(
+                        entity.clone(),
+                        &row.id,
+                        locale::text("Copy Path", "复制路径", "複製路徑"),
+                        ActivityCopyMode::Path,
+                    ))
+                    .when(has_diff, |menu| {
+                        menu.item(Self::activity_copy_item(
+                            entity.clone(),
+                            &row.id,
+                            locale::text("Copy Diff", "复制差异", "複製差異"),
+                            ActivityCopyMode::Diff,
+                        ))
+                    })
+                    .when(has_details, |menu| {
+                        menu.separator().item(
+                            PopupMenuItem::new(if open {
+                                locale::text("Hide Details", "隐藏详情", "隱藏詳細資料")
+                            } else {
+                                locale::text("Show Details", "显示详情", "顯示詳細資料")
+                            })
+                            .on_click({
+                                let toggle_entity = toggle_entity.clone();
+                                let row_id = toggle_row_id.clone();
+                                let turn_id = toggle_turn_id.clone();
+                                move |_, _, cx| {
+                                    let row_id = row_id.clone();
+                                    let turn_id = turn_id.clone();
+                                    let _ = toggle_entity.update(cx, |this, cx| {
+                                        this.set_timeline_disclosure(
+                                            row_id,
+                                            turn_id.as_deref(),
+                                            !open,
+                                        );
+                                        cx.notify();
+                                    });
+                                }
+                            }),
+                        )
+                    });
+            }
+            TimelineRowKind::ToolCall
+            | TimelineRowKind::WebSearch
+            | TimelineRowKind::Collaboration => {
+                let open = self
+                    .timeline_command_expansion
+                    .get(&row.id)
+                    .copied()
+                    .unwrap_or(false);
+                let toggle_entity = entity.clone();
+                let toggle_row_id = row.id.clone();
+                let toggle_turn_id = row.turn_id.clone();
+                menu = menu
+                    .when(has_input, |menu| {
+                        menu.item(Self::activity_copy_item(
+                            entity.clone(),
+                            &row.id,
+                            locale::text("Copy Input", "复制输入", "複製輸入"),
+                            ActivityCopyMode::Input,
+                        ))
+                    })
+                    .when(has_output, |menu| {
+                        menu.item(Self::activity_copy_item(
+                            entity.clone(),
+                            &row.id,
+                            locale::text("Copy Output", "复制输出", "複製輸出"),
+                            ActivityCopyMode::Output,
+                        ))
+                    })
+                    .item(Self::activity_copy_item(
+                        entity.clone(),
+                        &row.id,
+                        locale::text("Copy Details", "复制详情", "複製詳細資料"),
+                        ActivityCopyMode::Details,
+                    ))
+                    .separator()
+                    .item(
+                        PopupMenuItem::new(if open {
+                            locale::text("Hide Details", "隐藏详情", "隱藏詳細資料")
+                        } else {
+                            locale::text("Show Details", "显示详情", "顯示詳細資料")
+                        })
+                        .on_click(move |_, _, cx| {
+                            let row_id = toggle_row_id.clone();
+                            let turn_id = toggle_turn_id.clone();
+                            let _ = toggle_entity.update(cx, |this, cx| {
+                                this.set_timeline_disclosure(row_id, turn_id.as_deref(), !open);
+                                cx.notify();
+                            });
+                        }),
+                    );
+            }
+            TimelineRowKind::Error => {
+                menu = menu
+                    .item(Self::activity_copy_item(
+                        entity.clone(),
+                        &row.id,
+                        locale::text("Copy Error", "复制错误", "複製錯誤"),
+                        ActivityCopyMode::Primary,
+                    ))
+                    .when(row_is_live_view && !row.body.trim().is_empty(), |menu| {
+                        let quote_entity = entity.clone();
+                        let quote_row_id = row.id.clone();
+                        menu.item(
+                            PopupMenuItem::new(locale::text(
+                                "Quote in Composer",
+                                "引用到输入框",
+                                "引用到輸入框",
+                            ))
+                            .on_click(move |_, window, cx| {
+                                let row_id = quote_row_id.clone();
+                                let _ = quote_entity.update(cx, |this, cx| {
+                                    let body = this
+                                        .timeline_row_by_id(&row_id)
+                                        .map(|row| row.body.clone())
+                                        .unwrap_or_default();
+                                    this.quote_in_composer(&body, window, cx);
+                                });
+                            }),
+                        )
+                    });
+            }
+            TimelineRowKind::PermissionRequest => {
+                let request = self.permission_request_for_row(&row);
+                let pending = request
+                    .as_ref()
+                    .is_some_and(|request| permission_request_is_pending(&row, request));
+                let review_entity = entity.clone();
+                let copy_entity = entity.clone();
+                let copy_row_id = row.id.clone();
+                menu = menu
+                    .when(pending, |menu| {
+                        menu.item(
+                            PopupMenuItem::new(locale::text(
+                                "Review Request",
+                                "查看请求",
+                                "查看請求",
+                            ))
+                            .icon(IconName::Eye)
+                            .on_click(move |_, _, cx| {
+                                let _ = review_entity
+                                    .update(cx, |this, cx| this.reveal_pending_permission_card(cx));
+                            }),
+                        )
+                    })
+                    .item(
+                        PopupMenuItem::new(locale::text(
+                            "Copy Request",
+                            "复制请求内容",
+                            "複製請求內容",
+                        ))
+                        .icon(IconName::Copy)
+                        .on_click(move |_, _, cx| {
+                            let row_id = copy_row_id.clone();
+                            let _ = copy_entity.update(cx, |this, cx| {
+                                this.copy_permission_request_text(&row_id, cx);
+                            });
+                        }),
+                    );
+            }
+            _ => {
+                menu = menu.item(Self::activity_copy_item(
+                    entity.clone(),
+                    &row.id,
+                    locale::text("Copy", "复制", "複製"),
+                    ActivityCopyMode::Primary,
+                ));
+            }
+        }
+
+        menu
+    }
+
+    fn build_turn_context_menu(
+        &self,
+        menu: PopupMenu,
+        entity: WeakEntity<Self>,
+        context: TurnMenuContext,
+    ) -> PopupMenu {
+        let mut menu = menu
+            .min_w(px(220.0))
+            .max_w(px(320.0))
+            .item(PopupMenuItem::label(
+                locale::text("This Turn", "本轮", "本輪").to_string(),
+            ))
+            .separator();
+
+        if context.process_collapsible {
+            let toggle_entity = entity.clone();
+            let turn_id = context.turn_id.clone();
+            let expanded = context.process_expanded;
+            menu = menu.item(
+                PopupMenuItem::new(if expanded {
+                    locale::text("Collapse Process", "收起过程", "收合過程")
+                } else {
+                    locale::text("Expand Process", "展开过程", "展開過程")
+                })
+                .on_click(move |_, _, cx| {
+                    let turn_id = turn_id.clone();
+                    let _ = toggle_entity.update(cx, |this, cx| {
+                        this.prepare_timeline_disclosure(Some(&turn_id), !expanded);
+                        this.timeline_process_expansion.insert(turn_id, !expanded);
+                        cx.notify();
+                    });
+                }),
+            );
+        }
+
+        let copy_entity = entity.clone();
+        let copy_turn_id = context.turn_id.clone();
+        menu = menu.item(
+            PopupMenuItem::new(locale::text("Copy Turn", "复制本轮", "複製本輪"))
+                .icon(IconName::Copy)
+                .on_click(move |_, _, cx| {
+                    let turn_id = copy_turn_id.clone();
+                    let _ = copy_entity.update(cx, |this, cx| this.copy_turn(&turn_id, cx));
+                }),
+        );
+
+        if context.row_is_live_view && context.fork_sequence > 0 {
+            let fork_entity = entity.clone();
+            let fork_session_id = context.session_id.clone();
+            let fork_sequence = context.fork_sequence;
+            menu = menu.separator().item(
+                PopupMenuItem::new(locale::text("Fork from Here", "从此处分叉", "從此處分支"))
+                    .icon(Icon::default().path("icons/vibex/git-branch.svg"))
+                    .disabled(context.fork_disabled)
+                    .on_click(move |_, window, cx| {
+                        let Some(session_id) = fork_session_id.clone() else {
+                            return;
+                        };
+                        let _ = fork_entity.update(cx, |this, cx| {
+                            this.fork_session_at(session_id, fork_sequence, window, cx);
+                        });
+                    }),
+            );
+        }
+
+        menu
+    }
+
+    fn build_timeline_context_menu(&self, menu: PopupMenu, entity: WeakEntity<Self>) -> PopupMenu {
+        let has_conversation = !self.conversation_turns_cache.is_empty();
+        let mut menu = menu
+            .min_w(px(220.0))
+            .max_w(px(320.0))
+            .item(PopupMenuItem::label(
+                locale::text("Conversation", "会话", "工作階段").to_string(),
+            ))
+            .separator();
+
+        if has_conversation {
+            let copy_entity = entity.clone();
+            menu = menu.item(
+                PopupMenuItem::new(locale::text(
+                    "Copy Conversation",
+                    "复制会话",
+                    "複製工作階段",
+                ))
+                .icon(IconName::Copy)
+                .on_click(move |_, _, cx| {
+                    let _ = copy_entity.update(cx, |this, cx| this.copy_conversation(cx));
+                }),
+            );
+        }
+
+        let find_entity = entity.clone();
+        menu = menu.item(
+            PopupMenuItem::new(locale::text(
+                "Find in Conversation",
+                "在会话中查找",
+                "在工作階段中尋找",
+            ))
+            .icon(IconName::Search)
+            .disabled(!has_conversation)
+            .on_click(move |_, window, cx| {
+                let _ = find_entity.update(cx, |this, cx| {
+                    this.open_conversation_find_with_query(None, window, cx)
+                });
+            }),
+        );
+
+        if !self.timeline_follow.following_bottom {
+            let jump_entity = entity.clone();
+            menu = menu.item(
+                PopupMenuItem::new(locale::text("Jump to Latest", "跳到最新", "跳至最新"))
+                    .on_click(move |_, _, cx| {
+                        let _ = jump_entity.update(cx, |this, cx| {
+                            this.timeline_scroll_wheel_idle_task = None;
+                            this.timeline_follow.set_following_bottom(true);
+                            this.request_timeline_scroll_to_latest();
+                            cx.notify();
+                        });
+                    }),
+            );
+        }
+
+        menu
+    }
+
+    fn copy_permission_request_text(&self, row_id: &str, cx: &mut Context<Self>) {
+        let Some(row) = self.timeline_row_by_id(row_id) else {
+            return;
+        };
+        let Some(request) = self.permission_request_for_row(row) else {
+            return;
+        };
+        let mut text = request.title;
+        for detail in request.details {
+            text.push('\n');
+            text.push_str(&detail.label);
+            text.push_str(": ");
+            text.push_str(&detail.value);
+        }
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
     }
 
     /// Whether the turn a row belongs to is still producing output.
@@ -69162,98 +70581,135 @@ impl VibexWorkbench {
                     .as_ref()
                     .is_some_and(|session_id| self.session_turn_pending(session_id)),
         );
+        let menu_entity = cx.weak_entity();
+        let menu_context = UserMessageMenuContext {
+            row: row.clone(),
+            row_id: row.id.clone(),
+            session_id: self.timeline.session_id.clone(),
+            turn_id: turn_id.map(str::to_string),
+            first_sequence: row.first_sequence,
+            last_sequence: row.last_sequence,
+            authoritative_end_sequence: edit_source_end_sequence.unwrap_or(row.last_sequence),
+            latest_user_message,
+            turn_complete,
+            edit_action_state,
+            row_is_live_view: self.timeline.session_id.as_ref() == self.view_session_id.as_ref(),
+            child_session: self
+                .child_agent_render_session
+                .as_ref()
+                .map(|session_id| session_id.as_str().to_string()),
+            copy_item: copy_item.clone(),
+            attachments: edit_attachments.clone(),
+            mentions: mentions.clone(),
+            timestamp,
+        };
+        let content = v_flex()
+            .id(row.id.clone())
+            .min_w_0()
+            .w(relative(USER_MESSAGE_COLUMN_WIDTH_RATIO))
+            .items_end()
+            .gap_1()
+            .child(render_user_message_bubble(
+                inline_content,
+                edge_reactions,
+                cx.theme().muted,
+                cx.theme().foreground,
+                editing,
+            ))
+            .when(!editing, |this| {
+                this.child(
+                    h_flex()
+                        .items_center()
+                        .gap_2()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .opacity(0.0)
+                        .group_hover(hover_group.clone(), |style| style.opacity(1.0))
+                        .when_some(timestamp, |this, timestamp| {
+                            this.child(format_timeline_hover_time(timestamp, locale))
+                        })
+                        .child(
+                            Button::new(format!("copy-user-message:{}", row.id))
+                                .xsmall()
+                                .ghost()
+                                .compact()
+                                .size(px(24.0))
+                                .icon(IconName::Copy)
+                                .tooltip(locale::text("Copy", "复制", "複製"))
+                                .on_click(move |_, _, cx| {
+                                    cx.write_to_clipboard(copy_item.clone());
+                                }),
+                        )
+                        .when(
+                            edit_action_state != UserMessageEditActionState::Hidden,
+                            |this| {
+                                this.child(
+                                    Button::new(format!("edit-user-message:{}", row.id))
+                                        .xsmall()
+                                        .ghost()
+                                        .compact()
+                                        .size(px(24.0))
+                                        .icon(Icon::default().path("icons/vibex/pencil.svg"))
+                                        .tooltip(locale::text("Edit", "编辑", "編輯"))
+                                        .disabled(
+                                            edit_action_state
+                                                != UserMessageEditActionState::Enabled,
+                                        )
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            let (
+                                                Some(source_session_id),
+                                                Some(source_end_sequence),
+                                            ) = (
+                                                edit_source_session_id.clone(),
+                                                edit_source_end_sequence,
+                                            )
+                                            else {
+                                                return;
+                                            };
+                                            this.begin_inline_user_message_edit(
+                                                edit_turn_id.clone(),
+                                                edit_row_id.clone(),
+                                                source_session_id,
+                                                edit_user_sequence,
+                                                source_end_sequence,
+                                                edit_text.clone(),
+                                                edit_attachments.clone(),
+                                                mentions.clone(),
+                                                window,
+                                                cx,
+                                            )
+                                        })),
+                                )
+                            },
+                        ),
+                )
+            });
+        let content = if editing {
+            content.into_any_element()
+        } else {
+            content
+                .context_menu(move |menu, window, cx| {
+                    let Some(entity) = menu_entity.upgrade() else {
+                        return menu;
+                    };
+                    entity.update(cx, |this, cx| {
+                        this.build_user_message_context_menu(
+                            menu,
+                            window,
+                            cx,
+                            menu_entity.clone(),
+                            menu_context.clone(),
+                        )
+                    })
+                })
+                .into_any_element()
+        };
         div()
             .flex()
             .w_full()
             .justify_end()
             .group(hover_group.clone())
-            .child(
-                v_flex()
-                    .id(row.id.clone())
-                    .min_w_0()
-                    .w(relative(USER_MESSAGE_COLUMN_WIDTH_RATIO))
-                    .items_end()
-                    .gap_1()
-                    .child(render_user_message_bubble(
-                        inline_content,
-                        edge_reactions,
-                        cx.theme().muted,
-                        cx.theme().foreground,
-                        editing,
-                    ))
-                    .when(!editing, |this| {
-                        this.child(
-                            h_flex()
-                                .items_center()
-                                .gap_2()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .opacity(0.0)
-                                .group_hover(hover_group, |style| style.opacity(1.0))
-                                .when_some(timestamp, |this, timestamp| {
-                                    this.child(format_timeline_hover_time(timestamp, locale))
-                                })
-                                .child(
-                                    Button::new(format!("copy-user-message:{}", row.id))
-                                        .xsmall()
-                                        .ghost()
-                                        .compact()
-                                        .size(px(24.0))
-                                        .icon(IconName::Copy)
-                                        .tooltip(locale::text("Copy", "复制", "複製"))
-                                        .on_click(move |_, _, cx| {
-                                            cx.write_to_clipboard(copy_item.clone());
-                                        }),
-                                )
-                                .when(
-                                    edit_action_state != UserMessageEditActionState::Hidden,
-                                    |this| {
-                                        this.child(
-                                            Button::new(format!("edit-user-message:{}", row.id))
-                                                .xsmall()
-                                                .ghost()
-                                                .compact()
-                                                .size(px(24.0))
-                                                .icon(
-                                                    Icon::default().path("icons/vibex/pencil.svg"),
-                                                )
-                                                .tooltip(locale::text("Edit", "编辑", "編輯"))
-                                                .disabled(
-                                                    edit_action_state
-                                                        != UserMessageEditActionState::Enabled,
-                                                )
-                                                .on_click(cx.listener(
-                                                    move |this, _, window, cx| {
-                                                        let (
-                                                            Some(source_session_id),
-                                                            Some(source_end_sequence),
-                                                        ) = (
-                                                            edit_source_session_id.clone(),
-                                                            edit_source_end_sequence,
-                                                        )
-                                                        else {
-                                                            return;
-                                                        };
-                                                        this.begin_inline_user_message_edit(
-                                                            edit_turn_id.clone(),
-                                                            edit_row_id.clone(),
-                                                            source_session_id,
-                                                            edit_user_sequence,
-                                                            source_end_sequence,
-                                                            edit_text.clone(),
-                                                            edit_attachments.clone(),
-                                                            mentions.clone(),
-                                                            window,
-                                                            cx,
-                                                        )
-                                                    },
-                                                )),
-                                        )
-                                    },
-                                ),
-                        )
-                    }),
-            )
+            .child(content)
             .into_any_element()
     }
 
@@ -69262,42 +70718,86 @@ impl VibexWorkbench {
         row: &TimelineRow,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let attachments = self
+        let (attachments, mentions) = self
             .timeline_row_latest_item(row)
             .and_then(|item| match &item.payload {
                 vibex_core::TimelinePayload::UserMessage(message) => {
-                    Some(message.attachments.clone())
+                    Some((message.attachments.clone(), message.mentions.clone()))
                 }
                 _ => None,
             })
             .unwrap_or_default();
+        let copy_item =
+            user_message_clipboard_item_with_mentions(&row.body, &attachments, &mentions);
+        let timestamp = self.timeline_row_timestamp(row);
         let search_highlight = self.session_search_highlight_for_rows(std::slice::from_ref(row));
         let inline_content = self.render_user_message_inline_content(
             &row.id,
             row.body.clone(),
-            attachments,
+            attachments.clone(),
             search_highlight,
             None,
             cx,
         );
+        let menu_entity = cx.weak_entity();
+        let menu_context = UserMessageMenuContext {
+            row: row.clone(),
+            row_id: row.id.clone(),
+            session_id: self.timeline.session_id.clone(),
+            turn_id: row.turn_id.clone(),
+            first_sequence: row.first_sequence,
+            last_sequence: row.last_sequence,
+            authoritative_end_sequence: self
+                .timeline
+                .authoritative_end_sequence
+                .unwrap_or(row.last_sequence),
+            latest_user_message: false,
+            turn_complete: true,
+            edit_action_state: UserMessageEditActionState::Hidden,
+            row_is_live_view: false,
+            child_session: self
+                .child_agent_render_session
+                .as_ref()
+                .map(|session_id| session_id.as_str().to_string()),
+            copy_item,
+            attachments,
+            mentions,
+            timestamp,
+        };
+        let content = v_flex()
+            .id(row.id.clone())
+            .min_w_0()
+            .w(relative(USER_MESSAGE_COLUMN_WIDTH_RATIO))
+            .items_end()
+            .gap_1()
+            .child(render_user_message_bubble(
+                inline_content,
+                None,
+                cx.theme().muted,
+                cx.theme().foreground,
+                false,
+            ));
         div()
             .flex()
             .w_full()
             .justify_end()
             .child(
-                v_flex()
-                    .id(row.id.clone())
-                    .min_w_0()
-                    .w(relative(USER_MESSAGE_COLUMN_WIDTH_RATIO))
-                    .items_end()
-                    .gap_1()
-                    .child(render_user_message_bubble(
-                        inline_content,
-                        None,
-                        cx.theme().muted,
-                        cx.theme().foreground,
-                        false,
-                    )),
+                content
+                    .context_menu(move |menu, window, cx| {
+                        let Some(entity) = menu_entity.upgrade() else {
+                            return menu;
+                        };
+                        entity.update(cx, |this, cx| {
+                            this.build_user_message_context_menu(
+                                menu,
+                                window,
+                                cx,
+                                menu_entity.clone(),
+                                menu_context.clone(),
+                            )
+                        })
+                    })
+                    .into_any_element(),
             )
             .into_any_element()
     }
@@ -69346,9 +70846,9 @@ impl VibexWorkbench {
         // back even when the surface draws the whole of it. A body that is not
         // folded has nothing behind the control, so a windowed body alone does
         // not carry one.
-        let body_reveal_control = (hidden_body_bytes > 0
-            || (body_revealed && self.row_body_folds(row)))
-        .then(|| self.timeline_body_reveal_control(row, hidden_body_bytes, cx));
+        let context_foldable = hidden_body_bytes > 0 || (body_revealed && self.row_body_folds(row));
+        let body_reveal_control =
+            context_foldable.then(|| self.timeline_body_reveal_control(row, hidden_body_bytes, cx));
         let markdown_view = (!body_windowed).then(|| {
             let arriving = self.row_is_arriving(row);
             let image_plugin = self.session_image_plugin(cx.weak_entity());
@@ -69467,7 +70967,23 @@ impl VibexWorkbench {
             Vec::new()
         };
         let show_answer_footer = answer_metadata.is_some() || show_answer_actions;
-        v_flex()
+        let menu_entity = cx.weak_entity();
+        let menu_context = AgentMessageMenuContext {
+            row: row.clone(),
+            row_id: row.id.clone(),
+            session_id: self.timeline.session_id.clone(),
+            turn_id: row.turn_id.clone(),
+            last_sequence: row.last_sequence,
+            streaming: self.row_is_arriving(row),
+            foldable: context_foldable,
+            row_is_live_view: self.timeline.session_id.as_ref() == self.view_session_id.as_ref(),
+            child_session: self
+                .child_agent_render_session
+                .as_ref()
+                .map(|session_id| session_id.as_str().to_string()),
+            timestamp: self.timeline_row_timestamp(row),
+        };
+        let content = v_flex()
             .id(row.id.clone())
             .w_full()
             .min_w_0()
@@ -69510,6 +71026,21 @@ impl VibexWorkbench {
                             )
                         }),
                 )
+            });
+        content
+            .context_menu(move |menu, window, cx| {
+                let Some(entity) = menu_entity.upgrade() else {
+                    return menu;
+                };
+                entity.update(cx, |this, cx| {
+                    this.build_agent_message_context_menu(
+                        menu,
+                        window,
+                        cx,
+                        menu_entity.clone(),
+                        menu_context.clone(),
+                    )
+                })
             })
             .into_any_element()
     }
@@ -100854,6 +102385,96 @@ fn render_user_message_bubble(
         )
 }
 
+/// Whether a retained Markdown surface belongs to the row a menu was opened on.
+fn markdown_surface_matches(id: &str, prefixes: &[String]) -> bool {
+    prefixes
+        .iter()
+        .any(|prefix| id == prefix || id.starts_with(&format!("{prefix}:")))
+}
+
+/// Turn arbitrary selected text into a Markdown blockquote.
+fn context_menu_blockquote(text: &str) -> String {
+    let trimmed = text.trim_end();
+    if trimmed.trim().is_empty() {
+        return String::new();
+    }
+    trimmed
+        .lines()
+        .map(|line| {
+            if line.trim().is_empty() {
+                ">".to_string()
+            } else {
+                format!("> {line}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn selection_menu_header(count: usize) -> String {
+    match locale::current_locale() {
+        locale::ResolvedLocale::ZhCn => format!("已选 {count} 个字符"),
+        locale::ResolvedLocale::ZhTw => format!("已選 {count} 個字元"),
+        _ => format!("{count} characters selected"),
+    }
+}
+
+/// The first useful line of a selection, bounded for the find field.
+fn selection_find_query(text: &str) -> String {
+    text.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(|line| line.chars().take(120).collect())
+        .unwrap_or_default()
+}
+
+/// The URL a selection names, when it names exactly one external destination.
+fn single_external_url(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || trimmed.chars().any(char::is_whitespace) {
+        return None;
+    }
+    validate_external_open_url(trimmed).ok().map(|url| url.url)
+}
+
+fn activity_row_kind_label(kind: TimelineRowKind) -> &'static str {
+    match kind {
+        TimelineRowKind::UserMessage => locale::text("You", "你", "你"),
+        TimelineRowKind::AgentMessage => locale::text("Agent", "Agent", "Agent"),
+        TimelineRowKind::Reasoning => locale::text("Thought", "思考", "思考"),
+        TimelineRowKind::Plan | TimelineRowKind::TodoUpdate => locale::text("Plan", "计划", "計畫"),
+        TimelineRowKind::ToolCall => locale::text("Tool", "工具", "工具"),
+        TimelineRowKind::Command => locale::text("Command", "命令", "命令"),
+        TimelineRowKind::FileOperation => locale::text("File Change", "文件变更", "檔案變更"),
+        TimelineRowKind::WebSearch => locale::text("Web Search", "网页搜索", "網頁搜尋"),
+        TimelineRowKind::Collaboration => locale::text("Collaboration", "协作", "協作"),
+        TimelineRowKind::ImageGeneration => locale::text("Image", "图片", "圖片"),
+        TimelineRowKind::GitNotice | TimelineRowKind::SystemNotice => {
+            locale::text("Notice", "通知", "通知")
+        }
+        TimelineRowKind::PermissionRequest => {
+            locale::text("Permission Request", "权限请求", "權限請求")
+        }
+        TimelineRowKind::PermissionResolution => locale::text("Permission", "权限", "權限"),
+        TimelineRowKind::ElicitationRequest => locale::text("Question", "提问", "提問"),
+        TimelineRowKind::ElicitationResolution => locale::text("Answer", "回答", "回答"),
+        TimelineRowKind::Retry => locale::text("Retry", "重试", "重試"),
+        TimelineRowKind::Error => locale::text("Error", "错误", "錯誤"),
+    }
+}
+
+fn push_conversation_row(out: &mut String, speaker: &str, body: &str) {
+    let body = body.trim();
+    if body.is_empty() {
+        return;
+    }
+    out.push_str("## ");
+    out.push_str(speaker);
+    out.push_str("\n\n");
+    out.push_str(body);
+    out.push_str("\n\n");
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::{Cell, RefCell};
@@ -131976,5 +133597,78 @@ mod route_picker_tests {
             group.choices[0].label, "deepseek-chat",
             "the model is named, not its storage id"
         );
+    }
+
+    #[test]
+    fn session_context_quotes_each_line_and_keeps_blank_lines() {
+        assert_eq!(context_menu_blockquote("one\n\ntwo\n"), "> one\n>\n> two");
+        assert_eq!(context_menu_blockquote("   \n"), "");
+    }
+
+    #[test]
+    fn session_context_find_query_takes_the_first_useful_line() {
+        assert_eq!(selection_find_query("\n\n  hello  \nworld"), "hello");
+        let long = "x".repeat(200);
+        assert_eq!(selection_find_query(&long).chars().count(), 120);
+    }
+
+    #[test]
+    fn session_context_links_must_be_one_external_url() {
+        assert!(single_external_url(" https://example.com/a ").is_some());
+        assert_eq!(
+            single_external_url("https://example.com/a https://example.com/b"),
+            None,
+        );
+        assert_eq!(single_external_url("javascript:alert(1)"), None);
+    }
+
+    #[test]
+    fn session_context_markdown_surfaces_match_their_row_only() {
+        let prefixes = vec!["markdown:row".to_string()];
+        assert!(markdown_surface_matches("markdown:row", &prefixes));
+        assert!(markdown_surface_matches("markdown:row:0", &prefixes));
+        assert!(!markdown_surface_matches("markdown:row-extra", &prefixes));
+        assert!(!markdown_surface_matches("markdown:other", &prefixes));
+    }
+
+    /// The child Agent rail renders another session's transcript through the
+    /// same row renderers as the focused timeline, so its row menus must not
+    /// fork, stop, fold or act on the borrowed view. They stay copy and quote.
+    #[test]
+    fn session_context_child_agent_rail_menus_stay_copy_only() {
+        let source = include_str!("app.rs");
+
+        let agent_menu = source
+            .split_once("    fn build_agent_message_context_menu(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn activity_copy_item("))
+            .map(|(body, _)| body)
+            .expect("the Agent message menu should remain inspectable");
+        assert!(agent_menu.contains("context.child_session.is_none()"));
+        assert!(agent_menu.contains("ClipboardItem::new_string(copy_body"));
+
+        let user_menu = source
+            .split_once("    fn build_user_message_context_menu(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn build_agent_message_context_menu("))
+            .map(|(body, _)| body)
+            .expect("the user message menu should remain inspectable");
+        assert!(user_menu.contains("let copy_item = context.copy_item.clone();"));
+
+        let turn = source
+            .split_once("    fn render_timeline_turn(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_turn_file_changes_card("))
+            .map(|(body, _)| body)
+            .expect("the turn renderer should remain inspectable");
+        assert!(turn.contains(
+            "if self.rendering_child_agent_timeline() {\n            return content.into_any_element();\n        }\n        content\n            .context_menu("
+        ));
+
+        let row = source
+            .split_once("    fn render_timeline_row(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn highlight_session_search_rows("))
+            .map(|(body, _)| body)
+            .expect("the row renderer should remain inspectable");
+        assert!(row.contains(
+            "let element = if self.rendering_child_agent_timeline()\n            || matches!("
+        ));
     }
 }
