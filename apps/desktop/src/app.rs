@@ -41860,9 +41860,15 @@ impl VibexWorkbench {
         }
         // Creation is an authority operation: the local runtime is not required
         // because the backend facade also serves a paired remote runtime.
+        //
+        // A draft that names a collaborator runs on that collaborator's
+        // configuration, tuning included. Reading the page's own selection here
+        // would start the session on the Agent the page shows while the chip the
+        // reader tuned was silently ignored — the same disagreement the chip
+        // work exists to remove.
         let (Some(catalog), Some(selection)) = (
             self.runtime_catalog.as_ref(),
-            self.new_session_runtime_selection.clone(),
+            self.composer_runtime_selection_for(ComposerTarget::NewSession, cx),
         ) else {
             self.new_session_error = Some("No available Agent runtime is configured".into());
             cx.notify();
@@ -42173,6 +42179,7 @@ impl VibexWorkbench {
             let message_backend = backend.clone();
             let initial_message = if has_initial_message {
                 let initial_attachments = attachments;
+                let message_mentions = mentions.clone();
                 Some(async move {
                     let desired_runtime = message_backend
                         .agent()
@@ -42253,7 +42260,12 @@ impl VibexWorkbench {
                                     delivery: UserMessageDelivery::Prompt,
                                     prompt_context: None,
                                     provenance: vibex_core::MessageProvenance::HumanInput,
-                                    mentions: Vec::new(),
+                                    // The draft's chips belong to the message, so
+                                    // the turn's route note names the collaborator
+                                    // the reader addressed. Sending an empty list
+                                    // dropped that binding for every new session's
+                                    // first message.
+                                    mentions: message_mentions,
                                 },
                             })
                             .with_idempotency_key(format!(
@@ -102828,6 +102840,65 @@ mod tests {
             version: Some("28 tools".to_string()),
             responsive: true,
         }
+    }
+
+    /// A new-session draft runs on the chip it names, tuning included.
+    ///
+    /// The page's own selection describes the Agent being started; the chip
+    /// describes the collaborator the reader addressed. Reading the page's
+    /// selection on submit started the session on the wrong configuration while
+    /// the composer showed the tuned one.
+    #[test]
+    fn a_new_session_draft_reads_its_chip_selection() {
+        let agent_id = AgentId::parse("codex").unwrap();
+        let option = SessionRuntimeOption {
+            selection: SessionRuntimeSelection::provider(
+                agent_id.clone(),
+                ProviderProfileId::parse("provider_local").unwrap(),
+                "gpt-5",
+            ),
+            agent_label: "Codex".to_string(),
+            auth_source_label: "Local".to_string(),
+            model_label: "gpt-5".to_string(),
+            reasoning_efforts: vec![SessionConfigValue {
+                value: "high".to_string(),
+                label: None,
+            }],
+            modes: Vec::new(),
+            features: Vec::new(),
+            availability: RuntimeOptionAvailability::Available,
+            member_count: 1,
+            auto_routes: false,
+        };
+        let catalog = SessionRuntimeOptionCatalog {
+            revision: 1,
+            agents: Vec::new(),
+            auth_sources: Vec::new(),
+            options: vec![option.clone()],
+        };
+
+        // A tuned chip resolves to the tuned selection, which is what the create
+        // request now sends.
+        let mut tuned = option.selection.clone();
+        tuned.reasoning_effort = Some("high".to_string());
+        let mention = VibexUseMention::tuned_agent(
+            &agent_id,
+            &vibex_core::VibexUseRef::runtime_option(
+                &vibex_desktop_runtime::selection_fingerprint(&tuned),
+            ),
+            None,
+            vibex_core::MentionTuning {
+                reasoning_effort: Some("high".to_string()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            delegation_chip_selection(&catalog, &mention),
+            Some(tuned.clone())
+        );
+        // The page's own validation accepts it, so the tuned selection is not
+        // rejected as "no longer available" on the way out.
+        assert!(catalog_has_runtime_selection(&catalog, &tuned));
     }
 
     /// The caret decides which chip the controls edit, and moving it away is
