@@ -1287,3 +1287,182 @@ async fn a_parent_cannot_answer_another_tasks_approval() {
         .expect_err("only the delegating session may answer");
     assert_eq!(error.code, use_codes::NOT_FOUND_OR_NOT_AUTHORIZED);
 }
+
+/// A parent can read the card it is being asked to answer, fenced as untrusted.
+///
+/// Without this the parent only ever sees a request id, so "approve" would be a
+/// guess. The text comes from the child's provider, which makes it untrusted
+/// input arriving in the parent's context — the fence is what keeps the parent
+/// from reading it as instruction.
+#[tokio::test]
+async fn a_parent_reads_its_childs_card_inside_an_untrusted_fence() {
+    let fixture = Fixture::new();
+    let parent = fixture.session("Parent");
+    let child = fixture.session("Child");
+    let task = fixture.task(&parent, &child, "read-my-card", None);
+    let actor = fixture.actor(&parent);
+    let card = PermissionRequest {
+        id: RequestId::new(),
+        session_id: child.id.clone(),
+        project_id: None,
+        workspace_id: None,
+        provider_request_id: None,
+        risk_category: PermissionRiskCategory::Command,
+        title: "Run the test suite".to_string(),
+        details: vec![vibex_core::PermissionActionDetail {
+            label: "command".to_string(),
+            value: "cargo test".to_string(),
+        }],
+        allowed_responses: vec![
+            PermissionResponseKind::Approve,
+            PermissionResponseKind::Deny,
+        ],
+        response_options: Vec::new(),
+        status: PermissionRequestStatus::Pending,
+        requested_at_ms: unix_timestamp_ms(),
+        expires_at_ms: None,
+    };
+    let conn = fixture.service.open().unwrap();
+    PermissionRepository::insert_request(&conn, &card).unwrap();
+    vibex_db::set_delegation_blocked_on(
+        &conn,
+        &task.id,
+        Some(&DelegationBlockedOn::Permission {
+            request_id: card.id.as_str().to_string(),
+        }),
+    )
+    .unwrap();
+    drop(conn);
+
+    let page: vibex_core::ApprovalListPage = serde_json::from_value(
+        fixture
+            .call(&actor, VibexUseTool::ReadApprovals, json!({}))
+            .await,
+    )
+    .unwrap();
+    assert_eq!(page.cards.len(), 1, "the waiting task should be found");
+    let read = &page.cards[0];
+    assert_eq!(read.request_id, card.id.as_str());
+    assert!(
+        read.may_answer,
+        "a command is within the parent's authority"
+    );
+    assert!(read.escalate_reason.is_none());
+    assert!(
+        read.fenced
+            .contains(vibex_core::VIBEX_USE_APPROVAL_UNTRUSTED_BEGIN),
+        "the card must be fenced: {}",
+        read.fenced
+    );
+    assert!(read.fenced.contains("cargo test"));
+    assert!(page.notice.contains("untrusted"));
+}
+
+/// An irreversible card is readable but marked as needing a human.
+#[tokio::test]
+async fn an_irreversible_card_reads_as_escalated() {
+    let fixture = Fixture::new();
+    let parent = fixture.session("Parent");
+    let child = fixture.session("Child");
+    let task = fixture.task(&parent, &child, "irreversible-read", None);
+    let actor = fixture.actor(&parent);
+    let card = PermissionRequest {
+        id: RequestId::new(),
+        session_id: child.id.clone(),
+        project_id: None,
+        workspace_id: None,
+        provider_request_id: None,
+        risk_category: PermissionRiskCategory::FileDeleteOrMove,
+        title: "Delete the build directory".to_string(),
+        details: Vec::new(),
+        allowed_responses: vec![PermissionResponseKind::Approve],
+        response_options: Vec::new(),
+        status: PermissionRequestStatus::Pending,
+        requested_at_ms: unix_timestamp_ms(),
+        expires_at_ms: None,
+    };
+    let conn = fixture.service.open().unwrap();
+    PermissionRepository::insert_request(&conn, &card).unwrap();
+    vibex_db::set_delegation_blocked_on(
+        &conn,
+        &task.id,
+        Some(&DelegationBlockedOn::Permission {
+            request_id: card.id.as_str().to_string(),
+        }),
+    )
+    .unwrap();
+    drop(conn);
+
+    let page: vibex_core::ApprovalListPage = serde_json::from_value(
+        fixture
+            .call(
+                &actor,
+                VibexUseTool::ReadApprovals,
+                json!({"taskRefs": [VibexUseRef::task(&task.id)]}),
+            )
+            .await,
+    )
+    .unwrap();
+    assert_eq!(page.cards.len(), 1);
+    assert!(!page.cards[0].may_answer);
+    assert!(
+        page.cards[0]
+            .escalate_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("human")),
+        "got {:?}",
+        page.cards[0].escalate_reason
+    );
+}
+
+/// A card belonging to somebody else's child is not readable.
+#[tokio::test]
+async fn a_parent_cannot_read_another_tasks_card() {
+    let fixture = Fixture::new();
+    let parent = fixture.session("Parent");
+    let child = fixture.session("Child");
+    let stranger = fixture.session("Stranger");
+    let task = fixture.task(&parent, &child, "not-yours", None);
+    let actor = fixture.actor(&stranger);
+    let card = PermissionRequest {
+        id: RequestId::new(),
+        session_id: child.id.clone(),
+        project_id: None,
+        workspace_id: None,
+        provider_request_id: None,
+        risk_category: PermissionRiskCategory::Command,
+        title: "Run it".to_string(),
+        details: Vec::new(),
+        allowed_responses: vec![PermissionResponseKind::Approve],
+        response_options: Vec::new(),
+        status: PermissionRequestStatus::Pending,
+        requested_at_ms: unix_timestamp_ms(),
+        expires_at_ms: None,
+    };
+    let conn = fixture.service.open().unwrap();
+    PermissionRepository::insert_request(&conn, &card).unwrap();
+    vibex_db::set_delegation_blocked_on(
+        &conn,
+        &task.id,
+        Some(&DelegationBlockedOn::Permission {
+            request_id: card.id.as_str().to_string(),
+        }),
+    )
+    .unwrap();
+    drop(conn);
+
+    let page: vibex_core::ApprovalListPage = serde_json::from_value(
+        fixture
+            .call(
+                &actor,
+                VibexUseTool::ReadApprovals,
+                json!({"taskRefs": [VibexUseRef::task(&task.id)]}),
+            )
+            .await,
+    )
+    .unwrap();
+    assert!(
+        page.cards.is_empty(),
+        "another session's cards must not be readable"
+    );
+}

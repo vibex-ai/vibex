@@ -32,6 +32,7 @@ use vibex_core::{
     SessionListPage, SessionReadAnchor, SessionReadCursor, SessionReadEntry, SessionReadPage,
     SessionReadView, SessionRuntimeOption, SessionRuntimeSelection, SessionTreeNode, TaskListPage,
     TimelineItem, TimelineItemKind, TimelinePayload, UserMessageDelivery,
+    VIBEX_USE_APPROVAL_READ_CHARS, VIBEX_USE_APPROVAL_UNTRUSTED_NOTICE,
     VIBEX_USE_DEFAULT_READ_CHARS, VIBEX_USE_DEFAULT_READ_ITEMS, VIBEX_USE_IDEMPOTENCY_KEY_CHARS,
     VIBEX_USE_MAX_BATCH_REFS, VIBEX_USE_MAX_CONTEXT_REFS, VIBEX_USE_MAX_GROUP_MEMBERS,
     VIBEX_USE_MAX_LIVE_PANES, VIBEX_USE_MAX_READ_CHARS, VIBEX_USE_MAX_READ_ITEMS,
@@ -4101,6 +4102,136 @@ impl VibexUseService {
     // approval delegation
     // -----------------------------------------------------------------------
 
+    /// Reads the approval cards one of the caller's own child tasks is parked on.
+    ///
+    /// A parent can only answer a card it can read, and `vibex_get_tasks` only
+    /// reports the card's id. This is the missing half: the card's own text,
+    /// fenced and bounded, plus whether this parent may answer it at all.
+    ///
+    /// The fence is not decoration. The text was written by the child's
+    /// provider, so it is untrusted input arriving in the parent's context; a
+    /// parent that treats it as instruction has been talked into an approval.
+    /// `may_answer` reports the same boundary `vibex_decide_approval` enforces,
+    /// so an irreversible action reads as "a human has to answer this" instead
+    /// of failing only when the parent tries.
+    fn read_approvals(
+        &self,
+        actor: &VibexUseActor,
+        arguments: &serde_json::Value,
+    ) -> VibexResult<serde_json::Value> {
+        let conn = self.open()?;
+        let mut task_ids = Vec::new();
+        if let Some(list) = arguments
+            .get("taskRefs")
+            .and_then(serde_json::Value::as_array)
+        {
+            if list.len() > VIBEX_USE_MAX_BATCH_REFS {
+                return Err(VibexError::validation(
+                    use_codes::REQUEST_INVALID,
+                    format!("at most {VIBEX_USE_MAX_BATCH_REFS} task references are accepted"),
+                ));
+            }
+            for entry in list {
+                let raw = entry.as_str().ok_or_else(|| {
+                    VibexError::validation(
+                        use_codes::REQUEST_INVALID,
+                        "taskRefs entries must be strings",
+                    )
+                })?;
+                let reference = VibexUseRef::parse(raw).ok_or_else(|| {
+                    VibexError::validation(use_codes::REQUEST_INVALID, "taskRefs entry is invalid")
+                })?;
+                task_ids.push(reference.task_id().ok_or_else(|| {
+                    VibexError::validation(
+                        use_codes::REQUEST_INVALID,
+                        "taskRefs entry is not a task",
+                    )
+                })?);
+            }
+        } else {
+            // No explicit list: every task this caller delegated that is parked
+            // on an approval right now. That is what a parent actually wants —
+            // "is anything of mine waiting on me?" — without having to poll each
+            // task it ever created.
+            let root = self.actor_root(&conn, actor)?;
+            for task in vibex_db::list_delegations_for_root(&conn, &root, false)? {
+                if task.parent_session_id == actor.session_id {
+                    task_ids.push(task.id);
+                }
+            }
+        }
+        let max_items = bounded_usize(
+            arguments,
+            "maxItems",
+            VIBEX_USE_DEFAULT_READ_ITEMS,
+            VIBEX_USE_MAX_READ_ITEMS,
+        );
+        let mut cards = Vec::new();
+        for task_id in task_ids {
+            if cards.len() >= max_items {
+                break;
+            }
+            let Some(task) = AgentDelegationRepository::get(&conn, &task_id)? else {
+                continue;
+            };
+            // Only the delegating session reads its own child's cards. A
+            // sibling reading them would learn what another branch was asked to
+            // do, which is a different disclosure than reading the task.
+            if task.parent_session_id != actor.session_id {
+                continue;
+            }
+            let Some(DelegationBlockedOn::Permission { request_id }) = task.blocked_on.as_ref()
+            else {
+                continue;
+            };
+            let Some(child) = task.child_session_id.as_ref() else {
+                continue;
+            };
+            let Some(request) = PermissionRepository::get_request(
+                &conn,
+                &vibex_core::RequestId::parse(request_id).map_err(|_| {
+                    VibexError::validation(use_codes::REQUEST_INVALID, "requestId is invalid")
+                })?,
+            )?
+            else {
+                continue;
+            };
+            if request.status != vibex_core::PermissionRequestStatus::Pending {
+                continue;
+            }
+            let escalate = requires_human_approval(request.risk_category);
+            let mut body = String::new();
+            body.push_str(&request.title);
+            for detail in &request.details {
+                body.push('\n');
+                body.push_str(&detail.label);
+                body.push_str(": ");
+                body.push_str(&detail.value);
+            }
+            let (body, truncated) = vibex_core::bounded_chars(&body, VIBEX_USE_APPROVAL_READ_CHARS);
+            cards.push(vibex_core::ApprovalCardView {
+                request_id: request.id.as_str().to_string(),
+                task_ref: VibexUseRef::task(&task.id),
+                child_session_ref: VibexUseRef::session(child),
+                risk_category: format!("{:?}", request.risk_category),
+                title: vibex_core::bounded_chars(&request.title, VIBEX_USE_TITLE_CHARS).0,
+                fenced: vibex_core::fence_untrusted_approval(&body),
+                truncated,
+                may_answer: !escalate,
+                escalate_reason: escalate.then(|| {
+                    "this action cannot be undone; only a human may approve it".to_string()
+                }),
+                requested_at_ms: request.requested_at_ms,
+                expires_at_ms: request.expires_at_ms,
+            });
+        }
+        serde_json::to_value(vibex_core::ApprovalListPage {
+            notice: VIBEX_USE_APPROVAL_UNTRUSTED_NOTICE.to_string(),
+            cards,
+        })
+        .map_err(internal_encode_error)
+    }
+
     /// Answers a card one of the caller's own child tasks is parked on.
     ///
     /// The parent can answer because the child inherited the parent's sandbox
@@ -4651,6 +4782,7 @@ impl VibexUseToolHost for VibexUseService {
                 VibexUseTool::Interrupt => self.interrupt(&actor, &arguments).await,
                 VibexUseTool::CancelTask => self.cancel_task(&actor, &arguments).await,
                 VibexUseTool::DecideApproval => self.decide_approval(&actor, &arguments).await,
+                VibexUseTool::ReadApprovals => self.read_approvals(&actor, &arguments),
                 VibexUseTool::GetEvents => self.get_events(&actor, &arguments),
                 VibexUseTool::AckEvents => self.ack_events(&actor, &arguments),
                 VibexUseTool::ListGroups => self.list_groups(&actor, &arguments),
