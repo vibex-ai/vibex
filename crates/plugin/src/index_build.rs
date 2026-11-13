@@ -181,6 +181,7 @@ mod tests {
                 compatibility: Default::default(),
                 size_bytes: None,
                 featured: false,
+                source_name: None,
                 i18n: Default::default(),
             },
             versions: vec![PluginMarketVersion {
@@ -189,7 +190,7 @@ mod tests {
                 size_bytes: Some(10),
                 sha256: "a".repeat(64),
                 sha512: None,
-                url: "https://example.com/widgets.vibexplug".to_string(),
+                url: "https://example.com/widgets.vplug".to_string(),
                 changelog: None,
                 min_vibex: None,
                 min_shell: None,

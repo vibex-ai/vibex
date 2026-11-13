@@ -358,6 +358,7 @@ mod tests {
                 compatibility: Default::default(),
                 size_bytes: None,
                 featured: false,
+                source_name: None,
                 i18n: Default::default(),
             },
             description: None,
@@ -370,7 +371,7 @@ mod tests {
                 size_bytes: Some(10),
                 sha256: "a".repeat(64),
                 sha512: None,
-                url: "https://example.com/widgets.vibexplug".to_string(),
+                url: "https://example.com/widgets.vplug".to_string(),
                 changelog: None,
                 min_vibex: None,
                 min_shell: None,
@@ -395,6 +396,29 @@ mod tests {
             plugins: vec![entry("acme.widgets")],
             revocations_revision: 1,
         }
+    }
+
+    /// The published official index must verify against the key a release
+    /// build embeds.
+    ///
+    /// Point `VIBEX_TEST_INDEX` at a downloaded `index.json` (and
+    /// `VIBEX_TEST_ROOT_KEY` at its signer) to check the real published files;
+    /// without them the test is a no-op, so the ordinary suite stays offline.
+    #[test]
+    fn a_published_index_verifies_against_the_key_it_was_signed_with() {
+        let Ok(index) = std::env::var("VIBEX_TEST_INDEX") else {
+            return;
+        };
+        let root = std::env::var("VIBEX_TEST_ROOT_KEY")
+            .expect("VIBEX_TEST_ROOT_KEY must name the index signer");
+        let raw = std::fs::read(&index).unwrap();
+        let signature = std::fs::read_to_string(format!("{index}.sig")).unwrap();
+        verify_signature(&raw, signature.trim(), &root).unwrap();
+        let parsed = PluginIndexFile::parse(&raw).unwrap();
+        assert!(
+            !parsed.plugins.is_empty(),
+            "the published catalog lists at least one plugin"
+        );
     }
 
     #[test]

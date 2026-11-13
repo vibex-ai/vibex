@@ -116,6 +116,19 @@ impl MarketCache {
         self.read_json("publisher-keys.json")
     }
 
+    /// Persists the publisher keys the reader's own catalogs vouch for.
+    ///
+    /// They are kept apart from the official index's keys: a user catalog can
+    /// make a package signature check out, but it can never upgrade an entry
+    /// past `Community`, so the two lists must not merge into one claim.
+    pub fn write_user_publisher_keys(&self, keys: &[PublisherKey]) -> std::io::Result<()> {
+        self.write_json("user-publisher-keys.json", &keys)
+    }
+
+    pub fn read_user_publisher_keys(&self) -> Option<Vec<PublisherKey>> {
+        self.read_json("user-publisher-keys.json")
+    }
+
     /// How long ago the merged listing was written.
     pub fn merged_age(&self) -> Option<Duration> {
         self.age(MERGED_FILE)

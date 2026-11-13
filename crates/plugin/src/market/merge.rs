@@ -195,6 +195,7 @@ mod tests {
                 compatibility: Default::default(),
                 size_bytes: None,
                 featured: false,
+                source_name: None,
                 i18n: Default::default(),
             },
             versions: Vec::new(),

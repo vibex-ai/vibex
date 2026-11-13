@@ -1,7 +1,7 @@
 //! The plugin publishing tool.
 //!
 //! ```text
-//! vibex-plugin pack <dir> [--output <file>]      build a .vibexplug package
+//! vibex-plugin pack <dir> [--output <file>]      build a .vplug package
 //! vibex-plugin verify <package>                  read a package's manifest
 //! vibex-plugin hash <file>                       print sha256 and sha512
 //! vibex-plugin keygen [--output <file>]          make a signing key pair
@@ -64,7 +64,7 @@ fn usage() {
     println!(
         "vibex-plugin <command>\n\n\
          commands:\n\
-           pack <dir> [--output <file>]                          build a .vibexplug package\n\
+           pack <dir> [--output <file>]                          build a .vplug package\n\
            verify <package>                                      read a package's manifest\n\
            hash <file>                                           print sha256 and sha512\n\
            keygen [--output <file>]                              make a signing key pair\n\
@@ -202,7 +202,7 @@ fn publish(args: &[String]) -> Result<(), String> {
     let bytes = std::fs::read(&path).map_err(|error| error.to_string())?;
     let manifest = read_package_manifest(&bytes).map_err(|error| error.to_string())?;
     let signature = vibex_plugin::market::sign_package(&bytes, &signing_key);
-    let signature_path = path.with_extension("vibexplug.sig");
+    let signature_path = path.with_extension("vplug.sig");
     std::fs::write(&signature_path, &signature).map_err(|error| error.to_string())?;
 
     let entry = serde_json::json!({

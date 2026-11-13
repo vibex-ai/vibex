@@ -1,4 +1,4 @@
-//! Building a `.vibexplug` package from a plugin directory.
+//! Building a `.vplug` package from a plugin directory.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -11,7 +11,7 @@ use crate::manifest::{AUTHOR_MANIFEST_FILE, PluginManifest};
 use crate::shell::{SHELL_MANIFEST_FILE, ShellManifestContext, build_shell_manifest};
 
 /// The package extension the desktop installs.
-pub const PACKAGE_EXTENSION: &str = "vibexplug";
+pub const PACKAGE_EXTENSION: &str = "vplug";
 
 /// Files never packed: the generated host manifest and VCS metadata.
 const SKIPPED: &[&str] = &[SHELL_MANIFEST_FILE, ".git", ".DS_Store"];

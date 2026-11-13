@@ -14,7 +14,8 @@ use vibex_core::{
     PluginMarketInstallRequest, PluginMarketInstallResult, PluginMarketSearchRequest,
     PluginMarketSearchResponse, PluginMarketVersion, PluginPermission, PluginPermissionDiff,
     PluginPermissionGrant, PluginSource, PluginTrust, PluginUpdate, PluginUpdateCheckRequest,
-    PluginUpdateCheckResponse, VibexError, VibexResult, unix_timestamp_ms,
+    PluginUpdateCheckResponse, PluginUserSource, PluginUserSourceAddRequest, VibexError,
+    VibexResult, unix_timestamp_ms,
 };
 use vibex_db::{PluginRecord, PluginRepository, PluginVersionRecord};
 
@@ -480,6 +481,84 @@ impl PluginService {
         Ok(record.to_installed())
     }
 
+    // ---- catalogs the reader added ----
+
+    /// Every catalog the reader added, in the order they were added.
+    pub fn user_sources(&self, conn: &rusqlite::Connection) -> VibexResult<Vec<PluginUserSource>> {
+        PluginRepository::list_sources(conn)
+    }
+
+    /// Adds or updates one catalog the reader typed.
+    ///
+    /// Re-adding the same address updates the row rather than listing the
+    /// catalog twice: the id is derived from the address, and the unique index
+    /// on the column is the second guard.
+    pub fn add_user_source(
+        &self,
+        conn: &rusqlite::Connection,
+        request: &PluginUserSourceAddRequest,
+    ) -> VibexResult<PluginUserSource> {
+        vibex_core::validate_plugin_user_source(
+            &request.name,
+            &request.index_url,
+            request.public_key.as_deref(),
+            request.allow_unsigned,
+        )
+        .map_err(|message| VibexError::validation("plugin_source_invalid", message))?;
+        let index_url = request.index_url.trim().to_string();
+        let source_id = vibex_core::plugin_user_source_id(&index_url);
+        let existing = PluginRepository::get_source(conn, &source_id)?;
+        if existing.is_none() {
+            let count = PluginRepository::list_sources(conn)?.len();
+            if count >= vibex_core::MAX_PLUGIN_USER_SOURCES {
+                return Err(VibexError::validation(
+                    "plugin_source_limit",
+                    format!(
+                        "at most {} catalogs can be added",
+                        vibex_core::MAX_PLUGIN_USER_SOURCES
+                    ),
+                ));
+            }
+        }
+        let now = unix_timestamp_ms();
+        let source = PluginUserSource {
+            source_id,
+            name: request.name.trim().to_string(),
+            index_url,
+            public_key: request
+                .public_key
+                .as_deref()
+                .map(str::trim)
+                .filter(|key| !key.is_empty())
+                .map(str::to_string),
+            enabled: existing.as_ref().is_none_or(|source| source.enabled),
+            added_at_ms: existing.as_ref().map_or(now, |source| source.added_at_ms),
+            updated_at_ms: Some(now),
+            last_error: None,
+        };
+        PluginRepository::upsert_source(conn, &source)?;
+        Ok(source)
+    }
+
+    /// Turns one catalog the reader added on or off.
+    pub fn set_user_source_enabled(
+        &self,
+        conn: &rusqlite::Connection,
+        source_id: &str,
+        enabled: bool,
+    ) -> VibexResult<bool> {
+        PluginRepository::set_source_enabled(conn, source_id, enabled, unix_timestamp_ms())
+    }
+
+    /// Removes one catalog the reader added.
+    pub fn remove_user_source(
+        &self,
+        conn: &rusqlite::Connection,
+        source_id: &str,
+    ) -> VibexResult<bool> {
+        PluginRepository::delete_source(conn, source_id)
+    }
+
     /// Uninstalls a script plugin, optionally removing its data.
     pub fn uninstall(
         &self,
@@ -609,12 +688,24 @@ impl PluginService {
         };
         let mut trusted = entry.trust;
         if let Some(signature) = &version.signature {
-            let keys = self
-                .market
-                .config()
-                .cache
-                .read_publisher_keys()
-                .unwrap_or_default();
+            // A catalog the reader added publishes its own keys; they are read
+            // from their own list so a user catalog can make a package
+            // signature check out without ever borrowing the official index's
+            // authority.
+            let keys = match entry.listing_source {
+                PluginListingSource::User => self
+                    .market
+                    .config()
+                    .cache
+                    .read_user_publisher_keys()
+                    .unwrap_or_default(),
+                _ => self
+                    .market
+                    .config()
+                    .cache
+                    .read_publisher_keys()
+                    .unwrap_or_default(),
+            };
             let key = keys
                 .iter()
                 .find(|key| key.key_id == signature.key_id)
@@ -626,6 +717,9 @@ impl PluginService {
             )
             .map_err(VibexError::from)?;
             signature_status = "publisher-verified".to_string();
+            // Only the official index upgrades a verified package to
+            // `Verified`; a user catalog's signature says who built the
+            // package, not that the marketplace reviewed it.
             if entry.listing_source == PluginListingSource::Index
                 && trusted != PluginTrust::Official
             {
@@ -704,6 +798,7 @@ impl PluginService {
             compatibility: Default::default(),
             size_bytes: Some(bytes.len() as u64),
             featured: false,
+            source_name: None,
             i18n: Default::default(),
         };
         let granted: Vec<PluginPermissionGrant> = version
@@ -1497,12 +1592,114 @@ mod tests {
     }
 
     #[test]
+    fn a_catalog_the_reader_adds_is_stored_validated_and_removable() {
+        let directory = tempfile::tempdir().unwrap();
+        let service = service(directory.path());
+        let connection = connection();
+
+        // No key and no explicit acceptance is refused: an unsigned catalog
+        // has to be a decision the reader made, not a default.
+        assert!(
+            service
+                .add_user_source(
+                    &connection,
+                    &PluginUserSourceAddRequest {
+                        name: "Acme".to_string(),
+                        index_url: "https://acme.example/index.json".to_string(),
+                        public_key: None,
+                        allow_unsigned: false,
+                    },
+                )
+                .is_err()
+        );
+
+        let added = service
+            .add_user_source(
+                &connection,
+                &PluginUserSourceAddRequest {
+                    name: "Acme".to_string(),
+                    index_url: "https://acme.example/index.json".to_string(),
+                    public_key: None,
+                    allow_unsigned: true,
+                },
+            )
+            .unwrap();
+        assert_eq!(added.name, "Acme");
+        assert!(added.enabled);
+        assert_eq!(service.user_sources(&connection).unwrap().len(), 1);
+
+        // Re-adding the same address renames the row instead of duplicating it.
+        service
+            .add_user_source(
+                &connection,
+                &PluginUserSourceAddRequest {
+                    name: "Acme Renamed".to_string(),
+                    index_url: "https://acme.example/index.json".to_string(),
+                    public_key: None,
+                    allow_unsigned: true,
+                },
+            )
+            .unwrap();
+        let sources = service.user_sources(&connection).unwrap();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].name, "Acme Renamed");
+        assert_eq!(sources[0].added_at_ms, added.added_at_ms);
+
+        assert!(
+            service
+                .set_user_source_enabled(&connection, &added.source_id, false)
+                .unwrap()
+        );
+        assert!(
+            !service
+                .user_sources(&connection)
+                .unwrap()
+                .first()
+                .unwrap()
+                .enabled
+        );
+
+        assert!(
+            service
+                .remove_user_source(&connection, &added.source_id)
+                .unwrap()
+        );
+        assert!(service.user_sources(&connection).unwrap().is_empty());
+        assert!(
+            !service
+                .remove_user_source(&connection, &added.source_id)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn a_plaintext_catalog_address_is_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let service = service(directory.path());
+        let connection = connection();
+        assert!(
+            service
+                .add_user_source(
+                    &connection,
+                    &PluginUserSourceAddRequest {
+                        name: "Acme".to_string(),
+                        index_url: "http://acme.example/index.json".to_string(),
+                        public_key: None,
+                        allow_unsigned: true,
+                    },
+                )
+                .is_err()
+        );
+        assert!(service.user_sources(&connection).unwrap().is_empty());
+    }
+
+    #[test]
     fn a_local_package_installs_enables_and_uninstalls() {
         let directory = tempfile::tempdir().unwrap();
         let service = service(directory.path());
         let connection = connection();
 
-        let package_path = directory.path().join("acme.widgets.vibexplug");
+        let package_path = directory.path().join("acme.widgets.vplug");
         std::fs::write(&package_path, package()).unwrap();
 
         let result = service
@@ -1679,7 +1876,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let service = service(directory.path());
         let connection = connection();
-        let package_path = directory.path().join("acme.widgets.vibexplug");
+        let package_path = directory.path().join("acme.widgets.vplug");
         std::fs::write(&package_path, package()).unwrap();
 
         let result = service
@@ -1707,7 +1904,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let service = service(directory.path());
         let connection = connection();
-        let package_path = directory.path().join("acme.widgets.vibexplug");
+        let package_path = directory.path().join("acme.widgets.vplug");
         std::fs::write(&package_path, package()).unwrap();
         service
             .install_from_file(&connection, package_path.to_str().unwrap(), true)
@@ -1770,7 +1967,7 @@ mod tests {
             Version::parse("0.1.2").unwrap(),
         );
         let connection = connection();
-        let package_path = directory.path().join("acme.widgets.vibexplug");
+        let package_path = directory.path().join("acme.widgets.vplug");
         std::fs::write(&package_path, package()).unwrap();
 
         service
@@ -1793,7 +1990,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let service = service(directory.path());
         let connection = connection();
-        let package_path = directory.path().join("acme.widgets.vibexplug");
+        let package_path = directory.path().join("acme.widgets.vplug");
         std::fs::write(&package_path, package()).unwrap();
         service
             .install_from_file(&connection, package_path.to_str().unwrap(), true)
@@ -1830,7 +2027,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let service = service(directory.path());
         let connection = connection();
-        let package_path = directory.path().join("acme.widgets.vibexplug");
+        let package_path = directory.path().join("acme.widgets.vplug");
         std::fs::write(&package_path, package()).unwrap();
         service
             .install_from_file(&connection, package_path.to_str().unwrap(), true)
@@ -1856,13 +2053,13 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let service = service(directory.path());
         let connection = connection();
-        let package_path = directory.path().join("acme.widgets.vibexplug");
+        let package_path = directory.path().join("acme.widgets.vplug");
         std::fs::write(&package_path, package()).unwrap();
         service
             .install_from_file(&connection, package_path.to_str().unwrap(), true)
             .unwrap();
 
-        let next_path = directory.path().join("acme.widgets-1.1.0.vibexplug");
+        let next_path = directory.path().join("acme.widgets-1.1.0.vplug");
         std::fs::write(&next_path, package_version("1.1.0")).unwrap();
         service
             .install_from_file(&connection, next_path.to_str().unwrap(), true)
@@ -1891,13 +2088,13 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let service = service(directory.path());
         let connection = connection();
-        let package_path = directory.path().join("acme.widgets.vibexplug");
+        let package_path = directory.path().join("acme.widgets.vplug");
         std::fs::write(&package_path, package()).unwrap();
         service
             .install_from_file(&connection, package_path.to_str().unwrap(), true)
             .unwrap();
 
-        let next_path = directory.path().join("acme.widgets-1.1.0.vibexplug");
+        let next_path = directory.path().join("acme.widgets-1.1.0.vplug");
         std::fs::write(&next_path, package_version("1.1.0")).unwrap();
         service
             .install_from_file(&connection, next_path.to_str().unwrap(), true)
@@ -1929,7 +2126,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let service = service(directory.path());
         let connection = connection();
-        let package_path = directory.path().join("acme.widgets.vibexplug");
+        let package_path = directory.path().join("acme.widgets.vplug");
         std::fs::write(&package_path, package()).unwrap();
         service
             .install_from_file(&connection, package_path.to_str().unwrap(), true)
@@ -1961,6 +2158,7 @@ mod tests {
             compatibility: Default::default(),
             size_bytes: None,
             featured: false,
+            source_name: None,
             i18n: Default::default(),
         };
 
@@ -2016,7 +2214,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let service = service(directory.path());
         let connection = connection();
-        let package_path = directory.path().join("acme.widgets.vibexplug");
+        let package_path = directory.path().join("acme.widgets.vplug");
         std::fs::write(&package_path, package()).unwrap();
         service
             .install_from_file(&connection, package_path.to_str().unwrap(), true)

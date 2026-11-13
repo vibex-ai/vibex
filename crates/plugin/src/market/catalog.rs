@@ -43,6 +43,8 @@ pub struct MarketConfig {
     pub root_public_key: Option<VerifyingKey>,
     /// Topic discovery, when enabled.
     pub github: Option<GithubTopicSource>,
+    /// Catalogs the reader added themselves.
+    pub user_sources: Vec<UserSourceConfig>,
     /// The cache directory.
     pub cache: MarketCache,
     /// How long a merged listing stands.
@@ -55,6 +57,19 @@ pub struct MarketConfig {
     pub allow_unverified_index: bool,
 }
 
+/// One catalog the reader added, resolved for fetching.
+#[derive(Debug, Clone)]
+pub struct UserSourceConfig {
+    /// The reader's name for the catalog, shown on every entry it lists.
+    pub name: String,
+    /// The index address.
+    pub url: Url,
+    /// The key its signature is checked against.
+    ///
+    /// `None` means the reader accepted an unsigned catalog.
+    pub public_key: Option<VerifyingKey>,
+}
+
 impl MarketConfig {
     /// A config with no sources, for tests and for a build without a market.
     pub fn empty(cache: MarketCache) -> Self {
@@ -62,6 +77,7 @@ impl MarketConfig {
             index_urls: Vec::new(),
             root_public_key: None,
             github: None,
+            user_sources: Vec::new(),
             cache,
             index_ttl: INDEX_TTL,
             github_ttl: GITHUB_TTL,
@@ -127,8 +143,15 @@ impl MarketCatalog {
         };
 
         let github_entries = self.load_github(request, &mut partial_reason).await;
+        let user_entries = self.load_user_sources(&mut partial_reason).await;
 
-        let merged = merge_entries(index_entries, github_entries);
+        // The official index wins, then a catalog the reader added, then topic
+        // discovery: a reviewed entry beats one nobody reviewed, and a source
+        // the reader chose beats a repository that merely tagged itself.
+        let merged = merge_entries(
+            index_entries,
+            user_entries.into_iter().chain(github_entries).collect(),
+        );
         if !merged.is_empty() {
             let response = PluginMarketIndexResponse {
                 entries: merged.iter().map(|entry| entry.entry.clone()).collect(),
@@ -205,6 +228,81 @@ impl MarketCatalog {
             }
         }
         Err(last_error.unwrap_or(PluginError::NoCatalog))
+    }
+
+    /// Reads every catalog the reader added.
+    ///
+    /// One failing source never empties the list: the reason is appended to the
+    /// response's `partial_reason`, and the sources that answered still show
+    /// their plugins.
+    async fn load_user_sources(
+        &self,
+        partial_reason: &mut Option<String>,
+    ) -> Vec<PluginIndexEntry> {
+        let mut entries = Vec::new();
+        for source in &self.config.user_sources {
+            match self.fetch_user_source(source).await {
+                Ok(mut listed) => entries.append(&mut listed),
+                Err(error) => {
+                    let reason =
+                        format!("the catalog `{}` could not be read: {error}", source.name);
+                    *partial_reason = Some(match partial_reason.take() {
+                        Some(existing) => format!("{existing}; {reason}"),
+                        None => reason,
+                    });
+                }
+            }
+        }
+        entries
+    }
+
+    /// Reads and verifies one catalog the reader added.
+    ///
+    /// Its entries can never claim more trust than `Community`: the root key
+    /// the application embeds does not vouch for this document, so an entry
+    /// that calls itself `Official` is still a third party's catalog.
+    async fn fetch_user_source(
+        &self,
+        source: &UserSourceConfig,
+    ) -> Result<Vec<PluginIndexEntry>, PluginError> {
+        let raw = self
+            .client
+            .fetch_bytes(&source.url, MAX_INDEX_BYTES)
+            .await?;
+        match &source.public_key {
+            Some(key) => {
+                let signature_url = signature_url(&source.url)?;
+                let signature_bytes = self
+                    .client
+                    .fetch_bytes(&signature_url, MAX_SIGNATURE_BYTES)
+                    .await?;
+                let signature = String::from_utf8_lossy(&signature_bytes).trim().to_string();
+                verify_signature(&raw, &signature, &encode_verifying_key(key))?;
+            }
+            // The reader accepted an unsigned catalog; that is the only reason
+            // a user source may be read without a signature.
+            None => {}
+        }
+        let index = PluginIndexFile::parse(&raw)?;
+        // The keys this catalog publishes are kept apart from the official
+        // index's, so a package signature it vouches for can never be mistaken
+        // for one the official catalog vouched for. Several catalogs share the
+        // list, so a key is added rather than replacing what another published.
+        if !index.publisher_keys.is_empty() {
+            let mut keys = self
+                .config
+                .cache
+                .read_user_publisher_keys()
+                .unwrap_or_default();
+            for key in &index.publisher_keys {
+                match keys.iter_mut().find(|known| known.key_id == key.key_id) {
+                    Some(known) => *known = key.clone(),
+                    None => keys.push(key.clone()),
+                }
+            }
+            let _ = self.config.cache.write_user_publisher_keys(&keys);
+        }
+        Ok(mark_user_entries(index.plugins, &source.name))
     }
 
     async fn fetch_index_from(&self, url: &Url) -> Result<PluginIndexFile, PluginError> {
@@ -385,6 +483,29 @@ fn target_version<'a>(
     }
 }
 
+/// Marks entries as coming from a catalog the reader added.
+///
+/// The trust cap is the whole point: the root key the application embeds does
+/// not sign this document, so an entry that calls itself `Official` is still a
+/// third party's catalog. The strongest thing it can say is that its packages
+/// are signed by a key it publishes, which is `Community`.
+fn mark_user_entries(entries: Vec<PluginIndexEntry>, source_name: &str) -> Vec<PluginIndexEntry> {
+    entries
+        .into_iter()
+        .map(|mut entry| {
+            entry.entry.listing_source = vibex_core::PluginListingSource::User;
+            entry.entry.source_name = Some(source_name.to_string());
+            entry.entry.trust = match entry.entry.trust {
+                vibex_core::PluginTrust::Official | vibex_core::PluginTrust::Verified => {
+                    vibex_core::PluginTrust::Community
+                }
+                other => other,
+            };
+            entry
+        })
+        .collect()
+}
+
 /// The `owner/repo` a topic-discovered entry came from.
 fn repository_spec(entry: &PluginIndexEntry) -> Option<String> {
     for version in &entry.versions {
@@ -410,6 +531,7 @@ fn signature_url(url: &Url) -> Result<Url, PluginError> {
 mod tests {
     use super::*;
     use crate::market::fetch::{MarketHttpClient, MarketUrlPolicy};
+    use crate::market::index::{INDEX_SCHEMA, sign_document};
 
     #[test]
     fn the_signature_url_appends_to_the_path() {
@@ -446,6 +568,188 @@ mod tests {
             MarketConfig::empty(MarketCache::new("/tmp/does-not-matter")),
         );
         assert!(catalog.revocation_url().is_none());
+    }
+
+    fn user_entry(id: &str, trust: vibex_core::PluginTrust) -> PluginIndexEntry {
+        PluginIndexEntry {
+            entry: vibex_core::PluginMarketEntry {
+                id: id.to_string(),
+                name: "Widgets".to_string(),
+                trust,
+                ..Default::default()
+            },
+            versions: Vec::new(),
+            publisher_key_id: None,
+            description: None,
+            readme: None,
+            screenshots: Vec::new(),
+            reviews: None,
+        }
+    }
+
+    /// The whole reason a user catalog exists is that it cannot borrow the
+    /// official index's authority; an entry that calls itself `Official` must
+    /// come out as `Community`.
+    /// Reads a catalog served from a local HTTP server.
+    ///
+    /// This is the round trip the shipped client makes: fetch the index, fetch
+    /// its detached signature, verify it against the root key, parse it, and
+    /// mark the entries as coming from the reader's own catalog.
+    #[tokio::test]
+    async fn a_signed_catalog_round_trips_through_the_fetcher() {
+        use ed25519_dalek::SigningKey;
+        use std::io::{Read, Write};
+
+        let entry = user_entry("acme.widgets", vibex_core::PluginTrust::Community);
+        let document = PluginIndexFile {
+            schema: INDEX_SCHEMA,
+            generated_at: "2026-11-13T00:00:00Z".to_string(),
+            revision: 1,
+            publisher_keys: Vec::new(),
+            plugins: vec![entry],
+            revocations_revision: 0,
+        };
+        let raw = serde_json::to_vec(&document).unwrap();
+        let signing_key = SigningKey::from_bytes(&[3u8; 32]);
+        let signature = sign_document(&raw, &signing_key);
+
+        // One request per connection, answering `/index.json` and its `.sig`.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let index_body = raw.clone();
+        let signature_body = signature.clone().into_bytes();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut request = [0u8; 1024];
+                let Ok(read) = stream.read(&mut request) else {
+                    continue;
+                };
+                let request = String::from_utf8_lossy(&request[..read]);
+                let path = request.split_whitespace().nth(1).unwrap_or("/");
+                let body = if path.ends_with(".sig") {
+                    signature_body.clone()
+                } else {
+                    index_body.clone()
+                };
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(header.as_bytes());
+                let _ = stream.write_all(&body);
+            }
+        });
+
+        let directory = tempfile::tempdir().unwrap();
+        let cache = MarketCache::new(directory.path());
+        let mut config = MarketConfig::empty(cache);
+        config.user_sources = vec![UserSourceConfig {
+            name: "Acme".to_string(),
+            url: Url::parse(&format!("http://{address}/index.json")).unwrap(),
+            public_key: Some(signing_key.verifying_key()),
+        }];
+        let catalog = MarketCatalog::new(MarketHttpClient::new(MarketUrlPolicy::Testing), config);
+        let mut reason = None;
+        let entries = catalog.load_user_sources(&mut reason).await;
+        assert_eq!(reason, None, "a readable catalog must not report a failure");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].entry.id, "acme.widgets");
+        assert_eq!(entries[0].entry.source_name.as_deref(), Some("Acme"));
+        assert_eq!(
+            entries[0].entry.listing_source,
+            vibex_core::PluginListingSource::User
+        );
+    }
+
+    /// A catalog whose signature does not verify contributes nothing and says
+    /// why; it must not quietly return an empty list as if it had no plugins.
+    #[tokio::test]
+    async fn a_tampered_catalog_is_refused_with_a_reason() {
+        use ed25519_dalek::SigningKey;
+        use std::io::{Read, Write};
+
+        let entry = user_entry("acme.widgets", vibex_core::PluginTrust::Community);
+        let document = PluginIndexFile {
+            schema: INDEX_SCHEMA,
+            generated_at: "2026-11-13T00:00:00Z".to_string(),
+            revision: 1,
+            publisher_keys: Vec::new(),
+            plugins: vec![entry],
+            revocations_revision: 0,
+        };
+        let raw = serde_json::to_vec(&document).unwrap();
+        let signing_key = SigningKey::from_bytes(&[3u8; 32]);
+        // Signed by a different key than the one the source was added with.
+        let wrong = sign_document(&raw, &SigningKey::from_bytes(&[9u8; 32]));
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let index_body = raw.clone();
+        let signature_body = wrong.into_bytes();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut request = [0u8; 1024];
+                let Ok(read) = stream.read(&mut request) else {
+                    continue;
+                };
+                let request = String::from_utf8_lossy(&request[..read]);
+                let path = request.split_whitespace().nth(1).unwrap_or("/");
+                let body = if path.ends_with(".sig") {
+                    signature_body.clone()
+                } else {
+                    index_body.clone()
+                };
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(header.as_bytes());
+                let _ = stream.write_all(&body);
+            }
+        });
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = MarketConfig::empty(MarketCache::new(directory.path()));
+        config.user_sources = vec![UserSourceConfig {
+            name: "Acme".to_string(),
+            url: Url::parse(&format!("http://{address}/index.json")).unwrap(),
+            public_key: Some(signing_key.verifying_key()),
+        }];
+        let catalog = MarketCatalog::new(MarketHttpClient::new(MarketUrlPolicy::Testing), config);
+        let mut reason = None;
+        let entries = catalog.load_user_sources(&mut reason).await;
+        assert!(entries.is_empty());
+        let reason = reason.expect("a refused catalog must say why");
+        assert!(reason.contains("Acme"), "{reason}");
+    }
+
+    /// The whole reason a user catalog exists is that it cannot borrow the
+    /// official index's authority; an entry that calls itself `Official` must
+    /// come out as `Community`.
+    #[test]
+    fn a_user_catalog_cannot_mint_official_or_verified() {
+        let marked = mark_user_entries(
+            vec![
+                user_entry("acme.official", vibex_core::PluginTrust::Official),
+                user_entry("acme.verified", vibex_core::PluginTrust::Verified),
+                user_entry("acme.community", vibex_core::PluginTrust::Community),
+                user_entry("acme.unverified", vibex_core::PluginTrust::Unverified),
+            ],
+            "Acme",
+        );
+        assert_eq!(marked[0].entry.trust, vibex_core::PluginTrust::Community);
+        assert_eq!(marked[1].entry.trust, vibex_core::PluginTrust::Community);
+        assert_eq!(marked[2].entry.trust, vibex_core::PluginTrust::Community);
+        assert_eq!(marked[3].entry.trust, vibex_core::PluginTrust::Unverified);
+        for entry in &marked {
+            assert_eq!(
+                entry.entry.listing_source,
+                vibex_core::PluginListingSource::User
+            );
+            assert_eq!(entry.entry.source_name.as_deref(), Some("Acme"));
+        }
     }
 
     #[tokio::test]

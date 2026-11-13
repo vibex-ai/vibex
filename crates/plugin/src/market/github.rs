@@ -239,6 +239,7 @@ fn entry_for(item: &RepoItem, manifest: &PluginManifest) -> PluginIndexEntry {
         },
         size_bytes: None,
         featured: false,
+        source_name: None,
         i18n: Default::default(),
     };
     PluginIndexEntry {
