@@ -438,6 +438,16 @@ Use the smallest relevant gate while iterating. Packaging, mobile, Relay, and re
 
 ---
 
+## Star History
+
+<a href="https://www.star-history.com/?repos=vibex-ai%2Fvibex&type=date&legend=bottom-right">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=vibex-ai/vibex&type=date&theme=dark&legend=bottom-right" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=vibex-ai/vibex&type=date&legend=bottom-right" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=vibex-ai/vibex&type=date&legend=bottom-right" />
+ </picture>
+</a>
+
 ## Contributing
 
 Thanks to every developer who has helped Vibex. If you run into a problem, open an Issue or a Pull Request.
