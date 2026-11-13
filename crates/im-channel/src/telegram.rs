@@ -13,10 +13,29 @@ use vibex_core::{
 use crate::adapter::ImAdapter;
 use crate::error::{ImError, ImResult};
 use crate::types::{
-    ImButton, ImCallback, ImChatType, ImInboundEvent, ImSentMessage, ImTarget, ImThreadTarget,
+    ImAttachment, ImButton, ImCallback, ImChatType, ImInboundEvent, ImSentMessage, ImTarget,
+    ImThreadTarget,
 };
 
 const TELEGRAM_API_BASE: &str = "https://api.telegram.org";
+
+/// The largest file a chat message may bring in.
+///
+/// The bot API itself refuses files over 20 MB, and a prompt carrying a large
+/// binary is rarely what the user meant. The channel caps well below that so a
+/// paste of a disk image is rejected with a reason instead of timing out.
+const MAX_ATTACHMENT_BYTES: usize = 10 * 1024 * 1024;
+
+/// Whether a document is worth handing to the Agent.
+fn is_accepted_document(mime_type: &str) -> bool {
+    let mime = mime_type.to_ascii_lowercase();
+    mime.starts_with("image/")
+        || mime.starts_with("text/")
+        || matches!(
+            mime.as_str(),
+            "application/json" | "application/pdf" | "application/x-ndjson"
+        )
+}
 
 pub struct TelegramAdapter {
     channel_id: ImChannelId,
@@ -211,9 +230,14 @@ impl TelegramAdapter {
             let external_chat_id = chat.get("id")?.as_i64()?.to_string();
             let text = message
                 .get("text")
+                .or_else(|| message.get("caption"))
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string();
+            // A photo or a document carries no text; without this the message
+            // would parse as an empty prompt and be dropped before the service
+            // ever saw the file.
+            let attachments = self.download_attachments(message).await.unwrap_or_default();
             let chat_type = match chat.get("type").and_then(Value::as_str) {
                 Some("private") => ImChatType::Direct,
                 _ => ImChatType::Group,
@@ -237,6 +261,7 @@ impl TelegramAdapter {
                     .and_then(Value::as_i64)
                     .map(|id| id.to_string()),
                 text,
+                attachments,
                 callback: None,
                 received_at_ms,
             })
@@ -268,6 +293,7 @@ impl TelegramAdapter {
                     .and_then(Value::as_i64)
                     .map(|id| id.to_string()),
                 text: String::new(),
+                attachments: Vec::new(),
                 callback: Some(ImCallback {
                     callback_query_id: callback
                         .get("id")
@@ -419,6 +445,78 @@ impl TelegramAdapter {
                 .map(str::to_string),
             warnings,
         })
+    }
+
+    /// Downloads a photo or document Telegram is hosting.
+    ///
+    /// Only two shapes are accepted, and both are capped: a photo is taken at
+    /// the largest size the message offers, a document only when it declares
+    /// an image MIME type or a text-like one. Anything else is named back to the
+    /// user by the service rather than silently dropped.
+    pub async fn download_attachments(&self, message: &Value) -> ImResult<Vec<ImAttachment>> {
+        let mut files = Vec::new();
+        if let Some(photos) = message.get("photo").and_then(Value::as_array)
+            && let Some(photo) = photos
+                .iter()
+                .max_by_key(|photo| photo.get("file_size").and_then(Value::as_i64).unwrap_or(0))
+            && let Some(file_id) = photo.get("file_id").and_then(Value::as_str)
+            && let Some(bytes) = self.download_file(file_id).await?
+        {
+            files.push(ImAttachment {
+                file_name: format!("photo-{}.jpg", files.len() + 1),
+                mime_type: "image/jpeg".to_string(),
+                bytes,
+            });
+        }
+        if let Some(document) = message.get("document")
+            && let Some(mime_type) = document.get("mime_type").and_then(Value::as_str)
+            && is_accepted_document(mime_type)
+            && let Some(file_id) = document.get("file_id").and_then(Value::as_str)
+            && let Some(bytes) = self.download_file(file_id).await?
+        {
+            files.push(ImAttachment {
+                file_name: document
+                    .get("file_name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("document")
+                    .to_string(),
+                mime_type: mime_type.to_string(),
+                bytes,
+            });
+        }
+        Ok(files)
+    }
+
+    async fn download_file(&self, file_id: &str) -> ImResult<Option<Vec<u8>>> {
+        let file = self.call("getFile", json!({ "file_id": file_id })).await?;
+        let Some(path) = file.get("file_path").and_then(Value::as_str) else {
+            return Ok(None);
+        };
+        let declared = file.get("file_size").and_then(Value::as_i64).unwrap_or(0);
+        if declared > MAX_ATTACHMENT_BYTES as i64 {
+            return Err(ImError::ProviderRejected {
+                code: "telegram_attachment_too_large".to_string(),
+                message: "the file is larger than this channel accepts".to_string(),
+            });
+        }
+        let response = self
+            .client
+            .get(format!(
+                "{}/file/bot{}/{path}",
+                self.api_base.trim_end_matches('/'),
+                self.token
+            ))
+            .send()
+            .await
+            .map_err(|_| ImError::Transport)?;
+        let bytes = response.bytes().await.map_err(|_| ImError::Transport)?;
+        if bytes.len() > MAX_ATTACHMENT_BYTES {
+            return Err(ImError::ProviderRejected {
+                code: "telegram_attachment_too_large".to_string(),
+                message: "the file is larger than this channel accepts".to_string(),
+            });
+        }
+        Ok(Some(bytes.to_vec()))
     }
 
     pub async fn is_group_trigger(&self, text: &str) -> bool {

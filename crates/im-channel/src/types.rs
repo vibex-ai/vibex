@@ -7,6 +7,17 @@ pub enum ImChatType {
     Thread,
 }
 
+/// One file a user sent with a message.
+///
+/// The bytes are already downloaded: the channel decides what it accepts, and
+/// the Agent is never handed a provider URL it would have to fetch itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImAttachment {
+    pub file_name: String,
+    pub mime_type: String,
+    pub bytes: Vec<u8>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImInboundEvent {
     pub channel_id: vibex_core::ImChannelId,
@@ -19,6 +30,8 @@ pub struct ImInboundEvent {
     pub sender_display_name: String,
     pub external_message_id: Option<String>,
     pub text: String,
+    /// Files that came with the message, already downloaded and validated.
+    pub attachments: Vec<ImAttachment>,
     pub callback: Option<ImCallback>,
     pub received_at_ms: i64,
 }

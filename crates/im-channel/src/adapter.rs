@@ -49,4 +49,17 @@ pub trait ImAdapter: Send + Sync + 'static {
     async fn edit_thread_title(&self, _thread_key: &str, _title: &str) -> ImResult<()> {
         Err(crate::error::ImError::Unsupported)
     }
+
+    /// Downloads the files a message carried.
+    ///
+    /// The adapter owns this because only it knows how the provider exposes
+    /// file bytes and how large a download it will tolerate. The default
+    /// refuses, so a transport without attachment support says so instead of
+    /// silently dropping them.
+    async fn download_attachments(
+        &self,
+        _message: &serde_json::Value,
+    ) -> ImResult<Vec<crate::types::ImAttachment>> {
+        Err(crate::error::ImError::Unsupported)
+    }
 }

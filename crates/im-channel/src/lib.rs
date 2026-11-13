@@ -16,7 +16,7 @@ mod telegram;
 mod types;
 
 pub use adapter::ImAdapter;
-pub use agent_port::ImAgentPort;
+pub use agent_port::{AdministrativeAgent, ImAgentPort};
 pub use error::{ImError, ImResult};
 pub use i18n::ImLocale;
 pub use lark::LarkAdapter;

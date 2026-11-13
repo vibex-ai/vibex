@@ -10512,6 +10512,7 @@ version = "0.1.5"
 dependencies = [
  "async-trait",
  "axum",
+ "base64",
  "futures-util",
  "reqwest",
  "rusqlite",
@@ -10725,9 +10726,11 @@ dependencies = [
  "vibex-browser",
  "vibex-client",
  "vibex-computer",
+ "vibex-config-switch",
  "vibex-core",
  "vibex-db",
  "vibex-desktop-runtime",
+ "vibex-im-channel",
  "vibex-remote",
  "vibex-tui",
 ]
