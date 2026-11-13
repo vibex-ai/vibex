@@ -60401,7 +60401,11 @@ impl VibexWorkbench {
                 .flex_none()
                 .bg(cx.theme().border.opacity(0.70))
         };
+        let closing = self.runtime_menu_closing_since;
+        // See the current-session twin: a closed popover never paints this.
+        let menu_mounted = self.new_session_runtime_menu_open || closing.is_some();
         let menu_content = match menu_view {
+            _ if !menu_mounted => div().into_any_element(),
             ComposerRuntimeMenuView::AuthSource => match (catalog.as_ref(), agent_id.as_ref()) {
                 (Some(catalog), Some(agent_id)) => self.render_provider_model_groups(
                     agent_id,
@@ -60564,7 +60568,6 @@ impl VibexWorkbench {
             .shadow_lg()
             .child(menu_content);
 
-        let closing = self.runtime_menu_closing_since;
         let popover = Popover::new("new-session-runtime-cascade")
             .anchor(menu_placement.anchor)
             .appearance(false)
@@ -63831,7 +63834,21 @@ impl VibexWorkbench {
                 .flex_none()
                 .bg(cx.theme().border.opacity(0.70))
         };
+        // One pane owns the cascade. Every other pane's Composer shares the
+        // flag, and a popover keys its open state by element id, so without both
+        // the scope and the id below a chip pressed in one pane opened in all of
+        // them — each one anchored to the last pane that painted a trigger.
+        let focused_pane = self.composer_menu_scope_focused();
+        let menu_open = self.composer_runtime_menu_open && focused_pane;
+        let closing = self.runtime_menu_closing_since.filter(|_| focused_pane);
+        let scope = self.composer_menu_scope();
+        // The Composer is rebuilt on every timeline frame, and a closed popover
+        // drops its content unpainted. Building the provider list anyway cost
+        // more than the rest of the frame: it walks and copies the whole model
+        // catalog.
+        let menu_mounted = menu_open || closing.is_some();
         let menu_content = match self.composer_runtime_menu_view {
+            _ if !menu_mounted => div().into_any_element(),
             ComposerRuntimeMenuView::AuthSource => self.render_provider_model_groups(
                 &menu_agent_id,
                 &catalog,
@@ -64024,15 +64041,6 @@ impl VibexWorkbench {
             .bg(cx.theme().popover)
             .shadow_lg()
             .child(menu_content);
-        // One pane owns the cascade. Every other pane's Composer shares the
-        // flag, and a popover keys its open state by element id, so without both
-        // the scope and the id below a chip pressed in one pane opened in all of
-        // them — each one anchored to the last pane that painted a trigger.
-        let focused_pane = self.composer_menu_scope_focused();
-        let menu_open = self.composer_runtime_menu_open && focused_pane;
-        let closing = self.runtime_menu_closing_since.filter(|_| focused_pane);
-        let scope = self.composer_menu_scope();
-
         let popover = Popover::new(format!("composer-runtime-cascade{scope}"))
             .anchor(menu_placement.anchor)
             .appearance(false)
