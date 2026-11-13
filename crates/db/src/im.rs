@@ -918,6 +918,20 @@ impl ImMessageRepository {
         Ok(deleted)
     }
 
+    /// Records the provider's id once a send was accepted.
+    pub fn set_external_id(
+        conn: &Connection,
+        message_id: &str,
+        external_message_id: &str,
+    ) -> VibexResult<()> {
+        conn.execute(
+            "UPDATE im_messages SET external_message_id = ?2 WHERE message_id = ?1",
+            params![message_id, external_message_id],
+        )
+        .map_err(storage_error("im_message_external_id_failed"))?;
+        Ok(())
+    }
+
     pub fn set_status(
         conn: &Connection,
         message_id: &str,

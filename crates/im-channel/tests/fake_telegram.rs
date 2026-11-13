@@ -440,7 +440,7 @@ async fn telegram_pairing_commands_and_approval_round_trip() {
     let agent_port: Arc<dyn ImAgentPort> = agent.clone();
     let service = Arc::new(
         ImChannelService::new(ImChannelServiceConfig {
-            db_path,
+            db_path: db_path.clone(),
             home_dir: home,
             agent: agent_port,
             telegram_api_base: Some(format!("http://{address}")),
@@ -479,6 +479,8 @@ async fn telegram_pairing_commands_and_approval_round_trip() {
             channel_id: channel.channel_id.clone(),
             role: ImPrincipalRole::Operator,
             ttl_ms: Some(60_000),
+            scope: vibex_core::ImPairingScope::Direct,
+            target_chat_id: None,
         })
         .await
         .expect("pairing");
@@ -497,6 +499,39 @@ async fn telegram_pairing_commands_and_approval_round_trip() {
                 .unwrap_or(false)
         },
         "pairing",
+    )
+    .await;
+
+    // A code minted for a direct message is refused in a group, so a code
+    // pasted into a group cannot pair everyone with it. The bot still sees the
+    // message because the fake has no privacy mode.
+    let group_code = service
+        .create_pairing_code(ImPairingRequest {
+            channel_id: channel.channel_id.clone(),
+            role: ImPrincipalRole::Operator,
+            ttl_ms: Some(60_000),
+            scope: vibex_core::ImPairingScope::Direct,
+            target_chat_id: None,
+        })
+        .await
+        .expect("group code");
+    fake.push(json!({
+        "update_id": 41,
+        "message": {
+            "message_id": 41,
+            "date": 1,
+            "text": format!("/pair {}", group_code.code),
+            "chat": { "id": -1001234, "type": "supergroup" },
+            "from": { "id": 42, "is_bot": false, "first_name": "Tester" }
+        }
+    }));
+    wait_for(
+        || async {
+            fake.sent_texts()
+                .iter()
+                .any(|text| text.contains("cannot be used in this chat"))
+        },
+        "group pairing rejection",
     )
     .await;
 
@@ -795,6 +830,59 @@ async fn telegram_pairing_commands_and_approval_round_trip() {
             .iter()
             .any(|text| text.contains("open Vibex"))
     );
+
+    // Every send leaves a row, and the row reaches a terminal state. The ack
+    // for the last answer is still in flight when the resolution lands, so the
+    // drain is waited for rather than asserted immediately.
+    let conn = rusqlite::Connection::open(&db_path).expect("db");
+    let queued_rows = || -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM im_messages
+             WHERE direction = 'outbound' AND status = 'queued'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("queued rows")
+    };
+    for _ in 0..100 {
+        if queued_rows() == 0 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert_eq!(
+        queued_rows(),
+        0,
+        "nothing is left queued after the sends return"
+    );
+    let outbound: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM im_messages WHERE direction = 'outbound'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("outbound rows");
+    assert!(outbound > 0, "a delivered message is recorded");
+    let with_external_id: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM im_messages
+             WHERE direction = 'outbound' AND external_message_id IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )
+        .expect("external ids");
+    assert!(with_external_id > 0, "the provider id is kept");
+    // The log stores a preview and a digest, never the whole answer.
+    let preview_too_long: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM im_messages
+             WHERE direction = 'outbound' AND LENGTH(content_preview) > 256",
+            [],
+            |row| row.get(0),
+        )
+        .expect("preview bounds");
+    assert_eq!(preview_too_long, 0);
+    drop(conn);
 
     service.stop().await;
     server.abort();

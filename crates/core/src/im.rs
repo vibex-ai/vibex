@@ -379,12 +379,46 @@ pub struct ImChannelTestReport {
     pub warnings: Vec<String>,
 }
 
+/// Where a pairing code may be claimed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImPairingScope {
+    /// A direct message. The default, because a group code is a deliberate
+    /// choice: whoever sees it in the group can claim it.
+    #[default]
+    Direct,
+    /// One named group chat. A code minted this way is refused anywhere else.
+    Group,
+}
+
+impl ImPairingScope {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Direct => "dm",
+            Self::Group => "group",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "dm" => Some(Self::Direct),
+            "group" => Some(Self::Group),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ImPairingRequest {
     pub channel_id: ImChannelId,
     pub role: ImPrincipalRole,
     pub ttl_ms: Option<u32>,
+    #[serde(default)]
+    pub scope: ImPairingScope,
+    /// Required when `scope` is [`ImPairingScope::Group`].
+    #[serde(default)]
+    pub target_chat_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

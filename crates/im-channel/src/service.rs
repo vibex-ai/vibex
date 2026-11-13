@@ -14,9 +14,9 @@ use vibex_core::{
     CreateAgentSessionRequest, FetchTimelineRequest, ImActionId, ImBindingId, ImBindingStatus,
     ImBindingSummary, ImChannelConfig, ImChannelConfigEnvelope, ImChannelDraft, ImChannelId,
     ImChannelState, ImChannelStatus, ImChannelSummary, ImChannelTestReport, ImLarkTransport,
-    ImMessageId, ImPairingCodeInfo, ImPairingId, ImPairingRequest, ImPrincipalId, ImPrincipalRole,
-    ImPrincipalStatus, ImPrincipalSummary, ImSessionDefaults, MessageProvenance, PermissionRequest,
-    PermissionRequestStatus, PermissionResolution, PermissionResponseKind,
+    ImMessageId, ImPairingCodeInfo, ImPairingId, ImPairingRequest, ImPairingScope, ImPrincipalId,
+    ImPrincipalRole, ImPrincipalStatus, ImPrincipalSummary, ImSessionDefaults, MessageProvenance,
+    PermissionRequest, PermissionRequestStatus, PermissionResolution, PermissionResponseKind,
     PermissionResponseOption, ResolvePermissionRequest, SendAgentMessageRequest, TimelineLiveEvent,
     TimelinePayload, VibexError, VibexResult, VibexSessionId, unix_timestamp_ms,
 };
@@ -644,13 +644,23 @@ impl ImChannelService {
         let code = generate_pairing_code();
         let code_hash = sha256_hex(&code);
         let now = unix_timestamp_ms();
+        if request.scope == vibex_core::ImPairingScope::Group
+            && request.target_chat_id.as_deref().is_none_or(str::is_empty)
+        {
+            return Err(VibexError::validation(
+                "im_pairing_group_chat_required",
+                "a group pairing code needs the chat it may be claimed in",
+            ));
+        }
         let record = ImPairingRecord {
             pairing_id: ImPairingId::new(),
             channel_id: request.channel_id.clone(),
             code_hash,
             role: request.role,
-            scope: "dm".to_string(),
-            target_chat_id: None,
+            scope: request.scope.as_str().to_string(),
+            target_chat_id: (request.scope == vibex_core::ImPairingScope::Group)
+                .then(|| request.target_chat_id.clone())
+                .flatten(),
             created_by_principal_id: None,
             expires_at_ms: now.saturating_add(ttl_ms),
             claimed_principal_id: None,
@@ -1082,6 +1092,13 @@ impl ImChannelService {
         )?;
         let Some(principal) = principal else {
             if event.chat_type != ImChatType::Direct {
+                // An unpaired group is ignored so a bot in a busy room stays
+                // quiet, with one exception: a pairing code is a deliberate act
+                // by someone holding a code, and the handler enforces which chat
+                // the code was minted for.
+                if is_pairing_attempt(&event.text) {
+                    return self.handle_pairing(&event, &runtime).await;
+                }
                 return Ok(());
             }
             if event.text.trim_start().starts_with("/pair") {
@@ -1119,6 +1136,11 @@ impl ImChannelService {
                     .unwrap_or_default();
             }
         }
+        // A paired identity may still be trying to pair a second chat, and the
+        // answer depends on where the code was minted rather than on who sent it.
+        if is_pairing_attempt(&text) {
+            return self.handle_pairing(&event, &runtime).await;
+        }
         if text.trim_start().starts_with('/') {
             self.handle_command(&event, &runtime, &principal, &text)
                 .await
@@ -1133,21 +1155,14 @@ impl ImChannelService {
         event: &ImInboundEvent,
         runtime: &ChannelRuntime,
     ) -> VibexResult<()> {
-        if event.chat_type != ImChatType::Direct {
-            self.reply(
-                event,
-                runtime,
-                "Pairing codes are accepted in a direct message only.",
-            )
-            .await?;
-            return Ok(());
-        }
-        let code = event
-            .text
-            .trim()
-            .strip_prefix("/pair")
-            .unwrap_or_default()
-            .trim();
+        // In a group the command arrives as `@bot /pair CODE`.
+        let text = event.text.trim();
+        let text = text
+            .strip_prefix('@')
+            .and_then(|rest| rest.split_once(char::is_whitespace).map(|(_, rest)| rest))
+            .map(str::trim)
+            .unwrap_or(text);
+        let code = text.strip_prefix("/pair").unwrap_or_default().trim();
         if code.is_empty() {
             self.reply(
                 event,
@@ -1166,6 +1181,26 @@ impl ImChannelService {
                 .await?;
             return Ok(());
         };
+        // A code is bound to the kind of chat it was minted for. A direct code
+        // used in a group would otherwise pair everyone in it to one identity.
+        let scope_ok = match ImPairingScope::parse(&pairing.scope) {
+            Some(ImPairingScope::Direct) => event.chat_type == ImChatType::Direct,
+            Some(ImPairingScope::Group) => {
+                event.chat_type != ImChatType::Direct
+                    && pairing.target_chat_id.as_deref() == Some(event.external_chat_id.as_str())
+            }
+            None => false,
+        };
+        if !scope_ok {
+            drop(conn);
+            self.reply(
+                event,
+                runtime,
+                "That pairing code cannot be used in this chat.",
+            )
+            .await?;
+            return Ok(());
+        }
         {
             let tx = conn.transaction().map_err(|_| {
                 VibexError::storage(
@@ -2022,12 +2057,72 @@ impl ImChannelService {
             chat_id: binding.external_chat_id.clone(),
             thread_key: binding.thread_key.clone(),
         };
-        let sent = runtime
+        let message_id = self.record_outbound(binding, text, "message");
+        let result = runtime
             .outbox
             .send(target, text.to_string(), Vec::new(), priority)
-            .await
-            .map_err(im_error_to_vibex)?;
+            .await;
+        self.finish_outbound(&message_id, &result);
+        let sent = result.map_err(im_error_to_vibex)?;
         Ok(Some(sent))
+    }
+
+    /// Writes the row for one outbound message before the provider call.
+    ///
+    /// The `queued` state is what makes a restart honest: a row that never
+    /// reached `sent` is a message the runtime owes the chat. Content is kept
+    /// as a preview and a digest, never the full text, so the log cannot become
+    /// a second transcript.
+    fn record_outbound(&self, binding: &ImBindingRecord, text: &str, kind: &str) -> Option<String> {
+        let conn = self.open().ok()?;
+        let message_id = ImMessageId::new().into_string();
+        let preview = render::truncate(text, 256);
+        let record = ImMessageRecord {
+            message_id: message_id.clone(),
+            channel_id: binding.channel_id.clone(),
+            direction: "outbound".to_string(),
+            provider_update_id: None,
+            external_message_id: None,
+            binding_id: Some(binding.binding_id.clone()),
+            principal_id: binding.created_by_principal_id.clone(),
+            kind: kind.to_string(),
+            content_preview: (!preview.is_empty()).then_some(preview),
+            content_sha256: (!text.is_empty()).then(|| sha256_hex(text)),
+            status: "queued".to_string(),
+            error_code: None,
+            error_detail: None,
+            created_at_ms: unix_timestamp_ms(),
+        };
+        ImMessageRepository::insert(&conn, &record).ok()?;
+        Some(message_id)
+    }
+
+    fn finish_outbound(
+        &self,
+        message_id: &Option<String>,
+        result: &Result<ImSentMessage, ImError>,
+    ) {
+        let Some(message_id) = message_id.as_deref() else {
+            return;
+        };
+        let Ok(conn) = self.open() else {
+            return;
+        };
+        match result {
+            Ok(sent) => {
+                let _ = ImMessageRepository::set_status(&conn, message_id, "sent", None, None);
+                let _ = ImMessageRepository::set_external_id(&conn, message_id, &sent.message_id);
+            }
+            Err(error) => {
+                let _ = ImMessageRepository::set_status(
+                    &conn,
+                    message_id,
+                    "failed",
+                    Some(error.code()),
+                    Some(&error.to_string()),
+                );
+            }
+        }
     }
 
     async fn reply(
@@ -2051,12 +2146,43 @@ impl ImChannelService {
             chat_id: event.external_chat_id.clone(),
             thread_key: event.thread_key.clone(),
         };
-        runtime
+        let message_id = self.record_outbound_reply(event, text);
+        let result = runtime
             .outbox
             .send(target, text.to_string(), Vec::new(), priority)
-            .await
-            .map_err(im_error_to_vibex)?;
+            .await;
+        self.finish_outbound(&message_id, &result);
+        result.map_err(im_error_to_vibex)?;
         Ok(())
+    }
+
+    /// The row for a reply that belongs to the chat rather than a binding.
+    fn record_outbound_reply(&self, event: &ImInboundEvent, text: &str) -> Option<String> {
+        let conn = self.open().ok()?;
+        let message_id = ImMessageId::new().into_string();
+        let preview = render::truncate(text, 256);
+        let record = ImMessageRecord {
+            message_id: message_id.clone(),
+            channel_id: event.channel_id.clone(),
+            direction: "outbound".to_string(),
+            provider_update_id: None,
+            external_message_id: None,
+            binding_id: self
+                .binding_for(&conn, event)
+                .ok()
+                .flatten()
+                .map(|binding| binding.binding_id),
+            principal_id: None,
+            kind: "reply".to_string(),
+            content_preview: (!preview.is_empty()).then_some(preview),
+            content_sha256: (!text.is_empty()).then(|| sha256_hex(text)),
+            status: "queued".to_string(),
+            error_code: None,
+            error_detail: None,
+            created_at_ms: unix_timestamp_ms(),
+        };
+        ImMessageRepository::insert(&conn, &record).ok()?;
+        Some(message_id)
     }
 
     /// The locale for a chat.
@@ -2235,6 +2361,17 @@ fn action_short_code(action_id: &ImActionId) -> String {
         .take(6)
         .collect::<String>()
         .to_uppercase()
+}
+
+/// Whether a message is a `/pair` attempt, with or without a group mention.
+fn is_pairing_attempt(text: &str) -> bool {
+    let text = text.trim();
+    let text = text
+        .strip_prefix('@')
+        .and_then(|rest| rest.split_once(char::is_whitespace).map(|(_, rest)| rest))
+        .map(str::trim)
+        .unwrap_or(text);
+    text.starts_with("/pair")
 }
 
 fn sha256_hex(value: &str) -> String {
@@ -2488,6 +2625,8 @@ mod tests {
                 channel_id: channel.channel_id.clone(),
                 role: ImPrincipalRole::Approver,
                 ttl_ms: Some(60_000),
+                scope: ImPairingScope::Direct,
+                target_chat_id: None,
             })
             .await
             .expect("pairing code");
@@ -2594,6 +2733,20 @@ mod tests {
             locale: None,
         };
         assert_eq!(draft.config.kind(), vibex_core::ImChannelKind::Lark);
+    }
+
+    #[test]
+    fn a_group_code_names_its_chat_and_a_direct_code_names_kind_only() {
+        let direct = ImPairingScope::Direct;
+        assert_eq!(direct.as_str(), "dm");
+        assert_eq!(ImPairingScope::parse("dm"), Some(direct));
+        let group = ImPairingScope::Group;
+        assert_eq!(group.as_str(), "group");
+        assert_eq!(ImPairingScope::parse("group"), Some(group));
+        assert_eq!(ImPairingScope::parse("anything"), None);
+        // The stored scope column round-trips through the parser the claim path
+        // uses, so a row written by an older build still reads as a direct code.
+        assert_eq!(ImPairingScope::parse("dm"), Some(ImPairingScope::Direct));
     }
 
     #[test]

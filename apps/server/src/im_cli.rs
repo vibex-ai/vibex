@@ -26,6 +26,8 @@ pub enum ImCommand {
         channel: String,
         role: ImPrincipalRole,
         ttl_ms: Option<u32>,
+        scope: vibex_core::ImPairingScope,
+        group_chat: Option<String>,
     },
     Revoke {
         channel: String,
@@ -87,10 +89,18 @@ impl ImCommand {
                             .map_err(|_| "--ttl-minutes must be a number".to_string())
                     })
                     .transpose()?;
+                let group_chat = flag("--chat");
+                let scope = if group_chat.is_some() {
+                    vibex_core::ImPairingScope::Group
+                } else {
+                    vibex_core::ImPairingScope::Direct
+                };
                 Ok(Self::Pair {
                     channel,
                     role,
                     ttl_ms,
+                    scope,
+                    group_chat,
                 })
             }
             "revoke" => Ok(Self::Revoke {
@@ -172,6 +182,8 @@ pub async fn run(config: &DesktopRuntimeConfig, command: ImCommand) -> Result<()
             channel,
             role,
             ttl_ms,
+            scope,
+            group_chat,
         } => {
             let channel_id = resolve_channel(&service, &channel).await?;
             let pairing = service
@@ -179,6 +191,8 @@ pub async fn run(config: &DesktopRuntimeConfig, command: ImCommand) -> Result<()
                     channel_id,
                     role,
                     ttl_ms,
+                    scope,
+                    target_chat_id: group_chat,
                 })
                 .await
                 .map_err(|error| error.message)?;
@@ -328,7 +342,9 @@ fn configure_secret_store(config: &DesktopRuntimeConfig) {
 pub fn print_help() {
     println!("  im list [--json]                     list configured channels");
     println!("  im pair --channel <id|name> [--role observer|approver|operator|admin]");
-    println!("          [--ttl-minutes N]            mint a one-time pairing code");
+    println!("          [--ttl-minutes N] [--chat GROUP_ID]");
+    println!("                                       mint a one-time pairing code; --chat");
+    println!("                                       binds a code to one group");
     println!("  im revoke --channel <id|name> --principal <id|external-id>");
     println!("  im bindings --channel <id|name>      list session bindings");
     println!("  im unbind --binding <id>             drop one binding");
@@ -361,10 +377,14 @@ mod tests {
                 channel,
                 role,
                 ttl_ms,
+                scope,
+                group_chat,
             } => {
                 assert_eq!(channel, "imchannel_ab");
                 assert_eq!(role, ImPrincipalRole::Operator);
                 assert!(ttl_ms.is_none());
+                assert_eq!(scope, vibex_core::ImPairingScope::Direct);
+                assert!(group_chat.is_none());
             }
             _ => panic!("expected pair"),
         }
@@ -382,6 +402,21 @@ mod tests {
             ImCommand::Pair { role, ttl_ms, .. } => {
                 assert_eq!(role, ImPrincipalRole::Admin);
                 assert_eq!(ttl_ms, Some(120_000));
+            }
+            _ => panic!("expected pair"),
+        }
+    }
+
+    #[test]
+    fn a_group_code_needs_a_chat_and_carries_it() {
+        let command = ImCommand::parse(&args(&["pair", "--channel", "bot", "--chat", "-1001234"]))
+            .expect("parse");
+        match command {
+            ImCommand::Pair {
+                scope, group_chat, ..
+            } => {
+                assert_eq!(scope, vibex_core::ImPairingScope::Group);
+                assert_eq!(group_chat.as_deref(), Some("-1001234"));
             }
             _ => panic!("expected pair"),
         }
