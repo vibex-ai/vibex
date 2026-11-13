@@ -2224,6 +2224,16 @@ pub static COPY_ROWS: &[CopyRow] = &[
         ru: "Автоматическое архивирование бездействующих сеансов",
     },
     CopyRow {
+        en: "Auto-collapse tool calls",
+        ja: "ツール呼び出しを自動で折りたたむ",
+        ko: "도구 호출 자동 접기",
+        de: "Werkzeugaufrufe automatisch einklappen",
+        fr: "Replier automatiquement les appels d'outils",
+        es: "Contraer automáticamente las llamadas de herramientas",
+        pt_br: "Recolher chamadas de ferramentas automaticamente",
+        ru: "Автоматически сворачивать вызовы инструментов",
+    },
+    CopyRow {
         en: "Auto-continue",
         ja: "自動継続",
         ko: "자동 계속",
@@ -11472,6 +11482,16 @@ pub static COPY_ROWS: &[CopyRow] = &[
         es: "sigue corriendo",
         pt_br: "Continue correndo",
         ru: "Продолжайте бежать",
+    },
+    CopyRow {
+        en: "Keep runs of tool calls folded into one summary line while the Agent works. Expand a run to see every call.",
+        ja: "Agent の実行中、連続するツール呼び出しを 1 行の概要に折りたたみます。展開すると各呼び出しを確認できます。",
+        ko: "Agent가 작업하는 동안 연속된 도구 호출을 한 줄 요약으로 접습니다. 펼치면 각 호출을 볼 수 있습니다.",
+        de: "Fasst laufende Werkzeugaufrufe während der Agent arbeitet zu einer Zusammenfassungszeile zusammen. Aufklappen zeigt jeden Aufruf.",
+        fr: "Regroupe les appels d'outils successifs sur une ligne de résumé pendant que l'Agent travaille. Déplier pour voir chaque appel.",
+        es: "Agrupa las llamadas de herramientas consecutivas en una línea de resumen mientras el Agent trabaja. Despliega para ver cada llamada.",
+        pt_br: "Agrupa chamadas de ferramentas consecutivas em uma linha de resumo enquanto o Agent trabalha. Expanda para ver cada chamada.",
+        ru: "Объединяет последовательные вызовы инструментов в одну строку-сводку, пока Agent работает. Разверните, чтобы увидеть каждый вызов.",
     },
     CopyRow {
         en: "Keep runtime data",

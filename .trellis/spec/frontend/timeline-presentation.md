@@ -17,7 +17,7 @@ Portable APIs live in `crates/vibex-ui` and compile with no default features:
 Activity::project(&TimelineRow, Option<&TimelinePayload>, Locale) -> Activity
 ActivitySummary::record(&mut self, &Activity, row_id: &str)
 ActivitySummary::label(&self, Locale) -> String
-group_open(&TimelineConversationTurn, &TimelineProcessActivityGroup, Option<bool>) -> bool
+group_open(&TimelineConversationTurn, &TimelineProcessActivityGroup, Option<bool>, bool) -> bool
 is_running(&TimelineRow, turn_live: bool) -> bool
 tool_detail::project(&TimelineRow, Option<&TimelinePayload>, Option<&str>, Locale) -> Vec<Detail>
 tool_detail::text(&[Detail]) -> String
@@ -61,10 +61,16 @@ Transcript::advance_disclosures(&mut self, Instant) -> bool
   bounded detail scroll regions. File detail preferences change content inside
   the activity group.
 - Explicit expansion/collapse wins over live defaults and survives refresh.
-  Mobile opens active groups by the shared desktop rule. Individual tool
-  details stay collapsed until requested: a TUI tool call that settles while
-  the reader is following the tail keeps its compact row instead of unfolding
-  its payload.
+  Mobile opens active groups by the shared desktop rule and reads the same
+  **Auto-collapse tool calls** preference from the synced display settings.
+  Individual tool details stay collapsed until requested: a TUI tool call that
+  settles while the reader is following the tail keeps its compact row instead
+  of unfolding its payload.
+- The fourth `group_open` argument is the session's auto-collapse preference.
+  It folds a live run to its summary line instead of opening it, because that
+  line already counts changed files, commands, reads and failures. It never
+  folds a run holding an approval-pending row: the request is an affordance,
+  and it must stay visible.
 - TUI groups three or more settled typed activities by turn and runtime,
   summarizes all action categories, and deduplicates changed files by full
   path. Running, failing, or approval-pending activities stay visible.

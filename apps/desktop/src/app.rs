@@ -31950,6 +31950,10 @@ impl VibexWorkbench {
             .session
             .enhanced_file_operation_display
             .hash(&mut hasher);
+        self.ui_state
+            .session
+            .auto_collapse_tool_calls
+            .hash(&mut hasher);
         turn.process_rows.len().hash(&mut hasher);
         // A thought that is still arriving draws its window without being
         // opened, so the trailing row's streaming flag is part of the turn's
@@ -32033,6 +32037,10 @@ impl VibexWorkbench {
             .session
             .enhanced_file_operation_display
             .hash(&mut hasher);
+        self.ui_state
+            .session
+            .auto_collapse_tool_calls
+            .hash(&mut hasher);
 
         turn.process_rows.len().hash(&mut hasher);
         {
@@ -32095,6 +32103,7 @@ impl VibexWorkbench {
                         turn,
                         group,
                         self.timeline_command_expansion.get(&group.id).copied(),
+                        self.ui_state.session.auto_collapse_tool_calls,
                     )
                     .hash(&mut hasher);
                 }
@@ -32149,6 +32158,10 @@ impl VibexWorkbench {
         self.ui_state
             .session
             .enhanced_file_operation_display
+            .hash(&mut hasher);
+        self.ui_state
+            .session
+            .auto_collapse_tool_calls
             .hash(&mut hasher);
         // The estimate wraps its row bodies against the pane the timeline last
         // painted into, so a memoized estimate stops being valid the moment
@@ -48369,6 +48382,24 @@ impl VibexWorkbench {
         cx.notify();
     }
 
+    /// Keeps runs of tool calls folded while the Agent works.
+    ///
+    /// The fold changes which rows are drawn, not which rows exist, so the
+    /// measured heights are dropped and the page is rebuilt from the new
+    /// disclosure. It does not clear the reader's own choices: a run they
+    /// opened stays open, and a folded one can always be opened again.
+    fn set_auto_collapse_tool_calls(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if self.ui_state.session.auto_collapse_tool_calls == enabled {
+            return;
+        }
+        self.ui_state.session.auto_collapse_tool_calls = enabled;
+        self.invalidate_timeline_layout_measurements();
+        self.rebuild_timeline_sizes();
+        self.queue_ui_state();
+        self.sync_timeline_display_settings_to_runtime();
+        cx.notify();
+    }
+
     fn set_show_agent_generation_status(&mut self, enabled: bool, cx: &mut Context<Self>) {
         self.ui_state.session.show_agent_generation_status = enabled;
         if !enabled {
@@ -48397,6 +48428,7 @@ impl VibexWorkbench {
                 .session
                 .enhanced_command_execution_display,
             enhanced_file_operation_display: self.ui_state.session.enhanced_file_operation_display,
+            auto_collapse_tool_calls: self.ui_state.session.auto_collapse_tool_calls,
         });
     }
 
@@ -69978,6 +70010,7 @@ impl VibexWorkbench {
             turn,
             group,
             self.timeline_command_expansion.get(&group.id).copied(),
+            self.ui_state.session.auto_collapse_tool_calls,
         );
         let Some(rows) = turn
             .process_rows
@@ -70141,6 +70174,7 @@ impl VibexWorkbench {
                         turn,
                         group,
                         self.timeline_command_expansion.get(&group.id).copied(),
+                        self.ui_state.session.auto_collapse_tool_calls,
                     ),
                 ));
                 units.push(TimelineProcessUnit {
@@ -71590,6 +71624,7 @@ impl VibexWorkbench {
             turn,
             group,
             self.timeline_command_expansion.get(&group.id).copied(),
+            self.ui_state.session.auto_collapse_tool_calls,
         );
         let progress = self.timeline_disclosure_progress(&group.id, expanded, window, cx);
         let group_id = group.id.clone();
@@ -71617,12 +71652,19 @@ impl VibexWorkbench {
             this.set_timeline_disclosure(group_id.clone(), Some(&turn_id), !expanded);
             cx.notify();
         }));
+        let summary_selector = format!("activity-summary:{}", group.id);
+        let group_selector = format!("activity-group:{}", group.id);
         let mut body = v_flex()
             .id(group.id.clone())
+            .debug_selector(move || group_selector.clone())
             .w_full()
             .min_w_0()
             .flex_none()
-            .child(header);
+            .child(
+                div()
+                    .debug_selector(move || summary_selector.clone())
+                    .child(header),
+            );
         if progress > 0.0 {
             // A pending reveal points at one row of the group and scrolls to
             // it, and the spike's window has no pin: while one is pending the
@@ -87999,6 +88041,21 @@ fn settings_search_candidates(strings: &'static Strings) -> Vec<SettingsSearchCa
         ),
         settings_search_candidate(
             SettingsSection::Session,
+            strings.auto_collapse_tool_calls,
+            strings.auto_collapse_tool_calls_description,
+            &[
+                "tool",
+                "tool call",
+                "collapse",
+                "fold",
+                "工具",
+                "呼叫",
+                "折叠",
+                "折疊",
+            ],
+        ),
+        settings_search_candidate(
+            SettingsSection::Session,
             locale::text("Queue sending", "队列发送", "佇列傳送"),
             locale::text(
                 "Choose the default behavior while an Agent is running.",
@@ -91660,6 +91717,13 @@ impl FoundationSettings {
         cx.notify();
     }
 
+    fn set_auto_collapse_tool_calls(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        let _ = self.workbench.update(cx, |this, cx| {
+            this.set_auto_collapse_tool_calls(enabled, cx)
+        });
+        cx.notify();
+    }
+
     fn set_show_agent_generation_status(&mut self, enabled: bool, cx: &mut Context<Self>) {
         let _ = self.workbench.update(cx, |this, cx| {
             this.set_show_agent_generation_status(enabled, cx)
@@ -93382,6 +93446,13 @@ impl FoundationSettings {
             .on_click(cx.listener(|this, enabled, _, cx| {
                 this.set_enhanced_file_operation_display(*enabled, cx)
             }));
+        let auto_collapse_tool_calls_switch = Switch::new("auto-collapse-tool-calls")
+            .small()
+            .checked(session.auto_collapse_tool_calls)
+            .tooltip(strings.auto_collapse_tool_calls)
+            .on_click(
+                cx.listener(|this, enabled, _, cx| this.set_auto_collapse_tool_calls(*enabled, cx)),
+            );
         let queue_manual = self
             .workbench
             .read_with(cx, |this, _| {
@@ -93561,6 +93632,13 @@ impl FoundationSettings {
                             strings.enhanced_file_operation_display,
                             strings.enhanced_file_operation_display_description,
                             enhanced_file_operation_switch,
+                            stacked,
+                            cx,
+                        ),
+                        setting_row(
+                            strings.auto_collapse_tool_calls,
+                            strings.auto_collapse_tool_calls_description,
+                            auto_collapse_tool_calls_switch,
                             stacked,
                             cx,
                         ),
@@ -125075,6 +125153,11 @@ mod tests {
         assert!(notification_candidates.iter().any(|candidate| {
             candidate.section == SettingsSection::Session && candidate.keywords.contains(&"failed")
         }));
+        let collapse_candidates = settings_search_candidates_for_query("collapse", english);
+        assert!(collapse_candidates.iter().any(|candidate| {
+            candidate.section == SettingsSection::Session
+                && candidate.title == "Auto-collapse tool calls"
+        }));
         assert!(settings_search_candidates_for_query("", english).is_empty());
     }
 
@@ -126083,6 +126166,8 @@ mod tests {
         assert!(session.contains("set_enhanced_command_execution_display"));
         assert!(session.contains("enhanced_file_operation_display"));
         assert!(session.contains("set_enhanced_file_operation_display"));
+        assert!(session.contains("auto_collapse_tool_calls"));
+        assert!(session.contains("set_auto_collapse_tool_calls"));
         assert!(session.contains("notify-completed"));
         assert!(session.contains("notify-needs-input"));
         assert!(session.contains("notify-failed"));
@@ -126535,10 +126620,17 @@ mod tests {
         let file_operation_display = source
             .split_once("    fn set_enhanced_file_operation_display(")
             .and_then(|(_, tail)| {
-                tail.split_once("\n    fn sync_timeline_display_settings_to_runtime(")
+                tail.split_once("\n    /// Keeps runs of tool calls folded while the Agent works.")
             })
             .map(|(body, _)| body)
             .expect("file operation display setter should remain inspectable");
+        let auto_collapse = source
+            .split_once("    fn set_auto_collapse_tool_calls(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    fn sync_timeline_display_settings_to_runtime(")
+            })
+            .map(|(body, _)| body)
+            .expect("auto-collapse setter should remain inspectable");
         let invalidation = source
             .split_once("    fn invalidate_timeline_layout_measurements(")
             .and_then(|(_, tail)| tail.split_once("\n    fn refresh_last_timeline_size("))
@@ -126548,6 +126640,8 @@ mod tests {
         assert!(content_width.contains("self.invalidate_timeline_layout_measurements();"));
         assert!(command_display.contains("self.invalidate_timeline_layout_measurements();"));
         assert!(file_operation_display.contains("self.invalidate_timeline_layout_measurements();"));
+        assert!(auto_collapse.contains("self.invalidate_timeline_layout_measurements();"));
+        assert!(auto_collapse.contains("self.queue_ui_state();"));
         assert!(invalidation.contains("self.timeline_measured_turn_heights.clear();"));
         assert!(invalidation.contains("self.timeline_measured_turn_layout_signatures.clear();"));
         assert!(invalidation.contains("self.timeline_pending_turn_heights.clear();"));
@@ -126565,6 +126659,7 @@ mod tests {
 
         assert!(signature.contains("enhanced_command_execution_display"));
         assert!(signature.contains("enhanced_file_operation_display"));
+        assert!(signature.contains("auto_collapse_tool_calls"));
         assert!(signature.contains("process_activity_groups_with_commands"));
         assert!(signature.contains("process_activity_groups_with_file_operations"));
 
