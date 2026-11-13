@@ -322,6 +322,12 @@ impl PluginService {
         if record.kind == PluginKind::Native {
             return Err(PluginError::NotUninstallable(plugin_id.to_string()).into());
         }
+        if auto_update && !record.trust.allows_auto_update() {
+            return Err(PluginError::PermissionDenied(
+                "unverified plugins cannot update themselves".to_string(),
+            )
+            .into());
+        }
         PluginRepository::set_auto_update(conn, plugin_id, auto_update, Self::now_ms())?;
         let record = PluginRepository::get(conn, plugin_id)?
             .ok_or_else(|| PluginError::NotInstalled(plugin_id.to_string()))?;
@@ -1780,6 +1786,23 @@ mod tests {
             service.store().current_version("acme.widgets").as_deref(),
             Some("1.0.0")
         );
+    }
+
+    #[test]
+    fn an_unverified_plugin_cannot_enable_auto_update() {
+        let directory = tempfile::tempdir().unwrap();
+        let service = service(directory.path());
+        let connection = connection();
+        let package_path = directory.path().join("acme.widgets.vibexplug");
+        std::fs::write(&package_path, package()).unwrap();
+        service
+            .install_from_file(&connection, package_path.to_str().unwrap(), true)
+            .unwrap();
+
+        let error = service
+            .set_auto_update(&connection, "acme.widgets", true)
+            .unwrap_err();
+        assert_eq!(error.code, "plugin_permission_denied");
     }
 
     #[test]
