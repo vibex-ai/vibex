@@ -33,11 +33,14 @@ pub trait ImAdapter: Send + Sync + 'static {
 
     async fn probe(&self) -> ImResult<ImChannelTestReport>;
 
+    /// Whether an inbound group message is addressed to the bot.
+    ///
+    /// The adapter owns this policy because it depends on what the transport
+    /// can see: Telegram knows its own `@username`, a thread transport may only
+    /// ever receive commands.
     async fn is_group_trigger(&self, text: &str) -> bool;
 
     fn mark_inbound(&self);
-
-    fn requires_group_mention(&self) -> bool;
 
     async fn create_thread(&self, _title: &str) -> ImResult<ImThreadTarget> {
         Err(crate::error::ImError::Unsupported)

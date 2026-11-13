@@ -58,15 +58,14 @@ impl ImChannelService {
             ImActionRepository::invalidate_for_card(&conn, &card.card_id, unix_timestamp_ms())?;
             if let Some(message_id) = card.external_message_id.as_deref() {
                 let _ = runtime
-                    .adapter
-                    .edit_text(
-                        &ImTarget {
+                    .outbox
+                    .edit(
+                        ImTarget {
                             chat_id: binding.external_chat_id.clone(),
                             thread_key: binding.thread_key.clone(),
                         },
-                        message_id,
-                        &format!("{}: {}\n{}", status, request.title, principal.display_name),
-                        &[],
+                        message_id.to_string(),
+                        format!("{}: {}\n{}", status, request.title, principal.display_name),
                     )
                     .await;
             }
@@ -195,7 +194,13 @@ impl ImChannelService {
             chat_id: binding.external_chat_id.clone(),
             thread_key: binding.thread_key.clone(),
         };
-        if let Ok(sent) = runtime.adapter.send_text(&target, &text, &buttons).await {
+        // The card is the one message a user must be able to act on later, so it
+        // outranks a progress reply when the provider is rate limiting us.
+        if let Ok(sent) = runtime
+            .outbox
+            .send(target, text, buttons, OutboundPriority::Critical)
+            .await
+        {
             ImApprovalCardRepository::set_message_id(
                 &conn,
                 &card_id,
@@ -246,15 +251,14 @@ impl ImChannelService {
                     .cloned()
             {
                 let _ = runtime
-                    .adapter
-                    .edit_text(
-                        &ImTarget {
+                    .outbox
+                    .edit(
+                        ImTarget {
                             chat_id: binding.external_chat_id.clone(),
                             thread_key: binding.thread_key.clone(),
                         },
-                        message_id,
-                        &format!("{status}: approval request {}", request_id),
-                        &[],
+                        message_id.to_string(),
+                        format!("{status}: approval request {}", request_id),
                     )
                     .await;
             }

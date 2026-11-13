@@ -22,7 +22,17 @@ impl ImChannelService {
                                 tracing::warn!(target: "vibex_im", error_code = %error.code, "IM timeline event failed");
                             }
                         }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {
+                            // Dropping these silently is what makes a busy runtime
+                            // "go quiet" with no way to tell it happened. Every
+                            // bound chat gets one notice and a re-sync instead.
+                            tracing::warn!(
+                                target: "vibex_im",
+                                skipped = count,
+                                "IM timeline subscription fell behind"
+                            );
+                            let _ = service.recover_from_lag().await;
+                        }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }
                 }
@@ -38,6 +48,129 @@ impl ImChannelService {
                 }
             }
         }
+    }
+
+    /// Brings every bound chat back to a state the user can act on.
+    ///
+    /// A restart loses the in-memory broadcast ring, and a crash between writing
+    /// an approval card and sending it leaves a card the user never saw. Both
+    /// are reconciled here: missed final answers are counted against the stored
+    /// delivery watermark, undelivered approval cards are re-sent, and a single
+    /// line tells the chat what happened instead of resuming in silence.
+    pub(super) async fn reconcile_on_start(&self) -> VibexResult<()> {
+        let conn = self.open()?;
+        for record in ImChannelRepository::list(&conn)? {
+            if !record.enabled {
+                continue;
+            }
+            let locale = self.locale_for_channel(&record.channel_id);
+            let mut resend = Vec::new();
+            let mut missed_total = 0_usize;
+            for binding in ImBindingRepository::list_for_channel(&conn, &record.channel_id)?
+                .into_iter()
+                .filter(|binding| binding.status == ImBindingStatus::Active)
+            {
+                let page = self
+                    .inner
+                    .agent
+                    .fetch_timeline(FetchTimelineRequest {
+                        session_id: binding.session_id.clone(),
+                        after_sequence: Some(binding.last_delivered_sequence),
+                        before_sequence: None,
+                        limit: 100,
+                        max_turns: None,
+                        max_bytes: None,
+                    })
+                    .await;
+                let mut missed = 0_usize;
+                let mut newest_sequence = binding.last_delivered_sequence;
+                if let Ok(page) = page {
+                    for item in &page.items {
+                        if let TimelinePayload::AgentMessage(message) = &item.payload
+                            && message.is_final
+                            && !message.text.trim().is_empty()
+                        {
+                            missed = missed.saturating_add(1);
+                        }
+                        if let TimelinePayload::PermissionRequest(request) = &item.payload
+                            && request.status == PermissionRequestStatus::Pending
+                        {
+                            resend.push((binding.clone(), request.clone()));
+                        }
+                        newest_sequence = newest_sequence.max(item.sequence);
+                    }
+                }
+                if missed > 0 {
+                    missed_total = missed_total.saturating_add(missed);
+                    ImBindingRepository::set_delivered_sequence(
+                        &conn,
+                        &binding.binding_id,
+                        newest_sequence,
+                        unix_timestamp_ms(),
+                    )?;
+                }
+            }
+            if missed_total > 0 || !resend.is_empty() {
+                let notice = render::resume_notice(locale, missed_total);
+                let target_binding =
+                    resend
+                        .first()
+                        .map(|(binding, _)| binding.clone())
+                        .or_else(|| {
+                            ImBindingRepository::list_for_channel(&conn, &record.channel_id)
+                                .ok()
+                                .and_then(|bindings| {
+                                    bindings
+                                        .into_iter()
+                                        .find(|binding| binding.status == ImBindingStatus::Active)
+                                })
+                        });
+                if let Some(binding) = target_binding {
+                    let _ = self.send_to_binding(&binding, notice).await;
+                }
+            }
+            for (binding, request) in resend {
+                self.send_approval_card(&binding, &request, 0).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Tells every bound chat that live updates were missed and re-sends the
+    /// state they can act on.
+    ///
+    /// A successful turn is not replayed: the message text is gone from the
+    /// broadcast ring, and the desktop timeline is the place to read it. What is
+    /// re-sent is what a user would otherwise be stuck on — a pending approval
+    /// whose card never arrived, and a one-line notice that replies may be
+    /// incomplete.
+    async fn recover_from_lag(&self) -> VibexResult<()> {
+        let conn = self.open()?;
+        let channels = ImChannelRepository::list(&conn)?;
+        for record in channels {
+            if !record.enabled {
+                continue;
+            }
+            let bindings = ImBindingRepository::list_for_channel(&conn, &record.channel_id)?;
+            for binding in bindings
+                .into_iter()
+                .filter(|binding| binding.status == ImBindingStatus::Active)
+            {
+                let notice = render::lag_notice(self.locale_for_channel(&record.channel_id));
+                let _ = self.send_to_binding(&binding, notice).await;
+                let pending =
+                    ImApprovalCardRepository::list_pending_for_binding(&conn, &binding.binding_id)?;
+                for card in pending {
+                    if let Some(request) = self
+                        .pending_permission(&binding.session_id, Some(&card.request_id))
+                        .await?
+                    {
+                        self.send_approval_card(&binding, &request, 0).await?;
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     async fn handle_timeline_event(&self, event: TimelineLiveEvent) -> VibexResult<()> {

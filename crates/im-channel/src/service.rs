@@ -11,10 +11,10 @@ use vibex_core::{
     AgentNotificationIntent, AgentNotificationKind, AgentSession, CorrelationId,
     CreateAgentSessionRequest, FetchTimelineRequest, ImActionId, ImBindingId, ImBindingStatus,
     ImBindingSummary, ImChannelConfig, ImChannelConfigEnvelope, ImChannelDraft, ImChannelId,
-    ImChannelKind, ImChannelState, ImChannelStatus, ImChannelSummary, ImChannelTestReport,
-    ImLarkTransport, ImMessageId, ImPairingCodeInfo, ImPairingId, ImPairingRequest, ImPrincipalId,
-    ImPrincipalRole, ImPrincipalStatus, ImPrincipalSummary, ImSessionDefaults, MessageProvenance,
-    PermissionRequest, PermissionRequestStatus, PermissionResolution, PermissionResponseKind,
+    ImChannelState, ImChannelStatus, ImChannelSummary, ImChannelTestReport, ImLarkTransport,
+    ImMessageId, ImPairingCodeInfo, ImPairingId, ImPairingRequest, ImPrincipalId, ImPrincipalRole,
+    ImPrincipalStatus, ImPrincipalSummary, ImSessionDefaults, MessageProvenance, PermissionRequest,
+    PermissionRequestStatus, PermissionResolution, PermissionResponseKind,
     PermissionResponseOption, ResolvePermissionRequest, SendAgentMessageRequest, TimelineLiveEvent,
     TimelinePayload, VibexError, VibexResult, VibexSessionId, unix_timestamp_ms,
 };
@@ -31,6 +31,7 @@ use crate::agent_port::ImAgentPort;
 use crate::error::ImError;
 use crate::i18n::ImLocale;
 use crate::lark::LarkAdapter;
+use crate::outbox::{OutboundPriority, Outbox};
 use crate::render;
 use crate::telegram::TelegramAdapter;
 use crate::types::{ImButton, ImChatType, ImInboundEvent, ImSentMessage, ImTarget};
@@ -75,8 +76,8 @@ struct Inner {
 
 struct ChannelRuntime {
     adapter: Arc<dyn ImAdapter>,
+    outbox: Outbox,
     task: JoinHandle<()>,
-    send_lock: Arc<AsyncMutex<()>>,
 }
 
 impl Drop for Inner {
@@ -152,6 +153,16 @@ impl ImChannelService {
                 );
             }
         }
+        // Reconciliation runs after the channels are registered: it sends
+        // through the transports, and a notice about the restart is exactly what
+        // a chat should see once rather than never.
+        if let Err(error) = self.reconcile_on_start().await {
+            tracing::warn!(
+                target: "vibex_im",
+                error_code = %error.code,
+                "IM restart reconciliation failed; channels stay connected"
+            );
+        }
         Ok(())
     }
 
@@ -197,17 +208,9 @@ impl ImChannelService {
                 "IM channel name is required",
             ));
         }
-        if matches!(
-            draft.config,
-            ImChannelConfig::WeCom(_) | ImChannelConfig::WeChatPersonal(_)
-        ) {
-            return Err(VibexError::capability(
-                "im_channel_kind_unsupported",
-                "this build supports Telegram and Lark IM channels only",
-            ));
-        }
         let now = unix_timestamp_ms();
         let channel_id = ImChannelId::new();
+        let kind = draft.config.kind();
         let envelope = ImChannelConfigEnvelope {
             schema_version: 1,
             config: draft.config,
@@ -223,7 +226,7 @@ impl ImChannelService {
         let record = ImChannelRecord {
             channel_id: channel_id.clone(),
             display_name: draft.display_name.trim().to_string(),
-            kind: ImChannelKind::Telegram,
+            kind,
             enabled: false,
             config_json: serde_json::to_string(&envelope).map_err(|_| {
                 VibexError::validation(
@@ -275,6 +278,20 @@ impl ImChannelService {
     pub async fn delete_channel(&self, channel_id: &ImChannelId) -> VibexResult<()> {
         self.disconnect_channel(channel_id).await;
         let conn = self.open()?;
+        // Read the lookup keys before the rows that name them are gone, then
+        // erase the secret material itself. Deleting only the rows would leave
+        // a usable bot token in the OS keychain with nothing pointing at it.
+        let secrets = ImChannelSecretRepository::list_for_channel(&conn, channel_id)?;
+        for secret in secrets {
+            if let Err(error) = vibex_config_switch::secrets::delete_im_secret(&secret.lookup_key) {
+                tracing::warn!(
+                    target: "vibex_im",
+                    channel_id = %channel_id,
+                    error_code = %error.code,
+                    "IM channel secret could not be erased from the secret store"
+                );
+            }
+        }
         ImChannelSecretRepository::delete_for_channel(&conn, channel_id)?;
         ImChannelRepository::delete(&conn, channel_id)?;
         self.inner.statuses.write().await.remove(channel_id);
@@ -432,10 +449,6 @@ impl ImChannelService {
                 .await
                 .map_err(im_error_to_vibex)
             }
-            _ => Err(VibexError::capability(
-                "im_channel_kind_unsupported",
-                "this build supports Telegram and Lark IM channels only",
-            )),
         }
     }
 
@@ -694,17 +707,23 @@ impl ImChannelService {
                 );
                 (adapter, task)
             }
-            _ => {
-                return Err(VibexError::capability(
-                    "im_channel_kind_unsupported",
-                    "this build supports Telegram and Lark IM channels only",
-                ));
-            }
         };
+        let (outbox, outbox_task) = Outbox::spawn(
+            Arc::clone(&adapter),
+            Arc::clone(&status),
+            self.inner.shutdown.subscribe(),
+        );
+        // Aborting the channel has to stop the poller and the sender together,
+        // so the stored handle owns the sender task and aborts the transport when
+        // it ends. The shutdown signal already covers a clean stop.
+        let task = tokio::spawn(async move {
+            let _ = outbox_task.await;
+            task.abort();
+        });
         let runtime = ChannelRuntime {
             adapter,
+            outbox,
             task,
-            send_lock: Arc::new(AsyncMutex::new(())),
         };
         self.inner
             .channels
@@ -1113,7 +1132,8 @@ impl ImChannelService {
                 action.card_id.as_deref(),
             )
             .await?;
-        self.reply(event, runtime, &status).await?;
+        self.reply_with(event, runtime, &status, OutboundPriority::BestEffort)
+            .await?;
         Ok(())
     }
 
@@ -1534,7 +1554,8 @@ impl ImChannelService {
                 action_card.as_deref(),
             )
             .await?;
-        self.reply(event, runtime, &status).await?;
+        self.reply_with(event, runtime, &status, OutboundPriority::BestEffort)
+            .await?;
         Ok(())
     }
 
@@ -1674,6 +1695,16 @@ impl ImChannelService {
         binding: &ImBindingRecord,
         text: &str,
     ) -> VibexResult<Option<ImSentMessage>> {
+        self.send_to_binding_with(binding, text, OutboundPriority::Normal)
+            .await
+    }
+
+    async fn send_to_binding_with(
+        &self,
+        binding: &ImBindingRecord,
+        text: &str,
+        priority: OutboundPriority,
+    ) -> VibexResult<Option<ImSentMessage>> {
         let Some(runtime) = self
             .inner
             .channels
@@ -1689,8 +1720,8 @@ impl ImChannelService {
             thread_key: binding.thread_key.clone(),
         };
         let sent = runtime
-            .adapter
-            .send_text(&target, text, &[])
+            .outbox
+            .send(target, text.to_string(), Vec::new(), priority)
             .await
             .map_err(im_error_to_vibex)?;
         Ok(Some(sent))
@@ -1702,27 +1733,54 @@ impl ImChannelService {
         runtime: &ChannelRuntime,
         text: &str,
     ) -> VibexResult<()> {
+        self.reply_with(event, runtime, text, OutboundPriority::Normal)
+            .await
+    }
+
+    async fn reply_with(
+        &self,
+        event: &ImInboundEvent,
+        runtime: &ChannelRuntime,
+        text: &str,
+        priority: OutboundPriority,
+    ) -> VibexResult<()> {
         let target = ImTarget {
             chat_id: event.external_chat_id.clone(),
             thread_key: event.thread_key.clone(),
         };
-        let _guard = runtime.send_lock.lock().await;
         runtime
-            .adapter
-            .send_text(&target, text, &[])
+            .outbox
+            .send(target, text.to_string(), Vec::new(), priority)
             .await
             .map_err(im_error_to_vibex)?;
         Ok(())
     }
 
+    /// The locale for a chat.
+    ///
+    /// The channel's own setting wins, then the host default, then English. The
+    /// channel row is read rather than cached: an owner changing the language in
+    /// settings expects the next reply to change with it, and the read is one
+    /// indexed row per inbound message.
     fn locale(&self, event: &ImInboundEvent) -> ImLocale {
-        let _ = event;
-        ImLocale::parse(self.inner.config.locale.as_deref())
+        self.locale_for_channel(&event.channel_id)
     }
 
     fn locale_for_channel(&self, channel_id: &ImChannelId) -> ImLocale {
-        let _ = channel_id;
-        ImLocale::parse(self.inner.config.locale.as_deref())
+        ImLocale::parse(
+            self.channel_locale(channel_id)
+                .as_deref()
+                .or(self.inner.config.locale.as_deref()),
+        )
+    }
+
+    /// The stored language tag for a channel, when one was chosen.
+    fn channel_locale(&self, channel_id: &ImChannelId) -> Option<String> {
+        let conn = self.open().ok()?;
+        ImChannelRepository::get(&conn, channel_id)
+            .ok()
+            .flatten()
+            .and_then(|record| record.locale)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2207,11 +2265,27 @@ mod tests {
     }
 
     #[test]
+    fn channel_kind_comes_from_the_draft_platform() {
+        let draft = ImChannelDraft {
+            display_name: "Lark acceptance".to_string(),
+            config: ImChannelConfig::Lark(vibex_core::ImLarkConfig {
+                app_id: "cli_test".to_string(),
+                chat_id: None,
+                transport: ImLarkTransport::LongConnection,
+            }),
+            default_session: None,
+            event_filter: Vec::new(),
+            locale: None,
+        };
+        assert_eq!(draft.config.kind(), vibex_core::ImChannelKind::Lark);
+    }
+
+    #[test]
     fn default_event_filter_keeps_approvals_and_drops_prompt_echo() {
         let record = ImChannelRecord {
             channel_id: ImChannelId::new(),
             display_name: "Test".to_string(),
-            kind: ImChannelKind::Telegram,
+            kind: vibex_core::ImChannelKind::Telegram,
             enabled: true,
             config_json: serde_json::to_string(&ImChannelConfigEnvelope::new(
                 ImChannelConfig::Telegram(ImTelegramConfig {

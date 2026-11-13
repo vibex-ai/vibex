@@ -75,6 +75,41 @@ pub fn help(locale: ImLocale, prefix: &str) -> String {
     }
 }
 
+/// Sent once at start-up when work finished while the runtime was not running.
+pub fn resume_notice(locale: ImLocale, missed_final_answers: usize) -> &'static str {
+    match (locale, missed_final_answers) {
+        (ImLocale::En, 0) => {
+            "Vibex is back. A pending approval could not be delivered before the restart and is re-sent below."
+        }
+        (ImLocale::En, _) => {
+            "Vibex is back. Some replies finished while it was offline; open Vibex for the full transcript. Pending approvals are re-sent below."
+        }
+        (ImLocale::ZhCn, 0) => "Vibex 已恢复。重启前有一条待处理审批未送达，已在下方重新发送。",
+        (ImLocale::ZhCn, _) => {
+            "Vibex 已恢复。停机期间有回复已完成，完整内容请在 Vibex 里查看；待处理审批已在下方重新发送。"
+        }
+        (ImLocale::ZhTw, 0) => "Vibex 已恢復。重新啟動前有一筆待處理審批未送達，已在下方重新傳送。",
+        (ImLocale::ZhTw, _) => {
+            "Vibex 已恢復。停機期間有回覆已完成，完整內容請在 Vibex 裡查看；待處理審批已在下方重新傳送。"
+        }
+    }
+}
+
+/// Sent after the subscription fell behind and some live events were lost.
+pub fn lag_notice(locale: ImLocale) -> &'static str {
+    match locale {
+        ImLocale::En => {
+            "Vibex fell behind and some live updates were not delivered. Send /status for the current state; pending approvals are re-sent below."
+        }
+        ImLocale::ZhCn => {
+            "Vibex 处理积压时漏掉了一些实时更新。发送 /status 查看当前状态；待处理的审批已在下方重新发送。"
+        }
+        ImLocale::ZhTw => {
+            "Vibex 處理積壓時漏掉了一些即時更新。傳送 /status 查看目前狀態；待處理的審批已在下方重新傳送。"
+        }
+    }
+}
+
 pub fn session_list(sessions: &[AgentSession], locale: ImLocale) -> String {
     let mut text = match locale {
         ImLocale::En => "Recent sessions\n".to_string(),

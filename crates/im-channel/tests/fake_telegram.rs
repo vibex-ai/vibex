@@ -564,13 +564,17 @@ async fn telegram_pairing_commands_and_approval_round_trip() {
             .any(|body| body.get("callback_query_id").and_then(Value::as_str) == Some("callback-1")),
         "callback was acknowledged"
     );
-    assert!(
-        fake.edited.lock().expect("edited").iter().any(|body| body
-            .get("text")
-            .and_then(Value::as_str)
-            .is_some_and(|text| text.contains("approved"))),
-        "approval card was edited"
-    );
+    wait_for(
+        || async {
+            fake.edited.lock().expect("edited").iter().any(|body| {
+                body.get("text")
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| text.contains("approved"))
+            })
+        },
+        "approval card edit",
+    )
+    .await;
 
     let bindings: Vec<ImBindingSummary> = service
         .list_bindings(&channel.channel_id)

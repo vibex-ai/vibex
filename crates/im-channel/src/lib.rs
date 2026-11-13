@@ -9,6 +9,7 @@ mod agent_port;
 mod error;
 mod i18n;
 mod lark;
+mod outbox;
 mod render;
 mod service;
 mod telegram;

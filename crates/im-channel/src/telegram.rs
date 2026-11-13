@@ -148,12 +148,13 @@ impl TelegramAdapter {
         if status == reqwest::StatusCode::UNAUTHORIZED {
             return Err(ImError::AuthFailed);
         }
-        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        let too_many_requests = status == reqwest::StatusCode::TOO_MANY_REQUESTS;
+        let value: Value = response.json().await.map_err(|_| ImError::Transport)?;
+        if too_many_requests || value.get("error_code").and_then(Value::as_i64) == Some(429) {
             return Err(ImError::RateLimited {
-                retry_after_ms: 1000,
+                retry_after_ms: retry_after_ms(&value),
             });
         }
-        let value: Value = response.json().await.map_err(|_| ImError::Transport)?;
         if value.get("ok").and_then(Value::as_bool) != Some(true) {
             return Err(provider_error(&value));
         }
@@ -186,7 +187,13 @@ impl TelegramAdapter {
         if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
             return Err(ImError::AuthFailed);
         }
+        let too_many_requests = status == reqwest::StatusCode::TOO_MANY_REQUESTS;
         let value: Value = response.json().await.map_err(|_| ImError::Transport)?;
+        if too_many_requests || value.get("error_code").and_then(Value::as_i64) == Some(429) {
+            return Err(ImError::RateLimited {
+                retry_after_ms: retry_after_ms(&value),
+            });
+        }
         if value.get("ok").and_then(Value::as_bool) != Some(true) {
             return Err(provider_error(&value));
         }
@@ -300,14 +307,10 @@ impl TelegramAdapter {
                     .collect::<Vec<_>>()]
             });
         }
-        let result = match self.call("sendMessage", body.clone()).await {
-            Ok(result) => result,
-            Err(ImError::RateLimited { retry_after_ms }) => {
-                tokio::time::sleep(Duration::from_millis(retry_after_ms)).await;
-                self.call("sendMessage", body).await?
-            }
-            Err(error) => return Err(error),
-        };
+        // Retry policy belongs to the outbox: it knows the message priority and
+        // whether the caller is waiting, and a second sleep here would stack on
+        // top of that. Report the provider's own cool-down and let it decide.
+        let result = self.call("sendMessage", body).await?;
         self.mark_outbound();
         let message_id = result
             .get("message_id")
@@ -423,14 +426,16 @@ impl TelegramAdapter {
         if text.starts_with('/') {
             return true;
         }
+        // A channel that opted out of the mention requirement accepts any text
+        // in a group. The default stays conservative: a group bot that reacts to
+        // every message is a surprise nobody asked for.
+        if !self.require_mention_in_groups {
+            return !text.is_empty();
+        }
         let username = self.bot_username.read().await.clone();
         username
             .as_deref()
             .is_some_and(|username| text.starts_with(&format!("@{username}")))
-    }
-
-    pub fn requires_group_mention(&self) -> bool {
-        self.require_mention_in_groups
     }
 
     fn set_state(&self, state: ImChannelState, error_code: Option<String>, retry_after_ms: u64) {
@@ -475,6 +480,18 @@ fn sender_name(from: &Value) -> String {
         name.push_str(&format!(" (@{username})"));
     }
     name
+}
+
+/// Telegram reports its own cool-down in `parameters.retry_after` (seconds).
+/// Guessing a delay instead of reading it either hammers the API or stalls a
+/// reply that could have gone out sooner.
+fn retry_after_ms(value: &Value) -> u64 {
+    value
+        .pointer("/parameters/retry_after")
+        .and_then(Value::as_f64)
+        .filter(|seconds| seconds.is_finite() && *seconds > 0.0)
+        .map(|seconds| (seconds * 1000.0).min(60_000.0) as u64)
+        .unwrap_or(1_000)
 }
 
 fn provider_error(value: &Value) -> ImError {
@@ -530,10 +547,6 @@ impl ImAdapter for TelegramAdapter {
 
     fn mark_inbound(&self) {
         TelegramAdapter::mark_inbound(self);
-    }
-
-    fn requires_group_mention(&self) -> bool {
-        TelegramAdapter::requires_group_mention(self)
     }
 
     async fn create_thread(&self, title: &str) -> ImResult<ImThreadTarget> {
