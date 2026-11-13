@@ -35,6 +35,8 @@ pub struct ImChannelsView {
     lark_app_secret_input: Entity<InputState>,
     lark_chat_input: Entity<InputState>,
     telegram_topic_mode: bool,
+    /// The role a newly minted pairing code grants.
+    pairing_role: ImPrincipalRole,
     channels: Vec<ImChannelSummary>,
     selected: Option<ImChannelId>,
     principals: Vec<ImPrincipalSummary>,
@@ -74,6 +76,7 @@ impl ImChannelsView {
             lark_app_secret_input,
             lark_chat_input,
             telegram_topic_mode: false,
+            pairing_role: ImPrincipalRole::Operator,
             channels: Vec::new(),
             selected: None,
             principals: Vec::new(),
@@ -583,12 +586,13 @@ impl ImChannelsView {
             return;
         };
         self.busy = true;
+        let role = self.pairing_role;
         self.task = Some(cx.spawn(async move |weak: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
             let result = backend
                 .management()
                 .create_im_pairing_code(vibex_backend::MutationRequest::new(ImPairingRequest {
                     channel_id,
-                    role: ImPrincipalRole::Operator,
+                    role,
                     ttl_ms: Some(600_000),
                 }))
                 .await
@@ -628,6 +632,168 @@ impl ImChannelsView {
                 });
             },
         ));
+    }
+
+    /// Adds or removes one event id from the channel's forwarded set.
+    fn toggle_event_filter(
+        &mut self,
+        channel: ImChannelSummary,
+        event_id: &'static str,
+        enabled: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(backend) = self.backend(cx) else {
+            return;
+        };
+        let mut filter = channel.event_filter.clone();
+        if enabled {
+            if !filter.iter().any(|id| id == event_id) {
+                filter.push(event_id.to_string());
+            }
+        } else {
+            filter.retain(|id| id != event_id);
+        }
+        self.task = Some(cx.spawn(
+            async move |weak: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let result = backend
+                    .management()
+                    .set_im_channel_event_filter(vibex_backend::MutationRequest::new(
+                        vibex_backend::ImChannelEventFilterUpdate {
+                            channel_id: channel.channel_id.clone(),
+                            event_filter: filter,
+                        },
+                    ))
+                    .await
+                    .map(|_| ())
+                    .map_err(backend_error);
+                let _ = weak.update(cx, |this, cx| {
+                    match result {
+                        Ok(()) => {
+                            this.loaded = false;
+                            this.loading = false;
+                            this.reload(cx);
+                        }
+                        Err(error) => this.error = Some(error),
+                    }
+                    cx.notify();
+                });
+            },
+        ));
+    }
+
+    fn set_channel_locale(
+        &mut self,
+        channel_id: ImChannelId,
+        locale: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(backend) = self.backend(cx) else {
+            return;
+        };
+        self.task = Some(cx.spawn(
+            async move |weak: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let result = backend
+                    .management()
+                    .set_im_channel_locale(vibex_backend::MutationRequest::new(
+                        vibex_backend::ImChannelLocaleUpdate { channel_id, locale },
+                    ))
+                    .await
+                    .map(|_| ())
+                    .map_err(backend_error);
+                let _ = weak.update(cx, |this, cx| {
+                    match result {
+                        Ok(()) => {
+                            this.notice = Some("Channel language updated.".to_string());
+                            this.loaded = false;
+                            this.loading = false;
+                            this.reload(cx);
+                        }
+                        Err(error) => this.error = Some(error),
+                    }
+                    cx.notify();
+                });
+            },
+        ));
+    }
+
+    fn set_principal_role(
+        &mut self,
+        principal_id: ImPrincipalId,
+        role: ImPrincipalRole,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(backend) = self.backend(cx) else {
+            return;
+        };
+        self.task = Some(cx.spawn(
+            async move |weak: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let result = backend
+                    .management()
+                    .set_im_principal_role(vibex_backend::MutationRequest::new(
+                        vibex_backend::ImPrincipalRoleUpdate { principal_id, role },
+                    ))
+                    .await
+                    .map(|_| ())
+                    .map_err(backend_error);
+                let _ = weak.update(cx, |this, cx| {
+                    match result {
+                        Ok(()) => {
+                            this.notice = Some("Role updated.".to_string());
+                            this.loaded = false;
+                            this.loading = false;
+                            this.reload(cx);
+                        }
+                        Err(error) => this.error = Some(error),
+                    }
+                    cx.notify();
+                });
+            },
+        ));
+    }
+
+    fn revoke_binding(&mut self, binding_id: vibex_core::ImBindingId, cx: &mut Context<Self>) {
+        let Some(backend) = self.backend(cx) else {
+            return;
+        };
+        self.task = Some(cx.spawn(
+            async move |weak: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let result = backend
+                    .management()
+                    .revoke_im_binding(vibex_backend::MutationRequest::new(binding_id))
+                    .await
+                    .map_err(backend_error);
+                let _ = weak.update(cx, |this, cx| {
+                    match result {
+                        Ok(()) => {
+                            this.notice = Some("Binding removed.".to_string());
+                            this.loaded = false;
+                            this.loading = false;
+                            this.reload(cx);
+                        }
+                        Err(error) => this.error = Some(error),
+                    }
+                    cx.notify();
+                });
+            },
+        ));
+    }
+
+    fn role_label(role: ImPrincipalRole) -> &'static str {
+        match role {
+            ImPrincipalRole::Observer => "Observer",
+            ImPrincipalRole::Approver => "Approver",
+            ImPrincipalRole::Operator => "Operator",
+            ImPrincipalRole::Admin => "Admin",
+        }
+    }
+
+    fn next_role(role: ImPrincipalRole) -> ImPrincipalRole {
+        match role {
+            ImPrincipalRole::Observer => ImPrincipalRole::Approver,
+            ImPrincipalRole::Approver => ImPrincipalRole::Operator,
+            ImPrincipalRole::Operator => ImPrincipalRole::Admin,
+            ImPrincipalRole::Admin => ImPrincipalRole::Observer,
+        }
     }
 
     fn select_channel(&mut self, channel_id: ImChannelId, cx: &mut Context<Self>) {
@@ -913,6 +1079,16 @@ impl Render for ImChannelsView {
                             .gap_2()
                             .items_center()
                             .child(
+                                Button::new("im-pairing-role")
+                                    .small()
+                                    .outline()
+                                    .label(format!("Role: {}", Self::role_label(self.pairing_role)))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.pairing_role = Self::next_role(this.pairing_role);
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
                                 Button::new("im-channel-pair")
                                     .small()
                                     .primary()
@@ -975,6 +1151,22 @@ impl Render for ImChannelsView {
                                 )
                                 .child(
                                     Button::new(format!(
+                                        "im-principal-role-{}",
+                                        principal.principal_id.as_str()
+                                    ))
+                                    .small()
+                                    .outline()
+                                    .label(Self::role_label(principal.role))
+                                    .on_click(cx.listener({
+                                        let principal_id = principal_id.clone();
+                                        let next = Self::next_role(principal.role);
+                                        move |this, _, _, cx| {
+                                            this.set_principal_role(principal_id.clone(), next, cx)
+                                        }
+                                    })),
+                                )
+                                .child(
+                                    Button::new(format!(
                                         "im-principal-revoke-{}",
                                         principal.principal_id.as_str()
                                     ))
@@ -992,10 +1184,65 @@ impl Render for ImChannelsView {
                 }
                 panel = panel.child(
                     div()
-                        .text_xs()
-                        .text_color(muted)
-                        .child(format!("Session bindings: {}", self.bindings.len())),
+                        .text_sm()
+                        .text_color(foreground)
+                        .child(format!("Session bindings ({})", self.bindings.len())),
                 );
+                if self.bindings.is_empty() {
+                    panel = panel.child(div().text_xs().text_color(muted).child(
+                        "No chat is bound to a session yet. Use /use in the chat, or /new.",
+                    ));
+                } else {
+                    for binding in &self.bindings {
+                        let binding_id = binding.binding_id.clone();
+                        let title = binding
+                            .title
+                            .clone()
+                            .filter(|title| !title.trim().is_empty())
+                            .unwrap_or_else(|| {
+                                format!(
+                                    "session {}",
+                                    &binding.session_id.as_str()
+                                        [..8.min(binding.session_id.as_str().len())]
+                                )
+                            });
+                        panel = panel.child(
+                            h_flex()
+                                .gap_2()
+                                .items_center()
+                                .child(
+                                    v_flex()
+                                        .flex_1()
+                                        .child(div().text_xs().text_color(foreground).child(title))
+                                        .child(div().text_xs().text_color(muted).child({
+                                            let thread = if binding.thread_key.is_empty() {
+                                                String::new()
+                                            } else {
+                                                format!(" · thread {}", binding.thread_key)
+                                            };
+                                            format!(
+                                                "chat {} · {:?}{thread}",
+                                                binding.external_chat_id, binding.status
+                                            )
+                                        })),
+                                )
+                                .child(
+                                    Button::new(format!(
+                                        "im-binding-revoke-{}",
+                                        binding.binding_id.as_str()
+                                    ))
+                                    .small()
+                                    .ghost()
+                                    .label("Unbind")
+                                    .on_click(cx.listener(
+                                        move |this, _, _, cx| {
+                                            this.revoke_binding(binding_id.clone(), cx)
+                                        },
+                                    )),
+                                ),
+                        );
+                    }
+                }
                 panel = panel.child(
                     h_flex()
                         .justify_between()
@@ -1072,6 +1319,132 @@ impl Render for ImChannelsView {
                             ),
                     );
                 }
+
+                // Events this channel forwards. The list is the full known set,
+                // with the channel's current selection checked.
+                panel = panel.child(
+                    v_flex()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(foreground)
+                                .child("Events sent to this chat"),
+                        )
+                        .child(div().text_xs().text_color(muted).child(
+                            "Approvals and errors are the default set. Turning one off stops it for every binding on this channel.",
+                        )),
+                );
+                for event_id in vibex_core::IM_EVENT_FILTER_IDS {
+                    let enabled = channel.event_filter.iter().any(|id| id == event_id);
+                    let channel_for_toggle = channel.clone();
+                    panel = panel.child(
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .text_xs()
+                                    .text_color(foreground)
+                                    .child(*event_id),
+                            )
+                            .child(
+                                Switch::new(format!(
+                                    "im-event-{}-{}",
+                                    channel_id.as_str(),
+                                    event_id
+                                ))
+                                .small()
+                                .checked(enabled)
+                                .on_click(cx.listener(
+                                    move |this, checked, _, cx| {
+                                        this.toggle_event_filter(
+                                            channel_for_toggle.clone(),
+                                            event_id,
+                                            *checked,
+                                            cx,
+                                        )
+                                    },
+                                )),
+                            ),
+                    );
+                }
+
+                // Language for this channel's replies.
+                panel = panel.child(
+                    h_flex()
+                        .justify_between()
+                        .items_center()
+                        .child(
+                            v_flex()
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(foreground)
+                                        .child("Reply language"),
+                                )
+                                .child(div().text_xs().text_color(muted).child(format!(
+                                    "{} (host default when unset)",
+                                    channel
+                                        .locale
+                                        .clone()
+                                        .unwrap_or_else(|| "Not set".to_string())
+                                ))),
+                        )
+                        .child(
+                            h_flex()
+                                .gap_1()
+                                .child(
+                                    Button::new(format!("im-locale-en-{}", channel_id.as_str()))
+                                        .small()
+                                        .ghost()
+                                        .label("English")
+                                        .on_click(cx.listener({
+                                            let channel_id = channel_id.clone();
+                                            move |this, _, _, cx| {
+                                                this.set_channel_locale(
+                                                    channel_id.clone(),
+                                                    Some("en".to_string()),
+                                                    cx,
+                                                )
+                                            }
+                                        })),
+                                )
+                                .child(
+                                    Button::new(format!("im-locale-zh-{}", channel_id.as_str()))
+                                        .small()
+                                        .ghost()
+                                        .label("中文")
+                                        .on_click(cx.listener({
+                                            let channel_id = channel_id.clone();
+                                            move |this, _, _, cx| {
+                                                this.set_channel_locale(
+                                                    channel_id.clone(),
+                                                    Some("zh-CN".to_string()),
+                                                    cx,
+                                                )
+                                            }
+                                        })),
+                                )
+                                .child(
+                                    Button::new(format!("im-locale-auto-{}", channel_id.as_str()))
+                                        .small()
+                                        .ghost()
+                                        .label("Host")
+                                        .on_click(cx.listener({
+                                            let channel_id = channel_id.clone();
+                                            move |this, _, _, cx| {
+                                                this.set_channel_locale(
+                                                    channel_id.clone(),
+                                                    None,
+                                                    cx,
+                                                )
+                                            }
+                                        })),
+                                ),
+                        ),
+                );
             }
             panel.into_any_element()
         } else {

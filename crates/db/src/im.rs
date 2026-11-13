@@ -901,6 +901,23 @@ impl ImMessageRepository {
         Ok(changed == 1)
     }
 
+    /// Deletes message rows older than the cutoff and reports how many went.
+    ///
+    /// The table records what was delivered, not what must be kept: the
+    /// transcript lives in the session timeline. Retaining the rows forever
+    /// would grow the database with every message a bot ever received, so the
+    /// runtime prunes on a schedule and keeps only a recent window for
+    /// debugging.
+    pub fn prune_older_than(conn: &Connection, cutoff_ms: i64) -> VibexResult<usize> {
+        let deleted = conn
+            .execute(
+                "DELETE FROM im_messages WHERE created_at_ms < ?1",
+                params![cutoff_ms],
+            )
+            .map_err(storage_error("im_message_prune_failed"))?;
+        Ok(deleted)
+    }
+
     pub fn set_status(
         conn: &Connection,
         message_id: &str,
@@ -921,6 +938,21 @@ impl ImMessageRepository {
 pub struct ImAuditRepository;
 
 impl ImAuditRepository {
+    /// Deletes audit rows older than the cutoff and reports how many went.
+    ///
+    /// Approvals are also recorded on the session timeline, which is the
+    /// durable fact. The audit table is the operator's recent record and is
+    /// kept longer than the message log because it answers "who approved this".
+    pub fn prune_audit_older_than(conn: &Connection, cutoff_ms: i64) -> VibexResult<usize> {
+        let deleted = conn
+            .execute(
+                "DELETE FROM im_audit_logs WHERE created_at_ms < ?1",
+                params![cutoff_ms],
+            )
+            .map_err(storage_error("im_audit_prune_failed"))?;
+        Ok(deleted)
+    }
+
     pub fn insert(conn: &Connection, record: &ImAuditRecord) -> VibexResult<()> {
         conn.execute(
             "INSERT INTO im_audit_logs (
@@ -1176,6 +1208,210 @@ mod tests {
             ImChannelSecretRepository::get(&conn, &channel_id, "bot_token")
                 .expect("read deleted secret")
                 .is_none()
+        );
+    }
+
+    /// Two resolvers racing for one approval must not both win.
+    ///
+    /// The desktop and a chat can answer the same request at the same moment,
+    /// and the guarantee is a single conditional UPDATE rather than a lock this
+    /// process holds. Two real connections against one file is the only shape
+    /// that exercises the database's own serialization.
+    #[test]
+    fn only_one_of_two_racing_resolvers_consumes_an_action() {
+        let dir = std::env::temp_dir().join(format!(
+            "vibex-im-race-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("race.db");
+        let mut setup = Connection::open(&path).expect("open");
+        setup
+            .pragma_update(None, "foreign_keys", "ON")
+            .expect("foreign keys");
+        super::super::apply_migrations(&mut setup).expect("apply migrations");
+        let channel_id = ImChannelId::new();
+        ImChannelRepository::insert(
+            &setup,
+            &ImChannelRecord {
+                channel_id: channel_id.clone(),
+                display_name: "Race".to_string(),
+                kind: ImChannelKind::Telegram,
+                enabled: true,
+                config_json: "{}".to_string(),
+                event_filter_json: None,
+                locale: None,
+                created_at_ms: 1,
+                updated_at_ms: 1,
+            },
+        )
+        .expect("channel");
+        // A binding needs a session; the schema enforces the reference.
+        setup
+            .execute_batch(
+                "INSERT INTO projects (project_id, name, root_path, created_at_ms, updated_at_ms)
+                 VALUES ('project_race', 'Race', '/tmp/race', 1, 1);
+                 INSERT INTO workspaces (
+                    workspace_id, project_id, root_path, mode, created_at_ms, updated_at_ms
+                 ) VALUES ('workspace_race', 'project_race', '/tmp/race', 'current_checkout', 1, 1);
+                 INSERT INTO agent_sessions (
+                    session_id, title, project_id, workspace_id, workspace_root, workspace_mode,
+                    state, permission_mode, ask_on_risk, bypass_all_permissions,
+                    created_at_ms, updated_at_ms
+                 ) VALUES (
+                    'session_race', 'Race', 'project_race', 'workspace_race', '/tmp/race',
+                    'current_checkout', 'idle', 'workspace_write', 1, 0, 1, 1
+                 );",
+            )
+            .expect("seed session");
+        let binding_id = ImBindingId::new();
+        ImBindingRepository::upsert(
+            &setup,
+            &ImBindingRecord {
+                binding_id: binding_id.clone(),
+                channel_id: channel_id.clone(),
+                external_chat_id: "42".to_string(),
+                thread_key: String::new(),
+                thread_kind: None,
+                session_id: VibexSessionId::parse("session_race".to_string()).expect("session id"),
+                created_by_principal_id: None,
+                status: ImBindingStatus::Active,
+                last_delivered_sequence: 0,
+                title: None,
+                title_sync_enabled: false,
+                provider_payload_json: None,
+                created_at_ms: 1,
+                updated_at_ms: 1,
+            },
+        )
+        .expect("binding");
+        let action_id = ImActionId::new();
+        let principal_id = ImPrincipalId::new();
+        ImActionRepository::insert(
+            &setup,
+            &ImActionRecord {
+                action_id: action_id.clone(),
+                short_code: "ABC123".to_string(),
+                card_id: None,
+                channel_id,
+                binding_id,
+                kind: "approve".to_string(),
+                payload_json: "{}".to_string(),
+                expires_at_ms: 1_000_000,
+                consumed_at_ms: None,
+                consumed_by_principal_id: None,
+                created_at_ms: 1,
+            },
+        )
+        .expect("action");
+        drop(setup);
+
+        // Each thread opens its own connection and both try to consume at once.
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let path = path.clone();
+            let action_id = action_id.clone();
+            let principal_id = principal_id.clone();
+            handles.push(std::thread::spawn(move || {
+                let conn = Connection::open(&path).expect("open");
+                // `consume` is a single conditional UPDATE, so busy_timeout only
+                // needs to cover the moment the other writer holds the lock.
+                conn.busy_timeout(std::time::Duration::from_secs(5))
+                    .expect("busy timeout");
+                ImActionRepository::consume(&conn, &action_id, &principal_id, 500).expect("consume")
+            }));
+        }
+        let wins = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("join"))
+            .filter(|won| *won)
+            .count();
+        assert_eq!(wins, 1, "exactly one resolver may consume the action");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pruning_drops_only_rows_past_the_cutoff() {
+        let conn = migrated();
+        let channel_id = ImChannelId::new();
+        ImChannelRepository::insert(
+            &conn,
+            &ImChannelRecord {
+                channel_id: channel_id.clone(),
+                display_name: "Prune".to_string(),
+                kind: ImChannelKind::Telegram,
+                enabled: true,
+                config_json: "{}".to_string(),
+                event_filter_json: None,
+                locale: None,
+                created_at_ms: 1,
+                updated_at_ms: 1,
+            },
+        )
+        .expect("channel");
+        for (index, created_at_ms) in [1_000_i64, 2_000, 9_000].into_iter().enumerate() {
+            ImMessageRepository::insert(
+                &conn,
+                &ImMessageRecord {
+                    message_id: format!("message-{index}"),
+                    channel_id: channel_id.clone(),
+                    direction: "inbound".to_string(),
+                    provider_update_id: Some(format!("update-{index}")),
+                    external_message_id: None,
+                    binding_id: None,
+                    principal_id: None,
+                    kind: "message".to_string(),
+                    content_preview: None,
+                    content_sha256: None,
+                    status: "received".to_string(),
+                    error_code: None,
+                    error_detail: None,
+                    created_at_ms,
+                },
+            )
+            .expect("message");
+            ImAuditRepository::insert(
+                &conn,
+                &ImAuditRecord {
+                    audit_id: format!("audit-{index}"),
+                    channel_id: channel_id.clone(),
+                    principal_id: None,
+                    action: "channel_created".to_string(),
+                    target_kind: None,
+                    target_id: None,
+                    outcome: "allowed".to_string(),
+                    detail_json: None,
+                    created_at_ms,
+                },
+            )
+            .expect("audit");
+        }
+
+        assert_eq!(
+            ImMessageRepository::prune_older_than(&conn, 5_000).expect("prune messages"),
+            2
+        );
+        assert_eq!(
+            ImAuditRepository::prune_audit_older_than(&conn, 5_000).expect("prune audit"),
+            2
+        );
+        let remaining: i64 = conn
+            .query_row("SELECT COUNT(*) FROM im_messages", [], |row| row.get(0))
+            .expect("count messages");
+        assert_eq!(remaining, 1);
+        let remaining: i64 = conn
+            .query_row("SELECT COUNT(*) FROM im_audit_logs", [], |row| row.get(0))
+            .expect("count audit");
+        assert_eq!(remaining, 1);
+        // The channel itself is not history and must survive the sweep.
+        assert!(
+            ImChannelRepository::get(&conn, &channel_id)
+                .expect("read channel")
+                .is_some()
         );
     }
 

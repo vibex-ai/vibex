@@ -157,6 +157,17 @@ pub fn resume_notice(locale: ImLocale, missed_final_answers: usize) -> &'static 
     }
 }
 
+/// Answers a sender whose message arrived faster than the channel accepts.
+pub fn rate_limited(locale: ImLocale, retry_after_secs: u64) -> String {
+    match locale {
+        ImLocale::En => {
+            format!("Too many messages for this chat. Try again in about {retry_after_secs}s.")
+        }
+        ImLocale::ZhCn => format!("这个聊天的消息太频繁了，请约 {retry_after_secs} 秒后再试。"),
+        ImLocale::ZhTw => format!("這個聊天的訊息太頻繁了，請約 {retry_after_secs} 秒後再試。"),
+    }
+}
+
 /// Sent after the subscription fell behind and some live events were lost.
 pub fn lag_notice(locale: ImLocale) -> &'static str {
     match locale {

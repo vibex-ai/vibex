@@ -6,9 +6,11 @@
 
 mod adapter;
 mod agent_port;
+mod elicitation;
 mod error;
 mod i18n;
 mod lark;
+mod limits;
 mod outbox;
 mod render;
 mod service;

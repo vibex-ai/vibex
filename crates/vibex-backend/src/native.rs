@@ -99,10 +99,11 @@ use crate::{
     BrowserDialogResolution, BrowserFrameBatch, BrowserFrameSubscription, BrowserInputRequest,
     BrowserSessionOpenRequest, BrowserTabOpenRequest, BrowserTabSelection, BrowserViewportRequest,
     DeviceBackend, FileBackend, GitBackend, ImChannelAppSecretUpdateRequest,
-    ImChannelDefaultSessionUpdate, ImChannelEnabledRequest, ImChannelSecretUpdateRequest,
-    ManagementBackend, ManagementProfileSelectionRequest, MutationRequest, RelayConnectionState,
-    RelayStatusSummary, SidebarBackend, TerminalBackend, TerminalFrame, TerminalFrameBatch,
-    TerminalFrameSubscription, WorkspaceBackend, WorkspaceSummary,
+    ImChannelDefaultSessionUpdate, ImChannelEnabledRequest, ImChannelEventFilterUpdate,
+    ImChannelLocaleUpdate, ImChannelSecretUpdateRequest, ImPrincipalRoleUpdate, ManagementBackend,
+    ManagementProfileSelectionRequest, MutationRequest, RelayConnectionState, RelayStatusSummary,
+    SidebarBackend, TerminalBackend, TerminalFrame, TerminalFrameBatch, TerminalFrameSubscription,
+    WorkspaceBackend, WorkspaceSummary,
 };
 use vibex_desktop_model::{SidebarMutationOutcome, SidebarOrganizationView, UiStateStore};
 
@@ -5344,6 +5345,57 @@ impl ManagementBackend for NativeBackend {
                 .management()
                 .im_channels()
                 .set_default_session(&request.payload.channel_id, request.payload.default_session)
+                .await
+                .map_err(Into::into)
+        })
+    }
+
+    fn set_im_channel_event_filter(
+        &self,
+        request: MutationRequest<ImChannelEventFilterUpdate>,
+    ) -> BackendFuture<'_, ImChannelSummary> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .im_channels()
+                .set_event_filter(&request.payload.channel_id, request.payload.event_filter)
+                .await
+                .map_err(Into::into)
+        })
+    }
+
+    fn set_im_channel_locale(
+        &self,
+        request: MutationRequest<ImChannelLocaleUpdate>,
+    ) -> BackendFuture<'_, ImChannelSummary> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .im_channels()
+                .set_channel_locale(&request.payload.channel_id, request.payload.locale)
+                .await
+                .map_err(Into::into)
+        })
+    }
+
+    fn set_im_principal_role(
+        &self,
+        request: MutationRequest<ImPrincipalRoleUpdate>,
+    ) -> BackendFuture<'_, ImPrincipalSummary> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .im_channels()
+                .set_principal_role(&request.payload.principal_id, request.payload.role)
                 .await
                 .map_err(Into::into)
         })

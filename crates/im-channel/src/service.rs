@@ -33,12 +33,20 @@ use crate::agent_port::ImAgentPort;
 use crate::error::ImError;
 use crate::i18n::ImLocale;
 use crate::lark::LarkAdapter;
+use crate::limits::{InboundDecision, InboundKind, InboundLimiter};
 use crate::outbox::{OutboundPriority, Outbox};
 use crate::render;
 use crate::telegram::TelegramAdapter;
 use crate::types::{ImButton, ImChatType, ImInboundEvent, ImSentMessage, ImTarget};
 
 const PAIRING_TTL_MS: i64 = 10 * 60 * 1000;
+/// How long the delivered-message log is kept for debugging.
+const MESSAGE_RETENTION_MS: i64 = 14 * 24 * 60 * 60 * 1000;
+/// How long the audit trail is kept. Longer than the message log: it is what
+/// answers "who approved this" after the fact.
+const AUDIT_RETENTION_MS: i64 = 180 * 24 * 60 * 60 * 1000;
+/// How often the retention sweep runs while the service is up.
+const RETENTION_INTERVAL: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
 const PAIRING_CODE_ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 const DEFAULT_SESSION_LIST_LIMIT: usize = 5;
 
@@ -73,7 +81,9 @@ struct Inner {
     shutdown: watch::Sender<bool>,
     router_task: AsyncMutex<Option<JoinHandle<()>>>,
     event_task: AsyncMutex<Option<JoinHandle<()>>>,
+    retention_task: AsyncMutex<Option<JoinHandle<()>>>,
     session_choices: Mutex<HashMap<ImPrincipalId, Vec<VibexSessionId>>>,
+    inbound_limiter: InboundLimiter,
 }
 
 struct ChannelRuntime {
@@ -118,7 +128,9 @@ impl ImChannelService {
                 shutdown,
                 router_task: AsyncMutex::new(None),
                 event_task: AsyncMutex::new(None),
+                retention_task: AsyncMutex::new(None),
                 session_choices: Mutex::new(HashMap::new()),
+                inbound_limiter: InboundLimiter::new(),
             }),
         })
     }
@@ -165,7 +177,51 @@ impl ImChannelService {
                 "IM restart reconciliation failed; channels stay connected"
             );
         }
+        // Retention runs once now so a database that was offline for months is
+        // trimmed before the timer's first tick, then keeps trimming.
+        let _ = self.prune_history().await;
+        let retention = Arc::downgrade(self);
+        let mut retention_shutdown = self.inner.shutdown.subscribe();
+        *self.inner.retention_task.lock().await = Some(tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = retention_shutdown.changed() => break,
+                    _ = tokio::time::sleep(RETENTION_INTERVAL) => {}
+                }
+                let Some(service) = retention.upgrade() else {
+                    break;
+                };
+                if let Err(error) = service.prune_history().await {
+                    tracing::warn!(
+                        target: "vibex_im",
+                        error_code = %error.code,
+                        "IM history pruning failed"
+                    );
+                }
+            }
+        }));
         Ok(())
+    }
+
+    /// Deletes rows past their retention window.
+    ///
+    /// Called at start-up and on a timer. A failure is logged rather than
+    /// propagated: a full disk matters, but it must not stop the channels from
+    /// serving messages.
+    pub async fn prune_history(&self) -> VibexResult<(usize, usize)> {
+        let conn = self.open()?;
+        let now = unix_timestamp_ms();
+        let messages = ImMessageRepository::prune_older_than(&conn, now - MESSAGE_RETENTION_MS)?;
+        let audits = ImAuditRepository::prune_audit_older_than(&conn, now - AUDIT_RETENTION_MS)?;
+        if messages > 0 || audits > 0 {
+            tracing::info!(
+                target: "vibex_im",
+                messages,
+                audits,
+                "pruned expired IM channel history"
+            );
+        }
+        Ok((messages, audits))
     }
 
     pub async fn stop(&self) {
@@ -174,6 +230,9 @@ impl ImChannelService {
             task.abort();
         }
         if let Some(task) = self.inner.event_task.lock().await.take() {
+            task.abort();
+        }
+        if let Some(task) = self.inner.retention_task.lock().await.take() {
             task.abort();
         }
         let runtimes: Vec<Arc<ChannelRuntime>> = {
@@ -399,6 +458,116 @@ impl ImChannelService {
         self.reload_channel(channel_id).await?;
         let status = self.status_for(&updated.channel_id, updated.enabled).await;
         self.summary_for(&conn, &updated, status)
+    }
+
+    /// Replaces the set of events this channel forwards.
+    ///
+    /// The filter is stored as JSON so a future event id can be added without a
+    /// migration. An empty list clears the filter and restores the default set.
+    pub async fn set_event_filter(
+        &self,
+        channel_id: &ImChannelId,
+        filter: Vec<String>,
+    ) -> VibexResult<ImChannelSummary> {
+        let conn = self.open()?;
+        let record = ImChannelRepository::get(&conn, channel_id)?.ok_or_else(|| {
+            VibexError::validation("im_channel_not_found", "IM channel was not found")
+        })?;
+        let known: Vec<&str> = filter
+            .iter()
+            .filter(|id| vibex_core::IM_EVENT_FILTER_IDS.contains(&id.as_str()))
+            .map(String::as_str)
+            .collect();
+        if known.len() != filter.len() {
+            return Err(VibexError::validation(
+                "im_event_filter_unknown",
+                "the event filter names an event this build does not know",
+            ));
+        }
+        let event_filter_json = if filter.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_string(&filter).map_err(|_| {
+                VibexError::validation("im_event_filter_invalid", "event filter is not valid JSON")
+            })?)
+        };
+        let updated = ImChannelRecord {
+            event_filter_json,
+            updated_at_ms: unix_timestamp_ms(),
+            ..record
+        };
+        ImChannelRepository::update(&conn, &updated)?;
+        let status = self.status_for(&updated.channel_id, updated.enabled).await;
+        self.summary_for(&conn, &updated, status)
+    }
+
+    /// Sets the language this channel replies in. `None` follows the host.
+    pub async fn set_channel_locale(
+        &self,
+        channel_id: &ImChannelId,
+        locale: Option<String>,
+    ) -> VibexResult<ImChannelSummary> {
+        if let Some(locale) = locale.as_deref()
+            && !matches!(
+                locale.split('-').next().unwrap_or_default(),
+                "en" | "zh" | "ja" | "ko" | "fr" | "de" | "es" | "pt" | "ru"
+            )
+        {
+            return Err(VibexError::validation(
+                "im_channel_locale_invalid",
+                "the channel language is not supported",
+            ));
+        }
+        let conn = self.open()?;
+        let record = ImChannelRepository::get(&conn, channel_id)?.ok_or_else(|| {
+            VibexError::validation("im_channel_not_found", "IM channel was not found")
+        })?;
+        let updated = ImChannelRecord {
+            locale,
+            updated_at_ms: unix_timestamp_ms(),
+            ..record
+        };
+        ImChannelRepository::update(&conn, &updated)?;
+        let status = self.status_for(&updated.channel_id, updated.enabled).await;
+        self.summary_for(&conn, &updated, status)
+    }
+
+    /// Changes what a paired identity is allowed to do.
+    ///
+    /// The role is read on every inbound message, so the next message honours
+    /// the change without reconnecting.
+    pub async fn set_principal_role(
+        &self,
+        principal_id: &ImPrincipalId,
+        role: ImPrincipalRole,
+    ) -> VibexResult<ImPrincipalSummary> {
+        let conn = self.open()?;
+        let principal = ImPrincipalRepository::get(&conn, principal_id)?.ok_or_else(|| {
+            VibexError::validation("im_principal_not_found", "IM principal was not found")
+        })?;
+        if principal.status != ImPrincipalStatus::Active {
+            return Err(VibexError::validation(
+                "im_principal_revoked",
+                "a revoked identity cannot change role",
+            ));
+        }
+        let updated = ImPrincipalRecord {
+            role,
+            updated_at_ms: unix_timestamp_ms(),
+            ..principal
+        };
+        ImPrincipalRepository::upsert_active(&conn, &updated)?;
+        self.audit(
+            &conn,
+            &updated.channel_id,
+            Some(principal_id),
+            "principal_role_changed",
+            Some("principal"),
+            Some(principal_id.as_str()),
+            "allowed",
+            Some(&format!("role={}", role.as_str())),
+        )?;
+        Ok(principal_summary(updated))
     }
 
     pub async fn test_channel(&self, channel_id: &ImChannelId) -> VibexResult<ImChannelTestReport> {
@@ -860,6 +1029,36 @@ impl ImChannelService {
             return Ok(());
         };
         runtime.adapter.mark_inbound();
+        // Buttons are exempt: a click is a single answer to a card that was
+        // already delivered, and throttling it would leave a request stuck.
+        if event.callback.is_none()
+            && let InboundDecision::Limited { retry_after } = self.inner.inbound_limiter.check(
+                &event.external_user_id,
+                &event.external_chat_id,
+                if event.text.trim_start().starts_with("/pair") {
+                    InboundKind::Pairing
+                } else if event.text.trim_start().starts_with('/') {
+                    InboundKind::Command
+                } else {
+                    InboundKind::Prompt
+                },
+            )
+        {
+            tracing::warn!(
+                target: "vibex_im",
+                channel_id = %event.channel_id,
+                retry_after_ms = retry_after.as_millis() as u64,
+                "IM inbound message was rate limited"
+            );
+            self.reply_with(
+                &event,
+                &runtime,
+                &render::rate_limited(self.locale(&event), retry_after.as_secs().max(1)),
+                OutboundPriority::BestEffort,
+            )
+            .await?;
+            return Ok(());
+        }
         if let Some(callback) = &event.callback {
             let action_id = callback.action_id.clone();
             if let Some(callback_query_id) = callback.callback_query_id.as_deref() {
@@ -1068,13 +1267,6 @@ impl ImChannelService {
                 .await?;
             return Ok(());
         }
-        let payload: ApprovalActionPayload =
-            serde_json::from_str(&action.payload_json).map_err(|_| {
-                VibexError::validation(
-                    "im_action_payload_invalid",
-                    "approval action payload is invalid",
-                )
-            })?;
         let Some(binding) = ImBindingRepository::get(&conn, &action.binding_id)? else {
             self.reply(event, runtime, "This conversation is no longer bound.")
                 .await?;
@@ -1087,6 +1279,63 @@ impl ImChannelService {
                 .await?;
             return Ok(());
         }
+        // An elicitation button answers a question, not a permission request;
+        // the two share one action table but resolve through different ports.
+        if let Some(request_id) = action
+            .kind
+            .strip_prefix(ELICITATION_ACTION_PREFIX)
+            .map(str::to_string)
+        {
+            let payload: ElicitationActionPayload = serde_json::from_str(&action.payload_json)
+                .map_err(|_| {
+                    VibexError::validation(
+                        "im_action_payload_invalid",
+                        "elicitation action payload is invalid",
+                    )
+                })?;
+            let Some(request) = self
+                .pending_elicitation(&binding.session_id, &request_id)
+                .await?
+            else {
+                self.reply(
+                    event,
+                    runtime,
+                    "That question was already answered or withdrawn.",
+                )
+                .await?;
+                return Ok(());
+            };
+            if !ImActionRepository::consume(
+                &conn,
+                action_id,
+                &principal.principal_id,
+                unix_timestamp_ms(),
+            )? {
+                self.reply(event, runtime, "That answer was already recorded.")
+                    .await?;
+                return Ok(());
+            }
+            let status = self
+                .apply_elicitation_choice(
+                    event,
+                    runtime,
+                    &binding,
+                    &principal,
+                    &request,
+                    &payload.value,
+                )
+                .await?;
+            self.reply_with(event, runtime, &status, OutboundPriority::BestEffort)
+                .await?;
+            return Ok(());
+        }
+        let payload: ApprovalActionPayload =
+            serde_json::from_str(&action.payload_json).map_err(|_| {
+                VibexError::validation(
+                    "im_action_payload_invalid",
+                    "approval action payload is invalid",
+                )
+            })?;
         let Some(request) = self
             .pending_permission(&binding.session_id, Some(&payload.request_id))
             .await?
@@ -1889,6 +2138,19 @@ struct ApprovalActionPayload {
     option_id: String,
     choice: String,
 }
+
+/// The payload behind one elicitation button.
+#[derive(Debug, Serialize, Deserialize)]
+struct ElicitationActionPayload {
+    request_id: String,
+    /// `true`/`false` for a boolean field, the option value for a choice field.
+    value: String,
+}
+
+/// What an action record points at. The `kind` column already distinguishes a
+/// consent from an answer; the prefix keeps the two payload shapes apart when
+/// an old row is read back.
+const ELICITATION_ACTION_PREFIX: &str = "elicitation:";
 
 fn choose_option(
     request: &PermissionRequest,

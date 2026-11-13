@@ -29,8 +29,8 @@ use vibex_core::{
     GatewayRequestSummary, GatewaySettingsUpdateRequest, GatewaySnapshot, Hook, HookCreateRequest,
     HookDeleteRequest, HookInstallPreview, HookInstallPreviewRequest, HookUpdateRequest,
     ImBindingId, ImBindingSummary, ImChannelDraft, ImChannelId, ImChannelSummary,
-    ImChannelTestReport, ImPairingCodeInfo, ImPairingRequest, ImPrincipalId, ImPrincipalSummary,
-    ImSessionDefaults, ManagementSnapshotPayload, MarketIcon, McpMarketIcon,
+    ImChannelTestReport, ImPairingCodeInfo, ImPairingRequest, ImPrincipalId, ImPrincipalRole,
+    ImPrincipalSummary, ImSessionDefaults, ManagementSnapshotPayload, MarketIcon, McpMarketIcon,
     McpMarketInstallRequest, McpMarketInstallResult, McpMarketSearchRequest,
     McpMarketSearchResponse, McpServer, McpServerAgentMatrix, McpServerAgentMatrixListRequest,
     McpServerCreateRequest, McpServerDeleteRequest, McpServerDiscoverRequest,
@@ -129,6 +129,27 @@ impl std::fmt::Debug for ImChannelSecretUpdateRequest {
 pub struct ImChannelDefaultSessionUpdate {
     pub channel_id: ImChannelId,
     pub default_session: Option<ImSessionDefaults>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImChannelEventFilterUpdate {
+    pub channel_id: ImChannelId,
+    pub event_filter: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImChannelLocaleUpdate {
+    pub channel_id: ImChannelId,
+    pub locale: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImPrincipalRoleUpdate {
+    pub principal_id: ImPrincipalId,
+    pub role: ImPrincipalRole,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1019,6 +1040,45 @@ pub trait ManagementBackend: BackendBound {
         &self,
         request: MutationRequest<ImChannelDefaultSessionUpdate>,
     ) -> BackendFuture<'_, ImChannelSummary> {
+        let _ = request;
+        Box::pin(async {
+            Err(BackendError::unsupported(
+                "im_channels_unavailable",
+                "IM channels are unavailable on this backend",
+            ))
+        })
+    }
+
+    fn set_im_channel_event_filter(
+        &self,
+        request: MutationRequest<ImChannelEventFilterUpdate>,
+    ) -> BackendFuture<'_, ImChannelSummary> {
+        let _ = request;
+        Box::pin(async {
+            Err(BackendError::unsupported(
+                "im_channels_unavailable",
+                "IM channels are unavailable on this backend",
+            ))
+        })
+    }
+
+    fn set_im_channel_locale(
+        &self,
+        request: MutationRequest<ImChannelLocaleUpdate>,
+    ) -> BackendFuture<'_, ImChannelSummary> {
+        let _ = request;
+        Box::pin(async {
+            Err(BackendError::unsupported(
+                "im_channels_unavailable",
+                "IM channels are unavailable on this backend",
+            ))
+        })
+    }
+
+    fn set_im_principal_role(
+        &self,
+        request: MutationRequest<ImPrincipalRoleUpdate>,
+    ) -> BackendFuture<'_, ImPrincipalSummary> {
         let _ = request;
         Box::pin(async {
             Err(BackendError::unsupported(

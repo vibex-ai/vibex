@@ -229,14 +229,17 @@ impl ImChannelService {
                     )?;
                 }
                 TimelinePayload::ElicitationRequest(request) => {
-                    self.send_to_binding(
-                        &binding,
-                        &format!(
-                            "The Agent needs an answer: {}\nOpen Vibex to answer this question.",
-                            request.message
-                        ),
-                    )
-                    .await?;
+                    self.send_elicitation(&binding, request).await?;
+                    ImBindingRepository::set_delivered_sequence(
+                        &conn,
+                        &binding.binding_id,
+                        event.sequence,
+                        unix_timestamp_ms(),
+                    )?;
+                }
+                TimelinePayload::ElicitationResolution(resolution) => {
+                    self.close_elicitation(resolution.request_id.as_str())
+                        .await?;
                 }
                 _ => {}
             }
@@ -292,6 +295,39 @@ impl ImChannelService {
             }
         }
         Ok(())
+    }
+
+    /// The pending elicitation a button refers to.
+    ///
+    /// It is read from the timeline rather than the action row: the timeline is
+    /// the fact, and a question answered on the desktop must make the chat card
+    /// stale the same way an answered approval does.
+    pub(super) async fn pending_elicitation(
+        &self,
+        session_id: &VibexSessionId,
+        request_id: &str,
+    ) -> VibexResult<Option<vibex_core::ElicitationRequest>> {
+        let page = self
+            .inner
+            .agent
+            .fetch_timeline(FetchTimelineRequest {
+                session_id: session_id.clone(),
+                after_sequence: None,
+                before_sequence: None,
+                limit: 100,
+                max_turns: None,
+                max_bytes: None,
+            })
+            .await?;
+        for item in page.items.iter().rev() {
+            if let TimelinePayload::ElicitationRequest(request) = &item.payload
+                && request.status == vibex_core::ElicitationRequestStatus::Pending
+                && request.id.as_str() == request_id
+            {
+                return Ok(Some(request.clone()));
+            }
+        }
+        Ok(None)
     }
 
     pub(super) async fn pending_permission(

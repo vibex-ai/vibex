@@ -144,9 +144,11 @@ struct MockAgent {
     session: AgentSession,
     selection: SessionRuntimeSelection,
     pending: Mutex<Option<PermissionRequest>>,
+    pending_elicitation: Mutex<Option<vibex_core::ElicitationRequest>>,
     prompts: Mutex<Vec<String>>,
     attachments: Mutex<Vec<Vec<vibex_core::MessageAttachment>>>,
     resolutions: Mutex<Vec<PermissionResolution>>,
+    elicitations: Mutex<Vec<vibex_core::ElicitationResolution>>,
 }
 
 impl MockAgent {
@@ -186,9 +188,11 @@ impl MockAgent {
             session,
             selection,
             pending: Mutex::new(None),
+            pending_elicitation: Mutex::new(None),
             prompts: Mutex::new(Vec::new()),
             attachments: Mutex::new(Vec::new()),
             resolutions: Mutex::new(Vec::new()),
+            elicitations: Mutex::new(Vec::new()),
         }
     }
 
@@ -233,13 +237,21 @@ impl ImAgentPort for MockAgent {
     }
 
     async fn fetch_timeline(&self, _request: FetchTimelineRequest) -> VibexResult<TimelinePage> {
-        let items = self
+        let mut items = self
             .pending
             .lock()
             .expect("pending")
             .clone()
             .map(|request| vec![self.item(7, TimelinePayload::PermissionRequest(request))])
             .unwrap_or_default();
+        if let Some(request) = self
+            .pending_elicitation
+            .lock()
+            .expect("pending elicitation")
+            .clone()
+        {
+            items.push(self.item(9, TimelinePayload::ElicitationRequest(request)));
+        }
         Ok(TimelinePage {
             session_id: self.session.id.clone(),
             items,
@@ -309,11 +321,15 @@ impl ImAgentPort for MockAgent {
 
     async fn resolve_elicitation(
         &self,
-        _request: ResolveElicitationRequest,
+        request: ResolveElicitationRequest,
     ) -> VibexResult<TimelineItem> {
-        Err(vibex_core::VibexError::process(
-            "fake_resolve_elicitation",
-            "not used by this test",
+        self.elicitations
+            .lock()
+            .expect("elicitations")
+            .push(request.resolution.clone());
+        Ok(self.item(
+            9,
+            TimelinePayload::ElicitationResolution(request.resolution),
         ))
     }
 }
@@ -640,6 +656,36 @@ async fn telegram_pairing_commands_and_approval_round_trip() {
     )
     .await;
 
+    // The card and the desktop can answer at the same moment. Replaying the
+    // same button must not resolve twice, and the second press must be told the
+    // action is gone rather than silently ignored.
+    fake.push(json!({
+        "update_id": 7,
+        "callback_query": {
+            "id": "callback-2",
+            "from": { "id": 42, "is_bot": false, "first_name": "Tester" },
+            "data": action_id,
+            "message": {
+                "message_id": 1,
+                "chat": { "id": 42, "type": "private" }
+            }
+        }
+    }));
+    wait_for(
+        || async {
+            fake.sent_texts()
+                .iter()
+                .any(|text| text.contains("already handled"))
+        },
+        "duplicate press rejection",
+    )
+    .await;
+    assert_eq!(
+        agent.resolutions.lock().expect("resolutions").len(),
+        1,
+        "a replayed button resolves nothing"
+    );
+
     let bindings: Vec<ImBindingSummary> = service
         .list_bindings(&channel.channel_id)
         .await
@@ -647,6 +693,108 @@ async fn telegram_pairing_commands_and_approval_round_trip() {
     assert_eq!(bindings.len(), 1);
     assert_eq!(agent.prompts.lock().expect("prompts").len(), 2);
     assert_eq!(agent.resolutions.lock().expect("resolutions").len(), 1);
+
+    // A one-field question is answered with a button, not with a trip to Vibex.
+    let elicitation = vibex_core::ElicitationRequest {
+        id: vibex_core::RequestId::new(),
+        session_id: agent.session.id.clone(),
+        provider_request_id: Some("elicitation-1".to_string()),
+        tool_call_id: None,
+        message: "Continue with the plan?".to_string(),
+        title: Some("Confirm".to_string()),
+        description: None,
+        fields: vec![vibex_core::ElicitationField {
+            id: "confirm".to_string(),
+            title: "Confirm".to_string(),
+            description: None,
+            required: true,
+            kind: vibex_core::ElicitationFieldKind::Boolean { default: None },
+        }],
+        status: vibex_core::ElicitationRequestStatus::Pending,
+        requested_at_ms: unix_timestamp_ms(),
+    };
+    *agent.pending_elicitation.lock().expect("elicitation") = Some(elicitation.clone());
+    agent
+        .timeline
+        .send(TimelineLiveEvent {
+            session_id: agent.session.id.clone(),
+            sequence: 9,
+            item: agent.item(9, TimelinePayload::ElicitationRequest(elicitation.clone())),
+        })
+        .expect("timeline");
+    wait_for(
+        || async {
+            fake.sent.lock().expect("sent").iter().any(|body| {
+                body.get("text")
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| text.contains("Continue with the plan?"))
+            })
+        },
+        "elicitation card",
+    )
+    .await;
+    let question = fake
+        .sent
+        .lock()
+        .expect("sent")
+        .iter()
+        .find(|body| {
+            body.get("text")
+                .and_then(Value::as_str)
+                .is_some_and(|text| text.contains("Continue with the plan?"))
+        })
+        .cloned()
+        .expect("question");
+    assert_eq!(
+        question
+            .pointer("/reply_markup/inline_keyboard/0/0/text")
+            .and_then(Value::as_str),
+        Some("Yes")
+    );
+    let yes_action = question
+        .pointer("/reply_markup/inline_keyboard/0/0/callback_data")
+        .and_then(Value::as_str)
+        .expect("yes action")
+        .to_string();
+    fake.push(json!({
+        "update_id": 9,
+        "callback_query": {
+            "id": "callback-3",
+            "from": { "id": 42, "is_bot": false, "first_name": "Tester" },
+            "data": yes_action,
+            "message": {
+                "message_id": 1,
+                "chat": { "id": 42, "type": "private" }
+            }
+        }
+    }));
+    wait_for(
+        || async { !agent.elicitations.lock().expect("elicitations").is_empty() },
+        "elicitation resolution",
+    )
+    .await;
+    let answered = agent
+        .elicitations
+        .lock()
+        .expect("elicitations")
+        .first()
+        .cloned()
+        .expect("resolution");
+    assert_eq!(
+        answered.action,
+        vibex_core::ElicitationResolutionAction::Accept
+    );
+    assert_eq!(
+        answered.answers.get("confirm"),
+        Some(&vibex_core::ElicitationAnswerValue::Boolean(true))
+    );
+    // The question was one field, so it never had to send the fallback notice.
+    assert!(
+        !fake
+            .sent_texts()
+            .iter()
+            .any(|text| text.contains("open Vibex"))
+    );
 
     service.stop().await;
     server.abort();
