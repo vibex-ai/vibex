@@ -10920,6 +10920,15 @@ pub struct VibexWorkbench {
     /// this records rather than from what `new_session_agent_id` already says.
     new_session_logo_swap: Option<NewSessionLogoSwap>,
     new_session_runtime_selection: Option<SessionRuntimeSelection>,
+    /// A chip tuning a new-session draft asked for, waiting for a frame that has
+    /// a window to write it with.
+    ///
+    /// The feature toggles run from a dialog callback that borrows the window,
+    /// so they cannot rewrite the composer's token themselves. Recording the
+    /// choice and applying it on the next frame keeps one write path — the same
+    /// one the cascade uses — instead of a second, window-free way to edit
+    /// tokens.
+    pending_new_session_chip_selection: Option<(AgentId, SessionRuntimeSelection)>,
     /// Which built-in tool panels this draft asks for.
     ///
     /// Empty follows whichever Agent is selected, which is what the row shows
@@ -12663,6 +12672,7 @@ impl VibexWorkbench {
             new_session_agent_id: None,
             new_session_logo_swap: None,
             new_session_runtime_selection: None,
+            pending_new_session_chip_selection: None,
             new_session_tools: SessionToolSettings::default(),
             new_session_runtime_menu_open: false,
             new_session_runtime_menu_view: ComposerRuntimeMenuView::AuthSource,
@@ -28742,22 +28752,46 @@ impl VibexWorkbench {
     /// to the session, which is the ordinary state and the one every caller
     /// predating delegation assumes.
     fn composer_delegation_subject(&self, cx: &App) -> Option<VibexUseMention> {
-        let input = self.composer_input.as_ref()?;
+        self.delegation_subject_for(ComposerTarget::Session, cx)
+    }
+
+    /// The `@Agent` chip the runtime controls are tuning in one composer.
+    ///
+    /// Both composers have the same controls and the same kind of chip, so both
+    /// derive their subject the same way. A new-session draft that addresses a
+    /// collaborator used to ignore the chip entirely: the page's controls
+    /// always described the Agent being started, so tuning a chip there changed
+    /// nothing the reader could see.
+    fn delegation_subject_for(&self, target: ComposerTarget, cx: &App) -> Option<VibexUseMention> {
+        let input = self.input_for_composer_target(target)?;
         let input = input.read(cx);
         delegation_edit_subject(input.tokens(), input.cursor())
     }
 
-    /// The runtime selection the composer's controls should show.
+    /// The selection one composer's runtime controls should show.
+    fn composer_runtime_selection_for(
+        &self,
+        target: ComposerTarget,
+        cx: &App,
+    ) -> Option<SessionRuntimeSelection> {
+        if let Some(mention) = self.delegation_subject_for(target, cx) {
+            return self
+                .runtime_catalog
+                .as_deref()
+                .and_then(|catalog| delegation_chip_selection(catalog, &mention));
+        }
+        match target {
+            ComposerTarget::Session => self.view_runtime_selection(),
+            ComposerTarget::NewSession => self.new_session_runtime_selection.clone(),
+        }
+    }
+
+    /// The runtime selection the session composer's controls should show.
     ///
     /// A draft that is tuning a collaborator shows that collaborator's
-    /// selection; otherwise it shows the session's. The cascade only needs a
-    /// selection, so the same controls serve both without a second widget.
+    /// selection; otherwise it shows the session's.
     fn composer_runtime_selection(&self, cx: &App) -> Option<SessionRuntimeSelection> {
-        let Some(mention) = self.composer_delegation_subject(cx) else {
-            return self.view_runtime_selection();
-        };
-        let catalog = self.runtime_catalog.as_deref()?;
-        delegation_chip_selection(catalog, &mention)
+        self.composer_runtime_selection_for(ComposerTarget::Session, cx)
     }
 
     /// The runtime selection a session renders, selected or not.
@@ -41387,6 +41421,19 @@ impl VibexWorkbench {
         next.config_values.insert(feature.id.clone(), value);
         match target {
             RuntimeFeatureTarget::NewSession => {
+                // A draft that names a collaborator tunes that collaborator, so
+                // the value belongs on its chip rather than on the page. The
+                // write needs a window this callback does not own, so it is
+                // recorded and applied by the next frame.
+                if let Some(agent_id) = self
+                    .delegation_subject_for(ComposerTarget::NewSession, cx)
+                    .and_then(|mention| mention.agent_id)
+                {
+                    self.pending_new_session_chip_selection = Some((agent_id, next.clone()));
+                    self.new_session_error = None;
+                    cx.notify();
+                    return;
+                }
                 self.set_new_session_runtime_selection(Some(next.clone()));
                 self.remember_runtime_selection(&next);
                 self.new_session_error = None;
@@ -42675,7 +42722,30 @@ impl VibexWorkbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(input) = self.input_for_composer_target(ComposerTarget::Session) else {
+        self.apply_delegation_chip_selection_for(
+            ComposerTarget::Session,
+            agent_id,
+            selection,
+            window,
+            cx,
+        )
+    }
+
+    /// Writes one tuned selection into the chip of one composer.
+    ///
+    /// Both composers carry the same kind of chip, so both write it the same
+    /// way. A new-session draft that addresses a collaborator would otherwise
+    /// silently discard the tuning: the page's controls accepted the choice and
+    /// then reported the page's own Agent again on the next frame.
+    fn apply_delegation_chip_selection_for(
+        &mut self,
+        target: ComposerTarget,
+        agent_id: &AgentId,
+        selection: &SessionRuntimeSelection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(input) = self.input_for_composer_target(target) else {
             return;
         };
         let reference = vibex_core::VibexUseRef::runtime_option(
@@ -42711,8 +42781,18 @@ impl VibexWorkbench {
             .collect::<Vec<_>>();
         if updates.is_empty() {
             // No chip to tune after all (the caret moved while the menu was
-            // open); fall back to the session so the choice is not dropped.
-            self.request_runtime_selection(selection.clone(), false, cx);
+            // open); fall back to the composer's own runtime so the choice is
+            // not dropped.
+            match target {
+                ComposerTarget::Session => {
+                    self.request_runtime_selection(selection.clone(), false, cx)
+                }
+                ComposerTarget::NewSession => {
+                    self.set_new_session_runtime_selection(Some(selection.clone()));
+                    self.remember_runtime_selection(selection);
+                    cx.notify();
+                }
+            }
             return;
         }
         input.update(cx, |input, cx| {
@@ -60376,7 +60456,32 @@ impl VibexWorkbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let selection = self.new_session_runtime_selection.clone();
+        // A chip tuning recorded by a callback that could not touch the input
+        // is applied here, where a window is available. It goes through the
+        // same writer the cascade uses, so there is one way to edit a token.
+        if let Some((agent_id, selection)) = self.pending_new_session_chip_selection.take() {
+            self.apply_delegation_chip_selection_for(
+                ComposerTarget::NewSession,
+                &agent_id,
+                &selection,
+                window,
+                cx,
+            );
+            self.remember_runtime_selection(&selection);
+        }
+        // A draft that names a collaborator is tuning that collaborator, exactly
+        // as the session composer does. Without this the page's controls always
+        // described the Agent being started, so a chip's depth, mode or feature
+        // values were unreachable from here.
+        let delegation_subject = self.delegation_subject_for(ComposerTarget::NewSession, cx);
+        let chip_selection = delegation_subject.as_ref().and_then(|mention| {
+            self.runtime_catalog
+                .as_deref()
+                .and_then(|catalog| delegation_chip_selection(catalog, mention))
+        });
+        let selection = chip_selection
+            .clone()
+            .or_else(|| self.new_session_runtime_selection.clone());
         let projection = selection.as_ref().and_then(|selection| {
             self.runtime_catalog
                 .as_ref()
@@ -83673,18 +83778,24 @@ fn delegation_edit_subject(tokens: &[InlineTokenSpan], cursor: usize) -> Option<
                 .then_some((span.range(), mention))
         })
     };
-    // The caret just past a chip counts as being on it: a reader who typed
-    // `@Codex ` and stopped has their caret one character beyond the range.
+    // The caret decides, and nothing else. An earlier version also claimed the
+    // only chip in the draft, which made the mode inescapable exactly where it
+    // matters most: with one chip there was no caret position that returned the
+    // controls to the session, so the reader could not get back to their own
+    // runtime without deleting the chip.
+    //
+    // Containment wins over adjacency, so a caret sitting between two chips
+    // belongs to the one it is inside rather than to the one before it.
     if let Some((_, mention)) =
         agent_mentions().find(|(range, _)| cursor >= range.start && cursor <= range.end)
     {
         return Some(mention);
     }
-    let mut all = agent_mentions();
-    match (all.next(), all.next()) {
-        (Some((_, mention)), None) => Some(mention),
-        _ => None,
-    }
+    // Adjacency covers the single separator character an insertion appends, so
+    // a chip the reader has just picked is immediately tunable.
+    agent_mentions()
+        .find(|(range, _)| cursor == range.end + 1)
+        .map(|(_, mention)| mention)
 }
 
 /// The catalogue entry an `@Agent` chip's reference names.
@@ -102719,14 +102830,15 @@ mod tests {
         }
     }
 
-    /// A draft's runtime controls follow the caret to the chip it is on.
+    /// The caret decides which chip the controls edit, and moving it away is
+    /// the way out.
     ///
-    /// This is what replaces an explicit "delegation editing" mode: the subject
-    /// is derived, so there is no state to enter, leave, or leak. A caret on the
-    /// chip tunes it; a caret anywhere else with one chip still tunes it; two
-    /// chips and a caret away from both belongs to the session.
+    /// An earlier version also claimed the only chip in the draft, which made
+    /// the mode inescapable exactly where it matters most: with one chip no
+    /// caret position returned the controls to the session, so the reader had
+    /// to delete the chip to get their own runtime back.
     #[test]
-    fn the_delegation_subject_follows_the_caret_and_the_only_chip() {
+    fn the_delegation_subject_follows_the_caret() {
         let codex = AgentId::parse("codex").unwrap();
         let claude = AgentId::parse("claude").unwrap();
         let codex_mention = VibexUseMention::agent(
@@ -102740,43 +102852,56 @@ mod tests {
             Some("@Claude"),
         );
 
-        // One chip, caret inside it.
+        // A real draft after picking a chip: the insertion appends one space, so
+        // the caret rests one byte past the token.
         let single = composer_content_with_mentions("@Codex fix it", &[codex_mention.clone()]);
+        let chip = single.tokens()[0].range();
         assert_eq!(
-            delegation_edit_subject(single.tokens(), 2).and_then(|mention| mention.agent_id),
-            Some(codex.clone())
+            delegation_edit_subject(single.tokens(), chip.end).and_then(|m| m.agent_id),
+            Some(codex.clone()),
+            "a caret inside the chip edits it"
         );
-        // One chip, caret far away: still that chip, because there is no other.
         assert_eq!(
-            delegation_edit_subject(single.tokens(), 12).and_then(|mention| mention.agent_id),
-            Some(codex.clone())
+            delegation_edit_subject(single.tokens(), chip.end + 1).and_then(|m| m.agent_id),
+            Some(codex.clone()),
+            "a caret just past the chip still edits it, so a freshly picked chip is tunable"
         );
 
-        // Two chips: the caret decides, and away from both there is no subject.
+        // The escape hatch: with one chip, moving the caret away returns the
+        // controls to the session. This is the case that used to be a trap —
+        // the old rule claimed the only chip from anywhere in the draft, so the
+        // mode could not be left without deleting the chip.
+        assert_eq!(
+            delegation_edit_subject(single.tokens(), 12).and_then(|m| m.agent_id),
+            None,
+            "a caret away from the only chip must return the session's controls"
+        );
+
+        // Two chips: the caret picks one, and between or after them there is
+        // none.
         let both = composer_content_with_mentions(
             "@Codex @Claude compare",
-            &[codex_mention.clone(), claude_mention.clone()],
+            &[codex_mention, claude_mention],
         );
+        let first = both.tokens()[0].range();
+        let second = both.tokens()[1].range();
         assert_eq!(
-            delegation_edit_subject(both.tokens(), 1).and_then(|mention| mention.agent_id),
+            delegation_edit_subject(both.tokens(), first.start).and_then(|m| m.agent_id),
             Some(codex.clone())
         );
         assert_eq!(
-            delegation_edit_subject(both.tokens(), 8).and_then(|mention| mention.agent_id),
+            delegation_edit_subject(both.tokens(), second.start).and_then(|m| m.agent_id),
             Some(claude.clone())
         );
         assert_eq!(
-            delegation_edit_subject(both.tokens(), 20).and_then(|mention| mention.agent_id),
-            None,
-            "with two chips and the caret away from both, the session owns the controls"
+            delegation_edit_subject(both.tokens(), second.end + 1).and_then(|m| m.agent_id),
+            Some(claude),
+            "the chip just picked stays tunable"
         );
-
-        // A caret just past a chip still counts as being on it: a reader who
-        // typed `@Codex ` and stopped has their caret one past the range.
-        let chip_end = both.tokens()[0].range().end;
         assert_eq!(
-            delegation_edit_subject(both.tokens(), chip_end).and_then(|mention| mention.agent_id),
-            Some(codex)
+            delegation_edit_subject(both.tokens(), 20).and_then(|m| m.agent_id),
+            None,
+            "with the caret away from both, the session owns the controls"
         );
     }
 
