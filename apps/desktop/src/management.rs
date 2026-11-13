@@ -7316,10 +7316,12 @@ impl ManagementCenter {
         } else {
             management_locale_text("Add model provider", "添加模型供应商", "新增模型供應商")
         };
+        let content_view = dialog_content.clone();
         window.open_dialog(cx, move |dialog, _, _| {
             let dialog_center = dialog_center.clone();
             let confirm_center = confirm_center.clone();
             let cancel_center = cancel_center.clone();
+            let content_view = content_view.clone();
             dialog
                 .title(title)
                 .w(px(dialog_width))
@@ -7331,7 +7333,17 @@ impl ManagementCenter {
                 // the drop-in every time the reader moved one step, so the
                 // surface appears at rest.
                 .entrance(DialogEntrance::None)
-                .child(dialog_content.clone())
+                // `content`, not `child`: the kit's default body is one
+                // auto-height scroll region, which makes the whole dialog page
+                // scroll. The Model picker and its settings are two panes that
+                // must share the dialog's height and scroll inside themselves,
+                // so the body is handed a definite one.
+                .content(move |content, _, _| {
+                    content
+                        .min_h_0()
+                        .overflow_hidden()
+                        .child(content_view.clone())
+                })
                 // The Dialog answers Enter with its own confirm action, whose
                 // default is "close this overlay". The step decides what Enter
                 // means: on the picker it runs the highlighted source, and in
@@ -31177,10 +31189,12 @@ impl ManagementCenter {
         } else {
             management_locale_text("New route group", "新建路由组", "新增路由組")
         };
+        let content_view = dialog_content.clone();
         window.open_dialog(cx, move |dialog, _, _| {
             let dialog_center = dialog_center.clone();
             let confirm_center = confirm_center.clone();
             let cancel_center = cancel_center.clone();
+            let content_view = content_view.clone();
             dialog
                 .title(title)
                 .w(px(dialog_width))
@@ -31190,7 +31204,14 @@ impl ManagementCenter {
                 // are steps of one flow, so neither may replay an entrance when
                 // the reader steps between them.
                 .entrance(DialogEntrance::None)
-                .child(dialog_content.clone())
+                // Same body contract as the Provider form: a definite height,
+                // so the form's own sections scroll rather than the overlay.
+                .content(move |content, _, _| {
+                    content
+                        .min_h_0()
+                        .overflow_hidden()
+                        .child(content_view.clone())
+                })
                 .on_ok(move |_, window, cx| {
                     confirm_center.update(cx, |center, cx| center.save_route_group(window, cx));
                     false
@@ -48259,6 +48280,89 @@ fn save(cx: &mut Context<Self>) {
             .debug_bounds("provider-candidate-row-gpt-5")
             .expect("the picker must lay its rows out");
         assert!(row.size.width > px(0.0) && row.size.height > px(0.0));
+    }
+
+    /// The Agent dialog's two panes scroll inside themselves, the way the
+    /// Provider's fetch picker does: a wheel over the catalogue moves its rows
+    /// and leaves the panes, the form band, and the dialog page where they are.
+    #[gpui::test]
+    fn the_agent_model_panes_scroll_inside_themselves(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let (center, cx) = cx.add_window_view(ManagementCenter::new);
+        // Enough Models that the picker's well overflows at this size.
+        let catalogue = (0..40)
+            .map(|index| {
+                test_provider_model(
+                    &format!("model-{index:02}"),
+                    Some(&format!("Model {index:02}")),
+                )
+            })
+            .collect::<Vec<_>>();
+        center.update(cx, |center, _| {
+            center.profile_editor_open = true;
+            center
+                .projection_editor
+                .replace_capability(projection_capability_with_models());
+            center.profile_available_models = catalogue;
+            let mut chosen = test_provider_model("model-00", Some("Model 00"));
+            chosen.capabilities.context_tokens = Some(128_000);
+            center.profile_configured_models = vec![chosen];
+            center.profile_model_selection = Some("model-00".to_string());
+        });
+        let dialog = cx.new(|cx| ManagementProfileDialog::new(center.clone(), cx));
+        let (_, cx) = cx.add_window_view(move |_, _| ProfileDialogHarness {
+            dialog: dialog.clone(),
+        });
+        let handle = cx.windows().pop().expect("test window");
+        cx.simulate_window_resize(handle, gpui::size(px(1080.0), px(720.0)));
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+        });
+
+        let picker = cx
+            .debug_bounds("provider-candidates-pane")
+            .expect("the picker is drawn");
+        let settings = cx
+            .debug_bounds("provider-chosen-pane")
+            .expect("the settings are drawn");
+        let band = cx
+            .debug_bounds("provider-form-band")
+            .expect("the form band is drawn");
+        let first_row = cx
+            .debug_bounds("provider-candidate-row-model-00")
+            .expect("the first row is drawn");
+
+        cx.simulate_event(gpui::ScrollEvent {
+            position: picker.center(),
+            delta: ScrollDelta::Lines(point(0.0, -12.0)),
+            modifiers: Default::default(),
+            touch_phase: gpui::TouchPhase::Moved,
+            ..Default::default()
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+        });
+        let picker_after = cx
+            .debug_bounds("provider-candidates-pane")
+            .expect("the picker is still drawn");
+        let settings_after = cx
+            .debug_bounds("provider-chosen-pane")
+            .expect("the settings are still drawn");
+        let band_after = cx
+            .debug_bounds("provider-form-band")
+            .expect("the form band is still drawn");
+        let first_row_after = cx
+            .debug_bounds("provider-candidate-row-model-00")
+            .expect("the first row is still drawn");
+        assert!(
+            first_row_after.top() < first_row.top(),
+            "the wheel moved the picker's own rows: before={first_row:?} after={first_row_after:?}"
+        );
+        assert_eq!(picker, picker_after, "the picker pane does not move");
+        assert_eq!(settings, settings_after, "the settings pane does not move");
+        assert_eq!(band, band_after, "the form band above them does not move");
     }
 
     /// A row click offers the Model and opens its settings, while the checkbox

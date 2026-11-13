@@ -291,17 +291,12 @@ impl ManagementCenter {
             .as_ref()
             .map(|draft| draft.profile_name.clone())
             .unwrap_or_default();
-        window.open_dialog(cx, move |dialog, window, cx| {
-            // The Agent dialog's picker is the model this one follows, and it is
-            // a two-pane surface: a narrow dialog would stack the panes and turn
-            // the settings into a second scroll region. It takes the window
-            // instead, and reads the size per frame so a resize while it is open
-            // is followed rather than left behind.
-            let viewport = window.viewport_size();
-            let (dialog_width, dialog_height) = (
-                (f32::from(viewport.width) - 32.0).max(360.0),
-                (f32::from(viewport.height) - 32.0).max(360.0),
-            );
+        // The same frame the Agent's authoring dialog opens at: wide enough for
+        // two readable panes, and no wider, because the content fills the dialog
+        // rather than the window.
+        let (dialog_width, dialog_height) = management_authoring_dialog_size(window);
+        let content_view = content.clone();
+        window.open_dialog(cx, move |dialog, _, cx| {
             let confirm_center = confirm_center.clone();
             let close_center = close_center.clone();
             let picked = confirm_center
@@ -342,7 +337,20 @@ impl ManagementCenter {
                 .max_w(px(dialog_width))
                 .h(px(dialog_height))
                 .entrance(DialogEntrance::None)
-                .child(content.clone())
+                // `content`, not `child`: the kit's default body is one
+                // auto-height scroll region, which would make the whole page
+                // scroll and leave the panes sized by their rows instead of by
+                // the dialog. This hands the body a definite height, so each
+                // pane scrolls inside itself.
+                .content({
+                    let content_view = content_view.clone();
+                    move |content, _, _| {
+                        content
+                            .min_h_0()
+                            .overflow_hidden()
+                            .child(content_view.clone())
+                    }
+                })
                 .footer(footer)
                 .on_ok(move |_, window, cx| {
                     let mut added = false;
@@ -1173,7 +1181,14 @@ impl ManagementCenter {
                     cx,
                 );
                 if bounded {
-                    v_flex()
+                    // The pane's own scroll region: the editor is taller than
+                    // the pane at almost any width, so it must scroll inside the
+                    // pane rather than growing the dialog page.
+                    div()
+                        .id("management-provider-model-import-settings-scroll")
+                        .debug_selector(|| {
+                            "management-provider-model-import-settings-scroll".to_string()
+                        })
                         .w_full()
                         .min_h_0()
                         .flex_1()
@@ -1542,9 +1557,122 @@ mod picker_tests {
             list.size.height > px(420.0),
             "a one-row catalogue still fills the pane: {list:?}"
         );
+        // The editor is taller than the pane, so it scrolls inside it rather
+        // than stretching the pane: the pane's height comes from the dialog, and
+        // the editor overflows its own scroll region.
         assert!(
-            editor.top() >= settings.top() && editor.bottom() <= settings.bottom() + px(1.0),
-            "the settings stay inside their pane: editor={editor:?} pane={settings:?}"
+            editor.size.height > settings.size.height,
+            "the settings overflow their pane instead of stretching it: \
+             editor={editor:?} pane={settings:?}"
+        );
+        assert!(
+            editor.top() >= settings.top() && editor.top() < settings.bottom(),
+            "the editor starts inside its pane: editor={editor:?} pane={settings:?}"
+        );
+    }
+
+    /// The two panes scroll inside themselves: a wheel over the list moves the
+    /// list's rows and leaves both panes, and the dialog's own page, where they
+    /// are.
+    #[gpui::test]
+    fn each_pane_scrolls_inside_itself(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let mut built = None;
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            let center = cx.new(|cx| ManagementCenter::new(window, cx));
+            let root = gpui_base::Root::new(center.clone(), window, cx);
+            built = Some(center);
+            root
+        });
+        let center = built.expect("the management window builds its center");
+        let profile = profile(Vec::new());
+        let profile_id = profile.id.clone();
+        // Enough rows that the list overflows any pane the dialog can give it.
+        let rows = (0..40)
+            .map(|index| ProviderModelImportRow {
+                model: entry(
+                    &format!("model-{index:02}"),
+                    Some(&format!("Model {index:02}")),
+                ),
+                chosen: false,
+                existing: false,
+            })
+            .collect::<Vec<_>>();
+        cx.update(|window, cx| {
+            center.update(cx, |center, cx| {
+                center.navigation.active = ManagementSection::Providers;
+                center.selected_global_provider_id = Some(profile_id.as_str().to_string());
+                center.provider_detail_tab = ProviderDetailTab::Models;
+                center.providers = vec![profile];
+                center.provider_model_import = Some(ProviderModelImportDraft {
+                    profile_id: profile_id.clone(),
+                    profile_name: "Vendor".to_string(),
+                    rows,
+                    expanded: Some("model-00".to_string()),
+                    error: None,
+                    hint: None,
+                });
+                center.present_provider_model_picker(window, cx);
+                cx.notify();
+            });
+        });
+        cx.simulate_resize(gpui::size(px(1440.0), px(900.0)));
+        for _ in 0..3 {
+            cx.update(|window, cx| {
+                let _ = window.draw(cx);
+            });
+            cx.run_until_parked();
+        }
+        let list_pane = cx
+            .debug_bounds("provider-model-import-candidates-pane")
+            .expect("the picker draws its candidates pane");
+        let settings_pane = cx
+            .debug_bounds("provider-model-import-settings-pane")
+            .expect("the picker draws its settings pane");
+        let dialog = cx
+            .debug_bounds("dialog-0")
+            .expect("the dialog surface is drawn");
+        let first_row = cx
+            .debug_bounds("management-provider-model-import-row-model-00")
+            .expect("the first row is drawn");
+
+        // A wheel over the list moves the list's rows, and neither pane nor the
+        // dialog surface moves with them.
+        cx.simulate_event(gpui::ScrollEvent {
+            position: list_pane.center(),
+            delta: ScrollDelta::Lines(point(0.0, -12.0)),
+            modifiers: Default::default(),
+            touch_phase: gpui::TouchPhase::Moved,
+            ..Default::default()
+        });
+        cx.run_until_parked();
+        let list_pane_after = cx
+            .debug_bounds("provider-model-import-candidates-pane")
+            .expect("the candidates pane is still drawn");
+        let settings_pane_after = cx
+            .debug_bounds("provider-model-import-settings-pane")
+            .expect("the settings pane is still drawn");
+        let dialog_after = cx
+            .debug_bounds("dialog-0")
+            .expect("the dialog surface is still drawn");
+        let first_row_after = cx
+            .debug_bounds("management-provider-model-import-row-model-00")
+            .expect("the first row is still drawn");
+        assert!(
+            first_row_after.top() < first_row.top(),
+            "the wheel moved the list's own content: before={first_row:?} after={first_row_after:?}"
+        );
+        assert_eq!(
+            list_pane, list_pane_after,
+            "the candidates pane stays where the dialog put it"
+        );
+        assert_eq!(
+            settings_pane, settings_pane_after,
+            "the settings pane stays where the dialog put it"
+        );
+        assert_eq!(
+            dialog, dialog_after,
+            "the dialog page itself must not scroll"
         );
     }
 
