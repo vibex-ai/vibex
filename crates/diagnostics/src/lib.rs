@@ -12,7 +12,8 @@ use vibex_core::{
     AgentSession, AgentSessionSafety, AgentSessionState, DIAGNOSTIC_BUNDLE_SCHEMA_VERSION,
     DiagnosticBundle, DiagnosticBundleMetadata, DiagnosticBundleRedactionPolicy,
     DiagnosticBundleRequest, DiagnosticCount, DiagnosticDatabasePathKind, DiagnosticErrorSection,
-    DiagnosticExcludedContent, DiagnosticProviderCapabilitySummary, DiagnosticProviderHealthProbe,
+    DiagnosticExcludedContent, DiagnosticImChannelRecord, DiagnosticImChannelSection,
+    DiagnosticProviderCapabilitySummary, DiagnosticProviderHealthProbe,
     DiagnosticProviderHealthSummary, DiagnosticProviderProfileRef, DiagnosticProviderSection,
     DiagnosticProviderUsageSummary, DiagnosticReleaseContext, DiagnosticRuntimeMetric,
     DiagnosticRuntimeSection, DiagnosticScheduledTaskAttentionRecord,
@@ -29,9 +30,10 @@ use vibex_core::{
     TimelineSource, VibexError, VibexResult, VibexSessionId, WorkspaceMode, unix_timestamp_ms,
 };
 use vibex_db::{
-    CURRENT_SCHEMA_VERSION, DbConnection, RecentFileRepository, ScheduledTaskRepository,
-    SessionRepository, TimelineRepository, WorkspaceRepository, apply_migrations,
-    current_schema_version, default_database_path, open_database,
+    CURRENT_SCHEMA_VERSION, DbConnection, ImChannelRepository, ImChannelSecretRepository,
+    RecentFileRepository, ScheduledTaskRepository, SessionRepository, TimelineRepository,
+    WorkspaceRepository, apply_migrations, current_schema_version, default_database_path,
+    open_database,
 };
 use vibex_fs::WorkspaceFileService;
 use vibex_terminal::TerminalManager;
@@ -169,6 +171,7 @@ impl DiagnosticBundleService {
                     .collect(),
             },
             workbench: self.workbench_section(&conn)?,
+            im_channels: self.im_channel_section(&conn)?,
             runtime: project_runtime_metrics(
                 self.config
                     .runtime_observability
@@ -186,6 +189,49 @@ impl DiagnosticBundleService {
             errors: DiagnosticErrorSection {
                 scheduled_task_error_codes: scheduled_error_codes(&audit, limit),
             },
+        })
+    }
+
+    /// Summarizes configured IM channels without any identifying content.
+    ///
+    /// A bundle may be attached to a support report, so this deliberately
+    /// carries no chat id, session id, or message text: the operator gets the
+    /// kind and the connection state, which is what a diagnosis needs.
+    fn im_channel_section(&self, conn: &DbConnection) -> VibexResult<DiagnosticImChannelSection> {
+        let channels = ImChannelRepository::list(conn)?;
+        Ok(DiagnosticImChannelSection {
+            channels: channels
+                .into_iter()
+                .map(|channel| {
+                    let configured =
+                        ImChannelSecretRepository::list_for_channel(conn, &channel.channel_id)
+                            .map(|secrets| {
+                                secrets.iter().any(|secret| {
+                                    matches!(
+                                        secret.secret_kind.as_str(),
+                                        "bot_token" | "app_secret"
+                                    ) && secret.setup_state == "configured"
+                                })
+                            })
+                            .unwrap_or(false);
+                    DiagnosticImChannelRecord {
+                        channel_id: channel.channel_id.as_str().to_string(),
+                        kind: channel.kind.as_str().to_string(),
+                        enabled: channel.enabled,
+                        configured,
+                        // The live state lives in the runtime's memory, which a
+                        // bundle writer does not share. The stored flags are
+                        // what it can honestly report.
+                        state: if channel.enabled {
+                            "enabled".to_string()
+                        } else {
+                            "disabled".to_string()
+                        },
+                        consecutive_failures: 0,
+                        last_error_code: None,
+                    }
+                })
+                .collect(),
         })
     }
 
