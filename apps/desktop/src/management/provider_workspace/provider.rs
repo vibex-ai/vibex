@@ -251,10 +251,10 @@ impl ManagementCenter {
                 let refresh = {
                     let center = center.clone();
                     let id = menu_profile.id.clone();
-                    move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
+                    move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
                         center
                             .update(cx, |this, cx| {
-                                this.refresh_shared_provider_models(id.clone(), cx)
+                                this.open_shared_provider_model_picker(id.clone(), window, cx)
                             })
                             .ok();
                     }
@@ -291,9 +291,9 @@ impl ManagementCenter {
                 )
                 .item(
                     PopupMenuItem::new(management_locale_text(
-                        "Refresh models",
-                        "刷新模型列表",
-                        "重新整理模型清單",
+                        "Fetch and choose models",
+                        "拉取并选择模型",
+                        "擷取並選擇模型",
                     ))
                     .icon(IconName::RefreshCw)
                     .on_click(refresh),
@@ -1238,19 +1238,19 @@ impl ManagementCenter {
                 let refresh = {
                     let center = bulk_center.clone();
                     let id = bulk_profile.clone();
-                    move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
+                    move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
                         center
                             .update(cx, |this, cx| {
-                                this.refresh_shared_provider_models(id.clone(), cx)
+                                this.open_shared_provider_model_picker(id.clone(), window, cx)
                             })
                             .ok();
                     }
                 };
                 menu.item(
                     PopupMenuItem::new(management_locale_text(
-                        "Refresh from the Provider",
-                        "从供应商刷新",
-                        "從供應商重新整理",
+                        "Fetch and choose from the Provider",
+                        "从供应商拉取并选择",
+                        "從供應商擷取並選擇",
                     ))
                     .icon(IconName::RefreshCw)
                     .on_click(refresh),
@@ -1289,7 +1289,9 @@ impl ManagementCenter {
             .disabled(self.mutation.is_some())
             .on_click(cx.listener({
                 let id = profile.id.clone();
-                move |this, _, _, cx| this.refresh_shared_provider_models(id.clone(), cx)
+                move |this, _, window, cx| {
+                    this.open_shared_provider_model_picker(id.clone(), window, cx)
+                }
             }));
         let toolbar = h_flex()
             .w_full()
@@ -1356,9 +1358,9 @@ impl ManagementCenter {
             ws_empty_line(
                 if profile.configured_models.is_empty() {
                     management_locale_text(
-                        "No models yet. Fetch the Provider's list, or add a model id below.",
-                        "还没有模型。可以拉取供应商的模型列表，也可以在下方直接添加模型 ID。",
-                        "還沒有模型。可以擷取供應商的模型清單，也可以在下方直接新增模型 ID。",
+                        "No models yet. Fetch the Provider's list and choose which ones to offer, or add a model id below.",
+                        "还没有模型。可以拉取供应商的模型列表并选择要提供哪些，也可以在下方直接添加模型 ID。",
+                        "還沒有模型。可以擷取供應商的模型清單並選擇要提供哪些，也可以在下方直接新增模型 ID。",
                     )
                 } else {
                     management_locale_text(
@@ -1710,14 +1712,14 @@ impl ManagementCenter {
             ),
             management_setting_row(
                 management_locale_text(
-                    "Refresh models on start",
-                    "启动时刷新模型",
-                    "啟動時重新整理模型",
+                    "Pre-select fetched models",
+                    "预选拉取到的模型",
+                    "預選擷取到的模型",
                 ),
                 management_locale_text(
-                    "Fetch the model list again each time Vibex starts.",
-                    "每次 Vibex 启动时重新获取模型列表。",
-                    "每次 Vibex 啟動時重新取得模型清單。",
+                    "Start every fetch with the vendor's new models already checked. You still confirm what gets added.",
+                    "每次拉取时把厂商新增的模型默认勾选；最终仍由你确认要添加哪些。",
+                    "每次擷取時把廠商新增的模型預設勾選；最終仍由你確認要新增哪些。",
                 ),
                 switch(
                     "management-shared-provider-auto-refresh",

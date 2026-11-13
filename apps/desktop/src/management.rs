@@ -1794,6 +1794,15 @@ pub struct ManagementCenter {
     model_editor: provider_workspace::ModelEditDraft,
     /// The Models tab's "add a model by id" field.
     provider_model_add_input: Entity<InputState>,
+    /// The fetch picker's check state for a saved Provider's catalogue.
+    ///
+    /// A fetch no longer writes the whole answer into the record: it opens this
+    /// draft, the reader chooses which Models the Provider should offer, and
+    /// only the confirm writes. `None` means no picker is open.
+    provider_model_import: Option<provider_workspace::ProviderModelImportDraft>,
+    /// The fetch picker's own filter, so a long catalogue is scannable without
+    /// narrowing the Models tab behind it.
+    provider_model_import_search: Entity<InputState>,
     provider_endpoint_probes: Option<Vec<vibex_core::ModelProviderEndpointProbe>>,
     provider_endpoint_probes_profile: Option<vibex_core::ModelProviderProfileId>,
     shared_provider_advanced_target: Option<vibex_core::ModelProviderProfileId>,
@@ -2560,6 +2569,13 @@ impl ManagementCenter {
                 "篩選模型",
             ))
         });
+        let provider_model_import_search = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(management_locale_text(
+                "Filter the fetched models",
+                "筛选拉取到的模型",
+                "篩選擷取到的模型",
+            ))
+        });
         let provider_search = cx.new(|cx| {
             InputState::new(window, cx).placeholder(management_locale_text(
                 "Search Providers and groups",
@@ -2849,6 +2865,15 @@ impl ManagementCenter {
                 }
                 cx.notify();
             }),
+            cx.subscribe(
+                &provider_model_import_search,
+                |_, _, event: &InputEvent, cx| {
+                    if !management_input_changed(event) {
+                        return;
+                    }
+                    cx.notify();
+                },
+            ),
             cx.subscribe(&route_group_model_query, |_, _, event: &InputEvent, cx| {
                 if management_input_changed(event) {
                     cx.notify();
@@ -3278,6 +3303,8 @@ impl ManagementCenter {
             traffic_range: TrafficRange::Day,
             provider_model_edit_id: None,
             provider_models_list: None,
+            provider_model_import: None,
+            provider_model_import_search: provider_model_import_search.clone(),
             provider_model_capability_task: None,
             model_editor: provider_workspace::ModelEditDraft::new(window, cx),
             provider_model_add_input,
@@ -17549,122 +17576,6 @@ impl ManagementCenter {
                     Err(error) => this.error = Some(format!("{}: {}", error.code, error.message)),
                 }
                 cx.notify();
-            });
-        }));
-    }
-
-    fn refresh_shared_provider_models(
-        &mut self,
-        profile_id: vibex_core::ModelProviderProfileId,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(backend) = self.backend.clone() else {
-            return;
-        };
-        if self.mutation.is_some() {
-            return;
-        }
-        self.mutation = Some(ManagementMutation::ProviderProbe(format!(
-            "shared-models:{}",
-            profile_id.as_str()
-        )));
-        self.error = None;
-        self.notice = None;
-        let this = cx.entity();
-        self.mutation_task = Some(cx.spawn(async move |_, cx| {
-            let outcome = management_off_thread(cx, async move {
-                backend
-                    .management()
-                    .fetch_model_provider_profile_models(
-                        vibex_core::ModelProviderFetchModelsRequest {
-                            model_provider_profile_id: profile_id,
-                        },
-                    )
-                    .await
-            })
-            .await;
-            this.update(cx, |this, cx| {
-                this.mutation = None;
-                match outcome {
-                    Ok(response) => {
-                        let Some(mut profile) = this
-                            .providers
-                            .iter()
-                            .find(|profile| profile.id == response.model_provider_profile_id)
-                            .cloned()
-                        else {
-                            this.error = Some(
-                                management_locale_text(
-                                    "The Provider is no longer listed",
-                                    "该供应商已不在列表中",
-                                    "該供應商已不在清單中",
-                                )
-                                .to_string(),
-                            );
-                            cx.notify();
-                            return;
-                        };
-                        if response.models.is_empty() {
-                            this.error = Some(
-                                management_locale_text(
-                                    "The endpoint returned no models",
-                                    "接口没有返回模型",
-                                    "介面沒有回傳模型",
-                                )
-                                .to_string(),
-                            );
-                            cx.notify();
-                            return;
-                        }
-                        profile.configured_models = if profile.metadata.auto_refresh_models {
-                            // AutoInclude adds newly discovered models while
-                            // keeping the user's existing rows: their
-                            // capabilities, names, and disabled state are
-                            // hand-authored data, not discovery output.
-                            merge_discovered_provider_models(
-                                &profile.configured_models,
-                                response.models,
-                            )
-                        } else {
-                            response.models
-                        };
-                        if profile.default_model_id.as_ref().is_none_or(|default| {
-                            !profile
-                                .configured_models
-                                .iter()
-                                .any(|model| model.enabled && &model.id == default)
-                        }) {
-                            profile.default_model_id = profile
-                                .configured_models
-                                .iter()
-                                .find(|model| model.enabled)
-                                .map(|model| model.id.clone());
-                        }
-                        this.notice = Some(format!(
-                            "{} · {}",
-                            management_locale_text(
-                                "Model list refreshed",
-                                "模型列表已刷新",
-                                "模型清單已重新整理",
-                            ),
-                            profile.configured_models.len()
-                        ));
-                        this.update_shared_provider(
-                            profile,
-                            management_locale_text(
-                                "Model list refreshed",
-                                "模型列表已刷新",
-                                "模型清單已重新整理",
-                            ),
-                            cx,
-                        );
-                        cx.notify();
-                    }
-                    Err(error) => {
-                        this.error = Some(format!("{}: {}", error.code, error.message));
-                        cx.notify();
-                    }
-                }
             });
         }));
     }
