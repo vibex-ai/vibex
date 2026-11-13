@@ -38,6 +38,7 @@ pub mod recovery;
 pub mod relay;
 pub mod remote;
 pub mod remote_v2;
+pub mod right_rail;
 pub mod runtime;
 pub mod scheduled_task;
 pub mod terminal;
@@ -580,6 +581,7 @@ pub use remote::{
     redact_agent_snapshot_for_remote,
 };
 pub use remote_v2::*;
+pub use right_rail::*;
 pub use runtime::{
     AGENT_ACCOUNT_LABEL, AcpAdapterId, ActiveWorkKind, AgentRuntimeRouteKey,
     AgentSessionRestoreAttempt, AgentSessionRestoreCompatibility,

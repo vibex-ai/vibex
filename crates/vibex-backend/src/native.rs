@@ -5403,6 +5403,42 @@ impl ManagementBackend for NativeBackend {
                 .map_err(Into::into)
         })
     }
+
+    fn right_rail_web_panels(&self) -> BackendFuture<'_, Vec<vibex_core::RightRailWebPanel>> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime.right_rail().web_panels().map_err(Into::into)
+        })
+    }
+
+    fn add_right_rail_web_panel(
+        &self,
+        request: MutationRequest<vibex_core::RightRailWebPanelAddRequest>,
+    ) -> BackendFuture<'_, vibex_core::RightRailWebPanel> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .right_rail()
+                .add_web_panel(request.payload)
+                .map_err(Into::into)
+        })
+    }
+
+    fn remove_right_rail_web_panel(
+        &self,
+        request: MutationRequest<vibex_core::RightRailWebPanelRemoveRequest>,
+    ) -> BackendFuture<'_, bool> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .right_rail()
+                .remove_web_panel(request.payload)
+                .map_err(Into::into)
+        })
+    }
 }
 
 fn map_relay_state(state: RelayClientConnectionState) -> RelayConnectionState {

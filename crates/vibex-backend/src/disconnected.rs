@@ -1808,6 +1808,24 @@ impl ManagementBackend for DisconnectedBackend {
     ) -> BackendFuture<'_, Vec<vibex_core::PluginMarketInstallResult>> {
         disconnected_future!()
     }
+
+    fn right_rail_web_panels(&self) -> BackendFuture<'_, Vec<vibex_core::RightRailWebPanel>> {
+        disconnected_future!()
+    }
+
+    fn add_right_rail_web_panel(
+        &self,
+        _request: MutationRequest<vibex_core::RightRailWebPanelAddRequest>,
+    ) -> BackendFuture<'_, vibex_core::RightRailWebPanel> {
+        disconnected_future!()
+    }
+
+    fn remove_right_rail_web_panel(
+        &self,
+        _request: MutationRequest<vibex_core::RightRailWebPanelRemoveRequest>,
+    ) -> BackendFuture<'_, bool> {
+        disconnected_future!()
+    }
 }
 
 impl DeviceBackend for DisconnectedBackend {

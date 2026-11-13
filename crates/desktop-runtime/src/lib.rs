@@ -26,6 +26,8 @@ mod terminal_observation;
 mod timeline_display_settings;
 mod usage;
 pub use plugins::{PluginHandle, install_plugin_runtime};
+mod right_rail;
+pub use right_rail::RightRailHandle;
 mod vibex_use;
 mod workbench;
 mod worktree;
@@ -4714,6 +4716,11 @@ impl DesktopRuntime {
     /// The plugin market and lifecycle handle.
     pub fn plugins(&self) -> PluginHandle {
         PluginHandle::new(self.config.database_path.clone())
+    }
+
+    /// The right rail's pinned web panels.
+    pub fn right_rail(&self) -> RightRailHandle {
+        RightRailHandle::new(self.config.database_path.clone())
     }
 
     /// The local model gateway: one loopback endpoint that routes each call to

@@ -85,6 +85,8 @@ mod model_source;
 pub use model_source::*;
 mod plugin;
 pub use plugin::*;
+mod right_rail;
+pub use right_rail::*;
 
 pub type DbConnection = Connection;
 

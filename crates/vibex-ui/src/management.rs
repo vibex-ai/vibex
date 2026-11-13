@@ -2063,6 +2063,24 @@ mod tests {
             error_future()
         }
 
+        fn right_rail_web_panels(&self) -> BackendFuture<'_, Vec<vibex_core::RightRailWebPanel>> {
+            error_future()
+        }
+
+        fn add_right_rail_web_panel(
+            &self,
+            _request: MutationRequest<vibex_core::RightRailWebPanelAddRequest>,
+        ) -> BackendFuture<'_, vibex_core::RightRailWebPanel> {
+            error_future()
+        }
+
+        fn remove_right_rail_web_panel(
+            &self,
+            _request: MutationRequest<vibex_core::RightRailWebPanelRemoveRequest>,
+        ) -> BackendFuture<'_, bool> {
+            error_future()
+        }
+
         fn model_capability_suggestion(
             &self,
             _request: vibex_core::ModelCapabilitySuggestionRequest,

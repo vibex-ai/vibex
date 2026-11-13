@@ -4193,9 +4193,9 @@ impl RightRailActivity {
 /// One button the rail draws.
 ///
 /// A built-in panel is compiled into the application; a script panel belongs to
-/// a plugin installed from the market. Both reach the bar the same way — through
-/// the plugin catalog's `right_rail_activity` contributions — so the bar no
-/// longer has a second, hard-coded list of what may appear on it.
+/// a plugin installed from the market. Both reach the bar through the plugin
+/// catalog's `right_rail_activity` contributions. A web panel is neither: it is
+/// an address the reader pinned, drawn by the embedded browser.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum RightRailEntry {
     Builtin(RightRailActivity),
@@ -4203,6 +4203,11 @@ enum RightRailEntry {
         plugin_id: String,
         contribution_id: String,
         title: String,
+    },
+    Web {
+        panel_id: String,
+        title: String,
+        url: String,
     },
 }
 
@@ -4213,6 +4218,10 @@ impl RightRailEntry {
             Self::Builtin(activity) => activity.id(),
             Self::Script {
                 contribution_id, ..
+            }
+            | Self::Web {
+                panel_id: contribution_id,
+                ..
             } => contribution_id,
         }
     }
@@ -4220,22 +4229,23 @@ impl RightRailEntry {
     fn builtin(&self) -> Option<RightRailActivity> {
         match self {
             Self::Builtin(activity) => Some(*activity),
-            Self::Script { .. } => None,
+            Self::Script { .. } | Self::Web { .. } => None,
         }
     }
 
     fn icon(&self) -> Icon {
         match self {
             Self::Builtin(activity) => activity.icon(),
-            // A script panel has no compiled-in glyph; the frame mark says
-            // "this is a plugin surface" without guessing at its brand.
-            Self::Script { .. } => Icon::new(IconName::Frame),
+            // A plugin or web panel has no compiled-in glyph; the frame mark
+            // says "this is a panel this build did not draw" without guessing
+            // at a brand.
+            Self::Script { .. } | Self::Web { .. } => Icon::new(IconName::Frame),
         }
     }
 
     fn plugin_id(&self) -> Option<&str> {
         match self {
-            Self::Builtin(_) => None,
+            Self::Builtin(_) | Self::Web { .. } => None,
             Self::Script { plugin_id, .. } => Some(plugin_id),
         }
     }
@@ -4243,7 +4253,15 @@ impl RightRailEntry {
     fn title(&self) -> Option<&str> {
         match self {
             Self::Builtin(_) => None,
-            Self::Script { title, .. } => Some(title),
+            Self::Script { title, .. } | Self::Web { title, .. } => Some(title),
+        }
+    }
+
+    /// The address a web panel shows.
+    fn web_url(&self) -> Option<&str> {
+        match self {
+            Self::Web { url, .. } => Some(url),
+            _ => None,
         }
     }
 }
@@ -10848,6 +10866,17 @@ pub struct VibexWorkbench {
     /// built-in buttons visible rather than blanking the bar before the first
     /// read answers.
     right_rail_activities: Option<Vec<PluginContribution>>,
+    /// The addresses the reader pinned to the rail, in rail order.
+    right_rail_web_panels: Vec<vibex_core::RightRailWebPanel>,
+    /// One embedded-browser surface per web panel that has been opened.
+    ///
+    /// A surface owns a real browser tab, so it outlives the panel being
+    /// hidden: closing the rail stops its frames and reopening reuses it.
+    right_rail_web_surfaces: BTreeMap<String, gpui::Entity<crate::browser_surface::BrowserSurface>>,
+    /// The web panel the rail is showing, if any.
+    right_rail_web_active: Option<String>,
+    /// Why the web panel could not be opened (no runtime, no browser, policy).
+    right_rail_web_error: Option<String>,
     /// Commands plugins registered at run time, refreshed every frame.
     ///
     /// The palette is built from `&self`, so the values are pulled into the
@@ -12626,6 +12655,10 @@ impl VibexWorkbench {
             right_rail_script_title: None,
             right_rail_script_error: None,
             right_rail_activities: None,
+            right_rail_web_panels: Vec::new(),
+            right_rail_web_surfaces: BTreeMap::new(),
+            right_rail_web_active: None,
+            right_rail_web_error: None,
             plugin_runtime_commands: Vec::new(),
             session_group_view_loads: BTreeSet::new(),
             session_group_view_errors: BTreeMap::new(),
@@ -46451,6 +46484,7 @@ impl VibexWorkbench {
         self.child_agent_panel_active = false;
         self.right_rail_script_panel = None;
         self.right_rail_script_error = None;
+        self.clear_web_panel(cx);
         if visibility_changed {
             self.queue_ui_state();
         }
@@ -46482,6 +46516,7 @@ impl VibexWorkbench {
         self.child_agent_panel_active = true;
         self.right_rail_script_panel = None;
         self.right_rail_script_error = None;
+        self.clear_web_panel(cx);
         let visibility_changed = !self.ui_state.workbench.right_rail_visible;
         self.ui_state.workbench.right_rail_visible = true;
         if !self.right_rail_docks_when_open(cx) {
@@ -46552,6 +46587,7 @@ impl VibexWorkbench {
         self.child_agent_panel_active = false;
         self.right_rail_script_panel = None;
         self.right_rail_script_error = None;
+        self.clear_web_panel(cx);
         let activity_id = right_rail_activity_id(mode).to_string();
         let mode_changed =
             self.ui_state.right_rail.selected_activity_id.as_ref() != Some(&activity_id);
@@ -46751,8 +46787,187 @@ impl VibexWorkbench {
         crate::plugin_host::request_load(plugin_id, &record);
     }
 
+    /// Opens a web panel, or closes the rail when it is already showing.
+    fn toggle_web_panel(
+        &mut self,
+        panel_id: String,
+        url: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.right_rail_web_active.as_deref() == Some(panel_id.as_str())
+            && self.right_rail_panel_open()
+        {
+            self.close_right_rail(cx);
+            return;
+        }
+        self.open_web_panel(panel_id, url, window, cx);
+    }
+
+    /// Shows a web panel, opening its browser tab on first use.
+    fn open_web_panel(
+        &mut self,
+        panel_id: String,
+        url: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.child_agent_panel_active = false;
+        self.right_rail_script_panel = None;
+        self.right_rail_script_error = None;
+        self.right_rail_web_error = None;
+        self.right_rail_web_active = Some(panel_id.clone());
+        self.ui_state.right_rail.selected_activity_id = Some(panel_id.clone());
+        let visibility_changed = !self.ui_state.workbench.right_rail_visible;
+        self.ui_state.workbench.right_rail_visible = true;
+        if !self.right_rail_docks_when_open(cx) {
+            self.right_rail_overlay_open = true;
+            self.preview_overlay_open = false;
+        } else {
+            self.right_rail_overlay_open = false;
+        }
+        if visibility_changed {
+            self.queue_ui_state();
+        }
+        // A surface that is already attached just comes back to life; its tab
+        // kept the page loaded while the rail was hidden.
+        if let Some(surface) = self.right_rail_web_surfaces.get(&panel_id).cloned() {
+            surface.update(cx, |surface, cx| surface.set_active(true, cx));
+            cx.notify();
+            return;
+        }
+        self.open_web_panel_tab(panel_id, url, window, cx);
+    }
+
+    /// Opens the browser tab a web panel draws, then attaches its surface.
+    ///
+    /// The panel is a real page in the embedded browser: it gets a user-owned
+    /// tab, so its script runs and its controls work. Nothing is installed and
+    /// nothing is granted; the reader typed the address.
+    fn open_web_panel_tab(
+        &mut self,
+        panel_id: String,
+        url: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let transport = self.code_workbench.read(cx).browser_settings_transport();
+        let Some(transport) = transport else {
+            self.right_rail_web_error = Some(
+                locale::text(
+                    "The embedded browser needs a connected runtime.",
+                    "内嵌浏览器需要已连接的 runtime。",
+                    "內嵌瀏覽器需要已連接的 runtime。",
+                )
+                .to_string(),
+            );
+            cx.notify();
+            return;
+        };
+        let Some(workspace_id) = self
+            .selected_session()
+            .map(|session| session.workspace_id.clone())
+        else {
+            self.right_rail_web_error = Some(
+                locale::text(
+                    "Select a workspace before opening a web panel.",
+                    "请先选择工作区再打开网页面板。",
+                    "請先選擇工作區再開啟網頁面板。",
+                )
+                .to_string(),
+            );
+            cx.notify();
+            return;
+        };
+        let surface =
+            cx.new(|cx| crate::browser_surface::BrowserSurface::new(panel_id.clone(), window, cx));
+        self.right_rail_web_surfaces
+            .insert(panel_id.clone(), surface.clone());
+        let attach_transport = std::sync::Arc::clone(&transport);
+        cx.spawn(async move |this, cx| {
+            let opened = async {
+                let session_id = transport.ensure_workspace_session(&workspace_id).await?;
+                let tab = transport
+                    .create_tab(&session_id, Some(url.as_str()))
+                    .await?;
+                Ok::<_, crate::browser_transport::BrowserTransportError>((session_id, tab))
+            }
+            .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.right_rail_web_active.as_deref() != Some(panel_id.as_str()) {
+                    return;
+                }
+                match opened {
+                    Ok((session_id, tab)) => {
+                        surface.update(cx, |surface, cx| {
+                            surface.attach(attach_transport, session_id, tab.tab_id.clone(), cx);
+                        });
+                        this.right_rail_web_error = None;
+                    }
+                    Err(error) => this.right_rail_web_error = Some(error.message),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Stops a web panel's frames without closing its tab.
+    fn deactivate_web_panel(&mut self, panel_id: &str, cx: &mut Context<Self>) {
+        if let Some(surface) = self.right_rail_web_surfaces.get(panel_id).cloned() {
+            surface.update(cx, |surface, cx| surface.set_active(false, cx));
+        }
+    }
+
+    /// Puts the rail's web panel away, stopping its frames.
+    fn clear_web_panel(&mut self, cx: &mut Context<Self>) {
+        if let Some(active) = self.right_rail_web_active.take() {
+            self.deactivate_web_panel(&active, cx);
+        }
+        self.right_rail_web_error = None;
+    }
+
+    /// Closes the browser tabs of panels that are no longer pinned.
+    ///
+    /// A surface whose panel is gone has no button left to reach it, and the
+    /// tab behind it would otherwise keep a page loaded forever.
+    fn prune_web_panel_surfaces(&mut self, cx: &mut Context<Self>) {
+        let known: BTreeSet<String> = self
+            .right_rail_web_panels
+            .iter()
+            .map(|panel| panel.panel_id.clone())
+            .collect();
+        let stale: Vec<String> = self
+            .right_rail_web_surfaces
+            .keys()
+            .filter(|panel_id| !known.contains(*panel_id))
+            .cloned()
+            .collect();
+        if stale.is_empty() {
+            return;
+        }
+        let transport = self.code_workbench.read(cx).browser_settings_transport();
+        for panel_id in stale {
+            let Some(surface) = self.right_rail_web_surfaces.remove(&panel_id) else {
+                continue;
+            };
+            let tab_id = surface.read(cx).tab_id().cloned();
+            surface.update(cx, |surface, cx| surface.set_active(false, cx));
+            if let (Some(transport), Some(tab_id)) = (transport.clone(), tab_id) {
+                cx.background_executor()
+                    .spawn(async move {
+                        let _ = transport.close_tab(&tab_id).await;
+                    })
+                    .detach();
+            }
+        }
+    }
+
     fn right_rail_panel_open(&self) -> bool {
-        if self.child_agent_panel_active || self.right_rail_script_panel.is_some() {
+        if self.child_agent_panel_active
+            || self.right_rail_script_panel.is_some()
+            || self.right_rail_web_active.is_some()
+        {
             return if self.last_visibility.right_rail_docked {
                 self.ui_state.workbench.right_rail_visible
             } else {
@@ -46812,9 +47027,65 @@ impl VibexWorkbench {
             }
             return self.render_script_panel_placeholder(cx);
         }
+        if self.right_rail_web_active.is_some() {
+            return self.render_web_panel(cx);
+        }
         self.code_right_rail
             .clone()
             .cached(StyleRefinement::default().size_full())
+            .into_any_element()
+    }
+
+    /// A web panel: the embedded browser's surface for its user-owned tab.
+    ///
+    /// There is no static fallback. The panel is a page, and showing a fetched
+    /// copy of one is a different, worse thing; when the browser cannot start,
+    /// the rail says why instead.
+    fn render_web_panel(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(panel_id) = self.right_rail_web_active.clone() else {
+            return div().into_any_element();
+        };
+        if let Some(error) = &self.right_rail_web_error {
+            return v_flex()
+                .size_full()
+                .min_w_0()
+                .items_center()
+                .justify_center()
+                .gap_2()
+                .p_4()
+                .child(
+                    Icon::new(IconName::TriangleAlert)
+                        .size(px(18.0))
+                        .text_color(cx.theme().danger),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_center()
+                        .text_color(cx.theme().danger)
+                        .child(error.clone()),
+                )
+                .into_any_element();
+        }
+        if let Some(surface) = self.right_rail_web_surfaces.get(&panel_id).cloned() {
+            return surface
+                .cached(StyleRefinement::default().size_full())
+                .into_any_element();
+        }
+        v_flex()
+            .size_full()
+            .items_center()
+            .justify_center()
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(locale::text(
+                        "Opening the page…",
+                        "正在打开页面…",
+                        "正在開啟頁面…",
+                    )),
+            )
             .into_any_element()
     }
 
@@ -46875,12 +47146,23 @@ impl VibexWorkbench {
     /// plugin that contributes one appears beside the first-party buttons.
     fn right_rail_activity_order(&self) -> Vec<RightRailEntry> {
         let persisted = &self.ui_state.right_rail.activity_order;
-        match &self.right_rail_activities {
+        let mut available = match &self.right_rail_activities {
             None => resolved_right_rail_activity_order(persisted),
             Some(contributions) => {
                 order_right_rail_entries(persisted, catalog_right_rail_entries(contributions))
             }
+        };
+        for panel in &self.right_rail_web_panels {
+            let entry = RightRailEntry::Web {
+                panel_id: panel.panel_id.clone(),
+                title: panel.title.clone(),
+                url: panel.url.clone(),
+            };
+            if !available.contains(&entry) {
+                available.push(entry);
+            }
         }
+        order_right_rail_entries(persisted, available)
     }
 
     /// Reads the right rail's contributions from the plugin catalog.
@@ -46895,7 +47177,6 @@ impl VibexWorkbench {
         match runtime.plugins().contributions() {
             Ok(contributions) => {
                 self.right_rail_activities = Some(contributions);
-                cx.notify();
             }
             Err(error) => {
                 eprintln!(
@@ -46904,6 +47185,30 @@ impl VibexWorkbench {
                 );
             }
         }
+        match runtime.right_rail().web_panels() {
+            Ok(panels) => {
+                self.right_rail_web_panels = panels;
+                // A panel that was removed while it was open must not keep
+                // showing a browser tab nobody can reach any more.
+                let active_is_gone = self.right_rail_web_active.as_ref().is_some_and(|active| {
+                    !self
+                        .right_rail_web_panels
+                        .iter()
+                        .any(|panel| &panel.panel_id == active)
+                });
+                if active_is_gone {
+                    self.right_rail_web_active = None;
+                }
+                self.prune_web_panel_surfaces(cx);
+            }
+            Err(error) => {
+                eprintln!(
+                    "vibex-foundation: right-rail-web-panel-read-failed code={}",
+                    error.code
+                );
+            }
+        }
+        cx.notify();
     }
 
     /// Remembers which side of a button a dragged activity would land on.
@@ -47035,24 +47340,45 @@ impl VibexWorkbench {
                         .on_click(cx.listener(|this, _, _, cx| this.toggle_child_agent_panel(cx)))
                         .into_any_element()
                 }
-                None => {
-                    // A script plugin's panel. The view belongs to the plugin
-                    // host; the button only decides which panel the rail shows.
-                    let plugin_id = activity.plugin_id().unwrap_or_default().to_string();
-                    let title = activity.title().unwrap_or_default().to_string();
-                    let open = panel_open
-                        && self.right_rail_script_panel.as_deref() == Some(plugin_id.as_str());
-                    right_rail_activity_button(
-                        format!("activity-plugin-{plugin_id}"),
-                        activity.icon(),
-                    )
-                    .tooltip(title.clone())
-                    .selected(open)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.toggle_script_panel(plugin_id.clone(), title.clone(), cx)
-                    }))
-                    .into_any_element()
-                }
+                None => match activity.web_url() {
+                    // A pinned page. The embedded browser draws it; the button
+                    // only decides which panel the rail shows.
+                    Some(url) => {
+                        let panel_id = activity.id().to_string();
+                        let title = activity.title().unwrap_or_default().to_string();
+                        let url = url.to_string();
+                        let open = panel_open
+                            && self.right_rail_web_active.as_deref() == Some(panel_id.as_str());
+                        right_rail_activity_button(
+                            format!("activity-web-{panel_id}"),
+                            activity.icon(),
+                        )
+                        .tooltip(title.clone())
+                        .selected(open)
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.toggle_web_panel(panel_id.clone(), url.clone(), window, cx)
+                        }))
+                        .into_any_element()
+                    }
+                    None => {
+                        // A script plugin's panel. The view belongs to the plugin
+                        // host; the button only decides which panel the rail shows.
+                        let plugin_id = activity.plugin_id().unwrap_or_default().to_string();
+                        let title = activity.title().unwrap_or_default().to_string();
+                        let open = panel_open
+                            && self.right_rail_script_panel.as_deref() == Some(plugin_id.as_str());
+                        right_rail_activity_button(
+                            format!("activity-plugin-{plugin_id}"),
+                            activity.icon(),
+                        )
+                        .tooltip(title.clone())
+                        .selected(open)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.toggle_script_panel(plugin_id.clone(), title.clone(), cx)
+                        }))
+                        .into_any_element()
+                    }
+                },
             };
             let drop_position = drop_target
                 .as_ref()
@@ -105186,6 +105512,28 @@ mod tests {
         );
         assert_eq!(reordered[0], entries[1]);
         assert_eq!(reordered[1], entries[0]);
+    }
+
+    /// A pinned page is a rail button like any other, ordered by the same key.
+    #[test]
+    fn a_pinned_page_takes_its_place_in_the_rail_order() {
+        let web = RightRailEntry::Web {
+            panel_id: "web.1".to_string(),
+            title: "Status".to_string(),
+            url: "https://status.example.com/".to_string(),
+        };
+        assert_eq!(web.id(), "web.1");
+        assert_eq!(web.title(), Some("Status"));
+        assert_eq!(web.web_url(), Some("https://status.example.com/"));
+        assert!(web.builtin().is_none());
+        assert!(web.plugin_id().is_none());
+
+        let persisted = vec!["web.1".to_string(), "activity-files".to_string()];
+        let available = vec![builtin(RightRailActivity::Files), web.clone()];
+        assert_eq!(
+            order_right_rail_entries(&persisted, available),
+            vec![web, builtin(RightRailActivity::Files)]
+        );
     }
 
     /// The activity buttons are draggable and the drop target is persisted.

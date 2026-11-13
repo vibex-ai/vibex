@@ -7392,6 +7392,33 @@ impl ManagementBackend for WebRemoteBackend {
             "Plugin management belongs to the local desktop runtime",
         )
     }
+
+    fn right_rail_web_panels(&self) -> BackendFuture<'_, Vec<vibex_core::RightRailWebPanel>> {
+        self.unsupported(
+            "right_rail_remote_unsupported",
+            "The right rail's web panels belong to the local desktop",
+        )
+    }
+
+    fn add_right_rail_web_panel(
+        &self,
+        _request: MutationRequest<vibex_core::RightRailWebPanelAddRequest>,
+    ) -> BackendFuture<'_, vibex_core::RightRailWebPanel> {
+        self.unsupported(
+            "right_rail_remote_unsupported",
+            "The right rail's web panels belong to the local desktop",
+        )
+    }
+
+    fn remove_right_rail_web_panel(
+        &self,
+        _request: MutationRequest<vibex_core::RightRailWebPanelRemoveRequest>,
+    ) -> BackendFuture<'_, bool> {
+        self.unsupported(
+            "right_rail_remote_unsupported",
+            "The right rail's web panels belong to the local desktop",
+        )
+    }
 }
 
 impl DeviceBackend for WebRemoteBackend {

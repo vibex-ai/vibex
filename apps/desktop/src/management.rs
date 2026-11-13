@@ -2113,6 +2113,14 @@ pub struct ManagementCenter {
     plugin_market_loading: bool,
     plugin_market_error: Option<String>,
     plugin_market_generation: u64,
+    /// The addresses pinned to the right rail.
+    ///
+    /// They are not plugins: the embedded browser draws them, so this page only
+    /// manages the list.
+    right_rail_web_panels: Vec<vibex_core::RightRailWebPanel>,
+    right_rail_web_form_open: bool,
+    right_rail_web_title: Entity<InputState>,
+    right_rail_web_url: Entity<InputState>,
     /// Pictures already loaded, by their URL.
     ///
     /// A plugin's mark and its screenshots are addressed by the catalog, and a
@@ -2524,6 +2532,15 @@ impl ManagementCenter {
                 "搜尋外掛",
             ))
         });
+        let right_rail_web_title = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(management_locale_text(
+                "Panel title",
+                "面板标题",
+                "面板標題",
+            ))
+        });
+        let right_rail_web_url =
+            cx.new(|cx| InputState::new(window, cx).placeholder("https://example.com/"));
         let mcp_name_draft = cx.new(|cx| {
             InputState::new(window, cx).placeholder(management_locale_text(
                 "Server name, for example filesystem",
@@ -3243,6 +3260,10 @@ impl ManagementCenter {
             plugin_market_loading: false,
             plugin_market_error: None,
             plugin_market_generation: 0,
+            right_rail_web_panels: Vec::new(),
+            right_rail_web_form_open: false,
+            right_rail_web_title,
+            right_rail_web_url,
             plugin_market_icons: BTreeMap::new(),
             plugin_market_icon_pending: BTreeSet::new(),
             mcp_validation: None,
@@ -12054,6 +12075,7 @@ impl ManagementCenter {
         self.plugin_consent = None;
         self.load_plugin_catalog(cx);
         self.load_installed_plugins(cx);
+        self.load_right_rail_web_panels(cx);
     }
 
     fn load_plugin_catalog(&mut self, cx: &mut Context<Self>) {
@@ -12518,6 +12540,116 @@ impl ManagementCenter {
                         cx.emit(ManagementEvent::PluginsChanged);
                     }
                     Ok(Ok(None)) => {}
+                    Ok(Err(error)) => {
+                        this.plugin_market_error =
+                            Some(management_market_error_text(&error.code, &error.message));
+                    }
+                    Err(error) => this.plugin_market_error = Some(format!("{error}")),
+                }
+                cx.notify();
+            });
+        }));
+    }
+
+    fn load_right_rail_web_panels(&mut self, cx: &mut Context<Self>) {
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        let entity = cx.weak_entity();
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            backend
+                .management()
+                .right_rail_web_panels()
+                .await
+                .map_err(crate::app::remote_error_into_vibex)
+        });
+        self.mutation_task = Some(cx.spawn(async move |_, cx| {
+            let outcome = runner.await;
+            let _ = entity.update(cx, |this, cx| {
+                match outcome {
+                    Ok(Ok(panels)) => this.right_rail_web_panels = panels,
+                    Ok(Err(error)) => {
+                        this.plugin_market_error =
+                            Some(management_market_error_text(&error.code, &error.message));
+                    }
+                    Err(error) => this.plugin_market_error = Some(format!("{error}")),
+                }
+                cx.notify();
+            });
+        }));
+    }
+
+    fn add_right_rail_web_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        let title = self
+            .right_rail_web_title
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        let url = self.right_rail_web_url.read(cx).value().trim().to_string();
+        // The form closes and clears before the request goes out, so a slow
+        // request cannot leave a second copy of the text in the fields.
+        self.right_rail_web_form_open = false;
+        self.right_rail_web_title
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        self.right_rail_web_url
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        let entity = cx.weak_entity();
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            backend
+                .management()
+                .add_right_rail_web_panel(MutationRequest::new(
+                    vibex_core::RightRailWebPanelAddRequest { title, url },
+                ))
+                .await
+                .map_err(crate::app::remote_error_into_vibex)
+        });
+        self.mutation_task = Some(cx.spawn(async move |_, cx| {
+            let outcome = runner.await;
+            let _ = entity.update(cx, |this, cx| {
+                match outcome {
+                    Ok(Ok(panel)) => {
+                        this.right_rail_web_panels
+                            .retain(|existing| existing.panel_id != panel.panel_id);
+                        this.right_rail_web_panels.push(panel);
+                        cx.emit(ManagementEvent::PluginsChanged);
+                    }
+                    Ok(Err(error)) => {
+                        this.plugin_market_error =
+                            Some(management_market_error_text(&error.code, &error.message));
+                    }
+                    Err(error) => this.plugin_market_error = Some(format!("{error}")),
+                }
+                cx.notify();
+            });
+        }));
+    }
+
+    fn remove_right_rail_web_panel(&mut self, panel_id: String, cx: &mut Context<Self>) {
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        let entity = cx.weak_entity();
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            backend
+                .management()
+                .remove_right_rail_web_panel(MutationRequest::new(
+                    vibex_core::RightRailWebPanelRemoveRequest { panel_id },
+                ))
+                .await
+                .map_err(crate::app::remote_error_into_vibex)
+        });
+        self.mutation_task = Some(cx.spawn(async move |_, cx| {
+            let outcome = runner.await;
+            let _ = entity.update(cx, |this, cx| {
+                match outcome {
+                    Ok(Ok(_)) => {
+                        this.load_right_rail_web_panels(cx);
+                        cx.emit(ManagementEvent::PluginsChanged);
+                    }
                     Ok(Err(error)) => {
                         this.plugin_market_error =
                             Some(management_market_error_text(&error.code, &error.message));
@@ -13236,6 +13368,124 @@ impl ManagementCenter {
         column.into_any_element()
     }
 
+    /// The right rail's pinned pages, and the form that adds one.
+    ///
+    /// They are not plugins and do not appear as rows: the embedded browser
+    /// draws each one in its own tab, so this card only manages the list.
+    fn render_right_rail_web_panels(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let panels = self.right_rail_web_panels.clone();
+        let form_open = self.right_rail_web_form_open;
+        let mut card = v_flex()
+            .w_full()
+            .gap_2()
+            .p_3()
+            .rounded(cx.theme().radius)
+            .border_1()
+            .border_color(cx.theme().border.opacity(0.7))
+            .child(
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_semibold()
+                            .child(management_locale_text(
+                                "Right-rail web panels",
+                                "右栏网页面板",
+                                "右欄網頁面板",
+                            )),
+                    )
+                    .child(
+                        Button::new("management-right-rail-web-add")
+                            .small()
+                            .outline()
+                            .label(if form_open {
+                                management_locale_text("Cancel", "取消", "取消")
+                            } else {
+                                management_locale_text("Add a page", "添加页面", "新增頁面")
+                            })
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.right_rail_web_form_open = !this.right_rail_web_form_open;
+                                cx.notify();
+                            })),
+                    ),
+            );
+        if form_open {
+            card = card.child(
+                v_flex()
+                    .w_full()
+                    .gap_2()
+                    .child(Input::new(&self.right_rail_web_title).small())
+                    .child(Input::new(&self.right_rail_web_url).small())
+                    .child(
+                        h_flex().w_full().justify_end().child(
+                            Button::new("management-right-rail-web-save")
+                                .small()
+                                .primary()
+                                .label(management_locale_text("Add", "添加", "新增"))
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.add_right_rail_web_panel(window, cx);
+                                    cx.notify();
+                                })),
+                        ),
+                    ),
+            );
+        }
+        if panels.is_empty() {
+            card = card.child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(management_locale_text(
+                        "No pages pinned. Add an https address to open it in the embedded browser from the right rail.",
+                        "还没有固定页面。添加一个 https 地址，就能从右栏用内嵌浏览器打开它。",
+                        "還沒有固定頁面。新增一個 https 網址，就能從右欄用內嵌瀏覽器開啟它。",
+                    )),
+            );
+        }
+        for panel in panels {
+            let panel_id = panel.panel_id.clone();
+            card = card.child(
+                h_flex()
+                    .w_full()
+                    .min_w_0()
+                    .items_center()
+                    .gap_3()
+                    .child(
+                        v_flex()
+                            .min_w_0()
+                            .flex_1()
+                            .gap(px(2.0))
+                            .child(div().text_sm().font_semibold().child(panel.title))
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(panel.url),
+                            ),
+                    )
+                    .child(
+                        Button::new(SharedString::from(format!(
+                            "management-right-rail-web-remove-{panel_id}"
+                        )))
+                        .small()
+                        .outline()
+                        .label(management_locale_text("Remove", "移除", "移除"))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.remove_right_rail_web_panel(panel_id.clone(), cx);
+                            cx.notify();
+                        })),
+                    ),
+            );
+        }
+        card.into_any_element()
+    }
+
     fn render_plugin_installed(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let installed = self.plugin_market_installed.clone();
         let mut column = v_flex().w_full().gap_3();
@@ -13255,6 +13505,7 @@ impl ManagementCenter {
                     })),
             ),
         );
+        column = column.child(self.render_right_rail_web_panels(cx));
         if installed.is_empty() {
             column = column.child(management_market_empty_row(
                 management_locale_text(

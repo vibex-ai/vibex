@@ -103,7 +103,8 @@ use vibex_core::{
     PluginMarketIndexResponse, PluginMarketInstallRequest, PluginMarketInstallResult,
     PluginMarketSearchRequest, PluginMarketSearchResponse, PluginRollbackRequest,
     PluginUninstallRequest, PluginUpdateApplyRequest, PluginUpdateCheckRequest,
-    PluginUpdateCheckResponse, PluginVersionPinRequest,
+    PluginUpdateCheckResponse, PluginVersionPinRequest, RightRailWebPanel,
+    RightRailWebPanelAddRequest, RightRailWebPanelRemoveRequest,
 };
 
 pub trait ManagementBackend: BackendBound {
@@ -967,4 +968,17 @@ pub trait ManagementBackend: BackendBound {
         &self,
         request: MutationRequest<PluginUpdateApplyRequest>,
     ) -> BackendFuture<'_, Vec<PluginMarketInstallResult>>;
+
+    /// The right rail's pinned web panels.
+    fn right_rail_web_panels(&self) -> BackendFuture<'_, Vec<RightRailWebPanel>>;
+
+    fn add_right_rail_web_panel(
+        &self,
+        request: MutationRequest<RightRailWebPanelAddRequest>,
+    ) -> BackendFuture<'_, RightRailWebPanel>;
+
+    fn remove_right_rail_web_panel(
+        &self,
+        request: MutationRequest<RightRailWebPanelRemoveRequest>,
+    ) -> BackendFuture<'_, bool>;
 }
