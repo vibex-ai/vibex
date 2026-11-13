@@ -18,6 +18,8 @@ use vibex_desktop_runtime::{
 };
 use vibex_remote::{RemoteIdentity, RemoteIdentityStore, RemoteTrustService};
 
+mod im_cli;
+
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const SERVER_STATE_FILE: &str = "server-state.json";
 const PAIRING_SCHEMA_VERSION: &str = "vibex-server-pairing.v1";
@@ -199,6 +201,23 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 std::process::exit(2);
             }
         }
+    }
+    if arguments.first().is_some_and(|argument| argument == "im") {
+        let command = match im_cli::ImCommand::parse(&arguments[1..]) {
+            Ok(command) => command,
+            Err(message) => {
+                eprintln!("error: {message}");
+                eprintln!("run vibex-server --help for the im command list");
+                std::process::exit(2);
+            }
+        };
+        let config = headless_config()?;
+        config_check(&config)?;
+        if let Err(message) = im_cli::run(&config, command).await {
+            eprintln!("error: {message}");
+            std::process::exit(2);
+        }
+        return Ok(());
     }
     let command = Command::parse(arguments)?;
     match command {
@@ -1042,6 +1061,7 @@ fn print_help() {
     println!("  status [--json]                      report runtime state and loopback health");
     println!("  stop                                 stop the runtime owned by this home");
     println!("  revoke DEVICE_ID [--reason TEXT]     revoke a paired device");
+    im_cli::print_help();
     println!("  config-check                          validate VIBEX_* deployment settings");
     println!("  tui [--local]                        run the terminal client; attaches to a");
     println!(

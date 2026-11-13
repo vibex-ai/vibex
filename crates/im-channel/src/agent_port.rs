@@ -41,3 +41,86 @@ pub trait ImAgentPort: Send + Sync + 'static {
         request: ResolveElicitationRequest,
     ) -> VibexResult<TimelineItem>;
 }
+
+/// The Agent port for administrative commands that never run a turn.
+///
+/// `vibex-server im list|pair|revoke|test` edits channel configuration, pairing
+/// codes and bindings; none of it dispatches a prompt or resolves an approval.
+/// Rather than start a runtime to satisfy the signature, those commands build
+/// the service with this port and call only the administrative methods. Every
+/// Agent operation fails loudly, so a future caller that reaches one gets a
+/// capability error instead of silence.
+pub struct AdministrativeAgent;
+
+#[async_trait]
+impl ImAgentPort for AdministrativeAgent {
+    fn subscribe_timeline(&self) -> broadcast::Receiver<TimelineLiveEvent> {
+        broadcast::channel(1).0.subscribe()
+    }
+
+    fn subscribe_session_updates(&self) -> broadcast::Receiver<AgentSession> {
+        broadcast::channel(1).0.subscribe()
+    }
+
+    fn subscribe_notifications(&self) -> broadcast::Receiver<AgentNotificationIntent> {
+        broadcast::channel(1).0.subscribe()
+    }
+
+    async fn get_session(&self, _session_id: &VibexSessionId) -> VibexResult<AgentSession> {
+        Err(no_agent())
+    }
+
+    async fn list_sessions(&self, _include_archived: bool) -> VibexResult<Vec<AgentSession>> {
+        Ok(Vec::new())
+    }
+
+    async fn fetch_timeline(&self, _request: FetchTimelineRequest) -> VibexResult<TimelinePage> {
+        Err(no_agent())
+    }
+
+    async fn runtime_selection(
+        &self,
+        _session_id: &VibexSessionId,
+    ) -> VibexResult<AgentSessionRuntimeSelectionState> {
+        Err(no_agent())
+    }
+
+    async fn create_session(
+        &self,
+        _request: CreateAgentSessionRequest,
+    ) -> VibexResult<AgentSession> {
+        Err(no_agent())
+    }
+
+    async fn send_message(
+        &self,
+        _request: SendAgentMessageRequest,
+    ) -> VibexResult<Vec<TimelineItem>> {
+        Err(no_agent())
+    }
+
+    async fn interrupt(&self, _session_id: &VibexSessionId) -> VibexResult<()> {
+        Err(no_agent())
+    }
+
+    async fn resolve_permission(
+        &self,
+        _request: ResolvePermissionRequest,
+    ) -> VibexResult<TimelineItem> {
+        Err(no_agent())
+    }
+
+    async fn resolve_elicitation(
+        &self,
+        _request: ResolveElicitationRequest,
+    ) -> VibexResult<TimelineItem> {
+        Err(no_agent())
+    }
+}
+
+fn no_agent() -> vibex_core::VibexError {
+    vibex_core::VibexError::capability(
+        "im_administrative_only",
+        "this channel service was built for administration and hosts no Agent",
+    )
+}

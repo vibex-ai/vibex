@@ -14,9 +14,11 @@ tokio.workspace = true
 vibex-agent = { path = "../../crates/agent" }
 vibex-browser = { path = "../../crates/browser" }
 vibex-computer = { path = "../../crates/computer" }
+vibex-config-switch = { path = "../../crates/config-switch", default-features = false }
 vibex-core = { path = "../../crates/core" }
 vibex-db = { path = "../../crates/db" }
 vibex-desktop-runtime = { path = "../../crates/desktop-runtime", default-features = false }
+vibex-im-channel = { path = "../../crates/im-channel" }
 vibex-remote = { path = "../../crates/remote" }
 vibex-client = { path = "../tui", default-features = false }
 vibex-tui = { path = "../../crates/vibex-tui" }
