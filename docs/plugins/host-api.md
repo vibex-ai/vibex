@@ -26,6 +26,21 @@ const session = current();
 
 `current()` returns `null` when no Agent session is selected.
 
+### `send` (requires `agent.send`)
+
+```js
+import { send } from "vibex.session";
+
+send("Run the formatter over src/");
+// true  — queued to the current session
+// false — no session is selected
+```
+
+The message is queued on the host and sent by the workbench through the
+authority, so the plugin never talks to the backend itself. An empty message
+throws. A plugin may request `agent.send` without `agent.read`; it then gets
+only `send`.
+
 ## `vibex.workspace` (requires `agent.read`)
 
 ```js
@@ -67,9 +82,31 @@ A plugin can contribute commands through its manifest:
 ```
 
 Each command appears in the command palette under **Plugin commands**. Selecting
-one opens that plugin's panel; the panel decides what the command does. This is
-the safe first shape: the host does not execute arbitrary script callbacks from
-the palette, and a command cannot run without the plugin's panel surface.
+one opens that plugin's panel and hands the command id to it; the panel decides
+what the command does.
+
+A plugin may also register commands at run time, once its panel is up:
+
+```js
+import { register, list, take } from "vibex.commands";
+
+register("refresh", "Refresh the card");  // true, false when the id is taken
+list();                                    // [{ id: "refresh", title: "..." }]
+
+// Command ids dispatched since the last call, cleared as they are returned.
+const run = take();
+if (run.includes("refresh")) {
+  // Act on the command. Commands from the manifest arrive here too.
+}
+```
+
+The host cannot call into the script — `gpui-shell` has no function value — so
+dispatch is a queue: the palette records the command, opens the panel, and the
+script takes the ids when it renders. A command cannot run without the plugin's
+panel surface, and a plugin that is not loaded has no queue.
+
+Both `vibex.commands` and the manifest's `contributes.commands` require
+`ui.command`.
 
 ## Manifest
 
@@ -84,14 +121,15 @@ Request the permission in `vibex-plugin.json`:
   "entry": "main.js",
   "capabilities": {
     "panel": true,
-    "agent": { "read": true }
+    "command": true,
+    "agent": { "read": true, "send": true }
   }
 }
 ```
 
-The consent sheet shows `agent.read` before installation. An update that adds
-the permission asks again; an update that does not add permissions keeps the
-existing grant.
+The consent sheet shows `agent.read`, `agent.send`, `ui.panel` and `ui.command`
+before installation. An update that adds a permission asks again; an update that
+does not add permissions keeps the existing grant.
 
 ## Example
 

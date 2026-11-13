@@ -60,6 +60,92 @@ pub enum HostRequest {
     },
 }
 
+/// A write a plugin asked the desktop to perform.
+///
+/// The host runs on the UI thread and cannot await the authority, so a write
+/// is recorded here and drained by the workbench, which owns the backend.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PluginAction {
+    /// Send a message to the session the plugin is looking at.
+    SendMessage {
+        plugin_id: String,
+        session_id: String,
+        text: String,
+    },
+}
+
+/// A command a plugin registered at run time through `vibex.commands`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RegisteredCommand {
+    pub plugin_id: String,
+    pub id: String,
+    pub title: String,
+}
+
+/// State shared between the host modules, the host and the workbench.
+///
+/// Each field is its own `Rc<RefCell<..>>` so a host module can borrow one
+/// while another is used, and so the global and the `Host` observe the same
+/// value.
+#[derive(Clone, Default)]
+struct PluginChannels {
+    /// Writes waiting to be drained by the workbench.
+    actions: Rc<RefCell<Vec<PluginAction>>>,
+    /// Run-time commands, by plugin id.
+    commands: Rc<RefCell<BTreeMap<String, Vec<RegisteredCommand>>>>,
+    /// Command ids dispatched to a plugin but not yet taken by it.
+    dispatched: Rc<RefCell<BTreeMap<String, Vec<String>>>>,
+}
+
+impl PluginChannels {
+    /// Drops a plugin's run-time state.
+    fn forget(&self, plugin_id: &str) {
+        self.commands.borrow_mut().remove(plugin_id);
+        self.dispatched.borrow_mut().remove(plugin_id);
+    }
+
+    /// Registers a run-time command; `false` when the id is already taken.
+    fn register(&self, plugin_id: &str, id: &str, title: &str) -> bool {
+        let mut commands = self.commands.borrow_mut();
+        let list = commands.entry(plugin_id.to_string()).or_default();
+        if list.iter().any(|command| command.id == id) {
+            return false;
+        }
+        list.push(RegisteredCommand {
+            plugin_id: plugin_id.to_string(),
+            id: id.to_string(),
+            title: title.to_string(),
+        });
+        true
+    }
+
+    /// A plugin's run-time commands, as `(id, title)` pairs.
+    fn commands_for(&self, plugin_id: &str) -> Vec<(String, String)> {
+        self.commands
+            .borrow()
+            .get(plugin_id)
+            .map(|list| {
+                list.iter()
+                    .map(|command| (command.id.clone(), command.title.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Takes the command ids dispatched to a plugin, clearing the queue.
+    fn take_dispatched(&self, plugin_id: &str) -> Vec<String> {
+        self.dispatched
+            .borrow_mut()
+            .remove(plugin_id)
+            .unwrap_or_default()
+    }
+}
+
+/// The application-global view of the channels.
+struct PluginActions(PluginChannels);
+
+impl Global for PluginActions {}
+
 /// The runtime and, once a plugin has been loaded, the manager over it.
 ///
 /// The manager is built on first use because it needs two directories that are
@@ -71,6 +157,7 @@ struct Host {
     /// over that plugin's own grants.
     managers: BTreeMap<String, PluginManager>,
     session: Rc<RefCell<Option<PluginSessionSnapshot>>>,
+    channels: PluginChannels,
 }
 
 impl Host {
@@ -87,6 +174,7 @@ impl Host {
             plugin.data_directory.clone(),
             grants,
             Rc::clone(&self.session),
+            self.channels.clone(),
         );
         let mut manager = PluginManager::new(vec![plugins_root]).with_data_home(data_root);
         // `gpui-shell` has no plural builder: each host module is one call,
@@ -158,6 +246,7 @@ fn load(
     if let Some(mut previous) = host.managers.remove(&plugin_id) {
         previous.unload(&plugin_id);
     }
+    host.channels.forget(&plugin_id);
     let mut manager = host.manager_for(plugin)?;
     discover(&mut manager)?;
     manager
@@ -177,6 +266,7 @@ fn unload(host: &mut Host, plugin_id: &str) -> Result<(), String> {
     if let Some(mut manager) = host.managers.remove(plugin_id) {
         manager.unload(plugin_id);
     }
+    host.channels.forget(plugin_id);
     Ok(())
 }
 
@@ -275,6 +365,51 @@ pub fn set_session(cx: &App, session: Option<PluginSessionSnapshot>) {
     }
 }
 
+/// Takes the writes plugins asked for since the last drain.
+pub fn take_pending_actions(cx: &App) -> Vec<PluginAction> {
+    let Some(state) = cx.try_global::<PluginActions>() else {
+        return Vec::new();
+    };
+    std::mem::take(&mut *state.0.actions.borrow_mut())
+}
+
+/// The commands plugins registered at run time, as palette contributions.
+pub fn runtime_commands(cx: &App) -> Vec<vibex_core::PluginContribution> {
+    let Some(state) = cx.try_global::<PluginActions>() else {
+        return Vec::new();
+    };
+    let commands = state.0.commands.borrow();
+    commands
+        .iter()
+        .flat_map(|(plugin_id, list)| {
+            list.iter().map(|command| vibex_core::PluginContribution {
+                plugin_id: plugin_id.clone(),
+                kind: "command".to_string(),
+                contribution_id: command.id.clone(),
+                title: Some(command.title.clone()),
+                enabled: true,
+            })
+        })
+        .collect()
+}
+
+/// Records that a command was dispatched to a plugin.
+///
+/// The plugin's panel reads the queue with `vibex.commands.take()`; the host
+/// cannot call into the script, because `gpui-shell` has no function value.
+pub fn dispatch_command(cx: &App, plugin_id: &str, command_id: &str) {
+    let Some(state) = cx.try_global::<PluginActions>() else {
+        return;
+    };
+    state
+        .0
+        .dispatched
+        .borrow_mut()
+        .entry(plugin_id.to_string())
+        .or_default()
+        .push(command_id.to_string());
+}
+
 /// The UI thread's inbox, set once the first window starts its pump.
 static INBOX: OnceLock<UnboundedSender<HostRequest>> = OnceLock::new();
 
@@ -293,6 +428,8 @@ pub fn init(cx: &mut App) {
 
     let session = Rc::new(RefCell::new(None));
     cx.set_global(SessionState(session.clone()));
+    let channels = PluginChannels::default();
+    cx.set_global(PluginActions(channels.clone()));
 
     match ShellRuntime::new_isolated_with_components(components) {
         Ok(runtime) => {
@@ -300,6 +437,7 @@ pub fn init(cx: &mut App) {
                 runtime,
                 managers: BTreeMap::new(),
                 session: session.clone(),
+                channels,
             }))));
         }
         Err(error) => {
@@ -325,18 +463,23 @@ fn host_modules(
     data_dir: PathBuf,
     grants: BTreeSet<String>,
     session: Rc<RefCell<Option<PluginSessionSnapshot>>>,
+    channels: PluginChannels,
 ) -> Vec<HostModule> {
     let session_reader = {
-        let session = Rc::clone(&session);
-        let grants = grants.clone();
-        let plugin_id = plugin_id.clone();
+        let current_session = Rc::clone(&session);
+        let send_session = Rc::clone(&session);
+        let current_grants = grants.clone();
+        let send_grants = grants.clone();
+        let current_plugin = plugin_id.clone();
+        let send_plugin = plugin_id.clone();
+        let send_channels = channels.clone();
         HostModule::new("vibex.session")
             .declarations(
-                "export function current(): { id: string; title: string; workspaceId: string; workspaceRoot: string; agentId: string } | null;",
+                "export function current(): { id: string; title: string; workspaceId: string; workspaceRoot: string; agentId: string } | null;\nexport function send(text: string): boolean;",
             )
             .function("current", move |_| {
-                require_permission(&grants, "agent.read", &plugin_id)?;
-                let session = session.borrow();
+                require_permission(&current_grants, "agent.read", &current_plugin)?;
+                let session = current_session.borrow();
                 let Some(session) = session.as_ref() else {
                     return Ok(HostValue::Null);
                 };
@@ -359,6 +502,26 @@ fn host_modules(
                         HostValue::from(session.agent_id.clone()),
                     ),
                 ]))
+            })
+            .function("send", move |arguments: &gpui_shell::HostArguments| {
+                require_permission(&send_grants, "agent.send", &send_plugin)?;
+                let text = arguments.string(0)?.trim().to_string();
+                if text.is_empty() {
+                    return Err(HostError::new("the message is empty"));
+                }
+                let session = send_session.borrow();
+                let Some(session) = session.as_ref() else {
+                    return Ok(HostValue::Bool(false));
+                };
+                send_channels
+                    .actions
+                    .borrow_mut()
+                    .push(PluginAction::SendMessage {
+                        plugin_id: send_plugin.clone(),
+                        session_id: session.id.clone(),
+                        text,
+                    });
+                Ok(HostValue::Bool(true))
             })
     };
 
@@ -388,14 +551,90 @@ fn host_modules(
     };
 
     let mut modules = Vec::new();
-    if grants.contains("agent.read") {
+    if grants.contains("agent.read") || grants.contains("agent.send") {
         modules.push(session_reader);
+    }
+    if grants.contains("agent.read") {
         modules.push(workspace_reader);
     }
     if grants.contains("storage") {
-        modules.push(settings_module(plugin_id, data_dir, grants));
+        modules.push(settings_module(plugin_id.clone(), data_dir, grants.clone()));
+    }
+    if grants.contains("ui.command") {
+        modules.push(commands_module(plugin_id, grants, channels));
     }
     modules
+}
+
+/// The commands a plugin registers and the ones dispatched to it.
+///
+/// A command the palette runs is written to the plugin's dispatched queue; the
+/// script takes it with `take()`. That is the shape the host can support:
+/// `gpui-shell` has no function value, so the host cannot hold a script
+/// callback and call it later.
+fn commands_module(
+    plugin_id: String,
+    grants: BTreeSet<String>,
+    channels: PluginChannels,
+) -> HostModule {
+    let register = {
+        let grants = grants.clone();
+        let plugin_id = plugin_id.clone();
+        let channels = channels.clone();
+        move |arguments: &gpui_shell::HostArguments| {
+            require_permission(&grants, "ui.command", &plugin_id)?;
+            let id = arguments.string(0)?.trim().to_string();
+            let title = arguments.string(1)?.trim().to_string();
+            if id.is_empty() || title.is_empty() {
+                return Err(HostError::new("a command needs an id and a title"));
+            }
+            if id.len() > 128 || title.len() > 128 {
+                return Err(HostError::new("the command id or title is too long"));
+            }
+            Ok(HostValue::Bool(channels.register(&plugin_id, &id, &title)))
+        }
+    };
+    let list = {
+        let grants = grants.clone();
+        let plugin_id = plugin_id.clone();
+        let channels = channels.clone();
+        move |_: &gpui_shell::HostArguments| {
+            require_permission(&grants, "ui.command", &plugin_id)?;
+            let values = channels
+                .commands_for(&plugin_id)
+                .into_iter()
+                .map(|(id, title)| {
+                    HostValue::Object(vec![
+                        ("id".to_string(), HostValue::from(id)),
+                        ("title".to_string(), HostValue::from(title)),
+                    ])
+                })
+                .collect();
+            Ok(HostValue::Array(values))
+        }
+    };
+    let take = {
+        let grants = grants.clone();
+        let plugin_id = plugin_id.clone();
+        let channels = channels.clone();
+        move |_: &gpui_shell::HostArguments| {
+            require_permission(&grants, "ui.command", &plugin_id)?;
+            Ok(HostValue::Array(
+                channels
+                    .take_dispatched(&plugin_id)
+                    .into_iter()
+                    .map(HostValue::from)
+                    .collect(),
+            ))
+        }
+    };
+    HostModule::new("vibex.commands")
+        .declarations(
+            "export function register(id: string, title: string): boolean;\nexport function list(): { id: string; title: string }[];\nexport function take(): string[];",
+        )
+        .function("register", register)
+        .function("list", list)
+        .function("take", take)
 }
 
 /// The plugin's own durable settings store, namespaced by its data directory.
@@ -744,6 +983,7 @@ mod tests {
                 data_dir.clone(),
                 BTreeSet::new(),
                 session.clone(),
+                PluginChannels::default(),
             )
             .is_empty(),
             "a plugin with no grants must not get a host module"
@@ -754,21 +994,95 @@ mod tests {
             data_dir.clone(),
             BTreeSet::from(["agent.read".to_string()]),
             session.clone(),
+            PluginChannels::default(),
         );
         assert_eq!(session_modules.len(), 2);
 
+        // `agent.send` alone gets the session module (its `send`), not the
+        // workspace reader, which stays behind `agent.read`.
+        let send_modules = host_modules(
+            "acme.widgets".to_string(),
+            data_dir.clone(),
+            BTreeSet::from(["agent.send".to_string()]),
+            session.clone(),
+            PluginChannels::default(),
+        );
+        assert_eq!(send_modules.len(), 1);
+
         let settings_modules = host_modules(
             "acme.widgets".to_string(),
-            data_dir,
+            data_dir.clone(),
             BTreeSet::from(["storage".to_string()]),
-            session,
+            session.clone(),
+            PluginChannels::default(),
         );
         assert_eq!(settings_modules.len(), 1);
-        for module in session_modules.into_iter().chain(settings_modules) {
+
+        let command_modules = host_modules(
+            "acme.widgets".to_string(),
+            data_dir,
+            BTreeSet::from(["ui.command".to_string()]),
+            session,
+            PluginChannels::default(),
+        );
+        assert_eq!(command_modules.len(), 1);
+
+        for module in session_modules
+            .into_iter()
+            .chain(send_modules)
+            .chain(settings_modules)
+            .chain(command_modules)
+        {
             module
                 .validate()
                 .expect("the built-in host modules must be valid");
         }
+    }
+
+    #[test]
+    fn forgetting_a_plugin_drops_its_commands_and_queue() {
+        let channels = PluginChannels::default();
+        channels
+            .commands
+            .borrow_mut()
+            .entry("acme.widgets".to_string())
+            .or_default()
+            .push(RegisteredCommand {
+                plugin_id: "acme.widgets".to_string(),
+                id: "open".to_string(),
+                title: "Open".to_string(),
+            });
+        channels
+            .dispatched
+            .borrow_mut()
+            .entry("acme.widgets".to_string())
+            .or_default()
+            .push("open".to_string());
+        channels.forget("acme.widgets");
+        assert!(channels.commands.borrow().is_empty());
+        assert!(channels.dispatched.borrow().is_empty());
+    }
+
+    #[test]
+    fn run_time_commands_register_and_dispatch_once() {
+        let channels = PluginChannels::default();
+        assert!(channels.register("acme.widgets", "open", "Open"));
+        assert!(!channels.register("acme.widgets", "open", "Open again"));
+        assert_eq!(
+            channels.commands_for("acme.widgets"),
+            vec![("open".to_string(), "Open".to_string())]
+        );
+        channels
+            .dispatched
+            .borrow_mut()
+            .entry("acme.widgets".to_string())
+            .or_default()
+            .push("open".to_string());
+        assert_eq!(
+            channels.take_dispatched("acme.widgets"),
+            vec!["open".to_string()]
+        );
+        assert!(channels.take_dispatched("acme.widgets").is_empty());
     }
 
     #[test]

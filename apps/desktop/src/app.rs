@@ -10848,6 +10848,11 @@ pub struct VibexWorkbench {
     /// built-in buttons visible rather than blanking the bar before the first
     /// read answers.
     right_rail_activities: Option<Vec<PluginContribution>>,
+    /// Commands plugins registered at run time, refreshed every frame.
+    ///
+    /// The palette is built from `&self`, so the values are pulled into the
+    /// workbench before the frame's elements are.
+    plugin_runtime_commands: Vec<PluginContribution>,
     /// Group members whose parked view is being fetched.
     session_group_view_loads: BTreeSet<String>,
     session_group_view_errors: BTreeMap<String, String>,
@@ -12621,6 +12626,7 @@ impl VibexWorkbench {
             right_rail_script_title: None,
             right_rail_script_error: None,
             right_rail_activities: None,
+            plugin_runtime_commands: Vec::new(),
             session_group_view_loads: BTreeSet::new(),
             session_group_view_errors: BTreeMap::new(),
             session_group_available_width_rem: 72.0,
@@ -44950,6 +44956,13 @@ impl VibexWorkbench {
                     .title
                     .clone()
                     .unwrap_or_else(|| contribution.contribution_id.clone());
+                // The panel takes the id with `vibex.commands.take()`; the host
+                // cannot call into the script, so the queue is the hand-off.
+                crate::plugin_host::dispatch_command(
+                    cx,
+                    &contribution.plugin_id,
+                    &contribution.contribution_id,
+                );
                 self.open_script_panel(contribution.plugin_id, title, cx);
             }
             // The row's Action already ran during the same confirm; the palette
@@ -46605,6 +46618,73 @@ impl VibexWorkbench {
             return;
         }
         self.open_script_panel(plugin_id, title, cx);
+    }
+
+    /// Performs the writes plugins asked for since the last frame.
+    ///
+    /// The host records the request; the workbench, which owns the backend,
+    /// performs it. A failure is logged rather than surfaced: the script was
+    /// answered "queued", and there is no request the panel could match an
+    /// error to.
+    fn drain_plugin_actions(&mut self, cx: &mut Context<Self>) {
+        let actions = crate::plugin_host::take_pending_actions(cx);
+        if actions.is_empty() {
+            return;
+        }
+        for action in actions {
+            let crate::plugin_host::PluginAction::SendMessage {
+                plugin_id,
+                session_id,
+                text,
+            } = action;
+            let Some(backend) = self.backend.clone() else {
+                eprintln!("vibex-foundation: plugin-send-skipped no backend");
+                continue;
+            };
+            let Ok(session_id) = vibex_core::VibexSessionId::parse(session_id) else {
+                eprintln!("vibex-foundation: plugin-send-skipped bad session id");
+                continue;
+            };
+            let idempotency_key = format!(
+                "plugin-send:{}:{}",
+                plugin_id,
+                vibex_core::RequestId::new().as_str()
+            );
+            cx.spawn(async move |_, _| {
+                let outcome: Result<(), BackendError> = async {
+                    let selection = backend
+                        .agent()
+                        .runtime_selection(session_id.clone())
+                        .await?
+                        .effective;
+                    backend
+                        .agent()
+                        .send_message(
+                            MutationRequest::new(SendAgentMessageRequest {
+                                session_id,
+                                message_idempotency_key: idempotency_key.clone(),
+                                reasoning_effort: selection.reasoning_effort.clone(),
+                                desired_runtime: selection,
+                                text,
+                                attachments: Vec::new(),
+                                correlation_id: None,
+                                delivery: UserMessageDelivery::Prompt,
+                                prompt_context: None,
+                                provenance: vibex_core::MessageProvenance::HumanInput,
+                                mentions: Vec::new(),
+                            })
+                            .with_idempotency_key(idempotency_key),
+                        )
+                        .await?;
+                    Ok(())
+                }
+                .await;
+                if let Err(error) = outcome {
+                    eprintln!("vibex-foundation: plugin-send-failed code={}", error.code);
+                }
+            })
+            .detach();
+        }
     }
 
     /// Opens a plugin's panel without toggling it closed when it is already up.
@@ -75584,10 +75664,11 @@ impl VibexWorkbench {
             }
         }
 
-        if !query_empty && let Some(runtime) = &self.runtime {
-            let plugin_commands = runtime
-                .plugins()
-                .contributions()
+        if !query_empty {
+            let mut plugin_commands = self
+                .runtime
+                .as_ref()
+                .map(|runtime| runtime.plugins().contributions().unwrap_or_default())
                 .unwrap_or_default()
                 .into_iter()
                 .filter(|contribution| contribution.kind == "command" && contribution.enabled)
@@ -75600,9 +75681,25 @@ impl VibexWorkbench {
                         .contains(&query)
                         || contribution.plugin_id.to_lowercase().contains(&query)
                 })
-                .take(COMMAND_PALETTE_PLUGIN_LIMIT)
                 .map(CommandPaletteEntry::PluginCommand)
                 .collect::<Vec<_>>();
+            // Commands a plugin registered at run time sit beside the ones its
+            // manifest declared; both are dispatched to the plugin's panel.
+            plugin_commands.extend(
+                self.plugin_runtime_commands
+                    .iter()
+                    .filter(|contribution| {
+                        contribution
+                            .title
+                            .as_deref()
+                            .unwrap_or(&contribution.contribution_id)
+                            .to_lowercase()
+                            .contains(&query)
+                            || contribution.plugin_id.to_lowercase().contains(&query)
+                    })
+                    .map(|contribution| CommandPaletteEntry::PluginCommand(contribution.clone())),
+            );
+            plugin_commands.truncate(COMMAND_PALETTE_PLUGIN_LIMIT);
             if !plugin_commands.is_empty() {
                 sections.push(CommandPaletteSection {
                     heading: locale::text("Plugin commands", "插件命令", "外掛命令").into(),
@@ -96614,6 +96711,11 @@ impl Render for VibexWorkbench {
                     agent_id: session.agent_id.as_str().to_string(),
                 });
         crate::plugin_host::set_session(cx, plugin_session);
+        // Run-time commands are read here because the palette builder borrows
+        // `&self`, and writes plugins asked for are performed now that the
+        // frame has a backend in reach.
+        self.plugin_runtime_commands = crate::plugin_host::runtime_commands(cx);
+        self.drain_plugin_actions(cx);
         self.present_persistence_note(window, cx);
         self.present_settings_operation_notice(window, cx);
         self.present_runtime_registry_error(window, cx);
