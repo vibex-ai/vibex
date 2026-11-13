@@ -641,8 +641,6 @@ impl ImChannelsView {
         match kind {
             ImChannelKind::Telegram => "Telegram",
             ImChannelKind::Lark => "Lark",
-            ImChannelKind::WeCom => "WeCom",
-            ImChannelKind::WeChatPersonal => "WeChat",
         }
     }
 

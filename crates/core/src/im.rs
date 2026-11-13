@@ -1,10 +1,9 @@
 //! Contracts for IM chat channels.
 //!
-//! An IM channel connects an external messaging account (Telegram, Lark,
-//! WeCom) to one local Vibex runtime. The runtime owns the channel, its
-//! external identities, and the session bindings; the contracts here are the
-//! platform-neutral shape that the runtime, the backend facade, and the
-//! desktop settings page share.
+//! An IM channel connects an external messaging account (Telegram, Lark) to one
+//! local Vibex runtime. The runtime owns the channel, its external identities,
+//! and the session bindings; the contracts here are the platform-neutral shape
+//! that the runtime, the backend facade, and the desktop settings page share.
 
 use std::collections::BTreeMap;
 
@@ -21,10 +20,6 @@ use crate::workspace::WorkspaceMode;
 pub enum ImChannelKind {
     Telegram,
     Lark,
-    WeCom,
-    /// The non-official personal WeChat route. Compiled only behind the
-    /// `wechat-personal` feature and never enabled by default.
-    WeChatPersonal,
 }
 
 impl ImChannelKind {
@@ -32,8 +27,6 @@ impl ImChannelKind {
         match self {
             Self::Telegram => "telegram",
             Self::Lark => "lark",
-            Self::WeCom => "wecom",
-            Self::WeChatPersonal => "wechat_personal",
         }
     }
 
@@ -41,8 +34,6 @@ impl ImChannelKind {
         match value {
             "telegram" => Some(Self::Telegram),
             "lark" => Some(Self::Lark),
-            "wecom" => Some(Self::WeCom),
-            "wechat_personal" => Some(Self::WeChatPersonal),
             _ => None,
         }
     }
@@ -54,8 +45,6 @@ impl ImChannelKind {
 pub enum ImChannelConfig {
     Telegram(ImTelegramConfig),
     Lark(ImLarkConfig),
-    WeCom(ImWeComConfig),
-    WeChatPersonal(ImWeChatPersonalConfig),
 }
 
 impl ImChannelConfig {
@@ -63,8 +52,6 @@ impl ImChannelConfig {
         match self {
             Self::Telegram(_) => ImChannelKind::Telegram,
             Self::Lark(_) => ImChannelKind::Lark,
-            Self::WeCom(_) => ImChannelKind::WeCom,
-            Self::WeChatPersonal(_) => ImChannelKind::WeChatPersonal,
         }
     }
 }
@@ -96,24 +83,6 @@ pub enum ImLarkTransport {
     #[default]
     LongConnection,
     Webhook,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ImWeComConfig {
-    pub corp_id: String,
-    pub agent_id: String,
-    #[serde(default)]
-    pub chat_id: Option<String>,
-    /// Random path segment for the callback URL. This is routing metadata, not
-    /// the callback's cryptographic secret.
-    pub callback_path: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ImWeChatPersonalConfig {
-    pub base_url: String,
 }
 
 /// A serializable projection of [`SessionRuntimeSelection`].
@@ -432,8 +401,6 @@ pub struct ImPairingCodeInfo {
 pub enum ImSecretKind {
     BotToken,
     AppSecret,
-    VerificationToken,
-    EncodingAesKey,
 }
 
 impl ImSecretKind {
@@ -441,8 +408,6 @@ impl ImSecretKind {
         match self {
             Self::BotToken => "bot_token",
             Self::AppSecret => "app_secret",
-            Self::VerificationToken => "verification_token",
-            Self::EncodingAesKey => "encoding_aes_key",
         }
     }
 }

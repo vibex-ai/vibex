@@ -462,10 +462,6 @@ impl ImAdapter for LarkAdapter {
         LarkAdapter::mark_inbound(self);
     }
 
-    fn requires_group_mention(&self) -> bool {
-        false
-    }
-
     async fn create_thread(&self, _title: &str) -> ImResult<ImThreadTarget> {
         Err(ImError::Unsupported)
     }

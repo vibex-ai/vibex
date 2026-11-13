@@ -86000,8 +86000,6 @@ fn settings_section_for_query(query: &str) -> Option<SettingsSection> {
         "telegram",
         "lark",
         "feishu",
-        "wechat",
-        "wecom",
         "bot",
         "channel",
         "频道",
@@ -86010,8 +86008,6 @@ fn settings_section_for_query(query: &str) -> Option<SettingsSection> {
         "機器人",
         "飞书",
         "飛書",
-        "企业微信",
-        "企業微信",
     ]) {
         Some(SettingsSection::Channels)
     } else if matches(&[
@@ -86780,8 +86776,6 @@ fn settings_search_candidates(strings: &'static Strings) -> Vec<SettingsSearchCa
                 "telegram",
                 "lark",
                 "feishu",
-                "wechat",
-                "wecom",
                 "bot",
                 "channel",
                 "频道",
@@ -86790,8 +86784,6 @@ fn settings_search_candidates(strings: &'static Strings) -> Vec<SettingsSearchCa
                 "機器人",
                 "飞书",
                 "飛書",
-                "企业微信",
-                "企業微信",
             ],
         ),
         settings_search_candidate(
