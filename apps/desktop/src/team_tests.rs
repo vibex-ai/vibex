@@ -3662,14 +3662,15 @@ fn a_group_pane_draws_a_terminal_session_as_a_terminal(cx: &mut TestAppContext) 
     );
 }
 
-/// Asking to tune a collaborator puts the caret on its chip.
+/// Picking a collaborator puts the caret where its chip is, which is the whole
+/// entry point to tuning it.
 ///
-/// This is the whole entry point: the runtime controls follow the caret, so
-/// landing the caret on the chip is what makes them that collaborator's. A draft
-/// that does not name the Agent yet gets the chip inserted, which is the same
-/// gesture as picking it from the `@` popup.
+/// There is no separate control for this any more: the row is the choice, and
+/// the caret landing on the chip is what turns the composer's own runtime
+/// controls into that collaborator's. This pins the mechanism the row relies on,
+/// so removing the pencil did not also remove the way in.
 #[gpui::test]
-async fn tuning_a_collaborator_puts_the_caret_on_its_chip(cx: &mut TestAppContext) {
+async fn picking_a_collaborator_lands_the_caret_on_its_chip(cx: &mut TestAppContext) {
     let (workbench, cx, _) = fixture(cx, 1);
     let agent_id = AgentId::parse("claude").expect("agent id");
     let reference = VibexUseRef::runtime_option("option_claude");
@@ -3687,12 +3688,17 @@ async fn tuning_a_collaborator_puts_the_caret_on_its_chip(cx: &mut TestAppContex
                     .replace_range_with_token(0.."@Claude".len(), token, window, cx)
                     .expect("the token replaces its label");
             });
-
-            workbench.tune_delegation_chip(&agent_id, window, cx);
+            // What inserting a chip does: leave the caret just past it. The
+            // subject rule accepts that one-byte adjacency, so the chip is
+            // tunable the moment it appears.
+            let end = input.read(cx).tokens()[0].range().end;
+            input.update(cx, |input, cx| {
+                input.set_selected_range(end..end, cx);
+            });
 
             let subject = workbench
                 .composer_delegation_subject(cx)
-                .expect("the caret must land on the chip it tunes");
+                .expect("a freshly inserted chip must be the subject");
             assert_eq!(subject.agent_id.as_ref(), Some(&agent_id));
             assert_eq!(subject.reference, reference);
         });

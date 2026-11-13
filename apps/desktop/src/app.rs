@@ -193,11 +193,11 @@ use vibex_desktop_model::{
 };
 use vibex_desktop_runtime::DriverState;
 use vibex_desktop_runtime::{
-    AuthoritativeRefetch, COMPOSER_AGENT_REFERENCE_KEY, DesktopEvent, DesktopEventStream,
-    DesktopRuntime, DesktopRuntimeConfig, DesktopRuntimeFacade, DesktopRuntimeMode,
-    LocalClientsSnapshot, PREVIEW_APP_ID, ProviderConfigChangePhase, RC_APP_ID,
-    STABLE_DESKTOP_APP_ID, SessionGroupPresentationRequest, SidebarOrganizationRequest,
-    StorageCleanupKind, StorageCleanupReport, runtime_option_ref, validate_external_open_url,
+    AuthoritativeRefetch, DesktopEvent, DesktopEventStream, DesktopRuntime, DesktopRuntimeConfig,
+    DesktopRuntimeFacade, DesktopRuntimeMode, LocalClientsSnapshot, PREVIEW_APP_ID,
+    ProviderConfigChangePhase, RC_APP_ID, STABLE_DESKTOP_APP_ID, SessionGroupPresentationRequest,
+    SidebarOrganizationRequest, StorageCleanupKind, StorageCleanupReport, runtime_option_ref,
+    validate_external_open_url,
 };
 use vibex_ui::{
     AgentFileGitController, ElicitationFormDraft, GpuiThemeMode, ManagementWorkflowCapabilities,
@@ -1310,7 +1310,6 @@ const COMPOSER_SUGGESTION_MAX_ROWS: usize = 50;
 ///
 /// These rows never travel to the authority: they are the second layer of the
 /// `@` popup, built from the catalogue this client already holds.
-const COMPOSER_DELEGATION_EDIT_AGENT_KEY: &str = "vibexUseDelegationEditAgent";
 const NEW_SESSION_RUNTIME_MENU_MAX_HEIGHT: f32 = 360.0;
 const NEW_SESSION_RUNTIME_MENU_MIN_HEIGHT: f32 = 104.0;
 const RUNTIME_MENU_VIEWPORT_MARGIN: f32 = 12.0;
@@ -1871,30 +1870,6 @@ fn split_mention_suggestions(
     (delegation_suggestions(collaborators), conversations)
 }
 
-/// The Agent id one delegation row names.
-///
-/// A row from the authority carries the reference metadata; a client-built
-/// configuration row names its Agent under the edit key. The id shape is the
-/// last resort so an older paired authority still resolves.
-fn delegation_agent_id(entry: &AgentCommandEntry) -> Option<AgentId> {
-    entry
-        .metadata
-        .iter()
-        .find(|metadata| {
-            metadata.key == COMPOSER_AGENT_REFERENCE_KEY
-                || metadata.key == COMPOSER_DELEGATION_EDIT_AGENT_KEY
-        })
-        .and_then(|metadata| AgentId::parse(&metadata.value).ok())
-        .or_else(|| {
-            entry
-                .id
-                .strip_prefix("reference:agent:")
-                .or_else(|| entry.id.strip_prefix("delegate-now:"))
-                .and_then(|rest| rest.split(':').next())
-                .and_then(|id| AgentId::parse(id).ok())
-        })
-}
-
 /// One row of the composer's `/` popup, without the app-specific handlers the
 /// caller attaches.
 ///
@@ -1919,25 +1894,25 @@ fn composer_suggestion_row(
     theme: &Theme,
 ) -> Stateful<Div> {
     let agent_row = agent_identity.is_some();
-    let agent_copy = agent_row
-        .then(|| composer_suggestion_description(entry))
-        .flatten();
     let display_label = entry.label.trim_start_matches(['/', '$', '@']).to_string();
     let description = if agent_row {
         None
     } else {
         composer_suggestion_description(entry)
     };
-    let source_label = agent_copy.clone().unwrap_or_else(|| {
-        if agent_row {
-            "Agent".to_string()
-        } else {
-            command_source_label(entry.source_kind).to_string()
-        }
-    });
+    // A collaborator row is the choice of *who*, not *what they will run on*.
+    // The configuration belongs to the chip the row inserts: picking the row
+    // puts the caret on that chip, and the composer's own controls then show —
+    // and change — the provider, model, depth and mode. Printing a provider and
+    // model here would describe a configuration the reader has not chosen yet,
+    // and would go stale the moment they tune the chip.
+    let source_label = if agent_row {
+        "Agent".to_string()
+    } else {
+        command_source_label(entry.source_kind).to_string()
+    };
     let aria_label = description
         .as_ref()
-        .or(agent_copy.as_ref())
         .map(|description| format!("{display_label}, {description}"))
         .unwrap_or_else(|| display_label.clone());
 
@@ -66236,105 +66211,6 @@ impl VibexWorkbench {
             .collect()
     }
 
-    /// The pencil that opens one collaborator's configuration picker.
-    ///
-    /// It sits between the provider/model copy and the `Mention | Delegate`
-    /// halves: the copy says which configuration the row carries, and this is
-    /// the way to change it. The click is swallowed before the row's own
-    /// mention action can fire.
-    fn composer_delegation_edit_button(
-        &self,
-        target: ComposerTarget,
-        entry: &AgentCommandEntry,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let Some(agent_id) = delegation_agent_id(entry) else {
-            return Empty.into_any_element();
-        };
-        Button::new(format!(
-            "composer-delegation-edit:{}:{}",
-            target.id(),
-            entry.id
-        ))
-        .xsmall()
-        .ghost()
-        .compact()
-        .size(px(24.0))
-        .icon(Icon::default().path("icons/vibex/pencil.svg"))
-        .tooltip(locale::text(
-            "Change provider and model",
-            "修改供应商配置与模型",
-            "修改供應商設定與模型",
-        ))
-        .on_mouse_down(MouseButton::Left, |_, window, cx| {
-            window.prevent_default();
-            cx.stop_propagation();
-        })
-        .on_click(cx.listener(move |this, _, window, cx| {
-            cx.stop_propagation();
-            this.tune_delegation_chip(&agent_id, window, cx);
-        }))
-        .into_any_element()
-    }
-
-    /// Puts the caret on one collaborator's chip so the runtime controls edit it.
-    ///
-    /// This replaces a separate panel that listed every Agent × provider × model
-    /// combination: the composer already has the controls that change provider,
-    /// model, depth, mode and features, and they already sit beside the draft
-    /// the reader is writing. Reusing them keeps one place to look, scales to
-    /// any number of Agents, and means the chip — not a side table — is what
-    /// remembers the choice.
-    ///
-    /// A draft that does not name this Agent yet gets the chip inserted at the
-    /// caret, which is the same gesture as picking it from the popup.
-    fn tune_delegation_chip(
-        &mut self,
-        agent_id: &AgentId,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(input) = self.input_for_composer_target(ComposerTarget::Session) else {
-            return;
-        };
-        let existing = input.read(cx).tokens().iter().find_map(|span| {
-            let mention = VibexUseMention::parse(span.token().id().as_ref())?;
-            (mention.kind == vibex_core::VibexUseMentionKind::Agent
-                && mention.agent_id.as_ref() == Some(agent_id))
-            .then(|| span.range())
-        });
-        if let Some(range) = existing {
-            input.update(cx, |input, cx| {
-                let end = range.end;
-                input.set_selected_range(end..end, cx);
-                input.focus(window, cx);
-            });
-            self.clear_suggestions();
-            cx.notify();
-            return;
-        }
-        let Some(entry) = self
-            .delegation_suggestions
-            .iter()
-            .find(|entry| delegation_agent_id(entry).as_ref() == Some(agent_id))
-            .cloned()
-        else {
-            return;
-        };
-        // No chip yet: insert it where the reader is typing, exactly as the
-        // popup would, and leave the caret after it so the controls take over.
-        let value = input.read(cx).value().to_string();
-        let selection = input.read(cx).selected_range();
-        let range = character_offset_to_byte(&value, selection.start)
-            ..character_offset_to_byte(&value, selection.end);
-        input.update(cx, |input, cx| {
-            replace_composer_trigger(input, &entry, range, window, cx);
-            input.focus(window, cx);
-        });
-        self.clear_suggestions();
-        cx.notify();
-    }
-
     /// The `Mention | Delegate` half of one collaborator row.
     ///
     /// The row itself is the reference; this control owns the direct hand-off.
@@ -74514,12 +74390,16 @@ impl VibexWorkbench {
                 let agent_row = target == ComposerTarget::Session
                     && active_tab == ComposerSuggestionTab::Delegation
                     && composer_suggestion_is_agent(&entry);
+                // The row offers the two halves of the choice and nothing else.
+                // Picking the Agent already puts the caret on its chip, which is
+                // what turns the composer's own controls into that
+                // collaborator's; a pencil beside the row repeated that gesture
+                // and, worse, implied the row was where the configuration lived.
                 let trailing = agent_row.then(|| {
                     h_flex()
                         .flex_none()
                         .items_center()
                         .gap_1()
-                        .child(self.composer_delegation_edit_button(target, &entry, cx))
                         .child(self.composer_delegation_action_control(
                             target,
                             &entry,
