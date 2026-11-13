@@ -612,9 +612,18 @@ impl VibexUseService {
             .unwrap_or_else(|| serde_json::json!({}));
         let session = request.existing_session_id.as_ref().map(|id| serde_json::json!({"kind": "existing", "sessionRef": VibexUseRef::session(id).as_uri()})).unwrap_or_else(|| serde_json::json!({"kind": "new"}));
         let context: Vec<_> = request.context_refs.iter().map(|reference| serde_json::json!({"sessionRef": VibexUseRef::session(&reference.session_id).as_uri(), "fromSequence": reference.from_sequence, "throughSequence": reference.through_sequence})).collect();
-        let args = serde_json::json!({"idempotencyKey": human_key(&granted_by, &key), "target": target, "session": session,
+        let mut args = serde_json::json!({"idempotencyKey": human_key(&granted_by, &key), "target": target, "session": session,
             "task": {"prompt": request.task, "title": request.title, "acceptanceCriteria": request.acceptance_criteria, "completionPolicy": request.completion_policy},
             "attachments": request.attachments, "context": context, "mentions": request.mentions});
+        // The composer already resolved the row the reader clicked. Binding it
+        // again to the newest user message would let an older mention override
+        // that explicit choice.
+        if let Some(object) = args.as_object_mut() {
+            object.insert(
+                HUMAN_DIRECT_DELEGATION.to_string(),
+                serde_json::Value::Bool(true),
+            );
+        }
         let value = self.call(actor, VibexUseTool::Delegate, args).await?;
         let operation_ref = value
             .get("operationRef")

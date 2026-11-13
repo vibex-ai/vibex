@@ -1227,6 +1227,46 @@ impl ProviderConfigService {
         )))
     }
 
+    /// The provider key an Agent's projected model ids are namespaced under.
+    ///
+    /// pi's adapter addresses a model as `<provider>/<id>` and reads the first
+    /// path segment as the provider. A Model the binding's projection does not
+    /// carry — a selection that survived a Model edit — would otherwise travel
+    /// bare and pi would resolve it against the wrong provider, or reject it
+    /// when the id itself contains a `/`. Returning the namespace lets the
+    /// runtime qualify such an id.
+    pub fn legacy_agent_provider_model_id_namespace(
+        &self,
+        provider_profile_id: &vibex_core::ProviderProfileId,
+    ) -> VibexResult<Option<String>> {
+        let conn = self.open_connection()?;
+        let Some(binding) =
+            AgentModelProviderBindingRepository::get_by_legacy_profile(&conn, provider_profile_id)?
+        else {
+            return Ok(None);
+        };
+        let (provider, _, _, descriptor) = load_projection_input(&conn, &binding.id)?;
+        if !matches!(
+            descriptor.provider_control,
+            AgentProviderControl::ManagedConfigOverlay {
+                strategy: ConfigOverlayStrategy::PiModelsJson
+            }
+        ) && !matches!(
+            descriptor.model_control,
+            AgentModelControl::ManagedConfigOverlay {
+                strategy: ConfigOverlayStrategy::PiModelsJson
+            }
+        ) {
+            return Ok(None);
+        }
+        Ok(Some(sanitize_provider_id(
+            provider
+                .vendor_hint
+                .as_deref()
+                .unwrap_or_else(|| provider.id.as_str()),
+        )))
+    }
+
     pub fn plan_legacy_agent_provider_projection(
         &self,
         provider_profile_id: &vibex_core::ProviderProfileId,
@@ -1816,16 +1856,28 @@ fn project_provider_control(
                 && let Some(catalog) = codex_model_catalog_overlay(provider, binding)?
             {
                 // The catalogue is what turns a declared thinking depth into a
-                // control: codex-acp publishes `reasoning_effort` only when
-                // `model/list` reports levels for the selected Model, and the
-                // bundled catalogue knows no Provider alias id.
-                targets.push(ProjectionTargetPreview {
-                    field: "reasoningEfforts".to_string(),
-                    target_kind: ProjectionTargetKind::ManagedOverlay,
-                    target: catalog.relative_path.clone(),
-                    value_preview: "declared thinking depth".to_string(),
-                    secret: false,
-                });
+                // control and carries a declared context window: codex-acp
+                // publishes `reasoning_effort` only when `model/list` reports
+                // levels for the selected Model, and the bundled catalogue
+                // knows no Provider alias id.
+                if codex_projects_reasoning_efforts(provider, binding) {
+                    targets.push(ProjectionTargetPreview {
+                        field: "reasoningEfforts".to_string(),
+                        target_kind: ProjectionTargetKind::ManagedOverlay,
+                        target: catalog.relative_path.clone(),
+                        value_preview: "declared thinking depth".to_string(),
+                        secret: false,
+                    });
+                }
+                if codex_projects_context_window(provider, binding) {
+                    targets.push(ProjectionTargetPreview {
+                        field: "contextTokens".to_string(),
+                        target_kind: ProjectionTargetKind::ManagedOverlay,
+                        target: catalog.relative_path.clone(),
+                        value_preview: "declared context window".to_string(),
+                        secret: false,
+                    });
+                }
                 overlays.push(catalog);
             }
             if *strategy == ConfigOverlayStrategy::DeepseekHarnessSettingsYaml {
@@ -2907,12 +2959,8 @@ fn codex_overlay(
     format!("{}\n", lines.join("\n"))
 }
 
-/// True when the binding projects a catalogue of its own.
-///
-/// A profile where no Model declares a thinking depth keeps the bundled
-/// catalogue byte-for-byte: it has nothing to add, and `config.toml` must not
-/// start pointing at a file that would repeat the bundled answer.
-fn codex_projects_model_catalog(
+/// True when any enabled Model of the binding declares a thinking depth.
+fn codex_projects_reasoning_efforts(
     provider: &ModelProviderProfile,
     binding: &AgentModelProviderBinding,
 ) -> bool {
@@ -2926,7 +2974,37 @@ fn codex_projects_model_catalog(
         })
 }
 
-/// The catalogue Codex answers `model/list` from, when a Model declares levels.
+/// True when any enabled Model of the binding declares a context window.
+fn codex_projects_context_window(
+    provider: &ModelProviderProfile,
+    binding: &AgentModelProviderBinding,
+) -> bool {
+    binding
+        .configured_models
+        .iter()
+        .filter(|model| model.enabled)
+        .any(|model| {
+            codex_configured_model(provider, model)
+                .is_some_and(|configured| configured.capabilities.context_tokens.is_some())
+        })
+}
+
+/// True when the binding projects a catalogue of its own.
+///
+/// A profile where no Model declares metadata the bundled catalogue cannot
+/// express — a thinking depth or a context window — keeps the bundled
+/// catalogue byte-for-byte: it has nothing to add, and `config.toml` must not
+/// start pointing at a file that would repeat the bundled answer.
+fn codex_projects_model_catalog(
+    provider: &ModelProviderProfile,
+    binding: &AgentModelProviderBinding,
+) -> bool {
+    codex_projects_reasoning_efforts(provider, binding)
+        || codex_projects_context_window(provider, binding)
+}
+
+/// The catalogue Codex answers `model/list` from, when a Model declares
+/// metadata the bundled catalogue cannot express.
 ///
 /// The reasoning-effort control is derived from `model/list` alone, and Codex
 /// answers that from its bundled catalogue: OpenAI's own model ids, with no
@@ -2934,6 +3012,10 @@ fn codex_projects_model_catalog(
 /// therefore reported no supported levels, codex-acp never published the
 /// `reasoning_effort` option, and `session/set_config_option` had nothing to
 /// apply. Projecting this file makes the Model's declared levels the answer.
+///
+/// The same entry carries a declared context window. Without the catalogue
+/// Codex answers from its bundled entry and reports that entry's window — and
+/// its `effective_context_window_percent` — instead of the declaration.
 ///
 /// The file *replaces* the bundled catalogue instead of extending it, so every
 /// enabled Model of the binding is listed: an omitted Provider id would fall
@@ -5372,13 +5454,13 @@ fn pi_overlay(
     model: Option<&AgentConfiguredModelBinding>,
     secret_env_key: &str,
 ) -> VibexResult<String> {
-    let model_id = projection_model_id(model).unwrap_or("vibex-model");
     let provider_id = sanitize_provider_id(
         provider
             .vendor_hint
             .as_deref()
             .unwrap_or_else(|| provider.id.as_str()),
     );
+    let model_id = pi_registry_model_id(&provider_id, model);
     let mut entry = serde_json::Map::new();
     json_string_if_present(
         &mut entry,
@@ -5397,13 +5479,13 @@ fn pi_overlay(
 
     let group = overlay_model_group(binding, model, |model| pi_api_kind(Some(model)));
     let models: Vec<serde_json::Value> = if group.is_empty() {
-        vec![pi_model_registry_entry(provider, model, model_id)]
+        vec![pi_model_registry_entry(provider, model, &model_id)]
     } else {
         group
             .iter()
             .map(|model_binding| {
-                let model_id = projection_model_id(Some(model_binding)).unwrap_or("vibex-model");
-                pi_model_registry_entry(provider, Some(model_binding), model_id)
+                let model_id = pi_registry_model_id(&provider_id, Some(model_binding));
+                pi_model_registry_entry(provider, Some(model_binding), &model_id)
             })
             .collect()
     };
@@ -5411,6 +5493,21 @@ fn pi_overlay(
     serialized_json(serde_json::json!({
         "providers": {provider_id: entry},
     }))
+}
+
+/// The model id pi's `models.json` registers for a Provider Profile.
+///
+/// pi's ACP adapter addresses a model as `<provider>/<id>`, so the registry
+/// entry stays unqualified. Stripping the prefix here keeps the entry and the
+/// ACP option id the projection sends in one vocabulary: a product id that
+/// already spells the provider would otherwise be read back as
+/// `<provider>/<provider>/<id>` while the wire form is `<provider>/<id>`.
+fn pi_registry_model_id(provider_id: &str, model: Option<&AgentConfiguredModelBinding>) -> String {
+    let model_id = projection_model_id(model).unwrap_or("vibex-model");
+    model_id
+        .strip_prefix(&format!("{provider_id}/"))
+        .unwrap_or(model_id)
+        .to_string()
 }
 
 fn pi_model_reasoning(
@@ -7749,12 +7846,12 @@ mod tests {
     /// model ids only. An alias id therefore reported no supported levels,
     /// codex-acp never published the control, and a reader had nothing to pick.
     #[test]
-    fn codex_projects_a_model_catalog_only_when_a_model_declares_a_thinking_depth() {
+    fn codex_projects_a_model_catalog_when_a_model_declares_a_thinking_depth() {
         let descriptor = provider_descriptor("codex");
         let (mut provider, runtime, binding) = typed_projection_fixture(&descriptor);
 
-        // Undeclared: the bundled catalogue stands, and `config.toml` must not
-        // point at a file that would only repeat it.
+        // No catalogue metadata: the bundled catalogue stands, and
+        // `config.toml` must not point at a file that would only repeat it.
         let plain = AgentProviderProjectionEngine::plan(
             &provider,
             &runtime,
@@ -7859,6 +7956,57 @@ mod tests {
                 "a projected catalogue entry needs {key}"
             );
         }
+    }
+
+    /// A declared context window alone still needs the catalogue.
+    ///
+    /// Codex answers `model/list` from its bundled catalogue, which carries
+    /// the window of its own model ids — `gpt-6-astra` is 272,000 tokens with
+    /// `effective_context_window_percent: 95`, so a session reports 258,400.
+    /// A Provider Model that declares a window but no thinking depth must not
+    /// fall back to that metadata: the declaration is catalogue metadata, not
+    /// a reasoning-only concern.
+    #[test]
+    fn codex_catalog_projects_a_declared_context_window_without_a_thinking_depth() {
+        let descriptor = provider_descriptor("codex");
+        let (mut provider, runtime, binding) = typed_projection_fixture(&descriptor);
+        provider.configured_models[0].capabilities.context_tokens = Some(1_000_000);
+
+        let plan = AgentProviderProjectionEngine::plan(
+            &provider,
+            &runtime,
+            &binding,
+            &descriptor,
+            "codex-context-catalog",
+        )
+        .unwrap();
+        assert_eq!(
+            plan.overlay_files.len(),
+            2,
+            "a declared context window has to project a catalogue"
+        );
+        let config: toml::Value = toml::from_str(&plan.overlay_files[0].content).unwrap();
+        assert_eq!(
+            config["model_catalog_json"].as_str(),
+            Some("vibex-models.json"),
+            "Codex only reads a catalogue `config.toml` names"
+        );
+        assert!(
+            plan.preview.targets.iter().any(|target| {
+                target.field == "contextTokens" && target.target == "vibex-models.json"
+            }),
+            "the editor reports where the declared window is projected"
+        );
+        let catalog: serde_json::Value =
+            serde_json::from_str(&plan.overlay_files[1].content).unwrap();
+        let model = &catalog["models"][0];
+        assert_eq!(model["slug"], "agent-model");
+        assert_eq!(model["context_window"], 1_000_000);
+        assert_eq!(model["max_context_window"], 1_000_000);
+        // The catalogue replaces the bundled one; a Model with no declared
+        // depth honestly offers none rather than inheriting bundled levels.
+        assert_eq!(model["supported_reasoning_levels"], serde_json::json!([]));
+        assert!(model.get("default_reasoning_level").is_none());
     }
 
     /// A catalogue replaces the bundled one, so it cannot omit a Model.
@@ -9452,6 +9600,28 @@ mod tests {
             projected_runtime_model_id(&provider, &descriptor, &prequalified),
             "fake/model-a"
         );
+    }
+
+    #[test]
+    fn pi_overlay_entry_ids_are_not_provider_qualified() {
+        let (provider, _, mut binding, _) = fixture(ConfigOverlayStrategy::PiModelsJson);
+        let endpoint = provider.endpoints.first().cloned().unwrap();
+        binding.configured_models[0].agent_model_id = "fake/model-a".to_string();
+
+        let content = pi_overlay(
+            &provider,
+            &binding,
+            Some(&endpoint),
+            binding.configured_models.first(),
+            "PI_API_KEY",
+        )
+        .unwrap();
+        let overlay: serde_json::Value = serde_json::from_str(&content).unwrap();
+        // pi's adapter addresses the model as `fake/model-a`, matching the ACP
+        // projection; an entry that kept the prefix would be reported back as
+        // `fake/fake/model-a`.
+        assert_eq!(overlay["providers"]["fake"]["models"][0]["id"], "model-a");
+        assert_eq!(overlay["providers"]["fake"]["models"][0]["name"], "model-a");
     }
 
     #[test]

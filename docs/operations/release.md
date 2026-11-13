@@ -26,10 +26,10 @@ or unverified source identity.
 
 The tag-triggered GitHub Actions release uses standard GitHub-hosted runners and
 keeps one native job per desktop platform and architecture. Linux x86_64
-produces the reviewed PDFium backed `.deb` and AppImage; Linux aarch64 produces
-a `.deb` cross-built on the x86_64 runner; macOS produces `.dmg` images for
-aarch64 and x86_64 on the arm64 `macos-15` image; Windows produces NSIS
-installers for x86_64 and aarch64.
+produces the reviewed PDFium backed `.deb`, AppImage, and `.rpm`; Linux aarch64
+produces a `.deb` and `.rpm` cross-built on the x86_64 runner; macOS produces
+`.dmg` images for aarch64 and x86_64 on the arm64 `macos-15` image; Windows
+produces NSIS installers for x86_64 and aarch64.
 Each job normalizes its filenames, writes SHA-256 sidecars, and uploads an
 immutable artifact. A final Ubuntu job collects the matrix before creating the
 GitHub Release, so a partial platform build can never be published.
@@ -44,9 +44,15 @@ AppImage packaging stays x86_64-only: the AppImage tooling (linuxdeploy) cannot
 process cross-architecture binaries, so an aarch64 AppImage would require a
 qemu binfmt compatibility layer that is not acceptable for release artifacts.
 
+RPM packaging repacks the already reviewed `.deb` payload with `rpmbuild`; it
+therefore covers both architectures and ships the same embedded PDFium runtime
+on x86_64. The packaging host needs `rpmbuild` (`rpm` on Debian/Ubuntu,
+`rpm-tools` on Arch). See
+[Linux rpm Packaging Rules](./release-packaging-matrix.md#linux-rpm-packaging-rules).
+
 The PDFium distribution approval covers linux-x86_64 only. The Linux aarch64
-deb and the macOS and Windows packages are built and packaged without the
-embedded PDFium runtime until their native runtime review completes.
+deb and rpm, and the macOS and Windows packages, are built and packaged without
+the embedded PDFium runtime until their native runtime review completes.
 
 Each macOS app bundle is ad-hoc signed before it is packed into the dmg, and the
 job reads the signature back from the dmg before uploading it; see

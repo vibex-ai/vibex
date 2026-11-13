@@ -37,12 +37,13 @@ use vibex_core::{
     VIBEX_USE_MAX_LIVE_PANES, VIBEX_USE_MAX_READ_CHARS, VIBEX_USE_MAX_READ_ITEMS,
     VIBEX_USE_MAX_WAIT_MS, VIBEX_USE_SUMMARY_CHARS, VIBEX_USE_TITLE_CHARS, VibexError,
     VibexExecutionId, VibexOperationId, VibexResult, VibexSessionId, VibexUseActor,
-    VibexUseCapabilitySnapshot, VibexUseDelivery, VibexUseGroupSummary, VibexUseOperation,
-    VibexUseOperationResource, VibexUseOperationState, VibexUsePresentationCapability, VibexUseRef,
-    VibexUseResourceKind, VibexUseRuntimeOption, VibexUseScope, VibexUseSessionSummary,
-    VibexUseTool, VibexUseToolDefinition, VibexUseToolFuture, VibexUseToolHost,
-    VibexUseUnavailableReason, VibexUseWorkspaceOption, WaitOutcome, WaitResponse, WorkspaceRecord,
-    bounded_chars, unix_timestamp_ms, vibex_use_codes as use_codes,
+    VibexUseCapabilitySnapshot, VibexUseDelivery, VibexUseGroupSummary, VibexUseMention,
+    VibexUseMentionKind, VibexUseOperation, VibexUseOperationResource, VibexUseOperationState,
+    VibexUsePresentationCapability, VibexUseRef, VibexUseResourceKind, VibexUseRuntimeOption,
+    VibexUseScope, VibexUseSessionSummary, VibexUseTool, VibexUseToolDefinition,
+    VibexUseToolFuture, VibexUseToolHost, VibexUseUnavailableReason, VibexUseWorkspaceOption,
+    WaitOutcome, WaitResponse, WorkspaceRecord, bounded_chars, unix_timestamp_ms,
+    vibex_use_codes as use_codes,
 };
 use vibex_db::{
     AgentDelegationRepository, AgentSessionRuntimeRepository, DbConnection, ElicitationRepository,
@@ -75,6 +76,15 @@ pub const LOCAL_AUTHORITY: &str = "local";
 /// process. The wait itself is notification-driven; this keeps a missed
 /// in-process signal from turning into a silent timeout.
 const WAIT_FALLBACK_POLL: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Internal argument marking a delegation the human started from the composer's
+/// own Delegate action.
+///
+/// That action already resolved and displayed one exact `selectionRef`; binding
+/// it again to the newest user message would let an older mention override the
+/// row the reader just clicked. The marker never comes from a model-facing tool
+/// schema, so an Agent has no reason to send it.
+pub(crate) const HUMAN_DIRECT_DELEGATION: &str = "humanDirectDelegation";
 
 pub struct VibexUseService {
     db_path: PathBuf,
@@ -1328,8 +1338,11 @@ impl VibexUseService {
                 })?
                 .safety
         };
+        // Creating a session is the other way an Agent starts a child runtime,
+        // so it answers to the same user-facing promise: the collaborator and
+        // configuration the composer showed is the one this session runs.
         let selection = self
-            .operation_selection(&operation, actor, arguments)
+            .operation_selection(&operation, actor, arguments, true)
             .await?;
         // A session created with a first message takes the same declared
         // context a delegation would: creating a session and delegating work
@@ -1524,7 +1537,10 @@ impl VibexUseService {
             )?;
             return Err(error);
         }
-        let selection = match self.operation_selection(&operation, actor, arguments).await {
+        let selection = match self
+            .operation_selection(&operation, actor, arguments, true)
+            .await
+        {
             Ok(selection) => selection,
             Err(error) => {
                 self.settle_operation(
@@ -2752,16 +2768,36 @@ impl VibexUseService {
 
     /// Resolves the runtime a new task should start on.
     ///
+    /// `bind_human_mentions` makes a delegation obey the collaborator the user
+    /// addressed in the turn that is running. An Agent may otherwise choose any
+    /// catalogue entry it likes, and the target it sends is the only thing the
+    /// authority would see; binding the newest user message's Agent mention here
+    /// is what keeps the child session on the provider and model the composer
+    /// showed. A direct human delegation carries its own exact reference and
+    /// skips the binding.
+    ///
     /// It deliberately owns no connection: a check that needs the database
     /// opens one for the synchronous part only, so this future stays `Send`.
     async fn resolve_selection(
         &self,
         actor: &VibexUseActor,
         arguments: &serde_json::Value,
+        bind_human_mentions: bool,
     ) -> VibexResult<SessionRuntimeSelection> {
         let target = arguments.get("target").cloned().unwrap_or_default();
-        let selection_ref = optional_string(&target, "selectionRef", 512)
+        let mut selection_ref = optional_string(&target, "selectionRef", 512)
             .or_else(|| optional_string(arguments, "selectionRef", 512));
+        let mut bound_mention = false;
+        if bind_human_mentions && !optional_bool(arguments, HUMAN_DIRECT_DELEGATION, false) {
+            let conn = self.open()?;
+            let mentions = latest_agent_mentions(&conn, &actor.session_id)?;
+            if let Some(reference) =
+                bound_mention_target(&mentions, &target, selection_ref.as_deref())?
+            {
+                selection_ref = Some(reference.as_uri());
+                bound_mention = true;
+            }
+        }
         let Some(selection_ref) = selection_ref else {
             // No explicit option: the caller may still have named an Agent and
             // a configuration. That is a *typed* selection, so it resolves
@@ -2833,7 +2869,21 @@ impl VibexUseService {
             )
             .with_diagnostic("reason", reason.as_str()));
         }
-        selection::select_option(option, &target)?.ok_or_else(|| {
+        let selected = selection::select_option(option, &target)?;
+        if bound_mention {
+            // The user's own row is the answer, not a starting point for the
+            // caller to overrule. A field that disagrees with it is a conflict;
+            // a field that merely restates it is allowed, but the exact option
+            // still wins so mode, effort and feature values cannot drift.
+            if selected.is_none() {
+                return Err(VibexError::validation(
+                    use_codes::TARGET_MISMATCH,
+                    "the delegation target conflicts with the collaborator and configuration the user addressed",
+                ));
+            }
+            return Ok(option.selection.clone());
+        }
+        selected.ok_or_else(|| {
             VibexError::validation(
                 use_codes::TARGET_UNAVAILABLE,
                 "target fields conflict with selectionRef",
@@ -4494,6 +4544,89 @@ impl VibexUseToolHost for VibexUseService {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// The Agent mentions carried by the newest user message of `session_id`.
+///
+/// The newest user message is the turn that is running: the authority appends
+/// it before the provider is prompted, and queued messages are appended only
+/// when their own turn begins. A session mention is not a delegation target and
+/// is ignored here.
+fn latest_agent_mentions(
+    conn: &DbConnection,
+    session_id: &VibexSessionId,
+) -> VibexResult<Vec<VibexUseMention>> {
+    let Some(message) = TimelineRepository::latest_user_message(conn, session_id)? else {
+        return Ok(Vec::new());
+    };
+    Ok(message
+        .mentions
+        .into_iter()
+        .filter(|mention| {
+            mention.kind == VibexUseMentionKind::Agent
+                && mention.agent_id.is_some()
+                && mention.reference.kind == VibexUseResourceKind::RuntimeOption
+        })
+        .collect())
+}
+
+/// The reference a user's Agent mention binds one delegation to.
+///
+/// `None` means the newest user message addressed no collaborator, so the
+/// caller's own target stands. A runtime option the user did not mention is a
+/// conflict, not a fallback: silently choosing it is exactly the behaviour that
+/// let the child session run a different provider or model than the composer
+/// displayed.
+fn bound_mention_target(
+    mentions: &[VibexUseMention],
+    target: &serde_json::Value,
+    selection_ref: Option<&str>,
+) -> VibexResult<Option<VibexUseRef>> {
+    if mentions.is_empty() {
+        return Ok(None);
+    }
+    if let Some(value) = selection_ref {
+        let Some(reference) = VibexUseRef::parse(value) else {
+            // A malformed reference is the normal resolver's error to report.
+            return Ok(None);
+        };
+        if reference.kind != VibexUseResourceKind::RuntimeOption {
+            return Ok(None);
+        }
+        return if mentions
+            .iter()
+            .any(|mention| mention.reference == reference)
+        {
+            Ok(Some(reference))
+        } else {
+            Err(VibexError::validation(
+                use_codes::TARGET_MISMATCH,
+                "the delegation target does not match the collaborator the user addressed; use the selectionRef carried by the user's mention",
+            ))
+        };
+    }
+    // No explicit option: one mention is unambiguous. Several mentions need the
+    // caller to name which one it is delegating to, unless its agent id narrows
+    // the choice to exactly one of them.
+    if mentions.len() == 1 {
+        return Ok(Some(mentions[0].reference.clone()));
+    }
+    let target_agent = target
+        .get("agentId")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| AgentId::parse(value).ok());
+    if let Some(target_agent) = target_agent {
+        let mut matching = mentions
+            .iter()
+            .filter(|mention| mention.agent_id.as_ref() == Some(&target_agent));
+        if let (Some(mention), None) = (matching.next(), matching.next()) {
+            return Ok(Some(mention.reference.clone()));
+        }
+    }
+    Err(VibexError::validation(
+        use_codes::TARGET_MISMATCH,
+        "the user addressed more than one collaborator; pass the selectionRef of the one you are delegating to",
+    ))
+}
+
 fn internal_encode_error(error: serde_json::Error) -> VibexError {
     VibexError::process(
         "vibex_use_encode_failed",
@@ -5272,6 +5405,83 @@ mod tests {
         // exactly the bug that would let a changed request reuse an operation.
         assert_ne!(one, fingerprint_of(&["ab"]));
         assert_ne!(one, fingerprint_of(&["a", "c"]));
+    }
+
+    #[test]
+    fn a_user_mention_binds_an_unspecified_delegation_target() {
+        let mention = VibexUseMention::agent(
+            &AgentId::parse("claude").unwrap(),
+            &VibexUseRef::runtime_option("option-claude-sonnet"),
+            None,
+        );
+        let bound =
+            bound_mention_target(std::slice::from_ref(&mention), &serde_json::json!({}), None)
+                .unwrap();
+        assert_eq!(bound, Some(mention.reference));
+    }
+
+    #[test]
+    fn a_different_runtime_option_is_a_target_mismatch() {
+        let mention = VibexUseMention::agent(
+            &AgentId::parse("claude").unwrap(),
+            &VibexUseRef::runtime_option("option-claude-sonnet"),
+            None,
+        );
+        let other = VibexUseRef::runtime_option("option-claude-opus");
+        let error = bound_mention_target(
+            std::slice::from_ref(&mention),
+            &serde_json::json!({ "selectionRef": other.as_uri() }),
+            Some(&other.as_uri()),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, use_codes::TARGET_MISMATCH);
+    }
+
+    #[test]
+    fn the_matching_mention_reference_is_accepted() {
+        let mention = VibexUseMention::agent(
+            &AgentId::parse("claude").unwrap(),
+            &VibexUseRef::runtime_option("option-claude-sonnet"),
+            None,
+        );
+        let reference = mention.reference.as_uri();
+        let bound = bound_mention_target(
+            std::slice::from_ref(&mention),
+            &serde_json::json!({ "selectionRef": reference }),
+            Some(&reference),
+        )
+        .unwrap();
+        assert_eq!(bound, Some(mention.reference));
+    }
+
+    #[test]
+    fn several_mentions_need_an_explicit_choice() {
+        let claude = VibexUseMention::agent(
+            &AgentId::parse("claude").unwrap(),
+            &VibexUseRef::runtime_option("option-claude"),
+            None,
+        );
+        let codex = VibexUseMention::agent(
+            &AgentId::parse("codex").unwrap(),
+            &VibexUseRef::runtime_option("option-codex"),
+            None,
+        );
+        let mentions = [claude.clone(), codex];
+        let error = bound_mention_target(&mentions, &serde_json::json!({}), None).unwrap_err();
+        assert_eq!(error.code, use_codes::TARGET_MISMATCH);
+
+        let bound =
+            bound_mention_target(&mentions, &serde_json::json!({ "agentId": "claude" }), None)
+                .unwrap();
+        assert_eq!(bound, Some(claude.reference));
+    }
+
+    #[test]
+    fn no_mention_leaves_the_target_alone() {
+        assert_eq!(
+            bound_mention_target(&[], &serde_json::json!({}), None).unwrap(),
+            None
+        );
     }
 
     #[test]

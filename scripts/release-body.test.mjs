@@ -191,6 +191,7 @@ const downloads = renderDownloads({
   assetNames: [
     "vibex-0.2.0-linux-x86_64-appimage.AppImage",
     "vibex-0.2.0-linux-x86_64-deb.deb",
+    "vibex-0.2.0-linux-x86_64-rpm.rpm",
     "vibex-0.2.0-macos-aarch64-app.dmg",
     "vibex-server-0.2.0-linux-x86_64.tar.gz",
     "SHA256SUMS"
@@ -199,7 +200,7 @@ const downloads = renderDownloads({
 assert.ok(downloads.startsWith("## Downloads\n"), "the downloads section lost its heading");
 assert.ok(
   downloads.includes(
-    "| Linux x64 | [AppImage](https://github.com/vibex-ai/vibex/releases/download/v0.2.0/vibex-0.2.0-linux-x86_64-appimage.AppImage) · [deb](https://github.com/vibex-ai/vibex/releases/download/v0.2.0/vibex-0.2.0-linux-x86_64-deb.deb) | [Server tarball](https://github.com/vibex-ai/vibex/releases/download/v0.2.0/vibex-server-0.2.0-linux-x86_64.tar.gz)"
+    "| Linux x64 | [AppImage](https://github.com/vibex-ai/vibex/releases/download/v0.2.0/vibex-0.2.0-linux-x86_64-appimage.AppImage) · [deb](https://github.com/vibex-ai/vibex/releases/download/v0.2.0/vibex-0.2.0-linux-x86_64-deb.deb) · [RPM](https://github.com/vibex-ai/vibex/releases/download/v0.2.0/vibex-0.2.0-linux-x86_64-rpm.rpm) | [Server tarball](https://github.com/vibex-ai/vibex/releases/download/v0.2.0/vibex-server-0.2.0-linux-x86_64.tar.gz)"
   ),
   "the Linux row does not pair the desktop package with its server tarball"
 );

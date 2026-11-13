@@ -14,6 +14,7 @@ mod create;
 mod form;
 mod gateway;
 mod model_editor;
+mod model_import;
 mod provider;
 mod route_group;
 mod route_stage;
@@ -28,6 +29,7 @@ pub(in crate::management) use model_editor::{
 // Only tests reach it; the editor itself reads the live fields.
 #[cfg(test)]
 pub(in crate::management) use model_editor::capability_matches_suggestion;
+pub(in crate::management) use model_import::ProviderModelImportDraft;
 pub(in crate::management) use provider::ProviderModelsList;
 pub(in crate::management) use route_group::RouteGroupFormScope;
 pub(crate) use route_stage::RouteStage;

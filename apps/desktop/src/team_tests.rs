@@ -567,11 +567,14 @@ fn a_settled_session_releases_the_pre_send_queue_fence(cx: &mut TestAppContext) 
         workbench.update(cx, |workbench, cx| {
             let session_id = session(0).id.clone();
             workbench.composer_queue = vec![head_queue_message(1, &session_id, Some(now - 1_000))];
-            workbench.composer_queue_dispatch_fence = Some(ComposerQueueDispatchFence {
-                session_id: session_id.clone(),
-                message_id: 99,
-                awaits_turn: true,
-            });
+            workbench.composer_queue_dispatch_fences.insert(
+                session_id.as_str().to_string(),
+                ComposerQueueDispatchFence {
+                    session_id: session_id.clone(),
+                    message_id: 99,
+                    awaits_turn: true,
+                },
+            );
             workbench.set_session_turn_pending(&session_id, true);
             assert!(!workbench.maybe_dispatch_next_composer_queue_message(
                 None,
@@ -598,12 +601,12 @@ fn a_settled_session_releases_the_pre_send_queue_fence(cx: &mut TestAppContext) 
 /// A due schedule is not held by a turn another session's queued message
 /// started.
 ///
-/// The dispatch fence keeps the queue one message at a time behind the turn the
-/// last hand-over started. A schedule is a promise about a moment, though, and
-/// an Agent still working in another session has no claim on that moment: the
-/// scheduled head's own session is settled, so it goes out even while the fence
-/// waits. The unblocked case is the one that left a due message sitting behind
-/// an unrelated long-running turn until the reader sent it by hand.
+/// The dispatch fence keeps one session's queue one message at a time behind
+/// the turn that session's last hand-over started. A schedule is a promise
+/// about a moment, though, and an Agent still working in another session has no
+/// claim on that moment — the fence is keyed by session precisely so one
+/// unrelated long-running turn cannot hold a due message until the reader sends
+/// it by hand.
 #[gpui::test]
 fn a_due_schedule_is_not_held_by_another_sessions_turn(cx: &mut TestAppContext) {
     let (workbench, cx, _) = fixture(cx, 2);
@@ -613,16 +616,23 @@ fn a_due_schedule_is_not_held_by_another_sessions_turn(cx: &mut TestAppContext) 
             // The message that last left the queue belongs to another session,
             // whose turn is still occupying it.
             workbench.sessions[0].state = AgentSessionState::Running;
-            workbench.composer_queue_dispatch_fence = Some(ComposerQueueDispatchFence {
-                session_id: session(0).id,
-                message_id: 99,
-                awaits_turn: true,
-            });
+            workbench.composer_queue_dispatch_fences.insert(
+                session(0).id.as_str().to_string(),
+                ComposerQueueDispatchFence {
+                    session_id: session(0).id,
+                    message_id: 99,
+                    awaits_turn: true,
+                },
+            );
             workbench.composer_queue =
                 vec![head_queue_message(1, &session(1).id, Some(now - 1_000))];
             assert!(
-                workbench.composer_queue_fence_blocks(),
+                workbench.composer_queue_fence_blocks(&session(0).id),
                 "the fixture's other session is still running"
+            );
+            assert!(
+                !workbench.composer_queue_fence_blocks(&session(1).id),
+                "a fence belongs to the session it was handed over from"
             );
 
             assert!(
@@ -635,6 +645,86 @@ fn a_due_schedule_is_not_held_by_another_sessions_turn(cx: &mut TestAppContext) 
                 "the due schedule leaves even though the other session's turn runs"
             );
             assert!(workbench.composer_queue.is_empty());
+        });
+    });
+}
+
+/// A dispatch whose submission never reached the provider releases its turn
+/// flag.
+///
+/// The optimistic flag is normally answered by an authoritative snapshot the
+/// authority wrote after the dispatch. A submission that failed or was
+/// cancelled before `dispatched_at_ms` writes no such snapshot — the turn never
+/// started — so the flag used to outlive the message it spoke for and hold that
+/// session's queue forever. This is the "message was not sent" row that froze
+/// the composer.
+#[gpui::test]
+fn an_unadmitted_submission_releases_the_turn_flag_it_armed(cx: &mut TestAppContext) {
+    let (workbench, cx, _) = fixture(cx, 1);
+    cx.update(|window, cx| {
+        workbench.update(cx, |workbench, cx| {
+            let session_id = session(0).id.clone();
+            workbench.set_session_turn_pending(&session_id, true);
+            assert!(workbench.session_turn_pending(&session_id));
+
+            let mut unadmitted = BTreeSet::new();
+            unadmitted.insert(session_id.as_str().to_string());
+            workbench.release_unadmitted_turn_flags(&unadmitted);
+
+            assert!(
+                !workbench.session_turn_pending(&session_id),
+                "a submission that never dispatched cannot keep claiming a turn"
+            );
+            let _ = (window, cx);
+        });
+    });
+}
+
+/// An unsent message's row can be recovered instead of only dismissed.
+///
+/// The durable submission is terminal, so nothing will ever deliver the text
+/// the optimistic row still holds. Retrying hands it back to the composer;
+/// discarding takes it off the timeline. A row that only said "not sent" left
+/// the reader with neither.
+#[gpui::test]
+fn an_unsent_message_can_be_recovered_or_discarded(cx: &mut TestAppContext) {
+    let (workbench, cx, _) = fixture(cx, 1);
+    cx.update(|window, cx| {
+        workbench.update(cx, |workbench, cx| {
+            let session_id = session(0).id.clone();
+            let install = |workbench: &mut VibexWorkbench, text: &str| {
+                workbench.install_optimistic_user_message(OptimisticUserMessage {
+                    mentions: Vec::new(),
+                    session_id: session_id.clone(),
+                    item_id: TimelineItemId::new(),
+                    after_sequence: 0,
+                    submitted_at_ms: unix_timestamp_ms(),
+                    text: text.to_string(),
+                    attachments: Vec::new(),
+                });
+            };
+
+            // Discard: the row and the status both go.
+            install(workbench, "discard me");
+            workbench.discard_failed_submission(&session_id, "submission-discard".to_string(), cx);
+            assert!(
+                !workbench
+                    .optimistic_user_messages
+                    .contains_key(session_id.as_str()),
+                "discarding must remove the row it dismisses"
+            );
+
+            // Retry: the text comes back as the composer's draft.
+            install(workbench, "recover me");
+            workbench.requeue_failed_submission(&session_id, "submission-retry", window, cx);
+            assert!(
+                !workbench
+                    .optimistic_user_messages
+                    .contains_key(session_id.as_str()),
+                "the failed row is replaced by the composer draft"
+            );
+            let input = workbench.ensure_composer_input(window, cx);
+            assert_eq!(input.read(cx).value(), "recover me");
         });
     });
 }
@@ -3570,4 +3660,59 @@ fn a_group_pane_draws_a_terminal_session_as_a_terminal(cx: &mut TestAppContext) 
         cx.debug_bounds("session-terminal-page").is_some(),
         "the group pane should paint the terminal page"
     );
+}
+
+#[gpui::test]
+async fn editing_the_delegation_row_rewrites_an_existing_agent_token(cx: &mut TestAppContext) {
+    let (workbench, cx, _) = fixture(cx, 1);
+    let agent_id = AgentId::parse("claude").expect("agent id");
+    let old = VibexUseRef::runtime_option("option-old");
+    let mention = VibexUseMention::agent(&agent_id, &old, Some("@Claude"));
+    let option = SessionRuntimeOption {
+        selection: SessionRuntimeSelection::provider(
+            agent_id.clone(),
+            ProviderProfileId::new(),
+            "sonnet",
+        ),
+        agent_label: "Claude".into(),
+        auth_source_label: "Profile".into(),
+        model_label: "Sonnet".into(),
+        reasoning_efforts: Vec::new(),
+        modes: Vec::new(),
+        features: Vec::new(),
+        availability: RuntimeOptionAvailability::Available,
+        member_count: 1,
+        auto_routes: false,
+    };
+    let expected = VibexUseRef::parse(&runtime_option_ref(&option)).expect("option reference");
+
+    cx.update(|window, cx| {
+        workbench.update(cx, |workbench, cx| {
+            let input = workbench.ensure_composer_input(window, cx);
+            input.update(cx, |input, cx| {
+                input.set_value("@Claude review", window, cx)
+            });
+            input.update(cx, |input, cx| {
+                let token = InlineToken::new(mention.encode(), "@Claude").with_label("@Claude");
+                input
+                    .replace_range_with_token(0.."@Claude".len(), token, window, cx)
+                    .expect("the token replaces its label");
+            });
+
+            workbench.rewrite_delegation_mention_tokens(
+                ComposerTarget::Session,
+                &agent_id,
+                &option,
+                window,
+                cx,
+            );
+
+            let mentions = composer_mentions(input.read(cx).tokens());
+            assert_eq!(mentions.len(), 1, "the chip was lost");
+            assert_eq!(
+                mentions[0].reference, expected,
+                "the chip still carries the row's previous configuration"
+            );
+        });
+    });
 }

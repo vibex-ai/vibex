@@ -69,6 +69,12 @@ pub struct HeldMessage {
     pub text: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<HeldImage>,
+    /// The typed `@` references the message addresses.
+    ///
+    /// They are part of the message's intent, so a held message that comes back
+    /// after a restart still names the same collaborator and configuration.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mentions: Vec<vibex_core::VibexUseMention>,
     /// The local deadline of a scheduled message, in milliseconds since the
     /// epoch. `None` is an ordinary held message that only waits for the
     /// session to be ready — the same field, with the same meaning, the
@@ -170,6 +176,7 @@ impl HeldMessage {
                 .iter()
                 .filter_map(|(image, offset)| HeldImage::of(image, *offset))
                 .collect(),
+            mentions: queued.mentions.clone(),
             scheduled_at_ms: queued.scheduled_at_ms,
         }
     }
@@ -189,6 +196,7 @@ impl HeldMessage {
             session_id,
             text: self.text,
             images,
+            mentions: self.mentions,
             scheduled_at_ms: self.scheduled_at_ms,
         })
     }
@@ -267,6 +275,7 @@ mod tests {
             session_id: VibexSessionId::parse(session).expect("a valid session id"),
             text: text.to_string(),
             images: Vec::new(),
+            mentions: Vec::new(),
             scheduled_at_ms,
         }
     }
@@ -275,12 +284,18 @@ mod tests {
     fn a_scheduled_message_comes_back_with_its_hour() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("tui-queue.json");
+        let mut first = message(
+            "session_queue0001",
+            "send me later",
+            Some(1_800_000_000_000),
+        );
+        first.mentions.push(vibex_core::VibexUseMention::agent(
+            &vibex_core::AgentId::parse("claude").expect("agent id"),
+            &vibex_core::VibexUseRef::runtime_option("option-claude"),
+            Some("@Claude"),
+        ));
         let queue = vec![
-            message(
-                "session_queue0001",
-                "send me later",
-                Some(1_800_000_000_000),
-            ),
+            first,
             message("session_queue0002", "and me after the turn", None),
         ];
 
@@ -382,6 +397,7 @@ mod tests {
                 session_id: "session_queue0001".to_string(),
                 text: format!("edited in {index}"),
                 images: Vec::new(),
+                mentions: Vec::new(),
                 scheduled_at_ms: None,
             })
             .collect();
@@ -408,12 +424,14 @@ mod tests {
                     session_id: "not a session".to_string(),
                     text: "lost".to_string(),
                     images: Vec::new(),
+                    mentions: Vec::new(),
                     scheduled_at_ms: None,
                 },
                 HeldMessage {
                     session_id: "session_queue0001".to_string(),
                     text: "kept".to_string(),
                     images: Vec::new(),
+                    mentions: Vec::new(),
                     scheduled_at_ms: Some(1_800_000_000_000),
                 },
             ],

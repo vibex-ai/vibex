@@ -867,3 +867,150 @@ async fn an_interrupt_during_provider_preparation_stops_only_that_round_and_keep
         assert_eq!(provider.interrupts.load(Ordering::SeqCst), 1);
     }
 }
+
+/// Cancelling a task takes its child's approval cards with it.
+///
+/// A card raised by the child is a question the child asked its own provider.
+/// The provider interrupt only silences the process: the durable row stays
+/// `Pending`, and an ACP card carries no deadline for the expiry sweep to
+/// reclaim. Left behind, the card stays clickable and a late approval runs the
+/// work the stop was meant to prevent.
+#[tokio::test]
+async fn cancelling_a_task_clears_the_child_approval_cards_it_left_open() {
+    let fixture = DelegationFixture::new().await;
+    let manager = fixture.harness.manager();
+    let first = manager
+        .create_task_delegation(fixture.request("cancel-open-card"))
+        .await
+        .unwrap();
+    let task = fixture.wait_for_task(&first.delegation.id).await;
+    let child = task.child_session_id.clone().unwrap();
+
+    let card = PermissionRequest {
+        id: vibex_core::RequestId::new(),
+        session_id: child.clone(),
+        project_id: None,
+        workspace_id: None,
+        provider_request_id: Some("acp-card-during-cancel".to_string()),
+        risk_category: PermissionRiskCategory::Command,
+        title: "Agent wants to run a command".to_string(),
+        details: Vec::new(),
+        allowed_responses: vec![
+            PermissionResponseKind::Approve,
+            PermissionResponseKind::Deny,
+        ],
+        response_options: Vec::new(),
+        status: PermissionRequestStatus::Pending,
+        requested_at_ms: unix_timestamp_ms(),
+        expires_at_ms: None,
+    };
+    manager.record_permission_request(card.clone()).await.unwrap();
+
+    manager
+        .cancel_agent_delegation(CancelAgentDelegationRequest {
+            parent_session_id: fixture.parent.id.clone(),
+            delegation_id: task.id.clone(),
+        })
+        .await
+        .unwrap();
+
+    let conn = manager.open_migrated().unwrap();
+    assert_eq!(
+        PermissionRepository::get_request(&conn, &card.id)
+            .unwrap()
+            .unwrap()
+            .status,
+        PermissionRequestStatus::Denied,
+        "the stop has to close the card it orphaned"
+    );
+    assert!(
+        PermissionRepository::pending_for_session(&conn, &child)
+            .unwrap()
+            .is_empty(),
+        "no card may stay pending after the task was cancelled"
+    );
+}
+
+/// A late approval of a cancelled task is refused instead of executed.
+///
+/// The card can outlive the stop on a surface that had not repainted yet, or on
+/// a client that queued the click before the cancel arrived. Accepting it would
+/// run the work in a task the ledger already calls cancelled, which is the one
+/// disagreement the parent can never reconcile.
+#[tokio::test]
+async fn a_late_approval_of_a_cancelled_task_is_refused() {
+    let fixture = DelegationFixture::new().await;
+    let manager = fixture.harness.manager();
+    let first = manager
+        .create_task_delegation(fixture.request("late-approval"))
+        .await
+        .unwrap();
+    let task = fixture.wait_for_task(&first.delegation.id).await;
+    let child = task.child_session_id.clone().unwrap();
+
+    let card = PermissionRequest {
+        id: vibex_core::RequestId::new(),
+        session_id: child.clone(),
+        project_id: None,
+        workspace_id: None,
+        provider_request_id: Some("acp-late-approval".to_string()),
+        risk_category: PermissionRiskCategory::Command,
+        title: "Agent wants to run a command".to_string(),
+        details: Vec::new(),
+        allowed_responses: vec![
+            PermissionResponseKind::Approve,
+            PermissionResponseKind::Deny,
+        ],
+        response_options: Vec::new(),
+        status: PermissionRequestStatus::Pending,
+        requested_at_ms: unix_timestamp_ms(),
+        expires_at_ms: None,
+    };
+    manager.record_permission_request(card.clone()).await.unwrap();
+
+    manager
+        .cancel_agent_delegation(CancelAgentDelegationRequest {
+            parent_session_id: fixture.parent.id.clone(),
+            delegation_id: task.id.clone(),
+        })
+        .await
+        .unwrap();
+
+    let resolution = PermissionResolution {
+        request_id: card.id.clone(),
+        session_id: child.clone(),
+        response: PermissionResponseKind::Approve,
+        responder_device_id: None,
+        provider_resolution_id: None,
+        note: None,
+        resolved_at_ms: unix_timestamp_ms(),
+    };
+    let error = manager
+        .resolve_permission(ResolvePermissionRequest {
+            session_id: child.clone(),
+            request_id: card.id.clone(),
+            resolution,
+        })
+        .await
+        .expect_err("a cancelled task must not accept an approval");
+    assert_eq!(error.code, "task_cancelled_before_approval");
+    assert_eq!(
+        error
+            .diagnostics
+            .iter()
+            .find(|entry| entry.key == "taskId")
+            .map(|entry| entry.value.as_str()),
+        Some(task.id.as_str())
+    );
+
+    let conn = manager.open_migrated().unwrap();
+    assert_eq!(
+        PermissionRepository::get_request(&conn, &card.id)
+            .unwrap()
+            .unwrap()
+            .status,
+        PermissionRequestStatus::Denied,
+        "the refused approval must not overwrite the stop's own resolution"
+    );
+}
+

@@ -8,7 +8,7 @@
   <img src="https://img.shields.io/badge/Rust-1.99.1-black?style=flat&logo=rust&logoColor=white" alt="Rust 1.99.1" />
   <img src="https://img.shields.io/badge/UI-GPUI-2563eb?style=flat" alt="GPUI" />
   <img src="https://img.shields.io/badge/platforms-macOS%20%7C%20Windows%20%7C%20Linux%20%7C%20iOS%20%7C%20Android-4493F8?style=flat" alt="Platforms: macOS, Windows, Linux, iOS, and Android" />
-  <img src="https://img.shields.io/badge/status-0.1.3-22c55e?style=flat" alt="Release status: 0.1.3" />
+  <img src="https://img.shields.io/badge/status-0.1.5-22c55e?style=flat" alt="Release status: 0.1.5" />
   <a href="https://deepwiki.com/vibex-ai/vibex"><img src="docs/assets/badges/ask-deepwiki.svg" alt="Ask DeepWiki" /></a>
 </p>
 
@@ -332,7 +332,7 @@ Mobile never starts a local Agent, owns a workspace filesystem, mutates local Gi
 
 Download the package for your platform from [GitHub Releases](https://github.com/vibex-ai/vibex/releases/latest):
 
-- **Linux:** `.deb` or AppImage (x86_64); `.deb` for aarch64.
+- **Linux:** `.deb`, `.rpm`, or AppImage (x86_64); `.deb` or `.rpm` for aarch64.
 - **macOS:** `.dmg` for Apple silicon or Intel.
 - **Windows:** NSIS `.exe` for x86_64 or ARM64.
 
@@ -437,6 +437,16 @@ pnpm check:mobile-native   # mobile crate and native project contract
 Use the smallest relevant gate while iterating. Packaging, mobile, Relay, and release instructions live in the [developer guide](https://vibex.peatboy.com/docs/developer) and [docs/operations/release.md](docs/operations/release.md).
 
 ---
+
+## Star History
+
+<a href="https://www.star-history.com/?repos=vibex-ai%2Fvibex&type=date&legend=bottom-right">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=vibex-ai/vibex&type=date&theme=dark&legend=bottom-right" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=vibex-ai/vibex&type=date&legend=bottom-right" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=vibex-ai/vibex&type=date&legend=bottom-right" />
+ </picture>
+</a>
 
 ## Contributing
 

@@ -1353,10 +1353,16 @@ impl AgentWorkflowController {
                     // read then answers with a fresh window instead of a
                     // tail; appending that window to the stale prefix would
                     // leave a hole in the middle of the conversation.
-                    if merged
+                    //
+                    // An empty answer is not a fresh window. A tail read that
+                    // found nothing new returns no items, and replacing the
+                    // restored prefix with that empty set is what made a cold
+                    // phone flash the conversation and then say it had no
+                    // messages. Only a non-empty answer may replace the prefix.
+                    let gap = merged
                         .windows(2)
-                        .any(|pair| pair[1].sequence != pair[0].sequence.saturating_add(1))
-                    {
+                        .any(|pair| pair[1].sequence != pair[0].sequence.saturating_add(1));
+                    if gap && !snapshot.timeline.is_empty() {
                         let restored = self.restore_timeline_details(snapshot.timeline);
                         self.state
                             .timeline
@@ -3601,6 +3607,60 @@ mod tests {
                 .map(|item| item.sequence)
                 .collect::<Vec<_>>(),
             vec![100]
+        );
+    }
+
+    #[test]
+    fn an_empty_tail_keeps_the_persisted_prefix_on_screen() {
+        let session = session();
+        let backend = Arc::new(MockAgentBackend::new(session.clone(), Vec::new()));
+        let mut controller = AgentWorkflowController::new(backend, capabilities());
+        let ticket = controller
+            .begin_session_load_after(session.id.clone(), Some(3))
+            .expect("a persisted prefix should resume");
+        assert_eq!(ticket.load, TimelineLoadKind::Tail(3));
+        assert!(controller.seed_timeline_prefix(
+            &session.id,
+            vec![
+                timeline_item(
+                    &session.id,
+                    1,
+                    TimelinePayload::UserMessage(UserMessagePayload {
+                        text: "first".into(),
+                        ..Default::default()
+                    }),
+                ),
+                timeline_item(
+                    &session.id,
+                    3,
+                    TimelinePayload::AgentMessage(AgentMessagePayload {
+                        text: "last".into(),
+                        is_final: true,
+                    }),
+                ),
+            ],
+            true,
+        ));
+
+        // The persisted window is not contiguous (row 2 was compacted), and
+        // the tail read found nothing newer. The empty answer must not erase
+        // the conversation the reader is already looking at.
+        let snapshot = AgentSessionSnapshot {
+            session: session.clone(),
+            timeline: Vec::new(),
+            runtime_selection: None,
+            timeline_has_older: true,
+        };
+        assert!(controller.apply_session_snapshot(&ticket, Ok(snapshot)));
+        assert_eq!(
+            controller
+                .state
+                .timeline
+                .items
+                .iter()
+                .map(|item| item.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 3]
         );
     }
 

@@ -153,6 +153,13 @@ function validatePackaging() {
     assert(command.includes(`build-channel.mjs ${channel}`), `${channel} package command drifted`);
     assert(command.includes("--formats deb,appimage"), `${channel} package formats drifted`);
     assert(command.includes("compress-deb.mjs"), `${channel} package does not xz-compress its deb`);
+    // cargo-packager has no rpm bundler, so every channel repacks the reviewed
+    // deb into an rpm with the dedicated builder after the deb is final.
+    assert(command.includes("build-rpm.mjs"), `${channel} package does not build the rpm`);
+    assert(
+      command.includes(`--config apps/desktop/Packager.${channel}.toml`),
+      `${channel} rpm build does not read the channel configuration`
+    );
   }
   // The Windows installer is the only place a `vibex` typed in a shell can come
   // from, so its directory has to reach PATH. The generic config points at the
@@ -224,6 +231,8 @@ function validatePackaging() {
   assert(workflow.includes("ubuntu-24.04"), "candidate workflow lost its Linux host");
   assert(workflow.includes("--formats deb,appimage"), "candidate workflow formats drifted");
   assert(workflow.includes("compress-deb.mjs"), "candidate workflow does not xz-compress its deb");
+  assert(workflow.includes("build-rpm.mjs"), "candidate workflow does not build the rpm");
+  assert(/^\s*rpm\s*$/mu.test(workflow), "candidate workflow does not install rpmbuild");
   for (const dependency of [
     "libglib2.0-dev",
     "libgtk-3-dev",
@@ -246,6 +255,19 @@ function validatePackaging() {
   assert(
     !releaseWorkflow.includes("appindicator"),
     "publish workflow still installs a dev package the ksni tray does not build against"
+  );
+  // Every Linux desktop job repacks its deb into an rpm, so both the amd64 and
+  // the cross amd64/arm64 apt sets have to carry rpmbuild. The publish job
+  // binds the rpm to the updater manifest as a system installer and refuses a
+  // release that lost one of the two architectures.
+  assert(/^\s*rpm\s*$/mu.test(releaseWorkflow), "publish workflow does not install rpmbuild");
+  assert(
+    releaseWorkflow.includes("require_artifact_class '*-linux-*-rpm.rpm'"),
+    "publish workflow does not require the Linux rpm artifacts"
+  );
+  assert(
+    releaseWorkflow.includes("|rpm|system_installer|"),
+    "publish workflow updater manifest does not bind the rpm package"
   );
   const releaseMatrix = [
     ["linux", "x86_64", "ubuntu-24.04", "x86_64-unknown-linux-gnu"],
@@ -660,6 +682,15 @@ function validatePackaging() {
   assert(
     desktopReleaseScript.includes("--formats"),
     "desktop release packager must select an explicit platform format"
+  );
+  assert(
+    desktopReleaseScript.includes("buildRpmPackage") &&
+      desktopReleaseScript.includes("-linux-${arch}-rpm.rpm"),
+    "desktop release packager must build and publish the Linux rpm"
+  );
+  assert(
+    existsSync(path("scripts/build-rpm.mjs")),
+    "the Linux rpm builder is missing"
   );
   assert(
     desktopReleaseScript.includes("const ARCHITECTURES = new Set([\"x86_64\", \"aarch64\"])"),

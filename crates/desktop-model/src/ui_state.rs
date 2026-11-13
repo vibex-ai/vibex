@@ -1699,6 +1699,14 @@ pub struct SessionUiState {
     pub enhanced_command_execution_display: bool,
     #[serde(default = "default_enhanced_file_operation_display")]
     pub enhanced_file_operation_display: bool,
+    /// Whether runs of tool calls stay folded into their one-line summary
+    /// while the Agent is working.
+    ///
+    /// A folded run still counts what the turn did — changed files, commands,
+    /// reads and failures — so the summary stays the live account of the work
+    /// while the individual calls wait behind one click.
+    #[serde(default)]
+    pub auto_collapse_tool_calls: bool,
     /// Whether automatic continuation is the default for every project.
     ///
     /// It ships on: a session keeps itself going until the reader turns the
@@ -1749,6 +1757,7 @@ impl Default for SessionUiState {
             show_agent_generation_status: true,
             enhanced_command_execution_display: false,
             enhanced_file_operation_display: true,
+            auto_collapse_tool_calls: false,
             auto_continue_enabled_by_default: true,
             auto_continue_disabled_project_ids: BTreeSet::new(),
             auto_continue_project_ids: BTreeSet::new(),
@@ -3842,6 +3851,10 @@ mod tests {
     fn session_display_preferences_are_backward_compatible() {
         assert!(SessionUiState::default().show_agent_generation_status);
         assert!(SessionUiState::default().enhanced_file_operation_display);
+        assert!(
+            !SessionUiState::default().auto_collapse_tool_calls,
+            "tool activity keeps opening itself until the reader asks for folds"
+        );
         assert_eq!(
             SessionUiState::default().reasoning_display_mode,
             ReasoningDisplayMode::LatestAtBottom
@@ -3869,6 +3882,7 @@ mod tests {
         session.remove("showAgentGenerationStatus");
         session.remove("enhancedCommandExecutionDisplay");
         session.remove("enhancedFileOperationDisplay");
+        session.remove("autoCollapseToolCalls");
         session.remove("reasoningDisplayMode");
         session.remove("reasoningExpandedByDefault");
         session.remove("reasoningExpansionMode");
@@ -3884,6 +3898,7 @@ mod tests {
         assert!(decoded.session.show_agent_generation_status);
         assert!(!decoded.session.enhanced_command_execution_display);
         assert!(decoded.session.enhanced_file_operation_display);
+        assert!(!decoded.session.auto_collapse_tool_calls);
         assert_eq!(
             decoded.session.reasoning_display_mode,
             ReasoningDisplayMode::LatestAtBottom

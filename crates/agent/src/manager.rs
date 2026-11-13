@@ -2691,21 +2691,25 @@ impl AgentManager {
         &self,
         conn: &mut DbConnection,
         delegation: &AgentDelegation,
-        status: AgentDelegationStatus,
         summary: Option<&str>,
     ) -> VibexResult<TimelineItem> {
+        // The phase is the fact; `status` is the compatibility projection a
+        // caller may have read before a later transition moved the task on. A
+        // card is redrawn from whichever snapshot the caller holds, so it has
+        // to be drawn from the one column every transition writes.
+        let phase = delegation.phase();
         let status_text = summary
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(|value| bounded_text(value, MAX_AGENT_DELEGATION_SUMMARY_CHARS))
-            .unwrap_or_else(|| delegation_status_summary(status));
+            .unwrap_or_else(|| delegation_status_summary_for_phase(phase));
         self.append_timeline_item(
             conn,
             &delegation.parent_session_id,
             TimelineSource::System,
             TimelinePayload::Collaboration(vibex_core::CollaborationPayload {
                 action: "delegate_to_agent".to_string(),
-                status: delegation_tool_status(status),
+                status: delegation_tool_status_for_phase(phase),
                 summary: format!("{}: {}", delegation.title, status_text),
                 agent_label: delegation
                     .effective_agent_id
@@ -2765,7 +2769,6 @@ impl AgentManager {
         let _ = self.append_delegation_timeline(
             &mut conn,
             &updated,
-            status,
             updated
                 .result_summary
                 .as_deref()
@@ -2880,10 +2883,21 @@ impl AgentManager {
     /// attachment, because the desktop can open it from the item. A phone
     /// pays for that payload on every page, so the remote answer replaces it
     /// with a bounded marker; the detail read still carries the bytes.
+    ///
+    /// The page is also clamped to [`vibex_core::REMOTE_TIMELINE_PAGE_MAX_BYTES`].
+    /// The caller's budget describes what it can render; it does not know the
+    /// Relay's frame limit, and the E2EE envelope is larger than the page.
     pub async fn fetch_timeline_remote(
         &self,
-        request: FetchTimelineRequest,
+        mut request: FetchTimelineRequest,
     ) -> VibexResult<TimelinePage> {
+        request.max_bytes = Some(
+            request
+                .max_bytes
+                .map_or(vibex_core::REMOTE_TIMELINE_PAGE_MAX_BYTES, |bytes| {
+                    bytes.min(vibex_core::REMOTE_TIMELINE_PAGE_MAX_BYTES)
+                }),
+        );
         let mut page = self.fetch_timeline(request).await?;
         page.items = page
             .items
@@ -5300,6 +5314,7 @@ impl AgentManager {
         let session = SessionRepository::get(&conn, &request.session_id)?.ok_or_else(|| {
             VibexError::validation("session_not_found", "Agent session was not found")
         })?;
+        self.reject_late_user_input_resolution(&conn, &session.id)?;
         let (selection, binding, _identity, route_key) =
             self.resolve_user_input_execution(&conn, &session)?;
         let provider = self.runtime(&route_key)?;
@@ -5425,6 +5440,7 @@ impl AgentManager {
         let session = SessionRepository::get(&conn, &request.session_id)?.ok_or_else(|| {
             VibexError::validation("session_not_found", "Agent session was not found")
         })?;
+        self.reject_late_user_input_resolution(&conn, &session.id)?;
         let (selection, binding, execution_identity, route_key) =
             self.resolve_user_input_execution(&conn, &session)?;
         let provider = self.runtime(&route_key)?;
@@ -5528,6 +5544,38 @@ impl AgentManager {
         Ok(item)
     }
 
+    /// Refuses an approval that arrives after the task asking for it was
+    /// cancelled.
+    ///
+    /// A stop is recorded as a fence, and every admission path already reads
+    /// it. User input was the one writer that did not: the card stayed
+    /// clickable because its durable row outlives the interrupt, and a late
+    /// click reached the provider and ran the work the stop was meant to
+    /// prevent. The ledger then said `cancelled` while the tool had really
+    /// executed, which is the one disagreement the parent can never reconcile.
+    ///
+    /// Refusing is the honest answer: the reader is told the task is gone and
+    /// can delegate again. Reviving the task instead would have to unwind a
+    /// terminal phase, an already-delivered `TaskCancelled` event, a released
+    /// session controller and cancelled queued inputs — a second failure mode
+    /// for every one of them.
+    fn reject_late_user_input_resolution(
+        &self,
+        conn: &DbConnection,
+        session_id: &VibexSessionId,
+    ) -> VibexResult<()> {
+        let Some(task_id) = vibex_db::delegation_cancellation_fence(conn, session_id)? else {
+            return Ok(());
+        };
+        Err(VibexError::conflict(
+            "task_cancelled_before_approval",
+            "the task that asked for this approval was cancelled; the approval cannot run",
+        )
+        .with_recovery_hint("Delegate the work again to get a fresh approval request")
+        .with_diagnostic("taskId", task_id.as_str())
+        .with_diagnostic("sessionId", session_id.as_str()))
+    }
+
     /// Answers every user-input request a cancelled turn left open.
     ///
     /// An interrupt cancels the Agent's native callbacks, but that only
@@ -5542,12 +5590,19 @@ impl AgentManager {
     /// A request the reader answered concurrently is left alone: it already has
     /// a resolution, and the interrupt must not overwrite it or fail over a
     /// race it did not lose.
+    ///
+    /// Returns the permission resolutions this call actually wrote, so the
+    /// caller can drain the native provider callbacks that are now
+    /// unanswerable. The elicitation half needs no drain: its answer is the
+    /// durable row, and the provider reads it through the same session.
     fn cancel_pending_user_input_requests(
         &self,
         conn: &mut DbConnection,
         session_id: &VibexSessionId,
-    ) -> VibexResult<()> {
+        note: &str,
+    ) -> VibexResult<Vec<vibex_core::PermissionResolution>> {
         let resolved_at_ms = unix_timestamp_ms();
+        let mut abandoned = Vec::new();
         for request in PermissionRepository::pending_for_session(conn, session_id)? {
             if let Some(current) = PermissionRepository::get_request(conn, &request.id)?
                 && current.status != vibex_core::PermissionRequestStatus::Pending
@@ -5563,7 +5618,7 @@ impl AgentManager {
                 response: vibex_core::PermissionResponseKind::Deny,
                 responder_device_id: None,
                 provider_resolution_id: None,
-                note: Some("interrupted".to_string()),
+                note: Some(note.to_string()),
                 resolved_at_ms,
             };
             // The permission write is now a pending-only compare-and-set, so
@@ -5579,11 +5634,12 @@ impl AgentManager {
                 conn,
                 session_id,
                 TimelineSource::System,
-                TimelinePayload::PermissionResolution(resolution),
+                TimelinePayload::PermissionResolution(resolution.clone()),
                 None,
                 None,
                 TimelineRedactionState::None,
             )?;
+            abandoned.push(resolution);
         }
         for request in ElicitationRepository::pending_for_session(conn, session_id)? {
             let resolution = vibex_core::ElicitationResolution {
@@ -5612,7 +5668,7 @@ impl AgentManager {
                 TimelineRedactionState::None,
             )?;
         }
-        Ok(())
+        Ok(abandoned)
     }
 
     /// Starts the sweep that expires unanswered user-input requests.
@@ -5830,7 +5886,13 @@ impl AgentManager {
         // answered. Clearing the rows before the state settles is what stops
         // the unwinding turn from re-parking the session in `NeedsInput` from
         // the same abandoned requests.
-        self.cancel_pending_user_input_requests(&mut conn, &session.id)?;
+        let abandoned =
+            self.cancel_pending_user_input_requests(&mut conn, &session.id, "interrupted")?;
+        drop(conn);
+        for resolution in abandoned {
+            self.drain_expired_permission(&session.id, resolution).await;
+        }
+        let conn = self.open_migrated()?;
         SessionRepository::update_state(&conn, &session.id, AgentSessionState::Idle)?;
         if let Some(settled) = self.client_session_snapshot(&conn, &session.id)? {
             self.publish_root_session_update(&conn, settled);
@@ -8077,30 +8139,42 @@ fn delegation_runtime_summary(selection: &SessionRuntimeSelection) -> Delegation
     }
 }
 
-fn delegation_tool_status(status: AgentDelegationStatus) -> vibex_core::ToolCallStatus {
-    match status {
-        AgentDelegationStatus::Queued | AgentDelegationStatus::Starting => {
+/// The card status of one task, read from its explicit phase.
+///
+/// The compatibility `status` column and the phase are two projections of one
+/// fact, but only the phase is written by every transition: a cancellation
+/// writes `task_phase = 'cancelling'` while leaving `status = 'running'` so a
+/// late snapshot cannot paint a stopping task back to working. A card drawn
+/// from the column therefore kept claiming the child was still running after
+/// the stop had been confirmed, which is exactly the "background work" badge
+/// the reader could never get rid of.
+fn delegation_tool_status_for_phase(phase: DelegationTaskPhase) -> vibex_core::ToolCallStatus {
+    match phase {
+        DelegationTaskPhase::Queued | DelegationTaskPhase::Starting => {
             vibex_core::ToolCallStatus::Started
         }
-        AgentDelegationStatus::Running | AgentDelegationStatus::NeedsInput => {
-            vibex_core::ToolCallStatus::Progress
-        }
-        AgentDelegationStatus::Completed => vibex_core::ToolCallStatus::Completed,
-        AgentDelegationStatus::Failed | AgentDelegationStatus::Cancelled => {
+        // A stopping task is still occupied: its execution has not settled, so
+        // it is not a failure yet. Only the confirmed stop turns the card.
+        DelegationTaskPhase::Active
+        | DelegationTaskPhase::AwaitingReview
+        | DelegationTaskPhase::Cancelling => vibex_core::ToolCallStatus::Progress,
+        DelegationTaskPhase::Completed => vibex_core::ToolCallStatus::Completed,
+        DelegationTaskPhase::Failed | DelegationTaskPhase::Cancelled => {
             vibex_core::ToolCallStatus::Failed
         }
     }
 }
 
-fn delegation_status_summary(status: AgentDelegationStatus) -> String {
-    match status {
-        AgentDelegationStatus::Queued => "Task queued".to_string(),
-        AgentDelegationStatus::Starting => "Starting child session".to_string(),
-        AgentDelegationStatus::Running => "Task running".to_string(),
-        AgentDelegationStatus::NeedsInput => "Waiting for input".to_string(),
-        AgentDelegationStatus::Completed => "Task completed".to_string(),
-        AgentDelegationStatus::Failed => "Task failed".to_string(),
-        AgentDelegationStatus::Cancelled => "Task cancelled".to_string(),
+fn delegation_status_summary_for_phase(phase: DelegationTaskPhase) -> String {
+    match phase {
+        DelegationTaskPhase::Queued => "Task queued".to_string(),
+        DelegationTaskPhase::Starting => "Starting child session".to_string(),
+        DelegationTaskPhase::Active => "Task running".to_string(),
+        DelegationTaskPhase::AwaitingReview => "Task awaiting review".to_string(),
+        DelegationTaskPhase::Cancelling => "Stopping task".to_string(),
+        DelegationTaskPhase::Completed => "Task completed".to_string(),
+        DelegationTaskPhase::Failed => "Task failed".to_string(),
+        DelegationTaskPhase::Cancelled => "Task cancelled".to_string(),
     }
 }
 
@@ -8349,6 +8423,38 @@ fn filter_and_limit_command_entries(
 
 #[cfg(test)]
 mod tests {
+    /// A stopped task's card must stop claiming it is running.
+    ///
+    /// The compatibility `status` column keeps `running` through `cancelling`
+    /// so a late snapshot cannot paint a stopping task back to working, which
+    /// means a card drawn from that column stays `Progress` forever and the
+    /// composer's "background work" strip never clears. The phase is the column
+    /// every transition writes.
+    #[test]
+    fn a_stopped_task_card_reads_its_phase_not_its_compatibility_status() {
+        assert_eq!(
+            super::delegation_tool_status_for_phase(DelegationTaskPhase::Cancelling),
+            vibex_core::ToolCallStatus::Progress,
+            "a stopping task is still occupied until its round settles"
+        );
+        assert_eq!(
+            super::delegation_tool_status_for_phase(DelegationTaskPhase::Cancelled),
+            vibex_core::ToolCallStatus::Failed
+        );
+        assert_eq!(
+            super::delegation_tool_status_for_phase(DelegationTaskPhase::Active),
+            vibex_core::ToolCallStatus::Progress
+        );
+        assert_eq!(
+            super::delegation_tool_status_for_phase(DelegationTaskPhase::Completed),
+            vibex_core::ToolCallStatus::Completed
+        );
+        assert_eq!(
+            super::delegation_status_summary_for_phase(DelegationTaskPhase::Cancelled),
+            "Task cancelled"
+        );
+    }
+
     /// A relayed failure keeps the Agent's explanation in the row.
     ///
     /// The runtime's sentence is what the copy catalogue translates; the

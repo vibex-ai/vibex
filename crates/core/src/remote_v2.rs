@@ -39,6 +39,15 @@ pub const DEFAULT_PAIRING_TTL_MS: u32 = 90_000;
 /// Upper bound on a runtime or device display name. It is short enough for a
 /// picker row and long enough for a hostname or a phone model.
 pub const REMOTE_DISPLAY_NAME_MAX_CHARS: usize = 64;
+/// The largest timeline page a paired client may be sent.
+///
+/// The page is JSON, sealed in an E2EE envelope, and base64 encoded before it
+/// becomes one Relay WebSocket message, so the wire frame is roughly a third
+/// larger than the page. A page budget at the Relay's frame limit therefore
+/// produces an oversized frame; the Relay closes the PC socket, and the phone
+/// retries into a room that no longer has an authority. This leaves enough
+/// headroom for the envelope while still holding several screens of history.
+pub const REMOTE_TIMELINE_PAGE_MAX_BYTES: u32 = 512 * 1024;
 
 /// Normalizes an operator-supplied runtime or device name.
 ///

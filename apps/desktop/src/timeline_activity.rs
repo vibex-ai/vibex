@@ -1,4 +1,5 @@
 use super::*;
+use crate::shimmer::ShimmerText;
 
 #[cfg(test)]
 #[path = "timeline_activity_tests.rs"]
@@ -56,13 +57,20 @@ const LIVE_LABEL_SAME_FRAME_GAP: Duration = Duration::from_millis(4);
 const LIVE_LABEL_LATE_STREAK: u32 = 2;
 /// Consecutive on-time frames before they start asking again.
 const LIVE_LABEL_RECOVERED_STREAK: u32 = 2;
-/// A frame may land this far past the display's interval and still count as on
-/// time, in tenths. Missing the display interval once is the first sign the
-/// frame is over budget; a repeating animation would only add a request such a
-/// frame cannot answer.
+/// The app's repeating-animation cadence.
+///
+/// `with_max_fps(30)` schedules the next render about 33ms out, so a gate that
+/// measured against a 60Hz display interval would read every deliberate 30fps
+/// frame as late and switch the sweep off for good. The frame budget is the
+/// display interval floored at this value.
+const LIVE_LABEL_FRAME_INTERVAL: Duration = Duration::from_millis(33);
+/// A frame may land this far past the frame budget and still count as on time,
+/// in tenths. Missing the budget once is the first sign the frame is over
+/// budget; a repeating animation would only add a request such a frame cannot
+/// answer.
 const LIVE_LABEL_LATE_SLACK_TENTHS: u64 = 18;
-/// The gap that restores the sweep, in tenths: close enough to the display's
-/// interval that a recovered timeline animates again on the next frame.
+/// The gap that restores the sweep, in tenths: close enough to the frame budget
+/// that a recovered timeline animates again on the next frame.
 const LIVE_LABEL_RECOVERED_SLACK_TENTHS: u64 = 13;
 
 /// What the live labels' frame gate decided, and the streaks it decides with.
@@ -84,23 +92,24 @@ impl LiveLabelGate {
         on_time_frames: 0,
     };
 
-    /// The state after one frame `gap`, measured against the display's own
-    /// `refresh` interval.
+    /// The state after one frame `gap`, measured against the frame budget: the
+    /// display's `refresh` interval floored at [`LIVE_LABEL_FRAME_INTERVAL`].
     ///
     /// The two budgets leave a band between them where a sweep that runs keeps
     /// running and a sweep that stopped stays stopped, so a frame that lands
     /// near the budget cannot flip the animation every other frame.
     fn observe(self, gap: Duration, refresh: Duration) -> Self {
         let refresh = (refresh.as_micros() as u64).max(1);
+        let budget = refresh.max(LIVE_LABEL_FRAME_INTERVAL.as_micros() as u64);
         let gap = gap.as_micros() as u64;
-        if gap > refresh * LIVE_LABEL_LATE_SLACK_TENTHS / 10 {
+        if gap > budget * LIVE_LABEL_LATE_SLACK_TENTHS / 10 {
             let late_frames = self.late_frames.saturating_add(1);
             Self {
                 animate: self.animate && late_frames < LIVE_LABEL_LATE_STREAK,
                 late_frames,
                 on_time_frames: 0,
             }
-        } else if gap <= refresh * LIVE_LABEL_RECOVERED_SLACK_TENTHS / 10 {
+        } else if gap <= budget * LIVE_LABEL_RECOVERED_SLACK_TENTHS / 10 {
             let on_time_frames = self.on_time_frames.saturating_add(1);
             Self {
                 animate: self.animate || on_time_frames >= LIVE_LABEL_RECOVERED_STREAK,
@@ -129,12 +138,12 @@ static LIVE_LABEL_GATE: std::sync::Mutex<LiveLabelGate> =
 /// The sweep is what makes a running row read as alive, and on a frame with
 /// headroom it costs nothing extra: that frame was going to be drawn anyway.
 /// On a frame that is already late it is the opposite. A repeating
-/// `with_animation` asks the window for a frame on every display refresh for as
+/// `with_animation` asks the window for a frame at its capped cadence for as
 /// long as it is mounted, so a workbench whose frames overrun the budget never
 /// idles — the main thread stays saturated by frames it cannot deliver on time,
 /// which is exactly the state an expanded, busy timeline lands in. This gate
-/// drops live labels back to static text while the timeline misses its display
-/// interval and restores the sweep once it holds it again.
+/// drops live labels back to static text while the timeline misses its frame
+/// budget and restores the sweep once it holds it again.
 pub(super) fn observe_live_label_frame(window: &Window, cx: &App) {
     let now = Instant::now();
     let epoch = *LIVE_LABEL_EPOCH.get_or_init(|| now);

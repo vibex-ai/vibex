@@ -153,6 +153,7 @@ enum RemoteAccessAction {
     CreateOffer,
     RegenerateOffer,
     CancelOffer,
+    DismissOffer,
     SelectEntry(RemoteConnectivityMethod),
     CopyLink,
     CancelLanPairing,
@@ -797,6 +798,7 @@ impl RemoteAccessPairing {
             RemoteAccessAction::CreateOffer => self.create_offer(cx),
             RemoteAccessAction::RegenerateOffer => self.regenerate_offer(self.state.permission, cx),
             RemoteAccessAction::CancelOffer => self.cancel_offer(cx),
+            RemoteAccessAction::DismissOffer => self.dismiss_offer(cx),
             RemoteAccessAction::SelectEntry(method) => self.select_entry(method, cx),
             RemoteAccessAction::CopyLink => self.copy_pairing_link(cx),
             RemoteAccessAction::CancelLanPairing => self.cancel_lan_pairing(cx),
@@ -1802,6 +1804,19 @@ impl RemoteAccessPairing {
                 .cancel_pairing_offer(offer_id)
                 .map(|_| RemoteAccessMutationOutcome::OfferCanceled)
         });
+    }
+
+    /// Leaves a completed pairing without revoking anything.
+    ///
+    /// Once the device is claimed every action that talks to the offer is
+    /// disabled — there is nothing left to copy, cancel, or regenerate. Without
+    /// this dismissal the sheet had no enabled control at all, so the modal
+    /// stayed over the workbench and every button behind it stayed out of reach.
+    fn dismiss_offer(&mut self, cx: &mut Context<Self>) {
+        self.offer_poll_task = None;
+        self.state.active_offer = None;
+        self.state.pending = None;
+        self.dispatch_action(RemoteAccessAction::ShowSetup, cx);
     }
 
     fn select_entry(&mut self, method: RemoteConnectivityMethod, cx: &mut Context<Self>) {
@@ -3609,6 +3624,7 @@ impl RemoteAccessPairing {
         let copy_entity = entity.clone();
         let regenerate_entity = entity.clone();
         let cancel_entity = entity.clone();
+        let done_entity = entity.clone();
         let status_label = if claimed {
             locale::text("Device paired", "设备已配对", "裝置已配對")
         } else if offer.summary.canceled {
@@ -3768,7 +3784,23 @@ impl RemoteAccessPairing {
                     )))
                     .child(entry_selector),
             )
-            .child(
+            .child(if claimed {
+                h_flex()
+                    .flex_wrap()
+                    .gap_2()
+                    .child(
+                        Button::new("pairing-done")
+                            .primary()
+                            .icon(IconName::Check)
+                            .label(locale::text("Done", "完成", "完成"))
+                            .on_click(move |_, _, cx| {
+                                let _ = done_entity.update(cx, |this, cx| {
+                                    this.dispatch_action(RemoteAccessAction::DismissOffer, cx)
+                                });
+                            }),
+                    )
+                    .into_any_element()
+            } else {
                 h_flex()
                     .flex_wrap()
                     .gap_2()
@@ -3815,8 +3847,9 @@ impl RemoteAccessPairing {
                                     this.dispatch_action(RemoteAccessAction::CancelOffer, cx)
                                 });
                             }),
-                    ),
-            );
+                    )
+                    .into_any_element()
+            });
 
         h_flex()
             .w_full()
@@ -5509,6 +5542,28 @@ mod tests {
         assert!(state.can_regenerate_offer());
         state.pending = Some(RemoteAccessMutation::RegenerateOffer);
         assert!(!state.can_regenerate_offer());
+    }
+
+    /// A claimed offer leaves every offer action disabled, so the sheet needs
+    /// one control that only dismisses it. Without that control the modal sat
+    /// over the workbench with nothing enabled and the user could not get back.
+    #[test]
+    fn a_claimed_offer_has_a_dismissal_control() {
+        let source = include_str!("remote_access_pairing.rs");
+        let sheet = source
+            .split_once("    fn render_offer_sheet(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_lan_window("))
+            .map(|(body, _)| body)
+            .expect("the offer sheet should remain inspectable");
+        assert!(sheet.contains("pairing-done"));
+        assert!(sheet.contains("RemoteAccessAction::DismissOffer"));
+
+        let dispatcher = source
+            .split_once("    fn dispatch_action(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn refresh("))
+            .map(|(body, _)| body)
+            .expect("the action dispatcher should remain inspectable");
+        assert!(dispatcher.contains("RemoteAccessAction::DismissOffer => self.dismiss_offer(cx)"));
     }
 
     #[test]

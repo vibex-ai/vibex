@@ -5,6 +5,8 @@
 //! property that lets the whole interaction model be tested by driving intents
 //! and asserting on state.
 
+use std::collections::BTreeMap;
+
 use vibex_backend::{BackendOperation, MutationRequest};
 use vibex_core::{
     AgentSessionState, ContinueAgentTurnRequest, CreateAgentSessionRequest, ElicitationAnswerValue,
@@ -807,7 +809,7 @@ impl App {
                 {
                     return Outcome::quiet();
                 }
-                let Some((text, attachments)) = self.take_queued_message() else {
+                let Some((text, attachments, mentions)) = self.take_queued_message() else {
                     // Nothing of this client's is held, so the send the reader
                     // is asking for is the one another client is waiting on:
                     // the same instruction travels as a deadline of now, and
@@ -837,6 +839,7 @@ impl App {
                     correlation_id: self.pending_sends[&send_id].correlation_id.clone(),
                     text,
                     attachments,
+                    mentions,
                 });
                 Outcome::effects(effects)
             }
@@ -6288,7 +6291,11 @@ impl App {
         let scheduled_at_ms = match self.take_draft_schedule(vibex_core::unix_timestamp_ms()) {
             Ok(at_ms) => at_ms,
             Err(error) => {
-                self.composer.set_draft(outgoing.text, outgoing.images);
+                self.composer.set_draft_with_mentions(
+                    outgoing.text,
+                    outgoing.images,
+                    outgoing.mentions,
+                );
                 self.toast(Toast::warning(error.message(self.strings).to_string()));
                 return Outcome::quiet();
             }
@@ -6309,10 +6316,11 @@ impl App {
         // message is projected here and now.
         let send_id = match scheduled_at_ms {
             Some(at_ms) => {
-                self.enqueue_scheduled(
+                self.enqueue_scheduled_with_mentions(
                     request_id.clone(),
                     outgoing.text.clone(),
                     outgoing.images.clone(),
+                    outgoing.mentions.clone(),
                     Some(at_ms),
                 );
                 0
@@ -7115,7 +7123,7 @@ impl App {
             return Outcome::quiet();
         }
         let outgoing = self.composer.take_outgoing();
-        let (text, images) = (outgoing.text, outgoing.images);
+        let (text, images, mentions) = (outgoing.text, outgoing.images, outgoing.mentions);
         self.completion = None;
         // A schedule is resolved at the moment the message is submitted: a
         // countdown starts here, and an absolute deadline the reader typed a
@@ -7125,7 +7133,8 @@ impl App {
         let scheduled_at_ms = match self.take_draft_schedule(vibex_core::unix_timestamp_ms()) {
             Ok(at_ms) => at_ms,
             Err(error) => {
-                self.composer.set_draft(text, images);
+                self.composer
+                    .set_draft_with_mentions(text, images, mentions);
                 self.toast(Toast::warning(error.message(self.strings).to_string()));
                 return Outcome::quiet();
             }
@@ -7139,7 +7148,13 @@ impl App {
             || self.turn_reads_running()
             || self.session_is_uncreated(&session_id)
         {
-            self.enqueue_scheduled(session_id.clone(), text, images, scheduled_at_ms);
+            self.enqueue_scheduled_with_mentions(
+                session_id.clone(),
+                text,
+                images,
+                mentions,
+                scheduled_at_ms,
+            );
             let message = match scheduled_at_ms {
                 Some(at_ms) => format!(
                     "{} · {}",
@@ -7167,6 +7182,7 @@ impl App {
             correlation_id: self.pending_sends[&send_id].correlation_id.clone(),
             text,
             attachments,
+            mentions,
         }])
     }
 
@@ -7190,7 +7206,7 @@ impl App {
             return Outcome::quiet();
         };
         let outgoing = self.composer.take_outgoing();
-        let (text, images) = (outgoing.text, outgoing.images);
+        let (text, images, mentions) = (outgoing.text, outgoing.images, outgoing.mentions);
         self.history_log.push(text.clone());
         // Remote seats have no steering RPC, so the worker falls back to
         // interrupt + resend and says so.
@@ -7205,6 +7221,7 @@ impl App {
             session_id,
             text,
             attachments,
+            mentions,
             fallback_to_resend: fallback,
         }])
     }
@@ -7263,7 +7280,14 @@ impl App {
             return Outcome::quiet();
         };
         let insertion = item.insert.clone();
+        let mention = menu.delegation_mentions.get(&insertion).cloned();
         self.composer.replace_trigger_word(menu.start, &insertion);
+        if let Some(mention) = mention {
+            // The row's visible `@Agent` is only half the reference. Keeping the
+            // typed value lets the send carry the exact runtime option the
+            // authority showed.
+            self.composer.remember_mention(mention);
+        }
         self.completion = None;
         Outcome::effects(vec![])
     }
@@ -7282,6 +7306,7 @@ impl App {
                             start,
                             query: query.clone(),
                             lists: CompletionLists::default(),
+                            delegation_mentions: BTreeMap::new(),
                             // The panels follow the trigger, so the drawer opens
                             // on the trigger's own first panel whatever the
                             // previous one was showing.
@@ -8451,10 +8476,11 @@ pub mod payloads {
         session_id: vibex_core::VibexSessionId,
         text: String,
         attachments: Vec<vibex_core::MessageAttachment>,
+        mentions: Vec<vibex_core::VibexUseMention>,
         desired_runtime: vibex_core::SessionRuntimeSelection,
     ) -> MutationRequest<SendAgentMessageRequest> {
         MutationRequest::new(SendAgentMessageRequest {
-            mentions: Vec::new(),
+            mentions,
             session_id,
             message_idempotency_key: RequestId::new().as_str().to_string(),
             // The submission is refused when the message's reasoning effort
@@ -8912,13 +8938,24 @@ mod tests {
             "gpt-5",
         );
         selection.reasoning_effort = Some("high".to_string());
+        let mention = vibex_core::VibexUseMention::agent(
+            &vibex_core::AgentId::parse("claude").expect("agent id"),
+            &vibex_core::VibexUseRef::runtime_option("option-claude"),
+            Some("@Claude"),
+        );
         let request = super::payloads::send_message(
             VibexSessionId::new(),
             "hello".to_string(),
             Vec::new(),
+            vec![mention.clone()],
             selection.clone(),
         );
         assert_eq!(request.payload.desired_runtime, selection);
+        assert_eq!(
+            request.payload.mentions,
+            vec![mention],
+            "the typed @ reference did not travel with the message"
+        );
         assert_eq!(
             request.payload.reasoning_effort, selection.reasoning_effort,
             "the message disagrees with the runtime selection it carries"

@@ -49,7 +49,7 @@ function findDebFiles(target) {
 // A .deb is an ar archive whose members are `debian-binary`, `control.tar.*`,
 // and `data.tar.*`. Only the header layout matters here; the member contents
 // are recompressed and written back with their original metadata.
-function parseAr(bytes) {
+export function parseAr(bytes) {
   if (bytes.subarray(0, AR_MAGIC.length).toString("latin1") !== AR_MAGIC) {
     throw new Error("archive does not start with the ar magic");
   }

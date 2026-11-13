@@ -2431,6 +2431,8 @@ pub mod codes {
     pub const AGENT_DISABLED: &str = "agent_disabled";
     /// The target Agent or runtime option cannot be used right now.
     pub const TARGET_UNAVAILABLE: &str = "target_unavailable";
+    /// The target does not match the collaborator the user addressed.
+    pub const TARGET_MISMATCH: &str = "target_mismatch";
     /// This runtime cannot offer the requested capability.
     pub const CAPABILITY_UNAVAILABLE: &str = "capability_unavailable";
     /// The caller may not act on this resource.

@@ -1848,6 +1848,15 @@ pub struct ManagementCenter {
     model_editor: provider_workspace::ModelEditDraft,
     /// The Models tab's "add a model by id" field.
     provider_model_add_input: Entity<InputState>,
+    /// The fetch picker's check state for a saved Provider's catalogue.
+    ///
+    /// A fetch no longer writes the whole answer into the record: it opens this
+    /// draft, the reader chooses which Models the Provider should offer, and
+    /// only the confirm writes. `None` means no picker is open.
+    provider_model_import: Option<provider_workspace::ProviderModelImportDraft>,
+    /// The fetch picker's own filter, so a long catalogue is scannable without
+    /// narrowing the Models tab behind it.
+    provider_model_import_search: Entity<InputState>,
     provider_endpoint_probes: Option<Vec<vibex_core::ModelProviderEndpointProbe>>,
     provider_endpoint_probes_profile: Option<vibex_core::ModelProviderProfileId>,
     shared_provider_advanced_target: Option<vibex_core::ModelProviderProfileId>,
@@ -2229,6 +2238,14 @@ pub struct ManagementCenter {
     /// The previewed document, held so install writes exactly what was shown.
     skill_market_document: Option<vibex_core::SkillMarketDocument>,
     skill_market_preview_loading: bool,
+    /// The reader asked to install before the preview finished arriving.
+    ///
+    /// The install is what writes the bytes the preview discloses, so it can
+    /// only run once the document is here. Wanting it while the folder is still
+    /// being read is not a reason to make them wait at a disabled button, so the
+    /// click is remembered and the install starts the moment the document
+    /// lands.
+    skill_market_install_armed: bool,
     mcp_validation: Option<(String, String, bool)>,
     skill_validation: Option<(String, String, bool)>,
     selected_agent_id: Option<String>,
@@ -2681,6 +2698,13 @@ impl ManagementCenter {
                 "篩選模型",
             ))
         });
+        let provider_model_import_search = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(management_locale_text(
+                "Filter the fetched models",
+                "筛选拉取到的模型",
+                "篩選擷取到的模型",
+            ))
+        });
         let provider_search = cx.new(|cx| {
             InputState::new(window, cx).placeholder(management_locale_text(
                 "Search Providers and groups",
@@ -2970,6 +2994,15 @@ impl ManagementCenter {
                 }
                 cx.notify();
             }),
+            cx.subscribe(
+                &provider_model_import_search,
+                |_, _, event: &InputEvent, cx| {
+                    if !management_input_changed(event) {
+                        return;
+                    }
+                    cx.notify();
+                },
+            ),
             cx.subscribe(&route_group_model_query, |_, _, event: &InputEvent, cx| {
                 if management_input_changed(event) {
                     cx.notify();
@@ -3277,6 +3310,7 @@ impl ManagementCenter {
             skill_market_install_agents: BTreeSet::new(),
             skill_market_document: None,
             skill_market_preview_loading: false,
+            skill_market_install_armed: false,
             plugin_market_tab: PluginTab::Discover,
             plugin_market_query,
             plugin_market_entries: Vec::new(),
@@ -3422,6 +3456,8 @@ impl ManagementCenter {
             traffic_range: TrafficRange::Day,
             provider_model_edit_id: None,
             provider_models_list: None,
+            provider_model_import: None,
+            provider_model_import_search: provider_model_import_search.clone(),
             provider_model_capability_task: None,
             model_editor: provider_workspace::ModelEditDraft::new(window, cx),
             provider_model_add_input,
@@ -11776,6 +11812,7 @@ impl ManagementCenter {
         self.skill_discovery = None;
         self.skill_market_install_target = None;
         self.skill_market_document = None;
+        self.skill_market_install_armed = false;
         self.skill_name_draft.update(cx, |state, cx| {
             state.set_value(
                 existing
@@ -14663,6 +14700,7 @@ impl ManagementCenter {
         self.skill_editor_open = false;
         self.skill_market_install_target = None;
         self.skill_market_document = None;
+        self.skill_market_install_armed = false;
         self.skill_market_install_agents = self.market_default_agents();
         self.search_skill_market(cx);
     }
@@ -15044,6 +15082,9 @@ impl ManagementCenter {
         };
         self.skill_market_install_target = Some(entry.clone());
         self.skill_market_document = None;
+        // A new target is a new approval: whatever the last card was armed
+        // with must not install this one.
+        self.skill_market_install_armed = false;
         self.skill_market_preview_loading = true;
         self.skill_market_error = None;
         let entity = cx.weak_entity();
@@ -15063,12 +15104,27 @@ impl ManagementCenter {
             let _ = entity.update(cx, |this, cx| {
                 this.skill_market_preview_loading = false;
                 match outcome {
-                    Ok(Ok(document)) => this.skill_market_document = Some(document),
+                    Ok(Ok(document)) => {
+                        this.skill_market_document = Some(document);
+                        // The reader already pressed Install while the folder
+                        // was being read; the documented bytes are here now, so
+                        // the click is honoured without a second press.
+                        if this.skill_market_install_armed {
+                            this.skill_market_install_armed = false;
+                            this.confirm_skill_market_install(cx);
+                        }
+                    }
                     Ok(Err(error)) => {
+                        // A failed read is not an approval; the next click
+                        // retries the read rather than installing on top of it.
+                        this.skill_market_install_armed = false;
                         this.skill_market_error =
                             Some(format!("{}: {}", error.code, error.message));
                     }
-                    Err(error) => this.skill_market_error = Some(format!("{error}")),
+                    Err(error) => {
+                        this.skill_market_install_armed = false;
+                        this.skill_market_error = Some(format!("{error}"));
+                    }
                 }
                 cx.notify();
             });
@@ -15080,6 +15136,18 @@ impl ManagementCenter {
             return;
         };
         let Some(document) = self.skill_market_document.clone() else {
+            // The document is what an install writes, so there is nothing to
+            // send while the folder is still being read. The press is
+            // remembered and run the moment it lands. A press after a failed
+            // read starts the read over, so the button is never a dead end.
+            self.skill_market_install_armed = true;
+            if self.skill_market_preview_loading {
+                cx.notify();
+            } else {
+                self.begin_skill_market_install(entry, cx);
+                self.skill_market_install_armed = true;
+                cx.notify();
+            }
             return;
         };
         let Some(backend) = self.backend.clone() else {
@@ -15132,6 +15200,7 @@ impl ManagementCenter {
                         this.selected_skill_id = Some(result.skill.id.as_str().to_string());
                         this.skill_market_install_target = None;
                         this.skill_market_document = None;
+                        this.skill_market_install_armed = false;
                         this.skill_market_open = false;
                         this.notice = Some(match active_locale {
                             ResolvedLocale::En => format!(
@@ -19920,122 +19989,6 @@ impl ManagementCenter {
                     Err(error) => this.error = Some(format!("{}: {}", error.code, error.message)),
                 }
                 cx.notify();
-            });
-        }));
-    }
-
-    fn refresh_shared_provider_models(
-        &mut self,
-        profile_id: vibex_core::ModelProviderProfileId,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(backend) = self.backend.clone() else {
-            return;
-        };
-        if self.mutation.is_some() {
-            return;
-        }
-        self.mutation = Some(ManagementMutation::ProviderProbe(format!(
-            "shared-models:{}",
-            profile_id.as_str()
-        )));
-        self.error = None;
-        self.notice = None;
-        let this = cx.entity();
-        self.mutation_task = Some(cx.spawn(async move |_, cx| {
-            let outcome = management_off_thread(cx, async move {
-                backend
-                    .management()
-                    .fetch_model_provider_profile_models(
-                        vibex_core::ModelProviderFetchModelsRequest {
-                            model_provider_profile_id: profile_id,
-                        },
-                    )
-                    .await
-            })
-            .await;
-            this.update(cx, |this, cx| {
-                this.mutation = None;
-                match outcome {
-                    Ok(response) => {
-                        let Some(mut profile) = this
-                            .providers
-                            .iter()
-                            .find(|profile| profile.id == response.model_provider_profile_id)
-                            .cloned()
-                        else {
-                            this.error = Some(
-                                management_locale_text(
-                                    "The Provider is no longer listed",
-                                    "该供应商已不在列表中",
-                                    "該供應商已不在清單中",
-                                )
-                                .to_string(),
-                            );
-                            cx.notify();
-                            return;
-                        };
-                        if response.models.is_empty() {
-                            this.error = Some(
-                                management_locale_text(
-                                    "The endpoint returned no models",
-                                    "接口没有返回模型",
-                                    "介面沒有回傳模型",
-                                )
-                                .to_string(),
-                            );
-                            cx.notify();
-                            return;
-                        }
-                        profile.configured_models = if profile.metadata.auto_refresh_models {
-                            // AutoInclude adds newly discovered models while
-                            // keeping the user's existing rows: their
-                            // capabilities, names, and disabled state are
-                            // hand-authored data, not discovery output.
-                            merge_discovered_provider_models(
-                                &profile.configured_models,
-                                response.models,
-                            )
-                        } else {
-                            response.models
-                        };
-                        if profile.default_model_id.as_ref().is_none_or(|default| {
-                            !profile
-                                .configured_models
-                                .iter()
-                                .any(|model| model.enabled && &model.id == default)
-                        }) {
-                            profile.default_model_id = profile
-                                .configured_models
-                                .iter()
-                                .find(|model| model.enabled)
-                                .map(|model| model.id.clone());
-                        }
-                        this.notice = Some(format!(
-                            "{} · {}",
-                            management_locale_text(
-                                "Model list refreshed",
-                                "模型列表已刷新",
-                                "模型清單已重新整理",
-                            ),
-                            profile.configured_models.len()
-                        ));
-                        this.update_shared_provider(
-                            profile,
-                            management_locale_text(
-                                "Model list refreshed",
-                                "模型列表已刷新",
-                                "模型清單已重新整理",
-                            ),
-                            cx,
-                        );
-                        cx.notify();
-                    }
-                    Err(error) => {
-                        this.error = Some(format!("{}: {}", error.code, error.message));
-                        cx.notify();
-                    }
-                }
             });
         }));
     }
@@ -25227,6 +25180,9 @@ impl ManagementCenter {
         // the code and message the runtime refused with are what a reader can
         // quote, so they travel into the pane with it.
         let load_error = self.skill_market_error.clone();
+        // A press already made while the folder was being read is still
+        // pending, so the button keeps reporting that it was taken.
+        let armed = self.skill_market_install_armed;
 
         let heading = h_flex()
             .w_full()
@@ -25240,6 +25196,7 @@ impl ManagementCenter {
                 cx.listener(|this, _, _, cx| {
                     this.skill_market_install_target = None;
                     this.skill_market_document = None;
+                    this.skill_market_install_armed = false;
                     // The install pane and the results pane share one error
                     // slot, so the failure that emptied the preview must not
                     // outlive it: leaving it set would show a market failure
@@ -25401,7 +25358,11 @@ impl ManagementCenter {
             cx,
         ));
 
-        let can_install = document.is_some_and(|document| !document.too_large);
+        // The button is live while the folder is still being read: a press is
+        // remembered and install runs once the document arrives. Only a
+        // document that can never be installed, or an install already in
+        // flight, disables it.
+        let too_large = document.is_some_and(|document| document.too_large);
         form.child(
             h_flex()
                 .w_full()
@@ -25421,6 +25382,7 @@ impl ManagementCenter {
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.skill_market_install_target = None;
                             this.skill_market_document = None;
+                            this.skill_market_install_armed = false;
                             cx.notify();
                         })),
                 )
@@ -25429,8 +25391,8 @@ impl ManagementCenter {
                         .small()
                         .primary()
                         .label(management_locale_text("Install", "安装", "安裝"))
-                        .loading(pending)
-                        .disabled(pending || !can_install)
+                        .loading(pending || armed)
+                        .disabled(pending || too_large)
                         .on_click(
                             cx.listener(|this, _, _, cx| this.confirm_skill_market_install(cx)),
                         ),
@@ -25734,6 +25696,7 @@ impl ManagementCenter {
                     this.skill_editor_open = false;
                     this.skill_market_install_target = None;
                     this.skill_market_document = None;
+                    this.skill_market_install_armed = false;
                     this.skill_discovery = None;
                     cx.notify();
                 },

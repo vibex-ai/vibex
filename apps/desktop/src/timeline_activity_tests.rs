@@ -368,8 +368,8 @@ fn activity_groups_follow_execution_until_the_reader_overrides_them() {
         0..2,
         "enhanced commands keep their standalone card while files stay grouped"
     );
-    assert!(group_open(&turn, &group, None));
-    assert!(!group_open(&turn, &group, Some(false)));
+    assert!(group_open(&turn, &group, None, false));
+    assert!(!group_open(&turn, &group, Some(false), false));
     turn.process_rows
         .push(row_for(&TimelinePayload::AgentMessage(
             AgentMessagePayload {
@@ -377,31 +377,65 @@ fn activity_groups_follow_execution_until_the_reader_overrides_them() {
                 is_final: false,
             },
         )));
-    assert!(!group_open(&turn, &group, None));
-    assert!(group_open(&turn, &group, Some(true)));
+    assert!(!group_open(&turn, &group, None, false));
+    assert!(group_open(&turn, &group, Some(true), false));
     turn.process_rows[0].streaming = true;
     assert!(
-        group_open(&turn, &group, None),
+        group_open(&turn, &group, None, false),
         "a parallel operation must remain visible after commentary"
     );
     turn.process_rows[0].streaming = false;
     turn.process_rows[0].pending_permission = true;
-    assert!(group_open(&turn, &group, None));
+    assert!(group_open(&turn, &group, None, false));
     turn.conclusion_row = Some(row_for(&TimelinePayload::AgentMessage(
         AgentMessagePayload {
             text: "Done".into(),
             is_final: true,
         },
     )));
-    assert!(!group_open(&turn, &group, None));
+    assert!(!group_open(&turn, &group, None, false));
     turn.conclusion_row = None;
     turn.complete = true;
-    assert!(!group_open(&turn, &group, None));
-    assert!(group_open(&turn, &group, Some(true)));
+    assert!(!group_open(&turn, &group, None, false));
+    assert!(group_open(&turn, &group, Some(true), false));
     turn.complete = false;
     turn.superseded = true;
-    assert!(!group_open(&turn, &group, None));
-    assert!(group_open(&turn, &group, Some(true)));
+    assert!(!group_open(&turn, &group, None, false));
+    assert!(group_open(&turn, &group, Some(true), false));
+}
+
+/// With folding on, the summary line is the whole account of a run while the
+/// Agent works. A request for approval is the one thing that must not wait
+/// behind it, and the reader's own click always wins.
+#[test]
+fn auto_collapse_keeps_tool_runs_folded_but_never_hides_an_approval() {
+    let mut turn = running_turn();
+    let group = timeline_process_activity_groups_for_display(&turn, false)[0].clone();
+    assert!(group_open(&turn, &group, None, false));
+    assert!(
+        !group_open(&turn, &group, None, true),
+        "a running turn folds its work when auto-collapse is on"
+    );
+    assert!(
+        group_open(&turn, &group, Some(true), true),
+        "an explicit open outranks the fold"
+    );
+
+    turn.process_rows[1].pending_permission = true;
+    assert!(
+        group_open(&turn, &group, None, true),
+        "an approval prompt is never hidden behind a summary"
+    );
+
+    turn.process_rows[1].pending_permission = false;
+    turn.complete = true;
+    turn.conclusion_row = Some(row_for(&TimelinePayload::AgentMessage(
+        AgentMessagePayload {
+            text: "Done".into(),
+            is_final: true,
+        },
+    )));
+    assert!(!group_open(&turn, &group, None, true));
 }
 
 #[test]
@@ -812,10 +846,20 @@ fn activity_shimmer_stops_when_settled_or_motion_is_reduced(cx: &mut TestAppCont
 #[test]
 fn live_label_gate_stops_a_late_timeline_and_restores_it_with_hysteresis() {
     let refresh = Duration::from_micros(16_667);
-    let on_time = Duration::from_micros(16_000);
-    let late = Duration::from_micros(33_000);
+    // The app deliberately samples repeating animations at 30fps; that is the
+    // budget, not a late 60Hz frame.
+    let on_time = Duration::from_millis(33);
+    let late = Duration::from_millis(70);
     // Between the two budgets: neither streak advances.
-    let near_budget = Duration::from_micros(25_000);
+    let near_budget = Duration::from_millis(50);
+
+    let steady = LiveLabelGate::ANIMATING
+        .observe(on_time, refresh)
+        .observe(on_time, refresh);
+    assert!(
+        steady.animate,
+        "a held 30fps animation cadence must keep the sweep running"
+    );
 
     let slipped = LiveLabelGate::ANIMATING.observe(late, refresh);
     assert!(
@@ -833,7 +877,7 @@ fn live_label_gate_stops_a_late_timeline_and_restores_it_with_hysteresis() {
     let recovered = recovering.observe(on_time, refresh);
     assert!(
         recovered.animate,
-        "a held display interval restores the sweep"
+        "a held animation budget restores the sweep"
     );
 
     assert!(

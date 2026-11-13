@@ -46,7 +46,7 @@ use gpui::{
     WindowControls, WindowDecorations, WindowId, WindowKind, WindowOptions, div, img,
     linear_color_stop, linear_gradient, point, prelude::*, px, relative, rgb, size,
 };
-use gpui_base::text::MarkdownExtensions;
+use gpui_base::{TextSelection, text::MarkdownExtensions};
 use gpui_component::{
     ActiveTheme as _, ColorName, Colorize as _, Disableable as _, ElementExt as _, Icon, IconName,
     IndexPath, InteractiveElementExt as _, Root, Selectable as _, Sizable as _, StyledExt as _,
@@ -85,7 +85,6 @@ use gpui_component::{
     scroll::{ScrollableElement as _, ScrollbarAxis},
     searchable_list::{SearchableListItem, SearchableVec},
     select::{Select, SelectDelegate, SelectEvent, SelectState},
-    shimmer::ShimmerText,
     switch::Switch,
     tab::{Tab, TabBar},
     tag::Tag,
@@ -207,8 +206,9 @@ use vibex_ui::{
 };
 
 use crate::markdown::{
-    MarkdownPresentation, RangeHighlight, RenderedText, TextView, TextViewState,
-    escape_markdown_literal, plain_text as markdown_plain_text, resolve_workspace_path,
+    MarkdownLinkKind, MarkdownPresentation, RangeHighlight, RenderedText, TextView, TextViewState,
+    escape_markdown_literal, is_file_url, is_windows_drive_path, local_file_path,
+    markdown_link_kind, plain_text as markdown_plain_text, resolve_workspace_path,
     resources as markdown_resources, text_view_style, utf8_prefix,
 };
 use crate::typography::{apply_code_font_weight, apply_terminal_visuals, code_font_weight};
@@ -252,9 +252,10 @@ use crate::platform::{
 use crate::remote_access_pairing::open_remote_access_pairing;
 use crate::remote_client::{
     DesktopRemoteCredential, DesktopRuntimeRegistry, DesktopRuntimeRegistryStore, LOCAL_RUNTIME_ID,
-    RegisteredRuntime,
+    RegisteredRuntime, claim_server_pairing_code, claim_server_pairing_link,
 };
 use crate::responsive::WorkbenchVisibility;
+use crate::shimmer::ShimmerText;
 use crate::single_instance::LaunchClaim;
 use crate::skeleton;
 use crate::spinner::Spinner;
@@ -265,7 +266,10 @@ use crate::ssh_connection::{
     SshProfileStore, SshProvisioningEffects, SshRuntimeChannel, SshUpgradePolicy, TunnelProcess,
     TunnelSpec, default_ssh_config_path, discover_default_hosts, download_server_artifact_for_os,
     normalized_server_os, probe, resolve_effective_default, select_local_port,
-    select_server_artifact_for_os, supervisor, wsl::WslCommand, wsl_provision::WslProvisioner,
+    select_server_artifact_for_os, supervisor,
+    wsl::WslCommand,
+    wsl_profile::{WslConnectionProfile, WslProfileStore},
+    wsl_provision::{WslProvisionStage, WslProvisioner},
 };
 use crate::terminal_surface::{TerminalSurface, available_shells, bind_terminal_keys};
 use crate::typography as type_scale;
@@ -382,6 +386,217 @@ const PREPARING_ATTEMPT_ID: u64 = 0;
 fn publish_preparing_stage(stage: &std::sync::Mutex<PreparingStage>, next: PreparingStage) {
     if let Ok(mut stage) = stage.lock() {
         *stage = next;
+    }
+}
+
+/// The steps a WSL runtime deployment reports.
+///
+/// WSL has no SSH hop and no tunnel, so its sequence is its own rather than the
+/// nine SSH provisioning steps. It starts before the provisioner exists — the
+/// distro HOME read, the manifest, and the artifact download — which is exactly
+/// the window in which the click used to look inert.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WslProvisioningStep {
+    PreparingDistro,
+    CheckingEnvironment,
+    FetchingManifest,
+    DownloadingRuntime,
+    InstallingRuntime,
+    StartingRuntime,
+    WaitingForForwarding,
+    Pairing,
+    Connecting,
+    Ready,
+}
+
+impl WslProvisioningStep {
+    const ALL: [Self; 10] = [
+        Self::PreparingDistro,
+        Self::CheckingEnvironment,
+        Self::FetchingManifest,
+        Self::DownloadingRuntime,
+        Self::InstallingRuntime,
+        Self::StartingRuntime,
+        Self::WaitingForForwarding,
+        Self::Pairing,
+        Self::Connecting,
+        Self::Ready,
+    ];
+
+    fn index(self) -> usize {
+        Self::ALL
+            .iter()
+            .position(|candidate| *candidate == self)
+            .unwrap_or(0)
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::PreparingDistro => locale::text("Prepare distro", "准备发行版", "準備發行版"),
+            Self::CheckingEnvironment => locale::text("Check environment", "检查环境", "檢查環境"),
+            Self::FetchingManifest => {
+                locale::text("Fetch manifest", "获取发布清单", "取得發行清單")
+            }
+            Self::DownloadingRuntime => {
+                locale::text("Download runtime", "下载运行时", "下載執行階段")
+            }
+            Self::InstallingRuntime => {
+                locale::text("Install runtime", "安装运行时", "安裝執行階段")
+            }
+            Self::StartingRuntime => locale::text("Start runtime", "启动运行时", "啟動執行階段"),
+            Self::WaitingForForwarding => {
+                locale::text("Wait for forwarding", "等待端口转发", "等待連接埠轉送")
+            }
+            Self::Pairing => locale::text("Pair", "配对", "配對"),
+            Self::Connecting => locale::text("Connect", "连接", "連線"),
+            Self::Ready => locale::text("Ready", "就绪", "就緒"),
+        }
+    }
+
+    fn from_stage(stage: WslProvisionStage) -> Self {
+        match stage {
+            WslProvisionStage::ProbingEnvironment => Self::CheckingEnvironment,
+            WslProvisionStage::InstallingRuntime => Self::InstallingRuntime,
+            WslProvisionStage::StartingRuntime => Self::StartingRuntime,
+            WslProvisionStage::WaitingForForwarding => Self::WaitingForForwarding,
+            WslProvisionStage::Pairing => Self::Pairing,
+            WslProvisionStage::Connecting => Self::Connecting,
+            WslProvisionStage::Ready => Self::Ready,
+        }
+    }
+}
+
+/// The latest stage a WSL deployment task reached.
+///
+/// The task runs on Tokio and has no `AsyncApp`; it publishes here and the
+/// workbench's foreground poller turns the latest value into the progress
+/// dialog's snapshot.
+#[derive(Debug, Clone)]
+struct WslProvisioningStage {
+    step: WslProvisioningStep,
+    detail: String,
+}
+
+impl Default for WslProvisioningStage {
+    fn default() -> Self {
+        Self {
+            step: WslProvisioningStep::PreparingDistro,
+            detail: locale::text(
+                "Reading the distro's HOME…",
+                "正在读取发行版的 HOME…",
+                "正在讀取發行版的 HOME…",
+            )
+            .to_string(),
+        }
+    }
+}
+
+impl WslProvisioningStage {
+    fn new(step: WslProvisioningStep, detail: impl Into<String>) -> Self {
+        Self {
+            step,
+            detail: detail.into(),
+        }
+    }
+}
+
+/// Publishes a WSL deployment task's stage for the progress dialog.
+///
+/// Best-effort for the same reason as [`publish_preparing_stage`]: a poisoned
+/// lock means the workbench dropped the handle, and a missing detail line must
+/// never fail the deployment.
+fn publish_wsl_provisioning_stage(
+    stage: &std::sync::Mutex<WslProvisioningStage>,
+    next: WslProvisioningStage,
+) {
+    if let Ok(mut stage) = stage.lock() {
+        *stage = next;
+    }
+}
+
+/// One WSL deployment attempt, as the Connections page renders it.
+#[derive(Debug, Clone)]
+struct WslProvisioningSnapshot {
+    attempt_id: u64,
+    distro: String,
+    /// The port this attempt installs and starts on. Retrying from the
+    /// progress dialog must keep it; picking a new one belongs to the add
+    /// dialog, where the reader can see the port they chose.
+    port: u16,
+    step: WslProvisioningStep,
+    status: ProvisioningStatus,
+    detail: Option<String>,
+    error: Option<String>,
+}
+
+impl WslProvisioningSnapshot {
+    fn running(attempt_id: u64, distro: String, port: u16) -> Self {
+        Self {
+            attempt_id,
+            distro,
+            port,
+            step: WslProvisioningStep::PreparingDistro,
+            status: ProvisioningStatus::Running,
+            detail: Some(WslProvisioningStage::default().detail),
+            error: None,
+        }
+    }
+
+    fn step_label(&self) -> String {
+        format!(
+            "{}/{} · {}",
+            self.step.index() + 1,
+            WslProvisioningStep::ALL.len(),
+            self.step.label()
+        )
+    }
+}
+
+fn provisioning_status_label(status: ProvisioningStatus) -> &'static str {
+    match status {
+        ProvisioningStatus::Pending => locale::text("Waiting", "等待中", "等待中"),
+        ProvisioningStatus::Running => locale::text("Running", "进行中", "進行中"),
+        ProvisioningStatus::Cancelling => locale::text("Cancelling", "正在取消", "正在取消"),
+        ProvisioningStatus::Ready => locale::text("Ready", "已就绪", "已就緒"),
+        ProvisioningStatus::Failed => locale::text("Failed", "失败", "失敗"),
+        ProvisioningStatus::Cancelled => locale::text("Cancelled", "已取消", "已取消"),
+    }
+}
+
+/// The detail line a WSL provisioner stage publishes.
+fn wsl_provision_stage_detail(stage: WslProvisionStage) -> &'static str {
+    match stage {
+        WslProvisionStage::ProbingEnvironment => locale::text(
+            "Checking the WSL environment…",
+            "正在检查 WSL 环境…",
+            "正在檢查 WSL 環境…",
+        ),
+        WslProvisionStage::InstallingRuntime => locale::text(
+            "Installing the runtime in the distro…",
+            "正在发行版中安装运行时…",
+            "正在發行版中安裝執行階段…",
+        ),
+        WslProvisionStage::StartingRuntime => locale::text(
+            "Starting the runtime in the distro…",
+            "正在发行版中启动运行时…",
+            "正在發行版中啟動執行階段…",
+        ),
+        WslProvisionStage::WaitingForForwarding => locale::text(
+            "Waiting for WSL2 localhost forwarding…",
+            "正在等待 WSL2 本地端口转发…",
+            "正在等待 WSL2 本機連接埠轉送…",
+        ),
+        WslProvisionStage::Pairing => locale::text(
+            "Pairing this desktop with the runtime…",
+            "正在将此桌面端与运行时配对…",
+            "正在將此桌面端與執行階段配對…",
+        ),
+        WslProvisionStage::Connecting => locale::text(
+            "Connecting to the runtime…",
+            "正在连接运行时…",
+            "正在連線執行階段…",
+        ),
+        WslProvisionStage::Ready => locale::text("Runtime ready", "运行时已就绪", "執行階段已就緒"),
     }
 }
 
@@ -667,7 +882,16 @@ const SUBMISSION_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const REMOTE_EVENT_RETRY_DELAY: Duration = Duration::from_secs(2);
 const RUNTIME_UI_SIGNAL_BATCH_LIMIT: usize = 256;
 const RUNTIME_UI_SIGNAL_QUEUE_CAPACITY: usize = RUNTIME_UI_SIGNAL_BATCH_LIMIT;
+/// How long the runtime event pump coalesces ordinary UI signals.
 const RUNTIME_UI_SIGNAL_COALESCE_DELAY: Duration = Duration::from_millis(16);
+/// How long a streaming-only timeline batch waits before it is applied.
+///
+/// The Markdown source those events feed advances at most once every
+/// [`TIMELINE_STREAMING_MARKDOWN_REFRESH_INTERVAL`], so painting at the display
+/// refresh would draw the same body two or three times for every visible
+/// update. One 30fps tick matches the app's repeating-animation budget and
+/// leaves the stream's own arrival rate, not the display, as the floor.
+const RUNTIME_UI_STREAMING_COALESCE_DELAY: Duration = Duration::from_millis(33);
 /// How long a passive ownership pass waits before it walks the pages again.
 /// A stale root page wakes the pass instead of waiting this out.
 const DELEGATED_REFRESH_INTERVAL: Duration = Duration::from_secs(3);
@@ -5251,6 +5475,23 @@ fn timeline_live_event_is_streaming_only(event: &TimelineLiveEvent) -> bool {
     }
 }
 
+/// How long the event pump waits before applying a batch that starts with
+/// `signal`.
+///
+/// A batch that begins with a streaming-only timeline event is repainted on the
+/// animation budget instead of the display cadence. If a non-streaming event
+/// arrives during the wait it is folded into the same batch, so the only cost
+/// is up to one extra frame of latency for that event.
+fn runtime_ui_coalesce_delay(signal: Option<&RuntimeUiSignal>) -> Duration {
+    if let Some(RuntimeUiSignal::Event(event)) = signal
+        && let DesktopEvent::Timeline(timeline) = &**event
+        && timeline_live_event_is_streaming_only(timeline)
+    {
+        return RUNTIME_UI_STREAMING_COALESCE_DELAY;
+    }
+    RUNTIME_UI_SIGNAL_COALESCE_DELAY
+}
+
 fn timeline_batch_requires_auto_continue_refresh(events: &[TimelineLiveEvent]) -> bool {
     events.iter().any(|event| {
         if !timeline_live_event_is_well_formed(event) {
@@ -7444,6 +7685,67 @@ enum UserMessageEditActionState {
     Hidden,
     Disabled,
     Enabled,
+}
+
+#[derive(Clone)]
+struct UserMessageMenuContext {
+    row: TimelineRow,
+    row_id: String,
+    session_id: Option<VibexSessionId>,
+    turn_id: Option<String>,
+    first_sequence: i64,
+    last_sequence: i64,
+    authoritative_end_sequence: i64,
+    latest_user_message: bool,
+    turn_complete: bool,
+    edit_action_state: UserMessageEditActionState,
+    row_is_live_view: bool,
+    child_session: Option<String>,
+    copy_item: ClipboardItem,
+    attachments: Vec<MessageAttachment>,
+    mentions: Vec<VibexUseMention>,
+    timestamp: Option<i64>,
+}
+
+#[derive(Clone)]
+struct AgentMessageMenuContext {
+    row: TimelineRow,
+    row_id: String,
+    session_id: Option<VibexSessionId>,
+    turn_id: Option<String>,
+    last_sequence: i64,
+    streaming: bool,
+    foldable: bool,
+    row_is_live_view: bool,
+    child_session: Option<String>,
+    timestamp: Option<i64>,
+}
+
+#[derive(Clone)]
+struct TurnMenuContext {
+    turn_id: String,
+    session_id: Option<VibexSessionId>,
+    fork_sequence: i64,
+    process_collapsible: bool,
+    process_expanded: bool,
+    row_is_live_view: bool,
+    fork_disabled: bool,
+}
+
+#[derive(Clone)]
+struct SelectionMenuContext {
+    text: String,
+    markdown: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActivityCopyMode {
+    Primary,
+    Input,
+    Output,
+    Details,
+    Diff,
+    Path,
 }
 
 #[derive(Clone)]
@@ -10419,12 +10721,10 @@ pub struct VibexWorkbench {
     fps_monitor_recorder: Option<Task<()>>,
     pair_button_hovered: bool,
     update_snapshot: UpdateSnapshot,
-    /// Whether the title-bar update panel is open. The panel stays open until
-    /// the user closes it or the release it describes stops being relevant.
+    /// Whether the title-bar update panel is open. The panel opens only from
+    /// the title-bar entry and stays open until the user closes it or the
+    /// release it describes stops being relevant.
     update_panel_open: bool,
-    /// Release version the panel currently describes, so a newly discovered
-    /// version reopens it while snapshot progress updates do not.
-    update_panel_version: Option<String>,
     /// Release version whose automatic download has already been requested.
     update_auto_download_version: Option<String>,
     update_status_task: Option<Task<()>>,
@@ -10502,7 +10802,18 @@ pub struct VibexWorkbench {
     ssh_uninstall_error: Option<String>,
     #[allow(dead_code)]
     wsl_task: Option<Task<()>>,
+    /// The port preflight that runs before a WSL deployment starts.
+    wsl_port_check_task: Option<Task<()>>,
     wsl_error: Option<String>,
+    /// The WSL deployment currently connected to the progress surface.
+    ///
+    /// Kept after a terminal failure so the page and dialog can still show why
+    /// it stopped; a new attempt replaces it.
+    wsl_provisioning: Option<WslProvisioningSnapshot>,
+    /// The latest stage the deployment task published.
+    wsl_provisioning_stage: Option<Arc<std::sync::Mutex<WslProvisioningStage>>>,
+    wsl_provisioning_attempt: u64,
+    wsl_provisioning_poll_task: Option<Task<()>>,
     wsl_keepalive: Option<crate::ssh_connection::wsl::WslKeepalive>,
     wsl_watch_generation: u64,
     wsl_watch_task: Option<Task<()>>,
@@ -10558,6 +10869,9 @@ pub struct VibexWorkbench {
     runtime_edit_error: Option<String>,
     /// The runtime id a switch is connecting to; blocks a second switch.
     runtime_switch_pending: Option<String>,
+    /// A pairing link or code is being claimed; blocks a second claim while
+    /// the first is still talking to the server.
+    remote_pairing_pending: bool,
     /// The runtime a removal is confirming.
     runtime_remove_pending: Option<String>,
     /// The SSH profile whose upgrade is waiting for confirmation.
@@ -11159,9 +11473,13 @@ pub struct VibexWorkbench {
     composer_queue_ready_after_continuation_session_ids: BTreeSet<String>,
     composer_queue_interrupted_session_ids: BTreeSet<String>,
     composer_queue_steering_session_ids: BTreeSet<String>,
-    /// The queued message whose turn the queue is waiting on before it may hand
-    /// over the next entry. See [`ComposerQueueDispatchFence`].
-    composer_queue_dispatch_fence: Option<ComposerQueueDispatchFence>,
+    /// One fence per session whose handed-over message the queue is still
+    /// waiting on. See [`ComposerQueueDispatchFence`].
+    ///
+    /// One entry per session rather than a single slot: a turn that never
+    /// settles used to freeze every other session's queue with it, so a stuck
+    /// child Agent stopped the reader from sending anything anywhere.
+    composer_queue_dispatch_fences: BTreeMap<String, ComposerQueueDispatchFence>,
     /// Sessions whose live Agent runtime advertised native steering. The queue
     /// exposes the native steer action only for these sessions.
     native_steering_supported_session_ids: BTreeSet<String>,
@@ -12461,7 +12779,6 @@ impl VibexWorkbench {
             pair_button_hovered: false,
             update_snapshot: UpdateSnapshot::default(),
             update_panel_open: false,
-            update_panel_version: None,
             update_auto_download_version: None,
             update_status_task: None,
             update_action_task: None,
@@ -12492,7 +12809,12 @@ impl VibexWorkbench {
             ssh_uninstall_task: None,
             ssh_uninstall_error: None,
             wsl_task: None,
+            wsl_port_check_task: None,
             wsl_error: None,
+            wsl_provisioning: None,
+            wsl_provisioning_stage: None,
+            wsl_provisioning_attempt: 0,
+            wsl_provisioning_poll_task: None,
             wsl_keepalive: None,
             wsl_watch_generation: 0,
             wsl_watch_task: None,
@@ -12525,6 +12847,7 @@ impl VibexWorkbench {
             runtime_edit_local_port_input,
             runtime_edit_error: None,
             runtime_switch_pending: None,
+            remote_pairing_pending: false,
             runtime_remove_pending: None,
             runtime_upgrade_pending: None,
             runtime_uninstall_pending: None,
@@ -12775,7 +13098,7 @@ impl VibexWorkbench {
             composer_queue_ready_after_continuation_session_ids: BTreeSet::new(),
             composer_queue_interrupted_session_ids: BTreeSet::new(),
             composer_queue_steering_session_ids: BTreeSet::new(),
-            composer_queue_dispatch_fence: None,
+            composer_queue_dispatch_fences: BTreeMap::new(),
             native_steering_supported_session_ids: BTreeSet::new(),
             native_steering_probed_generations: BTreeMap::new(),
             optimistic_user_messages: BTreeMap::new(),
@@ -14945,43 +15268,19 @@ impl VibexWorkbench {
             || self.ui_state.desktop_behavior.show_update_prompts
     }
 
-    /// Keep the title-bar panel in step with the current release.
+    /// Close the title-bar panel when its release is gone or prompts are off.
     ///
-    /// A newly discovered version opens the panel so the user sees the
-    /// download or the offered update; snapshot progress updates for the same
-    /// version leave the user's open/closed choice alone.
+    /// Discovering a release updates only the title-bar entry: the panel opens
+    /// on the user's click, never on a background check. Snapshot progress for
+    /// the release therefore leaves the user's open/closed choice alone.
     fn sync_update_panel(&mut self, cx: &mut Context<Self>) {
-        let was_open = self.update_panel_open;
-        let Some(version) = self
-            .update_snapshot
-            .state
-            .release()
-            .map(|release| release.version.to_string())
-        else {
-            self.update_panel_version = None;
-            self.update_auto_download_version = None;
+        let has_release = self.update_snapshot.state.release().is_some();
+        if (!has_release || !self.update_surfaces_enabled()) && self.update_panel_open {
             self.update_panel_open = false;
-            if was_open {
-                cx.notify();
-            }
-            return;
-        };
-        if !self.update_surfaces_enabled() {
-            // Do not record the version while the surfaces are hidden, so
-            // enabling a preference later reveals the release.
-            self.update_panel_version = None;
-            self.update_panel_open = false;
-            if was_open {
-                cx.notify();
-            }
-            return;
+            cx.notify();
         }
-        if self.update_panel_version.as_deref() != Some(version.as_str()) {
-            self.update_panel_version = Some(version);
-            self.update_panel_open = true;
-            if !was_open {
-                cx.notify();
-            }
+        if !has_release {
+            self.update_auto_download_version = None;
         }
     }
 
@@ -15180,7 +15479,7 @@ impl VibexWorkbench {
                     let mut signals = vec![signal];
                     if !matches!(signals.first(), Some(RuntimeUiSignal::Shutdown)) {
                         cx.background_executor()
-                            .timer(RUNTIME_UI_SIGNAL_COALESCE_DELAY)
+                            .timer(runtime_ui_coalesce_delay(signals.first()))
                             .await;
                     }
                     while signals.len() < RUNTIME_UI_SIGNAL_BATCH_LIMIT {
@@ -15618,21 +15917,195 @@ impl VibexWorkbench {
         cx.notify();
     }
 
-    #[allow(dead_code)]
-    fn provision_wsl_distro(&mut self, distro: String, cx: &mut Context<Self>) {
+    /// Checks a chosen WSL port before the deployment spends minutes on the
+    /// artifact.
+    ///
+    /// The probe is the same fixed environment script the SSH path uses, run
+    /// on a blocking worker because `wsl.exe` is a process call. A busy port
+    /// keeps the add dialog open with the port number in the message, so the
+    /// reader changes one field instead of restarting the whole flow.
+    fn check_wsl_runtime_port(
+        &mut self,
+        distro: String,
+        port: u16,
+        generation: u64,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .wsl_provisioning
+            .as_ref()
+            .is_some_and(|snapshot| !snapshot.status.is_terminal())
+        {
+            self.open_wsl_progress_dialog(cx);
+            return;
+        }
+        let check_distro = distro.clone();
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            tokio::task::spawn_blocking(move || {
+                crate::ssh_connection::wsl::probe_environment(
+                    std::path::Path::new("wsl.exe"),
+                    &check_distro,
+                    port,
+                )
+                .map_err(|error| (error.code.to_string(), error.message))
+            })
+            .await
+            .map_err(|error| {
+                (
+                    "wsl_port_check_task_failed".to_string(),
+                    format!("the WSL port check stopped unexpectedly: {error}"),
+                )
+            })?
+        });
+        self.wsl_port_check_task = Some(cx.spawn(
+            async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let result = runner.await;
+                let _ = entity.update(cx, |this, cx| {
+                    // A closed dialog, or a newer check, owns the state this
+                    // result would write; dropping the stale answer is what
+                    // keeps a reopened dialog from starting a deployment the
+                    // reader did not ask for.
+                    let (current_generation, still_open) =
+                        this.settings_view.read_with(cx, |settings, _| {
+                            (
+                                settings.connections_wsl_check_generation,
+                                settings.connections_wsl_open,
+                            )
+                        });
+                    if current_generation != generation {
+                        return;
+                    }
+                    match result {
+                        Ok(Ok(_)) => {
+                            this.settings_view.update(cx, |settings, cx| {
+                                settings.connections_wsl_checking = false;
+                                settings.connections_wsl_check_error = None;
+                                cx.notify();
+                            });
+                            if still_open {
+                                this.settings_view.update(cx, |settings, cx| {
+                                    settings.connections_wsl_open = false;
+                                    cx.notify();
+                                });
+                                if let Some(window) = this.window_handle {
+                                    let _ = window.update(cx, |_, window, cx| {
+                                        window.close_dialog(cx);
+                                    });
+                                }
+                                this.provision_wsl_distro(distro, port, cx);
+                            }
+                        }
+                        Ok(Err((code, message))) => {
+                            let display = if code == "wsl_port_busy" {
+                                format!(
+                                    "{} {port} {}",
+                                    locale::text(
+                                        "The WSL runtime port",
+                                        "WSL 运行时端口",
+                                        "WSL 執行階段連接埠",
+                                    ),
+                                    locale::text(
+                                        "is already in use. Choose another port.",
+                                        "已被占用，请换一个端口。",
+                                        "已被占用，請換一個連接埠。",
+                                    )
+                                )
+                            } else {
+                                format!("{code}: {message}")
+                            };
+                            this.settings_view.update(cx, |settings, cx| {
+                                settings.connections_wsl_checking = false;
+                                settings.connections_wsl_check_error = Some(display);
+                                cx.notify();
+                            });
+                        }
+                        Err(_) => {
+                            this.settings_view.update(cx, |settings, cx| {
+                                settings.connections_wsl_checking = false;
+                                settings.connections_wsl_check_error = Some(
+                                    "wsl_port_check_task_failed: the WSL port check stopped unexpectedly"
+                                        .to_string(),
+                                );
+                                cx.notify();
+                            });
+                        }
+                    }
+                    cx.notify();
+                });
+            },
+        ));
+        cx.notify();
+    }
+
+    fn provision_wsl_distro(&mut self, distro: String, port: u16, cx: &mut Context<Self>) {
+        // A deployment already owns the progress surface. A second click must
+        // not start a competing install; reopen the run in flight instead.
+        if self
+            .wsl_provisioning
+            .as_ref()
+            .is_some_and(|snapshot| !snapshot.status.is_terminal())
+        {
+            self.open_wsl_progress_dialog(cx);
+            return;
+        }
         let Some(config) = self.config.clone() else {
-            self.wsl_error = Some("the runtime configuration is unavailable".to_string());
+            let error = "the runtime configuration is unavailable".to_string();
+            self.wsl_error = Some(error.clone());
+            self.queue_settings_operation_notice(SettingsOperationNotice::error(error), cx);
             cx.notify();
             return;
         };
         let Some(runtime) = self.runtime.clone() else {
-            self.wsl_error = Some("the local runtime is unavailable".to_string());
+            let error = "the local runtime is unavailable".to_string();
+            self.wsl_error = Some(error.clone());
+            self.queue_settings_operation_notice(SettingsOperationNotice::error(error), cx);
             cx.notify();
             return;
         };
         let desktop_home = config.home_dir.clone();
         self.wsl_error = None;
+        let attempt_id = self.wsl_provisioning_attempt.wrapping_add(1).max(1);
+        self.wsl_provisioning_attempt = attempt_id;
+        let stage = Arc::new(std::sync::Mutex::new(WslProvisioningStage::default()));
+        self.wsl_provisioning_stage = Some(stage.clone());
+        self.wsl_provisioning = Some(WslProvisioningSnapshot::running(
+            attempt_id,
+            distro.clone(),
+            port,
+        ));
+        self.sync_wsl_provisioning_settings(cx);
+        // The dialog appears on the click that started the work, not after the
+        // manifest and the artifact download have already spent minutes.
+        self.open_wsl_progress_dialog(cx);
+        let runner_stage = stage.clone();
+        self.wsl_provisioning_poll_task = Some(cx.spawn(
+            async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                loop {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(120))
+                        .await;
+                    let keep_going = entity
+                        .update(cx, |this, cx| this.poll_wsl_provisioning_stage(&stage, cx))
+                        .ok()
+                        .unwrap_or(false);
+                    if !keep_going {
+                        break;
+                    }
+                }
+            },
+        ));
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            publish_wsl_provisioning_stage(
+                &runner_stage,
+                WslProvisioningStage::new(
+                    WslProvisioningStep::PreparingDistro,
+                    locale::text(
+                        "Reading the distro's HOME…",
+                        "正在读取发行版的 HOME…",
+                        "正在讀取發行版的 HOME…",
+                    ),
+                ),
+            );
             let mut command = WslCommand::new("wsl.exe", &distro);
             let output = command
                 .run_script("printf '%s' \"$HOME\"", &[])
@@ -15648,16 +16121,38 @@ impl VibexWorkbench {
                 &remote_home,
                 &install_root,
                 std::slice::from_ref(&remote_home),
-                8765,
+                port,
                 &desktop_home,
             )
             .map_err(|error| format!("{}: {}", error.code, error.message))?;
+            publish_wsl_provisioning_stage(
+                &runner_stage,
+                WslProvisioningStage::new(
+                    WslProvisioningStep::CheckingEnvironment,
+                    locale::text(
+                        "Checking the WSL environment…",
+                        "正在检查 WSL 环境…",
+                        "正在檢查 WSL 環境…",
+                    ),
+                ),
+            );
             let environment = provisioner
                 .probe()
                 .map_err(|error| format!("{}: {}", error.code, error.message))?;
             let local = match debug_wsl_artifact(environment.arch)? {
                 Some(local) => local,
                 None => {
+                    publish_wsl_provisioning_stage(
+                        &runner_stage,
+                        WslProvisioningStage::new(
+                            WslProvisioningStep::FetchingManifest,
+                            locale::text(
+                                "Fetching the signed release manifest…",
+                                "正在获取签名发布清单…",
+                                "正在取得簽章發行清單…",
+                            ),
+                        ),
+                    );
                     let verified = runtime
                         .app_update()
                         .latest_verified_manifest()
@@ -15668,37 +16163,88 @@ impl VibexWorkbench {
                     let artifact =
                         select_server_artifact_for_os(&verified, "linux", environment.arch)
                             .map_err(|error| format!("{}: {}", error.code, error.message))?;
+                    publish_wsl_provisioning_stage(
+                        &runner_stage,
+                        WslProvisioningStage::new(
+                            WslProvisioningStep::DownloadingRuntime,
+                            locale::text(
+                                "Downloading the runtime…",
+                                "正在下载运行时…",
+                                "正在下載執行階段…",
+                            ),
+                        ),
+                    );
                     download_server_artifact_for_os(
                         artifact,
                         "linux",
                         &version,
                         environment.arch,
                         &desktop_home.join("ssh-artifacts"),
-                        |_, _| {},
+                        |done, total| {
+                            let detail = if total > 0 {
+                                format!(
+                                    "{} {done}/{total}",
+                                    locale::text(
+                                        "Downloading the runtime…",
+                                        "正在下载运行时…",
+                                        "正在下載執行階段…",
+                                    )
+                                )
+                            } else {
+                                locale::text(
+                                    "Downloading the runtime…",
+                                    "正在下载运行时…",
+                                    "正在下載執行階段…",
+                                )
+                                .to_string()
+                            };
+                            publish_wsl_provisioning_stage(
+                                &runner_stage,
+                                WslProvisioningStage::new(
+                                    WslProvisioningStep::DownloadingRuntime,
+                                    detail,
+                                ),
+                            );
+                        },
                     )
                     .await
                     .map_err(|error| format!("{}: {}", error.code, error.message))?
                 }
             };
+            publish_wsl_provisioning_stage(
+                &runner_stage,
+                WslProvisioningStage::new(
+                    WslProvisioningStep::InstallingRuntime,
+                    wsl_provision_stage_detail(WslProvisionStage::InstallingRuntime),
+                ),
+            );
             let now_ms = unix_timestamp_ms();
             let outcome = provisioner
-                .provision(&local, now_ms)
+                .provision_with_progress(&local, now_ms, |stage| {
+                    publish_wsl_provisioning_stage(
+                        &runner_stage,
+                        WslProvisioningStage::new(
+                            WslProvisioningStep::from_stage(stage),
+                            wsl_provision_stage_detail(stage),
+                        ),
+                    );
+                })
                 .await
                 .map_err(|error| format!("{}: {}", error.code, error.message))?;
             let runtime_id = outcome.pairing.runtime_id;
-            let profile = crate::ssh_connection::wsl_profile::WslConnectionProfile {
+            let profile = WslConnectionProfile {
                 id: format!("wsl-{now_ms}"),
                 distro: distro.clone(),
                 display_name: distro.clone(),
                 remote_home: remote_home.clone(),
                 install_root: install_root.clone(),
                 workspace_roots: vec![remote_home.clone()],
-                remote_port: 8765,
+                remote_port: port,
                 registered_runtime_id: Some(runtime_id.clone()),
                 created_at_ms: now_ms,
                 last_connected_at_ms: Some(now_ms),
             };
-            let store = crate::ssh_connection::wsl_profile::WslProfileStore::at_home(&desktop_home);
+            let store = WslProfileStore::at_home(&desktop_home);
             let mut profiles = store.load().unwrap_or_default();
             profiles.retain(|existing| {
                 existing.registered_runtime_id.as_deref() != Some(runtime_id.as_str())
@@ -15714,7 +16260,7 @@ impl VibexWorkbench {
                     DesktopRemoteCredential,
                     Arc<WebRemoteBackend>,
                     crate::ssh_connection::wsl::WslKeepalive,
-                    crate::ssh_connection::wsl_profile::WslConnectionProfile,
+                    WslConnectionProfile,
                 ),
                 String,
             >((
@@ -15730,6 +16276,34 @@ impl VibexWorkbench {
             async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
                 let result = runner.await;
                 let _ = entity.update(cx, |this, cx| {
+                    this.wsl_provisioning_stage = None;
+                    this.wsl_provisioning_poll_task = None;
+                    let terminal = match &result {
+                        Ok(Ok(_)) => ProvisioningStatus::Ready,
+                        Ok(Err(error)) => {
+                            this.wsl_error = Some(error.clone());
+                            ProvisioningStatus::Failed
+                        }
+                        Err(_) => {
+                            let error =
+                                "the WSL provisioning task stopped unexpectedly".to_string();
+                            this.wsl_error = Some(error);
+                            ProvisioningStatus::Failed
+                        }
+                    };
+                    if let Some(snapshot) = this.wsl_provisioning.as_mut() {
+                        snapshot.status = terminal;
+                        if terminal == ProvisioningStatus::Failed {
+                            snapshot.error = this.wsl_error.clone();
+                        } else {
+                            snapshot.step = WslProvisioningStep::Ready;
+                            snapshot.detail = Some(
+                                locale::text("Runtime connected", "运行时已连接", "執行階段已連線")
+                                    .to_string(),
+                            );
+                            snapshot.error = None;
+                        }
+                    }
                     match result {
                         Ok(Ok((runtime_id, distro, credential, backend, keepalive, profile))) => {
                             this.wsl_keepalive = Some(keepalive);
@@ -15758,31 +16332,174 @@ impl VibexWorkbench {
                                     "WSL 執行階段已連線"
                                 )
                             ));
+                            let progress_open = this.settings_view.read_with(cx, |settings, _| {
+                                settings.connections_wsl_progress_open
+                            });
+                            this.settings_view.update(cx, |settings, cx| {
+                                settings.reload_connections_profiles();
+                                settings.connections_wsl_progress_open = false;
+                                settings.connections_wsl_progress_dismissed = None;
+                                cx.notify();
+                            });
+                            // A successful deployment is announced by the new
+                            // row and the success hint; leaving the progress
+                            // dialog behind would ask the reader to close a run
+                            // that has already finished.
+                            if progress_open && let Some(window) = this.window_handle {
+                                let _ = window.update(cx, |_, window, cx| {
+                                    window.close_dialog(cx);
+                                });
+                            }
+                            this.queue_settings_operation_notice(
+                                SettingsOperationNotice::success(format!(
+                                    "{} {distro}",
+                                    locale::text(
+                                        "WSL runtime connected",
+                                        "WSL 运行时已连接",
+                                        "WSL 執行階段已連線"
+                                    )
+                                )),
+                                cx,
+                            );
                         }
                         Ok(Err(error)) => {
-                            this.wsl_error = Some(error.clone());
-                            // The WSL dialog closes on submit, so the failure is
-                            // announced on the hint layer instead of in a body
-                            // that is no longer on screen.
-                            this.queue_settings_operation_notice(
-                                SettingsOperationNotice::error(error),
-                                cx,
-                            );
+                            // A failure in an open dialog is read there; when
+                            // the reader already dismissed it, the hint layer
+                            // is the only place left to announce it.
+                            let dialog_open = this.settings_view.read_with(cx, |settings, _| {
+                                settings.connections_wsl_progress_open
+                            });
+                            if !dialog_open {
+                                this.queue_settings_operation_notice(
+                                    SettingsOperationNotice::error(error),
+                                    cx,
+                                );
+                            }
                         }
                         Err(_) => {
-                            let error = "the WSL task stopped unexpectedly".to_string();
-                            this.wsl_error = Some(error.clone());
-                            this.queue_settings_operation_notice(
-                                SettingsOperationNotice::error(error),
-                                cx,
-                            );
+                            let error =
+                                "the WSL provisioning task stopped unexpectedly".to_string();
+                            let dialog_open = this.settings_view.read_with(cx, |settings, _| {
+                                settings.connections_wsl_progress_open
+                            });
+                            if !dialog_open {
+                                this.queue_settings_operation_notice(
+                                    SettingsOperationNotice::error(error),
+                                    cx,
+                                );
+                            }
                         }
                     }
+                    this.sync_wsl_provisioning_settings(cx);
                     cx.notify();
                 });
             },
         ));
         cx.notify();
+    }
+
+    /// Copies the latest deployment stage into the snapshot the page and its
+    /// dialog render.
+    ///
+    /// Returns `false` once the attempt is terminal, which stops the poller.
+    fn poll_wsl_provisioning_stage(
+        &mut self,
+        stage: &Arc<std::sync::Mutex<WslProvisioningStage>>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(snapshot) = self.wsl_provisioning.as_ref() else {
+            return false;
+        };
+        if snapshot.status.is_terminal() {
+            return false;
+        }
+        let Ok(next) = stage.lock().map(|stage| stage.clone()) else {
+            return false;
+        };
+        // `provision_with_progress` re-probes before it installs. That stage is
+        // behind the app's own download stage, so a progress bar must never
+        // walk backwards for it.
+        if next.step.index() < snapshot.step.index() {
+            return true;
+        }
+        let unchanged =
+            snapshot.step == next.step && snapshot.detail.as_deref() == Some(next.detail.as_str());
+        if unchanged {
+            return true;
+        }
+        if let Some(snapshot) = self.wsl_provisioning.as_mut() {
+            snapshot.step = next.step;
+            snapshot.detail = Some(next.detail);
+        }
+        self.sync_wsl_provisioning_settings(cx);
+        cx.notify();
+        true
+    }
+
+    /// Publishes the WSL deployment snapshot and its live status to Settings.
+    fn sync_wsl_provisioning_settings(&self, cx: &mut Context<Self>) {
+        let snapshot = self.wsl_provisioning.clone();
+        self.settings_view.update(cx, |settings, cx| {
+            settings.connections_wsl_progress = snapshot;
+            cx.notify();
+        });
+        self.sync_connections_live_status(cx);
+    }
+
+    /// Opens the WSL progress dialog for the attempt on screen.
+    fn open_wsl_progress_dialog(&mut self, cx: &mut Context<Self>) {
+        let Some(window) = self.window_handle else {
+            return;
+        };
+        // Progress events and a second Connect click both land here; opening
+        // again while the dialog is mounted would stack dialogs on top of each
+        // other.
+        if self
+            .settings_view
+            .read_with(cx, |settings, _| settings.connections_wsl_progress_open)
+        {
+            return;
+        }
+        let settings = self.settings_view.downgrade();
+        let _ = window.update(cx, |_, window, cx| {
+            let _ = settings.update(cx, |settings, cx| {
+                settings.open_connections_wsl_progress_dialog(window, cx);
+            });
+        });
+    }
+
+    /// Reconnects one saved WSL connection from the Connections page.
+    ///
+    /// A profile that never paired is provisioned again; a paired one restores
+    /// its foreground keepalive and then reconnects the existing credential.
+    fn connect_wsl_connection(&mut self, profile_id: String, cx: &mut Context<Self>) {
+        let profile = self
+            .wsl_profiles
+            .iter()
+            .find(|profile| profile.id == profile_id)
+            .cloned()
+            .or_else(|| {
+                self.config.as_ref().and_then(|config| {
+                    WslProfileStore::at_home(&config.home_dir)
+                        .load()
+                        .ok()?
+                        .into_iter()
+                        .find(|profile| profile.id == profile_id)
+                })
+            });
+        let Some(profile) = profile else {
+            return;
+        };
+        let Some(runtime_id) = profile.registered_runtime_id.clone() else {
+            self.provision_wsl_distro(profile.distro, profile.remote_port, cx);
+            return;
+        };
+        let Some(runtime) = self.runtime_registry.remote(&runtime_id).cloned() else {
+            self.provision_wsl_distro(profile.distro, profile.remote_port, cx);
+            return;
+        };
+        self.runtime_connect_errors.remove(&runtime_id);
+        self.begin_wsl_restore(runtime, profile, RuntimeConnectOrigin::Switch, cx);
     }
 
     #[allow(dead_code)]
@@ -16595,6 +17312,15 @@ impl VibexWorkbench {
         let profiles = SshProfileStore::at_home(&config.home_dir)
             .load()
             .unwrap_or_default();
+        let bound_runtime_ids = profiles
+            .iter()
+            .filter_map(|profile| profile.registered_runtime_id.clone())
+            .chain(
+                self.wsl_profiles
+                    .iter()
+                    .filter_map(|profile| profile.registered_runtime_id.clone()),
+            )
+            .collect::<std::collections::BTreeSet<_>>();
         let mut live = BTreeMap::new();
         for profile in profiles {
             let status = match profile.registered_runtime_id.as_deref() {
@@ -16635,6 +17361,87 @@ impl VibexWorkbench {
                 None => ConnectionRowStatus::Offline,
             };
             live.insert(profile.id, status);
+        }
+        // WSL connections are local and carry their own store, but their
+        // liveness is the same registry/client fact as an SSH profile's. A WSL
+        // runtime that is not the active authority is offline, not connected.
+        for profile in &self.wsl_profiles {
+            let status = match profile.registered_runtime_id.as_deref() {
+                Some(runtime_id) => {
+                    if self.runtime_switch_pending.as_deref() == Some(runtime_id) {
+                        ConnectionRowStatus::Connecting
+                    } else if self.runtime_registry.active_runtime_id() != runtime_id {
+                        ConnectionRowStatus::Offline
+                    } else {
+                        match self
+                            .remote_client
+                            .as_ref()
+                            .filter(|client| client.runtime_id == runtime_id)
+                        {
+                            Some(client) => match client.backend.connection_state().state {
+                                RemoteConnectionState::Online | RemoteConnectionState::Degraded => {
+                                    ConnectionRowStatus::Connected
+                                }
+                                RemoteConnectionState::Reconnecting => {
+                                    ConnectionRowStatus::Connecting
+                                }
+                                RemoteConnectionState::Offline
+                                | RemoteConnectionState::Revoked
+                                | RemoteConnectionState::Incompatible => {
+                                    ConnectionRowStatus::NeedsAttention
+                                }
+                                RemoteConnectionState::Idle
+                                | RemoteConnectionState::Resolving
+                                | RemoteConnectionState::Probing
+                                | RemoteConnectionState::Connecting
+                                | RemoteConnectionState::Authenticating
+                                | RemoteConnectionState::Syncing => ConnectionRowStatus::Connecting,
+                            },
+                            None => ConnectionRowStatus::Offline,
+                        }
+                    }
+                }
+                None => ConnectionRowStatus::Offline,
+            };
+            live.insert(profile.id.clone(), status);
+        }
+        // Directly paired runtimes have no profile store of their own, so the
+        // registry loop is what gives their Settings row a live status.
+        for runtime in &self.runtime_registry.runtimes {
+            if bound_runtime_ids.contains(runtime.id.as_str()) {
+                continue;
+            }
+            let status = if self.runtime_switch_pending.as_deref() == Some(runtime.id.as_str()) {
+                ConnectionRowStatus::Connecting
+            } else if self.runtime_registry.active_runtime_id() != runtime.id {
+                ConnectionRowStatus::Offline
+            } else {
+                match self
+                    .remote_client
+                    .as_ref()
+                    .filter(|client| client.runtime_id == runtime.id)
+                {
+                    Some(client) => match client.backend.connection_state().state {
+                        RemoteConnectionState::Online | RemoteConnectionState::Degraded => {
+                            ConnectionRowStatus::Connected
+                        }
+                        RemoteConnectionState::Reconnecting => ConnectionRowStatus::Connecting,
+                        RemoteConnectionState::Offline
+                        | RemoteConnectionState::Revoked
+                        | RemoteConnectionState::Incompatible => {
+                            ConnectionRowStatus::NeedsAttention
+                        }
+                        RemoteConnectionState::Idle
+                        | RemoteConnectionState::Resolving
+                        | RemoteConnectionState::Probing
+                        | RemoteConnectionState::Connecting
+                        | RemoteConnectionState::Authenticating
+                        | RemoteConnectionState::Syncing => ConnectionRowStatus::Connecting,
+                    },
+                    None => ConnectionRowStatus::Offline,
+                }
+            };
+            live.insert(runtime.id.clone(), status);
         }
         self.settings_view.update(cx, |settings, cx| {
             settings.connections_live_status = live;
@@ -17551,6 +18358,177 @@ impl VibexWorkbench {
         cx.notify();
     }
 
+    /// Claims a pairing link or code, registers the runtime, and connects it.
+    ///
+    /// The claim and the registry write run off the foreground executor
+    /// because both reach the network or the home directory. The Settings
+    /// dialog stays open while this runs: a rejected code or a bad address
+    /// belongs next to the field that produced it, and only a registered
+    /// runtime is worth closing the dialog for.
+    fn begin_pairing_entry_connect(
+        &mut self,
+        entry: String,
+        server_url: String,
+        cx: &mut Context<Self>,
+    ) {
+        if self.remote_pairing_pending {
+            self.report_pairing_entry_failure(
+                "remote_pairing_busy".to_string(),
+                locale::text(
+                    "A pairing is already in progress.",
+                    "已有配对正在进行中。",
+                    "已有配對正在進行中。",
+                )
+                .to_string(),
+                cx,
+            );
+            return;
+        }
+        if self.runtime_switch_pending.is_some() {
+            self.report_pairing_entry_failure(
+                "remote_pairing_busy".to_string(),
+                locale::text(
+                    "Another runtime is connecting. Try again in a moment.",
+                    "另一个运行时正在连接，请稍后再试。",
+                    "另一個執行階段正在連線，請稍後再試。",
+                )
+                .to_string(),
+                cx,
+            );
+            return;
+        }
+        let Some(home_dir) = self.config.as_ref().map(|config| config.home_dir.clone()) else {
+            self.report_pairing_entry_failure(
+                "desktop_home_unavailable".to_string(),
+                "the desktop home is unavailable".to_string(),
+                cx,
+            );
+            return;
+        };
+        self.remote_pairing_pending = true;
+        let link = pairing_entry_is_link(&entry);
+        let allow_insecure_local_dev = cfg!(debug_assertions);
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            let credential = if link {
+                claim_server_pairing_link(entry, allow_insecure_local_dev).await
+            } else {
+                claim_server_pairing_code(server_url, entry, allow_insecure_local_dev).await
+            }
+            .map_err(|error| (error.code, error.message))?;
+            credential
+                .validate()
+                .map_err(|error| (error.code, error.message))?;
+            let store = DesktopRuntimeRegistryStore::new(&home_dir);
+            let mut registry = store.load_or_migrate();
+            let runtime_id = registry.upsert(credential.clone(), unix_timestamp_ms());
+            store
+                .save(&registry)
+                .map_err(|error| (error.code, error.message))?;
+            Ok::<(String, DesktopRemoteCredential), (String, String)>((runtime_id, credential))
+        });
+        self.boot_task = Some(cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            let outcome = runner.await;
+            let _ = entity.update(cx, |this, cx| {
+                this.remote_pairing_pending = false;
+                match outcome {
+                    Ok(Ok((runtime_id, credential))) => {
+                        this.finish_pairing_entry_success(runtime_id, credential, cx)
+                    }
+                    Ok(Err((code, message))) => {
+                        this.report_pairing_entry_failure(code, message, cx)
+                    }
+                    Err(_) => this.report_pairing_entry_failure(
+                        "remote_pairing_task_failed".to_string(),
+                        "the pairing task stopped unexpectedly".to_string(),
+                        cx,
+                    ),
+                }
+                cx.notify();
+            });
+        }));
+        cx.notify();
+    }
+
+    /// Completes a successful pairing claim: the row appears in Settings, the
+    /// dialog closes, and the stored credential starts its handshake.
+    fn finish_pairing_entry_success(
+        &mut self,
+        runtime_id: String,
+        credential: DesktopRemoteCredential,
+        cx: &mut Context<Self>,
+    ) {
+        // The claim worker wrote the registry on another thread; this entity
+        // still holds the copy it read at boot, so reload before looking up
+        // the row.
+        if let Some(store) = self.runtime_registry_store.clone() {
+            self.runtime_registry = store.load_or_migrate();
+        }
+        if self.runtime_registry.remote(&runtime_id).is_none() {
+            self.runtime_registry
+                .upsert(credential, unix_timestamp_ms());
+            self.persist_runtime_registry(cx);
+        }
+        let dialog_open = self
+            .settings_view
+            .read_with(cx, |settings, _| settings.connections_pairing_open);
+        self.settings_view.update(cx, |settings, cx| {
+            settings.connections_pairing_busy = false;
+            settings.connections_pairing_error = None;
+            settings.connections_pairing_open = false;
+            settings.reload_connections_profiles();
+            cx.notify();
+        });
+        if dialog_open && let Some(window) = self.window_handle {
+            let _ = window.update(cx, |_, window, cx| {
+                window.close_dialog(cx);
+            });
+        }
+        let Some(runtime) = self.runtime_registry.remote(&runtime_id).cloned() else {
+            return;
+        };
+        let label = runtime.display_label();
+        self.queue_settings_operation_notice(
+            SettingsOperationNotice::success(format!(
+                "{} {label}",
+                locale::text("Paired", "已配对", "已配對")
+            )),
+            cx,
+        );
+        self.begin_remote_connect(runtime, RuntimeConnectOrigin::Switch, cx);
+    }
+
+    /// Puts a failed pairing into the open dialog, where the reader can fix
+    /// the value they typed. The raw transport code stays alongside an
+    /// actionable sentence so an unmapped failure is still diagnosable.
+    fn report_pairing_entry_failure(
+        &mut self,
+        code: String,
+        message: String,
+        cx: &mut Context<Self>,
+    ) {
+        let display = pairing_entry_error_copy(&code)
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("{code}: {message}"));
+        self.settings_view.update(cx, |settings, cx| {
+            settings.connections_pairing_busy = false;
+            settings.connections_pairing_error = Some(display);
+            cx.notify();
+        });
+    }
+
+    /// Reconnects a runtime that was paired directly, without a profile to
+    /// rebuild a tunnel from.
+    fn connect_paired_runtime(&mut self, runtime_id: String, cx: &mut Context<Self>) {
+        if self.runtime_switch_pending.is_some() {
+            return;
+        }
+        let Some(runtime) = self.runtime_registry.remote(&runtime_id).cloned() else {
+            return;
+        };
+        self.runtime_connect_errors.remove(&runtime_id);
+        self.begin_remote_connect(runtime, RuntimeConnectOrigin::Switch, cx);
+    }
+
     /// Connects to a registered remote runtime and installs it once the
     /// handshake succeeds. The runtime that is currently authoritative keeps
     /// running until then, so a failed switch leaves the workbench exactly
@@ -17953,26 +18931,73 @@ impl VibexWorkbench {
         }
     }
 
+    /// Removes the WSL store entry bound to a runtime.
+    ///
+    /// The WSL profile is the only record of which distro produced a runtime,
+    /// so deleting the runtime from the manager must delete it too; otherwise
+    /// the Connections page keeps a row for a runtime that no longer exists.
+    fn remove_wsl_profile_for_runtime(&mut self, runtime_id: &str) {
+        let Some(config) = self.config.as_ref() else {
+            return;
+        };
+        let store = WslProfileStore::at_home(&config.home_dir);
+        let Ok(mut profiles) = store.load() else {
+            return;
+        };
+        let before = profiles.len();
+        profiles.retain(|profile| profile.registered_runtime_id.as_deref() != Some(runtime_id));
+        if profiles.len() != before {
+            let _ = store.save(&profiles);
+        }
+        self.wsl_profiles
+            .retain(|profile| profile.registered_runtime_id.as_deref() != Some(runtime_id));
+    }
+
     fn remove_runtime(&mut self, id: String, cx: &mut Context<Self>) {
+        let was_wsl = self
+            .wsl_profiles
+            .iter()
+            .any(|profile| profile.registered_runtime_id.as_deref() == Some(id.as_str()));
+        let was_active_wsl = was_wsl && self.runtime_registry.active_runtime_id() == id;
         if !self.runtime_registry.remove(&id) {
             return;
         }
         self.runtime_compatibility.remove(&id);
         self.remove_ssh_profile_for_runtime(&id);
+        self.remove_wsl_profile_for_runtime(&id);
+        self.wsl_runtime_labels.remove(&id);
+        if was_active_wsl {
+            // The foreground child is the only thing keeping this distro's
+            // server alive. Dropping it is this shell's uninstall; an inactive
+            // WSL runtime shares no keepalive with the active one.
+            self.wsl_keepalive = None;
+            self.wsl_watch_generation = self.wsl_watch_generation.wrapping_add(1);
+            self.wsl_watch_task = None;
+        }
         self.runtime_remove_pending = None;
-        if self
+        let was_active_remote = self
             .remote_client
             .as_ref()
             .map(|client| client.runtime_id.as_str())
-            == Some(id.as_str())
-        {
+            == Some(id.as_str());
+        if was_active_remote {
             self.remote_client = None;
-            self.persist_runtime_registry(cx);
-            self.activate_local_runtime(cx);
-            return;
         }
+        // Settings reads the runtime registry from disk when it reloads. The
+        // registry has to be on disk first, or the page re-reads the file that
+        // still contains the removed runtime and paints its row back until the
+        // page is reopened. This is especially visible for a directly paired
+        // runtime, whose row has no profile store to disappear on its own.
         self.persist_runtime_registry(cx);
-        cx.notify();
+        if was_active_remote {
+            self.activate_local_runtime(cx);
+        } else {
+            cx.notify();
+        }
+        self.settings_view.update(cx, |settings, cx| {
+            settings.reload_connections_profiles();
+            cx.notify();
+        });
     }
 
     /// Deletes the runtime side of a removed SSH connection.
@@ -18026,6 +19051,39 @@ impl VibexWorkbench {
         {
             self.remove_runtime(runtime_id, cx);
         }
+        cx.notify();
+    }
+
+    /// Deletes the runtime side of a removed WSL connection.
+    ///
+    /// The WSL store entry is already gone by the time this runs. An in-flight
+    /// deployment for the same distro is dropped so it cannot save a profile
+    /// the reader just removed; a paired runtime is removed through the same
+    /// path the runtime manager uses.
+    fn remove_wsl_connection_runtime(
+        &mut self,
+        profile: WslConnectionProfile,
+        cx: &mut Context<Self>,
+    ) {
+        if self.wsl_provisioning.as_ref().is_some_and(|snapshot| {
+            snapshot.distro == profile.distro && !snapshot.status.is_terminal()
+        }) {
+            self.wsl_task = None;
+            self.wsl_provisioning_poll_task = None;
+            self.wsl_provisioning_stage = None;
+            self.wsl_provisioning = None;
+            self.sync_wsl_provisioning_settings(cx);
+        }
+        if let Some(runtime_id) = profile.registered_runtime_id
+            && self.runtime_registry.remote(&runtime_id).is_some()
+        {
+            self.remove_runtime(runtime_id, cx);
+        }
+        self.wsl_profiles.retain(|saved| saved.id != profile.id);
+        self.settings_view.update(cx, |settings, cx| {
+            settings.reload_connections_profiles();
+            cx.notify();
+        });
         cx.notify();
     }
 
@@ -19450,7 +20508,7 @@ impl VibexWorkbench {
                     let mut signals = vec![signal];
                     if !matches!(signals.first(), Some(RuntimeUiSignal::Shutdown)) {
                         cx.background_executor()
-                            .timer(RUNTIME_UI_SIGNAL_COALESCE_DELAY)
+                            .timer(runtime_ui_coalesce_delay(signals.first()))
                             .await;
                     }
                     while signals.len() < RUNTIME_UI_SIGNAL_BATCH_LIMIT {
@@ -20916,6 +21974,30 @@ impl VibexWorkbench {
         }
     }
 
+    /// Releases the optimistic dispatch flags of sessions whose submission
+    /// never reached the provider.
+    ///
+    /// The flag exists to paint a locally dispatched turn as running before the
+    /// authority admits it, and only an authoritative snapshot can normally
+    /// answer it. A submission that failed or was cancelled before
+    /// `dispatched_at_ms` is that same authority saying the turn never started:
+    /// no snapshot will follow to release the flag, so the queue it holds would
+    /// wait for a turn that does not exist.
+    fn release_unadmitted_turn_flags(&mut self, session_ids: &BTreeSet<String>) {
+        if session_ids.is_empty() {
+            return;
+        }
+        for session_id in session_ids {
+            let Ok(session_id) = VibexSessionId::parse(session_id.clone()) else {
+                continue;
+            };
+            if self.session_turn_pending(&session_id) {
+                self.set_session_turn_pending(&session_id, false);
+            }
+            self.mark_composer_queue_for_recheck(&session_id);
+        }
+    }
+
     fn release_initial_turn_interrupt_lock(&mut self, interrupted: bool) {
         if interrupted {
             self.agent_action_pending = false;
@@ -21165,9 +22247,8 @@ impl VibexWorkbench {
         // turn the queue is waiting on has to wake the same re-evaluation as a
         // session that still holds an entry.
         let holds_the_fence = self
-            .composer_queue_dispatch_fence
-            .as_ref()
-            .is_some_and(|fence| fence.session_id == *session_id);
+            .composer_queue_dispatch_fences
+            .contains_key(session_id.as_str());
         if holds_an_entry || holds_the_fence {
             self.composer_queue_ready_after_continuation_session_ids
                 .insert(session_id.as_str().to_string());
@@ -21189,9 +22270,11 @@ impl VibexWorkbench {
             .iter()
             .map(|message| message.session_id.clone())
             .collect::<BTreeSet<_>>();
-        if let Some(fence) = self.composer_queue_dispatch_fence.as_ref() {
-            referenced.insert(fence.session_id.clone());
-        }
+        referenced.extend(
+            self.composer_queue_dispatch_fences
+                .values()
+                .map(|fence| fence.session_id.clone()),
+        );
         for session_id in referenced {
             let Some((state, revision)) = self
                 .registered_session(session_id.as_str())
@@ -31099,6 +32182,10 @@ impl VibexWorkbench {
             .session
             .enhanced_file_operation_display
             .hash(&mut hasher);
+        self.ui_state
+            .session
+            .auto_collapse_tool_calls
+            .hash(&mut hasher);
         turn.process_rows.len().hash(&mut hasher);
         // A thought that is still arriving draws its window without being
         // opened, so the trailing row's streaming flag is part of the turn's
@@ -31182,6 +32269,10 @@ impl VibexWorkbench {
             .session
             .enhanced_file_operation_display
             .hash(&mut hasher);
+        self.ui_state
+            .session
+            .auto_collapse_tool_calls
+            .hash(&mut hasher);
 
         turn.process_rows.len().hash(&mut hasher);
         {
@@ -31244,6 +32335,7 @@ impl VibexWorkbench {
                         turn,
                         group,
                         self.timeline_command_expansion.get(&group.id).copied(),
+                        self.ui_state.session.auto_collapse_tool_calls,
                     )
                     .hash(&mut hasher);
                 }
@@ -31298,6 +32390,10 @@ impl VibexWorkbench {
         self.ui_state
             .session
             .enhanced_file_operation_display
+            .hash(&mut hasher);
+        self.ui_state
+            .session
+            .auto_collapse_tool_calls
             .hash(&mut hasher);
         // The estimate wraps its row bodies against the pane the timeline last
         // painted into, so a memoized estimate stops being valid the moment
@@ -32936,8 +34032,10 @@ impl VibexWorkbench {
     /// row on screen.
     fn apply_delegation_edit_choice(
         &mut self,
+        target: ComposerTarget,
         agent_id: AgentId,
         selection_ref: String,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some(option) = self
@@ -32976,6 +34074,10 @@ impl VibexWorkbench {
         {
             apply_delegation_selection_to_entry(entry, &agent_id, &option);
         }
+        // A draft may already carry this Agent's chip. It names the same
+        // collaborator but still remembers the old configuration; leaving it
+        // would make the message disagree with the row the reader just edited.
+        self.rewrite_delegation_mention_tokens(target, &agent_id, &option, window, cx);
         self.suggestion_tab = ComposerSuggestionTab::Delegation;
         let edited = self
             .delegation_suggestions
@@ -32987,6 +34089,55 @@ impl VibexWorkbench {
             self.suggestion_scroll.scroll_to_item(index);
         }
         cx.notify();
+    }
+
+    /// Re-points every `@Agent` chip already in `target`'s draft at `option`.
+    ///
+    /// The chip's visible label is only `@Agent`; the configuration lives in
+    /// the encoded mention id. Editing the row must therefore rewrite that id
+    /// too, or the next send would carry the configuration the reader just
+    /// replaced.
+    fn rewrite_delegation_mention_tokens(
+        &mut self,
+        target: ComposerTarget,
+        agent_id: &AgentId,
+        option: &SessionRuntimeOption,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(input) = self.input_for_composer_target(target) else {
+            return;
+        };
+        let Some(reference) = vibex_core::VibexUseRef::parse(&runtime_option_ref(option)) else {
+            return;
+        };
+        let updates = input
+            .read(cx)
+            .tokens()
+            .iter()
+            .filter_map(|span| {
+                let mention = VibexUseMention::parse(span.token().id().as_ref())?;
+                if mention.kind != vibex_core::VibexUseMentionKind::Agent
+                    || mention.agent_id.as_ref() != Some(agent_id)
+                {
+                    return None;
+                }
+                let next = VibexUseMention::agent(agent_id, &reference, None);
+                Some((
+                    span.range(),
+                    InlineToken::new(next.encode(), span.token().text().clone())
+                        .with_label(span.token().label().to_string()),
+                ))
+            })
+            .collect::<Vec<_>>();
+        if updates.is_empty() {
+            return;
+        }
+        input.update(cx, |input, cx| {
+            for (range, token) in updates {
+                let _ = input.replace_range_with_token(range, token, window, cx);
+            }
+        });
     }
 
     fn apply_suggestion(
@@ -33001,7 +34152,7 @@ impl VibexWorkbench {
         // mention: it writes the Agent's explicit delegation choice and leaves
         // the draft untouched.
         if let Some((agent_id, selection_ref)) = delegation_edit_target(&entry) {
-            self.apply_delegation_edit_choice(agent_id, selection_ref, cx);
+            self.apply_delegation_edit_choice(target, agent_id, selection_ref, window, cx);
             return;
         }
         let Some(input) = self.input_for_composer_target(target) else {
@@ -34095,13 +35246,8 @@ impl VibexWorkbench {
                 // A remote submission that never landed cannot produce the
                 // completion the pre-send queue is waiting on, so it releases the
                 // fence instead of stranding every message behind it.
-                if !completed
-                    && this
-                        .composer_queue_dispatch_fence
-                        .as_ref()
-                        .is_some_and(|fence| fence.message_id == message_id)
-                {
-                    this.composer_queue_dispatch_fence = None;
+                if !completed {
+                    this.release_composer_queue_fence(message_id);
                 }
                 let _ = window;
                 cx.notify();
@@ -34398,13 +35544,8 @@ impl VibexWorkbench {
                 // conversational turn of its own, cannot produce the completion
                 // the pre-send queue is waiting on. Releasing the fence here
                 // keeps one failed send from stranding every message behind it.
-                if (!completed || is_command)
-                    && this
-                        .composer_queue_dispatch_fence
-                        .as_ref()
-                        .is_some_and(|fence| fence.message_id == message_id)
-                {
-                    this.composer_queue_dispatch_fence = None;
+                if !completed || is_command {
+                    this.release_composer_queue_fence(message_id);
                 }
                 if completed || steering || interrupted {
                     this.maybe_dispatch_next_composer_queue_message(
@@ -34547,20 +35688,13 @@ impl VibexWorkbench {
         // front of it.
         //
         // The fence keeps the queue one-at-a-time behind the turn the last
-        // hand-over started. A schedule is a promise about a moment, and a turn
-        // running in a *different* session has no claim on that moment: waiting
-        // for it can hold the due message for as long as the other Agent runs,
-        // which is how a schedule misses its time while its own session is
-        // settled. The target session's own state and pending flag below already
-        // keep a schedule from overlapping a turn in the session it sends to.
-        let schedule_overtakes_another_sessions_turn = scheduled_at_ms.is_some()
-            && self
-                .composer_queue_dispatch_fence
-                .as_ref()
-                .is_some_and(|fence| fence.session_id != session_id);
+        // hand-over started, and it is scoped to the session that hand-over
+        // belongs to. A turn running in another session has no claim on this
+        // message: waiting for it could hold a due schedule for as long as the
+        // other Agent runs, and — before the fence was per-session — let one
+        // stuck child Agent freeze every session's queue.
         let fence_blocks = !composer_queue_behavior_is_explicit(behavior)
-            && !schedule_overtakes_another_sessions_turn
-            && self.composer_queue_fence_blocks();
+            && self.composer_queue_fence_blocks(&session_id);
         // An unobserved revision is not proof of a normal completion, so the
         // queue asks for a verdict. When nothing can judge the boundary right
         // now, the session's own settled state is the best evidence the queue
@@ -34586,11 +35720,14 @@ impl VibexWorkbench {
         }
         let message = self.composer_queue.remove(index);
         let message_id = message.id;
-        self.composer_queue_dispatch_fence = Some(ComposerQueueDispatchFence {
-            session_id: message.session_id.clone(),
-            message_id,
-            awaits_turn: message.command_invocation.is_none(),
-        });
+        self.composer_queue_dispatch_fences.insert(
+            message.session_id.as_str().to_string(),
+            ComposerQueueDispatchFence {
+                session_id: message.session_id.clone(),
+                message_id,
+                awaits_turn: message.command_invocation.is_none(),
+            },
+        );
         self.publish_sidebar_invalidation();
         self.dispatch_admitted_composer_message(message, behavior, window, cx);
         // The one hand-over the submission path still refuses — a local runtime
@@ -34607,7 +35744,7 @@ impl VibexWorkbench {
                 let message = self.composer_queue.remove(bounced);
                 self.composer_queue.insert(0, message);
             }
-            self.composer_queue_dispatch_fence = None;
+            self.release_composer_queue_fence(message_id);
         }
         // The send left the queue, so its name no longer stands and the
         // persisted queue must not bring the message back on the next launch.
@@ -34620,14 +35757,18 @@ impl VibexWorkbench {
     }
 
     /// Whether the pre-send queue is still waiting for the turn of the message it
-    /// handed over last.
+    /// handed over last in `session_id`.
     ///
     /// The queue advances one message at a time: after an entry leaves it, the
     /// entries behind it wait while that message's turn still occupies its
     /// session. The fence never waits on an asynchronous verdict, so a session
     /// that cannot answer a probe still releases the queue once it settles.
-    fn composer_queue_fence_blocks(&self) -> bool {
-        let Some(fence) = self.composer_queue_dispatch_fence.as_ref() else {
+    ///
+    /// Only the target session's own fence can hold its next entry. A turn
+    /// running in another session used to hold every session's queue, so one
+    /// stuck child Agent stopped the reader from sending anywhere.
+    fn composer_queue_fence_blocks(&self, session_id: &VibexSessionId) -> bool {
+        let Some(fence) = self.composer_queue_dispatch_fences.get(session_id.as_str()) else {
             return false;
         };
         if !fence.awaits_turn {
@@ -34638,6 +35779,16 @@ impl VibexWorkbench {
             self.registered_session(fence.session_id.as_str())
                 .map(|session| session.state),
         )
+    }
+
+    /// Drops the fence of the handed-over message `message_id`.
+    ///
+    /// Keyed by message rather than by session: a completion may arrive after a
+    /// newer hand-over replaced the entry, and that newer fence must not be
+    /// released by the older message's settle.
+    fn release_composer_queue_fence(&mut self, message_id: u64) {
+        self.composer_queue_dispatch_fences
+            .retain(|_, fence| fence.message_id != message_id);
     }
 
     /// Re-evaluates the pre-send queue after a turn outcome became known.
@@ -35296,6 +36447,13 @@ impl VibexWorkbench {
     ) {
         let mut completed_session_ids = BTreeSet::new();
         let mut ambiguous_any = false;
+        // A submission that ended before it ever reached the provider proves no
+        // turn was admitted for its session. The local dispatch flag was armed
+        // optimistically, though, and only an authoritative snapshot written
+        // after the dispatch is allowed to answer it — a failed or cancelled
+        // submission writes no such snapshot. The flag then outlived the
+        // message it spoke for and held that session's queue forever.
+        let mut unadmitted_session_ids = BTreeSet::new();
         for state in &states {
             if matches!(
                 state.status,
@@ -35308,11 +36466,20 @@ impl VibexWorkbench {
                         && locator.message_idempotency_key == state.message_idempotency_key)
                 });
             }
+            if state.dispatched_at_ms.is_none()
+                && matches!(
+                    state.status,
+                    MessageSubmissionStatus::Failed | MessageSubmissionStatus::Cancelled
+                )
+            {
+                unadmitted_session_ids.insert(state.session_id.as_str().to_string());
+            }
             if state.status == MessageSubmissionStatus::Completed {
                 completed_session_ids.insert(state.session_id.as_str().to_string());
             }
             ambiguous_any |= state.status == MessageSubmissionStatus::AmbiguousPromptDispatch;
         }
+        self.release_unadmitted_turn_flags(&unadmitted_session_ids);
         if ambiguous_any {
             hint_layer::push(
                 window,
@@ -35365,6 +36532,26 @@ impl VibexWorkbench {
         self.composer_submission_states
             .retain(|state| state.message_idempotency_key != message_idempotency_key);
         cx.notify();
+    }
+
+    /// Dismisses an unsent message's status row and the row it painted.
+    ///
+    /// Dismissing alone left the optimistic user message on the timeline with
+    /// nothing behind it: the submission is terminal, so no authoritative row
+    /// will ever replace it. Discarding the draft is the other half of the
+    /// reader's answer that this message is gone.
+    fn discard_failed_submission(
+        &mut self,
+        session_id: &VibexSessionId,
+        message_idempotency_key: String,
+        cx: &mut Context<Self>,
+    ) {
+        // A newer dispatch owns the session's optimistic row now; the row being
+        // dismissed belongs to the failed message, which has no other trace.
+        if !self.session_turn_pending(session_id) {
+            self.discard_optimistic_user_message(session_id);
+        }
+        self.dismiss_submission_status(message_idempotency_key, cx);
     }
 
     fn submission_runtime_label(&self, selection: &SessionRuntimeSelection) -> String {
@@ -35452,6 +36639,22 @@ impl VibexWorkbench {
                             .to_string(),
                     };
                     let dismiss_key = state.message_idempotency_key.clone();
+                    let dismiss_session = state.session_id.clone();
+                    // A row that only reports "not sent" leaves the reader with
+                    // nothing to do about it: the text is gone from the composer
+                    // and the durable submission will never be delivered. The
+                    // draft is still held in the optimistic message, so it can
+                    // be handed back to the composer as an ordinary draft and
+                    // sent again under a fresh key.
+                    let recoverable = terminal
+                        && self
+                            .optimistic_user_messages
+                            .get(state.session_id.as_str())
+                            .is_some_and(|message| {
+                                !message.text.trim().is_empty() || !message.attachments.is_empty()
+                            });
+                    let recover_key = state.message_idempotency_key.clone();
+                    let recover_session = state.session_id.clone();
                     h_flex()
                         .w_full()
                         .min_w_0()
@@ -35486,7 +36689,32 @@ impl VibexWorkbench {
                                 .child(label),
                         )
                         .when(terminal, |this| {
-                            this.child(
+                            this.when(recoverable, |this| {
+                                this.child(
+                                    Button::new(SharedString::from(format!(
+                                        "retry-submission-{}",
+                                        state.message_idempotency_key
+                                    )))
+                                    .xsmall()
+                                    .ghost()
+                                    .compact()
+                                    .label(locale::text("Retry", "重试", "重試"))
+                                    .tooltip(locale::text(
+                                        "Put this message back in the composer",
+                                        "把这条消息放回输入框",
+                                        "把這則訊息放回輸入框",
+                                    ))
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.requeue_failed_submission(
+                                            &recover_session,
+                                            &recover_key,
+                                            window,
+                                            cx,
+                                        );
+                                    })),
+                                )
+                            })
+                            .child(
                                 Button::new(SharedString::from(format!(
                                     "dismiss-submission-{}",
                                     state.message_idempotency_key
@@ -35497,13 +36725,17 @@ impl VibexWorkbench {
                                 .size(px(24.0))
                                 .icon(IconName::Close)
                                 .tooltip(locale::text(
-                                    "Dismiss submission status",
-                                    "关闭提交状态",
-                                    "關閉提交狀態",
+                                    "Discard this unsent message",
+                                    "丢弃这条未发送的消息",
+                                    "丟棄這則未傳送的訊息",
                                 ))
                                 .on_click(cx.listener(
                                     move |this, _, _, cx| {
-                                        this.dismiss_submission_status(dismiss_key.clone(), cx)
+                                        this.discard_failed_submission(
+                                            &dismiss_session,
+                                            dismiss_key.clone(),
+                                            cx,
+                                        )
                                     },
                                 )),
                             )
@@ -35512,6 +36744,69 @@ impl VibexWorkbench {
                 }))
                 .into_any_element(),
         )
+    }
+
+    /// Hands one unsent message back to the composer as an ordinary draft.
+    ///
+    /// The durable submission is already terminal, so it will never be
+    /// delivered; the text lives only in the optimistic row the failed dispatch
+    /// installed. Restoring it — mentions included — is what makes the row's
+    /// "not sent" a recoverable state instead of a dead end, and the retry goes
+    /// out under a fresh idempotency key because the old one is spent.
+    fn requeue_failed_submission(
+        &mut self,
+        session_id: &VibexSessionId,
+        message_idempotency_key: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(message) = self
+            .optimistic_user_messages
+            .get(session_id.as_str())
+            .cloned()
+        else {
+            self.dismiss_submission_status(message_idempotency_key.to_string(), cx);
+            return;
+        };
+        self.discard_optimistic_user_message(session_id);
+        self.dismiss_submission_status(message_idempotency_key.to_string(), cx);
+        // The text an unsent message carries may refer to its attachments by
+        // marker, so the two have to be rebuilt together: a bare text restore
+        // would show `attachment_1_…_vbx` instead of the picture.
+        let (text, attachments, serial) = composer_queue_edit_insertion(
+            &message.text,
+            &message.attachments,
+            self.composer_attachment_serial,
+        );
+        let content = composer_content_with_mentions(&text, &message.mentions);
+        if self.selected_session_id.as_ref() != Some(session_id) {
+            // The row belongs to a session that is not on screen; the draft is
+            // what the reader will find when they go back to it.
+            self.composer_attachment_serial = serial;
+            self.composer_drafts.save(
+                session_id.as_str(),
+                ComposerDraft {
+                    content,
+                    attachments,
+                    command_entry: None,
+                    attachment_serial: serial,
+                    schedule: None,
+                },
+            );
+            cx.notify();
+            return;
+        }
+        self.composer_attachment_serial = serial;
+        let input = self.ensure_composer_input(window, cx);
+        input.update(cx, |input, cx| {
+            input.set_value(content, window, cx);
+            input.focus(window, cx);
+        });
+        self.composer_attachments = attachments;
+        self.composer_command_entry = None;
+        self.agent_error = None;
+        self.remember_composer_draft(cx);
+        cx.notify();
     }
 
     fn sync_inline_composer_attachments(&mut self, new_session: bool, cx: &App) {
@@ -37676,21 +38971,32 @@ impl VibexWorkbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if url.starts_with('#') {
-            return;
-        }
-        if let Ok(parsed) = url::Url::parse(url) {
-            if matches!(parsed.scheme(), "http" | "https") {
+        match markdown_link_kind(url) {
+            MarkdownLinkKind::Web => {
                 self.open_web_link(url, window, cx);
+                return;
+            }
+            MarkdownLinkKind::Unsupported => return,
+            MarkdownLinkKind::Local => {}
+        }
+        let workspace_root = self
+            .selected_session()
+            .map(|session| session.workspace_root.as_str());
+        // A `file:` URL or a Windows drive path is a platform path, not a
+        // workspace link: the first parses as its own scheme and the second as
+        // a one-letter scheme, and `resolve_workspace_path` rejects the drive's
+        // `:`. Both are handed to the resolver that compares real paths, with
+        // any editor location and POSIX drive slash removed first.
+        if is_file_url(url) || is_windows_drive_path(url) {
+            let destination = local_file_path(url);
+            if let Some(target) = agent_file_operation_preview_path(&destination, workspace_root) {
+                self.open_code_file(target, window, cx);
             }
             return;
         }
         let Some(resolved) = resolve_workspace_path(base_path, url) else {
             return;
         };
-        let workspace_root = self
-            .selected_session()
-            .map(|session| session.workspace_root.as_str());
         if let Some(target) = agent_markdown_preview_path(url, &resolved, workspace_root) {
             self.open_code_file(target, window, cx);
         }
@@ -48034,6 +49340,24 @@ impl VibexWorkbench {
         cx.notify();
     }
 
+    /// Keeps runs of tool calls folded while the Agent works.
+    ///
+    /// The fold changes which rows are drawn, not which rows exist, so the
+    /// measured heights are dropped and the page is rebuilt from the new
+    /// disclosure. It does not clear the reader's own choices: a run they
+    /// opened stays open, and a folded one can always be opened again.
+    fn set_auto_collapse_tool_calls(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if self.ui_state.session.auto_collapse_tool_calls == enabled {
+            return;
+        }
+        self.ui_state.session.auto_collapse_tool_calls = enabled;
+        self.invalidate_timeline_layout_measurements();
+        self.rebuild_timeline_sizes();
+        self.queue_ui_state();
+        self.sync_timeline_display_settings_to_runtime();
+        cx.notify();
+    }
+
     fn set_show_agent_generation_status(&mut self, enabled: bool, cx: &mut Context<Self>) {
         self.ui_state.session.show_agent_generation_status = enabled;
         if !enabled {
@@ -48062,6 +49386,7 @@ impl VibexWorkbench {
                 .session
                 .enhanced_command_execution_display,
             enhanced_file_operation_display: self.ui_state.session.enhanced_file_operation_display,
+            auto_collapse_tool_calls: self.ui_state.session.auto_collapse_tool_calls,
         });
     }
 
@@ -49495,11 +50820,18 @@ impl VibexWorkbench {
 
     /// The title-bar update entry: an arrow that toggles the update panel.
     ///
-    /// `Popover` owns the toggle from its mouse-down handler and applies the
-    /// trigger's selected state itself, so the trigger must not add its own
-    /// click handler.
+    /// The panel is an ordinary absolutely positioned child rather than a
+    /// `Popover`. Popovers paint in GPUI's deferred pass, which runs after the
+    /// dialog layer, so a popover would float above an open modal — an update
+    /// check that lands while Settings is up must not cover it. An in-tree
+    /// layer stays below Root's dialog layers, and the title bar only clips
+    /// horizontally so the panel can hang below the band.
+    ///
+    /// The trigger owns the toggle because the panel is no longer a `Popover`
+    /// child, and it is built only while open so a closed panel costs nothing.
     fn render_update_entry(&mut self, version: &str, cx: &mut Context<Self>) -> AnyElement {
-        let panel = self.render_update_panel(cx);
+        let open = self.update_panel_open;
+        let panel = open.then(|| self.render_update_panel(cx));
         let tooltip = if version.is_empty() {
             locale::text("Update available", "有可用更新", "有可用更新").to_string()
         } else {
@@ -49514,6 +50846,7 @@ impl VibexWorkbench {
             .compact()
             .size(px(32.0))
             .px_0()
+            .selected(open)
             .tooltip(tooltip)
             // Green marks the entry as "an update is waiting", which is the only
             // state this trigger is rendered in.
@@ -49521,25 +50854,29 @@ impl VibexWorkbench {
                 Icon::new(IconName::ArrowDown)
                     .size(px(18.0))
                     .text_color(cx.theme().success),
-            );
-        div()
-            .flex_none()
-            .child(
-                Popover::new("update-popover")
-                    .anchor(Anchor::TopRight)
-                    .appearance(false)
-                    // The panel reports progress and offers the install; it
-                    // stays until the user closes it instead of disappearing
-                    // on the next click elsewhere.
-                    .overlay_closable(false)
-                    .open(self.update_panel_open)
-                    .on_open_change(cx.listener(|this, open: &bool, _, cx| {
-                        this.set_update_panel_open(*open, cx);
-                    }))
-                    .trigger(trigger)
-                    .child(panel)
-                    .top(px(6.0)),
             )
+            .on_click(cx.listener(|this, _, _, cx| {
+                let open = this.update_panel_open;
+                this.set_update_panel_open(!open, cx);
+            }));
+        div()
+            .relative()
+            .flex_none()
+            // The panel hangs below the band; keep those clicks from starting
+            // a window drag as they pass through the title-bar handler.
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(trigger)
+            .when_some(panel, |this, panel| {
+                this.child(
+                    div()
+                        .absolute()
+                        // The wrapper is vertically centered in the band, so
+                        // this puts the panel just below the bar's lower edge.
+                        .top(px(TITLE_BAR_HEIGHT))
+                        .right_0()
+                        .child(panel),
+                )
+            })
             .into_any_element()
     }
 
@@ -50284,7 +51621,9 @@ impl VibexWorkbench {
             .flex_row()
             .items_center()
             .h(px(TITLE_BAR_HEIGHT))
-            .overflow_hidden()
+            // Horizontal clipping keeps long titles inside the band, while the
+            // update panel hangs below it and must stay visible.
+            .overflow_x_hidden()
             .text_color(cx.theme().foreground)
             .when(is_linux, |this| {
                 this.on_double_click(|_, window, _| window.zoom_window())
@@ -53030,8 +54369,12 @@ impl VibexWorkbench {
             // sweep, at the same pace and spread, so the two surfaces read as
             // one state in two places. Only a tab that is actually generating
             // takes the animation; every other tab keeps static text that asks
-            // for no frames.
-            let title_element: AnyElement = if display_state == AgentSessionState::Running {
+            // for no frames. The sweep also yields to the timeline's frame
+            // gate, so a late workbench stops every running label together
+            // rather than keeping one surface at the display refresh.
+            let title_element: AnyElement = if display_state == AgentSessionState::Running
+                && timeline_activity::live_labels_animate()
+            {
                 ShimmerText::new(title.clone())
                     .id(format!("session-group-tab-title-{session_id}"))
                     .duration(TIMELINE_SHIMMER_SWEEP)
@@ -57101,16 +58444,18 @@ impl VibexWorkbench {
         // light on the text read as one state in two places. The sweep repeats
         // for as long as it is mounted, so only a row that is actually
         // generating takes it; every other row keeps a static title that asks
-        // for no frames.
-        let row_title: AnyElement = if session_generating {
-            ShimmerText::new(row_title)
-                .id(format!("sidebar-session-title-{session_id_string}"))
-                .duration(TIMELINE_SHIMMER_SWEEP)
-                .spread(TIMELINE_SHIMMER_SPREAD)
-                .into_any_element()
-        } else {
-            row_title.into_any_element()
-        };
+        // for no frames. Like the tab title, the sweep yields to the timeline's
+        // frame gate so every running label stops asking for frames together.
+        let row_title: AnyElement =
+            if session_generating && timeline_activity::live_labels_animate() {
+                ShimmerText::new(row_title)
+                    .id(format!("sidebar-session-title-{session_id_string}"))
+                    .duration(TIMELINE_SHIMMER_SWEEP)
+                    .spread(TIMELINE_SHIMMER_SPREAD)
+                    .into_any_element()
+            } else {
+                row_title.into_any_element()
+            };
         let reorder_offset = active_session_drag
             .as_ref()
             .filter(|drag| drag.flat_preview_enabled)
@@ -59841,7 +61186,11 @@ impl VibexWorkbench {
                 .flex_none()
                 .bg(cx.theme().border.opacity(0.70))
         };
+        let closing = self.runtime_menu_closing_since;
+        // See the current-session twin: a closed popover never paints this.
+        let menu_mounted = self.new_session_runtime_menu_open || closing.is_some();
         let menu_content = match menu_view {
+            _ if !menu_mounted => div().into_any_element(),
             ComposerRuntimeMenuView::AuthSource => match (catalog.as_ref(), agent_id.as_ref()) {
                 (Some(catalog), Some(agent_id)) => self.render_provider_model_groups(
                     agent_id,
@@ -60004,7 +61353,6 @@ impl VibexWorkbench {
             .shadow_lg()
             .child(menu_content);
 
-        let closing = self.runtime_menu_closing_since;
         let popover = Popover::new("new-session-runtime-cascade")
             .anchor(menu_placement.anchor)
             .appearance(false)
@@ -62495,6 +63843,7 @@ impl VibexWorkbench {
             .when(!turns.is_empty(), |this| {
                 this.child(
                     v_flex()
+                        .id("agent-timeline-context")
                         .size_full()
                         .min_h_0()
                         .min_w_0()
@@ -62642,7 +63991,18 @@ impl VibexWorkbench {
                             .py_4()
                             .gap_0(),
                         )
-                        .pinned_scrollbar(&self.timeline_scroll, ScrollbarAxis::Vertical),
+                        .pinned_scrollbar(&self.timeline_scroll, ScrollbarAxis::Vertical)
+                        .context_menu({
+                            let menu_entity = cx.weak_entity();
+                            move |menu, _, cx| {
+                                let Some(entity) = menu_entity.upgrade() else {
+                                    return menu;
+                                };
+                                entity.update(cx, |this, _| {
+                                    this.build_timeline_context_menu(menu, menu_entity.clone())
+                                })
+                            }
+                        }),
                 )
             });
         let runtime_controls = self.render_runtime_controls(live_session_id.as_ref(), cx);
@@ -63259,7 +64619,21 @@ impl VibexWorkbench {
                 .flex_none()
                 .bg(cx.theme().border.opacity(0.70))
         };
+        // One pane owns the cascade. Every other pane's Composer shares the
+        // flag, and a popover keys its open state by element id, so without both
+        // the scope and the id below a chip pressed in one pane opened in all of
+        // them — each one anchored to the last pane that painted a trigger.
+        let focused_pane = self.composer_menu_scope_focused();
+        let menu_open = self.composer_runtime_menu_open && focused_pane;
+        let closing = self.runtime_menu_closing_since.filter(|_| focused_pane);
+        let scope = self.composer_menu_scope();
+        // The Composer is rebuilt on every timeline frame, and a closed popover
+        // drops its content unpainted. Building the provider list anyway cost
+        // more than the rest of the frame: it walks and copies the whole model
+        // catalog.
+        let menu_mounted = menu_open || closing.is_some();
         let menu_content = match self.composer_runtime_menu_view {
+            _ if !menu_mounted => div().into_any_element(),
             ComposerRuntimeMenuView::AuthSource => self.render_provider_model_groups(
                 &menu_agent_id,
                 &catalog,
@@ -63452,15 +64826,6 @@ impl VibexWorkbench {
             .bg(cx.theme().popover)
             .shadow_lg()
             .child(menu_content);
-        // One pane owns the cascade. Every other pane's Composer shares the
-        // flag, and a popover keys its open state by element id, so without both
-        // the scope and the id below a chip pressed in one pane opened in all of
-        // them — each one anchored to the last pane that painted a trigger.
-        let focused_pane = self.composer_menu_scope_focused();
-        let menu_open = self.composer_runtime_menu_open && focused_pane;
-        let closing = self.runtime_menu_closing_since.filter(|_| focused_pane);
-        let scope = self.composer_menu_scope();
-
         let popover = Popover::new(format!("composer-runtime-cascade{scope}"))
             .anchor(menu_placement.anchor)
             .appearance(false)
@@ -65337,7 +66702,41 @@ impl VibexWorkbench {
             content = content.child(file_changes);
         }
 
-        content.into_any_element()
+        let fork_sequence = turn
+            .conclusion_row
+            .as_ref()
+            .map(|row| row.last_sequence)
+            .or_else(|| turn.process_rows.last().map(|row| row.last_sequence))
+            .or_else(|| turn.user_row.as_ref().map(|row| row.last_sequence))
+            .unwrap_or(0);
+        let menu_entity = cx.weak_entity();
+        let menu_context = TurnMenuContext {
+            turn_id: turn.id.clone(),
+            session_id: self.timeline.session_id.clone(),
+            fork_sequence,
+            process_collapsible,
+            process_expanded,
+            row_is_live_view: self.timeline.session_id.as_ref() == self.view_session_id.as_ref(),
+            fork_disabled: self.agent_action_pending
+                || self.fork_session_pending
+                || self.timeline.needs_authoritative_refetch,
+        };
+        // The child Agent rail reads a transcript that is not the borrowed view,
+        // so its turn commands would copy or toggle the focused session's turn.
+        // The rail keeps the per-message copy and quote menus instead.
+        if self.rendering_child_agent_timeline() {
+            return content.into_any_element();
+        }
+        content
+            .context_menu(move |menu, _, cx| {
+                let Some(entity) = menu_entity.upgrade() else {
+                    return menu;
+                };
+                entity.update(cx, |this, _| {
+                    this.build_turn_context_menu(menu, menu_entity.clone(), menu_context.clone())
+                })
+            })
+            .into_any_element()
     }
 
     fn render_turn_file_changes_card(
@@ -66892,6 +68291,43 @@ impl VibexWorkbench {
         } else {
             element
         };
+        // Process rows in the child Agent rail belong to a transcript that is
+        // not the borrowed view, so the activity menu could not read the row it
+        // was opened on. The rail stays read-only for process lines.
+        let element = if self.rendering_child_agent_timeline()
+            || matches!(
+                row.kind,
+                TimelineRowKind::UserMessage | TimelineRowKind::AgentMessage
+            ) {
+            element
+        } else {
+            let menu_entity = cx.weak_entity();
+            let menu_row_id = row.id.clone();
+            let menu_row_is_live_view =
+                self.timeline.session_id.as_ref() == self.view_session_id.as_ref();
+            div()
+                .id(format!("timeline-row-context:{}", row.id))
+                .w_full()
+                .min_w_0()
+                .context_menu(move |menu, window, cx| {
+                    let Some(entity) = menu_entity.upgrade() else {
+                        return menu;
+                    };
+                    let row_id = menu_row_id.clone();
+                    entity.update(cx, |this, cx| {
+                        this.build_activity_context_menu(
+                            menu,
+                            window,
+                            cx,
+                            menu_entity.clone(),
+                            row_id,
+                            menu_row_is_live_view,
+                        )
+                    })
+                })
+                .child(element)
+                .into_any_element()
+        };
         self.highlight_session_search_rows(std::slice::from_ref(row), element, cx)
     }
 
@@ -67474,6 +68910,1281 @@ impl VibexWorkbench {
         if let Some(body) = body {
             cx.write_to_clipboard(ClipboardItem::new_string(body));
         }
+    }
+
+    /// The row with `row_id` in the conversation this view is drawing.
+    fn timeline_row_by_id(&self, row_id: &str) -> Option<&TimelineRow> {
+        self.conversation_turns_cache.iter().find_map(|turn| {
+            turn.user_row
+                .as_ref()
+                .filter(|row| row.id == row_id)
+                .or_else(|| turn.process_rows.iter().find(|row| row.id == row_id))
+                .or_else(|| turn.conclusion_row.as_ref().filter(|row| row.id == row_id))
+        })
+    }
+
+    /// Copy the conversation as prose: user messages and Agent answers only.
+    ///
+    /// Process rows are deliberately left out. A reader asking for the
+    /// conversation wants a transcript they can paste into an issue or a
+    /// document, not every command the Agent ran on the way there.
+    fn copy_conversation(&mut self, cx: &mut Context<Self>) {
+        let title = self
+            .view_session()
+            .map(|session| session.title.trim().to_string())
+            .filter(|title| !title.is_empty());
+        let turns = self.conversation_turns_cached();
+        let mut out = String::new();
+        if let Some(title) = title {
+            out.push_str("# ");
+            out.push_str(&title);
+            out.push_str("\n\n");
+        }
+        for turn in turns.iter() {
+            if let Some(row) = turn.user_row.as_ref() {
+                push_conversation_row(&mut out, "You", &row.body);
+            }
+            if let Some(row) = turn.conclusion_row.as_ref() {
+                push_conversation_row(&mut out, "Agent", &row.body);
+            }
+        }
+        if !out.trim().is_empty() {
+            cx.write_to_clipboard(ClipboardItem::new_string(out.trim_end().to_string()));
+        }
+    }
+
+    /// Copy one turn's user message and final answer.
+    fn copy_turn(&mut self, turn_id: &str, cx: &mut Context<Self>) {
+        let turns = self.conversation_turns_cached();
+        let Some(turn) = turns.iter().find(|turn| turn.id == turn_id) else {
+            return;
+        };
+        let mut out = String::new();
+        if let Some(row) = turn.user_row.as_ref() {
+            push_conversation_row(&mut out, "You", &row.body);
+        }
+        if let Some(row) = turn.conclusion_row.as_ref() {
+            push_conversation_row(&mut out, "Agent", &row.body);
+        }
+        if !out.trim().is_empty() {
+            cx.write_to_clipboard(ClipboardItem::new_string(out.trim_end().to_string()));
+        }
+    }
+
+    /// Insert `text` as a Markdown blockquote at the composer caret.
+    ///
+    /// The quote is inserted rather than replacing the draft: a reader can
+    /// select a paragraph, quote it, and keep writing around it. The composer
+    /// keeps the keyboard afterwards so the follow-up can be typed straight
+    /// away.
+    fn quote_in_composer(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let quoted = context_menu_blockquote(text);
+        if quoted.is_empty() {
+            return;
+        }
+        let input = self.ensure_composer_input(window, cx);
+        let existing = input.read(cx).value().to_string();
+        let prefix = if existing.trim().is_empty() || existing.ends_with("\n\n") {
+            ""
+        } else if existing.ends_with('\n') {
+            "\n"
+        } else {
+            "\n\n"
+        };
+        let insertion = format!("{prefix}{quoted}\n\n");
+        input.update(cx, |input, cx| {
+            input.insert(insertion, window, cx);
+            input.focus(window, cx);
+        });
+        cx.notify();
+    }
+
+    /// Open the conversation find bar, optionally seeded with a query.
+    fn open_conversation_find_with_query(
+        &mut self,
+        query: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.conversation_context_active() {
+            return;
+        }
+        self.conversation_find_open = true;
+        self.conversation_find.update(cx, |input, cx| {
+            if let Some(query) = query.as_ref().filter(|query| !query.trim().is_empty()) {
+                input.set_value(query.clone(), window, cx);
+            }
+            input.focus(window, cx);
+        });
+        self.reveal_active_conversation_find_match(cx);
+        cx.notify();
+    }
+
+    /// The Markdown source behind a selection that stays inside one surface.
+    ///
+    /// A selection spanning rows has no single source range, so it copies as
+    /// plain text. User messages are escaped for rendering, so their source is
+    /// not useful as Markdown and they are deliberately excluded by the caller.
+    fn selected_markdown_source(
+        &self,
+        child_session: Option<&str>,
+        prefixes: &[String],
+        window_text: &str,
+        cx: &App,
+    ) -> Option<String> {
+        let table = match child_session {
+            Some(session_id) => self.child_agent_markdown_states.get(session_id)?,
+            None => &self.markdown_text_states,
+        };
+        let mut matches = 0;
+        let mut source = None;
+        for (id, entry) in table {
+            if !markdown_surface_matches(id, prefixes) {
+                continue;
+            }
+            let (selected, range) = {
+                let state = entry.state.read(cx);
+                (state.selected_text(), state.selected_source_range())
+            };
+            if selected.is_empty() {
+                continue;
+            }
+            matches += 1;
+            if selected.trim() != window_text.trim() {
+                continue;
+            }
+            if let Some(range) = range
+                && let Some(text) = entry.source.get(range)
+            {
+                source = Some(text.to_string());
+            }
+        }
+        (matches == 1).then_some(source).flatten()
+    }
+
+    /// Whether the right-clicked row participates in the current selection.
+    fn row_has_markdown_selection(
+        &self,
+        child_session: Option<&str>,
+        prefixes: &[String],
+        cx: &App,
+    ) -> bool {
+        let table = match child_session {
+            Some(session_id) => self.child_agent_markdown_states.get(session_id),
+            None => Some(&self.markdown_text_states),
+        };
+        table.is_some_and(|table| {
+            table.iter().any(|(id, entry)| {
+                markdown_surface_matches(id, prefixes)
+                    && !entry.state.read(cx).selected_text().is_empty()
+            })
+        })
+    }
+
+    /// The shared readable detail projection behind an activity row.
+    fn activity_details(&self, row: &TimelineRow) -> Vec<vibex_ui::tool_detail::Detail> {
+        let payload = self.timeline_row_latest_item(row).map(|item| &item.payload);
+        let workspace_root = self
+            .view_session()
+            .map(|session| session.workspace_root.as_str());
+        vibex_ui::tool_detail::project(
+            row,
+            payload,
+            workspace_root,
+            locale::current_locale().shared(),
+        )
+    }
+
+    /// Copy the text an activity row is asking about.
+    fn copy_activity_text(&mut self, row_id: &str, mode: ActivityCopyMode, cx: &mut Context<Self>) {
+        let Some(row) = self.timeline_row_by_id(row_id).cloned() else {
+            return;
+        };
+        let payload = self
+            .timeline_row_latest_item(&row)
+            .map(|item| item.payload.clone());
+        let details = self.activity_details(&row);
+        let text = match mode {
+            ActivityCopyMode::Primary => match payload.as_ref() {
+                Some(TimelinePayload::Command(command)) => command.command.clone(),
+                Some(TimelinePayload::FileOperation(operation)) => operation.path.clone(),
+                _ => row.body.clone(),
+            },
+            ActivityCopyMode::Path => match payload.as_ref() {
+                Some(TimelinePayload::FileOperation(operation)) => operation.path.clone(),
+                _ => row.body.clone(),
+            },
+            ActivityCopyMode::Diff => match payload.as_ref() {
+                Some(TimelinePayload::FileOperation(operation)) => operation
+                    .canonical_patch()
+                    .map(|patch| patch.text)
+                    .unwrap_or_default(),
+                _ => String::new(),
+            },
+            ActivityCopyMode::Output => match payload.as_ref() {
+                Some(TimelinePayload::Command(command)) => timeline_tool_detail::output(
+                    command.raw_extension.as_ref(),
+                    command.output_summary.as_deref(),
+                    command.exit_code,
+                )
+                .unwrap_or_default(),
+                Some(TimelinePayload::ToolCall(_)) | Some(TimelinePayload::WebSearch(_)) => {
+                    let label = locale::text("Output", "输出", "輸出");
+                    details
+                        .iter()
+                        .find(|detail| detail.label() == label)
+                        .map(|detail| detail.text())
+                        .unwrap_or_default()
+                }
+                _ => String::new(),
+            },
+            ActivityCopyMode::Input => match payload.as_ref() {
+                Some(TimelinePayload::Command(command)) => command.command.clone(),
+                Some(TimelinePayload::ToolCall(_)) | Some(TimelinePayload::WebSearch(_)) => {
+                    let label = locale::text("Input", "输入", "輸入");
+                    details
+                        .iter()
+                        .find(|detail| detail.label() == label)
+                        .map(|detail| detail.copy_text())
+                        .unwrap_or_default()
+                }
+                _ => String::new(),
+            },
+            ActivityCopyMode::Details => {
+                let text = vibex_ui::tool_detail::text(&details);
+                if text.trim().is_empty() {
+                    row.body.clone()
+                } else {
+                    text
+                }
+            }
+        };
+        if !text.trim().is_empty() {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        }
+    }
+
+    /// The selection a right-click on `row` should act on, if any.
+    fn selection_menu_context_for_row(
+        &self,
+        window: &mut Window,
+        cx: &mut App,
+        child_session: Option<&str>,
+        prefixes: &[String],
+        allow_markdown: bool,
+    ) -> Option<SelectionMenuContext> {
+        if !TextSelection::has_selection(window, cx)
+            || !TextSelection::is_selectable_at(window.mouse_position(), window, cx)
+        {
+            return None;
+        }
+        let text = TextSelection::selected_text(window, cx);
+        if text.trim().is_empty() || !self.row_has_markdown_selection(child_session, prefixes, cx) {
+            return None;
+        }
+        let markdown = allow_markdown
+            .then(|| self.selected_markdown_source(child_session, prefixes, &text, cx))
+            .flatten();
+        Some(SelectionMenuContext { text, markdown })
+    }
+
+    fn build_selection_context_menu(
+        &mut self,
+        menu: PopupMenu,
+        entity: WeakEntity<Self>,
+        selection: SelectionMenuContext,
+    ) -> PopupMenu {
+        let count = selection.text.chars().count();
+        let mut menu = menu
+            .min_w(px(220.0))
+            .max_w(px(320.0))
+            .item(PopupMenuItem::label(selection_menu_header(count)))
+            .separator();
+
+        let copy_text = selection.text.clone();
+        menu = menu.item(
+            PopupMenuItem::new(locale::text("Copy", "复制", "複製"))
+                .icon(IconName::Copy)
+                .on_click(move |_, _, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(copy_text.clone()));
+                }),
+        );
+
+        if let Some(markdown) = selection.markdown.clone() {
+            menu = menu.item(
+                PopupMenuItem::new(locale::text(
+                    "Copy as Markdown",
+                    "复制为 Markdown",
+                    "複製為 Markdown",
+                ))
+                .on_click(move |_, _, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(markdown.clone()));
+                }),
+            );
+        }
+
+        let quote_entity = entity.clone();
+        let quote_text = selection
+            .markdown
+            .clone()
+            .unwrap_or_else(|| selection.text.clone());
+        menu = menu.item(
+            PopupMenuItem::new(locale::text(
+                "Quote in Composer",
+                "引用到输入框",
+                "引用到輸入框",
+            ))
+            .on_click(move |_, window, cx| {
+                let text = quote_text.clone();
+                let _ = quote_entity.update(cx, |this, cx| {
+                    this.quote_in_composer(&text, window, cx);
+                });
+            }),
+        );
+
+        let find_entity = entity.clone();
+        let find_query = selection_find_query(&selection.text);
+        menu = menu.separator().item(
+            PopupMenuItem::new(locale::text(
+                "Find in Conversation",
+                "在会话中查找",
+                "在工作階段中尋找",
+            ))
+            .icon(IconName::Search)
+            .disabled(find_query.is_empty())
+            .on_click(move |_, window, cx| {
+                let query = find_query.clone();
+                let _ = find_entity.update(cx, |this, cx| {
+                    this.open_conversation_find_with_query(Some(query), window, cx);
+                });
+            }),
+        );
+
+        if let Some(url) = single_external_url(&selection.text) {
+            menu = menu.item(
+                PopupMenuItem::new(locale::text("Open Link", "打开链接", "開啟連結")).on_click(
+                    move |_, _, cx| {
+                        cx.open_url(&url);
+                    },
+                ),
+            );
+        }
+
+        menu
+    }
+
+    fn build_user_message_context_menu(
+        &mut self,
+        menu: PopupMenu,
+        window: &mut Window,
+        cx: &mut App,
+        entity: WeakEntity<Self>,
+        context: UserMessageMenuContext,
+    ) -> PopupMenu {
+        let prefixes = vec![format!("user-message-text:{}", context.row_id)];
+        if let Some(selection) = self.selection_menu_context_for_row(
+            window,
+            cx,
+            context.child_session.as_deref(),
+            &prefixes,
+            false,
+        ) {
+            return self.build_selection_context_menu(menu, entity, selection);
+        }
+
+        let has_body = !context.row.body.trim().is_empty();
+        let has_attachments = !context.attachments.is_empty();
+        let timestamp = context.timestamp;
+        let locale = self.resolved_locale();
+        let mut header = locale::text("You", "你", "你").to_string();
+        if let Some(timestamp) = timestamp {
+            header.push_str(" · ");
+            header.push_str(&format_timeline_hover_time(timestamp, locale));
+        }
+        if !context.row_is_live_view {
+            header.push_str(" · ");
+            header.push_str(locale::text("Read only", "只读", "唯讀"));
+        }
+
+        let mut menu = menu
+            .min_w(px(220.0))
+            .max_w(px(320.0))
+            .item(PopupMenuItem::label(header))
+            .separator();
+
+        if has_body || has_attachments {
+            let copy_item = context.copy_item.clone();
+            menu = menu.item(
+                PopupMenuItem::new(locale::text("Copy", "复制", "複製"))
+                    .icon(IconName::Copy)
+                    .on_click(move |_, _, cx| {
+                        cx.write_to_clipboard(copy_item.clone());
+                    }),
+            );
+        }
+
+        if has_body {
+            let quote_entity = entity.clone();
+            let quote_text = context.row.body.clone();
+            menu = menu.item(
+                PopupMenuItem::new(locale::text(
+                    "Quote in Composer",
+                    "引用到输入框",
+                    "引用到輸入框",
+                ))
+                .on_click(move |_, window, cx| {
+                    let text = quote_text.clone();
+                    let _ = quote_entity.update(cx, |this, cx| {
+                        this.quote_in_composer(&text, window, cx);
+                    });
+                }),
+            );
+        }
+
+        let fork_disabled = self.agent_action_pending
+            || self.fork_session_pending
+            || self.timeline.needs_authoritative_refetch
+            || !context.turn_complete;
+        let show_fork =
+            context.session_id.is_some() && context.row_is_live_view && context.last_sequence > 0;
+        let show_edit = context.latest_user_message
+            && context.row_is_live_view
+            && context.edit_action_state != UserMessageEditActionState::Hidden;
+
+        if show_fork || show_edit {
+            menu = menu.separator();
+        }
+        if show_fork {
+            let fork_entity = entity.clone();
+            let fork_session_id = context.session_id.clone();
+            let fork_sequence = context.last_sequence;
+            menu = menu.item(
+                PopupMenuItem::new(locale::text("Fork from Here", "从此处分叉", "從此處分支"))
+                    .icon(Icon::default().path("icons/vibex/git-branch.svg"))
+                    .disabled(fork_disabled)
+                    .on_click(move |_, window, cx| {
+                        let Some(session_id) = fork_session_id.clone() else {
+                            return;
+                        };
+                        let _ = fork_entity.update(cx, |this, cx| {
+                            this.fork_session_at(session_id, fork_sequence, window, cx);
+                        });
+                    }),
+            );
+        }
+        if show_edit {
+            if show_fork {
+                menu = menu.separator();
+            }
+            let edit_entity = entity.clone();
+            let edit_row_id = context.row.id.clone();
+            let edit_turn_id = context
+                .turn_id
+                .clone()
+                .unwrap_or_else(|| context.row.id.clone());
+            let edit_session_id = context.session_id.clone();
+            let edit_user_sequence = context.first_sequence;
+            let edit_end_sequence = context.authoritative_end_sequence;
+            let edit_body = context.row.body.clone();
+            let edit_attachments = context.attachments.clone();
+            let edit_mentions = context.mentions.clone();
+            menu = menu.item(
+                PopupMenuItem::new(locale::text(
+                    "Edit and Resend",
+                    "编辑并重新发送",
+                    "編輯並重新傳送",
+                ))
+                .icon(Icon::default().path("icons/vibex/pencil.svg"))
+                .disabled(context.edit_action_state != UserMessageEditActionState::Enabled)
+                .on_click(move |_, window, cx| {
+                    let Some(source_session_id) = edit_session_id.clone() else {
+                        return;
+                    };
+                    let row_id = edit_row_id.clone();
+                    let turn_id = edit_turn_id.clone();
+                    let body = edit_body.clone();
+                    let attachments = edit_attachments.clone();
+                    let mentions = edit_mentions.clone();
+                    let _ = edit_entity.update(cx, |this, cx| {
+                        this.begin_inline_user_message_edit(
+                            turn_id,
+                            row_id,
+                            source_session_id,
+                            edit_user_sequence,
+                            edit_end_sequence,
+                            body,
+                            attachments,
+                            mentions,
+                            window,
+                            cx,
+                        );
+                    });
+                }),
+            );
+        }
+
+        menu
+    }
+
+    fn build_agent_message_context_menu(
+        &mut self,
+        menu: PopupMenu,
+        window: &mut Window,
+        cx: &mut App,
+        entity: WeakEntity<Self>,
+        context: AgentMessageMenuContext,
+    ) -> PopupMenu {
+        let prefixes = vec![
+            format!("markdown:{}", context.row_id),
+            format!("markdown-chunk:{}", context.row_id),
+        ];
+        if let Some(selection) = self.selection_menu_context_for_row(
+            window,
+            cx,
+            context.child_session.as_deref(),
+            &prefixes,
+            true,
+        ) {
+            return self.build_selection_context_menu(menu, entity, selection);
+        }
+
+        let has_body = !context.row.body.trim().is_empty();
+        let timestamp = context.timestamp;
+        let locale = self.resolved_locale();
+        let mut header = locale::text("Agent", "Agent", "Agent").to_string();
+        if let Some(timestamp) = timestamp {
+            header.push_str(" · ");
+            header.push_str(&format_timeline_hover_time(timestamp, locale));
+        }
+        if context.streaming {
+            header.push_str(" · ");
+            header.push_str(locale::text("Responding…", "响应中…", "回應中…"));
+        }
+
+        let mut menu = menu
+            .min_w(px(220.0))
+            .max_w(px(320.0))
+            .item(PopupMenuItem::label(header))
+            .separator();
+
+        if has_body {
+            let copy_body = context.row.body.clone();
+            menu = menu.item(
+                PopupMenuItem::new(if context.streaming {
+                    locale::text("Copy Current Text", "复制当前内容", "複製目前內容")
+                } else {
+                    locale::text("Copy", "复制", "複製")
+                })
+                .icon(IconName::Copy)
+                .on_click(move |_, _, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(copy_body.clone()));
+                }),
+            );
+        }
+
+        if has_body && !context.streaming {
+            let plain_body = markdown_plain_text(&context.row.body);
+            menu = menu.item(
+                PopupMenuItem::new(locale::text(
+                    "Copy as Plain Text",
+                    "复制为纯文本",
+                    "複製為純文字",
+                ))
+                .on_click(move |_, _, cx| {
+                    if !plain_body.trim().is_empty() {
+                        cx.write_to_clipboard(ClipboardItem::new_string(plain_body.clone()));
+                    }
+                }),
+            );
+
+            let quote_entity = entity.clone();
+            let quote_text = context.row.body.clone();
+            menu = menu.item(
+                PopupMenuItem::new(locale::text(
+                    "Quote in Composer",
+                    "引用到输入框",
+                    "引用到輸入框",
+                ))
+                .on_click(move |_, window, cx| {
+                    let text = quote_text.clone();
+                    let _ = quote_entity.update(cx, |this, cx| {
+                        this.quote_in_composer(&text, window, cx);
+                    });
+                }),
+            );
+        }
+
+        if context.foldable && !context.streaming && context.child_session.is_none() {
+            let toggle_entity = entity.clone();
+            let toggle_row_id = context.row.id.clone();
+            let toggle_turn_id = context.turn_id.clone();
+            let revealed = self.timeline_row_body_revealed(&context.row.id);
+            menu = menu.separator().item(
+                PopupMenuItem::new(if revealed {
+                    locale::text("Collapse Answer", "收起回答", "收合回答")
+                } else {
+                    locale::text("Expand Answer", "展开回答", "展開回答")
+                })
+                .on_click(move |_, _, cx| {
+                    let row_id = toggle_row_id.clone();
+                    let turn_id = toggle_turn_id.clone();
+                    let _ = toggle_entity.update(cx, |this, cx| {
+                        this.toggle_timeline_row_body(row_id, turn_id, cx);
+                    });
+                }),
+            );
+        }
+
+        let fork_disabled = self.agent_action_pending
+            || self.fork_session_pending
+            || self.timeline.needs_authoritative_refetch;
+        // The child Agent rail is a read-only transcript: forking or stopping
+        // from it would act on the focused session instead of the one on screen.
+        if !context.streaming
+            && context.row_is_live_view
+            && context.last_sequence > 0
+            && context.child_session.is_none()
+        {
+            let fork_entity = entity.clone();
+            let fork_session_id = context.session_id.clone();
+            let fork_sequence = context.last_sequence;
+            menu = menu.separator().item(
+                PopupMenuItem::new(locale::text("Fork from Here", "从此处分叉", "從此處分支"))
+                    .icon(Icon::default().path("icons/vibex/git-branch.svg"))
+                    .disabled(fork_disabled)
+                    .on_click(move |_, window, cx| {
+                        let Some(session_id) = fork_session_id.clone() else {
+                            return;
+                        };
+                        let _ = fork_entity.update(cx, |this, cx| {
+                            this.fork_session_at(session_id, fork_sequence, window, cx);
+                        });
+                    }),
+            );
+        }
+
+        if context.streaming && context.row_is_live_view && context.child_session.is_none() {
+            let stop_entity = entity.clone();
+            let stop_session_id = context.session_id.clone();
+            menu = menu.separator().item(
+                PopupMenuItem::new(locale::text("Stop Response", "停止响应", "停止回應")).on_click(
+                    move |_, window, cx| {
+                        let _ = stop_entity.update(cx, |this, cx| {
+                            // Act on the session whose menu was opened, not on
+                            // whichever view the workbench currently borrows.
+                            this.with_session_view_for_render(stop_session_id.as_ref(), |this| {
+                                this.interrupt_session(window, cx)
+                            });
+                        });
+                    },
+                ),
+            );
+        }
+
+        menu
+    }
+
+    fn activity_copy_item(
+        entity: WeakEntity<Self>,
+        row_id: &str,
+        label: &'static str,
+        mode: ActivityCopyMode,
+    ) -> PopupMenuItem {
+        let row_id = row_id.to_string();
+        PopupMenuItem::new(label)
+            .icon(IconName::Copy)
+            .on_click(move |_, _, cx| {
+                let row_id = row_id.clone();
+                let _ = entity.update(cx, |this, cx| {
+                    this.copy_activity_text(&row_id, mode, cx);
+                });
+            })
+    }
+
+    fn build_activity_context_menu(
+        &mut self,
+        menu: PopupMenu,
+        window: &mut Window,
+        cx: &mut App,
+        entity: WeakEntity<Self>,
+        row_id: String,
+        row_is_live_view: bool,
+    ) -> PopupMenu {
+        let Some(row) = self.timeline_row_by_id(&row_id).cloned() else {
+            return menu;
+        };
+
+        if matches!(
+            row.kind,
+            TimelineRowKind::Reasoning | TimelineRowKind::Plan | TimelineRowKind::TodoUpdate
+        ) {
+            let prefixes = vec![format!("thought:{}", row.id)];
+            if let Some(selection) = self.selection_menu_context_for_row(
+                window,
+                cx,
+                self.child_agent_render_session
+                    .as_ref()
+                    .map(|session_id| session_id.as_str()),
+                &prefixes,
+                true,
+            ) {
+                return self.build_selection_context_menu(menu, entity, selection);
+            }
+        }
+
+        let payload = self
+            .timeline_row_latest_item(&row)
+            .map(|item| item.payload.clone());
+        let details = self.activity_details(&row);
+        let input_label = locale::text("Input", "输入", "輸入");
+        let output_label = locale::text("Output", "输出", "輸出");
+        let has_input = details.iter().any(|detail| detail.label() == input_label);
+        let has_output = details.iter().any(|detail| detail.label() == output_label);
+        let has_details = !details.is_empty() || !row.body.trim().is_empty();
+        let timestamp = self.timeline_row_timestamp(&row);
+        let locale = self.resolved_locale();
+        let mut header = activity_row_kind_label(row.kind).to_string();
+        if let Some(timestamp) = timestamp {
+            header.push_str(" · ");
+            header.push_str(&format_timeline_hover_time(timestamp, locale));
+        }
+
+        let mut menu = menu
+            .min_w(px(220.0))
+            .max_w(px(320.0))
+            .item(PopupMenuItem::label(header))
+            .separator();
+
+        match row.kind {
+            TimelineRowKind::Reasoning => {
+                let open = self.reasoning_row_open(&row.id);
+                let toggle_entity = entity.clone();
+                let toggle_row_id = row.id.clone();
+                let toggle_turn_id = row.turn_id.clone();
+                menu = menu
+                    .item(Self::activity_copy_item(
+                        entity.clone(),
+                        &row.id,
+                        locale::text("Copy Thought", "复制思考", "複製思考"),
+                        ActivityCopyMode::Primary,
+                    ))
+                    .when(row_is_live_view && !row.body.trim().is_empty(), |menu| {
+                        let quote_entity = entity.clone();
+                        let quote_row_id = row.id.clone();
+                        menu.item(
+                            PopupMenuItem::new(locale::text(
+                                "Quote in Composer",
+                                "引用到输入框",
+                                "引用到輸入框",
+                            ))
+                            .on_click(move |_, window, cx| {
+                                let row_id = quote_row_id.clone();
+                                let _ = quote_entity.update(cx, |this, cx| {
+                                    let body = this
+                                        .timeline_row_by_id(&row_id)
+                                        .map(|row| row.body.clone())
+                                        .unwrap_or_default();
+                                    this.quote_in_composer(&body, window, cx);
+                                });
+                            }),
+                        )
+                    })
+                    .separator()
+                    .item(
+                        PopupMenuItem::new(if open {
+                            locale::text("Collapse Thought", "收起思考", "收合思考")
+                        } else {
+                            locale::text("Expand Thought", "展开思考", "展開思考")
+                        })
+                        .on_click(move |_, _, cx| {
+                            let row_id = toggle_row_id.clone();
+                            let turn_id = toggle_turn_id.clone();
+                            let _ = toggle_entity.update(cx, |this, cx| {
+                                this.toggle_reasoning_expansion(row_id, turn_id, open, cx);
+                            });
+                        }),
+                    );
+            }
+            TimelineRowKind::Plan | TimelineRowKind::TodoUpdate => {
+                let open = self
+                    .timeline_command_expansion
+                    .get(&row.id)
+                    .copied()
+                    .unwrap_or(false);
+                let toggle_entity = entity.clone();
+                let toggle_row_id = row.id.clone();
+                let toggle_turn_id = row.turn_id.clone();
+                menu = menu
+                    .item(Self::activity_copy_item(
+                        entity.clone(),
+                        &row.id,
+                        locale::text("Copy Plan", "复制计划", "複製計畫"),
+                        ActivityCopyMode::Primary,
+                    ))
+                    .when(row_is_live_view && !row.body.trim().is_empty(), |menu| {
+                        let quote_entity = entity.clone();
+                        let quote_row_id = row.id.clone();
+                        menu.item(
+                            PopupMenuItem::new(locale::text(
+                                "Quote in Composer",
+                                "引用到输入框",
+                                "引用到輸入框",
+                            ))
+                            .on_click(move |_, window, cx| {
+                                let row_id = quote_row_id.clone();
+                                let _ = quote_entity.update(cx, |this, cx| {
+                                    let body = this
+                                        .timeline_row_by_id(&row_id)
+                                        .map(|row| row.body.clone())
+                                        .unwrap_or_default();
+                                    this.quote_in_composer(&body, window, cx);
+                                });
+                            }),
+                        )
+                    })
+                    .separator()
+                    .item(
+                        PopupMenuItem::new(if open {
+                            locale::text("Collapse Plan", "收起计划", "收合計畫")
+                        } else {
+                            locale::text("Expand Plan", "展开计划", "展開計畫")
+                        })
+                        .on_click(move |_, _, cx| {
+                            let row_id = toggle_row_id.clone();
+                            let turn_id = toggle_turn_id.clone();
+                            let _ = toggle_entity.update(cx, |this, cx| {
+                                this.set_timeline_disclosure(row_id, turn_id.as_deref(), !open);
+                                cx.notify();
+                            });
+                        }),
+                    );
+            }
+            TimelineRowKind::Command => {
+                let open = self
+                    .timeline_command_expansion
+                    .get(&row.id)
+                    .copied()
+                    .unwrap_or(false);
+                let toggle_entity = entity.clone();
+                let toggle_row_id = row.id.clone();
+                let toggle_turn_id = row.turn_id.clone();
+                menu = menu
+                    .item(Self::activity_copy_item(
+                        entity.clone(),
+                        &row.id,
+                        locale::text("Copy Command", "复制命令", "複製命令"),
+                        ActivityCopyMode::Primary,
+                    ))
+                    .when(has_output, |menu| {
+                        menu.item(Self::activity_copy_item(
+                            entity.clone(),
+                            &row.id,
+                            locale::text("Copy Output", "复制输出", "複製輸出"),
+                            ActivityCopyMode::Output,
+                        ))
+                    })
+                    .item(Self::activity_copy_item(
+                        entity.clone(),
+                        &row.id,
+                        locale::text("Copy Details", "复制详情", "複製詳細資料"),
+                        ActivityCopyMode::Details,
+                    ))
+                    .separator()
+                    .item(
+                        PopupMenuItem::new(if open {
+                            locale::text("Hide Details", "隐藏详情", "隱藏詳細資料")
+                        } else {
+                            locale::text("Show Details", "显示详情", "顯示詳細資料")
+                        })
+                        .on_click(move |_, _, cx| {
+                            let row_id = toggle_row_id.clone();
+                            let turn_id = toggle_turn_id.clone();
+                            let _ = toggle_entity.update(cx, |this, cx| {
+                                this.set_timeline_disclosure(row_id, turn_id.as_deref(), !open);
+                                cx.notify();
+                            });
+                        }),
+                    );
+            }
+            TimelineRowKind::FileOperation => {
+                let open = self
+                    .timeline_command_expansion
+                    .get(&row.id)
+                    .copied()
+                    .unwrap_or(false);
+                let file_path = payload.as_ref().and_then(|payload| match payload {
+                    TimelinePayload::FileOperation(operation) => Some(operation.path.clone()),
+                    _ => None,
+                });
+                let workspace_root = self
+                    .view_session()
+                    .map(|session| session.workspace_root.clone())
+                    .unwrap_or_default();
+                let open_path = file_path.as_deref().and_then(|path| {
+                    agent_file_operation_preview_path(path, Some(workspace_root.as_str()))
+                });
+                let has_diff = payload.as_ref().is_some_and(|payload| {
+                    matches!(
+                        payload,
+                        TimelinePayload::FileOperation(operation)
+                            if operation.canonical_patch().is_some()
+                    )
+                });
+                let toggle_entity = entity.clone();
+                let toggle_row_id = row.id.clone();
+                let toggle_turn_id = row.turn_id.clone();
+                let open_entity = entity.clone();
+                let reveal_entity = entity.clone();
+                let reveal_path = open_path.clone();
+                menu = menu
+                    .when_some(open_path.clone(), |menu, path| {
+                        let open_path = path.clone();
+                        menu.item(
+                            PopupMenuItem::new(locale::text(
+                                "Open in Editor",
+                                "在编辑器中打开",
+                                "在編輯器中開啟",
+                            ))
+                            .icon(IconName::FolderOpen)
+                            .on_click(move |_, window, cx| {
+                                let path = open_path.clone();
+                                let _ = open_entity.update(cx, |this, cx| {
+                                    this.open_code_file(path, window, cx);
+                                });
+                            }),
+                        )
+                    })
+                    .when_some(reveal_path, |menu, path| {
+                        let reveal_path = path.clone();
+                        menu.item(
+                            PopupMenuItem::new(locale::text(
+                                "Reveal in Files",
+                                "在文件树中显示",
+                                "在檔案樹中顯示",
+                            ))
+                            .on_click(move |_, window, cx| {
+                                let path = reveal_path.clone();
+                                let _ = reveal_entity.update(cx, |this, cx| {
+                                    this.reveal_session_image_in_files(&path, window, cx);
+                                });
+                            }),
+                        )
+                    })
+                    .item(Self::activity_copy_item(
+                        entity.clone(),
+                        &row.id,
+                        locale::text("Copy Path", "复制路径", "複製路徑"),
+                        ActivityCopyMode::Path,
+                    ))
+                    .when(has_diff, |menu| {
+                        menu.item(Self::activity_copy_item(
+                            entity.clone(),
+                            &row.id,
+                            locale::text("Copy Diff", "复制差异", "複製差異"),
+                            ActivityCopyMode::Diff,
+                        ))
+                    })
+                    .when(has_details, |menu| {
+                        menu.separator().item(
+                            PopupMenuItem::new(if open {
+                                locale::text("Hide Details", "隐藏详情", "隱藏詳細資料")
+                            } else {
+                                locale::text("Show Details", "显示详情", "顯示詳細資料")
+                            })
+                            .on_click({
+                                let toggle_entity = toggle_entity.clone();
+                                let row_id = toggle_row_id.clone();
+                                let turn_id = toggle_turn_id.clone();
+                                move |_, _, cx| {
+                                    let row_id = row_id.clone();
+                                    let turn_id = turn_id.clone();
+                                    let _ = toggle_entity.update(cx, |this, cx| {
+                                        this.set_timeline_disclosure(
+                                            row_id,
+                                            turn_id.as_deref(),
+                                            !open,
+                                        );
+                                        cx.notify();
+                                    });
+                                }
+                            }),
+                        )
+                    });
+            }
+            TimelineRowKind::ToolCall
+            | TimelineRowKind::WebSearch
+            | TimelineRowKind::Collaboration => {
+                let open = self
+                    .timeline_command_expansion
+                    .get(&row.id)
+                    .copied()
+                    .unwrap_or(false);
+                let toggle_entity = entity.clone();
+                let toggle_row_id = row.id.clone();
+                let toggle_turn_id = row.turn_id.clone();
+                menu = menu
+                    .when(has_input, |menu| {
+                        menu.item(Self::activity_copy_item(
+                            entity.clone(),
+                            &row.id,
+                            locale::text("Copy Input", "复制输入", "複製輸入"),
+                            ActivityCopyMode::Input,
+                        ))
+                    })
+                    .when(has_output, |menu| {
+                        menu.item(Self::activity_copy_item(
+                            entity.clone(),
+                            &row.id,
+                            locale::text("Copy Output", "复制输出", "複製輸出"),
+                            ActivityCopyMode::Output,
+                        ))
+                    })
+                    .item(Self::activity_copy_item(
+                        entity.clone(),
+                        &row.id,
+                        locale::text("Copy Details", "复制详情", "複製詳細資料"),
+                        ActivityCopyMode::Details,
+                    ))
+                    .separator()
+                    .item(
+                        PopupMenuItem::new(if open {
+                            locale::text("Hide Details", "隐藏详情", "隱藏詳細資料")
+                        } else {
+                            locale::text("Show Details", "显示详情", "顯示詳細資料")
+                        })
+                        .on_click(move |_, _, cx| {
+                            let row_id = toggle_row_id.clone();
+                            let turn_id = toggle_turn_id.clone();
+                            let _ = toggle_entity.update(cx, |this, cx| {
+                                this.set_timeline_disclosure(row_id, turn_id.as_deref(), !open);
+                                cx.notify();
+                            });
+                        }),
+                    );
+            }
+            TimelineRowKind::Error => {
+                menu = menu
+                    .item(Self::activity_copy_item(
+                        entity.clone(),
+                        &row.id,
+                        locale::text("Copy Error", "复制错误", "複製錯誤"),
+                        ActivityCopyMode::Primary,
+                    ))
+                    .when(row_is_live_view && !row.body.trim().is_empty(), |menu| {
+                        let quote_entity = entity.clone();
+                        let quote_row_id = row.id.clone();
+                        menu.item(
+                            PopupMenuItem::new(locale::text(
+                                "Quote in Composer",
+                                "引用到输入框",
+                                "引用到輸入框",
+                            ))
+                            .on_click(move |_, window, cx| {
+                                let row_id = quote_row_id.clone();
+                                let _ = quote_entity.update(cx, |this, cx| {
+                                    let body = this
+                                        .timeline_row_by_id(&row_id)
+                                        .map(|row| row.body.clone())
+                                        .unwrap_or_default();
+                                    this.quote_in_composer(&body, window, cx);
+                                });
+                            }),
+                        )
+                    });
+            }
+            TimelineRowKind::PermissionRequest => {
+                let request = self.permission_request_for_row(&row);
+                let pending = request
+                    .as_ref()
+                    .is_some_and(|request| permission_request_is_pending(&row, request));
+                let review_entity = entity.clone();
+                let copy_entity = entity.clone();
+                let copy_row_id = row.id.clone();
+                menu = menu
+                    .when(pending, |menu| {
+                        menu.item(
+                            PopupMenuItem::new(locale::text(
+                                "Review Request",
+                                "查看请求",
+                                "查看請求",
+                            ))
+                            .icon(IconName::Eye)
+                            .on_click(move |_, _, cx| {
+                                let _ = review_entity
+                                    .update(cx, |this, cx| this.reveal_pending_permission_card(cx));
+                            }),
+                        )
+                    })
+                    .item(
+                        PopupMenuItem::new(locale::text(
+                            "Copy Request",
+                            "复制请求内容",
+                            "複製請求內容",
+                        ))
+                        .icon(IconName::Copy)
+                        .on_click(move |_, _, cx| {
+                            let row_id = copy_row_id.clone();
+                            let _ = copy_entity.update(cx, |this, cx| {
+                                this.copy_permission_request_text(&row_id, cx);
+                            });
+                        }),
+                    );
+            }
+            _ => {
+                menu = menu.item(Self::activity_copy_item(
+                    entity.clone(),
+                    &row.id,
+                    locale::text("Copy", "复制", "複製"),
+                    ActivityCopyMode::Primary,
+                ));
+            }
+        }
+
+        menu
+    }
+
+    fn build_turn_context_menu(
+        &self,
+        menu: PopupMenu,
+        entity: WeakEntity<Self>,
+        context: TurnMenuContext,
+    ) -> PopupMenu {
+        let mut menu = menu
+            .min_w(px(220.0))
+            .max_w(px(320.0))
+            .item(PopupMenuItem::label(
+                locale::text("This Turn", "本轮", "本輪").to_string(),
+            ))
+            .separator();
+
+        if context.process_collapsible {
+            let toggle_entity = entity.clone();
+            let turn_id = context.turn_id.clone();
+            let expanded = context.process_expanded;
+            menu = menu.item(
+                PopupMenuItem::new(if expanded {
+                    locale::text("Collapse Process", "收起过程", "收合過程")
+                } else {
+                    locale::text("Expand Process", "展开过程", "展開過程")
+                })
+                .on_click(move |_, _, cx| {
+                    let turn_id = turn_id.clone();
+                    let _ = toggle_entity.update(cx, |this, cx| {
+                        this.prepare_timeline_disclosure(Some(&turn_id), !expanded);
+                        this.timeline_process_expansion.insert(turn_id, !expanded);
+                        cx.notify();
+                    });
+                }),
+            );
+        }
+
+        let copy_entity = entity.clone();
+        let copy_turn_id = context.turn_id.clone();
+        menu = menu.item(
+            PopupMenuItem::new(locale::text("Copy Turn", "复制本轮", "複製本輪"))
+                .icon(IconName::Copy)
+                .on_click(move |_, _, cx| {
+                    let turn_id = copy_turn_id.clone();
+                    let _ = copy_entity.update(cx, |this, cx| this.copy_turn(&turn_id, cx));
+                }),
+        );
+
+        if context.row_is_live_view && context.fork_sequence > 0 {
+            let fork_entity = entity.clone();
+            let fork_session_id = context.session_id.clone();
+            let fork_sequence = context.fork_sequence;
+            menu = menu.separator().item(
+                PopupMenuItem::new(locale::text("Fork from Here", "从此处分叉", "從此處分支"))
+                    .icon(Icon::default().path("icons/vibex/git-branch.svg"))
+                    .disabled(context.fork_disabled)
+                    .on_click(move |_, window, cx| {
+                        let Some(session_id) = fork_session_id.clone() else {
+                            return;
+                        };
+                        let _ = fork_entity.update(cx, |this, cx| {
+                            this.fork_session_at(session_id, fork_sequence, window, cx);
+                        });
+                    }),
+            );
+        }
+
+        menu
+    }
+
+    fn build_timeline_context_menu(&self, menu: PopupMenu, entity: WeakEntity<Self>) -> PopupMenu {
+        let has_conversation = !self.conversation_turns_cache.is_empty();
+        let mut menu = menu
+            .min_w(px(220.0))
+            .max_w(px(320.0))
+            .item(PopupMenuItem::label(
+                locale::text("Conversation", "会话", "工作階段").to_string(),
+            ))
+            .separator();
+
+        if has_conversation {
+            let copy_entity = entity.clone();
+            menu = menu.item(
+                PopupMenuItem::new(locale::text(
+                    "Copy Conversation",
+                    "复制会话",
+                    "複製工作階段",
+                ))
+                .icon(IconName::Copy)
+                .on_click(move |_, _, cx| {
+                    let _ = copy_entity.update(cx, |this, cx| this.copy_conversation(cx));
+                }),
+            );
+        }
+
+        let find_entity = entity.clone();
+        menu = menu.item(
+            PopupMenuItem::new(locale::text(
+                "Find in Conversation",
+                "在会话中查找",
+                "在工作階段中尋找",
+            ))
+            .icon(IconName::Search)
+            .disabled(!has_conversation)
+            .on_click(move |_, window, cx| {
+                let _ = find_entity.update(cx, |this, cx| {
+                    this.open_conversation_find_with_query(None, window, cx)
+                });
+            }),
+        );
+
+        if !self.timeline_follow.following_bottom {
+            let jump_entity = entity.clone();
+            menu = menu.item(
+                PopupMenuItem::new(locale::text("Jump to Latest", "跳到最新", "跳至最新"))
+                    .on_click(move |_, _, cx| {
+                        let _ = jump_entity.update(cx, |this, cx| {
+                            this.timeline_scroll_wheel_idle_task = None;
+                            this.timeline_follow.set_following_bottom(true);
+                            this.request_timeline_scroll_to_latest();
+                            cx.notify();
+                        });
+                    }),
+            );
+        }
+
+        menu
+    }
+
+    fn copy_permission_request_text(&self, row_id: &str, cx: &mut Context<Self>) {
+        let Some(row) = self.timeline_row_by_id(row_id) else {
+            return;
+        };
+        let Some(request) = self.permission_request_for_row(row) else {
+            return;
+        };
+        let mut text = request.title;
+        for detail in request.details {
+            text.push('\n');
+            text.push_str(&detail.label);
+            text.push_str(": ");
+            text.push_str(&detail.value);
+        }
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
     }
 
     /// Whether the turn a row belongs to is still producing output.
@@ -68265,6 +70976,7 @@ impl VibexWorkbench {
             turn,
             group,
             self.timeline_command_expansion.get(&group.id).copied(),
+            self.ui_state.session.auto_collapse_tool_calls,
         );
         let Some(rows) = turn
             .process_rows
@@ -68428,6 +71140,7 @@ impl VibexWorkbench {
                         turn,
                         group,
                         self.timeline_command_expansion.get(&group.id).copied(),
+                        self.ui_state.session.auto_collapse_tool_calls,
                     ),
                 ));
                 units.push(TimelineProcessUnit {
@@ -68868,98 +71581,135 @@ impl VibexWorkbench {
                     .as_ref()
                     .is_some_and(|session_id| self.session_turn_pending(session_id)),
         );
+        let menu_entity = cx.weak_entity();
+        let menu_context = UserMessageMenuContext {
+            row: row.clone(),
+            row_id: row.id.clone(),
+            session_id: self.timeline.session_id.clone(),
+            turn_id: turn_id.map(str::to_string),
+            first_sequence: row.first_sequence,
+            last_sequence: row.last_sequence,
+            authoritative_end_sequence: edit_source_end_sequence.unwrap_or(row.last_sequence),
+            latest_user_message,
+            turn_complete,
+            edit_action_state,
+            row_is_live_view: self.timeline.session_id.as_ref() == self.view_session_id.as_ref(),
+            child_session: self
+                .child_agent_render_session
+                .as_ref()
+                .map(|session_id| session_id.as_str().to_string()),
+            copy_item: copy_item.clone(),
+            attachments: edit_attachments.clone(),
+            mentions: mentions.clone(),
+            timestamp,
+        };
+        let content = v_flex()
+            .id(row.id.clone())
+            .min_w_0()
+            .w(relative(USER_MESSAGE_COLUMN_WIDTH_RATIO))
+            .items_end()
+            .gap_1()
+            .child(render_user_message_bubble(
+                inline_content,
+                edge_reactions,
+                cx.theme().muted,
+                cx.theme().foreground,
+                editing,
+            ))
+            .when(!editing, |this| {
+                this.child(
+                    h_flex()
+                        .items_center()
+                        .gap_2()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .opacity(0.0)
+                        .group_hover(hover_group.clone(), |style| style.opacity(1.0))
+                        .when_some(timestamp, |this, timestamp| {
+                            this.child(format_timeline_hover_time(timestamp, locale))
+                        })
+                        .child(
+                            Button::new(format!("copy-user-message:{}", row.id))
+                                .xsmall()
+                                .ghost()
+                                .compact()
+                                .size(px(24.0))
+                                .icon(IconName::Copy)
+                                .tooltip(locale::text("Copy", "复制", "複製"))
+                                .on_click(move |_, _, cx| {
+                                    cx.write_to_clipboard(copy_item.clone());
+                                }),
+                        )
+                        .when(
+                            edit_action_state != UserMessageEditActionState::Hidden,
+                            |this| {
+                                this.child(
+                                    Button::new(format!("edit-user-message:{}", row.id))
+                                        .xsmall()
+                                        .ghost()
+                                        .compact()
+                                        .size(px(24.0))
+                                        .icon(Icon::default().path("icons/vibex/pencil.svg"))
+                                        .tooltip(locale::text("Edit", "编辑", "編輯"))
+                                        .disabled(
+                                            edit_action_state
+                                                != UserMessageEditActionState::Enabled,
+                                        )
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            let (
+                                                Some(source_session_id),
+                                                Some(source_end_sequence),
+                                            ) = (
+                                                edit_source_session_id.clone(),
+                                                edit_source_end_sequence,
+                                            )
+                                            else {
+                                                return;
+                                            };
+                                            this.begin_inline_user_message_edit(
+                                                edit_turn_id.clone(),
+                                                edit_row_id.clone(),
+                                                source_session_id,
+                                                edit_user_sequence,
+                                                source_end_sequence,
+                                                edit_text.clone(),
+                                                edit_attachments.clone(),
+                                                mentions.clone(),
+                                                window,
+                                                cx,
+                                            )
+                                        })),
+                                )
+                            },
+                        ),
+                )
+            });
+        let content = if editing {
+            content.into_any_element()
+        } else {
+            content
+                .context_menu(move |menu, window, cx| {
+                    let Some(entity) = menu_entity.upgrade() else {
+                        return menu;
+                    };
+                    entity.update(cx, |this, cx| {
+                        this.build_user_message_context_menu(
+                            menu,
+                            window,
+                            cx,
+                            menu_entity.clone(),
+                            menu_context.clone(),
+                        )
+                    })
+                })
+                .into_any_element()
+        };
         div()
             .flex()
             .w_full()
             .justify_end()
             .group(hover_group.clone())
-            .child(
-                v_flex()
-                    .id(row.id.clone())
-                    .min_w_0()
-                    .w(relative(USER_MESSAGE_COLUMN_WIDTH_RATIO))
-                    .items_end()
-                    .gap_1()
-                    .child(render_user_message_bubble(
-                        inline_content,
-                        edge_reactions,
-                        cx.theme().muted,
-                        cx.theme().foreground,
-                        editing,
-                    ))
-                    .when(!editing, |this| {
-                        this.child(
-                            h_flex()
-                                .items_center()
-                                .gap_2()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .opacity(0.0)
-                                .group_hover(hover_group, |style| style.opacity(1.0))
-                                .when_some(timestamp, |this, timestamp| {
-                                    this.child(format_timeline_hover_time(timestamp, locale))
-                                })
-                                .child(
-                                    Button::new(format!("copy-user-message:{}", row.id))
-                                        .xsmall()
-                                        .ghost()
-                                        .compact()
-                                        .size(px(24.0))
-                                        .icon(IconName::Copy)
-                                        .tooltip(locale::text("Copy", "复制", "複製"))
-                                        .on_click(move |_, _, cx| {
-                                            cx.write_to_clipboard(copy_item.clone());
-                                        }),
-                                )
-                                .when(
-                                    edit_action_state != UserMessageEditActionState::Hidden,
-                                    |this| {
-                                        this.child(
-                                            Button::new(format!("edit-user-message:{}", row.id))
-                                                .xsmall()
-                                                .ghost()
-                                                .compact()
-                                                .size(px(24.0))
-                                                .icon(
-                                                    Icon::default().path("icons/vibex/pencil.svg"),
-                                                )
-                                                .tooltip(locale::text("Edit", "编辑", "編輯"))
-                                                .disabled(
-                                                    edit_action_state
-                                                        != UserMessageEditActionState::Enabled,
-                                                )
-                                                .on_click(cx.listener(
-                                                    move |this, _, window, cx| {
-                                                        let (
-                                                            Some(source_session_id),
-                                                            Some(source_end_sequence),
-                                                        ) = (
-                                                            edit_source_session_id.clone(),
-                                                            edit_source_end_sequence,
-                                                        )
-                                                        else {
-                                                            return;
-                                                        };
-                                                        this.begin_inline_user_message_edit(
-                                                            edit_turn_id.clone(),
-                                                            edit_row_id.clone(),
-                                                            source_session_id,
-                                                            edit_user_sequence,
-                                                            source_end_sequence,
-                                                            edit_text.clone(),
-                                                            edit_attachments.clone(),
-                                                            mentions.clone(),
-                                                            window,
-                                                            cx,
-                                                        )
-                                                    },
-                                                )),
-                                        )
-                                    },
-                                ),
-                        )
-                    }),
-            )
+            .child(content)
             .into_any_element()
     }
 
@@ -68968,42 +71718,86 @@ impl VibexWorkbench {
         row: &TimelineRow,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let attachments = self
+        let (attachments, mentions) = self
             .timeline_row_latest_item(row)
             .and_then(|item| match &item.payload {
                 vibex_core::TimelinePayload::UserMessage(message) => {
-                    Some(message.attachments.clone())
+                    Some((message.attachments.clone(), message.mentions.clone()))
                 }
                 _ => None,
             })
             .unwrap_or_default();
+        let copy_item =
+            user_message_clipboard_item_with_mentions(&row.body, &attachments, &mentions);
+        let timestamp = self.timeline_row_timestamp(row);
         let search_highlight = self.session_search_highlight_for_rows(std::slice::from_ref(row));
         let inline_content = self.render_user_message_inline_content(
             &row.id,
             row.body.clone(),
-            attachments,
+            attachments.clone(),
             search_highlight,
             None,
             cx,
         );
+        let menu_entity = cx.weak_entity();
+        let menu_context = UserMessageMenuContext {
+            row: row.clone(),
+            row_id: row.id.clone(),
+            session_id: self.timeline.session_id.clone(),
+            turn_id: row.turn_id.clone(),
+            first_sequence: row.first_sequence,
+            last_sequence: row.last_sequence,
+            authoritative_end_sequence: self
+                .timeline
+                .authoritative_end_sequence
+                .unwrap_or(row.last_sequence),
+            latest_user_message: false,
+            turn_complete: true,
+            edit_action_state: UserMessageEditActionState::Hidden,
+            row_is_live_view: false,
+            child_session: self
+                .child_agent_render_session
+                .as_ref()
+                .map(|session_id| session_id.as_str().to_string()),
+            copy_item,
+            attachments,
+            mentions,
+            timestamp,
+        };
+        let content = v_flex()
+            .id(row.id.clone())
+            .min_w_0()
+            .w(relative(USER_MESSAGE_COLUMN_WIDTH_RATIO))
+            .items_end()
+            .gap_1()
+            .child(render_user_message_bubble(
+                inline_content,
+                None,
+                cx.theme().muted,
+                cx.theme().foreground,
+                false,
+            ));
         div()
             .flex()
             .w_full()
             .justify_end()
             .child(
-                v_flex()
-                    .id(row.id.clone())
-                    .min_w_0()
-                    .w(relative(USER_MESSAGE_COLUMN_WIDTH_RATIO))
-                    .items_end()
-                    .gap_1()
-                    .child(render_user_message_bubble(
-                        inline_content,
-                        None,
-                        cx.theme().muted,
-                        cx.theme().foreground,
-                        false,
-                    )),
+                content
+                    .context_menu(move |menu, window, cx| {
+                        let Some(entity) = menu_entity.upgrade() else {
+                            return menu;
+                        };
+                        entity.update(cx, |this, cx| {
+                            this.build_user_message_context_menu(
+                                menu,
+                                window,
+                                cx,
+                                menu_entity.clone(),
+                                menu_context.clone(),
+                            )
+                        })
+                    })
+                    .into_any_element(),
             )
             .into_any_element()
     }
@@ -69052,9 +71846,9 @@ impl VibexWorkbench {
         // back even when the surface draws the whole of it. A body that is not
         // folded has nothing behind the control, so a windowed body alone does
         // not carry one.
-        let body_reveal_control = (hidden_body_bytes > 0
-            || (body_revealed && self.row_body_folds(row)))
-        .then(|| self.timeline_body_reveal_control(row, hidden_body_bytes, cx));
+        let context_foldable = hidden_body_bytes > 0 || (body_revealed && self.row_body_folds(row));
+        let body_reveal_control =
+            context_foldable.then(|| self.timeline_body_reveal_control(row, hidden_body_bytes, cx));
         let markdown_view = (!body_windowed).then(|| {
             let arriving = self.row_is_arriving(row);
             let image_plugin = self.session_image_plugin(cx.weak_entity());
@@ -69173,7 +71967,23 @@ impl VibexWorkbench {
             Vec::new()
         };
         let show_answer_footer = answer_metadata.is_some() || show_answer_actions;
-        v_flex()
+        let menu_entity = cx.weak_entity();
+        let menu_context = AgentMessageMenuContext {
+            row: row.clone(),
+            row_id: row.id.clone(),
+            session_id: self.timeline.session_id.clone(),
+            turn_id: row.turn_id.clone(),
+            last_sequence: row.last_sequence,
+            streaming: self.row_is_arriving(row),
+            foldable: context_foldable,
+            row_is_live_view: self.timeline.session_id.as_ref() == self.view_session_id.as_ref(),
+            child_session: self
+                .child_agent_render_session
+                .as_ref()
+                .map(|session_id| session_id.as_str().to_string()),
+            timestamp: self.timeline_row_timestamp(row),
+        };
+        let content = v_flex()
             .id(row.id.clone())
             .w_full()
             .min_w_0()
@@ -69216,6 +72026,21 @@ impl VibexWorkbench {
                             )
                         }),
                 )
+            });
+        content
+            .context_menu(move |menu, window, cx| {
+                let Some(entity) = menu_entity.upgrade() else {
+                    return menu;
+                };
+                entity.update(cx, |this, cx| {
+                    this.build_agent_message_context_menu(
+                        menu,
+                        window,
+                        cx,
+                        menu_entity.clone(),
+                        menu_context.clone(),
+                    )
+                })
             })
             .into_any_element()
     }
@@ -69765,6 +72590,7 @@ impl VibexWorkbench {
             turn,
             group,
             self.timeline_command_expansion.get(&group.id).copied(),
+            self.ui_state.session.auto_collapse_tool_calls,
         );
         let progress = self.timeline_disclosure_progress(&group.id, expanded, window, cx);
         let group_id = group.id.clone();
@@ -69792,12 +72618,19 @@ impl VibexWorkbench {
             this.set_timeline_disclosure(group_id.clone(), Some(&turn_id), !expanded);
             cx.notify();
         }));
+        let summary_selector = format!("activity-summary:{}", group.id);
+        let group_selector = format!("activity-group:{}", group.id);
         let mut body = v_flex()
             .id(group.id.clone())
+            .debug_selector(move || group_selector.clone())
             .w_full()
             .min_w_0()
             .flex_none()
-            .child(header);
+            .child(
+                div()
+                    .debug_selector(move || summary_selector.clone())
+                    .child(header),
+            );
         if progress > 0.0 {
             // A pending reveal points at one row of the group and scrolls to
             // it, and the spike's window has no pin: while one is pending the
@@ -85315,6 +88148,15 @@ struct SshLogView {
     loading: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnectionTransport {
+    Ssh,
+    Wsl,
+    /// A runtime paired directly from a pairing link or a pairing code. It has
+    /// no SSH or WSL profile: the registry entry is the whole connection.
+    Direct,
+}
+
 #[derive(Debug, Clone)]
 struct ConnectionDisplayRow {
     id: String,
@@ -85325,6 +88167,10 @@ struct ConnectionDisplayRow {
     port: u16,
     version: Option<String>,
     status: ConnectionRowStatus,
+    transport: ConnectionTransport,
+    /// The row's primary action needs a fact only the page holds: whether the
+    /// WSL deployment for this distro is still running.
+    wsl_provisioning: bool,
 }
 
 #[derive(Clone)]
@@ -86205,6 +89051,21 @@ fn settings_search_candidates(strings: &'static Strings) -> Vec<SettingsSearchCa
         ),
         settings_search_candidate(
             SettingsSection::Session,
+            strings.auto_collapse_tool_calls,
+            strings.auto_collapse_tool_calls_description,
+            &[
+                "tool",
+                "tool call",
+                "collapse",
+                "fold",
+                "工具",
+                "呼叫",
+                "折叠",
+                "折疊",
+            ],
+        ),
+        settings_search_candidate(
+            SettingsSection::Session,
             locale::text("Queue sending", "队列发送", "佇列傳送"),
             locale::text(
                 "Choose the default behavior while an Agent is running.",
@@ -86455,17 +89316,23 @@ fn settings_search_candidates(strings: &'static Strings) -> Vec<SettingsSearchCa
             SettingsSection::Connections,
             locale::text("Remote instances", "远程实例", "遠端執行個體"),
             locale::text(
-                "Connect Vibex to a runtime on another machine over SSH.",
-                "通过 SSH 把 Vibex 连接到另一台机器上的运行时。",
-                "透過 SSH 把 Vibex 連線到另一台機器上的執行階段。",
+                "Connect with a pairing link, reach a runtime over SSH, or start one in WSL2.",
+                "使用配对链接连接，通过 SSH 连接远程运行时，或在 WSL2 中启动运行时。",
+                "使用配對連結連線，透過 SSH 連線遠端執行階段，或在 WSL2 中啟動執行階段。",
             ),
             &[
                 "ssh",
+                "pairing",
+                "pairing link",
+                "wsl",
+                "port",
                 "connection",
                 "remote",
                 "instance",
                 "host",
                 "server",
+                "配对",
+                "配對",
                 "连接",
                 "連線",
                 "远程",
@@ -86780,6 +89647,71 @@ fn ssh_profile_edit_fields(
             local_port.clone(),
         ))
         .into_any_element()
+}
+
+/// Parses the runtime port typed in the WSL add dialog.
+///
+/// The server binds inside the distro as the logged-in user, so the useful
+/// range is the unprivileged one. A value outside it fails here, with the same
+/// sentence the dialog shows, rather than surfacing later as a permission or
+/// launch error from inside WSL.
+fn parse_wsl_runtime_port(value: &str) -> Result<u16, String> {
+    let port = value.trim().parse::<u16>().map_err(|_| {
+        locale::text(
+            "Enter a port number between 1024 and 65535.",
+            "请输入 1024 到 65535 之间的端口号。",
+            "請輸入 1024 到 65535 之間的連接埠號。",
+        )
+        .to_string()
+    })?;
+    if !(1024..=65535).contains(&port) {
+        return Err(locale::text(
+            "Enter a port number between 1024 and 65535.",
+            "请输入 1024 到 65535 之间的端口号。",
+            "請輸入 1024 到 65535 之間的連接埠號。",
+        )
+        .to_string());
+    }
+    Ok(port)
+}
+
+/// True when the pairing entry carries its own address, so the separate server
+/// field is unnecessary.
+///
+/// Only the headless runtime's `vibex://pair#/code/<payload>` connection string
+/// is accepted here. A phone-pairing offer (`#/pair/`) is a different claim
+/// endpoint and belongs to the mobile client, not to this runtime registry.
+fn pairing_entry_is_link(value: &str) -> bool {
+    let value = value.trim();
+    value.starts_with("vibex://") || value.contains("#/code/")
+}
+
+/// Recovery copy for pairing failures a reader can act on.
+///
+/// The raw transport sentence describes the protocol, so it stays in the
+/// diagnostic path; the dialog shows what to do next instead.
+fn pairing_entry_error_copy(code: &str) -> Option<&'static str> {
+    match code {
+        "remote_pairing_code_invalid" | "remote_pairing_code_expired" => Some(locale::text(
+            "That pairing code is wrong or has expired. Print a new one on the runtime.",
+            "配对码不正确或已过期，请在运行时上重新生成。",
+            "配對碼不正確或已過期，請在執行階段上重新產生。",
+        )),
+        "remote_pairing_link_invalid"
+        | "remote_pairing_entry_invalid"
+        | "remote_pairing_entry_untrusted"
+        | "remote_pairing_fragment_invalid" => Some(locale::text(
+            "That is not a Vibex pairing entry. Paste the whole line that starts with vibex://",
+            "无法识别这段内容，请粘贴以 vibex:// 开头的完整一行。",
+            "無法辨識這段內容，請貼上以 vibex:// 開頭的完整一行。",
+        )),
+        "remote_secure_context_required" | "remote_url_invalid" => Some(locale::text(
+            "The server address must be an HTTPS URL, or HTTP on this machine in a debug build.",
+            "服务器地址必须是 HTTPS；调试版本中允许本机 HTTP。",
+            "伺服器位址必須是 HTTPS；偵錯版本中允許本機 HTTP。",
+        )),
+        _ => None,
+    }
 }
 
 fn connection_diagnostic_title(
@@ -87837,6 +90769,11 @@ struct FoundationSettings {
     /// Whether the Connections page is showing its add panel.
     /// Profiles loaded when Connections is activated.
     connections_profiles: Vec<SshConnectionProfile>,
+    /// Saved WSL connections, loaded from their own store beside the SSH list.
+    connections_wsl_profiles: Vec<WslConnectionProfile>,
+    /// Registry runtimes paired directly from a link or code. They have no
+    /// SSH/WSL profile, so the page renders them from the registry itself.
+    connections_direct_runtimes: Vec<RegisteredRuntime>,
     /// The active provisioning snapshot/error mirrored from the workbench.
     connections_snapshot: Option<ProvisioningSnapshot>,
     connections_error: Option<String>,
@@ -87867,6 +90804,14 @@ struct FoundationSettings {
     /// it is already open; opening again on every event would stack dialogs on
     /// top of each other.
     connections_progress_open: bool,
+    /// The WSL deployment mirrored from the workbench. Unlike the SSH snapshot
+    /// it has its own step sequence; a terminal failure stays here so the page
+    /// can still explain it after the dialog is closed.
+    connections_wsl_progress: Option<WslProvisioningSnapshot>,
+    /// The attempt the reader closed while it was still running.
+    connections_wsl_progress_dismissed: Option<u64>,
+    /// Whether the WSL progress dialog is currently mounted.
+    connections_wsl_progress_open: bool,
     /// Hosts discovered from the user's OpenSSH config for the add panel.
     connections_hosts: Vec<SshHostEntry>,
     connections_host_warnings: Vec<String>,
@@ -87891,6 +90836,28 @@ struct FoundationSettings {
     /// The last read failed, with the child's own message. The dialog keeps it
     /// on screen; the hint layer carries the same text.
     connections_wsl_error: Option<String>,
+    /// The runtime port the add dialog will install on. WSL binds on the same
+    /// loopback port on both sides, so a port used inside the distro (or a
+    /// forwarding conflict on Windows) has to be changeable before the
+    /// deployment starts.
+    connections_wsl_port_input: Entity<InputState>,
+    /// A port preflight is running; the dialog says so and blocks a second
+    /// submit.
+    connections_wsl_checking: bool,
+    /// Why the preflight rejected the chosen port, kept in the dialog so the
+    /// reader can edit the port and retry without reopening anything.
+    connections_wsl_check_error: Option<String>,
+    /// Which preflight the dialog is waiting for. Closing the dialog or
+    /// starting a new check bumps this, so an older `wsl.exe` answer cannot
+    /// start a deployment for a dialog that has already moved on.
+    connections_wsl_check_generation: u64,
+    /// A pairing link or code is being claimed. The claim is the slow half of
+    /// adding a direct runtime, so the dialog owns its own busy state.
+    connections_pairing_open: bool,
+    connections_pairing_busy: bool,
+    connections_pairing_error: Option<String>,
+    connections_pairing_entry_input: Entity<InputState>,
+    connections_pairing_server_input: Entity<InputState>,
     /// Whether the Bootstrap SSH panel is showing. The command is generated
     /// only after the user names the Linux account it authorizes.
     bootstrap_open: bool,
@@ -88071,6 +91038,26 @@ impl FoundationSettings {
                 .placeholder(DEFAULT_NETWORK_PROXY_BYPASS)
         });
         let bootstrap_user_input = cx.new(|cx| InputState::new(window, cx).placeholder("ubuntu"));
+        let connections_wsl_port_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value("8765")
+                .placeholder("8765")
+                .submit_on_enter(true)
+        });
+        let connections_pairing_entry_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(locale::text(
+                    "vibex://pair#/code/… or 123-456-789",
+                    "vibex://pair#/code/… 或 123-456-789",
+                    "vibex://pair#/code/… 或 123-456-789",
+                ))
+                .submit_on_enter(true)
+        });
+        let connections_pairing_server_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("https://192.168.1.10:8765")
+                .submit_on_enter(true)
+        });
         let search = cx.new(|cx| {
             InputState::new(window, cx).placeholder(locale::text(
                 "Search settings",
@@ -88089,6 +91076,22 @@ impl FoundationSettings {
                         cx.notify();
                     }
                     InputEvent::PressEnter { .. } | InputEvent::Focus | InputEvent::Blur => {}
+                },
+            )
+            .detach();
+            // The pairing dialog decides whether to show the address field
+            // from the text in the entry field. Notify Settings on every change
+            // so the dialog's next frame reflects the new shape instead of
+            // waiting for an unrelated repaint.
+            cx.subscribe(
+                &connections_pairing_entry_input,
+                |this: &mut FoundationSettings, _, event: &InputEvent, cx| {
+                    if matches!(event, InputEvent::Change) {
+                        if !this.connections_pairing_busy {
+                            this.connections_pairing_error = None;
+                        }
+                        cx.notify();
+                    }
                 },
             )
             .detach();
@@ -88352,6 +91355,8 @@ impl FoundationSettings {
                 browser_clear_task: None,
                 shortcut_note: None,
                 connections_profiles: Vec::new(),
+                connections_wsl_profiles: Vec::new(),
+                connections_direct_runtimes: Vec::new(),
                 connections_snapshot: None,
                 connections_error: None,
                 connections_live_status: BTreeMap::new(),
@@ -88359,6 +91364,9 @@ impl FoundationSettings {
                 connections_progress_target: None,
                 connections_progress_dismissed: None,
                 connections_progress_open: false,
+                connections_wsl_progress: None,
+                connections_wsl_progress_dismissed: None,
+                connections_wsl_progress_open: false,
                 connections_hosts: Vec::new(),
                 connections_host_warnings: Vec::new(),
                 connections_selected_host: None,
@@ -88373,6 +91381,15 @@ impl FoundationSettings {
                 connections_wsl_generation: 0,
                 connections_wsl_loading: false,
                 connections_wsl_error: None,
+                connections_wsl_port_input,
+                connections_wsl_checking: false,
+                connections_wsl_check_error: None,
+                connections_wsl_check_generation: 0,
+                connections_pairing_open: false,
+                connections_pairing_busy: false,
+                connections_pairing_error: None,
+                connections_pairing_entry_input,
+                connections_pairing_server_input,
                 bootstrap_open: false,
                 bootstrap_user_input,
                 bootstrap_command: None,
@@ -88407,12 +91424,7 @@ impl FoundationSettings {
             self.request_local_clients_refresh(cx);
         }
         if section == SettingsSection::Connections {
-            self.connections_profiles = self
-                .home_dir
-                .as_deref()
-                .map(SshProfileStore::at_home)
-                .and_then(|store| store.load().ok())
-                .unwrap_or_default();
+            self.reload_connections_profiles();
             self.resume_unprovisioned_connections(cx);
         }
     }
@@ -89765,6 +92777,13 @@ impl FoundationSettings {
     fn set_enhanced_file_operation_display(&mut self, enabled: bool, cx: &mut Context<Self>) {
         let _ = self.workbench.update(cx, |this, cx| {
             this.set_enhanced_file_operation_display(enabled, cx)
+        });
+        cx.notify();
+    }
+
+    fn set_auto_collapse_tool_calls(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        let _ = self.workbench.update(cx, |this, cx| {
+            this.set_auto_collapse_tool_calls(enabled, cx)
         });
         cx.notify();
     }
@@ -91491,6 +94510,13 @@ impl FoundationSettings {
             .on_click(cx.listener(|this, enabled, _, cx| {
                 this.set_enhanced_file_operation_display(*enabled, cx)
             }));
+        let auto_collapse_tool_calls_switch = Switch::new("auto-collapse-tool-calls")
+            .small()
+            .checked(session.auto_collapse_tool_calls)
+            .tooltip(strings.auto_collapse_tool_calls)
+            .on_click(
+                cx.listener(|this, enabled, _, cx| this.set_auto_collapse_tool_calls(*enabled, cx)),
+            );
         let queue_manual = self
             .workbench
             .read_with(cx, |this, _| {
@@ -91670,6 +94696,13 @@ impl FoundationSettings {
                             strings.enhanced_file_operation_display,
                             strings.enhanced_file_operation_display_description,
                             enhanced_file_operation_switch,
+                            stacked,
+                            cx,
+                        ),
+                        setting_row(
+                            strings.auto_collapse_tool_calls,
+                            strings.auto_collapse_tool_calls_description,
+                            auto_collapse_tool_calls_switch,
                             stacked,
                             cx,
                         ),
@@ -91864,6 +94897,25 @@ impl FoundationSettings {
             .map(SshProfileStore::at_home)
             .and_then(|store| store.load().ok())
             .unwrap_or_default();
+        self.connections_wsl_profiles = self
+            .home_dir
+            .as_deref()
+            .map(WslProfileStore::at_home)
+            .and_then(|store| store.load().ok())
+            .unwrap_or_default();
+        // A runtime paired from a link or code has no profile of its own; the
+        // registry is the only record that it exists. The workbench reloads
+        // this after a pairing or a removal, so the list follows the action
+        // that produced it instead of waiting for the page to be reopened.
+        self.connections_direct_runtimes = self
+            .home_dir
+            .as_deref()
+            .map(|home| {
+                DesktopRuntimeRegistryStore::new(home)
+                    .load_or_migrate()
+                    .runtimes
+            })
+            .unwrap_or_default();
     }
 
     fn load_connections_discovery(&mut self, cx: &mut Context<Self>) {
@@ -91940,6 +94992,70 @@ impl FoundationSettings {
         });
     }
 
+    /// Asks before deleting a WSL connection.
+    ///
+    /// The WSL profile is the only record that this desktop installed a runtime
+    /// inside that distro. Removing it deletes the profile and the saved
+    /// credential; the distro and its files are untouched.
+    fn confirm_remove_wsl_connection(
+        &mut self,
+        profile_id: String,
+        profile_name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let entity = cx.weak_entity();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let entity = entity.clone();
+            let profile_id = profile_id.clone();
+            let profile_name = profile_name.clone();
+            let title = locale::text(
+                "Remove this WSL connection?",
+                "移除此 WSL 连接？",
+                "移除此 WSL 連線？",
+            );
+            let description = match locale::current_locale() {
+                locale::ResolvedLocale::ZhCn => format!(
+                    "“{profile_name}”的连接会被移除。这台机器上保存的配对凭据和后台运行时进程会一并停止；WSL 发行版和其中的文件不受影响。"
+                ),
+                locale::ResolvedLocale::ZhTw => format!(
+                    "「{profile_name}」的連線會被移除。這台機器上儲存的配對憑證與背景執行階段程序會一併停止；WSL 發行版和其中的檔案不受影響。"
+                ),
+                locale::ResolvedLocale::En => format!(
+                    "The saved connection for \u{201c}{profile_name}\u{201d} is removed. This machine's pairing credential and the background runtime process stop with it; the WSL distro and its files are left alone."
+                ),
+                locale => vibex_ui::locale_copy::fill(
+                    locale.shared(),
+                    "The saved connection for \u{201c}{profile_name}\u{201d} is removed. This machine's pairing credential and the background runtime process stop with it; the WSL distro and its files are left alone.",
+                    &[("profile_name", profile_name.clone())],
+                ),
+            };
+            dialog
+                .title(title)
+                .child(div().whitespace_normal().child(description))
+                .footer(
+                    DialogFooter::new()
+                        .child(DialogClose::new().child(
+                            Button::new("connections-wsl-remove-cancel")
+                                .outline()
+                                .label(locale::text("Cancel", "取消", "取消")),
+                        ))
+                        .child(DialogAction::new().child(
+                            Button::new("connections-wsl-remove-confirm")
+                                .danger()
+                                .label(locale::text("Remove", "移除", "移除")),
+                        )),
+                )
+                .on_ok(move |_, _, cx| {
+                    let profile_id = profile_id.clone();
+                    let _ = entity.update(cx, |this, cx| {
+                        this.remove_wsl_connection(&profile_id, cx)
+                    });
+                    true
+                })
+        });
+    }
+
     /// Records a Connections failure and announces it on the hint layer.
     ///
     /// The Connections page lives inside the settings dialog, so a red line
@@ -92010,6 +95126,66 @@ impl FoundationSettings {
         cx.defer(move |cx| {
             let _ = workbench.update(cx, |workbench, cx| {
                 workbench.remove_ssh_connection_runtime(profile, cx)
+            });
+        });
+        cx.notify();
+    }
+
+    /// Deletes one saved WSL connection and the runtime binding this machine
+    /// stored for it.
+    ///
+    /// The store is written first for the same reason as the SSH path: a
+    /// profile that disappears from the list while its runtime removal lags is
+    /// a stale runtime the manager can still remove, not a row that cannot be
+    /// removed at all.
+    fn remove_wsl_connection(&mut self, profile_id: &str, cx: &mut Context<Self>) {
+        let Some(home_dir) = self.home_dir.clone() else {
+            self.report_connections_failure(
+                locale::text(
+                    "The desktop home is unavailable, so the WSL connection was not removed.",
+                    "无法访问桌面数据目录，WSL 连接未移除。",
+                    "無法存取桌面資料目錄，WSL 連線未移除。",
+                )
+                .to_string(),
+                cx,
+            );
+            return;
+        };
+        let store = WslProfileStore::at_home(&home_dir);
+        let mut profiles = match store.load() {
+            Ok(profiles) => profiles,
+            Err(error) => {
+                self.report_connections_failure(format!("{}: {}", error.code, error.message), cx);
+                return;
+            }
+        };
+        let Some(index) = profiles.iter().position(|profile| profile.id == profile_id) else {
+            self.reload_connections_profiles();
+            cx.notify();
+            return;
+        };
+        let profile = profiles.remove(index);
+        if let Err(error) = store.save(&profiles) {
+            self.report_connections_failure(format!("{}: {}", error.code, error.message), cx);
+            return;
+        }
+        if self
+            .connections_wsl_progress
+            .as_ref()
+            .is_some_and(|snapshot| {
+                snapshot.distro == profile.distro && !snapshot.status.is_terminal()
+            })
+        {
+            self.connections_wsl_progress = None;
+            self.connections_wsl_progress_dismissed = None;
+            self.connections_wsl_progress_open = false;
+        }
+        self.reload_connections_profiles();
+        // The workbench holds the kept-alive runtime, so it owns the teardown.
+        let workbench = self.workbench.clone();
+        cx.defer(move |cx| {
+            let _ = workbench.update(cx, |workbench, cx| {
+                workbench.remove_wsl_connection_runtime(profile, cx)
             });
         });
         cx.notify();
@@ -92261,18 +95437,6 @@ impl FoundationSettings {
             },
         ));
         cx.notify();
-    }
-
-    fn connect_wsl_distro(&self, cx: &mut Context<Self>) {
-        let Some(distro) = self.connections_wsl_selected.clone() else {
-            return;
-        };
-        let workbench = self.workbench.clone();
-        cx.defer(move |cx| {
-            let _ = workbench.update(cx, |workbench, cx| {
-                workbench.provision_wsl_distro(distro.clone(), cx)
-            });
-        });
     }
 
     /// Opens the add-SSH-connection dialog and starts host discovery.
@@ -92600,18 +95764,32 @@ impl FoundationSettings {
     /// Opens the WSL distro dialog. The distro list is read once, when the
     /// dialog opens, because `wsl.exe` is a process call rather than a value.
     fn open_connections_wsl_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Every open starts from the documented default. The field keeps what
+        // the reader typed only while this dialog is on screen, so a port
+        // rejected by the preflight stays there for the correction.
+        self.connections_wsl_port_input.update(cx, |input, cx| {
+            input.set_value("8765", window, cx);
+        });
+        self.connections_wsl_checking = false;
+        self.connections_wsl_check_error = None;
+        self.connections_wsl_check_generation =
+            self.connections_wsl_check_generation.wrapping_add(1);
         self.load_wsl_distros(cx);
         let entity = cx.weak_entity();
+        let port_input = self.connections_wsl_port_input.clone();
         window.open_dialog(cx, move |dialog, _, cx| {
             let entity = entity.clone();
             let entity_for_footer = entity.clone();
-            let (distros, selected, loading, error) = entity
+            let entity_for_close = entity_for_footer.clone();
+            let (distros, selected, loading, error, checking, check_error) = entity
                 .update(cx, |this, _| {
                     (
                         this.connections_wsl_distros.clone(),
                         this.connections_wsl_selected.clone(),
                         this.connections_wsl_loading,
                         this.connections_wsl_error.clone(),
+                        this.connections_wsl_checking,
+                        this.connections_wsl_check_error.clone(),
                     )
                 })
                 .unwrap_or_default();
@@ -92627,7 +95805,7 @@ impl FoundationSettings {
                         "WSL2 在本機執行 Linux，不需要 sshd 或 SSH 金鑰。",
                     )),
             );
-            if let Some(error) = error {
+            if let Some(error) = error.as_ref() {
                 // The read failed and this dialog is what stays on screen. The
                 // hint layer carries the same text; the body repeats it because
                 // a hint is dismissed by a click, and a reader who looks down
@@ -92648,7 +95826,7 @@ impl FoundationSettings {
                                 .min_w_0()
                                 .text_xs()
                                 .whitespace_normal()
-                                .child(error),
+                                .child(error.clone()),
                         )
                         .child(
                             Button::new("connections-wsl-retry")
@@ -92702,6 +95880,7 @@ impl FoundationSettings {
                     let chosen = selected.as_deref() == Some(distro.as_str());
                     let row_entity = entity.clone();
                     let value = distro.clone();
+                    let row_checking = checking;
                     list = list.child(
                         h_flex()
                             .id(SharedString::from(format!("connections-wsl-{distro}")))
@@ -92716,6 +95895,12 @@ impl FoundationSettings {
                             .when(chosen, |this| this.bg(cx.theme().primary.opacity(0.14)))
                             .hover(|this| this.bg(cx.theme().muted.opacity(0.5)))
                             .on_click(move |_, _, cx| {
+                                // A check is already bound to the selection it
+                                // started with; switching distros mid-check
+                                // would deploy the previous one.
+                                if row_checking {
+                                    return;
+                                }
                                 let _ = row_entity.update(cx, |this, cx| {
                                     this.connections_wsl_selected = Some(value.clone());
                                     cx.notify();
@@ -92728,6 +95913,49 @@ impl FoundationSettings {
                     );
                 }
                 body = body.child(list);
+            }
+            // The port is chosen after the distro, because it only means
+            // something inside one. It stays editable after a rejected
+            // preflight so a busy 8765 costs one correction, not a reopened
+            // dialog.
+            if error.is_none() && !loading && !distros.is_empty() {
+                body = body.child(
+                    v_flex()
+                        .w_full()
+                        .min_w_0()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(locale::text(
+                                    "Runtime port",
+                                    "运行时端口",
+                                    "執行階段連接埠",
+                                )),
+                        )
+                        .child(Input::new(&port_input).small())
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .whitespace_normal()
+                                .child(locale::text(
+                                    "The runtime binds this port inside the distro. Change it when 8765 is already taken.",
+                                    "运行时会在发行版内绑定此端口。如果 8765 已被占用，请修改。",
+                                    "執行階段會在發行版內綁定此連接埠。若 8765 已被占用，請修改。",
+                                )),
+                        )
+                        .when_some(check_error, |this, error| {
+                            this.child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().danger)
+                                    .whitespace_normal()
+                                    .child(error),
+                            )
+                        }),
+                );
             }
             dialog
                 .title(locale::text(
@@ -92750,13 +95978,389 @@ impl FoundationSettings {
                             DialogAction::new().child(
                                 Button::new("connections-wsl-connect")
                                     .primary()
-                                    .label(locale::text("Connect WSL", "连接 WSL", "連線 WSL"))
-                                    .disabled(selected.is_none()),
+                                    .label(if checking {
+                                        locale::text(
+                                            "Checking port…",
+                                            "正在检查端口…",
+                                            "正在檢查連接埠…",
+                                        )
+                                    } else {
+                                        locale::text("Connect WSL", "连接 WSL", "連線 WSL")
+                                    })
+                                    .disabled(selected.is_none() || checking),
                             ),
                         ),
                 )
                 .on_ok(move |_, _, cx| {
-                    let _ = entity_for_footer.update(cx, |this, cx| this.connect_wsl_distro(cx));
+                    let _ = entity_for_footer
+                        .update(cx, |this, cx| this.start_wsl_connection(cx));
+                    // The dialog stays mounted while the port is checked. On
+                    // success the workbench closes it and opens the progress
+                    // dialog; on a busy port the same dialog shows the reason.
+                    false
+                })
+                .on_close({
+                    let close = entity_for_close;
+                    move |_, _, cx| {
+                        let _ = close.update(cx, |this, cx| {
+                            this.connections_wsl_open = false;
+                            this.connections_wsl_checking = false;
+                            this.connections_wsl_check_generation =
+                                this.connections_wsl_check_generation.wrapping_add(1);
+                            cx.notify();
+                        });
+                    }
+                })
+        });
+    }
+
+    /// Validates the port field and asks the workbench to check it before the
+    /// deployment starts.
+    ///
+    /// The range check is local and immediate; whether the port is free is a
+    /// fact inside the distro, so that half runs `wsl.exe` off the UI thread.
+    /// The dialog stays open either way until the answer arrives.
+    fn start_wsl_connection(&mut self, cx: &mut Context<Self>) {
+        if self.connections_wsl_checking {
+            return;
+        }
+        let Some(distro) = self.connections_wsl_selected.clone() else {
+            return;
+        };
+        let raw_port = self
+            .connections_wsl_port_input
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        let port = match parse_wsl_runtime_port(&raw_port) {
+            Ok(port) => port,
+            Err(error) => {
+                self.connections_wsl_check_error = Some(error);
+                cx.notify();
+                return;
+            }
+        };
+        self.connections_wsl_checking = true;
+        self.connections_wsl_check_error = None;
+        self.connections_wsl_check_generation =
+            self.connections_wsl_check_generation.wrapping_add(1);
+        let generation = self.connections_wsl_check_generation;
+        let workbench = self.workbench.clone();
+        let _ = workbench.update(cx, |workbench, cx| {
+            workbench.check_wsl_runtime_port(distro, port, generation, cx)
+        });
+        cx.notify();
+    }
+
+    /// Opens the one-field pairing entry: a `vibex://` link, or the runtime's
+    /// address plus the numeric code it printed.
+    ///
+    /// One field carries both shapes because they are unambiguous, and the
+    /// address field only appears for a bare code. A link already carries its
+    /// address and, for a self-signed runtime, the certificate to pin, so
+    /// asking which shape the reader holds would be asking them to read the
+    /// protocol.
+    fn open_connections_pairing_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.connections_pairing_open = true;
+        self.connections_pairing_busy = false;
+        self.connections_pairing_error = None;
+        self.connections_pairing_entry_input
+            .update(cx, |input, cx| {
+                input.set_value("", window, cx);
+                input.focus(window, cx);
+            });
+        self.connections_pairing_server_input
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        let entity = cx.weak_entity();
+        let entry_input = self.connections_pairing_entry_input.clone();
+        let server_input = self.connections_pairing_server_input.clone();
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let entity = entity.clone();
+            let entity_for_footer = entity.clone();
+            let entity_for_close = entity_for_footer.clone();
+            let (busy, error, entry) = entity
+                .read_with(cx, |this, _| {
+                    (
+                        this.connections_pairing_busy,
+                        this.connections_pairing_error.clone(),
+                        this.connections_pairing_entry_input
+                            .read(cx)
+                            .value()
+                            .to_string(),
+                    )
+                })
+                .unwrap_or_default();
+            let link = pairing_entry_is_link(&entry);
+            let mut body = v_flex()
+                .w_full()
+                .min_w_0()
+                .gap_2()
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .whitespace_normal()
+                        .child(locale::text(
+                            "Paste the pairing link printed by vibex-server, or enter the runtime's address and its one-time pairing code. No SSH setup is needed.",
+                            "粘贴 vibex-server 输出的配对链接，或填写运行时地址和一次性配对码。无需配置 SSH。",
+                            "貼上 vibex-server 輸出的配對連結，或填寫執行階段位址和一次性配對碼。無需設定 SSH。",
+                        )),
+                )
+                .child(
+                    v_flex()
+                        .w_full()
+                        .min_w_0()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(locale::text(
+                                    "Pairing link or code",
+                                    "配对链接或配对码",
+                                    "配對連結或配對碼",
+                                )),
+                        )
+                        .child(Input::new(&entry_input).small()),
+                );
+            if link {
+                body = body.child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .whitespace_normal()
+                        .child(locale::text(
+                            "The link already contains the server address and its certificate.",
+                            "链接中已经包含服务器地址和证书。",
+                            "連結中已經包含伺服器位址和憑證。",
+                        )),
+                );
+            } else {
+                body = body.child(
+                    v_flex()
+                        .w_full()
+                        .min_w_0()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(locale::text(
+                                    "Server address",
+                                    "服务器地址",
+                                    "伺服器位址",
+                                )),
+                        )
+                        .child(Input::new(&server_input).small())
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .whitespace_normal()
+                                .child(locale::text(
+                                    "Required with a bare code, for example https://192.168.1.10:8765.",
+                                    "使用配对码时必填，例如 https://192.168.1.10:8765。",
+                                    "使用配對碼時必填，例如 https://192.168.1.10:8765。",
+                                )),
+                        ),
+                );
+            }
+            if let Some(error) = error {
+                body = body.child(
+                    div()
+                        .w_full()
+                        .min_w_0()
+                        .text_xs()
+                        .text_color(cx.theme().danger)
+                        .whitespace_normal()
+                        .child(error),
+                );
+            }
+            dialog
+                .title(locale::text(
+                    "Connect with pairing link",
+                    "使用配对链接连接",
+                    "使用配對連結連線",
+                ))
+                .w(px(560.0))
+                .child(body)
+                .footer(
+                    DialogFooter::new()
+                        .child(
+                            DialogClose::new().child(
+                                Button::new("connections-pairing-cancel")
+                                    .outline()
+                                    .label(locale::text("Cancel", "取消", "取消")),
+                            ),
+                        )
+                        .child(
+                            DialogAction::new().child(
+                                Button::new("connections-pairing-connect")
+                                    .primary()
+                                    .label(if busy {
+                                        locale::text(
+                                            "Connecting…",
+                                            "正在连接…",
+                                            "正在連線…",
+                                        )
+                                    } else {
+                                        locale::text("Connect", "连接", "連線")
+                                    })
+                                    .disabled(busy),
+                            ),
+                        ),
+                )
+                .on_ok(move |_, _, cx| {
+                    let _ = entity_for_footer
+                        .update(cx, |this, cx| this.submit_pairing_entry(cx));
+                    // The claim keeps the dialog open: a rejected code or URL
+                    // is corrected here, and the workbench closes the dialog
+                    // itself once the runtime is registered and connecting.
+                    false
+                })
+                .on_close({
+                    let close = entity_for_close;
+                    move |_, _, cx| {
+                        let _ = close.update(cx, |this, cx| {
+                            this.connections_pairing_open = false;
+                            this.connections_pairing_busy = false;
+                            cx.notify();
+                        });
+                    }
+                })
+        });
+    }
+
+    /// Validates the pairing fields locally and hands the claim to the
+    /// workbench, which owns the registry and the client.
+    fn submit_pairing_entry(&mut self, cx: &mut Context<Self>) {
+        if self.connections_pairing_busy {
+            return;
+        }
+        let entry = self
+            .connections_pairing_entry_input
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        if entry.is_empty() {
+            self.connections_pairing_error = Some(
+                locale::text(
+                    "Paste the pairing link or code from the runtime.",
+                    "请粘贴运行时给出的配对链接或配对码。",
+                    "請貼上執行階段提供的配對連結或配對碼。",
+                )
+                .to_string(),
+            );
+            cx.notify();
+            return;
+        }
+        let server_url = self
+            .connections_pairing_server_input
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        if !pairing_entry_is_link(&entry) {
+            if server_url.is_empty() {
+                self.connections_pairing_error = Some(
+                    locale::text(
+                        "Enter the server address as well as the pairing code.",
+                        "请同时填写服务器地址和配对码。",
+                        "請同時填寫伺服器位址和配對碼。",
+                    )
+                    .to_string(),
+                );
+                cx.notify();
+                return;
+            }
+            if !(server_url.starts_with("http://") || server_url.starts_with("https://")) {
+                self.connections_pairing_error = Some(
+                    locale::text(
+                        "The server address must start with http:// or https://.",
+                        "服务器地址必须以 http:// 或 https:// 开头。",
+                        "伺服器位址必須以 http:// 或 https:// 開頭。",
+                    )
+                    .to_string(),
+                );
+                cx.notify();
+                return;
+            }
+        }
+        self.connections_pairing_busy = true;
+        self.connections_pairing_error = None;
+        let workbench = self.workbench.clone();
+        let _ = workbench.update(cx, |workbench, cx| {
+            workbench.begin_pairing_entry_connect(entry, server_url, cx)
+        });
+        cx.notify();
+    }
+
+    /// Asks before removing a runtime that was paired directly from a link.
+    ///
+    /// Unlike an SSH or WSL profile there is nothing left behind on a host:
+    /// the registry entry is the entire connection, so removing it only drops
+    /// this machine's grant.
+    fn confirm_remove_paired_runtime(
+        &mut self,
+        runtime_id: String,
+        runtime_name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let entity = cx.weak_entity();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let entity = entity.clone();
+            let runtime_id = runtime_id.clone();
+            let runtime_name = runtime_name.clone();
+            let title = locale::text(
+                "Remove this paired runtime?",
+                "移除此已配对运行时？",
+                "移除此已配對執行階段？",
+            );
+            let description = match locale::current_locale() {
+                locale::ResolvedLocale::ZhCn => format!(
+                    "“{runtime_name}”会从此电脑的运行时列表中移除，保存的配对凭据也会删除。远端运行时和工作区文件不受影响。"
+                ),
+                locale::ResolvedLocale::ZhTw => format!(
+                    "「{runtime_name}」會從此電腦的執行階段清單中移除，儲存的配對憑證也會刪除。遠端執行階段與工作區檔案不受影響。"
+                ),
+                locale::ResolvedLocale::En => format!(
+                    "The pairing for \u{201c}{runtime_name}\u{201d} is removed from this computer. The remote runtime and workspace files are left alone."
+                ),
+                locale => vibex_ui::locale_copy::fill(
+                    locale.shared(),
+                    "The pairing for \u{201c}{runtime_name}\u{201d} is removed from this computer. The remote runtime and workspace files are left alone.",
+                    &[("runtime_name", runtime_name.clone())],
+                ),
+            };
+            dialog
+                .title(title)
+                .child(div().whitespace_normal().child(description))
+                .footer(
+                    DialogFooter::new()
+                        .child(DialogClose::new().child(
+                            Button::new("connections-pairing-remove-cancel")
+                                .outline()
+                                .label(locale::text("Cancel", "取消", "取消")),
+                        ))
+                        .child(DialogAction::new().child(
+                            Button::new("connections-pairing-remove-confirm")
+                                .danger()
+                                .label(locale::text("Remove", "移除", "移除")),
+                        )),
+                )
+                .on_ok(move |_, _, cx| {
+                    let runtime_id = runtime_id.clone();
+                    let workbench = entity
+                        .read_with(cx, |this, _| this.workbench.clone())
+                        .ok();
+                    if let Some(workbench) = workbench {
+                        let _ = workbench.update(cx, |workbench, cx| {
+                            workbench.remove_runtime(runtime_id.clone(), cx)
+                        });
+                    }
                     true
                 })
         });
@@ -92972,6 +96576,220 @@ impl FoundationSettings {
         }
         self.connections_progress_target = None;
         self.connections_progress_open = false;
+    }
+
+    /// Opens the WSL deployment progress dialog.
+    ///
+    /// WSL used to close its add dialog and then show nothing until the runtime
+    /// appeared in the title-bar switcher minutes later. This dialog is the
+    /// click's answer: the distro, the current step, a progress bar, and the
+    /// provisioner's own detail line.
+    fn open_connections_wsl_progress_dialog(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.connections_wsl_progress_dismissed = None;
+        self.connections_wsl_progress_open = true;
+        let entity = cx.weak_entity();
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let entity = entity.clone();
+            let snapshot = entity
+                .update(cx, |this, _| this.connections_wsl_progress.clone())
+                .unwrap_or(None);
+            let settings = entity.clone();
+            let body = match snapshot.as_ref() {
+                Some(snapshot) => Self::connections_wsl_progress_body(snapshot, cx),
+                None => div()
+                    .w_full()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(locale::text(
+                        "No WSL runtime setup is running.",
+                        "当前没有正在进行的 WSL 运行时配置。",
+                        "目前沒有正在進行的 WSL 執行階段設定。",
+                    ))
+                    .into_any_element(),
+            };
+            let dismiss = entity.clone();
+            let mut footer = DialogFooter::new().child(
+                Button::new("connections-wsl-progress-close")
+                    .outline()
+                    .label(locale::text("Close", "关闭", "關閉"))
+                    .on_click(move |_, window, cx| {
+                        // Closing is not cancelling: the deployment keeps
+                        // going and the page keeps its progress entry.
+                        let _ = dismiss.update(cx, |this, cx| {
+                            this.close_connections_wsl_progress_dialog();
+                            cx.notify();
+                        });
+                        window.close_dialog(cx);
+                    }),
+            );
+            if let Some(snapshot) = snapshot.as_ref()
+                && snapshot.status == ProvisioningStatus::Failed
+            {
+                let retry_settings = settings;
+                let distro = snapshot.distro.clone();
+                let port = snapshot.port;
+                footer = footer.child(
+                    Button::new("connections-wsl-progress-retry")
+                        .primary()
+                        .label(locale::text("Retry", "重试", "重試"))
+                        .on_click(move |_, window, cx| {
+                            let _ = retry_settings.update(cx, |this, cx| {
+                                this.close_connections_wsl_progress_dialog();
+                                let workbench = this.workbench.clone();
+                                let distro = distro.clone();
+                                cx.defer(move |cx| {
+                                    let _ = workbench.update(cx, |workbench, cx| {
+                                        workbench.provision_wsl_distro(distro, port, cx)
+                                    });
+                                });
+                            });
+                            window.close_dialog(cx);
+                        }),
+                );
+            }
+            dialog
+                .title(locale::text(
+                    "WSL runtime setup",
+                    "WSL 运行时配置",
+                    "WSL 執行階段設定",
+                ))
+                .w(px(520.0))
+                .child(body)
+                .on_close({
+                    let dismiss = entity.clone();
+                    move |_, _, cx| {
+                        let _ = dismiss.update(cx, |this, cx| {
+                            this.close_connections_wsl_progress_dialog();
+                            cx.notify();
+                        });
+                    }
+                })
+                .footer(footer)
+        });
+    }
+
+    /// Records that the reader closed the WSL progress dialog on their own.
+    ///
+    /// The same attempt stays closed on every later progress event; a new
+    /// deployment gets a new attempt id and opens again.
+    fn close_connections_wsl_progress_dialog(&mut self) {
+        if self.connections_wsl_progress_open {
+            self.connections_wsl_progress_dismissed = self
+                .connections_wsl_progress
+                .as_ref()
+                .map(|snapshot| snapshot.attempt_id);
+        }
+        self.connections_wsl_progress_open = false;
+    }
+
+    /// One WSL deployment, rendered as the dialog's body.
+    fn connections_wsl_progress_body(
+        snapshot: &WslProvisioningSnapshot,
+        cx: &mut App,
+    ) -> AnyElement {
+        let border = cx.theme().border;
+        let muted = cx.theme().muted_foreground;
+        let success = cx.theme().success;
+        let danger = cx.theme().danger;
+        let step = snapshot.step;
+        let mut body = v_flex()
+            .w_full()
+            .min_w_0()
+            .gap_2()
+            .child(
+                h_flex()
+                    .w_full()
+                    .min_w_0()
+                    .items_center()
+                    .justify_between()
+                    .gap_4()
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_sm()
+                            .font_medium()
+                            .child(format!("WSL · {} · :{}", snapshot.distro, snapshot.port)),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(muted)
+                            .child(provisioning_status_label(snapshot.status)),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .w_full()
+                    .justify_between()
+                    .gap_4()
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_sm()
+                            .child(snapshot.step_label()),
+                    )
+                    .when_some(snapshot.detail.clone(), |this, detail| {
+                        this.child(
+                            div()
+                                .min_w_0()
+                                .max_w(px(280.0))
+                                .truncate()
+                                .text_xs()
+                                .text_color(muted)
+                                .child(detail),
+                        )
+                    }),
+            )
+            .child(
+                h_flex()
+                    .w_full()
+                    .gap_1()
+                    .children(WslProvisioningStep::ALL.iter().map(|candidate| {
+                        div().h(px(4.0)).flex_1().rounded_full().bg(
+                            if candidate.index() <= step.index() {
+                                success
+                            } else {
+                                border
+                            },
+                        )
+                    })),
+            );
+        if let Some(error) = snapshot.error.as_ref() {
+            body =
+                body.child(
+                    v_flex()
+                        .w_full()
+                        .min_w_0()
+                        .gap_1()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(danger)
+                        .p_2()
+                        .child(div().text_sm().font_medium().text_color(danger).child(
+                            locale::text(
+                                "WSL runtime setup failed",
+                                "WSL 运行时配置失败",
+                                "WSL 執行階段設定失敗",
+                            ),
+                        ))
+                        .child(
+                            div()
+                                .w_full()
+                                .min_w_0()
+                                .whitespace_normal()
+                                .text_xs()
+                                .text_color(muted)
+                                .child(error.clone()),
+                        ),
+                );
+        }
+        body.into_any_element()
     }
 
     /// One provisioning attempt, rendered as the dialog's body.
@@ -93281,11 +97099,23 @@ impl FoundationSettings {
     }
 
     fn render_connections_page(&self, stacked: bool, cx: &mut Context<Self>) -> AnyElement {
-        // The three add flows are dialogs over the page, not sections inside
+        // The four add flows are dialogs over the page, not sections inside
         // it. A page that grew a section whenever a button was pressed pushed
         // its own list down the viewport and read as a different page; a
         // dialog keeps the list where the reader left it and dismisses back to
         // the same scroll position.
+        let pairing_button = Button::new("connections-pair")
+            .small()
+            .outline()
+            .icon(IconName::Globe)
+            .label(locale::text(
+                "Connect with pairing link",
+                "使用配对链接连接",
+                "使用配對連結連線",
+            ))
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.open_connections_pairing_dialog(window, cx);
+            }));
         let add_button = Button::new("connections-add")
             .small()
             .outline()
@@ -93362,6 +97192,42 @@ impl FoundationSettings {
                 )],
             ));
         }
+        // WSL deployments do not pass through the SSH coordinator, so they get
+        // their own entry point. A failure stays visible here after the dialog
+        // is dismissed; a ready run falls through to the row in the list.
+        if let Some(snapshot) = self.connections_wsl_progress.as_ref().filter(|snapshot| {
+            snapshot.status == ProvisioningStatus::Failed || !snapshot.status.is_terminal()
+        }) {
+            let summary = if snapshot.status == ProvisioningStatus::Failed {
+                snapshot
+                    .error
+                    .as_deref()
+                    .and_then(|error| error.lines().next())
+                    .unwrap_or_else(|| snapshot.step.label())
+                    .to_string()
+            } else {
+                snapshot.step_label()
+            };
+            groups.push(SettingsGroup::new(
+                locale::text("WSL runtime setup", "WSL 运行时配置", "WSL 執行階段設定"),
+                vec![setting_row(
+                    locale::text("WSL runtime", "WSL 运行时", "WSL 執行階段"),
+                    div().text_xs().whitespace_normal().child(format!(
+                        "WSL · {} · :{} · {summary}",
+                        snapshot.distro, snapshot.port
+                    )),
+                    Button::new("connections-wsl-progress-open")
+                        .small()
+                        .outline()
+                        .label(locale::text("Show progress", "查看进度", "檢視進度"))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.open_connections_wsl_progress_dialog(window, cx);
+                        })),
+                    stacked,
+                    cx,
+                )],
+            ));
+        }
 
         let rows = self.connections_rows();
         let list_rows = if rows.is_empty() {
@@ -93377,9 +97243,11 @@ impl FoundationSettings {
             .items_center()
             .justify_end()
             .gap_2()
+            .flex_wrap()
             .child(bootstrap_button)
             .child(wsl_button)
             .child(add_button)
+            .child(pairing_button)
             .into_any_element();
         // A failure that outlives its dialog is a light hint, not a strip on the
         // page: Settings is itself a dialog, so a notice painted here competes
@@ -93387,7 +97255,7 @@ impl FoundationSettings {
         // layer sits above every dialog backdrop and dismisses on a click, so
         // the probe, WSL and removal failures all travel that way instead.
         groups.push(SettingsGroup::with_leading(
-            locale::text("SSH connections", "SSH 连接", "SSH 連線"),
+            locale::text("Remote connections", "远程连接", "遠端連線"),
             leading,
             list_rows,
         ));
@@ -93395,9 +97263,9 @@ impl FoundationSettings {
         settings_page(
             locale::text("Remote instances", "远程实例", "遠端執行個體"),
             locale::text(
-                "Connect Vibex to a runtime on another machine over SSH.",
-                "通过 SSH 把 Vibex 连接到另一台机器上的运行时。",
-                "透過 SSH 把 Vibex 連線到另一台機器上的執行階段。",
+                "Connect with a pairing link, reach a runtime over SSH, or start one inside a local WSL2 distro.",
+                "使用配对链接连接，或通过 SSH 连接到另一台机器上的运行时，也可以在本机 WSL2 发行版中启动一个运行时。",
+                "使用配對連結連線，或透過 SSH 連線到另一台機器上的執行階段，也可以在本機 WSL2 發行版中啟動一個執行階段。",
             ),
             groups,
             cx,
@@ -93430,9 +97298,9 @@ impl FoundationSettings {
                     .text_color(muted),
             )
             .child(div().text_sm().font_semibold().child(locale::text(
-                "No SSH connections yet",
-                "还没有 SSH 连接",
-                "還沒有 SSH 連線",
+                "No remote connections yet",
+                "还没有远程连接",
+                "還沒有遠端連線",
             )))
             .child(
                 div()
@@ -93441,17 +97309,52 @@ impl FoundationSettings {
                     .text_xs()
                     .text_color(muted)
                     .child(locale::text(
-                        "Add a host to install, start, and pair a runtime over SSH.",
-                        "添加主机后，Vibex 会通过 SSH 安装、启动并配对运行时。",
-                        "新增主機後，Vibex 會透過 SSH 安裝、啟動並配對執行階段。",
+                        "Paste a pairing link, add a host to install and pair a runtime over SSH, or start one inside a local WSL2 distro.",
+                        "粘贴配对链接，或添加主机以通过 SSH 安装并配对运行时；也可以在本机 WSL2 发行版中启动一个。",
+                        "貼上配對連結，或新增主機以透過 SSH 安裝並配對執行階段；也可以在本機 WSL2 發行版中啟動一個。",
                     )),
             )
-            .child(add)
+            .child(
+                h_flex()
+                    .gap_2()
+                    .flex_wrap()
+                    .justify_center()
+                    .child(
+                        Button::new("connections-empty-pair")
+                            .small()
+                            .outline()
+                            .icon(IconName::Globe)
+                            .label(locale::text(
+                                "Connect with pairing link",
+                                "使用配对链接连接",
+                                "使用配對連結連線",
+                            ))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_connections_pairing_dialog(window, cx);
+                            })),
+                    )
+                    .child(add)
+                    .child(
+                        Button::new("connections-empty-add-wsl")
+                            .small()
+                            .outline()
+                            .icon(IconName::Plus)
+                            .label(locale::text(
+                                "Add WSL runtime",
+                                "添加 WSL 运行时",
+                                "新增 WSL 執行階段",
+                            ))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_connections_wsl_dialog(window, cx);
+                            })),
+                    ),
+            )
             .into_any_element()
     }
 
     fn connections_rows(&self) -> Vec<ConnectionDisplayRow> {
-        self.connections_profiles
+        let mut rows = self
+            .connections_profiles
             .iter()
             .map(|profile| ConnectionDisplayRow {
                 id: profile.id.clone(),
@@ -93462,8 +97365,70 @@ impl FoundationSettings {
                 port: profile.port,
                 version: profile.runtime_version.clone(),
                 status: self.connection_row_status(profile),
+                transport: ConnectionTransport::Ssh,
+                wsl_provisioning: false,
             })
-            .collect()
+            .collect::<Vec<_>>();
+        rows.extend(self.connections_wsl_profiles.iter().map(|profile| {
+            ConnectionDisplayRow {
+                id: profile.id.clone(),
+                name: profile.display_name.clone(),
+                alias: String::new(),
+                user: String::new(),
+                host: "WSL2".to_string(),
+                port: profile.remote_port,
+                // WSL profiles do not carry a version; the runtime manager
+                // is where an installed version can be inspected.
+                version: None,
+                status: self.connection_wsl_row_status(profile),
+                transport: ConnectionTransport::Wsl,
+                wsl_provisioning: self
+                    .connections_wsl_progress
+                    .as_ref()
+                    .is_some_and(|snapshot| {
+                        snapshot.distro == profile.distro && !snapshot.status.is_terminal()
+                    }),
+            }
+        }));
+        // A direct pairing produces a registry entry without an SSH or WSL
+        // profile, so without this branch the runtime the reader just paired
+        // would be missing from the very page that paired it. A runtime a
+        // profile already owns is skipped: its row is the profile row, which
+        // carries the transport-specific actions.
+        let bound_runtime_ids = self
+            .connections_profiles
+            .iter()
+            .filter_map(|profile| profile.registered_runtime_id.as_deref())
+            .chain(
+                self.connections_wsl_profiles
+                    .iter()
+                    .filter_map(|profile| profile.registered_runtime_id.as_deref()),
+            )
+            .collect::<std::collections::BTreeSet<_>>();
+        rows.extend(
+            self.connections_direct_runtimes
+                .iter()
+                .filter(|runtime| !bound_runtime_ids.contains(runtime.id.as_str()))
+                .map(|runtime| ConnectionDisplayRow {
+                    id: runtime.id.clone(),
+                    name: runtime.display_label(),
+                    alias: String::new(),
+                    user: String::new(),
+                    host: runtime.credential.record.server_url.clone(),
+                    // The address carries its own port. `connection_detail`
+                    // renders a direct row from the URL, not from this field.
+                    port: 0,
+                    version: None,
+                    status: self
+                        .connections_live_status
+                        .get(runtime.id.as_str())
+                        .copied()
+                        .unwrap_or(ConnectionRowStatus::Offline),
+                    transport: ConnectionTransport::Direct,
+                    wsl_provisioning: false,
+                }),
+        );
+        rows
     }
 
     /// Whether a saved connection is reachable right now.
@@ -93480,6 +97445,34 @@ impl FoundationSettings {
             .connections_snapshot
             .as_ref()
             .filter(|snapshot| snapshot.profile_id == profile.id)
+        {
+            match snapshot.status {
+                ProvisioningStatus::Running | ProvisioningStatus::Cancelling => {
+                    return ConnectionRowStatus::Connecting;
+                }
+                ProvisioningStatus::Failed => return ConnectionRowStatus::NeedsAttention,
+                ProvisioningStatus::Pending | ProvisioningStatus::Cancelled => {
+                    return ConnectionRowStatus::Offline;
+                }
+                ProvisioningStatus::Ready => {}
+            }
+        }
+        self.connections_live_status
+            .get(profile.id.as_str())
+            .copied()
+            .unwrap_or(ConnectionRowStatus::Offline)
+    }
+
+    /// Whether a saved WSL connection is reachable right now.
+    ///
+    /// A deployment in flight is `Connecting` even before its profile exists;
+    /// once the profile is saved, the workbench's live mirror takes over so
+    /// parking the runtime behind another authority reads Offline.
+    fn connection_wsl_row_status(&self, profile: &WslConnectionProfile) -> ConnectionRowStatus {
+        if let Some(snapshot) = self
+            .connections_wsl_progress
+            .as_ref()
+            .filter(|snapshot| snapshot.distro == profile.distro)
         {
             match snapshot.status {
                 ProvisioningStatus::Running | ProvisioningStatus::Cancelling => {
@@ -93663,15 +97656,21 @@ impl FoundationSettings {
         let version = div()
             .text_xs()
             .text_color(muted)
-            .child(match row.version.as_deref() {
-                Some(version) => format!("v{version}"),
-                None => locale::text("Not installed", "未安装", "未安裝").to_string(),
+            .child(match row.transport {
+                ConnectionTransport::Wsl => locale::text("WSL2", "WSL2", "WSL2").to_string(),
+                ConnectionTransport::Direct => {
+                    locale::text("Pairing link", "配对链接", "配對連結").to_string()
+                }
+                ConnectionTransport::Ssh => match row.version.as_deref() {
+                    Some(version) => format!("v{version}"),
+                    None => locale::text("Not installed", "未安装", "未安裝").to_string(),
+                },
             });
         // The row's primary action is the way back from every state a
         // connection can be stuck in: an unpaired profile retries
         // provisioning, a running one cancels, and a paired one reconnects to
         // the runtime it kept.
-        let primary_label = Self::connection_primary_label(row.status);
+        let primary_label = Self::connection_primary_label(row);
         let primary_id = row.id.clone();
         let primary_settings = settings.clone();
         let primary = Button::new(SharedString::from(format!(
@@ -93681,7 +97680,13 @@ impl FoundationSettings {
         .small()
         .outline()
         .label(primary_label)
-        .tooltip(Self::connection_primary_hint(row.status))
+        .tooltip(Self::connection_primary_hint(row))
+        // A direct runtime has no cancellable provisioning run; while its
+        // handshake is in flight the only honest action is to wait.
+        .disabled(
+            row.transport == ConnectionTransport::Direct
+                && row.status == ConnectionRowStatus::Connecting,
+        )
         .on_click(move |_, window, cx| {
             let profile_id = primary_id.clone();
             let _ = primary_settings.update(cx, |this, cx| {
@@ -93691,6 +97696,10 @@ impl FoundationSettings {
         let remove_id = row.id.clone();
         let remove_name = row.name.clone();
         let remove_settings = settings.clone();
+        let wsl_menu = row.transport == ConnectionTransport::Wsl;
+        let direct_menu = row.transport == ConnectionTransport::Direct;
+        let direct_in_flight = direct_menu && row.status == ConnectionRowStatus::Connecting;
+        let wsl_in_flight = row.wsl_provisioning;
         let menu = Button::new(SharedString::from(format!("connections-{}-menu", row.id)))
             .small()
             .ghost()
@@ -93703,6 +97712,74 @@ impl FoundationSettings {
                 let remove_id = remove_id.clone();
                 let remove_name = remove_name.clone();
                 let remove_settings = remove_settings.clone();
+                if direct_menu {
+                    let reconnect_id = remove_id.clone();
+                    let reconnect_settings = remove_settings.clone();
+                    let menu = menu.item(
+                        PopupMenuItem::new(locale::text("Reconnect", "重新连接", "重新連線"))
+                            .on_click(move |_, window, cx| {
+                                let runtime_id = reconnect_id.clone();
+                                let _ = reconnect_settings.update(cx, |this, cx| {
+                                    this.run_connection_primary_action(runtime_id, window, cx)
+                                });
+                            }),
+                    );
+                    // Removing a runtime mid-handshake would let the connect
+                    // task re-register the credential it is still holding, so
+                    // the row would come back. Keep the destructive action out
+                    // until the attempt is terminal.
+                    if direct_in_flight {
+                        return menu;
+                    }
+                    return menu.separator().item(
+                        PopupMenuItem::new(locale::text("Remove", "移除", "移除")).on_click(
+                            move |_, window, cx| {
+                                let _ = remove_settings.update(cx, |this, cx| {
+                                    this.confirm_remove_paired_runtime(
+                                        remove_id.clone(),
+                                        remove_name.clone(),
+                                        window,
+                                        cx,
+                                    )
+                                });
+                            },
+                        ),
+                    );
+                }
+                if wsl_menu {
+                    let reconnect_id = remove_id.clone();
+                    let reconnect_settings = remove_settings.clone();
+                    let menu = menu.item(
+                        PopupMenuItem::new(locale::text("Reconnect", "重新连接", "重新連線"))
+                            .on_click(move |_, window, cx| {
+                                let profile_id = reconnect_id.clone();
+                                let _ = reconnect_settings.update(cx, |this, cx| {
+                                    this.run_connection_primary_action(profile_id, window, cx)
+                                });
+                            }),
+                    );
+                    // An in-flight deployment has no cancellable coordinator;
+                    // removing its profile would let the worker save it again
+                    // when it finishes. Keep the destructive item out until
+                    // the attempt is terminal.
+                    if wsl_in_flight {
+                        return menu;
+                    }
+                    return menu.separator().item(
+                        PopupMenuItem::new(locale::text("Remove", "移除", "移除")).on_click(
+                            move |_, window, cx| {
+                                let _ = remove_settings.update(cx, |this, cx| {
+                                    this.confirm_remove_wsl_connection(
+                                        remove_id.clone(),
+                                        remove_name.clone(),
+                                        window,
+                                        cx,
+                                    )
+                                });
+                            },
+                        ),
+                    );
+                }
                 let edit_id = remove_id.clone();
                 let edit_settings = remove_settings.clone();
                 let reconnect_id = remove_id.clone();
@@ -93789,6 +97866,12 @@ impl FoundationSettings {
     }
 
     fn connection_detail(row: &ConnectionDisplayRow) -> String {
+        if row.transport == ConnectionTransport::Direct {
+            return row.host.clone();
+        }
+        if row.transport == ConnectionTransport::Wsl {
+            return format!("{} · port {}", row.host, row.port);
+        }
         if row.alias.is_empty() {
             format!("{}@{}:{}", row.user, row.host, row.port)
         } else {
@@ -93816,8 +97899,31 @@ impl FoundationSettings {
         }
     }
 
-    fn connection_primary_label(status: ConnectionRowStatus) -> &'static str {
-        match status {
+    fn connection_primary_label(row: &ConnectionDisplayRow) -> &'static str {
+        if row.transport == ConnectionTransport::Direct {
+            return match row.status {
+                ConnectionRowStatus::Connected => locale::text("Reconnect", "重新连接", "重新連線"),
+                ConnectionRowStatus::Connecting => {
+                    locale::text("Connecting…", "连接中…", "連線中…")
+                }
+                ConnectionRowStatus::Offline | ConnectionRowStatus::NeedsAttention => {
+                    locale::text("Connect", "连接", "連線")
+                }
+            };
+        }
+        if row.transport == ConnectionTransport::Wsl {
+            if row.wsl_provisioning {
+                return locale::text("Show progress", "查看进度", "檢視進度");
+            }
+            return match row.status {
+                ConnectionRowStatus::Connected => locale::text("Reconnect", "重新连接", "重新連線"),
+                ConnectionRowStatus::NeedsAttention => locale::text("Retry", "重试", "重試"),
+                ConnectionRowStatus::Offline | ConnectionRowStatus::Connecting => {
+                    locale::text("Connect", "连接", "連線")
+                }
+            };
+        }
+        match row.status {
             ConnectionRowStatus::Connected => locale::text("Reconnect", "重新连接", "重新連線"),
             ConnectionRowStatus::Offline => locale::text("Connect", "连接", "連線"),
             ConnectionRowStatus::NeedsAttention => locale::text("Fix", "修复", "修復"),
@@ -93825,8 +97931,58 @@ impl FoundationSettings {
         }
     }
 
-    fn connection_primary_hint(status: ConnectionRowStatus) -> &'static str {
-        match status {
+    fn connection_primary_hint(row: &ConnectionDisplayRow) -> &'static str {
+        if row.transport == ConnectionTransport::Direct {
+            return match row.status {
+                ConnectionRowStatus::Connected => locale::text(
+                    "Reconnect and make this runtime authoritative.",
+                    "重新连接并使该运行时成为当前运行时。",
+                    "重新連線並使該執行階段成為目前執行階段。",
+                ),
+                ConnectionRowStatus::Offline => locale::text(
+                    "Connect to the runtime this pairing added.",
+                    "连接此配对添加的运行时。",
+                    "連線此配對新增的執行階段。",
+                ),
+                ConnectionRowStatus::NeedsAttention => locale::text(
+                    "Retry the connection to the paired runtime.",
+                    "重试连接该已配对运行时。",
+                    "重試連線該已配對執行階段。",
+                ),
+                ConnectionRowStatus::Connecting => locale::text(
+                    "This runtime is already connecting.",
+                    "该运行时正在连接中。",
+                    "該執行階段正在連線中。",
+                ),
+            };
+        }
+        if row.transport == ConnectionTransport::Wsl {
+            if row.wsl_provisioning {
+                return locale::text(
+                    "Open the WSL runtime setup progress.",
+                    "打开 WSL 运行时配置进度。",
+                    "開啟 WSL 執行階段設定進度。",
+                );
+            }
+            return match row.status {
+                ConnectionRowStatus::Connected => locale::text(
+                    "Restore this WSL runtime and make it authoritative.",
+                    "恢复该 WSL 运行时并使其成为当前运行时。",
+                    "恢復該 WSL 執行階段並使其成為目前執行階段。",
+                ),
+                ConnectionRowStatus::NeedsAttention => locale::text(
+                    "Retry the WSL runtime setup.",
+                    "重试 WSL 运行时配置。",
+                    "重試 WSL 執行階段設定。",
+                ),
+                ConnectionRowStatus::Offline | ConnectionRowStatus::Connecting => locale::text(
+                    "Start this WSL runtime and connect to it.",
+                    "启动该 WSL 运行时并连接。",
+                    "啟動該 WSL 執行階段並連線。",
+                ),
+            };
+        }
+        match row.status {
             ConnectionRowStatus::Connected => locale::text(
                 "Reconnect and make this runtime authoritative.",
                 "重新连接并使该运行时成为当前运行时。",
@@ -93852,22 +98008,53 @@ impl FoundationSettings {
 
     /// Runs a row's primary action for the state the row is in.
     ///
-    /// A running run cancels; every other state reconnects. The button is the
-    /// connection's own action now, not a way into the provisioning dialog: a
-    /// paired profile restores its tunnel and client, and an unpaired one
-    /// provisions from the start.
+    /// A running SSH run cancels; every other state reconnects. The button is
+    /// the connection's own action now, not a way into the provisioning dialog:
+    /// a paired profile restores its tunnel and client, and an unpaired one
+    /// provisions from the start. A WSL deployment in flight opens its progress
+    /// instead, because WSL has no cancellable coordinator to hand the click to.
     fn run_connection_primary_action(
         &mut self,
         profile_id: String,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let status = self
+        let row = self
             .connections_rows()
             .into_iter()
-            .find(|row| row.id == profile_id)
-            .map(|row| row.status);
-        if status == Some(ConnectionRowStatus::Connecting) {
+            .find(|row| row.id == profile_id);
+        let Some(row) = row else {
+            return;
+        };
+        if row.transport == ConnectionTransport::Direct {
+            // A direct runtime has no tunnel or provisioner to rebuild: the
+            // workbench reconnects the stored credential it already owns.
+            let pending = profile_id.clone();
+            let workbench = self.workbench.clone();
+            cx.defer(move |cx| {
+                let _ = workbench.update(cx, |workbench, cx| {
+                    workbench.connect_paired_runtime(pending, cx)
+                });
+            });
+            cx.notify();
+            return;
+        }
+        if row.transport == ConnectionTransport::Wsl {
+            if row.wsl_provisioning {
+                self.open_connections_wsl_progress_dialog(window, cx);
+                return;
+            }
+            let pending = profile_id.clone();
+            let workbench = self.workbench.clone();
+            cx.defer(move |cx| {
+                let _ = workbench.update(cx, |workbench, cx| {
+                    workbench.connect_wsl_connection(pending, cx)
+                });
+            });
+            cx.notify();
+            return;
+        }
+        if row.status == ConnectionRowStatus::Connecting {
             let workbench = self.workbench.clone();
             cx.defer(move |cx| {
                 let _ = workbench.update(cx, |workbench, cx| workbench.cancel_ssh_provisioning(cx));
@@ -99053,7 +103240,11 @@ fn agent_file_operation_preview_path(path: &str, workspace_root: Option<&str>) -
         Err(_) => std::path::PathBuf::from(path),
     };
     let path = if path.is_absolute() {
-        path.strip_prefix(std::path::Path::new(workspace_root?))
+        // The root may itself have been written from a POSIX shell with a
+        // leading `/` before the drive; normalizing both sides keeps the
+        // prefix comparison working for either spelling.
+        let root = local_file_path(workspace_root?);
+        path.strip_prefix(std::path::Path::new(&root))
             .ok()?
             .to_path_buf()
     } else {
@@ -99349,6 +103540,96 @@ fn render_user_message_bubble(
                 .when(fill_width, |this| this.w_full())
                 .child(body),
         )
+}
+
+/// Whether a retained Markdown surface belongs to the row a menu was opened on.
+fn markdown_surface_matches(id: &str, prefixes: &[String]) -> bool {
+    prefixes
+        .iter()
+        .any(|prefix| id == prefix || id.starts_with(&format!("{prefix}:")))
+}
+
+/// Turn arbitrary selected text into a Markdown blockquote.
+fn context_menu_blockquote(text: &str) -> String {
+    let trimmed = text.trim_end();
+    if trimmed.trim().is_empty() {
+        return String::new();
+    }
+    trimmed
+        .lines()
+        .map(|line| {
+            if line.trim().is_empty() {
+                ">".to_string()
+            } else {
+                format!("> {line}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn selection_menu_header(count: usize) -> String {
+    match locale::current_locale() {
+        locale::ResolvedLocale::ZhCn => format!("已选 {count} 个字符"),
+        locale::ResolvedLocale::ZhTw => format!("已選 {count} 個字元"),
+        _ => format!("{count} characters selected"),
+    }
+}
+
+/// The first useful line of a selection, bounded for the find field.
+fn selection_find_query(text: &str) -> String {
+    text.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(|line| line.chars().take(120).collect())
+        .unwrap_or_default()
+}
+
+/// The URL a selection names, when it names exactly one external destination.
+fn single_external_url(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || trimmed.chars().any(char::is_whitespace) {
+        return None;
+    }
+    validate_external_open_url(trimmed).ok().map(|url| url.url)
+}
+
+fn activity_row_kind_label(kind: TimelineRowKind) -> &'static str {
+    match kind {
+        TimelineRowKind::UserMessage => locale::text("You", "你", "你"),
+        TimelineRowKind::AgentMessage => locale::text("Agent", "Agent", "Agent"),
+        TimelineRowKind::Reasoning => locale::text("Thought", "思考", "思考"),
+        TimelineRowKind::Plan | TimelineRowKind::TodoUpdate => locale::text("Plan", "计划", "計畫"),
+        TimelineRowKind::ToolCall => locale::text("Tool", "工具", "工具"),
+        TimelineRowKind::Command => locale::text("Command", "命令", "命令"),
+        TimelineRowKind::FileOperation => locale::text("File Change", "文件变更", "檔案變更"),
+        TimelineRowKind::WebSearch => locale::text("Web Search", "网页搜索", "網頁搜尋"),
+        TimelineRowKind::Collaboration => locale::text("Collaboration", "协作", "協作"),
+        TimelineRowKind::ImageGeneration => locale::text("Image", "图片", "圖片"),
+        TimelineRowKind::GitNotice | TimelineRowKind::SystemNotice => {
+            locale::text("Notice", "通知", "通知")
+        }
+        TimelineRowKind::PermissionRequest => {
+            locale::text("Permission Request", "权限请求", "權限請求")
+        }
+        TimelineRowKind::PermissionResolution => locale::text("Permission", "权限", "權限"),
+        TimelineRowKind::ElicitationRequest => locale::text("Question", "提问", "提問"),
+        TimelineRowKind::ElicitationResolution => locale::text("Answer", "回答", "回答"),
+        TimelineRowKind::Retry => locale::text("Retry", "重试", "重試"),
+        TimelineRowKind::Error => locale::text("Error", "错误", "錯誤"),
+    }
+}
+
+fn push_conversation_row(out: &mut String, speaker: &str, body: &str) {
+    let body = body.trim();
+    if body.is_empty() {
+        return;
+    }
+    out.push_str("## ");
+    out.push_str(speaker);
+    out.push_str("\n\n");
+    out.push_str(body);
+    out.push_str("\n\n");
 }
 
 #[cfg(test)]
@@ -107360,6 +111641,39 @@ mod tests {
     }
 
     #[test]
+    fn streaming_only_batches_wait_for_the_animation_budget() {
+        let session_id = VibexSessionId::new();
+        let delta_item = timeline_item_with_payload(
+            &session_id,
+            1,
+            TimelineSource::Agent,
+            TimelinePayload::AgentMessageDelta(AgentMessageDeltaPayload {
+                text_delta: "token".into(),
+                chunk_index: 0,
+                phase: Some(AgentMessagePhase::FinalAnswer),
+            }),
+        );
+        let streaming =
+            RuntimeUiSignal::Event(Box::new(DesktopEvent::Timeline(TimelineLiveEvent {
+                session_id: session_id.clone(),
+                sequence: delta_item.sequence,
+                item: delta_item,
+            })));
+        assert_eq!(
+            runtime_ui_coalesce_delay(Some(&streaming)),
+            RUNTIME_UI_STREAMING_COALESCE_DELAY
+        );
+        assert_eq!(
+            runtime_ui_coalesce_delay(Some(&RuntimeUiSignal::SidebarInvalidated)),
+            RUNTIME_UI_SIGNAL_COALESCE_DELAY
+        );
+        assert_eq!(
+            runtime_ui_coalesce_delay(None),
+            RUNTIME_UI_SIGNAL_COALESCE_DELAY
+        );
+    }
+
+    #[test]
     fn hidden_timeline_streaming_work_waits_for_the_agent_surface() {
         assert!(!should_defer_timeline_streaming_work("agent", false));
         assert!(should_defer_timeline_streaming_work("agent", true));
@@ -111810,8 +116124,8 @@ mod tests {
             .map(|(body, _)| body)
             .expect("sidebar session renderer should remain inspectable");
         let title = sidebar_session
-            .split_once("        let row_title: AnyElement = if session_generating {")
-            .and_then(|(_, tail)| tail.split_once("        };\n"))
+            .split_once("        let row_title: AnyElement =\n            if session_generating && timeline_activity::live_labels_animate() {")
+            .and_then(|(_, tail)| tail.split_once("            };\n"))
             .map(|(body, _)| body)
             .expect("the session title should keep its own running gate");
 
@@ -111821,8 +116135,9 @@ mod tests {
         assert!(title.contains("TIMELINE_SHIMMER_SPREAD"));
         // The sweep repeats for as long as it is mounted, so it takes the same
         // gate the row's status column uses for "the Agent is working" — a
-        // parked, scheduled or idle row must not drive frames.
-        assert!(title.contains("} else {\n            row_title.into_any_element()\n"));
+        // parked, scheduled or idle row must not drive frames — and the
+        // timeline's frame gate, so a late workbench stops every sweep at once.
+        assert!(title.contains("row_title.into_any_element()"));
         assert!(
             sidebar_session
                 .contains("let session_generating = display_state == AgentSessionState::Running")
@@ -120601,7 +124916,7 @@ mod tests {
         let source = include_str!("app.rs");
         let loader = source
             .split_once("    fn load_wsl_distros(")
-            .and_then(|(_, tail)| tail.split_once("\n    fn connect_wsl_distro("))
+            .and_then(|(_, tail)| tail.split_once("\n    /// Opens the add-SSH-connection dialog"))
             .map(|(body, _)| body)
             .expect("the WSL distro loader should remain inspectable");
         assert!(
@@ -120638,6 +124953,90 @@ mod tests {
             dialog.contains("connections-wsl-retry"),
             "a failed read can be retried without reopening the dialog"
         );
+    }
+
+    /// A WSL deployment shows its progress and lands in the instance list.
+    ///
+    /// The click used to close the add dialog and change nothing on screen
+    /// while `wsl.exe` installed, started and paired the runtime; the first
+    /// visible sign was the runtime appearing in the title-bar switcher minutes
+    /// later. The deployment now owns a progress snapshot and a closable
+    /// dialog, and its finished profile is listed beside the SSH connections.
+    #[test]
+    fn a_wsl_deployment_reports_progress_and_joins_the_remote_instance_list() {
+        let source = include_str!("app.rs");
+        assert!(source.contains("enum WslProvisioningStep"));
+        assert!(source.contains("provision_with_progress"));
+        assert!(source.contains("publish_wsl_provisioning_stage"));
+
+        let start = source
+            .split_once("    fn provision_wsl_distro(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// Copies the latest deployment stage"))
+            .map(|(body, _)| body)
+            .expect("the WSL deployment should remain inspectable");
+        assert!(
+            start.contains("open_wsl_progress_dialog(cx)"),
+            "the click that starts the deployment opens its progress"
+        );
+        assert!(
+            start.contains("WslProvisioningSnapshot::running"),
+            "the snapshot exists before the worker reports its first stage"
+        );
+        assert!(
+            start.contains("publish_wsl_provisioning_stage"),
+            "the task publishes each stage the dialog paints"
+        );
+        assert!(
+            start.contains("provision_with_progress"),
+            "the install/start/pair window reports where it is"
+        );
+        assert!(
+            start.contains("settings.reload_connections_profiles()"),
+            "a connected distro has to appear in the list immediately"
+        );
+
+        let dialog = source
+            .split_once("    fn open_connections_wsl_progress_dialog(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// Records that the reader closed the WSL progress dialog")
+            })
+            .map(|(body, _)| body)
+            .expect("the WSL progress dialog should remain inspectable");
+        assert!(
+            dialog.contains("connections-wsl-progress-close"),
+            "the dialog can be dismissed without cancelling the deployment"
+        );
+        assert!(
+            dialog.contains("connections-wsl-progress-retry"),
+            "a failed deployment can be retried from its dialog"
+        );
+        let body = source
+            .split_once("    fn connections_wsl_progress_body(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// One provisioning attempt"))
+            .map(|(body, _)| body)
+            .expect("the WSL progress body should remain inspectable");
+        assert!(
+            body.contains("WslProvisioningStep::ALL"),
+            "the dialog draws one segment per WSL step"
+        );
+
+        let rows = source
+            .split_once("    fn connections_rows(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// Whether a saved connection is reachable")
+            })
+            .map(|(body, _)| body)
+            .expect("the connection rows should remain inspectable");
+        assert!(
+            rows.contains("self.connections_wsl_profiles"),
+            "WSL profiles are listed with the SSH connections"
+        );
+        assert!(
+            rows.contains("ConnectionTransport::Wsl"),
+            "a WSL row can render its own detail and actions"
+        );
+        assert!(source.contains("fn remove_wsl_connection("));
+        assert!(source.contains("fn connect_wsl_connection("));
     }
 
     /// Provisioning is a dialog the reader can close, not a page section.
@@ -120754,23 +125153,40 @@ mod tests {
             );
         }
 
-        // Both dialogs close on submit, so parking the failure in their bodies
-        // would show it for one frame and then drop it.
-        for opener in [
-            "    fn open_connections_add_dialog(",
-            "    fn open_connections_wsl_dialog(",
-        ] {
-            let body = source
-                .split_once(opener)
-                .and_then(|(_, tail)| tail.split_once("\n    /// "))
-                .map(|(body, _)| body)
-                .unwrap_or_else(|| panic!("{opener} should remain inspectable"));
-            assert!(body.contains(".on_ok("), "{opener} must submit from Enter");
-            assert!(
-                !body.contains("text_color(cx.theme().danger)"),
-                "{opener} must not paint its failure inside the panel"
-            );
-        }
+        // The add dialog closes on submit, so parking a failure in its body
+        // would show it for one frame and then drop it. The WSL dialog is the
+        // exception: it stays mounted while the chosen port is checked, and a
+        // busy or invalid port belongs next to the field that produced it.
+        let add_dialog = source
+            .split_once("    fn open_connections_add_dialog(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// "))
+            .map(|(body, _)| body)
+            .expect("the add dialog should remain inspectable");
+        assert!(
+            add_dialog.contains(".on_ok("),
+            "the add dialog must submit from Enter"
+        );
+        assert!(
+            !add_dialog.contains("text_color(cx.theme().danger)"),
+            "the add dialog must not paint its failure inside the panel"
+        );
+        let wsl_dialog = source
+            .split_once("    fn open_connections_wsl_dialog(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// "))
+            .map(|(body, _)| body)
+            .expect("the WSL dialog should remain inspectable");
+        assert!(
+            wsl_dialog.contains(".on_ok("),
+            "the WSL dialog must submit from Enter"
+        );
+        assert!(
+            wsl_dialog.contains("connections_wsl_check_error"),
+            "a rejected port stays in the dialog that is still open"
+        );
+        assert!(
+            wsl_dialog.contains("text_color(cx.theme().danger)"),
+            "the port field's rejection is painted where it can be corrected"
+        );
     }
 
     /// The browser page is where a new tab's page and the address bar's engine
@@ -121333,6 +125749,165 @@ mod tests {
         assert!(!source.contains(concat!("developer.ssh_remote", "_runtime")));
     }
 
+    /// Settings reads the runtime registry from disk, so removal has to write
+    /// it before asking the page to reload.
+    ///
+    /// Reloading first re-read the file that still contained the runtime and
+    /// painted the removed row back; the actual file write happened after the
+    /// repaint, so the row only disappeared when the page was reopened. A
+    /// directly paired runtime shows this most clearly because it has no
+    /// profile store whose removal would independently hide its row.
+    #[test]
+    fn removing_a_runtime_persists_before_the_connections_page_reloads() {
+        let source = include_str!("app.rs");
+        let body = source
+            .split_once("    fn remove_runtime(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// Deletes the runtime side of a removed SSH connection")
+            })
+            .map(|(body, _)| body)
+            .expect("the runtime removal should remain inspectable");
+        let persist = body
+            .find("self.persist_runtime_registry(cx);")
+            .expect("removal must persist the registry");
+        let reload = body
+            .find("settings.reload_connections_profiles();")
+            .expect("removal must refresh the Connections page");
+        assert!(
+            persist < reload,
+            "the registry must be on disk before the page re-reads it"
+        );
+        assert!(
+            body.contains("self.activate_local_runtime(cx);"),
+            "removing the active runtime still returns to the embedded authority"
+        );
+    }
+
+    /// A pairing link and a bare code are two shapes of the same entry.
+    ///
+    /// The dialog decides from the text itself whether the address field is
+    /// needed, and the claim path picks the matching transport. A regression
+    /// that made a link require an address, or sent a bare code to the link
+    /// parser, would strand exactly the connection string this page restores.
+    #[test]
+    fn pairing_entries_are_classified_by_shape() {
+        assert!(pairing_entry_is_link("vibex://pair#/code/abc"));
+        assert!(pairing_entry_is_link("  #/code/abc  "));
+        assert!(!pairing_entry_is_link("123-456-789"));
+        assert!(
+            !pairing_entry_is_link("https://host/#/pair/offer"),
+            "a phone-pairing offer is not a runtime connection string"
+        );
+        assert!(!pairing_entry_is_link("https://192.168.1.10:8765"));
+        assert!(!pairing_entry_is_link(""));
+
+        assert!(
+            pairing_entry_error_copy("remote_pairing_code_invalid").is_some(),
+            "a wrong code has recovery copy"
+        );
+        assert!(
+            pairing_entry_error_copy("remote_pairing_link_invalid").is_some(),
+            "a malformed link has recovery copy"
+        );
+        assert!(pairing_entry_error_copy("remote_something_else").is_none());
+
+        let source = include_str!("app.rs");
+        let page = source
+            .split_once("    fn render_connections_page(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_connections_empty_state("))
+            .map(|(body, _)| body)
+            .expect("the Connections page should remain inspectable");
+        assert!(
+            page.contains("open_connections_pairing_dialog"),
+            "the page must route the pairing-link entry"
+        );
+        assert!(page.contains("\"Connect with pairing link\""));
+        let dialog = source
+            .split_once("    fn open_connections_pairing_dialog(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// Validates the pairing fields"))
+            .map(|(body, _)| body)
+            .expect("the pairing dialog should remain inspectable");
+        assert!(dialog.contains("connections_pairing_entry_input"));
+        assert!(dialog.contains("connections_pairing_server_input"));
+        assert!(dialog.contains("connections_pairing_error"));
+        let claim = source
+            .split_once("    fn begin_pairing_entry_connect(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// Completes a successful pairing claim"))
+            .map(|(body, _)| body)
+            .expect("the pairing claim should remain inspectable");
+        assert!(claim.contains("claim_server_pairing_link"));
+        assert!(claim.contains("claim_server_pairing_code"));
+        assert!(claim.contains("DesktopRuntimeRegistryStore"));
+        let success = source
+            .split_once("    fn finish_pairing_entry_success(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// Puts a failed pairing"))
+            .map(|(body, _)| body)
+            .expect("the pairing success path should remain inspectable");
+        assert!(success.contains("begin_remote_connect"));
+        assert!(success.contains("reload_connections_profiles"));
+    }
+
+    /// The WSL port is chosen before the deployment and checked before the
+    /// download.
+    ///
+    /// The issue this covers is a busy `8765` that made adding a distro fail
+    /// with no way to pick another port. The range is validated locally, the
+    /// occupancy is probed through `wsl.exe`, and a conflict keeps the dialog
+    /// open on the port field instead of closing into a progress dialog that
+    /// cannot change it.
+    #[test]
+    fn a_wsl_runtime_port_is_bounded_and_preflighted() {
+        assert_eq!(parse_wsl_runtime_port("8765"), Ok(8765));
+        assert_eq!(parse_wsl_runtime_port(" 18765 "), Ok(18765));
+        for invalid in ["", "0", "80", "1023", "65536", "abc", "-1"] {
+            assert!(
+                parse_wsl_runtime_port(invalid).is_err(),
+                "{invalid:?} must be rejected"
+            );
+        }
+
+        let source = include_str!("app.rs");
+        let dialog = source
+            .split_once("    fn open_connections_wsl_dialog(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// Validates the port field"))
+            .map(|(body, _)| body)
+            .expect("the WSL dialog should remain inspectable");
+        assert!(
+            dialog.contains("connections_wsl_port_input"),
+            "the dialog carries the port field"
+        );
+        assert!(
+            dialog.contains("connections_wsl_check_error"),
+            "a rejected port is shown where it can be corrected"
+        );
+        let check = source
+            .split_once("    fn check_wsl_runtime_port(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn provision_wsl_distro("))
+            .map(|(body, _)| body)
+            .expect("the port preflight should remain inspectable");
+        assert!(check.contains("tokio::task::spawn_blocking("));
+        assert!(check.contains("probe_environment"));
+        assert!(
+            check.contains("wsl_port_busy"),
+            "a busy port is distinguished from a generic probe failure"
+        );
+        assert!(
+            check.contains("this.provision_wsl_distro(distro, port, cx)"),
+            "the checked port is the one the deployment uses"
+        );
+        let start = source
+            .split_once("    fn provision_wsl_distro(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// Copies the latest deployment stage"))
+            .map(|(body, _)| body)
+            .expect("the WSL deployment should remain inspectable");
+        assert!(start.contains("WslProvisioner::new("));
+        assert!(
+            !start.contains("8765"),
+            "the deployment must not fall back to the fixed port"
+        );
+        assert!(start.contains("remote_port: port"));
+    }
+
     #[test]
     fn bootstrap_command_authorizes_the_account_the_user_names() {
         let source = include_str!("app.rs");
@@ -121737,6 +126312,11 @@ mod tests {
         }));
         assert!(notification_candidates.iter().any(|candidate| {
             candidate.section == SettingsSection::Session && candidate.keywords.contains(&"failed")
+        }));
+        let collapse_candidates = settings_search_candidates_for_query("collapse", english);
+        assert!(collapse_candidates.iter().any(|candidate| {
+            candidate.section == SettingsSection::Session
+                && candidate.title == "Auto-collapse tool calls"
         }));
         assert!(settings_search_candidates_for_query("", english).is_empty());
     }
@@ -122746,6 +127326,8 @@ mod tests {
         assert!(session.contains("set_enhanced_command_execution_display"));
         assert!(session.contains("enhanced_file_operation_display"));
         assert!(session.contains("set_enhanced_file_operation_display"));
+        assert!(session.contains("auto_collapse_tool_calls"));
+        assert!(session.contains("set_auto_collapse_tool_calls"));
         assert!(session.contains("notify-completed"));
         assert!(session.contains("notify-needs-input"));
         assert!(session.contains("notify-failed"));
@@ -123014,13 +127596,25 @@ mod tests {
             .and_then(|(_, tail)| tail.split_once("\n    fn open_pairing("))
             .map(|(body, _)| body)
             .expect("the title-bar update entry should remain inspectable");
-        assert!(entry.contains("Popover::new(\"update-popover\")"));
-        assert!(entry.contains(".overlay_closable(false)"));
-        assert!(entry.contains(".on_open_change("));
-        assert!(
-            !entry.contains(".on_click("),
-            "the popover owns the toggle; a click handler here closes the panel on mouse-up"
-        );
+        // The panel is an in-tree layer, not a deferred popover: a popover
+        // paints after the dialog layer and would cover an open modal.
+        assert!(!entry.contains("Popover::new"));
+        assert!(entry.contains("self.update_panel_open"));
+        assert!(entry.contains(".on_click("));
+        assert!(entry.contains(".absolute()"));
+        assert!(entry.contains(".top(px(TITLE_BAR_HEIGHT))"));
+        assert!(entry.contains(".right_0()"));
+
+        // A background check updates only the title-bar entry. The panel may
+        // close itself when its release disappears, but it must never open
+        // without a click.
+        let sync = source
+            .split_once("    fn sync_update_panel(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// Start the download"))
+            .map(|(body, _)| body)
+            .expect("update panel synchronization should remain inspectable");
+        assert!(sync.contains("update_panel_open = false"));
+        assert!(!sync.contains("update_panel_open = true"));
 
         let panel = source
             .split_once("    fn render_update_panel(")
@@ -123048,7 +127642,7 @@ mod tests {
 
         let surfaces = source
             .split_once("    fn update_surfaces_enabled(")
-            .and_then(|(_, tail)| tail.split_once("\n    /// Keep the title-bar panel"))
+            .and_then(|(_, tail)| tail.split_once("\n    /// Close the title-bar panel"))
             .map(|(body, _)| body)
             .expect("update surface policy should remain inspectable");
         assert!(surfaces.contains("auto_update"));
@@ -123186,10 +127780,17 @@ mod tests {
         let file_operation_display = source
             .split_once("    fn set_enhanced_file_operation_display(")
             .and_then(|(_, tail)| {
-                tail.split_once("\n    fn sync_timeline_display_settings_to_runtime(")
+                tail.split_once("\n    /// Keeps runs of tool calls folded while the Agent works.")
             })
             .map(|(body, _)| body)
             .expect("file operation display setter should remain inspectable");
+        let auto_collapse = source
+            .split_once("    fn set_auto_collapse_tool_calls(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    fn sync_timeline_display_settings_to_runtime(")
+            })
+            .map(|(body, _)| body)
+            .expect("auto-collapse setter should remain inspectable");
         let invalidation = source
             .split_once("    fn invalidate_timeline_layout_measurements(")
             .and_then(|(_, tail)| tail.split_once("\n    fn refresh_last_timeline_size("))
@@ -123199,6 +127800,8 @@ mod tests {
         assert!(content_width.contains("self.invalidate_timeline_layout_measurements();"));
         assert!(command_display.contains("self.invalidate_timeline_layout_measurements();"));
         assert!(file_operation_display.contains("self.invalidate_timeline_layout_measurements();"));
+        assert!(auto_collapse.contains("self.invalidate_timeline_layout_measurements();"));
+        assert!(auto_collapse.contains("self.queue_ui_state();"));
         assert!(invalidation.contains("self.timeline_measured_turn_heights.clear();"));
         assert!(invalidation.contains("self.timeline_measured_turn_layout_signatures.clear();"));
         assert!(invalidation.contains("self.timeline_pending_turn_heights.clear();"));
@@ -123216,6 +127819,7 @@ mod tests {
 
         assert!(signature.contains("enhanced_command_execution_display"));
         assert!(signature.contains("enhanced_file_operation_display"));
+        assert!(signature.contains("auto_collapse_tool_calls"));
         assert!(signature.contains("process_activity_groups_with_commands"));
         assert!(signature.contains("process_activity_groups_with_file_operations"));
 
@@ -130248,5 +134852,78 @@ mod route_picker_tests {
             group.choices[0].label, "deepseek-chat",
             "the model is named, not its storage id"
         );
+    }
+
+    #[test]
+    fn session_context_quotes_each_line_and_keeps_blank_lines() {
+        assert_eq!(context_menu_blockquote("one\n\ntwo\n"), "> one\n>\n> two");
+        assert_eq!(context_menu_blockquote("   \n"), "");
+    }
+
+    #[test]
+    fn session_context_find_query_takes_the_first_useful_line() {
+        assert_eq!(selection_find_query("\n\n  hello  \nworld"), "hello");
+        let long = "x".repeat(200);
+        assert_eq!(selection_find_query(&long).chars().count(), 120);
+    }
+
+    #[test]
+    fn session_context_links_must_be_one_external_url() {
+        assert!(single_external_url(" https://example.com/a ").is_some());
+        assert_eq!(
+            single_external_url("https://example.com/a https://example.com/b"),
+            None,
+        );
+        assert_eq!(single_external_url("javascript:alert(1)"), None);
+    }
+
+    #[test]
+    fn session_context_markdown_surfaces_match_their_row_only() {
+        let prefixes = vec!["markdown:row".to_string()];
+        assert!(markdown_surface_matches("markdown:row", &prefixes));
+        assert!(markdown_surface_matches("markdown:row:0", &prefixes));
+        assert!(!markdown_surface_matches("markdown:row-extra", &prefixes));
+        assert!(!markdown_surface_matches("markdown:other", &prefixes));
+    }
+
+    /// The child Agent rail renders another session's transcript through the
+    /// same row renderers as the focused timeline, so its row menus must not
+    /// fork, stop, fold or act on the borrowed view. They stay copy and quote.
+    #[test]
+    fn session_context_child_agent_rail_menus_stay_copy_only() {
+        let source = include_str!("app.rs");
+
+        let agent_menu = source
+            .split_once("    fn build_agent_message_context_menu(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn activity_copy_item("))
+            .map(|(body, _)| body)
+            .expect("the Agent message menu should remain inspectable");
+        assert!(agent_menu.contains("context.child_session.is_none()"));
+        assert!(agent_menu.contains("ClipboardItem::new_string(copy_body"));
+
+        let user_menu = source
+            .split_once("    fn build_user_message_context_menu(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn build_agent_message_context_menu("))
+            .map(|(body, _)| body)
+            .expect("the user message menu should remain inspectable");
+        assert!(user_menu.contains("let copy_item = context.copy_item.clone();"));
+
+        let turn = source
+            .split_once("    fn render_timeline_turn(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_turn_file_changes_card("))
+            .map(|(body, _)| body)
+            .expect("the turn renderer should remain inspectable");
+        assert!(turn.contains(
+            "if self.rendering_child_agent_timeline() {\n            return content.into_any_element();\n        }\n        content\n            .context_menu("
+        ));
+
+        let row = source
+            .split_once("    fn render_timeline_row(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn highlight_session_search_rows("))
+            .map(|(body, _)| body)
+            .expect("the row renderer should remain inspectable");
+        assert!(row.contains(
+            "let element = if self.rendering_child_agent_timeline()\n            || matches!("
+        ));
     }
 }

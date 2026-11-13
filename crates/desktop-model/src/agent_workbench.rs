@@ -981,29 +981,31 @@ fn find_conversation_turn_conclusion<'a>(
     items: &[&'a TimelineItem],
     provider_turn_finished: bool,
 ) -> Option<&'a TimelineItem> {
+    // An answer that reached the reader is the turn's conclusion even when a
+    // boundary error followed it. The error is the reason the turn stopped, not
+    // what it produced: naming the error here removed the answer from the turn
+    // altogether (every final agent row is dropped from the process rows
+    // below), so a turn that answered and then failed showed only its failure.
+    // The error remains a process row, where the reader can open it.
+    if let Some((_, message)) = select_agent_message(items, true) {
+        return Some(message);
+    }
     let latest_error = items
         .iter()
         .copied()
         .enumerate()
         .rev()
         .find(|(_, item)| is_turn_boundary_error(item));
-    let final_agent_message = select_agent_message(items, true);
+    if let Some((_, error)) = latest_error {
+        return Some(error);
+    }
     let streaming_agent_message = select_streaming_agent_message(items);
     let fallback_agent_message = provider_turn_finished
         .then(|| select_agent_message(items, false))
         .flatten();
-    let agent_message = final_agent_message
-        .or(streaming_agent_message)
-        .or(fallback_agent_message);
-
-    match (latest_error, agent_message) {
-        (Some((error_index, error)), Some((message_index, _))) if error_index > message_index => {
-            Some(error)
-        }
-        (_, Some((_, message))) => Some(message),
-        (Some((_, error)), None) => Some(error),
-        (None, None) => None,
-    }
+    streaming_agent_message
+        .or(fallback_agent_message)
+        .map(|(_, message)| message)
 }
 
 fn select_streaming_agent_message<'a>(
@@ -3254,6 +3256,74 @@ mod tests {
         assert_eq!(conclusion.item_ids.len(), 2);
         assert_eq!(conclusion.turn_item_count, 4);
         assert!(turns[0].complete);
+    }
+
+    #[test]
+    fn a_failed_turn_keeps_the_answer_it_produced() {
+        let items = [
+            item(
+                1,
+                None,
+                TimelinePayload::UserMessage(UserMessagePayload {
+                    text: "Fix the bug".into(),
+                    attachments: Vec::new(),
+                    ..Default::default()
+                }),
+            ),
+            item(
+                2,
+                None,
+                TimelinePayload::ToolCall(ToolCallPayload {
+                    tool_call_id: "call-1".into(),
+                    tool_name: "read_file".into(),
+                    status: ToolCallStatus::Completed,
+                    summary: String::new(),
+                    input_summary: Some("src/lib.rs".into()),
+                    output_summary: Some("40 lines".into()),
+                    raw_extension: None,
+                }),
+            ),
+            item(
+                3,
+                Some("correlation_answer_3"),
+                TimelinePayload::AgentMessage(AgentMessagePayload {
+                    text: "The bug is fixed in src/lib.rs.".into(),
+                    is_final: true,
+                }),
+            ),
+            // A boundary error terminates the turn after the answer already
+            // reached the reader. The failure is work, not the thing the turn
+            // produced: the answer stays the conclusion and the error stays a
+            // process row, where the fold can still reveal it.
+            item(
+                4,
+                None,
+                TimelinePayload::Error(vibex_core::TimelineErrorPayload {
+                    code: "acp_rpc_error".into(),
+                    message: "Internal error: turn failed: 502".into(),
+                    recoverable: false,
+                }),
+            ),
+        ];
+
+        let turns = timeline_conversation_turns(&items, Some(AgentSessionState::Idle), false);
+
+        assert_eq!(turns.len(), 1);
+        assert!(turns[0].complete);
+        assert!(turns[0].failed);
+        let conclusion = turns[0]
+            .conclusion_row
+            .as_ref()
+            .expect("the answer is the conclusion");
+        assert_eq!(conclusion.kind, TimelineRowKind::AgentMessage);
+        assert_eq!(conclusion.body, "The bug is fixed in src/lib.rs.");
+        assert!(
+            turns[0]
+                .process_rows
+                .iter()
+                .any(|row| row.kind == TimelineRowKind::Error),
+            "the failure must stay available with the turn's work"
+        );
     }
 
     #[test]

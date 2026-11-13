@@ -322,7 +322,13 @@ impl MobileApp {
             );
         }
         let label = summary.label(locale::current());
-        let expanded = group_open(turn, group, self.row_expansion(&group.id));
+        let expanded = group_open(
+            turn,
+            group,
+            self.row_expansion(&group.id),
+            self.effective_timeline_display_settings()
+                .auto_collapse_tool_calls,
+        );
         let running = rows
             .iter()
             .any(|row| is_running(row, self.row_turn_live(row)));

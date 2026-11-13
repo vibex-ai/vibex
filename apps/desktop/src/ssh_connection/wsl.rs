@@ -487,7 +487,19 @@ pub fn probe_environment(
         .map_err(|error: EnvironmentError| WslError::new("wsl_probe_invalid", error.message()))?;
     environment
         .validate(super::environment::MIN_FREE_KB)
-        .map_err(|error| WslError::new("wsl_probe_invalid", error.message()))?;
+        .map_err(|error| match error {
+            // The port is the one probe failure the reader can fix in the add
+            // dialog. Name the port they picked instead of repeating the
+            // generic "port is in use" sentence, and keep a dedicated code so
+            // the UI can offer the input rather than a transport diagnostic.
+            EnvironmentError::PortBusy => WslError::retryable(
+                "wsl_port_busy",
+                format!(
+                    "the WSL runtime port {remote_port} is already in use; choose another port"
+                ),
+            ),
+            error => WslError::new("wsl_probe_invalid", error.message()),
+        })?;
     Ok(environment)
 }
 
@@ -635,6 +647,30 @@ mod tests {
             environment.arch,
             super::super::environment::RemoteArch::Aarch64
         );
+    }
+
+    /// A busy port is a different failure from a broken distro.
+    ///
+    /// The add dialog offers the port field only when it can see this code, and
+    /// the message has to name the port the reader chose; the generic probe
+    /// sentence left them guessing which of two occupied ports to change.
+    #[cfg(unix)]
+    #[test]
+    fn a_busy_runtime_port_names_the_port() {
+        let dir = tempfile::tempdir().unwrap();
+        let wsl = fake_wsl(
+            dir.path(),
+            "#!/bin/sh\ncat >/dev/null\nprintf 'probe=ok\\nos=Linux\\narch=x86_64\\nhome=/home/dev\\nshell=/bin/bash\\ngit=yes\\nsha256sum=yes\\nfree_kb=1048576\\nglibc=2.36\\nhome_writable=yes\\nport=busy\\nruntime=absent\\n'\n",
+        );
+        let _guard = test_support::process_guard();
+        let error = probe_environment(&wsl, "Ubuntu", 18765).unwrap_err();
+        assert_eq!(error.code, "wsl_port_busy");
+        assert!(
+            error.message.contains("18765"),
+            "the message names the chosen port: {}",
+            error.message
+        );
+        assert!(error.retryable);
     }
 
     #[cfg(windows)]

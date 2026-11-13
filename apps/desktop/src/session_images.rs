@@ -1007,4 +1007,139 @@ mod tests {
             "the reveal item should hand the rail a workspace-relative path, got {recorded:?}",
         );
     }
+
+    /// Serves one PNG over HTTP on a thread with its own runtime and returns
+    /// the base URL.
+    ///
+    /// GPUI tests run outside Tokio, so the server cannot borrow the test's
+    /// executor; a dedicated current-thread runtime keeps the test independent
+    /// of the application's runtime bridge. The thread ends with the test
+    /// process.
+    fn serve_png(png: Vec<u8>) -> String {
+        use axum::{Router, http::header, routing::get};
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("the test server runtime should start");
+            runtime.block_on(async move {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .expect("the test server should bind");
+                let address = listener.local_addr().expect("the listener has an address");
+                sender
+                    .send(format!("http://{address}"))
+                    .expect("the test should still want the address");
+                let router = Router::new().route(
+                    "/image.png",
+                    get(move || {
+                        let png = png.clone();
+                        async move { ([(header::CONTENT_TYPE, "image/png")], png) }
+                    }),
+                );
+                axum::serve(listener, router)
+                    .await
+                    .expect("the test server should serve");
+            });
+        });
+        receiver
+            .recv()
+            .expect("the test server should report its URL")
+    }
+
+    /// A remote image reaches the text view through the application's client.
+    ///
+    /// This is the end-to-end guard for the bug: the platform constructor
+    /// installs a client that refuses every request, so an `http(s)` image
+    /// parsed into an image node never loaded. The session plugin deliberately
+    /// leaves those destinations to GPUI's asset loader, so the test reads the
+    /// decoded frame back from the cache — proof the loader fetched and decoded
+    /// the bytes through the client the desktop installed.
+    #[gpui::test]
+    fn a_remote_image_loads_through_the_application_http_client(cx: &mut gpui::TestAppContext) {
+        use std::time::Duration;
+
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        use gpui::{AppContext as _, Context, Entity, IntoElement, Render, Window};
+
+        use crate::markdown::{TextView, TextViewState};
+
+        struct Host {
+            state: Entity<TextViewState>,
+            extensions: MarkdownExtensions,
+        }
+
+        impl Render for Host {
+            fn render(
+                &mut self,
+                _window: &mut Window,
+                _cx: &mut Context<Self>,
+            ) -> impl IntoElement {
+                TextView::new(&self.state)
+                    .markdown_extensions(self.extensions.clone())
+                    .text_sm()
+            }
+        }
+
+        // The load crosses into the client's Tokio runtime and back. The test
+        // scheduler's single-thread determinism check cannot model that, so
+        // this test explicitly allows parking and foreign-thread wakeups.
+        cx.executor().allow_parking();
+        cx.update(|cx| {
+            cx.set_http_client(Arc::new(crate::platform::ReqwestHttpClient::new()));
+        });
+        cx.update(gpui_component::init);
+        let root = tempfile::tempdir().unwrap();
+        let base = serve_png(STANDARD.decode(ONE_PIXEL_PNG).unwrap());
+        let uri = format!("{base}/image.png");
+        let plugin = plugin(root.path());
+        let extensions = MarkdownExtensions::default()
+            .plugin(plugin)
+            .parser_revision(1);
+        let source = format!("![remote]({uri})");
+        let state = cx.update(|cx| cx.new(|cx| TextViewState::markdown(&source, cx)));
+        let state_for_host = state.clone();
+        let (_, cx) = cx.add_window_view(move |_, _| Host {
+            state: state_for_host,
+            extensions,
+        });
+        let resource = Resource::Uri(uri.clone().into());
+        let mut loaded = None;
+        for _ in 0..300 {
+            cx.update(|window, cx| {
+                window.refresh();
+                let _ = window.draw(cx);
+            });
+            cx.run_until_parked();
+            loaded = cx.update(|_, cx| cx.fetch_asset::<gpui::ImgResourceLoader>(&resource));
+            if loaded.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // A cached *error* is still a completed load, so the assertion has to
+        // look at the decoded image rather than at the cache entry's presence.
+        match loaded {
+            Some(Ok(image)) => {
+                let size = image.size(0);
+                assert_eq!(
+                    (size.width.0, size.height.0),
+                    (1, 1),
+                    "the fetched PNG should decode to its one-pixel frame",
+                );
+            }
+            Some(Err(error)) => {
+                panic!("the remote image failed to load through the application's client: {error}")
+            }
+            None => panic!("the remote image load never completed"),
+        }
+        // The session plugin claims workspace files, not URLs; the assertion
+        // above only means something if the image node fell through to GPUI.
+        assert!(
+            cx.debug_bounds("vibex-session-image").is_none(),
+            "a remote image must not be claimed by the workspace-file plugin",
+        );
+    }
 }

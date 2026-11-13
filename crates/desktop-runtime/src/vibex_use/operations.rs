@@ -42,13 +42,16 @@ impl VibexUseService {
         operation: &VibexUseOperation,
         actor: &VibexUseActor,
         arguments: &serde_json::Value,
+        bind_human_mentions: bool,
     ) -> VibexResult<SessionRuntimeSelection> {
         if let Some(value) = VibexUseOperationRepository::get(&self.open()?, &operation.id)?
             .and_then(|op| op.checkpoint.get("selection").cloned())
         {
             return serde_json::from_str(&value).map_err(internal_encode_error);
         }
-        let selection = self.resolve_selection(actor, arguments).await?;
+        let selection = self
+            .resolve_selection(actor, arguments, bind_human_mentions)
+            .await?;
         let saved = VibexUseOperationRepository::set_checkpoint_once(
             &self.open()?,
             &operation.id,

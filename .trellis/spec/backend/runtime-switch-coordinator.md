@@ -915,6 +915,17 @@ RuntimeBinding {
   the catalog lookup must use the resource-free identity and never the launch
   fingerprint, or every explicit-model Agent-account session fails with
   `agent_auth_model_catalog_unavailable`.
+- The catalog identity also excludes runtime-only launch inputs: the presence of
+  a terminal host and resolved `ProcessEnvironment` values. They remain in the
+  process fingerprint (a change may restart the Agent), but a catalog must not
+  miss because the next launch ran under a different shell or a headless start.
+- A launch-identity change (managed Adapter update or application upgrade) is
+  served by the newest complete, usable catalog for the same context revision
+  while the background refresh re-discovers it. The exact fingerprint wins
+  whenever it exists. A refresh that discovers no Models must borrow the
+  previous usable Models and stay marked incomplete, so it cannot erase a
+  working selection or freeze the catalog before the Adapter is ready. One
+  Agent's failed discovery must not abort the refresh of the others.
 - `AgentDefault` omits a model override. Config convergence accepts a missing
   explicit model only for this semantic variant; a later Agent-reported model
   is effective evidence, not a rewrite of desired selection.

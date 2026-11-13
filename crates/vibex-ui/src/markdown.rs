@@ -121,6 +121,84 @@ pub fn resolve_workspace_path(base_path: &str, source: &str) -> Option<String> {
     (!segments.is_empty()).then(|| segments.join("/"))
 }
 
+/// What a rendered Markdown link destination names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarkdownLinkKind {
+    /// A page an embedded or system browser opens.
+    Web,
+    /// A file this client reads from disk.
+    Local,
+    /// A scheme with no handler here (`mailto:`, `asset:`, `data:`, ...).
+    Unsupported,
+}
+
+/// Classify a Markdown link destination.
+///
+/// The URL parser must not be asked first: a Windows drive path such as
+/// `C:\work\a.md` parses as a URL whose scheme is the drive letter, so a plain
+/// local file would be mistaken for an unknown scheme and a click on its link
+/// would do nothing. A `file:` URL and a drive-letter path are local,
+/// `http`/`https` are web, and every other parseable scheme is unsupported.
+pub fn markdown_link_kind(destination: &str) -> MarkdownLinkKind {
+    let destination = destination.trim();
+    if destination.is_empty() || destination.starts_with('#') {
+        return MarkdownLinkKind::Unsupported;
+    }
+    if is_file_url(destination) || is_windows_drive_path(destination) {
+        return MarkdownLinkKind::Local;
+    }
+    match url::Url::parse(destination) {
+        Ok(parsed) if matches!(parsed.scheme(), "http" | "https") => MarkdownLinkKind::Web,
+        Ok(_) => MarkdownLinkKind::Unsupported,
+        Err(_) => MarkdownLinkKind::Local,
+    }
+}
+
+/// Whether `destination` starts with the `file:` scheme.
+pub fn is_file_url(destination: &str) -> bool {
+    destination
+        .get(..5)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("file:"))
+}
+
+/// Whether `destination` is an absolute Windows path such as `C:\work\a.md`.
+///
+/// The test is lexical and host-independent, so a client can recognise the
+/// shape everywhere and route it to the platform path resolver instead of the
+/// URL parser. A POSIX spelling of the same path keeps a leading `/` before
+/// the drive (`/C:/work/a.md`), which a shell such as Git Bash produces; both
+/// name the drive.
+pub fn is_windows_drive_path(destination: &str) -> bool {
+    let destination = destination.trim();
+    let bytes = destination.as_bytes();
+    let drive = if bytes.first() == Some(&b'/') {
+        &bytes[1..]
+    } else {
+        bytes
+    };
+    drive.len() >= 3
+        && drive[0].is_ascii_alphabetic()
+        && drive[1] == b':'
+        && matches!(drive[2], b'\\' | b'/')
+}
+
+/// The platform path a local Markdown destination names.
+///
+/// An editor location (`:line` or `:line:column`) belongs to the click, not to
+/// the file, and a Windows path written from a POSIX shell keeps a leading `/`
+/// before its drive. Both are removed here so the platform path resolver sees
+/// the path the filesystem actually has.
+pub fn local_file_path(destination: &str) -> String {
+    let destination = destination.trim();
+    let path = destination.split(['?', '#']).next().unwrap_or(destination);
+    let path = strip_editor_location(path);
+    if is_windows_drive_path(path) {
+        path.trim_start_matches('/').to_string()
+    } else {
+        path.to_string()
+    }
+}
+
 fn normalize_base_path(base_path: &str) -> String {
     base_path
         .replace('\\', "/")
@@ -377,6 +455,71 @@ mod tests {
         assert_eq!(urls, vec!["a.png", "https://example.com", "docs/c.md"]);
         assert!(found[0].image);
         assert!(!found[2].image);
+    }
+
+    #[test]
+    fn link_destinations_classify_before_the_url_parser_reads_them() {
+        for web in ["https://example.com/a.md", "http://example.com"] {
+            assert_eq!(markdown_link_kind(web), MarkdownLinkKind::Web, "{web}");
+        }
+        // A Windows drive path parses as a URL whose scheme is the drive
+        // letter; it must stay local so the platform path resolver sees it.
+        for local in [
+            r"C:\work\notes.md",
+            "C:/work/notes.md",
+            "/C:/10000000/vibex/apps/desktop/src/timeline_activity.rs:354",
+            r"/C:\work\notes.md",
+            "file:///C:/work/notes.md",
+            "FILE:///tmp/notes.md",
+            "docs/notes.md",
+            "../notes.md",
+        ] {
+            assert_eq!(
+                markdown_link_kind(local),
+                MarkdownLinkKind::Local,
+                "{local}"
+            );
+        }
+        for unsupported in [
+            "#fragment",
+            "mailto:someone@example.com",
+            "data:image/png;base64,AA",
+            "asset://localhost/a.png",
+            "",
+        ] {
+            assert_eq!(
+                markdown_link_kind(unsupported),
+                MarkdownLinkKind::Unsupported,
+                "{unsupported}"
+            );
+        }
+    }
+
+    #[test]
+    fn local_file_paths_drop_the_editor_location_and_posix_drive_slash() {
+        // The exact shape a Windows tool prints from a POSIX shell: a leading
+        // slash before the drive and a trailing `:line`.
+        assert_eq!(
+            local_file_path("/C:/10000000/vibex/apps/desktop/src/timeline_activity.rs:354"),
+            "C:/10000000/vibex/apps/desktop/src/timeline_activity.rs"
+        );
+        assert_eq!(
+            local_file_path(r"/C:\work\notes.md:12:3"),
+            r"C:\work\notes.md"
+        );
+        // A plain Windows path and a relative path keep their shape.
+        assert_eq!(local_file_path(r"C:\work\notes.md:12"), r"C:\work\notes.md");
+        assert_eq!(local_file_path("docs/notes.md:12:3"), "docs/notes.md");
+        // A POSIX absolute path is not a drive path and stays untouched.
+        assert_eq!(
+            local_file_path("/home/user/notes.md:9"),
+            "/home/user/notes.md"
+        );
+        // A `file:` URL keeps its scheme for the URL-aware resolver.
+        assert_eq!(
+            local_file_path("file:///C:/work/notes.md:354"),
+            "file:///C:/work/notes.md"
+        );
     }
 
     #[test]

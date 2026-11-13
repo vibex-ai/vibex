@@ -2695,6 +2695,10 @@ struct ProcessShared {
 struct AcpModelIdProjection {
     product_to_runtime: BTreeMap<String, String>,
     runtime_to_product: BTreeMap<String, String>,
+    /// The provider key an Agent that addresses a model as `<provider>/<model>`
+    /// expects, used for a Model the projection carries no entry for. `None`
+    /// for every other Agent, which keeps a bare id bare.
+    namespace: Option<String>,
 }
 
 impl AcpModelIdProjection {
@@ -2757,6 +2761,19 @@ impl AcpModelIdProjection {
         self
     }
 
+    /// The provider key a Model the projection does not carry must be
+    /// qualified by. Only Agents that address a model as `<provider>/<model>`
+    /// pass one; every other Agent leaves the namespace unset.
+    fn with_namespace(mut self, namespace: Option<String>) -> Self {
+        self.namespace = namespace;
+        self
+    }
+
+    /// Whether the projection maps no product Model at all.
+    fn is_empty(&self) -> bool {
+        self.product_to_runtime.is_empty()
+    }
+
     fn insert_runtime_id(
         &mut self,
         runtime_model_id: &str,
@@ -2776,17 +2793,27 @@ impl AcpModelIdProjection {
     }
 
     fn runtime_id(&self, product_model_id: &str) -> String {
-        self.product_to_runtime
-            .get(product_model_id)
-            .cloned()
-            .unwrap_or_else(|| product_model_id.to_string())
+        if let Some(runtime_id) = self.product_to_runtime.get(product_model_id) {
+            return runtime_id.clone();
+        }
+        if let Some(namespace) = self.namespace.as_deref()
+            && !product_model_id.starts_with(&format!("{namespace}/"))
+        {
+            return format!("{namespace}/{product_model_id}");
+        }
+        product_model_id.to_string()
     }
 
     fn product_id(&self, runtime_model_id: &str) -> String {
-        self.runtime_to_product
-            .get(runtime_model_id)
-            .cloned()
-            .unwrap_or_else(|| runtime_model_id.to_string())
+        if let Some(product_id) = self.runtime_to_product.get(runtime_model_id) {
+            return product_id.clone();
+        }
+        if let Some(namespace) = self.namespace.as_deref()
+            && let Some(bare) = runtime_model_id.strip_prefix(&format!("{namespace}/"))
+        {
+            return bare.to_string();
+        }
+        runtime_model_id.to_string()
     }
 }
 
@@ -9339,12 +9366,49 @@ impl RuntimeSelectionResolver for AcpRuntimeSwitchBridge {
                     .ok_or_else(|| {
                         runtime_configuration_unavailable("agent_auth_model_catalog_unavailable")
                     })?;
-            AgentAuthModelCatalogRepository::get(
+            let exact = AgentAuthModelCatalogRepository::get(
                 &conn,
                 auth_context_id,
                 context.auth_source_revision,
                 catalog_fingerprint,
-            )?
+            )?;
+            // A managed Agent update or an application upgrade changes the
+            // launch identity before the background refresh has written the
+            // catalogue for it. The previous complete snapshot is still the
+            // best description of what this account can select; using it keeps
+            // the reader's existing configuration working while the refresh
+            // runs, instead of failing every explicit-model session until a
+            // manual "refresh models".
+            let exact_covers_selection =
+                exact
+                    .as_ref()
+                    .is_some_and(|snapshot| match selection.model {
+                        RuntimeModelSelection::Explicit { .. } => {
+                            snapshot.status == AgentAuthModelCatalogStatus::Available
+                        }
+                        RuntimeModelSelection::AgentDefault => matches!(
+                            snapshot.status,
+                            AgentAuthModelCatalogStatus::Available
+                                | AgentAuthModelCatalogStatus::AgentDefaultOnly
+                        ),
+                    });
+            if exact_covers_selection {
+                exact
+            } else {
+                let fallback = AgentAuthModelCatalogRepository::latest_usable(
+                    &conn,
+                    auth_context_id,
+                    context.auth_source_revision,
+                )?;
+                if fallback.is_some() {
+                    tracing::warn!(
+                        target: "vibex_agent_acp",
+                        agent_id = %selection.agent_id,
+                        "Agent account model catalog is stale for the current launch identity; using the last complete catalogue while it refreshes"
+                    );
+                }
+                fallback.or(exact)
+            }
         } else {
             None
         };
@@ -12891,6 +12955,11 @@ impl AcpRuntimeClient {
     /// launch time. Discovery and lookup must both use this resource-free
     /// identity or the fingerprint never matches and every explicit-model
     /// Agent-account session fails with `agent_auth_model_catalog_unavailable`.
+    ///
+    /// Runtime capabilities and inherited process values are excluded as well.
+    /// They describe the machine a launch happens to see, not the durable
+    /// configuration a catalogue describes; including them made a restart under
+    /// a different shell or terminal availability look like an Agent update.
     fn agent_account_catalog_fingerprint(
         &self,
         auth_source: &RuntimeAuthSource,
@@ -12899,6 +12968,7 @@ impl AcpRuntimeClient {
         config: &AcpProviderConfig,
         env_unsets: &[String],
     ) -> VibexResult<String> {
+        let volatile_env_keys = catalog_volatile_env_keys(config);
         Ok(self
             .process_spawn_config_snapshot_for_agent_account(
                 auth_source,
@@ -12908,7 +12978,7 @@ impl AcpRuntimeClient {
                 &ProviderRuntimeResources::default(),
                 env_unsets,
             )?
-            .process_spawn_fingerprint())
+            .account_catalog_fingerprint(&volatile_env_keys))
     }
 
     /// The launch identity an Agent-account model catalog is keyed by, read
@@ -13598,11 +13668,24 @@ impl AcpRuntimeClient {
                 let profile_id = self.source_profile_id(&agent_id, source)?.ok_or_else(|| {
                     runtime_configuration_unavailable("model_route_not_launchable")
                 })?;
-                AcpModelIdProjection::new(
+                let projection = AcpModelIdProjection::new(
                     self.config_service
                         .legacy_agent_provider_model_id_projections(&profile_id)?
                         .unwrap_or_default(),
-                )?
+                )?;
+                // pi's adapter reads the provider from the first path segment,
+                // so a Model the projection carries no entry for — a selection
+                // that survived a Model edit — still has to travel qualified.
+                // A Profile that projects no models at all is left alone: the
+                // Agent's own catalogue is its only vocabulary then, and those
+                // ids already carry their native provider.
+                let namespace = if projection.is_empty() {
+                    None
+                } else {
+                    self.config_service
+                        .legacy_agent_provider_model_id_namespace(&profile_id)?
+                };
+                projection.with_namespace(namespace)
             }
         }
         .with_alias_slots(claude_alias_slots);
@@ -17865,6 +17948,32 @@ fn binary_identity(command: &str) -> String {
             )
         }
     }
+}
+
+/// Launch inputs that describe the machine, not the durable Agent configuration.
+///
+/// `__vibex_terminal_*` report whether this process could offer a terminal, and
+/// a `ProcessEnvironment` reference resolves whatever the launching shell
+/// exported. Both belong to the process fingerprint — a change can require a
+/// restart — but a catalogue keyed by them would miss on the next launch under
+/// a different shell or a headless start. The catalogue therefore drops them
+/// entirely: the declared value is still applied to the launch, but it is not
+/// part of the identity that decides whether a stored catalogue is current.
+fn catalog_volatile_env_keys(config: &AcpProviderConfig) -> BTreeSet<String> {
+    let mut keys = BTreeSet::from([
+        "__vibex_terminal_tools".to_string(),
+        "__vibex_terminal_auth".to_string(),
+    ]);
+    for reference in &config.env {
+        if reference.source != AcpProviderEnvSource::ProcessEnvironment {
+            continue;
+        }
+        let key = reference.key.trim();
+        if !key.is_empty() {
+            keys.insert(key.to_string());
+        }
+    }
+    keys
 }
 
 fn stable_native_state_home_id(
@@ -22988,6 +23097,39 @@ mod tests {
         assert_eq!(projection.runtime_id("gpt-5.6-sol"), "custom:gpt-5.6-sol");
         assert_eq!(projection.product_id("custom:gpt-5.6-sol"), "gpt-5.6-sol");
         assert_eq!(projection.product_id("unmapped"), "unmapped");
+    }
+
+    #[test]
+    fn model_id_projection_qualifies_an_unmapped_pi_model_under_its_namespace() {
+        let projection = AcpModelIdProjection::default().with_namespace(Some("acp".to_string()));
+
+        assert_eq!(
+            projection.runtime_id("deepseek/deepseek-chat"),
+            "acp/deepseek/deepseek-chat"
+        );
+        // An id that already spells the namespace is never doubled.
+        assert_eq!(
+            projection.runtime_id("acp/deepseek/deepseek-chat"),
+            "acp/deepseek/deepseek-chat"
+        );
+        // A slashless id is qualified too, so the adapter never has to resolve
+        // the provider from its own catalogue.
+        assert_eq!(projection.runtime_id("deepseek-chat"), "acp/deepseek-chat");
+        assert_eq!(
+            projection.product_id("acp/deepseek/deepseek-chat"),
+            "deepseek/deepseek-chat"
+        );
+        assert_eq!(
+            projection.product_id("deepseek/deepseek-chat"),
+            "deepseek/deepseek-chat"
+        );
+
+        // An Agent with no namespace keeps a bare id bare.
+        let bare = AcpModelIdProjection::default();
+        assert_eq!(
+            bare.runtime_id("deepseek/deepseek-chat"),
+            "deepseek/deepseek-chat"
+        );
     }
 
     #[test]
@@ -30233,12 +30375,20 @@ for line in sys.stdin:
         let conn = open_database(&fixture.fixture.db_path).unwrap();
         AgentAuthModelCatalogRepository::upsert(&conn, &wrong_fingerprint).unwrap();
         drop(conn);
-        let error = fixture
+        // A complete snapshot under an older launch identity is the fallback
+        // that keeps an existing configuration usable across an application
+        // upgrade. It still has to name the selected Model; the model fence
+        // below proves a stale catalogue cannot select something it never
+        // listed.
+        let resolved = fixture
             .bridge
             .resolve(&fixture.session.id, &selection, None)
             .await
-            .unwrap_err();
-        assert_runtime_configuration_cause(&error, "agent_auth_model_catalog_unavailable");
+            .expect("the previous complete catalogue remains usable");
+        assert!(matches!(
+            resolved.selection.model,
+            RuntimeModelSelection::Explicit { ref model_id } if model_id == "model-a"
+        ));
 
         let mut current_snapshot = wrong_fingerprint;
         current_snapshot.runtime_fingerprint = current_fingerprint;
@@ -40270,6 +40420,85 @@ for line in sys.stdin:
             .expect("Hermes model probe must select its target model");
         assert_eq!(model_request["params"]["configId"], "model");
         assert_eq!(model_request["params"]["value"], "custom:mock/model-2");
+        unsafe {
+            std::env::remove_var(SECRET_ENV);
+        }
+        fixture.cleanup();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pi_model_probe_qualifies_a_slashed_model_id_with_its_provider() {
+        let Some(fixture) = MockAcpFixture::create_for_agent(
+            "pi-model-probe",
+            Some(AgentId::parse(PI_AGENT_ID).unwrap()),
+        ) else {
+            return;
+        };
+        const SECRET_ENV: &str = "VIBEX_TEST_PI_PROVIDER_KEY";
+        let service = fixture.service();
+        let mut config = service
+            .get_acp_profile_config_for_launch(fixture.profile_id.clone())
+            .unwrap();
+        config.models = vec!["mock/model-1".to_string(), "mock/model-2".to_string()];
+        let conn = open_database(&fixture.db_path).unwrap();
+        persist_managed_runtime(&conn, PI_AGENT_ID, PI_AGENT_ID, "0.0.34", &config);
+        vibex_db::ProviderSecretReferenceRepository::replace_for_profile(
+            &conn,
+            &fixture.profile_id,
+            &[vibex_core::ProviderSecretReference {
+                id: RequestId::new(),
+                provider_profile_id: fixture.profile_id.clone(),
+                secret_kind: vibex_core::ProviderSecretKind::ApiKey,
+                backend: ProviderSecretBackend::Environment,
+                setup_state: vibex_core::ProviderSecretSetupState::Available,
+                lookup_key: SECRET_ENV.to_string(),
+                display_label: "VIBEX_PI_API_KEY".to_string(),
+                redacted_hint: "test environment".to_string(),
+                created_at_ms: 1,
+                updated_at_ms: 1,
+            }],
+        )
+        .unwrap();
+        drop(conn);
+        unsafe {
+            std::env::set_var(SECRET_ENV, "pi-test-secret");
+        }
+        service
+            .update_acp_profile_config(vibex_core::AcpProviderProfileUpdateRequest {
+                provider_profile_id: fixture.profile_id.clone(),
+                config,
+            })
+            .unwrap();
+        // The mock Agent qualifies its option ids with the overlay provider key
+        // exactly as pi-acp does.
+        fixture.set_model_prefix("acp");
+
+        let client = AcpRuntimeClient::new(service);
+        let _ = client
+            .probe_runtime_session_config_for_model(&fixture.profile_id, "mock/model-2")
+            .await
+            .unwrap();
+        let request = fixture
+            .request_log()
+            .into_iter()
+            .rev()
+            .find(|entry| {
+                matches!(
+                    entry["method"].as_str(),
+                    Some("session/set_model" | "session/set_config_option")
+                )
+            })
+            .expect("the Pi model probe must select its target model");
+        let value = request["params"]
+            .get("modelId")
+            .or_else(|| request["params"].get("value"))
+            .and_then(serde_json::Value::as_str)
+            .expect("the selection names the model");
+        assert_eq!(
+            value, "acp/mock/model-2",
+            "pi-acp reads the first path segment as the provider, so a model id \
+             that itself contains `/` must arrive qualified by the provider key"
+        );
         unsafe {
             std::env::remove_var(SECRET_ENV);
         }

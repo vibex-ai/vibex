@@ -18,6 +18,7 @@ sshd at all.
 ## Contents
 
 - [Quick start (Linux over SSH)](#quick-start-linux-over-ssh)
+- [Pairing link (no SSH)](#pairing-link-no-ssh)
 - [macOS remote](#macos-remote)
 - [Windows 11 + WSL2](#windows-11--wsl2)
 - [Linux without sshd (bootstrap)](#linux-without-sshd-bootstrap)
@@ -70,6 +71,30 @@ re-opens the tunnel, and connects with the stored, pinned credential. If that
 fails at launch, the workbench falls back to the local runtime; choose
 **Connect** (or **Fix**) on the connection to provision and pair again.
 
+## Pairing link (no SSH)
+
+A runtime that already prints a pairing link can be added directly, without
+SSH, a tunnel, or a Docker image. `vibex-server serve` prints a
+`vibex://pair#/code/<payload>` line next to the one-time numeric code; the link
+carries the server address and, when the runtime uses its own certificate, the
+certificate to pin.
+
+1. Start the runtime on the host and copy the `vibex://pair#/code/...` line it
+   printed. The code is single-use and expires.
+2. Settings → Remote instances → **Connect with pairing link**.
+3. Paste the whole link. The dialog hides the address field because the link
+   already carries it. If you only have the numeric code, leave the link field
+   as the code and enter the runtime's address, for example
+   `https://192.168.1.10:8765`.
+4. The runtime is added to **Remote connections** as a *Pairing link* instance
+   and the desktop connects to it. Reconnect later from that row, or use the
+   runtime switcher; **Remove** drops this machine's grant without touching the
+   runtime.
+
+A wrong or expired code keeps the dialog open with the reason, so a new code
+can be pasted without reopening it. The link is a secret: treat it like the
+one-time code and do not paste it into logs or chat.
+
 ## macOS remote
 
 macOS hosts are supported as **remote development machines** (beta), on
@@ -108,7 +133,18 @@ environment, not a remote Windows host. No sshd and no SSH keys are involved.
 
 1. Install WSL2 and at least one distro (`wsl --install`).
 2. Settings → Remote instances → **Add WSL runtime**, pick the distro, and choose
-   **Connect WSL**.
+   **Connect WSL**. The **Runtime port** field defaults to `8765`; change it
+   before connecting when a service inside the distro already listens there.
+   The dialog checks the port first and shows the conflicting port number, so
+   it can be corrected and retried in place.
+3. The **WSL runtime setup** dialog reports each step — distro check, manifest,
+   runtime download, install, start, forwarding, pairing, connect — and keeps
+   running if you close it. The connection stays listed under **Remote
+   connections** with its live status, so a failed attempt can be retried or
+   inspected from there.
+
+The chosen port is stored in the WSL connection profile and reused for the
+install, start, pairing, and every later reconnect.
 
 Vibex runs the Linux x86_64 artifact inside the distro through `wsl.exe`,
 installs it under the distro user's `~/.local/share/vibex/server`, and reaches

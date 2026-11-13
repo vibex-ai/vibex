@@ -8,9 +8,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::markdown::{
-    MarkdownPresentation, RangeHighlight, RenderedText, TextView, TextViewState,
-    base_path_for_file, data_url_image, resolve_workspace_path, resources as markdown_resources,
-    text_view_style,
+    MarkdownLinkKind, MarkdownPresentation, RangeHighlight, RenderedText, TextView, TextViewState,
+    base_path_for_file, data_url_image, is_file_url, is_windows_drive_path, local_file_path,
+    markdown_link_kind, resolve_workspace_path, resources as markdown_resources, text_view_style,
 };
 use crate::terminal_transport::{
     LocalTerminalTransport, RemoteTerminalTransport, TerminalTransport,
@@ -7061,17 +7061,25 @@ impl CodeWorkbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if url.starts_with('#') {
-            return;
-        }
-        if let Ok(parsed) = url::Url::parse(url) {
-            if matches!(parsed.scheme(), "http" | "https") {
+        match markdown_link_kind(url) {
+            MarkdownLinkKind::Web => {
                 // A link in a document opens where the reader already is: the
                 // panel. The system browser stays the answer when this
                 // workbench has no panel to show the page in.
                 if !self.open_web_link(url.to_string(), window, cx) {
                     self.open_web_external(url.to_string(), cx);
                 }
+                return;
+            }
+            MarkdownLinkKind::Unsupported => return,
+            MarkdownLinkKind::Local => {}
+        }
+        // A `file:` URL and a Windows drive path name a real file rather than a
+        // workspace-relative one: the URL parser reads the drive letter as a
+        // scheme and `resolve_workspace_path` refuses the drive's `:`.
+        if is_file_url(url) || is_windows_drive_path(url) {
+            if let Some(target) = local_file_destination_path(url) {
+                self.open_file(target, false, window, cx);
             }
             return;
         }
@@ -20980,6 +20988,23 @@ fn is_local_external_path(path: &str) -> bool {
     Path::new(&path).is_absolute()
         || path.starts_with('/')
         || path.as_bytes().get(1).is_some_and(|byte| *byte == b':')
+}
+
+/// The absolute local path a `file:` URL or a Windows drive path names.
+///
+/// The destination is a real path rather than a workspace-relative one, so it
+/// is decoded here and handed to [`Self::open_file`], which accepts absolute
+/// external paths unchanged.
+fn local_file_destination_path(destination: &str) -> Option<String> {
+    let destination = local_file_path(destination);
+    if is_file_url(&destination) {
+        return url::Url::parse(&destination)
+            .ok()?
+            .to_file_path()
+            .ok()
+            .map(|path| path.to_string_lossy().into_owned());
+    }
+    is_windows_drive_path(&destination).then_some(destination)
 }
 
 /// The workspace-relative form of a file the preview panel's browser picked.

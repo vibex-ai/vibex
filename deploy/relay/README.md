@@ -98,6 +98,7 @@ All hard limits are configurable and the effective values are reported by
 | `VIBEX_RELAY_MAX_CONNECTIONS_PER_ROOM` | `1` | `maxConnectionsPerRoom` |
 | `VIBEX_RELAY_MAX_DEVICES_PER_ROOM` | `8` | `maxDevicesPerRoom` |
 | `VIBEX_RELAY_MAX_BODY_BYTES` | `1048576` | `maxBodyBytes` |
+| `VIBEX_RELAY_MAX_WEBSOCKET_FRAME_BYTES` | `2097152` | `maxWebsocketFrameBytes` |
 | `VIBEX_RELAY_RATE_LIMIT_WINDOW_MS` | `1000` | `rateLimitWindowMs` |
 | `VIBEX_RELAY_MAX_REQUESTS_PER_WINDOW_PER_ROOM` | `120` | `maxRequestsPerWindowPerRoom` |
 | `VIBEX_RELAY_MAX_QUEUE_BYTES_PER_CONNECTION` | `4194304` | `maxQueueBytesPerConnection` |

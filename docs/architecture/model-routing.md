@@ -131,10 +131,17 @@ motion. There is no random particle traffic and no per-token animation.
   `credit`, `quota`, `other`), 1 ms to 1 day. `auth` is rejected because a
   rejected credential does not heal with time. The override is read when a
   failure is recorded, so it applies from the next rest onward.
-- **AutoInclude** is the shared Provider's `autoRefreshModels` flag. A model-list
-  refresh adds newly discovered entries and keeps the user's existing rows
-  (capabilities, display name, enabled state). A Provider without the flag keeps
-  the replace-the-list refresh.
+- **A model-list fetch is a picker, not a write.** Asking a shared Provider for
+  its catalogue fills a dialog with one row per advertised Model; the reader
+  chooses which of them the Provider should offer and can open any row's
+  settings before confirming. Nothing is written until the confirm, and the
+  confirm adds the chosen Models rather than replacing the list, so a row the
+  user authored keeps its capabilities, display name, and enabled state.
+- **AutoInclude** is the shared Provider's `autoRefreshModels` flag. It only
+  decides how the picker opens: with the flag, the vendor's new Models arrive
+  already checked; without it, every row starts unchecked. Either way the
+  confirm is what adds them, so discovery can never add a Model the reader did
+  not see.
 
 There is deliberately no Provider budget, quota, balance field, or compatibility
 switch in this wave.

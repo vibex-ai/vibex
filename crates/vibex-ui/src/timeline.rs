@@ -611,25 +611,41 @@ pub fn activity_target(summary: &str, icon: ActivityKind) -> &str {
     }
 }
 
+/// Whether a run of tool activity is open.
+///
+/// The reader's own choice always wins. Without one, a live run opens itself
+/// while the work it stands for is still arriving, unless the session asked
+/// for tool activity to stay folded: then the summary line is the whole
+/// account of the run, and opening it is a click away.
+///
+/// A run holding an approval-pending row is the exception to folding: the
+/// request is an affordance rather than activity, so the run keeps its live
+/// rule instead of closing behind a summary.
 pub fn group_open(
     turn: &TimelineConversationTurn,
     group: &TimelineProcessActivityGroup,
     explicit: Option<bool>,
+    auto_collapse: bool,
 ) -> bool {
     explicit.unwrap_or_else(|| {
+        let rows = turn.process_rows.get(group.start_row..group.end_row);
+        // Folding never hides a request for approval: that row is an
+        // affordance, and it keeps the live rule that opens its run.
+        let approval_pending =
+            rows.is_some_and(|rows| rows.iter().any(|row| row.pending_permission));
+        if auto_collapse && !approval_pending {
+            return false;
+        }
         !turn_finished(turn)
             && turn
                 .conclusion_row
                 .as_ref()
                 .is_none_or(|row| row.body.trim().is_empty())
             && (group.end_row == turn.process_rows.len()
-                || turn
-                    .process_rows
-                    .get(group.start_row..group.end_row)
-                    .is_some_and(|rows| {
-                        rows.iter()
-                            .any(|row| row.streaming || row.pending_permission)
-                    }))
+                || rows.is_some_and(|rows| {
+                    rows.iter()
+                        .any(|row| row.streaming || row.pending_permission)
+                }))
     })
 }
 

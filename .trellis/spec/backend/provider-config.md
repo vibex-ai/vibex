@@ -500,7 +500,7 @@ environment key and the final ACP authentication decision.
 ### 1. Scope / Trigger
 
 - Trigger: the Provider Model editor declares a Model's context window or maximum output tokens, and a projection carries that limit into an Agent's own configuration.
-- Only the projections whose Agent config owns a limit read the declaration: DeepSeek Harness, OpenCode, and ZCode. Every other Agent resolves its window from its own catalogue or API, so the declaration must not be invented for it.
+- Codex, DeepSeek Harness, OpenCode, and ZCode read the declaration. Codex carries it in the private model catalogue (`vibex-models.json`); every other Agent resolves its window from its own catalogue or API, so the declaration must not be invented for it.
 
 ### 2. Contracts
 
@@ -508,13 +508,14 @@ environment key and the final ACP authentication decision.
 - An empty field means "not declared", and the projection omits the key or keeps its own default. Zero is rejected by the editor rather than read as unknown, so clearing the field is the only way back to the Agent default.
 - The editor parses both fields before it mutates the Model, so a rejected value leaves the draft exactly as it was instead of half-applying the edit.
 - DeepSeek Harness writes `contextWindow` / `maxTokens` (undeclared -> 262,144 / 32,768), OpenCode writes `limit.context` and `limit.output` only when both are declared, and ZCode writes `limit.context`.
+- Codex writes `context_window` / `max_context_window` into the projected catalogue entry. The catalogue is generated when any enabled Model declares a context window **or** a thinking depth: a context-only declaration must still project it, or Codex answers `model/list` from its bundled entry. `gpt-6-astra` is the concrete failure: bundled at 272,000 tokens with `effective_context_window_percent: 95`, a session reports 258,400 instead of the declared window.
 - The declaration survives profile save normalization, catalogue merge, and an authoritative catalogue refresh, like every other declared capability.
 
 ### 3. Tests Required
 
 - Editor parse unit: an empty pair returns undeclared, whole positive numbers are accepted, and zero, negative, fractional, or oversized values are rejected with the field named.
 - Round-trip unit: declared limits survive profile normalization, catalogue merge, and an authoritative catalogue refresh.
-- Projection units assert each Agent's keys for a declared and an undeclared Model.
+- Projection units assert each Agent's keys for a declared and an undeclared Model. For Codex, a Model that declares only `context_tokens` still produces `vibex-models.json`, the `model_catalog_json` line, and the declared `context_window` / `max_context_window` with an empty reasoning-level list.
 
 ## Scenario: Agent Session Options The Agent Cannot Express
 
@@ -5745,9 +5746,11 @@ ProviderConfigService::{
   - Every failure is silent. A catalogue that cannot be fetched, parsed, stored,
     or read yields no suggestion and changes nothing else; a stale document still
     suggests, but its matches are marked approximate.
-  - `reasoning_efforts` is never suggested. The catalogue does not publish an
-    Agent's own effort vocabulary, and inventing one produces a declaration the
-    Agent refuses.
+  - `reasoning_efforts` is never adopted automatically. The catalogue publishes
+    `reasoning_options` effort values, and the editor may show the values the
+    Agent vocabulary names as an explicit Apply row under Thinking levels; the
+    declaration still comes from the user's click, never from `adopt_all` or
+    auto-fill. Values outside the vocabulary are dropped.
   - No money field exists anywhere in the catalogue, its cache, or its DTOs.
 - **A route group steps aside, not the gateway.** Three consecutive requests
   that produce no upstream answer put *that group* into a stepped-aside state:
@@ -6117,7 +6120,8 @@ ProviderConfigService::{
   Key is refused, and that each add advances the revision.
 - `cargo test -p vibex-model-catalog` asserts exact and approximate matching, that
   adoption records provenance per field, that a hand-typed value is not
-  overwritten, that `reasoning_efforts` is never suggested, that a corrupt or
+  overwritten, that `reasoning_options` produce only an explicit level
+  suggestion and are never adopted by `adopt_all`, that a corrupt or
   older-schema cache reads as missing, and that no cached field carries money.
 - `cargo test -p vibex-desktop gateway_surface_tests` asserts every gateway state
   is named in words, that a gateway without a ready Key is not routable, that a
@@ -6626,12 +6630,13 @@ GatewayRouteDecisionTrace {
   The override is read when a failure is recorded, so it applies from the next
   rest onward and does not change a Key already cooling.
 - **Provider reliability P2 is the two confirmed behaviours.** AutoInclude is
-  the shared Provider's `autoRefreshModels` flag: a model-list refresh adds
-  newly discovered entries and never rewrites a row the user authored
-  (capabilities, display name, enabled state), while a Provider without the
-  flag keeps the replace-the-list refresh. Cooldown overrides are the policy
-  above. There is no Provider budget, quota, or compatibility flag in this
-  wave.
+  the shared Provider's `autoRefreshModels` flag, and it now only seeds the
+  fetch picker: with the flag a fetched Model arrives checked, without it every
+  row starts unchecked. The picker is the write gate either way — confirming it
+  adds the chosen Models and never rewrites a row the user authored
+  (capabilities, display name, enabled state). A fetch must not write the
+  endpoint's whole answer on its own. Cooldown overrides are the policy above.
+  There is no Provider budget, quota, or compatibility flag in this wave.
 - **The first-token deadline can fail over, and the last member never times
   out.** When a member is not the last, the gateway reads its first body byte
   before committing; a timeout or an empty body is recorded as a skipped member
@@ -6726,8 +6731,10 @@ GatewayRouteDecisionTrace {
   palette expose the virtual id, model/alias palette, pipeline, policy,
   templates, suggestions, patience, and Unlists/Sink; the save
   path writes the model-group fields; the dashboard and live card read real
-  gateway state and expose no money metric; AutoInclude adds a discovered model
-  without rewriting an authored row; cooldown inputs write the policy map.
+  gateway state and expose no money metric; a model fetch fills a picker whose
+  confirm adds the chosen Models without rewriting an authored row, and
+  AutoInclude only pre-checks the vendor's new rows; cooldown inputs write the
+  policy map.
 - Manual: 10k request rows, 20–30 concurrent inflight attempts, reduced motion,
   keyboard-only editing, and a legacy provider group that must not regress.
 

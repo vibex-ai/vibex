@@ -3772,6 +3772,117 @@ fn turn_of_one_long_group(rows: usize) -> Vec<TimelineItem> {
     items
 }
 
+/// A live run of tool calls drawn with the reader's folding preference.
+fn tool_rows_with_folding(
+    cx: &mut TestAppContext,
+    items: Vec<TimelineItem>,
+    auto_collapse: bool,
+) -> (Entity<VibexWorkbench>, Vec<String>, &mut VisualTestContext) {
+    let session_id = VibexSessionId::parse("session_layout").unwrap();
+    let (view, cx) = cx.add_window_view(move |window, cx| {
+        let workbench = cx.new(|cx| {
+            let mut ui_state = DesktopUiStateV1::default();
+            ui_state.appearance.locale = LocaleMode::En;
+            ui_state.session.enhanced_command_execution_display = false;
+            ui_state.session.auto_collapse_tool_calls = auto_collapse;
+            ui_state.session.turn_preview_rail = false;
+            let mut workbench =
+                VibexWorkbench::with_initial_state(None, ui_state, None, window, cx);
+            workbench.agent_loading = false;
+            workbench.selected_session_id = Some(session_id.clone());
+            workbench.view_session_id = Some(session_id.clone());
+            workbench
+                .timeline
+                .replace_authoritative(session_id.clone(), items);
+            workbench.rebuild_timeline_sizes();
+            workbench.request_timeline_scroll_to_latest();
+            workbench
+        });
+        LiveTimelineProbe { workbench }
+    });
+    let workbench = view.read_with(cx, |view, _| view.workbench.clone());
+    for _ in 0..40 {
+        draw_disclosure_frame(cx);
+    }
+    let group = workbench.read_with(cx, |workbench, _| {
+        let turn = workbench
+            .conversation_turns_cache
+            .last()
+            .expect("the fixture projects one turn");
+        assert!(
+            turn.process_activity_groups_with_commands_and_file_operations
+                .first()
+                .is_some_and(|group| group.end_row - group.start_row > 1),
+            "the fixture needs a run worth folding"
+        );
+        turn.process_activity_groups_with_commands_and_file_operations[0]
+            .id
+            .clone()
+    });
+    (workbench, vec![group], cx)
+}
+
+fn activity_body_shown(cx: &mut VisualTestContext, group_id: &str) -> bool {
+    let selector: &'static str =
+        Box::leak(format!("activity-group-body:{group_id}").into_boxed_str());
+    cx.debug_bounds(selector).is_some()
+}
+
+/// Folding is the reader's choice, not a property of the run: the summary line
+/// stands for the whole run while the work arrives, and one click opens it.
+#[gpui::test]
+fn auto_collapse_draws_a_live_run_as_its_summary_until_the_reader_opens_it(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_component::init);
+    let items = {
+        let mut items = vec![live_timeline_item(
+            1,
+            TimelinePayload::UserMessage(UserMessagePayload {
+                text: "Check the workspace".into(),
+                ..Default::default()
+            }),
+        )];
+        for tool in 0..6 {
+            items.push(progress_tool(items.len() as i64 + 1, tool));
+        }
+        items
+    };
+    let (_workbench, groups, cx) = tool_rows_with_folding(cx, items.clone(), true);
+    let group = &groups[0];
+    assert!(
+        !activity_body_shown(cx, group),
+        "a folded run draws only its summary line"
+    );
+
+    let summary_selector: &'static str =
+        Box::leak(format!("activity-summary:{group}").into_boxed_str());
+    let summary = cx
+        .debug_bounds(summary_selector)
+        .expect("the summary line is what the reader clicks");
+    cx.simulate_click(summary.center(), Modifiers::none());
+    for _ in 0..30 {
+        draw_disclosure_frame(cx);
+    }
+    assert!(
+        activity_body_shown(cx, group),
+        "the reader's click opens the run they asked for"
+    );
+
+    // The same run without the preference opens itself as the work arrives.
+    let (unfolded, groups, cx) = tool_rows_with_folding(cx, items, false);
+    assert!(
+        activity_body_shown(cx, &groups[0]),
+        "without the preference a live run keeps opening itself"
+    );
+    assert!(
+        unfolded.read_with(cx, |workbench, _| workbench
+            .timeline_command_expansion
+            .is_empty()),
+        "the automatic state is not recorded as a reader choice"
+    );
+}
+
 /// The tool rows of the last turn, in order, whatever separates them.
 fn tool_row_ids(workbench: &Entity<VibexWorkbench>, cx: &VisualTestContext) -> Vec<String> {
     workbench.read_with(cx, |workbench, _| {
