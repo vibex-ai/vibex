@@ -377,6 +377,42 @@
     },
     {
       "type": "library",
+      "bom-ref": "cargo:aead@0.6.1:c19b7c6f923b580a",
+      "name": "aead",
+      "version": "0.6.1",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/aead@0.6.1",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/RustCrypto/traits"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "cargo:aes@0.8.4:c19b7c6f923b580a",
       "name": "aes",
       "version": "0.8.4",
@@ -408,6 +444,114 @@
         {
           "type": "vcs",
           "url": "https://github.com/RustCrypto/block-ciphers"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:aes@0.9.4:c19b7c6f923b580a",
+      "name": "aes",
+      "version": "0.9.4",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/aes@0.9.4",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/RustCrypto/block-ciphers"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:aes-gcm@0.11.1:c19b7c6f923b580a",
+      "name": "aes-gcm",
+      "version": "0.11.1",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 OR MIT"
+        }
+      ],
+      "purl": "pkg:cargo/aes-gcm@0.11.1",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "Apache-2.0"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/RustCrypto/AEADs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:aes-kw@0.3.1:c19b7c6f923b580a",
+      "name": "aes-kw",
+      "version": "0.3.1",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/aes-kw@0.3.1",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/RustCrypto/key-wraps"
         }
       ]
     },
@@ -629,6 +773,78 @@
     },
     {
       "type": "library",
+      "bom-ref": "cargo:alloc-no-stdlib@3.0.0:c19b7c6f923b580a",
+      "name": "alloc-no-stdlib",
+      "version": "3.0.0",
+      "licenses": [
+        {
+          "expression": "BSD-3-Clause"
+        }
+      ],
+      "purl": "pkg:cargo/alloc-no-stdlib@3.0.0",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "BSD-3-Clause"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/dropbox/rust-alloc-no-stdlib"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:alloc-stdlib@0.3.0:c19b7c6f923b580a",
+      "name": "alloc-stdlib",
+      "version": "0.3.0",
+      "licenses": [
+        {
+          "expression": "BSD-3-Clause"
+        }
+      ],
+      "purl": "pkg:cargo/alloc-stdlib@0.3.0",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "BSD-3-Clause"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/dropbox/rust-alloc-no-stdlib"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "cargo:alloca@0.4.0:c19b7c6f923b580a",
       "name": "alloca",
       "version": "0.4.0",
@@ -696,6 +912,42 @@
         {
           "type": "vcs",
           "url": "https://github.com/zakarumych/allocator-api2"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:ambient-authority@0.0.2:c19b7c6f923b580a",
+      "name": "ambient-authority",
+      "version": "0.0.2",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT"
+        }
+      ],
+      "purl": "pkg:cargo/ambient-authority@0.0.2",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "Apache-2.0 WITH LLVM-exception"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/sunfishcode/ambient-authority"
         }
       ]
     },
@@ -2429,6 +2681,42 @@
     },
     {
       "type": "library",
+      "bom-ref": "cargo:base16ct@1.0.0:c19b7c6f923b580a",
+      "name": "base16ct",
+      "version": "1.0.0",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 OR MIT"
+        }
+      ],
+      "purl": "pkg:cargo/base16ct@1.0.0",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "Apache-2.0"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/RustCrypto/formats"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "cargo:base62@2.2.4:c19b7c6f923b580a",
       "name": "base62",
       "version": "2.2.4",
@@ -2501,6 +2789,42 @@
     },
     {
       "type": "library",
+      "bom-ref": "cargo:base64-simd@0.8.0:c19b7c6f923b580a",
+      "name": "base64-simd",
+      "version": "0.8.0",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "purl": "pkg:cargo/base64-simd@0.8.0",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/Nugine/simd"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "cargo:base64ct@1.8.3:c19b7c6f923b580a",
       "name": "base64ct",
       "version": "1.8.3",
@@ -2532,6 +2856,42 @@
         {
           "type": "vcs",
           "url": "https://github.com/RustCrypto/formats"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:bincode@1.3.3:c19b7c6f923b580a",
+      "name": "bincode",
+      "version": "1.3.3",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "purl": "pkg:cargo/bincode@1.3.3",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/servo/bincode"
         }
       ]
     },
@@ -2609,6 +2969,42 @@
     },
     {
       "type": "library",
+      "bom-ref": "cargo:bit-set@0.8.0:c19b7c6f923b580a",
+      "name": "bit-set",
+      "version": "0.8.0",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 OR MIT"
+        }
+      ],
+      "purl": "pkg:cargo/bit-set@0.8.0",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "Apache-2.0"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/contain-rs/bit-set"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "cargo:bit-vec@0.10.1:c19b7c6f923b580a",
       "name": "bit-vec",
       "version": "0.10.1",
@@ -2618,6 +3014,42 @@
         }
       ],
       "purl": "pkg:cargo/bit-vec@0.10.1",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "Apache-2.0"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/contain-rs/bit-vec"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:bit-vec@0.8.0:c19b7c6f923b580a",
+      "name": "bit-vec",
+      "version": "0.8.0",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 OR MIT"
+        }
+      ],
+      "purl": "pkg:cargo/bit-vec@0.8.0",
       "properties": [
         {
           "name": "vibex:cargo-source",
@@ -2969,6 +3401,42 @@
     },
     {
       "type": "library",
+      "bom-ref": "cargo:block-padding@0.4.2:c19b7c6f923b580a",
+      "name": "block-padding",
+      "version": "0.4.2",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/block-padding@0.4.2",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/RustCrypto/utils"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "cargo:block2@0.5.1:c19b7c6f923b580a",
       "name": "block2",
       "version": "0.5.1",
@@ -3144,6 +3612,78 @@
         {
           "type": "vcs",
           "url": "https://github.com/near/borsh-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:brotli@9.1.1:c19b7c6f923b580a",
+      "name": "brotli",
+      "version": "9.1.1",
+      "licenses": [
+        {
+          "expression": "BSD-3-Clause AND MIT"
+        }
+      ],
+      "purl": "pkg:cargo/brotli@9.1.1",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "(BSD-3-Clause AND MIT)"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/dropbox/rust-brotli"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:brotli-decompressor@6.3.1:c19b7c6f923b580a",
+      "name": "brotli-decompressor",
+      "version": "6.3.1",
+      "licenses": [
+        {
+          "expression": "BSD-3-Clause OR MIT"
+        }
+      ],
+      "purl": "pkg:cargo/brotli-decompressor@6.3.1",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "BSD-3-Clause"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/dropbox/rust-brotli-decompressor"
         }
       ]
     },
@@ -3725,6 +4265,78 @@
     },
     {
       "type": "library",
+      "bom-ref": "cargo:cap-primitives@4.0.3:c19b7c6f923b580a",
+      "name": "cap-primitives",
+      "version": "4.0.3",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT"
+        }
+      ],
+      "purl": "pkg:cargo/cap-primitives@4.0.3",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "Apache-2.0 WITH LLVM-exception"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/bytecodealliance/cap-std"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:cap-std@4.0.3:c19b7c6f923b580a",
+      "name": "cap-std",
+      "version": "4.0.3",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT"
+        }
+      ],
+      "purl": "pkg:cargo/cap-std@4.0.3",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "Apache-2.0 WITH LLVM-exception"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/bytecodealliance/cap-std"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "cargo:cast@0.3.0:c19b7c6f923b580a",
       "name": "cast",
       "version": "0.3.0",
@@ -3806,6 +4418,42 @@
         }
       ],
       "purl": "pkg:cargo/cbc@0.1.2",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/RustCrypto/block-modes"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:cbc@0.2.1:c19b7c6f923b580a",
+      "name": "cbc",
+      "version": "0.2.1",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/cbc@0.2.1",
       "properties": [
         {
           "name": "vibex:cargo-source",
@@ -4121,6 +4769,42 @@
     },
     {
       "type": "library",
+      "bom-ref": "cargo:chacha20poly1305@0.11.0:c19b7c6f923b580a",
+      "name": "chacha20poly1305",
+      "version": "0.11.0",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 OR MIT"
+        }
+      ],
+      "purl": "pkg:cargo/chacha20poly1305@0.11.0",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "Apache-2.0"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/RustCrypto/AEADs"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "cargo:chrono@0.4.45:c19b7c6f923b580a",
       "name": "chrono",
       "version": "0.4.45",
@@ -4301,6 +4985,42 @@
     },
     {
       "type": "library",
+      "bom-ref": "cargo:cipher@0.5.2:c19b7c6f923b580a",
+      "name": "cipher",
+      "version": "0.5.2",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/cipher@0.5.2",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/RustCrypto/traits"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "cargo:clap@4.6.7:c19b7c6f923b580a",
       "name": "clap",
       "version": "4.6.7",
@@ -4440,6 +5160,78 @@
         {
           "type": "vcs",
           "url": "https://github.com/rust-lang/cmake-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:cmov@0.5.4:c19b7c6f923b580a",
+      "name": "cmov",
+      "version": "0.5.4",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 OR MIT"
+        }
+      ],
+      "purl": "pkg:cargo/cmov@0.5.4",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "Apache-2.0"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/RustCrypto/utils"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:cobs@0.3.0:c19b7c6f923b580a",
+      "name": "cobs",
+      "version": "0.3.0",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/cobs@0.3.0",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/jamesmunns/cobs.rs"
         }
       ]
     },
@@ -5021,6 +5813,42 @@
     },
     {
       "type": "library",
+      "bom-ref": "cargo:convert_case@0.12.0:c19b7c6f923b580a",
+      "name": "convert_case",
+      "version": "0.12.0",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "purl": "pkg:cargo/convert_case@0.12.0",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rutrum/convert-case"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "cargo:core-foundation@0.10.1:c19b7c6f923b580a",
       "name": "core-foundation",
       "version": "0.10.1",
@@ -5453,6 +6281,42 @@
     },
     {
       "type": "library",
+      "bom-ref": "cargo:cpubits@0.1.1:c19b7c6f923b580a",
+      "name": "cpubits",
+      "version": "0.1.1",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/cpubits@0.1.1",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/RustCrypto/utils"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "cargo:cpufeatures@0.2.17:c19b7c6f923b580a",
       "name": "cpufeatures",
       "version": "0.2.17",
@@ -5520,6 +6384,438 @@
         {
           "type": "vcs",
           "url": "https://github.com/RustCrypto/utils"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:cranelift-bforest@0.116.1:c19b7c6f923b580a",
+      "name": "cranelift-bforest",
+      "version": "0.116.1",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 WITH LLVM-exception"
+        }
+      ],
+      "purl": "pkg:cargo/cranelift-bforest@0.116.1",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "Apache-2.0 WITH LLVM-exception"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/bytecodealliance/wasmtime"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:cranelift-bitset@0.116.1:c19b7c6f923b580a",
+      "name": "cranelift-bitset",
+      "version": "0.116.1",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 WITH LLVM-exception"
+        }
+      ],
+      "purl": "pkg:cargo/cranelift-bitset@0.116.1",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "Apache-2.0 WITH LLVM-exception"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/bytecodealliance/wasmtime"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:cranelift-codegen@0.116.1:c19b7c6f923b580a",
+      "name": "cranelift-codegen",
+      "version": "0.116.1",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 WITH LLVM-exception"
+        }
+      ],
+      "purl": "pkg:cargo/cranelift-codegen@0.116.1",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "Apache-2.0 WITH LLVM-exception"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/bytecodealliance/wasmtime"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:cranelift-codegen-meta@0.116.1:c19b7c6f923b580a",
+      "name": "cranelift-codegen-meta",
+      "version": "0.116.1",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 WITH LLVM-exception"
+        }
+      ],
+      "purl": "pkg:cargo/cranelift-codegen-meta@0.116.1",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "Apache-2.0 WITH LLVM-exception"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/bytecodealliance/wasmtime"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:cranelift-codegen-shared@0.116.1:c19b7c6f923b580a",
+      "name": "cranelift-codegen-shared",
+      "version": "0.116.1",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 WITH LLVM-exception"
+        }
+      ],
+      "purl": "pkg:cargo/cranelift-codegen-shared@0.116.1",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "Apache-2.0 WITH LLVM-exception"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/bytecodealliance/wasmtime"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:cranelift-control@0.116.1:c19b7c6f923b580a",
+      "name": "cranelift-control",
+      "version": "0.116.1",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 WITH LLVM-exception"
+        }
+      ],
+      "purl": "pkg:cargo/cranelift-control@0.116.1",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "Apache-2.0 WITH LLVM-exception"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/bytecodealliance/wasmtime"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:cranelift-entity@0.116.1:c19b7c6f923b580a",
+      "name": "cranelift-entity",
+      "version": "0.116.1",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 WITH LLVM-exception"
+        }
+      ],
+      "purl": "pkg:cargo/cranelift-entity@0.116.1",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "Apache-2.0 WITH LLVM-exception"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/bytecodealliance/wasmtime"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:cranelift-frontend@0.116.1:c19b7c6f923b580a",
+      "name": "cranelift-frontend",
+      "version": "0.116.1",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 WITH LLVM-exception"
+        }
+      ],
+      "purl": "pkg:cargo/cranelift-frontend@0.116.1",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "Apache-2.0 WITH LLVM-exception"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/bytecodealliance/wasmtime"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:cranelift-isle@0.116.1:c19b7c6f923b580a",
+      "name": "cranelift-isle",
+      "version": "0.116.1",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 WITH LLVM-exception"
+        }
+      ],
+      "purl": "pkg:cargo/cranelift-isle@0.116.1",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "Apache-2.0 WITH LLVM-exception"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/bytecodealliance/wasmtime/tree/main/cranelift/isle"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:cranelift-module@0.116.1:c19b7c6f923b580a",
+      "name": "cranelift-module",
+      "version": "0.116.1",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 WITH LLVM-exception"
+        }
+      ],
+      "purl": "pkg:cargo/cranelift-module@0.116.1",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "Apache-2.0 WITH LLVM-exception"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/bytecodealliance/wasmtime"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:cranelift-native@0.116.1:c19b7c6f923b580a",
+      "name": "cranelift-native",
+      "version": "0.116.1",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 WITH LLVM-exception"
+        }
+      ],
+      "purl": "pkg:cargo/cranelift-native@0.116.1",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "Apache-2.0 WITH LLVM-exception"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/bytecodealliance/wasmtime"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:cranelift-object@0.116.1:c19b7c6f923b580a",
+      "name": "cranelift-object",
+      "version": "0.116.1",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 WITH LLVM-exception"
+        }
+      ],
+      "purl": "pkg:cargo/cranelift-object@0.116.1",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "Apache-2.0 WITH LLVM-exception"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/bytecodealliance/wasmtime"
         }
       ]
     },
@@ -5957,6 +7253,42 @@
     },
     {
       "type": "library",
+      "bom-ref": "cargo:crypto-bigint@0.7.11:c19b7c6f923b580a",
+      "name": "crypto-bigint",
+      "version": "0.7.11",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 OR MIT"
+        }
+      ],
+      "purl": "pkg:cargo/crypto-bigint@0.7.11",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "Apache-2.0"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/RustCrypto/crypto-bigint"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "cargo:crypto-common@0.1.7:c19b7c6f923b580a",
       "name": "crypto-common",
       "version": "0.1.7",
@@ -6029,6 +7361,78 @@
     },
     {
       "type": "library",
+      "bom-ref": "cargo:crypto-primes@0.7.2:c19b7c6f923b580a",
+      "name": "crypto-primes",
+      "version": "0.7.2",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 OR MIT"
+        }
+      ],
+      "purl": "pkg:cargo/crypto-primes@0.7.2",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "Apache-2.0"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/entropyxyz/crypto-primes"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:cshake@0.2.1:c19b7c6f923b580a",
+      "name": "cshake",
+      "version": "0.2.1",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/cshake@0.2.1",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/RustCrypto/XOFs"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "cargo:ctor@1.0.13:c19b7c6f923b580a",
       "name": "ctor",
       "version": "1.0.13",
@@ -6060,6 +7464,78 @@
         {
           "type": "vcs",
           "url": "https://github.com/mmastrac/linktime"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:ctr@0.10.1:c19b7c6f923b580a",
+      "name": "ctr",
+      "version": "0.10.1",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/ctr@0.10.1",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/RustCrypto/block-modes"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:ctutils@0.4.8:c19b7c6f923b580a",
+      "name": "ctutils",
+      "version": "0.4.8",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 OR MIT"
+        }
+      ],
+      "purl": "pkg:cargo/ctutils@0.4.8",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "Apache-2.0"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/RustCrypto/utils"
         }
       ]
     },
@@ -6110,6 +7586,42 @@
         }
       ],
       "purl": "pkg:cargo/curve25519-dalek@4.1.3",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "BSD-3-Clause"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/dalek-cryptography/curve25519-dalek/tree/main/curve25519-dalek"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:curve25519-dalek@5.0.0:c19b7c6f923b580a",
+      "name": "curve25519-dalek",
+      "version": "5.0.0",
+      "licenses": [
+        {
+          "expression": "BSD-3-Clause"
+        }
+      ],
+      "purl": "pkg:cargo/curve25519-dalek@5.0.0",
       "properties": [
         {
           "name": "vibex:cargo-source",
@@ -6569,6 +8081,42 @@
     },
     {
       "type": "library",
+      "bom-ref": "cargo:der@0.8.3:c19b7c6f923b580a",
+      "name": "der",
+      "version": "0.8.3",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 OR MIT"
+        }
+      ],
+      "purl": "pkg:cargo/der@0.8.3",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "Apache-2.0"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/RustCrypto/formats"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "cargo:der-parser@10.0.0:c19b7c6f923b580a",
       "name": "der-parser",
       "version": "10.0.0",
@@ -6600,6 +8148,42 @@
         {
           "type": "vcs",
           "url": "https://github.com/rusticata/der-parser.git"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:der_derive@0.8.0:c19b7c6f923b580a",
+      "name": "der_derive",
+      "version": "0.8.0",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 OR MIT"
+        }
+      ],
+      "purl": "pkg:cargo/der_derive@0.8.0",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "Apache-2.0"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/RustCrypto/formats"
         }
       ]
     },
@@ -7325,6 +8909,42 @@
     },
     {
       "type": "library",
+      "bom-ref": "cargo:ecdsa@0.17.0:c19b7c6f923b580a",
+      "name": "ecdsa",
+      "version": "0.17.0",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 OR MIT"
+        }
+      ],
+      "purl": "pkg:cargo/ecdsa@0.17.0",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "Apache-2.0"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/RustCrypto/signatures"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "cargo:ed25519@2.2.3:c19b7c6f923b580a",
       "name": "ed25519",
       "version": "2.2.3",
@@ -7361,6 +8981,42 @@
     },
     {
       "type": "library",
+      "bom-ref": "cargo:ed25519@3.0.0:c19b7c6f923b580a",
+      "name": "ed25519",
+      "version": "3.0.0",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 OR MIT"
+        }
+      ],
+      "purl": "pkg:cargo/ed25519@3.0.0",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "Apache-2.0"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/RustCrypto/signatures"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "cargo:ed25519-dalek@2.2.0:c19b7c6f923b580a",
       "name": "ed25519-dalek",
       "version": "2.2.0",
@@ -7370,6 +9026,42 @@
         }
       ],
       "purl": "pkg:cargo/ed25519-dalek@2.2.0",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "BSD-3-Clause"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/dalek-cryptography/curve25519-dalek/tree/main/ed25519-dalek"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:ed25519-dalek@3.0.0:c19b7c6f923b580a",
+      "name": "ed25519-dalek",
+      "version": "3.0.0",
+      "licenses": [
+        {
+          "expression": "BSD-3-Clause"
+        }
+      ],
+      "purl": "pkg:cargo/ed25519-dalek@3.0.0",
       "properties": [
         {
           "name": "vibex:cargo-source",
@@ -7433,6 +9125,42 @@
     },
     {
       "type": "library",
+      "bom-ref": "cargo:elliptic-curve@0.14.3:c19b7c6f923b580a",
+      "name": "elliptic-curve",
+      "version": "0.14.3",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 OR MIT"
+        }
+      ],
+      "purl": "pkg:cargo/elliptic-curve@0.14.3",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "Apache-2.0"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/RustCrypto/traits"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "cargo:embed-resource@3.0.9:c19b7c6f923b580a",
       "name": "embed-resource",
       "version": "3.0.9",
@@ -7464,6 +9192,78 @@
         {
           "type": "vcs",
           "url": "https://github.com/nabijaczleweli/rust-embed-resource"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:embedded-io@0.4.0:c19b7c6f923b580a",
+      "name": "embedded-io",
+      "version": "0.4.0",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/embedded-io@0.4.0",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/embassy-rs/embedded-io"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:embedded-io@0.6.1:c19b7c6f923b580a",
+      "name": "embedded-io",
+      "version": "0.6.1",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/embedded-io@0.6.1",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rust-embedded/embedded-hal"
         }
       ]
     },
@@ -8261,6 +10061,42 @@
     },
     {
       "type": "library",
+      "bom-ref": "cargo:fancy-regex@0.16.2:c19b7c6f923b580a",
+      "name": "fancy-regex",
+      "version": "0.16.2",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "purl": "pkg:cargo/fancy-regex@0.16.2",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/fancy-regex/fancy-regex"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "cargo:fastrand@2.4.1:c19b7c6f923b580a",
       "name": "fastrand",
       "version": "2.4.1",
@@ -8369,6 +10205,42 @@
     },
     {
       "type": "library",
+      "bom-ref": "cargo:ff@0.14.0:c19b7c6f923b580a",
+      "name": "ff",
+      "version": "0.14.0",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/ff@0.14.0",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/zkcrypto/ff"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "cargo:fiat-crypto@0.2.9:c19b7c6f923b580a",
       "name": "fiat-crypto",
       "version": "0.2.9",
@@ -8378,6 +10250,42 @@
         }
       ],
       "purl": "pkg:cargo/fiat-crypto@0.2.9",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/mit-plv/fiat-crypto"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:fiat-crypto@0.3.0:c19b7c6f923b580a",
+      "name": "fiat-crypto",
+      "version": "0.3.0",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0 OR BSD-1-Clause"
+        }
+      ],
+      "purl": "pkg:cargo/fiat-crypto@0.3.0",
       "properties": [
         {
           "name": "vibex:cargo-source",
@@ -8616,6 +10524,42 @@
         {
           "type": "vcs",
           "url": "https://github.com/rust-lang/flate2-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:float-cmp@0.10.0:c19b7c6f923b580a",
+      "name": "float-cmp",
+      "version": "0.10.0",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "purl": "pkg:cargo/float-cmp@0.10.0",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/mikedilger/float-cmp"
         }
       ]
     },
@@ -9228,6 +11172,42 @@
         {
           "type": "vcs",
           "url": "https://github.com/andrewhickman/fs-err"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:fs-set-times@0.20.3:c19b7c6f923b580a",
+      "name": "fs-set-times",
+      "version": "0.20.3",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT"
+        }
+      ],
+      "purl": "pkg:cargo/fs-set-times@0.20.3",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "Apache-2.0 WITH LLVM-exception"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/bytecodealliance/fs-set-times"
         }
       ]
     },
@@ -10097,6 +12077,42 @@
     },
     {
       "type": "library",
+      "bom-ref": "cargo:ghash@0.6.0:c19b7c6f923b580a",
+      "name": "ghash",
+      "version": "0.6.0",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 OR MIT"
+        }
+      ],
+      "purl": "pkg:cargo/ghash@0.6.0",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "Apache-2.0"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/RustCrypto/universal-hashes"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "cargo:gif@0.13.3:c19b7c6f923b580a",
       "name": "gif",
       "version": "0.13.3",
@@ -10164,6 +12180,42 @@
         {
           "type": "vcs",
           "url": "https://github.com/image-rs/image-gif"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:gimli@0.31.1:c19b7c6f923b580a",
+      "name": "gimli",
+      "version": "0.31.1",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/gimli@0.31.1",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/gimli-rs/gimli"
         }
       ]
     },
@@ -10673,7 +12725,7 @@
     },
     {
       "type": "library",
-      "bom-ref": "cargo:gpui-base@0.9.1:c19b7c6f923b580a",
+      "bom-ref": "cargo:gpui-base@0.9.1:21b891abfaccca05",
       "name": "gpui-base",
       "version": "0.9.1",
       "licenses": [
@@ -10685,7 +12737,7 @@
       "properties": [
         {
           "name": "vibex:cargo-source",
-          "value": "registry+https://github.com/rust-lang/crates.io-index"
+          "value": "git+https://github.com/PeatBoy/gpui-kit?rev=ed597a041d254d3cf44fae2a01e09b23e9ecdbf8#ed597a041d254d3cf44fae2a01e09b23e9ecdbf8"
         },
         {
           "name": "vibex:selected-license",
@@ -10709,7 +12761,7 @@
     },
     {
       "type": "library",
-      "bom-ref": "cargo:gpui-component@0.9.1:c19b7c6f923b580a",
+      "bom-ref": "cargo:gpui-component@0.9.1:21b891abfaccca05",
       "name": "gpui-component",
       "version": "0.9.1",
       "licenses": [
@@ -10721,7 +12773,7 @@
       "properties": [
         {
           "name": "vibex:cargo-source",
-          "value": "registry+https://github.com/rust-lang/crates.io-index"
+          "value": "git+https://github.com/PeatBoy/gpui-kit?rev=ed597a041d254d3cf44fae2a01e09b23e9ecdbf8#ed597a041d254d3cf44fae2a01e09b23e9ecdbf8"
         },
         {
           "name": "vibex:selected-license",
@@ -10745,7 +12797,7 @@
     },
     {
       "type": "library",
-      "bom-ref": "cargo:gpui-component-macros@0.9.1:c19b7c6f923b580a",
+      "bom-ref": "cargo:gpui-component-macros@0.9.1:21b891abfaccca05",
       "name": "gpui-component-macros",
       "version": "0.9.1",
       "licenses": [
@@ -10757,7 +12809,7 @@
       "properties": [
         {
           "name": "vibex:cargo-source",
-          "value": "registry+https://github.com/rust-lang/crates.io-index"
+          "value": "git+https://github.com/PeatBoy/gpui-kit?rev=ed597a041d254d3cf44fae2a01e09b23e9ecdbf8#ed597a041d254d3cf44fae2a01e09b23e9ecdbf8"
         },
         {
           "name": "vibex:selected-license",
@@ -10774,8 +12826,8 @@
       ],
       "externalReferences": [
         {
-          "type": "distribution",
-          "url": "https://crates.io/crates/gpui-component-macros/0.9.1"
+          "type": "vcs",
+          "url": "https://github.com/PeatBoy/gpui-kit?rev=ed597a041d254d3cf44fae2a01e09b23e9ecdbf8#ed597a041d254d3cf44fae2a01e09b23e9ecdbf8"
         }
       ]
     },
@@ -10853,7 +12905,7 @@
     },
     {
       "type": "library",
-      "bom-ref": "cargo:gpui-fps@0.9.1:c19b7c6f923b580a",
+      "bom-ref": "cargo:gpui-fps@0.9.1:21b891abfaccca05",
       "name": "gpui-fps",
       "version": "0.9.1",
       "licenses": [
@@ -10865,7 +12917,7 @@
       "properties": [
         {
           "name": "vibex:cargo-source",
-          "value": "registry+https://github.com/rust-lang/crates.io-index"
+          "value": "git+https://github.com/PeatBoy/gpui-kit?rev=ed597a041d254d3cf44fae2a01e09b23e9ecdbf8#ed597a041d254d3cf44fae2a01e09b23e9ecdbf8"
         },
         {
           "name": "vibex:selected-license",
@@ -10889,7 +12941,43 @@
     },
     {
       "type": "library",
-      "bom-ref": "cargo:gpui-kit-assets@0.9.1:c19b7c6f923b580a",
+      "bom-ref": "cargo:gpui-kit@0.9.1:21b891abfaccca05",
+      "name": "gpui-kit",
+      "version": "0.9.1",
+      "licenses": [
+        {
+          "expression": "Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/gpui-kit@0.9.1",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "git+https://github.com/PeatBoy/gpui-kit?rev=ed597a041d254d3cf44fae2a01e09b23e9ecdbf8#ed597a041d254d3cf44fae2a01e09b23e9ecdbf8"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "Apache-2.0"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/longbridge/gpui-kit"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:gpui-kit-assets@0.9.1:21b891abfaccca05",
       "name": "gpui-kit-assets",
       "version": "0.9.1",
       "licenses": [
@@ -10901,7 +12989,7 @@
       "properties": [
         {
           "name": "vibex:cargo-source",
-          "value": "registry+https://github.com/rust-lang/crates.io-index"
+          "value": "git+https://github.com/PeatBoy/gpui-kit?rev=ed597a041d254d3cf44fae2a01e09b23e9ecdbf8#ed597a041d254d3cf44fae2a01e09b23e9ecdbf8"
         },
         {
           "name": "vibex:selected-license",
@@ -11717,6 +13805,42 @@
     },
     {
       "type": "library",
+      "bom-ref": "cargo:gpui-shell@0.9.1:21b891abfaccca05",
+      "name": "gpui-shell",
+      "version": "0.9.1",
+      "licenses": [
+        {
+          "expression": "Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/gpui-shell@0.9.1",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "git+https://github.com/PeatBoy/gpui-kit?rev=ed597a041d254d3cf44fae2a01e09b23e9ecdbf8#ed597a041d254d3cf44fae2a01e09b23e9ecdbf8"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "Apache-2.0"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/longbridge/gpui-kit"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "cargo:gpui-tokio@0.1.5:a9a8ee941163297c",
       "name": "gpui-tokio",
       "version": "0.1.5",
@@ -11784,6 +13908,42 @@
         {
           "type": "vcs",
           "url": "https://github.com/bourumir-wyngs/granit-parser"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:group@0.14.0:c19b7c6f923b580a",
+      "name": "group",
+      "version": "0.14.0",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/group@0.14.0",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/zkcrypto/group"
         }
       ]
     },
@@ -11964,6 +14124,42 @@
         {
           "type": "vcs",
           "url": "https://github.com/VoidStarKat/half-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:halfbrown@0.4.0:c19b7c6f923b580a",
+      "name": "halfbrown",
+      "version": "0.4.0",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 OR MIT"
+        }
+      ],
+      "purl": "pkg:cargo/halfbrown@0.4.0",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "Apache-2.0"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/Licenser/halfbrown"
         }
       ]
     },
@@ -12473,6 +14669,42 @@
     },
     {
       "type": "library",
+      "bom-ref": "cargo:hex-simd@0.8.0:c19b7c6f923b580a",
+      "name": "hex-simd",
+      "version": "0.8.0",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "purl": "pkg:cargo/hex-simd@0.8.0",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/Nugine/simd"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "cargo:hkdf@0.12.4:c19b7c6f923b580a",
       "name": "hkdf",
       "version": "0.12.4",
@@ -12509,6 +14741,42 @@
     },
     {
       "type": "library",
+      "bom-ref": "cargo:hkdf@0.13.0:c19b7c6f923b580a",
+      "name": "hkdf",
+      "version": "0.13.0",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/hkdf@0.13.0",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/RustCrypto/KDFs/"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "cargo:hmac@0.12.1:c19b7c6f923b580a",
       "name": "hmac",
       "version": "0.12.1",
@@ -12518,6 +14786,42 @@
         }
       ],
       "purl": "pkg:cargo/hmac@0.12.1",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/RustCrypto/MACs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:hmac@0.13.0:c19b7c6f923b580a",
+      "name": "hmac",
+      "version": "0.13.0",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/hmac@0.13.0",
       "properties": [
         {
           "name": "vibex:cargo-source",
@@ -13985,6 +16289,42 @@
     },
     {
       "type": "library",
+      "bom-ref": "cargo:inout@0.2.6:c19b7c6f923b580a",
+      "name": "inout",
+      "version": "0.2.6",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/inout@0.2.6",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/RustCrypto/utils"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "cargo:instability@0.3.14:c19b7c6f923b580a",
       "name": "instability",
       "version": "0.3.14",
@@ -14160,6 +16500,114 @@
         {
           "type": "vcs",
           "url": "https://github.com/dtolnay/inventory"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:io-extras@0.19.0:c19b7c6f923b580a",
+      "name": "io-extras",
+      "version": "0.19.0",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT"
+        }
+      ],
+      "purl": "pkg:cargo/io-extras@0.19.0",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "Apache-2.0 WITH LLVM-exception"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/sunfishcode/io-extras"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:io-lifetimes@2.0.4:c19b7c6f923b580a",
+      "name": "io-lifetimes",
+      "version": "2.0.4",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT"
+        }
+      ],
+      "purl": "pkg:cargo/io-lifetimes@2.0.4",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "Apache-2.0 WITH LLVM-exception"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/sunfishcode/io-lifetimes"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:io-lifetimes@3.0.1:c19b7c6f923b580a",
+      "name": "io-lifetimes",
+      "version": "3.0.1",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT"
+        }
+      ],
+      "purl": "pkg:cargo/io-lifetimes@3.0.1",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "Apache-2.0 WITH LLVM-exception"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/sunfishcode/io-lifetimes"
         }
       ]
     },
@@ -14700,6 +17148,42 @@
         {
           "type": "vcs",
           "url": "https://github.com/ratatui/kasuari"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:keccak@0.2.2:c19b7c6f923b580a",
+      "name": "keccak",
+      "version": "0.2.2",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 OR MIT"
+        }
+      ],
+      "purl": "pkg:cargo/keccak@0.2.2",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "Apache-2.0"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/RustCrypto/sponges"
         }
       ]
     },
@@ -16442,6 +18926,42 @@
         }
       ],
       "purl": "pkg:cargo/md-5@0.10.6",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/RustCrypto/hashes"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:md-5@0.11.0:c19b7c6f923b580a",
+      "name": "md-5",
+      "version": "0.11.0",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/md-5@0.11.0",
       "properties": [
         {
           "name": "vibex:cargo-source",
@@ -19061,6 +21581,42 @@
     },
     {
       "type": "library",
+      "bom-ref": "cargo:object@0.36.7:c19b7c6f923b580a",
+      "name": "object",
+      "version": "0.36.7",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 OR MIT"
+        }
+      ],
+      "purl": "pkg:cargo/object@0.36.7",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "Apache-2.0"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/gimli-rs/object"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "cargo:object@0.37.3:c19b7c6f923b580a",
       "name": "object",
       "version": "0.37.3",
@@ -19452,6 +22008,150 @@
         {
           "type": "vcs",
           "url": "https://github.com/danieldg/ordered-stream"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:outref@0.5.2:c19b7c6f923b580a",
+      "name": "outref",
+      "version": "0.5.2",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "purl": "pkg:cargo/outref@0.5.2",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/Nugine/outref"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:p256@0.14.0:c19b7c6f923b580a",
+      "name": "p256",
+      "version": "0.14.0",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 OR MIT"
+        }
+      ],
+      "purl": "pkg:cargo/p256@0.14.0",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "Apache-2.0"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/RustCrypto/elliptic-curves"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:p384@0.14.0:c19b7c6f923b580a",
+      "name": "p384",
+      "version": "0.14.0",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 OR MIT"
+        }
+      ],
+      "purl": "pkg:cargo/p384@0.14.0",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "Apache-2.0"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/RustCrypto/elliptic-curves"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:p521@0.14.0:c19b7c6f923b580a",
+      "name": "p521",
+      "version": "0.14.0",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 OR MIT"
+        }
+      ],
+      "purl": "pkg:cargo/p521@0.14.0",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "Apache-2.0"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/RustCrypto/elliptic-curves"
         }
       ]
     },
@@ -19997,6 +22697,42 @@
     },
     {
       "type": "library",
+      "bom-ref": "cargo:pbkdf2@0.13.0:c19b7c6f923b580a",
+      "name": "pbkdf2",
+      "version": "0.13.0",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/pbkdf2@0.13.0",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/RustCrypto/password-hashes"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "cargo:pdfium-render@0.9.3:c19b7c6f923b580a",
       "name": "pdfium-render",
       "version": "0.9.3",
@@ -20028,6 +22764,42 @@
         {
           "type": "vcs",
           "url": "https://github.com/ajrcarey/pdfium-render"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:pem-rfc7468@1.0.0:c19b7c6f923b580a",
+      "name": "pem-rfc7468",
+      "version": "1.0.0",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 OR MIT"
+        }
+      ],
+      "purl": "pkg:cargo/pem-rfc7468@1.0.0",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "Apache-2.0"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/RustCrypto/formats"
         }
       ]
     },
@@ -20249,6 +23021,42 @@
     },
     {
       "type": "library",
+      "bom-ref": "cargo:phf@0.14.0:c19b7c6f923b580a",
+      "name": "phf",
+      "version": "0.14.0",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "purl": "pkg:cargo/phf@0.14.0",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rust-phf/rust-phf"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "cargo:phf_codegen@0.11.3:c19b7c6f923b580a",
       "name": "phf_codegen",
       "version": "0.11.3",
@@ -20357,6 +23165,42 @@
     },
     {
       "type": "library",
+      "bom-ref": "cargo:phf_generator@0.14.0:c19b7c6f923b580a",
+      "name": "phf_generator",
+      "version": "0.14.0",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "purl": "pkg:cargo/phf_generator@0.14.0",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rust-phf/rust-phf"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "cargo:phf_macros@0.13.1:c19b7c6f923b580a",
       "name": "phf_macros",
       "version": "0.13.1",
@@ -20366,6 +23210,42 @@
         }
       ],
       "purl": "pkg:cargo/phf_macros@0.13.1",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rust-phf/rust-phf"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:phf_macros@0.14.0:c19b7c6f923b580a",
+      "name": "phf_macros",
+      "version": "0.14.0",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "purl": "pkg:cargo/phf_macros@0.14.0",
       "properties": [
         {
           "name": "vibex:cargo-source",
@@ -20438,6 +23318,42 @@
         }
       ],
       "purl": "pkg:cargo/phf_shared@0.13.1",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rust-phf/rust-phf"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:phf_shared@0.14.0:c19b7c6f923b580a",
+      "name": "phf_shared",
+      "version": "0.14.0",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "purl": "pkg:cargo/phf_shared@0.14.0",
       "properties": [
         {
           "name": "vibex:cargo-source",
@@ -20681,6 +23597,42 @@
     },
     {
       "type": "library",
+      "bom-ref": "cargo:pkcs1@0.8.0:c19b7c6f923b580a",
+      "name": "pkcs1",
+      "version": "0.8.0",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 OR MIT"
+        }
+      ],
+      "purl": "pkg:cargo/pkcs1@0.8.0",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "Apache-2.0"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/RustCrypto/formats"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "cargo:pkcs8@0.10.2:c19b7c6f923b580a",
       "name": "pkcs8",
       "version": "0.10.2",
@@ -20712,6 +23664,42 @@
         {
           "type": "vcs",
           "url": "https://github.com/RustCrypto/formats/tree/master/pkcs8"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:pkcs8@0.11.0:c19b7c6f923b580a",
+      "name": "pkcs8",
+      "version": "0.11.0",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 OR MIT"
+        }
+      ],
+      "purl": "pkg:cargo/pkcs8@0.11.0",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "Apache-2.0"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/RustCrypto/formats"
         }
       ]
     },
@@ -21077,6 +24065,42 @@
     },
     {
       "type": "library",
+      "bom-ref": "cargo:poly1305@0.9.1:c19b7c6f923b580a",
+      "name": "poly1305",
+      "version": "0.9.1",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 OR MIT"
+        }
+      ],
+      "purl": "pkg:cargo/poly1305@0.9.1",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "Apache-2.0"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/RustCrypto/universal-hashes"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "cargo:polycool@0.4.0:c19b7c6f923b580a",
       "name": "polycool",
       "version": "0.4.0",
@@ -21108,6 +24132,42 @@
         {
           "type": "vcs",
           "url": "https://github.com/linebender/kurbo"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:polyval@0.7.3:c19b7c6f923b580a",
+      "name": "polyval",
+      "version": "0.7.3",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 OR MIT"
+        }
+      ],
+      "purl": "pkg:cargo/polyval@0.7.3",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "Apache-2.0"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/RustCrypto/universal-hashes"
         }
       ]
     },
@@ -21216,6 +24276,42 @@
         {
           "type": "vcs",
           "url": "https://github.com/austinjones/postage-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:postcard@1.1.3:c19b7c6f923b580a",
+      "name": "postcard",
+      "version": "1.1.3",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/postcard@1.1.3",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/jamesmunns/postcard"
         }
       ]
     },
@@ -21396,6 +24492,78 @@
         {
           "type": "vcs",
           "url": "https://github.com/EmbarkStudios/presser"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:primefield@0.14.0:c19b7c6f923b580a",
+      "name": "primefield",
+      "version": "0.14.0",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 OR MIT"
+        }
+      ],
+      "purl": "pkg:cargo/primefield@0.14.0",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "Apache-2.0"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/RustCrypto/elliptic-curves"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:primeorder@0.14.0:c19b7c6f923b580a",
+      "name": "primeorder",
+      "version": "0.14.0",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 OR MIT"
+        }
+      ],
+      "purl": "pkg:cargo/primeorder@0.14.0",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "Apache-2.0"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/RustCrypto/elliptic-curves"
         }
       ]
     },
@@ -22044,6 +25212,222 @@
         {
           "type": "vcs",
           "url": "https://github.com/tafia/quick-xml"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:quickjs-jit@0.14.1:c19b7c6f923b580a",
+      "name": "quickjs-jit",
+      "version": "0.14.1",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "purl": "pkg:cargo/quickjs-jit@0.14.1",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/longbridge/rquickjs.git"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:quickjs-jit-core@0.14.1:c19b7c6f923b580a",
+      "name": "quickjs-jit-core",
+      "version": "0.14.1",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "purl": "pkg:cargo/quickjs-jit-core@0.14.1",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/longbridge/rquickjs.git"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:quickjs-jit-macro@0.14.1:c19b7c6f923b580a",
+      "name": "quickjs-jit-macro",
+      "version": "0.14.1",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "purl": "pkg:cargo/quickjs-jit-macro@0.14.1",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/longbridge/rquickjs.git"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:quickjs-jit-runtime@0.14.1:c19b7c6f923b580a",
+      "name": "quickjs-jit-runtime",
+      "version": "0.14.1",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "purl": "pkg:cargo/quickjs-jit-runtime@0.14.1",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/longbridge/rquickjs.git"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:quickjs-jit-stdlib@0.14.1:c19b7c6f923b580a",
+      "name": "quickjs-jit-stdlib",
+      "version": "0.14.1",
+      "licenses": [
+        {
+          "expression": "Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/quickjs-jit-stdlib@0.14.1",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "Apache-2.0"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/longbridge/quickjs-jit"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:quickjs-jit-sys@0.14.1:c19b7c6f923b580a",
+      "name": "quickjs-jit-sys",
+      "version": "0.14.1",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "purl": "pkg:cargo/quickjs-jit-sys@0.14.1",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/longbridge/rquickjs.git"
         }
       ]
     },
@@ -23381,6 +26765,42 @@
     },
     {
       "type": "library",
+      "bom-ref": "cargo:regalloc2@0.11.2:c19b7c6f923b580a",
+      "name": "regalloc2",
+      "version": "0.11.2",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 WITH LLVM-exception"
+        }
+      ],
+      "purl": "pkg:cargo/regalloc2@0.11.2",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "Apache-2.0 WITH LLVM-exception"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/bytecodealliance/regalloc2"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "cargo:regex@1.12.4:c19b7c6f923b580a",
       "name": "regex",
       "version": "1.12.4",
@@ -23484,6 +26904,42 @@
         {
           "type": "vcs",
           "url": "https://github.com/rust-lang/regex"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:relative-path@2.0.3:c19b7c6f923b580a",
+      "name": "relative-path",
+      "version": "2.0.3",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/relative-path@2.0.3",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/udoprog/relative-path"
         }
       ]
     },
@@ -23628,6 +27084,42 @@
         {
           "type": "vcs",
           "url": "https://github.com/linebender/resvg"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:rfc6979@0.6.0:c19b7c6f923b580a",
+      "name": "rfc6979",
+      "version": "0.6.0",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 OR MIT"
+        }
+      ],
+      "purl": "pkg:cargo/rfc6979@0.6.0",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "Apache-2.0"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/RustCrypto/signatures"
         }
       ]
     },
@@ -23844,6 +27336,42 @@
         {
           "type": "vcs",
           "url": "https://github.com/RazrFalcon/roxmltree"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:rsa@0.10.0-rc.19:c19b7c6f923b580a",
+      "name": "rsa",
+      "version": "0.10.0-rc.19",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/rsa@0.10.0-rc.19",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/RustCrypto/RSA"
         }
       ]
     },
@@ -24312,6 +27840,42 @@
         {
           "type": "vcs",
           "url": "https://github.com/bytecodealliance/rustix"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:rustix-linux-procfs@0.1.1:c19b7c6f923b580a",
+      "name": "rustix-linux-procfs",
+      "version": "0.1.1",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT"
+        }
+      ],
+      "purl": "pkg:cargo/rustix-linux-procfs@0.1.1",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "Apache-2.0 WITH LLVM-exception"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/sunfishcode/rustix-linux-procfs"
         }
       ]
     },
@@ -25145,6 +28709,42 @@
     },
     {
       "type": "library",
+      "bom-ref": "cargo:sec1@0.8.1:c19b7c6f923b580a",
+      "name": "sec1",
+      "version": "0.8.1",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 OR MIT"
+        }
+      ],
+      "purl": "pkg:cargo/sec1@0.8.1",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "Apache-2.0"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/RustCrypto/formats"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "cargo:secret-service@4.0.0:c19b7c6f923b580a",
       "name": "secret-service",
       "version": "4.0.0",
@@ -25937,6 +29537,42 @@
     },
     {
       "type": "library",
+      "bom-ref": "cargo:serdect@0.4.3:c19b7c6f923b580a",
+      "name": "serdect",
+      "version": "0.4.3",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 OR MIT"
+        }
+      ],
+      "purl": "pkg:cargo/serdect@0.4.3",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "Apache-2.0"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/RustCrypto/formats"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "cargo:sha1@0.10.6:c19b7c6f923b580a",
       "name": "sha1",
       "version": "0.10.6",
@@ -25946,6 +29582,42 @@
         }
       ],
       "purl": "pkg:cargo/sha1@0.10.6",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/RustCrypto/hashes"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:sha1@0.11.0:c19b7c6f923b580a",
+      "name": "sha1",
+      "version": "0.11.0",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/sha1@0.11.0",
       "properties": [
         {
           "name": "vibex:cargo-source",
@@ -26076,6 +29748,78 @@
         {
           "type": "vcs",
           "url": "https://github.com/RustCrypto/hashes"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:sha3@0.12.0:c19b7c6f923b580a",
+      "name": "sha3",
+      "version": "0.12.0",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/sha3@0.12.0",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/RustCrypto/hashes"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:shake@0.1.0:c19b7c6f923b580a",
+      "name": "shake",
+      "version": "0.1.0",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/shake@0.1.0",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/RustCrypto/XOFs"
         }
       ]
     },
@@ -26369,6 +30113,42 @@
     },
     {
       "type": "library",
+      "bom-ref": "cargo:signature@3.0.0:c19b7c6f923b580a",
+      "name": "signature",
+      "version": "3.0.0",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 OR MIT"
+        }
+      ],
+      "purl": "pkg:cargo/signature@3.0.0",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "Apache-2.0"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/RustCrypto/traits"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "cargo:simd-adler32@0.3.9:c19b7c6f923b580a",
       "name": "simd-adler32",
       "version": "0.3.9",
@@ -26400,6 +30180,42 @@
         {
           "type": "vcs",
           "url": "https://github.com/mcountryman/simd-adler32"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:simd-json@0.18.1:c19b7c6f923b580a",
+      "name": "simd-json",
+      "version": "0.18.1",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 OR MIT"
+        }
+      ],
+      "purl": "pkg:cargo/simd-json@0.18.1",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "Apache-2.0"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/simd-lite/simd-json"
         }
       ]
     },
@@ -27156,6 +30972,78 @@
         {
           "type": "vcs",
           "url": "https://github.com/RustCrypto/formats/tree/master/spki"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:spki@0.8.1:c19b7c6f923b580a",
+      "name": "spki",
+      "version": "0.8.1",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 OR MIT"
+        }
+      ],
+      "purl": "pkg:cargo/spki@0.8.1",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "Apache-2.0"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/RustCrypto/formats"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:sponge-cursor@0.1.0:c19b7c6f923b580a",
+      "name": "sponge-cursor",
+      "version": "0.1.0",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/sponge-cursor@0.1.0",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/RustCrypto/utils"
         }
       ]
     },
@@ -28164,6 +32052,42 @@
         {
           "type": "vcs",
           "url": "https://github.com/mystor/synstructure"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:syntect@5.3.0:c19b7c6f923b580a",
+      "name": "syntect",
+      "version": "5.3.0",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "purl": "pkg:cargo/syntect@5.3.0",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/trishume/syntect"
         }
       ]
     },
@@ -31265,6 +35189,42 @@
     },
     {
       "type": "library",
+      "bom-ref": "cargo:two-face@0.4.5:c19b7c6f923b580a",
+      "name": "two-face",
+      "version": "0.4.5",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/two-face@0.4.5",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/CosmicHorrorDev/two-face"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "cargo:typed-path@0.13.0:c19b7c6f923b580a",
       "name": "typed-path",
       "version": "0.13.0",
@@ -31985,6 +35945,42 @@
     },
     {
       "type": "library",
+      "bom-ref": "cargo:universal-hash@0.6.1:c19b7c6f923b580a",
+      "name": "universal-hash",
+      "version": "0.6.1",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/universal-hash@0.6.1",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/RustCrypto/traits"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "cargo:unsafe-libyaml@0.2.11:c19b7c6f923b580a",
       "name": "unsafe-libyaml",
       "version": "0.2.11",
@@ -32448,6 +36444,42 @@
         {
           "type": "distribution",
           "url": "https://crates.io/crates/value-bag-sval2/1.13.0"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:value-trait@0.12.3:c19b7c6f923b580a",
+      "name": "value-trait",
+      "version": "0.12.3",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 OR MIT"
+        }
+      ],
+      "purl": "pkg:cargo/value-trait@0.12.3",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "Apache-2.0"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/simd-lite/value-trait"
         }
       ]
     },
@@ -33317,6 +37349,42 @@
     },
     {
       "type": "library",
+      "bom-ref": "cargo:vibex-plugin@0.1.2:12552dcdfe0d9755",
+      "name": "vibex-plugin",
+      "version": "0.1.2",
+      "licenses": [
+        {
+          "expression": "AGPL-3.0-or-later"
+        }
+      ],
+      "purl": "pkg:cargo/vibex-plugin@0.1.2",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "path:crates/plugin"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "AGPL-3.0-or-later"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/vibex-ai/vibex"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "cargo:vibex-relay@0.1.5:0c0a0267098c7864",
       "name": "vibex-relay",
       "version": "0.1.5",
@@ -33564,6 +37632,42 @@
         {
           "type": "vcs",
           "url": "https://github.com/vibex-ai/vibex"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:vsimd@0.8.0:c19b7c6f923b580a",
+      "name": "vsimd",
+      "version": "0.8.0",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "purl": "pkg:cargo/vsimd@0.8.0",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/Nugine/simd"
         }
       ]
     },
@@ -34550,6 +38654,78 @@
         }
       ],
       "purl": "pkg:cargo/webpki-root-certs@1.0.8",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "CDLA-Permissive-2.0"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rustls/webpki-roots"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:webpki-roots@0.26.11:c19b7c6f923b580a",
+      "name": "webpki-roots",
+      "version": "0.26.11",
+      "licenses": [
+        {
+          "expression": "CDLA-Permissive-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/webpki-roots@0.26.11",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "CDLA-Permissive-2.0"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rustls/webpki-roots"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:webpki-roots@1.0.12:c19b7c6f923b580a",
+      "name": "webpki-roots",
+      "version": "1.0.12",
+      "licenses": [
+        {
+          "expression": "CDLA-Permissive-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/webpki-roots@1.0.12",
       "properties": [
         {
           "name": "vibex:cargo-source",
@@ -37637,6 +41813,42 @@
     },
     {
       "type": "library",
+      "bom-ref": "cargo:winx@0.36.4:c19b7c6f923b580a",
+      "name": "winx",
+      "version": "0.36.4",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 WITH LLVM-exception"
+        }
+      ],
+      "purl": "pkg:cargo/winx@0.36.4",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "Apache-2.0 WITH LLVM-exception"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/sunfishcode/winx"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "cargo:wio@0.2.2:c19b7c6f923b580a",
       "name": "wio",
       "version": "0.2.2",
@@ -37704,6 +41916,42 @@
         {
           "type": "vcs",
           "url": "https://github.com/bytecodealliance/wit-bindgen"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:wnaf@0.14.1:c19b7c6f923b580a",
+      "name": "wnaf",
+      "version": "0.14.1",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 OR MIT"
+        }
+      ],
+      "purl": "pkg:cargo/wnaf@0.14.1",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "Apache-2.0"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/RustCrypto/elliptic-curves"
         }
       ]
     },
@@ -37862,6 +42110,42 @@
         }
       ],
       "purl": "pkg:cargo/x25519-dalek@2.0.1",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "BSD-3-Clause"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/dalek-cryptography/curve25519-dalek/tree/main/x25519-dalek"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:x25519-dalek@3.0.0:c19b7c6f923b580a",
+      "name": "x25519-dalek",
+      "version": "3.0.0",
+      "licenses": [
+        {
+          "expression": "BSD-3-Clause"
+        }
+      ],
+      "purl": "pkg:cargo/x25519-dalek@3.0.0",
       "properties": [
         {
           "name": "vibex:cargo-source",
@@ -40018,7 +44302,7 @@
     },
     {
       "type": "file",
-      "bom-ref": "asset:vibex-desktop-reviewed-icons:c8c6ded0716093ba",
+      "bom-ref": "asset:vibex-desktop-reviewed-icons:6476740c05075551",
       "name": "Vibex Desktop GPUI reviewed icon bundle",
       "version": "0.1.1",
       "licenses": [
@@ -40029,7 +44313,7 @@
       "hashes": [
         {
           "alg": "SHA-256",
-          "content": "c8c6ded0716093baab2ca0fc27397d3374c00d773f6a90343c6cfcd658db6575"
+          "content": "6476740c0507555132e7995a53d6e0b3a9d17a0c8bf5f9286c2280b547b47a09"
         }
       ],
       "externalReferences": [
@@ -40049,7 +44333,7 @@
         },
         {
           "name": "vibex:file-count",
-          "value": "235"
+          "value": "237"
         },
         {
           "name": "vibex:selected-license",
@@ -40650,7 +44934,7 @@
       "dependsOn": []
     },
     {
-      "ref": "asset:vibex-desktop-reviewed-icons:c8c6ded0716093ba",
+      "ref": "asset:vibex-desktop-reviewed-icons:6476740c05075551",
       "dependsOn": []
     },
     {
@@ -40745,12 +45029,44 @@
       ]
     },
     {
+      "ref": "cargo:aead@0.6.1:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:crypto-common@0.2.2:c19b7c6f923b580a",
+        "cargo:inout@0.2.6:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:aes-gcm@0.11.1:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:aead@0.6.1:c19b7c6f923b580a",
+        "cargo:cipher@0.5.2:c19b7c6f923b580a",
+        "cargo:ctr@0.10.1:c19b7c6f923b580a",
+        "cargo:ctutils@0.4.8:c19b7c6f923b580a",
+        "cargo:ghash@0.6.0:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:aes-kw@0.3.1:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:aes@0.9.4:c19b7c6f923b580a",
+        "cargo:const-oid@0.10.2:c19b7c6f923b580a"
+      ]
+    },
+    {
       "ref": "cargo:aes@0.8.4:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:cfg-if@1.0.4:c19b7c6f923b580a",
         "cargo:cipher@0.4.4:c19b7c6f923b580a",
         "cargo:cpufeatures@0.2.17:c19b7c6f923b580a",
         "cargo:zeroize@1.9.0:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:aes@0.9.4:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:cipher@0.5.2:c19b7c6f923b580a",
+        "cargo:cpubits@0.1.1:c19b7c6f923b580a",
+        "cargo:cpufeatures@0.3.0:c19b7c6f923b580a"
       ]
     },
     {
@@ -40817,6 +45133,16 @@
       ]
     },
     {
+      "ref": "cargo:alloc-no-stdlib@3.0.0:c19b7c6f923b580a",
+      "dependsOn": []
+    },
+    {
+      "ref": "cargo:alloc-stdlib@0.3.0:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:alloc-no-stdlib@3.0.0:c19b7c6f923b580a"
+      ]
+    },
+    {
       "ref": "cargo:alloca@0.4.0:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:cc@1.2.65:c19b7c6f923b580a"
@@ -40824,6 +45150,10 @@
     },
     {
       "ref": "cargo:allocator-api2@0.2.21:c19b7c6f923b580a",
+      "dependsOn": []
+    },
+    {
+      "ref": "cargo:ambient-authority@0.0.2:c19b7c6f923b580a",
       "dependsOn": []
     },
     {
@@ -41256,8 +45586,19 @@
       ]
     },
     {
+      "ref": "cargo:base16ct@1.0.0:c19b7c6f923b580a",
+      "dependsOn": []
+    },
+    {
       "ref": "cargo:base62@2.2.4:c19b7c6f923b580a",
       "dependsOn": []
+    },
+    {
+      "ref": "cargo:base64-simd@0.8.0:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:outref@0.5.2:c19b7c6f923b580a",
+        "cargo:vsimd@0.8.0:c19b7c6f923b580a"
+      ]
     },
     {
       "ref": "cargo:base64@0.22.1:c19b7c6f923b580a",
@@ -41266,6 +45607,12 @@
     {
       "ref": "cargo:base64ct@1.8.3:c19b7c6f923b580a",
       "dependsOn": []
+    },
+    {
+      "ref": "cargo:bincode@1.3.3:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:serde@1.0.228:c19b7c6f923b580a"
+      ]
     },
     {
       "ref": "cargo:bit-set@0.10.0:c19b7c6f923b580a",
@@ -41280,11 +45627,21 @@
       ]
     },
     {
+      "ref": "cargo:bit-set@0.8.0:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:bit-vec@0.8.0:c19b7c6f923b580a"
+      ]
+    },
+    {
       "ref": "cargo:bit-vec@0.10.1:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:borsh@1.8.1:c19b7c6f923b580a",
         "cargo:serde@1.0.228:c19b7c6f923b580a"
       ]
+    },
+    {
+      "ref": "cargo:bit-vec@0.8.0:c19b7c6f923b580a",
+      "dependsOn": []
     },
     {
       "ref": "cargo:bit-vec@0.9.1:c19b7c6f923b580a",
@@ -41328,6 +45685,12 @@
       "ref": "cargo:block-padding@0.3.3:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:generic-array@0.14.7:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:block-padding@0.4.2:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:hybrid-array@0.4.13:c19b7c6f923b580a"
       ]
     },
     {
@@ -41375,6 +45738,21 @@
       ]
     },
     {
+      "ref": "cargo:brotli-decompressor@6.3.1:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:alloc-no-stdlib@3.0.0:c19b7c6f923b580a",
+        "cargo:alloc-stdlib@0.3.0:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:brotli@9.1.1:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:alloc-no-stdlib@3.0.0:c19b7c6f923b580a",
+        "cargo:alloc-stdlib@0.3.0:c19b7c6f923b580a",
+        "cargo:brotli-decompressor@6.3.1:c19b7c6f923b580a"
+      ]
+    },
+    {
       "ref": "cargo:bs58@0.5.1:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:tinyvec@1.11.0:c19b7c6f923b580a"
@@ -41394,7 +45772,9 @@
     },
     {
       "ref": "cargo:bumpalo@3.20.3:c19b7c6f923b580a",
-      "dependsOn": []
+      "dependsOn": [
+        "cargo:allocator-api2@0.2.21:c19b7c6f923b580a"
+      ]
     },
     {
       "ref": "cargo:by_address@1.2.1:c19b7c6f923b580a",
@@ -41473,6 +45853,30 @@
       ]
     },
     {
+      "ref": "cargo:cap-primitives@4.0.3:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:ambient-authority@0.0.2:c19b7c6f923b580a",
+        "cargo:fs-set-times@0.20.3:c19b7c6f923b580a",
+        "cargo:io-extras@0.19.0:c19b7c6f923b580a",
+        "cargo:io-lifetimes@3.0.1:c19b7c6f923b580a",
+        "cargo:ipnet@2.12.0:c19b7c6f923b580a",
+        "cargo:maybe-owned@0.3.4:c19b7c6f923b580a",
+        "cargo:rustix-linux-procfs@0.1.1:c19b7c6f923b580a",
+        "cargo:rustix@1.1.4:c19b7c6f923b580a",
+        "cargo:windows-sys@0.61.2:c19b7c6f923b580a",
+        "cargo:winx@0.36.4:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:cap-std@4.0.3:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:cap-primitives@4.0.3:c19b7c6f923b580a",
+        "cargo:io-extras@0.19.0:c19b7c6f923b580a",
+        "cargo:io-lifetimes@3.0.1:c19b7c6f923b580a",
+        "cargo:rustix@1.1.4:c19b7c6f923b580a"
+      ]
+    },
+    {
       "ref": "cargo:cast@0.3.0:c19b7c6f923b580a",
       "dependsOn": []
     },
@@ -41486,6 +45890,12 @@
       "ref": "cargo:cbc@0.1.2:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:cipher@0.4.4:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:cbc@0.2.1:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:cipher@0.5.2:c19b7c6f923b580a"
       ]
     },
     {
@@ -41531,6 +45941,7 @@
       "ref": "cargo:chacha20@0.10.2:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:cfg-if@1.0.4:c19b7c6f923b580a",
+        "cargo:cipher@0.5.2:c19b7c6f923b580a",
         "cargo:cpufeatures@0.3.0:c19b7c6f923b580a",
         "cargo:rand_core@0.10.1:c19b7c6f923b580a"
       ]
@@ -41551,6 +45962,15 @@
         "cargo:cipher@0.4.4:c19b7c6f923b580a",
         "cargo:poly1305@0.8.0:c19b7c6f923b580a",
         "cargo:zeroize@1.9.0:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:chacha20poly1305@0.11.0:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:aead@0.6.1:c19b7c6f923b580a",
+        "cargo:chacha20@0.10.2:c19b7c6f923b580a",
+        "cargo:cipher@0.5.2:c19b7c6f923b580a",
+        "cargo:poly1305@0.9.1:c19b7c6f923b580a"
       ]
     },
     {
@@ -41592,6 +46012,14 @@
       ]
     },
     {
+      "ref": "cargo:cipher@0.5.2:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:block-buffer@0.12.1:c19b7c6f923b580a",
+        "cargo:crypto-common@0.2.2:c19b7c6f923b580a",
+        "cargo:inout@0.2.6:c19b7c6f923b580a"
+      ]
+    },
+    {
       "ref": "cargo:clap@4.6.7:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:clap_builder@4.6.7:c19b7c6f923b580a"
@@ -41612,6 +46040,16 @@
       "ref": "cargo:cmake@0.1.58:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:cc@1.2.65:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:cmov@0.5.4:c19b7c6f923b580a",
+      "dependsOn": []
+    },
+    {
+      "ref": "cargo:cobs@0.3.0:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:thiserror@2.0.18:c19b7c6f923b580a"
       ]
     },
     {
@@ -41732,6 +46170,12 @@
       ]
     },
     {
+      "ref": "cargo:convert_case@0.12.0:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:unicode-segmentation@1.13.3:c19b7c6f923b580a"
+      ]
+    },
+    {
       "ref": "cargo:core-foundation-sys@0.8.7:c19b7c6f923b580a",
       "dependsOn": []
     },
@@ -41836,6 +46280,10 @@
       ]
     },
     {
+      "ref": "cargo:cpubits@0.1.1:c19b7c6f923b580a",
+      "dependsOn": []
+    },
+    {
       "ref": "cargo:cpufeatures@0.2.17:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:libc@0.2.189:c19b7c6f923b580a"
@@ -41845,6 +46293,106 @@
       "ref": "cargo:cpufeatures@0.3.0:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:libc@0.2.189:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:cranelift-bforest@0.116.1:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:cranelift-entity@0.116.1:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:cranelift-bitset@0.116.1:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:serde@1.0.228:c19b7c6f923b580a",
+        "cargo:serde_derive@1.0.228:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:cranelift-codegen-meta@0.116.1:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:cranelift-codegen-shared@0.116.1:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:cranelift-codegen-shared@0.116.1:c19b7c6f923b580a",
+      "dependsOn": []
+    },
+    {
+      "ref": "cargo:cranelift-codegen@0.116.1:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:bumpalo@3.20.3:c19b7c6f923b580a",
+        "cargo:cranelift-bforest@0.116.1:c19b7c6f923b580a",
+        "cargo:cranelift-bitset@0.116.1:c19b7c6f923b580a",
+        "cargo:cranelift-codegen-meta@0.116.1:c19b7c6f923b580a",
+        "cargo:cranelift-codegen-shared@0.116.1:c19b7c6f923b580a",
+        "cargo:cranelift-control@0.116.1:c19b7c6f923b580a",
+        "cargo:cranelift-entity@0.116.1:c19b7c6f923b580a",
+        "cargo:cranelift-isle@0.116.1:c19b7c6f923b580a",
+        "cargo:gimli@0.31.1:c19b7c6f923b580a",
+        "cargo:hashbrown@0.14.5:c19b7c6f923b580a",
+        "cargo:log@0.4.33:c19b7c6f923b580a",
+        "cargo:regalloc2@0.11.2:c19b7c6f923b580a",
+        "cargo:rustc-hash@2.1.2:c19b7c6f923b580a",
+        "cargo:serde@1.0.228:c19b7c6f923b580a",
+        "cargo:serde_derive@1.0.228:c19b7c6f923b580a",
+        "cargo:smallvec@1.15.2:c19b7c6f923b580a",
+        "cargo:target-lexicon@0.13.5:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:cranelift-control@0.116.1:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:arbitrary@1.4.2:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:cranelift-entity@0.116.1:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:cranelift-bitset@0.116.1:c19b7c6f923b580a",
+        "cargo:serde@1.0.228:c19b7c6f923b580a",
+        "cargo:serde_derive@1.0.228:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:cranelift-frontend@0.116.1:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:cranelift-codegen@0.116.1:c19b7c6f923b580a",
+        "cargo:log@0.4.33:c19b7c6f923b580a",
+        "cargo:smallvec@1.15.2:c19b7c6f923b580a",
+        "cargo:target-lexicon@0.13.5:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:cranelift-isle@0.116.1:c19b7c6f923b580a",
+      "dependsOn": []
+    },
+    {
+      "ref": "cargo:cranelift-module@0.116.1:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:anyhow@1.0.102:c19b7c6f923b580a",
+        "cargo:cranelift-codegen@0.116.1:c19b7c6f923b580a",
+        "cargo:cranelift-control@0.116.1:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:cranelift-native@0.116.1:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:cranelift-codegen@0.116.1:c19b7c6f923b580a",
+        "cargo:libc@0.2.189:c19b7c6f923b580a",
+        "cargo:target-lexicon@0.13.5:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:cranelift-object@0.116.1:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:anyhow@1.0.102:c19b7c6f923b580a",
+        "cargo:cranelift-codegen@0.116.1:c19b7c6f923b580a",
+        "cargo:cranelift-control@0.116.1:c19b7c6f923b580a",
+        "cargo:cranelift-module@0.116.1:c19b7c6f923b580a",
+        "cargo:log@0.4.33:c19b7c6f923b580a",
+        "cargo:object@0.36.7:c19b7c6f923b580a",
+        "cargo:target-lexicon@0.13.5:c19b7c6f923b580a"
       ]
     },
     {
@@ -41944,6 +46492,19 @@
       "dependsOn": []
     },
     {
+      "ref": "cargo:crypto-bigint@0.7.11:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:cpubits@0.1.1:c19b7c6f923b580a",
+        "cargo:ctutils@0.4.8:c19b7c6f923b580a",
+        "cargo:hybrid-array@0.4.13:c19b7c6f923b580a",
+        "cargo:num-traits@0.2.19:c19b7c6f923b580a",
+        "cargo:rand_core@0.10.1:c19b7c6f923b580a",
+        "cargo:serdect@0.4.3:c19b7c6f923b580a",
+        "cargo:subtle@2.6.1:c19b7c6f923b580a",
+        "cargo:zeroize@1.9.0:c19b7c6f923b580a"
+      ]
+    },
+    {
       "ref": "cargo:crypto-common@0.1.7:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:generic-array@0.14.7:c19b7c6f923b580a",
@@ -41953,7 +46514,23 @@
     {
       "ref": "cargo:crypto-common@0.2.2:c19b7c6f923b580a",
       "dependsOn": [
-        "cargo:hybrid-array@0.4.13:c19b7c6f923b580a"
+        "cargo:hybrid-array@0.4.13:c19b7c6f923b580a",
+        "cargo:rand_core@0.10.1:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:crypto-primes@0.7.2:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:crypto-bigint@0.7.11:c19b7c6f923b580a",
+        "cargo:rand_core@0.10.1:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:cshake@0.2.1:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:digest@0.11.3:c19b7c6f923b580a",
+        "cargo:keccak@0.2.2:c19b7c6f923b580a",
+        "cargo:sponge-cursor@0.1.0:c19b7c6f923b580a"
       ]
     },
     {
@@ -41961,6 +46538,19 @@
       "dependsOn": [
         "cargo:link-section@0.19.3:c19b7c6f923b580a",
         "cargo:linktime-proc-macro@0.2.3:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:ctr@0.10.1:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:cipher@0.5.2:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:ctutils@0.4.8:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:cmov@0.5.4:c19b7c6f923b580a",
+        "cargo:subtle@2.6.1:c19b7c6f923b580a"
       ]
     },
     {
@@ -41983,6 +46573,20 @@
         "cargo:curve25519-dalek-derive@0.1.1:c19b7c6f923b580a",
         "cargo:digest@0.10.7:c19b7c6f923b580a",
         "cargo:fiat-crypto@0.2.9:c19b7c6f923b580a",
+        "cargo:rustc_version@0.4.1:c19b7c6f923b580a",
+        "cargo:subtle@2.6.1:c19b7c6f923b580a",
+        "cargo:zeroize@1.9.0:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:curve25519-dalek@5.0.0:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:cfg-if@1.0.4:c19b7c6f923b580a",
+        "cargo:cpufeatures@0.3.0:c19b7c6f923b580a",
+        "cargo:curve25519-dalek-derive@0.1.1:c19b7c6f923b580a",
+        "cargo:digest@0.11.3:c19b7c6f923b580a",
+        "cargo:fiat-crypto@0.3.0:c19b7c6f923b580a",
+        "cargo:rand_core@0.10.1:c19b7c6f923b580a",
         "cargo:rustc_version@0.4.1:c19b7c6f923b580a",
         "cargo:subtle@2.6.1:c19b7c6f923b580a",
         "cargo:zeroize@1.9.0:c19b7c6f923b580a"
@@ -42088,6 +46692,23 @@
       ]
     },
     {
+      "ref": "cargo:der@0.8.3:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:const-oid@0.10.2:c19b7c6f923b580a",
+        "cargo:der_derive@0.8.0:c19b7c6f923b580a",
+        "cargo:pem-rfc7468@1.0.0:c19b7c6f923b580a",
+        "cargo:zeroize@1.9.0:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:der_derive@0.8.0:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:proc-macro2@1.0.106:c19b7c6f923b580a",
+        "cargo:quote@1.0.46:c19b7c6f923b580a",
+        "cargo:syn@2.0.118:c19b7c6f923b580a"
+      ]
+    },
+    {
       "ref": "cargo:deranged@0.5.8:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:serde_core@1.0.228:c19b7c6f923b580a"
@@ -42123,7 +46744,8 @@
       "dependsOn": [
         "cargo:block-buffer@0.12.1:c19b7c6f923b580a",
         "cargo:const-oid@0.10.2:c19b7c6f923b580a",
-        "cargo:crypto-common@0.2.2:c19b7c6f923b580a"
+        "cargo:crypto-common@0.2.2:c19b7c6f923b580a",
+        "cargo:ctutils@0.4.8:c19b7c6f923b580a"
       ]
     },
     {
@@ -42219,12 +46841,38 @@
       "dependsOn": []
     },
     {
+      "ref": "cargo:ecdsa@0.17.0:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:der@0.8.3:c19b7c6f923b580a",
+        "cargo:digest@0.11.3:c19b7c6f923b580a",
+        "cargo:elliptic-curve@0.14.3:c19b7c6f923b580a",
+        "cargo:rfc6979@0.6.0:c19b7c6f923b580a",
+        "cargo:signature@3.0.0:c19b7c6f923b580a",
+        "cargo:spki@0.8.1:c19b7c6f923b580a",
+        "cargo:zeroize@1.9.0:c19b7c6f923b580a"
+      ]
+    },
+    {
       "ref": "cargo:ed25519-dalek@2.2.0:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:curve25519-dalek@4.1.3:c19b7c6f923b580a",
         "cargo:ed25519@2.2.3:c19b7c6f923b580a",
+        "cargo:rand_core@0.6.4:c19b7c6f923b580a",
         "cargo:serde@1.0.228:c19b7c6f923b580a",
         "cargo:sha2@0.10.9:c19b7c6f923b580a",
+        "cargo:subtle@2.6.1:c19b7c6f923b580a",
+        "cargo:zeroize@1.9.0:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:ed25519-dalek@3.0.0:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:curve25519-dalek@5.0.0:c19b7c6f923b580a",
+        "cargo:ed25519@3.0.0:c19b7c6f923b580a",
+        "cargo:rand_core@0.10.1:c19b7c6f923b580a",
+        "cargo:serde@1.0.228:c19b7c6f923b580a",
+        "cargo:sha2@0.11.0:c19b7c6f923b580a",
+        "cargo:signature@3.0.0:c19b7c6f923b580a",
         "cargo:subtle@2.6.1:c19b7c6f923b580a",
         "cargo:zeroize@1.9.0:c19b7c6f923b580a"
       ]
@@ -42237,8 +46885,33 @@
       ]
     },
     {
+      "ref": "cargo:ed25519@3.0.0:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:pkcs8@0.11.0:c19b7c6f923b580a",
+        "cargo:signature@3.0.0:c19b7c6f923b580a"
+      ]
+    },
+    {
       "ref": "cargo:either@1.16.0:c19b7c6f923b580a",
       "dependsOn": []
+    },
+    {
+      "ref": "cargo:elliptic-curve@0.14.3:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:base16ct@1.0.0:c19b7c6f923b580a",
+        "cargo:crypto-bigint@0.7.11:c19b7c6f923b580a",
+        "cargo:crypto-common@0.2.2:c19b7c6f923b580a",
+        "cargo:digest@0.11.3:c19b7c6f923b580a",
+        "cargo:ff@0.14.0:c19b7c6f923b580a",
+        "cargo:group@0.14.0:c19b7c6f923b580a",
+        "cargo:hkdf@0.13.0:c19b7c6f923b580a",
+        "cargo:hybrid-array@0.4.13:c19b7c6f923b580a",
+        "cargo:pkcs8@0.11.0:c19b7c6f923b580a",
+        "cargo:rand_core@0.10.1:c19b7c6f923b580a",
+        "cargo:sec1@0.8.1:c19b7c6f923b580a",
+        "cargo:subtle@2.6.1:c19b7c6f923b580a",
+        "cargo:zeroize@1.9.0:c19b7c6f923b580a"
+      ]
     },
     {
       "ref": "cargo:embed-resource@3.0.9:c19b7c6f923b580a",
@@ -42250,6 +46923,14 @@
         "cargo:vswhom@0.1.0:c19b7c6f923b580a",
         "cargo:winreg@0.55.0:c19b7c6f923b580a"
       ]
+    },
+    {
+      "ref": "cargo:embedded-io@0.4.0:c19b7c6f923b580a",
+      "dependsOn": []
+    },
+    {
+      "ref": "cargo:embedded-io@0.6.1:c19b7c6f923b580a",
+      "dependsOn": []
     },
     {
       "ref": "cargo:encoding_rs@0.8.35:c19b7c6f923b580a",
@@ -42403,6 +47084,14 @@
       "dependsOn": []
     },
     {
+      "ref": "cargo:fancy-regex@0.16.2:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:bit-set@0.8.0:c19b7c6f923b580a",
+        "cargo:regex-automata@0.4.14:c19b7c6f923b580a",
+        "cargo:regex-syntax@0.8.11:c19b7c6f923b580a"
+      ]
+    },
+    {
       "ref": "cargo:fastrand@2.4.1:c19b7c6f923b580a",
       "dependsOn": []
     },
@@ -42417,7 +47106,18 @@
       ]
     },
     {
+      "ref": "cargo:ff@0.14.0:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:rand_core@0.10.1:c19b7c6f923b580a",
+        "cargo:subtle@2.6.1:c19b7c6f923b580a"
+      ]
+    },
+    {
       "ref": "cargo:fiat-crypto@0.2.9:c19b7c6f923b580a",
+      "dependsOn": []
+    },
+    {
+      "ref": "cargo:fiat-crypto@0.3.0:c19b7c6f923b580a",
       "dependsOn": []
     },
     {
@@ -42456,6 +47156,12 @@
         "cargo:crc32fast@1.5.0:c19b7c6f923b580a",
         "cargo:miniz_oxide@0.8.9:c19b7c6f923b580a",
         "cargo:zlib-rs@0.6.6:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:float-cmp@0.10.0:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:num-traits@0.2.19:c19b7c6f923b580a"
       ]
     },
     {
@@ -42557,6 +47263,14 @@
       "dependsOn": [
         "cargo:autocfg@1.5.1:c19b7c6f923b580a",
         "cargo:tokio@1.52.3:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:fs-set-times@0.20.3:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:io-lifetimes@2.0.4:c19b7c6f923b580a",
+        "cargo:rustix@1.1.4:c19b7c6f923b580a",
+        "cargo:windows-sys@0.59.0:c19b7c6f923b580a"
       ]
     },
     {
@@ -42760,6 +47474,12 @@
       ]
     },
     {
+      "ref": "cargo:ghash@0.6.0:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:polyval@0.7.3:c19b7c6f923b580a"
+      ]
+    },
+    {
       "ref": "cargo:gif@0.13.3:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:color_quant@1.1.0:c19b7c6f923b580a",
@@ -42771,6 +47491,14 @@
       "dependsOn": [
         "cargo:color_quant@1.1.0:c19b7c6f923b580a",
         "cargo:weezl@0.1.12:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:gimli@0.31.1:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:fallible-iterator@0.3.0:c19b7c6f923b580a",
+        "cargo:indexmap@2.14.0:c19b7c6f923b580a",
+        "cargo:stable_deref_trait@1.2.1:c19b7c6f923b580a"
       ]
     },
     {
@@ -42900,7 +47628,7 @@
       ]
     },
     {
-      "ref": "cargo:gpui-base@0.9.1:c19b7c6f923b580a",
+      "ref": "cargo:gpui-base@0.9.1:21b891abfaccca05",
       "dependsOn": [
         "cargo:aho-corasick@1.1.4:c19b7c6f923b580a",
         "cargo:anyhow@1.0.102:c19b7c6f923b580a",
@@ -42939,7 +47667,7 @@
       ]
     },
     {
-      "ref": "cargo:gpui-component-macros@0.9.1:c19b7c6f923b580a",
+      "ref": "cargo:gpui-component-macros@0.9.1:21b891abfaccca05",
       "dependsOn": [
         "cargo:proc-macro-crate@3.5.0:c19b7c6f923b580a",
         "cargo:proc-macro2@1.0.106:c19b7c6f923b580a",
@@ -42948,16 +47676,16 @@
       ]
     },
     {
-      "ref": "cargo:gpui-component@0.9.1:c19b7c6f923b580a",
+      "ref": "cargo:gpui-component@0.9.1:21b891abfaccca05",
       "dependsOn": [
         "cargo:anyhow@1.0.102:c19b7c6f923b580a",
         "cargo:chrono@0.4.45:c19b7c6f923b580a",
         "cargo:core-text@21.0.0:c19b7c6f923b580a",
         "cargo:enum-iterator@2.3.0:c19b7c6f923b580a",
-        "cargo:gpui-base@0.9.1:c19b7c6f923b580a",
-        "cargo:gpui-component-macros@0.9.1:c19b7c6f923b580a",
+        "cargo:gpui-base@0.9.1:21b891abfaccca05",
+        "cargo:gpui-component-macros@0.9.1:21b891abfaccca05",
         "cargo:gpui-fast@0.1.14:c19b7c6f923b580a",
-        "cargo:gpui-kit-assets@0.9.1:c19b7c6f923b580a",
+        "cargo:gpui-kit-assets@0.9.1:21b891abfaccca05",
         "cargo:gpui-pre-macros@0.3.12:c19b7c6f923b580a",
         "cargo:gpui-pre-sum-tree@0.3.12:c19b7c6f923b580a",
         "cargo:gpui-pre@0.3.12:c19b7c6f923b580a",
@@ -42985,6 +47713,7 @@
         "cargo:similar@2.7.0:c19b7c6f923b580a",
         "cargo:smallvec@1.15.2:c19b7c6f923b580a",
         "cargo:smol@2.0.2:c19b7c6f923b580a",
+        "cargo:syntect@5.3.0:c19b7c6f923b580a",
         "cargo:tracing@0.1.44:c19b7c6f923b580a",
         "cargo:tree-sitter-bash@0.23.3:c19b7c6f923b580a",
         "cargo:tree-sitter-c-sharp@0.23.5:c19b7c6f923b580a",
@@ -43011,6 +47740,7 @@
         "cargo:tree-sitter-yaml@0.7.2:c19b7c6f923b580a",
         "cargo:tree-sitter-zig@1.1.2:c19b7c6f923b580a",
         "cargo:tree-sitter@0.26.13:c19b7c6f923b580a",
+        "cargo:two-face@0.4.5:c19b7c6f923b580a",
         "cargo:unicode-segmentation@1.13.3:c19b7c6f923b580a",
         "cargo:unicode-width@0.2.2:c19b7c6f923b580a",
         "cargo:uuid@1.23.3:c19b7c6f923b580a",
@@ -43095,7 +47825,7 @@
       ]
     },
     {
-      "ref": "cargo:gpui-fps@0.9.1:c19b7c6f923b580a",
+      "ref": "cargo:gpui-fps@0.9.1:21b891abfaccca05",
       "dependsOn": [
         "cargo:core-graphics@0.24.0:c19b7c6f923b580a",
         "cargo:gpui-pre@0.3.12:c19b7c6f923b580a",
@@ -43110,7 +47840,7 @@
       ]
     },
     {
-      "ref": "cargo:gpui-kit-assets@0.9.1:c19b7c6f923b580a",
+      "ref": "cargo:gpui-kit-assets@0.9.1:21b891abfaccca05",
       "dependsOn": [
         "asset:gpui-kit-lucide-icons:efafb5ab9a148d12",
         "cargo:anyhow@1.0.102:c19b7c6f923b580a",
@@ -43120,6 +47850,16 @@
         "cargo:rust-embed@8.12.0:c19b7c6f923b580a",
         "cargo:wasm-bindgen-futures@0.4.80:c19b7c6f923b580a",
         "cargo:wasm-bindgen@0.2.130:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:gpui-kit@0.9.1:21b891abfaccca05",
+      "dependsOn": [
+        "cargo:gpui-base@0.9.1:21b891abfaccca05",
+        "cargo:gpui-pre-macros@0.3.12:c19b7c6f923b580a",
+        "cargo:gpui-pre-platform@0.3.12:c19b7c6f923b580a",
+        "cargo:gpui-pre-web@0.3.12:c19b7c6f923b580a",
+        "cargo:gpui-pre@0.3.12:c19b7c6f923b580a"
       ]
     },
     {
@@ -43334,6 +48074,7 @@
         "cargo:base64@0.22.1:c19b7c6f923b580a",
         "cargo:bytes@1.12.0:c19b7c6f923b580a",
         "cargo:encoding_rs@0.8.35:c19b7c6f923b580a",
+        "cargo:futures-channel@0.3.34:c19b7c6f923b580a",
         "cargo:futures-core@0.3.34:c19b7c6f923b580a",
         "cargo:futures-util@0.3.34:c19b7c6f923b580a",
         "cargo:h2@0.4.15:c19b7c6f923b580a",
@@ -43573,6 +48314,43 @@
       ]
     },
     {
+      "ref": "cargo:gpui-shell@0.9.1:21b891abfaccca05",
+      "dependsOn": [
+        "cargo:anyhow@1.0.102:c19b7c6f923b580a",
+        "cargo:async-channel@2.5.0:c19b7c6f923b580a",
+        "cargo:cap-std@4.0.3:c19b7c6f923b580a",
+        "cargo:chrono@0.4.45:c19b7c6f923b580a",
+        "cargo:flate2@1.1.9:c19b7c6f923b580a",
+        "cargo:fs2@0.4.3:c19b7c6f923b580a",
+        "cargo:gpui-base@0.9.1:21b891abfaccca05",
+        "cargo:gpui-component@0.9.1:21b891abfaccca05",
+        "cargo:gpui-fps@0.9.1:21b891abfaccca05",
+        "cargo:gpui-kit@0.9.1:21b891abfaccca05",
+        "cargo:gpui-pre-platform@0.3.12:c19b7c6f923b580a",
+        "cargo:gpui-pre-reqwest@0.12.15:c19b7c6f923b580a",
+        "cargo:gpui-pre@0.3.12:c19b7c6f923b580a",
+        "cargo:image@0.25.10:c19b7c6f923b580a",
+        "cargo:instant@0.1.13:c19b7c6f923b580a",
+        "cargo:libc@0.2.189:c19b7c6f923b580a",
+        "cargo:quickjs-jit-runtime@0.14.1:c19b7c6f923b580a",
+        "cargo:quickjs-jit-stdlib@0.14.1:c19b7c6f923b580a",
+        "cargo:quickjs-jit@0.14.1:c19b7c6f923b580a",
+        "cargo:schemars@1.2.1:c19b7c6f923b580a",
+        "cargo:semver@1.0.28:c19b7c6f923b580a",
+        "cargo:serde@1.0.228:c19b7c6f923b580a",
+        "cargo:serde_json@1.0.150:c19b7c6f923b580a",
+        "cargo:sha2@0.10.9:c19b7c6f923b580a",
+        "cargo:smallvec@1.15.2:c19b7c6f923b580a",
+        "cargo:smol@2.0.2:c19b7c6f923b580a",
+        "cargo:tar@0.4.46:c19b7c6f923b580a",
+        "cargo:tracing@0.1.44:c19b7c6f923b580a",
+        "cargo:tungstenite@0.29.0:c19b7c6f923b580a",
+        "cargo:usvg@0.46.0:c19b7c6f923b580a",
+        "cargo:wait-timeout@0.2.1:c19b7c6f923b580a",
+        "cargo:windows@0.58.0:c19b7c6f923b580a"
+      ]
+    },
+    {
       "ref": "cargo:gpui-tokio@0.1.5:a9a8ee941163297c",
       "dependsOn": [
         "cargo:anyhow@1.0.102:c19b7c6f923b580a",
@@ -43586,6 +48364,14 @@
       "dependsOn": [
         "cargo:arraydeque@0.5.1:c19b7c6f923b580a",
         "cargo:smallvec@1.15.2:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:group@0.14.0:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:ff@0.14.0:c19b7c6f923b580a",
+        "cargo:rand_core@0.10.1:c19b7c6f923b580a",
+        "cargo:subtle@2.6.1:c19b7c6f923b580a"
       ]
     },
     {
@@ -43653,6 +48439,12 @@
         "cargo:crunchy@0.2.4:c19b7c6f923b580a",
         "cargo:num-traits@0.2.19:c19b7c6f923b580a",
         "cargo:zerocopy@0.8.52:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:halfbrown@0.4.0:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:hashbrown@0.16.1:c19b7c6f923b580a"
       ]
     },
     {
@@ -43734,6 +48526,13 @@
       "dependsOn": []
     },
     {
+      "ref": "cargo:hex-simd@0.8.0:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:outref@0.5.2:c19b7c6f923b580a",
+        "cargo:vsimd@0.8.0:c19b7c6f923b580a"
+      ]
+    },
+    {
       "ref": "cargo:hex@0.4.3:c19b7c6f923b580a",
       "dependsOn": []
     },
@@ -43744,9 +48543,21 @@
       ]
     },
     {
+      "ref": "cargo:hkdf@0.13.0:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:hmac@0.13.0:c19b7c6f923b580a"
+      ]
+    },
+    {
       "ref": "cargo:hmac@0.12.1:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:digest@0.10.7:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:hmac@0.13.0:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:digest@0.11.3:c19b7c6f923b580a"
       ]
     },
     {
@@ -43801,7 +48612,9 @@
     {
       "ref": "cargo:hybrid-array@0.4.13:c19b7c6f923b580a",
       "dependsOn": [
-        "cargo:typenum@1.20.1:c19b7c6f923b580a"
+        "cargo:subtle@2.6.1:c19b7c6f923b580a",
+        "cargo:typenum@1.20.1:c19b7c6f923b580a",
+        "cargo:zeroize@1.9.0:c19b7c6f923b580a"
       ]
     },
     {
@@ -44099,6 +48912,13 @@
       ]
     },
     {
+      "ref": "cargo:inout@0.2.6:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:block-padding@0.4.2:c19b7c6f923b580a",
+        "cargo:hybrid-array@0.4.13:c19b7c6f923b580a"
+      ]
+    },
+    {
       "ref": "cargo:instability@0.3.14:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:darling@0.24.1:c19b7c6f923b580a",
@@ -44134,6 +48954,21 @@
       "dependsOn": [
         "cargo:rustversion@1.0.22:c19b7c6f923b580a"
       ]
+    },
+    {
+      "ref": "cargo:io-extras@0.19.0:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:io-lifetimes@3.0.1:c19b7c6f923b580a",
+        "cargo:windows-sys@0.60.2:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:io-lifetimes@2.0.4:c19b7c6f923b580a",
+      "dependsOn": []
+    },
+    {
+      "ref": "cargo:io-lifetimes@3.0.1:c19b7c6f923b580a",
+      "dependsOn": []
     },
     {
       "ref": "cargo:ipnet@2.12.0:c19b7c6f923b580a",
@@ -44238,6 +49073,13 @@
         "cargo:hashbrown@0.16.1:c19b7c6f923b580a",
         "cargo:portable-atomic@1.13.1:c19b7c6f923b580a",
         "cargo:thiserror@2.0.18:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:keccak@0.2.2:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:cfg-if@1.0.4:c19b7c6f923b580a",
+        "cargo:cpufeatures@0.3.0:c19b7c6f923b580a"
       ]
     },
     {
@@ -44560,6 +49402,13 @@
       "dependsOn": [
         "cargo:cfg-if@1.0.4:c19b7c6f923b580a",
         "cargo:digest@0.10.7:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:md-5@0.11.0:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:cfg-if@1.0.4:c19b7c6f923b580a",
+        "cargo:digest@0.11.3:c19b7c6f923b580a"
       ]
     },
     {
@@ -45150,6 +49999,15 @@
       ]
     },
     {
+      "ref": "cargo:object@0.36.7:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:crc32fast@1.5.0:c19b7c6f923b580a",
+        "cargo:hashbrown@0.15.5:c19b7c6f923b580a",
+        "cargo:indexmap@2.14.0:c19b7c6f923b580a",
+        "cargo:memchr@2.8.2:c19b7c6f923b580a"
+      ]
+    },
+    {
       "ref": "cargo:object@0.37.3:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:memchr@2.8.2:c19b7c6f923b580a"
@@ -45231,6 +50089,42 @@
       "dependsOn": [
         "cargo:futures-core@0.3.34:c19b7c6f923b580a",
         "cargo:pin-project-lite@0.2.17:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:outref@0.5.2:c19b7c6f923b580a",
+      "dependsOn": []
+    },
+    {
+      "ref": "cargo:p256@0.14.0:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:ecdsa@0.17.0:c19b7c6f923b580a",
+        "cargo:elliptic-curve@0.14.3:c19b7c6f923b580a",
+        "cargo:primefield@0.14.0:c19b7c6f923b580a",
+        "cargo:primeorder@0.14.0:c19b7c6f923b580a",
+        "cargo:sha2@0.11.0:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:p384@0.14.0:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:ecdsa@0.17.0:c19b7c6f923b580a",
+        "cargo:elliptic-curve@0.14.3:c19b7c6f923b580a",
+        "cargo:fiat-crypto@0.3.0:c19b7c6f923b580a",
+        "cargo:primefield@0.14.0:c19b7c6f923b580a",
+        "cargo:primeorder@0.14.0:c19b7c6f923b580a",
+        "cargo:sha2@0.11.0:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:p521@0.14.0:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:base16ct@1.0.0:c19b7c6f923b580a",
+        "cargo:ecdsa@0.17.0:c19b7c6f923b580a",
+        "cargo:elliptic-curve@0.14.3:c19b7c6f923b580a",
+        "cargo:primefield@0.14.0:c19b7c6f923b580a",
+        "cargo:primeorder@0.14.0:c19b7c6f923b580a",
+        "cargo:sha2@0.11.0:c19b7c6f923b580a"
       ]
     },
     {
@@ -45335,6 +50229,12 @@
       ]
     },
     {
+      "ref": "cargo:pbkdf2@0.13.0:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:digest@0.11.3:c19b7c6f923b580a"
+      ]
+    },
+    {
       "ref": "cargo:pdfium-render@0.9.3:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:bitflags@2.13.0:c19b7c6f923b580a",
@@ -45354,6 +50254,12 @@
         "cargo:wasm-bindgen-futures@0.4.80:c19b7c6f923b580a",
         "cargo:wasm-bindgen@0.2.130:c19b7c6f923b580a",
         "cargo:web-sys@0.3.107:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:pem-rfc7468@1.0.0:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:base64ct@1.8.3:c19b7c6f923b580a"
       ]
     },
     {
@@ -45401,6 +50307,13 @@
       ]
     },
     {
+      "ref": "cargo:phf@0.14.0:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:phf_macros@0.14.0:c19b7c6f923b580a",
+        "cargo:phf_shared@0.14.0:c19b7c6f923b580a"
+      ]
+    },
+    {
       "ref": "cargo:phf_codegen@0.11.3:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:phf_generator@0.11.3:c19b7c6f923b580a",
@@ -45422,10 +50335,27 @@
       ]
     },
     {
+      "ref": "cargo:phf_generator@0.14.0:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:fastrand@2.4.1:c19b7c6f923b580a",
+        "cargo:phf_shared@0.14.0:c19b7c6f923b580a"
+      ]
+    },
+    {
       "ref": "cargo:phf_macros@0.13.1:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:phf_generator@0.13.1:c19b7c6f923b580a",
         "cargo:phf_shared@0.13.1:c19b7c6f923b580a",
+        "cargo:proc-macro2@1.0.106:c19b7c6f923b580a",
+        "cargo:quote@1.0.46:c19b7c6f923b580a",
+        "cargo:syn@2.0.118:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:phf_macros@0.14.0:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:phf_generator@0.14.0:c19b7c6f923b580a",
+        "cargo:phf_shared@0.14.0:c19b7c6f923b580a",
         "cargo:proc-macro2@1.0.106:c19b7c6f923b580a",
         "cargo:quote@1.0.46:c19b7c6f923b580a",
         "cargo:syn@2.0.118:c19b7c6f923b580a"
@@ -45439,6 +50369,12 @@
     },
     {
       "ref": "cargo:phf_shared@0.13.1:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:siphasher@1.0.3:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:phf_shared@0.14.0:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:siphasher@1.0.3:c19b7c6f923b580a"
       ]
@@ -45478,10 +50414,24 @@
       "dependsOn": []
     },
     {
+      "ref": "cargo:pkcs1@0.8.0:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:der@0.8.3:c19b7c6f923b580a",
+        "cargo:spki@0.8.1:c19b7c6f923b580a"
+      ]
+    },
+    {
       "ref": "cargo:pkcs8@0.10.2:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:der@0.7.10:c19b7c6f923b580a",
         "cargo:spki@0.7.3:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:pkcs8@0.11.0:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:der@0.8.3:c19b7c6f923b580a",
+        "cargo:spki@0.8.1:c19b7c6f923b580a"
       ]
     },
     {
@@ -45556,9 +50506,24 @@
       ]
     },
     {
+      "ref": "cargo:poly1305@0.9.1:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:cpufeatures@0.3.0:c19b7c6f923b580a",
+        "cargo:universal-hash@0.6.1:c19b7c6f923b580a"
+      ]
+    },
+    {
       "ref": "cargo:polycool@0.4.0:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:arrayvec@0.7.8:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:polyval@0.7.3:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:cpubits@0.1.1:c19b7c6f923b580a",
+        "cargo:cpufeatures@0.3.0:c19b7c6f923b580a",
+        "cargo:universal-hash@0.6.1:c19b7c6f923b580a"
       ]
     },
     {
@@ -45581,6 +50546,15 @@
         "cargo:pollster@0.2.5:c19b7c6f923b580a",
         "cargo:static_assertions@1.1.0:c19b7c6f923b580a",
         "cargo:thiserror@1.0.69:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:postcard@1.1.3:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:cobs@0.3.0:c19b7c6f923b580a",
+        "cargo:embedded-io@0.4.0:c19b7c6f923b580a",
+        "cargo:embedded-io@0.6.1:c19b7c6f923b580a",
+        "cargo:serde@1.0.228:c19b7c6f923b580a"
       ]
     },
     {
@@ -45608,6 +50582,26 @@
     {
       "ref": "cargo:presser@0.3.1:c19b7c6f923b580a",
       "dependsOn": []
+    },
+    {
+      "ref": "cargo:primefield@0.14.0:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:crypto-bigint@0.7.11:c19b7c6f923b580a",
+        "cargo:crypto-common@0.2.2:c19b7c6f923b580a",
+        "cargo:ff@0.14.0:c19b7c6f923b580a",
+        "cargo:rand_core@0.10.1:c19b7c6f923b580a",
+        "cargo:subtle@2.6.1:c19b7c6f923b580a",
+        "cargo:zeroize@1.9.0:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:primeorder@0.14.0:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:elliptic-curve@0.14.3:c19b7c6f923b580a",
+        "cargo:primefield@0.14.0:c19b7c6f923b580a",
+        "cargo:serdect@0.4.3:c19b7c6f923b580a",
+        "cargo:wnaf@0.14.1:c19b7c6f923b580a"
+      ]
     },
     {
       "ref": "cargo:proc-macro-crate@3.5.0:c19b7c6f923b580a",
@@ -45734,6 +50728,117 @@
       ]
     },
     {
+      "ref": "cargo:quickjs-jit-core@0.14.1:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:async-lock@3.4.2:c19b7c6f923b580a",
+        "cargo:half@2.7.1:c19b7c6f923b580a",
+        "cargo:hashbrown@0.17.1:c19b7c6f923b580a",
+        "cargo:quickjs-jit-sys@0.14.1:c19b7c6f923b580a",
+        "cargo:relative-path@2.0.3:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:quickjs-jit-macro@0.14.1:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:convert_case@0.12.0:c19b7c6f923b580a",
+        "cargo:indexmap@2.14.0:c19b7c6f923b580a",
+        "cargo:proc-macro-crate@3.5.0:c19b7c6f923b580a",
+        "cargo:proc-macro2@1.0.106:c19b7c6f923b580a",
+        "cargo:quickjs-jit-core@0.14.1:c19b7c6f923b580a",
+        "cargo:quote@1.0.46:c19b7c6f923b580a",
+        "cargo:syn@3.0.6:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:quickjs-jit-runtime@0.14.1:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:cranelift-codegen@0.116.1:c19b7c6f923b580a",
+        "cargo:cranelift-frontend@0.116.1:c19b7c6f923b580a",
+        "cargo:cranelift-module@0.116.1:c19b7c6f923b580a",
+        "cargo:cranelift-native@0.116.1:c19b7c6f923b580a",
+        "cargo:cranelift-object@0.116.1:c19b7c6f923b580a",
+        "cargo:gimli@0.31.1:c19b7c6f923b580a",
+        "cargo:libc@0.2.189:c19b7c6f923b580a",
+        "cargo:postcard@1.1.3:c19b7c6f923b580a",
+        "cargo:quickjs-jit-core@0.14.1:c19b7c6f923b580a",
+        "cargo:quickjs-jit-sys@0.14.1:c19b7c6f923b580a",
+        "cargo:rustc-hash@2.1.2:c19b7c6f923b580a",
+        "cargo:serde@1.0.228:c19b7c6f923b580a",
+        "cargo:serde_json@1.0.150:c19b7c6f923b580a",
+        "cargo:serde_yaml@0.9.34+deprecated:c19b7c6f923b580a",
+        "cargo:target-lexicon@0.13.5:c19b7c6f923b580a",
+        "cargo:windows-sys@0.61.2:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:quickjs-jit-stdlib@0.14.1:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:aes-gcm@0.11.1:c19b7c6f923b580a",
+        "cargo:aes-kw@0.3.1:c19b7c6f923b580a",
+        "cargo:aes@0.9.4:c19b7c6f923b580a",
+        "cargo:base64-simd@0.8.0:c19b7c6f923b580a",
+        "cargo:brotli@9.1.1:c19b7c6f923b580a",
+        "cargo:cbc@0.2.1:c19b7c6f923b580a",
+        "cargo:chacha20poly1305@0.11.0:c19b7c6f923b580a",
+        "cargo:const-oid@0.10.2:c19b7c6f923b580a",
+        "cargo:crc32c@0.6.8:c19b7c6f923b580a",
+        "cargo:crc32fast@1.5.0:c19b7c6f923b580a",
+        "cargo:cshake@0.2.1:c19b7c6f923b580a",
+        "cargo:ctr@0.10.1:c19b7c6f923b580a",
+        "cargo:ctutils@0.4.8:c19b7c6f923b580a",
+        "cargo:der@0.8.3:c19b7c6f923b580a",
+        "cargo:ecdsa@0.17.0:c19b7c6f923b580a",
+        "cargo:ed25519-dalek@3.0.0:c19b7c6f923b580a",
+        "cargo:elliptic-curve@0.14.3:c19b7c6f923b580a",
+        "cargo:flate2@1.1.9:c19b7c6f923b580a",
+        "cargo:half@2.7.1:c19b7c6f923b580a",
+        "cargo:hex-simd@0.8.0:c19b7c6f923b580a",
+        "cargo:hkdf@0.13.0:c19b7c6f923b580a",
+        "cargo:hmac@0.13.0:c19b7c6f923b580a",
+        "cargo:itoa@1.0.18:c19b7c6f923b580a",
+        "cargo:keccak@0.2.2:c19b7c6f923b580a",
+        "cargo:libc@0.2.189:c19b7c6f923b580a",
+        "cargo:md-5@0.11.0:c19b7c6f923b580a",
+        "cargo:memchr@2.8.2:c19b7c6f923b580a",
+        "cargo:once_cell@1.21.4:c19b7c6f923b580a",
+        "cargo:p256@0.14.0:c19b7c6f923b580a",
+        "cargo:p384@0.14.0:c19b7c6f923b580a",
+        "cargo:p521@0.14.0:c19b7c6f923b580a",
+        "cargo:pbkdf2@0.13.0:c19b7c6f923b580a",
+        "cargo:phf@0.14.0:c19b7c6f923b580a",
+        "cargo:pkcs8@0.11.0:c19b7c6f923b580a",
+        "cargo:quickjs-jit@0.14.1:c19b7c6f923b580a",
+        "cargo:rand@0.10.3:c19b7c6f923b580a",
+        "cargo:rsa@0.10.0-rc.19:c19b7c6f923b580a",
+        "cargo:ryu@1.0.23:c19b7c6f923b580a",
+        "cargo:sha1@0.11.0:c19b7c6f923b580a",
+        "cargo:sha3@0.12.0:c19b7c6f923b580a",
+        "cargo:shake@0.1.0:c19b7c6f923b580a",
+        "cargo:simd-json@0.18.1:c19b7c6f923b580a",
+        "cargo:simdutf8@0.1.5:c19b7c6f923b580a",
+        "cargo:spki@0.8.1:c19b7c6f923b580a",
+        "cargo:sponge-cursor@0.1.0:c19b7c6f923b580a",
+        "cargo:tokio@1.52.3:c19b7c6f923b580a",
+        "cargo:tracing@0.1.44:c19b7c6f923b580a",
+        "cargo:url@2.5.8:c19b7c6f923b580a",
+        "cargo:windows-sys@0.61.2:c19b7c6f923b580a",
+        "cargo:x25519-dalek@3.0.0:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:quickjs-jit-sys@0.14.1:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:cc@1.2.65:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:quickjs-jit@0.14.1:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:quickjs-jit-core@0.14.1:c19b7c6f923b580a",
+        "cargo:quickjs-jit-macro@0.14.1:c19b7c6f923b580a"
+      ]
+    },
+    {
       "ref": "cargo:quinn-proto@0.11.15:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:aws-lc-rs@1.19.0:c19b7c6f923b580a",
@@ -45797,6 +50902,7 @@
     {
       "ref": "cargo:rand@0.10.3:c19b7c6f923b580a",
       "dependsOn": [
+        "cargo:chacha20@0.10.2:c19b7c6f923b580a",
         "cargo:getrandom@0.4.3:c19b7c6f923b580a",
         "cargo:rand_core@0.10.1:c19b7c6f923b580a"
       ]
@@ -46057,6 +51163,18 @@
       ]
     },
     {
+      "ref": "cargo:regalloc2@0.11.2:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:allocator-api2@0.2.21:c19b7c6f923b580a",
+        "cargo:bumpalo@3.20.3:c19b7c6f923b580a",
+        "cargo:hashbrown@0.15.5:c19b7c6f923b580a",
+        "cargo:log@0.4.33:c19b7c6f923b580a",
+        "cargo:rustc-hash@2.1.2:c19b7c6f923b580a",
+        "cargo:serde@1.0.228:c19b7c6f923b580a",
+        "cargo:smallvec@1.15.2:c19b7c6f923b580a"
+      ]
+    },
+    {
       "ref": "cargo:regex-automata@0.4.14:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:aho-corasick@1.1.4:c19b7c6f923b580a",
@@ -46075,6 +51193,12 @@
         "cargo:memchr@2.8.2:c19b7c6f923b580a",
         "cargo:regex-automata@0.4.14:c19b7c6f923b580a",
         "cargo:regex-syntax@0.8.11:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:relative-path@2.0.3:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:serde_core@1.0.228:c19b7c6f923b580a"
       ]
     },
     {
@@ -46151,6 +51275,13 @@
       ]
     },
     {
+      "ref": "cargo:rfc6979@0.6.0:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:crypto-bigint@0.7.11:c19b7c6f923b580a",
+        "cargo:hmac@0.13.0:c19b7c6f923b580a"
+      ]
+    },
+    {
       "ref": "cargo:rfd@0.17.2:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:block2@0.6.2:c19b7c6f923b580a",
@@ -46205,6 +51336,22 @@
       "ref": "cargo:roxmltree@0.21.1:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:memchr@2.8.2:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:rsa@0.10.0-rc.19:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:const-oid@0.10.2:c19b7c6f923b580a",
+        "cargo:crypto-bigint@0.7.11:c19b7c6f923b580a",
+        "cargo:crypto-primes@0.7.2:c19b7c6f923b580a",
+        "cargo:digest@0.11.3:c19b7c6f923b580a",
+        "cargo:pkcs1@0.8.0:c19b7c6f923b580a",
+        "cargo:pkcs8@0.11.0:c19b7c6f923b580a",
+        "cargo:rand_core@0.10.1:c19b7c6f923b580a",
+        "cargo:sha2@0.11.0:c19b7c6f923b580a",
+        "cargo:signature@3.0.0:c19b7c6f923b580a",
+        "cargo:spki@0.8.1:c19b7c6f923b580a",
+        "cargo:zeroize@1.9.0:c19b7c6f923b580a"
       ]
     },
     {
@@ -46306,6 +51453,13 @@
       "ref": "cargo:rusticata-macros@4.1.0:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:nom@7.1.3:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:rustix-linux-procfs@0.1.1:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:once_cell@1.21.4:c19b7c6f923b580a",
+        "cargo:rustix@1.1.4:c19b7c6f923b580a"
       ]
     },
     {
@@ -46506,6 +51660,17 @@
       "dependsOn": []
     },
     {
+      "ref": "cargo:sec1@0.8.1:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:base16ct@1.0.0:c19b7c6f923b580a",
+        "cargo:ctutils@0.4.8:c19b7c6f923b580a",
+        "cargo:der@0.8.3:c19b7c6f923b580a",
+        "cargo:hybrid-array@0.4.13:c19b7c6f923b580a",
+        "cargo:subtle@2.6.1:c19b7c6f923b580a",
+        "cargo:zeroize@1.9.0:c19b7c6f923b580a"
+      ]
+    },
+    {
       "ref": "cargo:secret-service@4.0.0:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:aes@0.8.4:c19b7c6f923b580a",
@@ -46702,11 +51867,26 @@
       ]
     },
     {
+      "ref": "cargo:serdect@0.4.3:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:base16ct@1.0.0:c19b7c6f923b580a",
+        "cargo:serde@1.0.228:c19b7c6f923b580a"
+      ]
+    },
+    {
       "ref": "cargo:sha1@0.10.6:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:cfg-if@1.0.4:c19b7c6f923b580a",
         "cargo:cpufeatures@0.2.17:c19b7c6f923b580a",
         "cargo:digest@0.10.7:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:sha1@0.11.0:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:cfg-if@1.0.4:c19b7c6f923b580a",
+        "cargo:cpufeatures@0.3.0:c19b7c6f923b580a",
+        "cargo:digest@0.11.3:c19b7c6f923b580a"
       ]
     },
     {
@@ -46727,6 +51907,22 @@
         "cargo:cfg-if@1.0.4:c19b7c6f923b580a",
         "cargo:cpufeatures@0.3.0:c19b7c6f923b580a",
         "cargo:digest@0.11.3:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:sha3@0.12.0:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:digest@0.11.3:c19b7c6f923b580a",
+        "cargo:keccak@0.2.2:c19b7c6f923b580a",
+        "cargo:sponge-cursor@0.1.0:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:shake@0.1.0:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:digest@0.11.3:c19b7c6f923b580a",
+        "cargo:keccak@0.2.2:c19b7c6f923b580a",
+        "cargo:sponge-cursor@0.1.0:c19b7c6f923b580a"
       ]
     },
     {
@@ -46779,8 +51975,24 @@
       ]
     },
     {
+      "ref": "cargo:signature@3.0.0:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:digest@0.11.3:c19b7c6f923b580a",
+        "cargo:rand_core@0.10.1:c19b7c6f923b580a"
+      ]
+    },
+    {
       "ref": "cargo:simd-adler32@0.3.9:c19b7c6f923b580a",
       "dependsOn": []
+    },
+    {
+      "ref": "cargo:simd-json@0.18.1:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:halfbrown@0.4.0:c19b7c6f923b580a",
+        "cargo:ref-cast@1.0.25:c19b7c6f923b580a",
+        "cargo:simdutf8@0.1.5:c19b7c6f923b580a",
+        "cargo:value-trait@0.12.3:c19b7c6f923b580a"
+      ]
     },
     {
       "ref": "cargo:simd_cesu8@1.1.1:c19b7c6f923b580a",
@@ -46848,7 +52060,9 @@
     },
     {
       "ref": "cargo:smallvec@1.15.2:c19b7c6f923b580a",
-      "dependsOn": []
+      "dependsOn": [
+        "cargo:serde@1.0.228:c19b7c6f923b580a"
+      ]
     },
     {
       "ref": "cargo:smol@2.0.2:c19b7c6f923b580a",
@@ -46913,6 +52127,17 @@
         "cargo:base64ct@1.8.3:c19b7c6f923b580a",
         "cargo:der@0.7.10:c19b7c6f923b580a"
       ]
+    },
+    {
+      "ref": "cargo:spki@0.8.1:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:base64ct@1.8.3:c19b7c6f923b580a",
+        "cargo:der@0.8.3:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:sponge-cursor@0.1.0:c19b7c6f923b580a",
+      "dependsOn": []
     },
     {
       "ref": "cargo:stable_deref_trait@1.2.1:c19b7c6f923b580a",
@@ -47095,6 +52320,21 @@
         "cargo:proc-macro2@1.0.106:c19b7c6f923b580a",
         "cargo:quote@1.0.46:c19b7c6f923b580a",
         "cargo:syn@3.0.6:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:syntect@5.3.0:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:bincode@1.3.3:c19b7c6f923b580a",
+        "cargo:fancy-regex@0.16.2:c19b7c6f923b580a",
+        "cargo:flate2@1.1.9:c19b7c6f923b580a",
+        "cargo:fnv@1.0.7:c19b7c6f923b580a",
+        "cargo:once_cell@1.21.4:c19b7c6f923b580a",
+        "cargo:regex-syntax@0.8.11:c19b7c6f923b580a",
+        "cargo:serde@1.0.228:c19b7c6f923b580a",
+        "cargo:serde_derive@1.0.228:c19b7c6f923b580a",
+        "cargo:thiserror@2.0.18:c19b7c6f923b580a",
+        "cargo:walkdir@2.5.0:c19b7c6f923b580a"
       ]
     },
     {
@@ -47777,8 +53017,20 @@
         "cargo:httparse@1.10.1:c19b7c6f923b580a",
         "cargo:log@0.4.33:c19b7c6f923b580a",
         "cargo:rand@0.9.4:c19b7c6f923b580a",
+        "cargo:rustls-pki-types@1.14.1:c19b7c6f923b580a",
+        "cargo:rustls@0.23.46:c19b7c6f923b580a",
         "cargo:sha1@0.10.6:c19b7c6f923b580a",
-        "cargo:thiserror@2.0.18:c19b7c6f923b580a"
+        "cargo:thiserror@2.0.18:c19b7c6f923b580a",
+        "cargo:url@2.5.8:c19b7c6f923b580a",
+        "cargo:webpki-roots@0.26.11:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:two-face@0.4.5:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:serde@1.0.228:c19b7c6f923b580a",
+        "cargo:serde_derive@1.0.228:c19b7c6f923b580a",
+        "cargo:syntect@5.3.0:c19b7c6f923b580a"
       ]
     },
     {
@@ -47870,6 +53122,13 @@
       "dependsOn": [
         "cargo:crypto-common@0.1.7:c19b7c6f923b580a",
         "cargo:subtle@2.6.1:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:universal-hash@0.6.1:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:crypto-common@0.2.2:c19b7c6f923b580a",
+        "cargo:ctutils@0.4.8:c19b7c6f923b580a"
       ]
     },
     {
@@ -47995,6 +53254,15 @@
       "dependsOn": [
         "cargo:value-bag-serde1@1.13.0:c19b7c6f923b580a",
         "cargo:value-bag-sval2@1.13.0:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:value-trait@0.12.3:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:float-cmp@0.10.0:c19b7c6f923b580a",
+        "cargo:halfbrown@0.4.0:c19b7c6f923b580a",
+        "cargo:itoa@1.0.18:c19b7c6f923b580a",
+        "cargo:ryu@1.0.23:c19b7c6f923b580a"
       ]
     },
     {
@@ -48251,6 +53519,7 @@
         "cargo:base64@0.22.1:c19b7c6f923b580a",
         "cargo:bzip2@0.6.1:c19b7c6f923b580a",
         "cargo:chrono@0.4.45:c19b7c6f923b580a",
+        "cargo:ed25519-dalek@2.2.0:c19b7c6f923b580a",
         "cargo:flate2@1.1.9:c19b7c6f923b580a",
         "cargo:fs2@0.4.3:c19b7c6f923b580a",
         "cargo:futures-util@0.3.34:c19b7c6f923b580a",
@@ -48285,6 +53554,7 @@
         "cargo:vibex-git@0.1.5:b6ca7a78bc73d037",
         "cargo:vibex-model-catalog@0.1.5:1bc02d71b534700b",
         "cargo:vibex-model-gateway@0.1.5:5811db0c4b687e85",
+        "cargo:vibex-plugin@0.1.2:12552dcdfe0d9755",
         "cargo:vibex-relay@0.1.5:0c0a0267098c7864",
         "cargo:vibex-remote@0.1.5:b2402acf3d0333d8",
         "cargo:vibex-terminal-ui@0.1.5:81e25774d4aead5f",
@@ -48297,7 +53567,7 @@
       "ref": "cargo:vibex-desktop@0.1.5:8be20e5fa4f9b6f0",
       "dependsOn": [
         "asset:vibex-desktop-application-icons:6d723c8f201e9676",
-        "asset:vibex-desktop-reviewed-icons:c8c6ded0716093ba",
+        "asset:vibex-desktop-reviewed-icons:6476740c05075551",
         "cargo:anyhow@1.0.102:c19b7c6f923b580a",
         "cargo:base64@0.22.1:c19b7c6f923b580a",
         "cargo:chrono@0.4.45:c19b7c6f923b580a",
@@ -48305,13 +53575,14 @@
         "cargo:futures-channel@0.3.34:c19b7c6f923b580a",
         "cargo:futures-util@0.3.34:c19b7c6f923b580a",
         "cargo:glob@0.3.3:c19b7c6f923b580a",
-        "cargo:gpui-base@0.9.1:c19b7c6f923b580a",
-        "cargo:gpui-component@0.9.1:c19b7c6f923b580a",
-        "cargo:gpui-fps@0.9.1:c19b7c6f923b580a",
-        "cargo:gpui-kit-assets@0.9.1:c19b7c6f923b580a",
+        "cargo:gpui-base@0.9.1:21b891abfaccca05",
+        "cargo:gpui-component@0.9.1:21b891abfaccca05",
+        "cargo:gpui-fps@0.9.1:21b891abfaccca05",
+        "cargo:gpui-kit-assets@0.9.1:21b891abfaccca05",
         "cargo:gpui-pre-platform@0.3.12:c19b7c6f923b580a",
         "cargo:gpui-pre-wgpu@0.3.12:c19b7c6f923b580a",
         "cargo:gpui-pre@0.3.12:c19b7c6f923b580a",
+        "cargo:gpui-shell@0.9.1:21b891abfaccca05",
         "cargo:gpui-tokio@0.1.5:a9a8ee941163297c",
         "cargo:gtk@0.19.0:c19b7c6f923b580a",
         "cargo:image@0.25.10:c19b7c6f923b580a",
@@ -48324,6 +53595,7 @@
         "cargo:reqwest@0.13.4:c19b7c6f923b580a",
         "cargo:resvg@0.46.0:c19b7c6f923b580a",
         "cargo:rfd@0.17.2:c19b7c6f923b580a",
+        "cargo:rustls@0.23.46:c19b7c6f923b580a",
         "cargo:semver@1.0.28:c19b7c6f923b580a",
         "cargo:serde@1.0.228:c19b7c6f923b580a",
         "cargo:serde_json@1.0.150:c19b7c6f923b580a",
@@ -48349,6 +53621,7 @@
         "cargo:vibex-core@0.1.5:a1f32ad3e304847a",
         "cargo:vibex-desktop-model@0.1.5:3eccb8226f5ee757",
         "cargo:vibex-desktop-runtime@0.1.5:7b92bf06aa544433",
+        "cargo:vibex-plugin@0.1.2:12552dcdfe0d9755",
         "cargo:vibex-remote-client@0.1.5:fbf177affd133cad",
         "cargo:vibex-terminal@0.1.5:73363de7836b4dd0",
         "cargo:vibex-tui@0.1.5:97b7354da06442ef",
@@ -48431,6 +53704,28 @@
         "cargo:vibex-config-switch@0.1.5:15ba9694989d1411",
         "cargo:vibex-core@0.1.5:a1f32ad3e304847a",
         "cargo:vibex-db@0.1.5:b0d5d96e1f6cacc2"
+      ]
+    },
+    {
+      "ref": "cargo:vibex-plugin@0.1.2:12552dcdfe0d9755",
+      "dependsOn": [
+        "cargo:async-trait@0.1.92:c19b7c6f923b580a",
+        "cargo:base64@0.22.1:c19b7c6f923b580a",
+        "cargo:ed25519-dalek@2.2.0:c19b7c6f923b580a",
+        "cargo:futures-util@0.3.34:c19b7c6f923b580a",
+        "cargo:rand_core@0.6.4:c19b7c6f923b580a",
+        "cargo:reqwest@0.13.4:c19b7c6f923b580a",
+        "cargo:rusqlite@0.37.0:c19b7c6f923b580a",
+        "cargo:semver@1.0.28:c19b7c6f923b580a",
+        "cargo:serde@1.0.228:c19b7c6f923b580a",
+        "cargo:serde_json@1.0.150:c19b7c6f923b580a",
+        "cargo:sha2@0.10.9:c19b7c6f923b580a",
+        "cargo:thiserror@2.0.18:c19b7c6f923b580a",
+        "cargo:tokio@1.52.3:c19b7c6f923b580a",
+        "cargo:url@2.5.8:c19b7c6f923b580a",
+        "cargo:vibex-core@0.1.5:a1f32ad3e304847a",
+        "cargo:vibex-db@0.1.5:b0d5d96e1f6cacc2",
+        "cargo:zip@9.1.3:c19b7c6f923b580a"
       ]
     },
     {
@@ -48567,7 +53862,7 @@
         "asset:vibex-mobile-application-icons:b690a33c976cf781",
         "asset:vibex-mobile-brand-marks:84a77e160e305979",
         "asset:vibex-mobile-native-icons:60418f3d673b6ca6",
-        "cargo:gpui-component@0.9.1:c19b7c6f923b580a",
+        "cargo:gpui-component@0.9.1:21b891abfaccca05",
         "cargo:gpui-pre@0.3.12:c19b7c6f923b580a",
         "cargo:markdown@1.0.0:c19b7c6f923b580a",
         "cargo:percent-encoding@2.3.2:c19b7c6f923b580a",
@@ -48580,6 +53875,10 @@
         "cargo:vibex-terminal-ui@0.1.5:81e25774d4aead5f",
         "font:vibex-mobile-android-emoji:f1b204593bacbc43"
       ]
+    },
+    {
+      "ref": "cargo:vsimd@0.8.0:c19b7c6f923b580a",
+      "dependsOn": []
     },
     {
       "ref": "cargo:vswhom-sys@0.1.3:c19b7c6f923b580a",
@@ -48799,6 +54098,18 @@
     },
     {
       "ref": "cargo:webpki-root-certs@1.0.8:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:rustls-pki-types@1.14.1:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:webpki-roots@0.26.11:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:webpki-roots@1.0.12:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:webpki-roots@1.0.12:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:rustls-pki-types@1.14.1:c19b7c6f923b580a"
       ]
@@ -49434,6 +54745,13 @@
       ]
     },
     {
+      "ref": "cargo:winx@0.36.4:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:bitflags@2.13.0:c19b7c6f923b580a",
+        "cargo:windows-sys@0.59.0:c19b7c6f923b580a"
+      ]
+    },
+    {
       "ref": "cargo:wio@0.2.2:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:winapi@0.3.9:c19b7c6f923b580a"
@@ -49442,6 +54760,15 @@
     {
       "ref": "cargo:wit-bindgen@0.46.0:c19b7c6f923b580a",
       "dependsOn": []
+    },
+    {
+      "ref": "cargo:wnaf@0.14.1:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:ff@0.14.0:c19b7c6f923b580a",
+        "cargo:group@0.14.0:c19b7c6f923b580a",
+        "cargo:hybrid-array@0.4.13:c19b7c6f923b580a",
+        "cargo:primefield@0.14.0:c19b7c6f923b580a"
+      ]
     },
     {
       "ref": "cargo:writeable@0.6.4:c19b7c6f923b580a",
@@ -49475,6 +54802,14 @@
         "cargo:curve25519-dalek@4.1.3:c19b7c6f923b580a",
         "cargo:rand_core@0.6.4:c19b7c6f923b580a",
         "cargo:serde@1.0.228:c19b7c6f923b580a",
+        "cargo:zeroize@1.9.0:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:x25519-dalek@3.0.0:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:curve25519-dalek@5.0.0:c19b7c6f923b580a",
+        "cargo:rand_core@0.10.1:c19b7c6f923b580a",
         "cargo:zeroize@1.9.0:c19b7c6f923b580a"
       ]
     },
