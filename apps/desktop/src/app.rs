@@ -120,10 +120,10 @@ use vibex_core::{
     AgentAuthContextStatus, AgentAuthContextVerifyRequest, AgentAuthMethodEffect,
     AgentAuthMethodKind, AgentAuthenticationOperationId, AgentBuiltinTool,
     AgentCommandDiscoverRequest, AgentCommandEntry, AgentCommandExecuteRequest,
-    AgentCommandExecutionBehavior, AgentCommandSelectionBehavior, AgentCommandSourceKind,
-    AgentCommandTrigger, AgentGoalControlRequest, AgentId, AgentListRequest,
-    AgentManagedInstallStatus, AgentMessagePhase, AgentSession, AgentSessionRuntimeSelectionState,
-    AgentSessionSafety, AgentSessionState, AgentSnapshotEntry, AgentTimelineDisplaySettings,
+    AgentCommandExecutionBehavior, AgentCommandSourceKind, AgentCommandTrigger,
+    AgentGoalControlRequest, AgentId, AgentListRequest, AgentManagedInstallStatus,
+    AgentMessagePhase, AgentSession, AgentSessionRuntimeSelectionState, AgentSessionSafety,
+    AgentSessionState, AgentSnapshotEntry, AgentTimelineDisplaySettings,
     AgentTimelineReasoningDisplayMode, AgentTokenUsage, AgentToolPreferences, AttachRuntimeRequest,
     BrowserCaptureQuality, BrowserDataClearReport, BrowserLoginImportReport,
     BrowserLoginImportRequest, BrowserProfileSource, CancelAgentSessionRuntimeSwitchRequest,
@@ -193,9 +193,9 @@ use vibex_desktop_model::{
 };
 use vibex_desktop_runtime::DriverState;
 use vibex_desktop_runtime::{
-    AuthoritativeRefetch, COMPOSER_AGENT_REFERENCE_KEY, COMPOSER_SELECTION_REFERENCE_KEY,
-    DesktopEvent, DesktopEventStream, DesktopRuntime, DesktopRuntimeConfig, DesktopRuntimeFacade,
-    DesktopRuntimeMode, LocalClientsSnapshot, PREVIEW_APP_ID, ProviderConfigChangePhase, RC_APP_ID,
+    AuthoritativeRefetch, COMPOSER_AGENT_REFERENCE_KEY, DesktopEvent, DesktopEventStream,
+    DesktopRuntime, DesktopRuntimeConfig, DesktopRuntimeFacade, DesktopRuntimeMode,
+    LocalClientsSnapshot, PREVIEW_APP_ID, ProviderConfigChangePhase, RC_APP_ID,
     STABLE_DESKTOP_APP_ID, SessionGroupPresentationRequest, SidebarOrganizationRequest,
     StorageCleanupKind, StorageCleanupReport, runtime_option_ref, validate_external_open_url,
 };
@@ -1311,7 +1311,6 @@ const COMPOSER_SUGGESTION_MAX_ROWS: usize = 50;
 /// These rows never travel to the authority: they are the second layer of the
 /// `@` popup, built from the catalogue this client already holds.
 const COMPOSER_DELEGATION_EDIT_AGENT_KEY: &str = "vibexUseDelegationEditAgent";
-const COMPOSER_DELEGATION_EDIT_SELECTION_KEY: &str = "vibexUseDelegationEditSelection";
 const NEW_SESSION_RUNTIME_MENU_MAX_HEIGHT: f32 = 360.0;
 const NEW_SESSION_RUNTIME_MENU_MIN_HEIGHT: f32 = 104.0;
 const RUNTIME_MENU_VIEWPORT_MARGIN: f32 = 12.0;
@@ -1894,152 +1893,6 @@ fn delegation_agent_id(entry: &AgentCommandEntry) -> Option<AgentId> {
                 .and_then(|rest| rest.split(':').next())
                 .and_then(|id| AgentId::parse(id).ok())
         })
-}
-
-/// The runtime option ref one delegation row carries.
-fn delegation_selection_ref(entry: &AgentCommandEntry) -> Option<&str> {
-    entry
-        .metadata
-        .iter()
-        .find(|metadata| {
-            metadata.key == COMPOSER_SELECTION_REFERENCE_KEY
-                || metadata.key == COMPOSER_DELEGATION_EDIT_SELECTION_KEY
-        })
-        .map(|metadata| metadata.value.as_str())
-}
-
-/// One row per available configuration of `agent_id`, for the delegation
-/// panel's edit layer.
-///
-/// The configuration the row already carries leads, then the models the reader
-/// uses most, then catalogue order. Each row is a client-only choice: its
-/// metadata names the Agent and the option to write down, not a mention to
-/// insert.
-fn delegation_runtime_edit_entries(
-    catalog: &SessionRuntimeOptionCatalog,
-    agent_id: &AgentId,
-    selected: Option<&SessionRuntimeSelection>,
-    usage: &BTreeMap<String, u64>,
-) -> Vec<AgentCommandEntry> {
-    let mut options = catalog
-        .options
-        .iter()
-        .filter(|option| {
-            &option.selection.agent_id == agent_id
-                && option.availability == vibex_core::RuntimeOptionAvailability::Available
-        })
-        .collect::<Vec<_>>();
-    options.sort_by_key(|option| {
-        let selected = selected.is_some_and(|selected| {
-            runtime_selection_identity_matches(&option.selection, selected)
-        });
-        let uses = runtime_selection_use_count(usage, &option.selection);
-        (!selected, std::cmp::Reverse(uses))
-    });
-    options
-        .into_iter()
-        .map(|option| AgentCommandEntry {
-            id: format!(
-                "delegation-edit:{}:{}",
-                agent_id.as_str(),
-                runtime_option_ref(option)
-            ),
-            trigger: AgentCommandTrigger::Mention,
-            source_kind: AgentCommandSourceKind::Reference,
-            label: format!("@{}", option.model_label),
-            description: Some(option.auth_source_label.clone()),
-            insertion_text: String::new(),
-            command_name: None,
-            provider_kind: Some(vibex_core::ProviderKind::Acp),
-            prompt_id: None,
-            skill_id: None,
-            reference_path: None,
-            selection_behavior: AgentCommandSelectionBehavior::Insert,
-            execution_behavior: AgentCommandExecutionBehavior::None,
-            destructive: false,
-            metadata: vec![
-                vibex_core::ProviderBindingMetadata {
-                    key: COMPOSER_DELEGATION_EDIT_AGENT_KEY.to_string(),
-                    value: agent_id.as_str().to_string(),
-                },
-                vibex_core::ProviderBindingMetadata {
-                    key: COMPOSER_DELEGATION_EDIT_SELECTION_KEY.to_string(),
-                    value: runtime_option_ref(option),
-                },
-            ],
-        })
-        .collect()
-}
-
-/// The Agent and selection a click on one configuration row chooses.
-fn delegation_edit_target(entry: &AgentCommandEntry) -> Option<(AgentId, String)> {
-    let agent_id = entry
-        .metadata
-        .iter()
-        .find(|metadata| metadata.key == COMPOSER_DELEGATION_EDIT_AGENT_KEY)
-        .and_then(|metadata| AgentId::parse(&metadata.value).ok())?;
-    let selection_ref = entry
-        .metadata
-        .iter()
-        .find(|metadata| metadata.key == COMPOSER_DELEGATION_EDIT_SELECTION_KEY)
-        .map(|metadata| metadata.value.clone())?;
-    Some((agent_id, selection_ref))
-}
-
-/// The description one runtime option shows beside its Agent.
-///
-/// Mirrors the authority's own projection so a row the client re-points reads
-/// the same as the row the next discovery sends.
-fn delegation_runtime_description(option: &SessionRuntimeOption) -> String {
-    let mut parts = vec![
-        option.auth_source_label.as_str(),
-        option.model_label.as_str(),
-    ];
-    for (selected, choices) in [
-        (option.selection.mode_id.as_deref(), &option.modes),
-        (
-            option.selection.reasoning_effort.as_deref(),
-            &option.reasoning_efforts,
-        ),
-    ] {
-        if let Some(selected) = selected {
-            parts.push(
-                choices
-                    .iter()
-                    .find(|choice| choice.value == selected)
-                    .and_then(|choice| choice.label.as_deref())
-                    .unwrap_or(selected),
-            );
-        }
-    }
-    parts.join(" · ")
-}
-
-/// Points one delegation entry at `option`.
-///
-/// Only the reference and the labels move: the row still names the same Agent,
-/// and the send path reads the same two metadata keys it read before.
-fn apply_delegation_selection_to_entry(
-    entry: &mut AgentCommandEntry,
-    agent_id: &AgentId,
-    option: &SessionRuntimeOption,
-) {
-    let selection_ref = runtime_option_ref(option);
-    entry.id = format!("reference:agent:{}:{selection_ref}", agent_id.as_str());
-    entry.label = format!("@{}", option.agent_label);
-    entry.description = Some(delegation_runtime_description(option));
-    entry.metadata.retain(|metadata| {
-        metadata.key != COMPOSER_AGENT_REFERENCE_KEY
-            && metadata.key != COMPOSER_SELECTION_REFERENCE_KEY
-    });
-    entry.metadata.push(vibex_core::ProviderBindingMetadata {
-        key: COMPOSER_AGENT_REFERENCE_KEY.to_string(),
-        value: agent_id.as_str().to_string(),
-    });
-    entry.metadata.push(vibex_core::ProviderBindingMetadata {
-        key: COMPOSER_SELECTION_REFERENCE_KEY.to_string(),
-        value: selection_ref,
-    });
 }
 
 /// One row of the composer's `/` popup, without the app-specific handlers the
@@ -5969,9 +5822,7 @@ pub struct SessionView {
     /// While this is set the popup shows that Agent's available
     /// configurations instead of the collaborator list; choosing one writes
     /// the row's explicit delegation selection.
-    delegation_edit_agent: Option<AgentId>,
     /// The rows of the open delegation configuration picker.
-    delegation_edit_entries: Vec<AgentCommandEntry>,
     suggestion_tab: ComposerSuggestionTab,
     suggestion_selection: ComposerSuggestionSelection,
     /// Which half of the selected delegation row owns Enter.
@@ -6119,8 +5970,6 @@ impl SessionView {
             phrase_suggestions: Vec::new(),
             delegation_suggestions: Vec::new(),
             session_suggestions: Vec::new(),
-            delegation_edit_agent: None,
-            delegation_edit_entries: Vec::new(),
             suggestion_tab: ComposerSuggestionTab::default(),
             suggestion_selection: ComposerSuggestionSelection::default(),
             suggestion_delegation_action: ComposerDelegationAction::default(),
@@ -28887,6 +28736,30 @@ impl VibexWorkbench {
         self.runtime_selection_for_session(&session_id)
     }
 
+    /// The `@Agent` chip the composer's runtime controls are tuning, if any.
+    ///
+    /// Reads the draft's tokens and the caret. `None` means the controls belong
+    /// to the session, which is the ordinary state and the one every caller
+    /// predating delegation assumes.
+    fn composer_delegation_subject(&self, cx: &App) -> Option<VibexUseMention> {
+        let input = self.composer_input.as_ref()?;
+        let input = input.read(cx);
+        delegation_edit_subject(input.tokens(), input.cursor())
+    }
+
+    /// The runtime selection the composer's controls should show.
+    ///
+    /// A draft that is tuning a collaborator shows that collaborator's
+    /// selection; otherwise it shows the session's. The cascade only needs a
+    /// selection, so the same controls serve both without a second widget.
+    fn composer_runtime_selection(&self, cx: &App) -> Option<SessionRuntimeSelection> {
+        let Some(mention) = self.composer_delegation_subject(cx) else {
+            return self.view_runtime_selection();
+        };
+        let catalog = self.runtime_catalog.as_deref()?;
+        delegation_chip_option(catalog, &mention).map(|option| option.selection.clone())
+    }
+
     /// The runtime selection a session renders, selected or not.
     fn runtime_selection_for_session(
         &self,
@@ -33063,8 +32936,6 @@ impl VibexWorkbench {
         self.phrase_suggestions.clear();
         self.delegation_suggestions.clear();
         self.session_suggestions.clear();
-        self.delegation_edit_agent = None;
-        self.delegation_edit_entries.clear();
         self.suggestion_tab = ComposerSuggestionTab::default();
         self.suggestion_selection.dismiss();
         self.suggestion_delegation_action = ComposerDelegationAction::default();
@@ -33235,17 +33106,6 @@ impl VibexWorkbench {
         };
         if self.suggestion_context.as_ref() == Some(&context) {
             return;
-        }
-        // Typing while a delegation configuration picker is open means the
-        // reader moved back to naming a file or collaborator: the picker is a
-        // layer of the old query, not a second mode of the composer.
-        if self
-            .suggestion_context
-            .as_ref()
-            .is_some_and(|current| current.request.query.as_deref() != request.query.as_deref())
-        {
-            self.delegation_edit_agent = None;
-            self.delegation_edit_entries.clear();
         }
         let preserve_rows = self
             .suggestion_context
@@ -33431,13 +33291,6 @@ impl VibexWorkbench {
 
     /// The rows the popup is showing right now.
     fn visible_suggestions(&self) -> &[AgentCommandEntry] {
-        // The delegation tab's second layer: one Agent's configurations, so
-        // the reader can choose the provider/model the row will carry.
-        if self.delegation_edit_agent.is_some()
-            && self.active_suggestion_tab() == ComposerSuggestionTab::Delegation
-        {
-            return &self.delegation_edit_entries;
-        }
         self.active_suggestion_tab().rows(
             &self.suggestions,
             &self.phrase_suggestions,
@@ -33483,8 +33336,6 @@ impl VibexWorkbench {
         if next == self.active_suggestion_tab() {
             return false;
         }
-        self.delegation_edit_agent = None;
-        self.delegation_edit_entries.clear();
         self.suggestion_tab = next;
         self.reseat_suggestion_selection(true);
         cx.notify();
@@ -33748,15 +33599,7 @@ impl VibexWorkbench {
                 cx.stop_propagation();
             }
             ComposerSuggestionAction::Dismiss => {
-                // Escape leaves the configuration layer first; only the next
-                // press closes the popup the reader came from.
-                if self.delegation_edit_agent.is_some() {
-                    self.delegation_edit_agent = None;
-                    self.delegation_edit_entries.clear();
-                    self.reseat_suggestion_selection(true);
-                } else {
-                    self.clear_suggestions();
-                }
+                self.clear_suggestions();
                 cx.stop_propagation();
                 cx.notify();
             }
@@ -33782,161 +33625,6 @@ impl VibexWorkbench {
         }
     }
 
-    /// Opens the delegation tab's configuration layer for one Agent.
-    ///
-    /// The rows are built from the catalogue this client already holds, so the
-    /// picker opens without another round trip. The row the Agent currently
-    /// carries leads; the rest keep the reader's use order.
-    fn open_delegation_runtime_edit(&mut self, agent_id: AgentId, cx: &mut Context<Self>) {
-        let Some(catalog) = self.runtime_catalog.as_deref() else {
-            return;
-        };
-        let selected = self
-            .delegation_suggestions
-            .iter()
-            .find(|entry| delegation_agent_id(entry).as_ref() == Some(&agent_id))
-            .and_then(delegation_selection_ref)
-            .and_then(|reference| {
-                catalog
-                    .options
-                    .iter()
-                    .find(|option| runtime_option_ref(option) == reference)
-            })
-            .map(|option| option.selection.clone());
-        let entries = delegation_runtime_edit_entries(
-            catalog,
-            &agent_id,
-            selected.as_ref(),
-            &self.ui_state.composer.runtime_selection_usage,
-        );
-        if entries.is_empty() {
-            return;
-        }
-        self.delegation_edit_agent = Some(agent_id);
-        self.delegation_edit_entries = entries;
-        self.suggestion_tab = ComposerSuggestionTab::Delegation;
-        self.suggestion_selection.dismiss();
-        self.reseat_suggestion_selection(true);
-        self.suggestion_scroll.scroll_to_item(0);
-        cx.notify();
-    }
-
-    /// Writes down the configuration the reader picked for one Agent and
-    /// re-points its delegation row at it.
-    ///
-    /// The choice lives in the UI state the authority reads, so it outlives the
-    /// popup and a restart, and applies to the next discovery as well as the
-    /// row on screen.
-    fn apply_delegation_edit_choice(
-        &mut self,
-        target: ComposerTarget,
-        agent_id: AgentId,
-        selection_ref: String,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(option) = self
-            .runtime_catalog
-            .as_deref()
-            .and_then(|catalog| {
-                catalog.options.iter().find(|option| {
-                    option.availability == vibex_core::RuntimeOptionAvailability::Available
-                        && runtime_option_ref(option) == selection_ref
-                })
-            })
-            .cloned()
-        else {
-            return;
-        };
-        let selection = option.selection.clone();
-        self.ui_state
-            .composer
-            .delegation_runtime_selections_by_agent
-            .insert(agent_id.clone(), selection.clone());
-        self.ui_state
-            .composer
-            .record_runtime_selection_use(&selection);
-        self.delegation_edit_agent = None;
-        self.delegation_edit_entries.clear();
-        self.queue_ui_state();
-        // The authority picks the row's one configuration from the same file,
-        // so the write must be visible before a later discovery asks again.
-        if let Some(writer) = self.ui_writer.as_mut() {
-            let _ = writer.flush();
-        }
-        if let Some(entry) = self
-            .delegation_suggestions
-            .iter_mut()
-            .find(|entry| delegation_agent_id(entry).as_ref() == Some(&agent_id))
-        {
-            apply_delegation_selection_to_entry(entry, &agent_id, &option);
-        }
-        // A draft may already carry this Agent's chip. It names the same
-        // collaborator but still remembers the old configuration; leaving it
-        // would make the message disagree with the row the reader just edited.
-        self.rewrite_delegation_mention_tokens(target, &agent_id, &option, window, cx);
-        self.suggestion_tab = ComposerSuggestionTab::Delegation;
-        let edited = self
-            .delegation_suggestions
-            .iter()
-            .position(|entry| delegation_agent_id(entry).as_ref() == Some(&agent_id));
-        self.reseat_suggestion_selection(true);
-        if let Some(index) = edited {
-            self.suggestion_selection.selected_index = Some(index);
-            self.suggestion_scroll.scroll_to_item(index);
-        }
-        cx.notify();
-    }
-
-    /// Re-points every `@Agent` chip already in `target`'s draft at `option`.
-    ///
-    /// The chip's visible label is only `@Agent`; the configuration lives in
-    /// the encoded mention id. Editing the row must therefore rewrite that id
-    /// too, or the next send would carry the configuration the reader just
-    /// replaced.
-    fn rewrite_delegation_mention_tokens(
-        &mut self,
-        target: ComposerTarget,
-        agent_id: &AgentId,
-        option: &SessionRuntimeOption,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(input) = self.input_for_composer_target(target) else {
-            return;
-        };
-        let Some(reference) = vibex_core::VibexUseRef::parse(&runtime_option_ref(option)) else {
-            return;
-        };
-        let updates = input
-            .read(cx)
-            .tokens()
-            .iter()
-            .filter_map(|span| {
-                let mention = VibexUseMention::parse(span.token().id().as_ref())?;
-                if mention.kind != vibex_core::VibexUseMentionKind::Agent
-                    || mention.agent_id.as_ref() != Some(agent_id)
-                {
-                    return None;
-                }
-                let next = VibexUseMention::agent(agent_id, &reference, None);
-                Some((
-                    span.range(),
-                    InlineToken::new(next.encode(), span.token().text().clone())
-                        .with_label(span.token().label().to_string()),
-                ))
-            })
-            .collect::<Vec<_>>();
-        if updates.is_empty() {
-            return;
-        }
-        input.update(cx, |input, cx| {
-            for (range, token) in updates {
-                let _ = input.replace_range_with_token(range, token, window, cx);
-            }
-        });
-    }
-
     fn apply_suggestion(
         &mut self,
         target: ComposerTarget,
@@ -33945,13 +33633,6 @@ impl VibexWorkbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // A configuration row in the delegation tab's edit layer is not a
-        // mention: it writes the Agent's explicit delegation choice and leaves
-        // the draft untouched.
-        if let Some((agent_id, selection_ref)) = delegation_edit_target(&entry) {
-            self.apply_delegation_edit_choice(target, agent_id, selection_ref, window, cx);
-            return;
-        }
         let Some(input) = self.input_for_composer_target(target) else {
             return;
         };
@@ -34829,7 +34510,36 @@ impl VibexWorkbench {
                 .take(vibex_core::VIBEX_USE_TITLE_CHARS)
                 .collect(),
         );
-        request.runtime_option_ref = Some(selection_ref);
+        // The chip is the source of truth for a tuned delegation: it carries the
+        // option reference *and* the depth, mode and feature values the reader
+        // set on it. Reading both from the same place is what keeps the
+        // reference and its overrides from disagreeing; a side table keyed by
+        // Agent could only hold one configuration no matter how many times the
+        // draft named that Agent.
+        let chip_selection = self
+            .runtime_catalog
+            .as_deref()
+            .and_then(|catalog| {
+                composer_mentions(composer_input.read(cx).tokens())
+                    .into_iter()
+                    .find(|mention| {
+                        mention.kind == vibex_core::VibexUseMentionKind::Agent
+                            && mention.agent_id.as_ref().map(AgentId::as_str)
+                                == Some(agent_id.as_str())
+                    })
+                    .and_then(|mention| delegation_chip_option(catalog, &mention))
+            })
+            .map(|option| option.selection.clone());
+        if let Some(selection) = chip_selection {
+            request.runtime_option_ref = Some(vibex_core::VibexUseRef::runtime_option(
+                &vibex_desktop_runtime::selection_fingerprint(&selection),
+            ));
+            request.reasoning_effort = selection.reasoning_effort.clone();
+            request.mode_id = selection.mode_id.clone();
+            request.config_values = selection.config_values.clone();
+        } else {
+            request.runtime_option_ref = Some(selection_ref);
+        }
         request.attachments = attachments;
         request.context_refs = mentions
             .iter()
@@ -42936,11 +42646,76 @@ impl VibexWorkbench {
         self.composer_runtime_menu_auth_source = None;
         self.begin_runtime_menu_close(window, cx);
         self.record_runtime_selection_use(&selection);
+        // A draft that is tuning a collaborator owns this choice: it rewrites
+        // the chip the caret is on, and the session keeps the runtime it had.
+        // Switching the session instead would silently move the reader's own
+        // conversation while they were configuring somebody else's work.
+        if let Some(agent_id) = self
+            .composer_delegation_subject(cx)
+            .and_then(|mention| mention.agent_id)
+        {
+            self.apply_delegation_chip_selection(&agent_id, &selection, window, cx);
+            return;
+        }
         if self.selected_session_runtime_uninitialized() {
             self.initialize_uninitialized_session_runtime(selection, cx);
             return;
         }
         self.request_runtime_selection(selection, false, cx);
+    }
+
+    /// Writes one tuned selection into the chip the reader is editing.
+    ///
+    /// The chip's encoded id is the whole contract: a draft, a clipboard copy
+    /// and a remote client all read the configuration from it, so the tuning
+    /// travels with the mention instead of living in a side table keyed by
+    /// Agent — which could only ever hold one configuration per Agent, no
+    /// matter how many times the draft named it.
+    fn apply_delegation_chip_selection(
+        &mut self,
+        agent_id: &AgentId,
+        selection: &SessionRuntimeSelection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(input) = self.input_for_composer_target(ComposerTarget::Session) else {
+            return;
+        };
+        let reference = vibex_core::VibexUseRef::runtime_option(
+            &vibex_desktop_runtime::selection_fingerprint(selection),
+        );
+        let updates = input
+            .read(cx)
+            .tokens()
+            .iter()
+            .filter_map(|span| {
+                let mention = VibexUseMention::parse(span.token().id().as_ref())?;
+                if mention.kind != vibex_core::VibexUseMentionKind::Agent
+                    || mention.agent_id.as_ref() != Some(agent_id)
+                {
+                    return None;
+                }
+                let next = VibexUseMention::agent(agent_id, &reference, None);
+                Some((
+                    span.range(),
+                    InlineToken::new(next.encode(), span.token().text().clone())
+                        .with_label(span.token().label().to_string()),
+                ))
+            })
+            .collect::<Vec<_>>();
+        if updates.is_empty() {
+            // No chip to tune after all (the caret moved while the menu was
+            // open); fall back to the session so the choice is not dropped.
+            self.request_runtime_selection(selection.clone(), false, cx);
+            return;
+        }
+        input.update(cx, |input, cx| {
+            for (range, token) in updates {
+                let _ = input.replace_range_with_token(range, token, window, cx);
+            }
+        });
+        self.remember_composer_draft(cx);
+        cx.notify();
     }
 
     fn initialize_uninitialized_session_runtime(
@@ -66372,11 +66147,69 @@ impl VibexWorkbench {
             window.prevent_default();
             cx.stop_propagation();
         })
-        .on_click(cx.listener(move |this, _, _, cx| {
+        .on_click(cx.listener(move |this, _, window, cx| {
             cx.stop_propagation();
-            this.open_delegation_runtime_edit(agent_id.clone(), cx);
+            this.tune_delegation_chip(&agent_id, window, cx);
         }))
         .into_any_element()
+    }
+
+    /// Puts the caret on one collaborator's chip so the runtime controls edit it.
+    ///
+    /// This replaces a separate panel that listed every Agent × provider × model
+    /// combination: the composer already has the controls that change provider,
+    /// model, depth, mode and features, and they already sit beside the draft
+    /// the reader is writing. Reusing them keeps one place to look, scales to
+    /// any number of Agents, and means the chip — not a side table — is what
+    /// remembers the choice.
+    ///
+    /// A draft that does not name this Agent yet gets the chip inserted at the
+    /// caret, which is the same gesture as picking it from the popup.
+    fn tune_delegation_chip(
+        &mut self,
+        agent_id: &AgentId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(input) = self.input_for_composer_target(ComposerTarget::Session) else {
+            return;
+        };
+        let existing = input.read(cx).tokens().iter().find_map(|span| {
+            let mention = VibexUseMention::parse(span.token().id().as_ref())?;
+            (mention.kind == vibex_core::VibexUseMentionKind::Agent
+                && mention.agent_id.as_ref() == Some(agent_id))
+            .then(|| span.range())
+        });
+        if let Some(range) = existing {
+            input.update(cx, |input, cx| {
+                let end = range.end;
+                input.set_selected_range(end..end, cx);
+                input.focus(window, cx);
+            });
+            self.clear_suggestions();
+            cx.notify();
+            return;
+        }
+        let Some(entry) = self
+            .delegation_suggestions
+            .iter()
+            .find(|entry| delegation_agent_id(entry).as_ref() == Some(agent_id))
+            .cloned()
+        else {
+            return;
+        };
+        // No chip yet: insert it where the reader is typing, exactly as the
+        // popup would, and leave the caret after it so the controls take over.
+        let value = input.read(cx).value().to_string();
+        let selection = input.read(cx).selected_range();
+        let range = character_offset_to_byte(&value, selection.start)
+            ..character_offset_to_byte(&value, selection.end);
+        input.update(cx, |input, cx| {
+            replace_composer_trigger(input, &entry, range, window, cx);
+            input.focus(window, cx);
+        });
+        self.clear_suggestions();
+        cx.notify();
     }
 
     /// The `Mention | Delegate` half of one collaborator row.
@@ -74554,22 +74387,9 @@ impl VibexWorkbench {
             .map(|(index, entry)| {
                 let selected = self.suggestion_selection.selected_index == Some(index);
                 let selected_entry = entry.clone();
-                let editing_delegation = self.delegation_edit_agent.is_some();
-                let edit_agent_identity =
-                    self.delegation_edit_agent.as_ref().and_then(|agent_id| {
-                        self.agent_snapshots
-                            .iter()
-                            .find(|agent| &agent.id == agent_id)
-                            .map(agent_brand_identity)
-                    });
-                let agent_identity = if editing_delegation {
-                    edit_agent_identity.clone()
-                } else {
-                    self.composer_suggestion_agent_identity(&entry)
-                };
+                let agent_identity = self.composer_suggestion_agent_identity(&entry);
                 let agent_row = target == ComposerTarget::Session
                     && active_tab == ComposerSuggestionTab::Delegation
-                    && !editing_delegation
                     && composer_suggestion_is_agent(&entry);
                 let trailing = agent_row.then(|| {
                     h_flex()
@@ -74853,8 +74673,6 @@ impl VibexWorkbench {
         if !self.composer_suggestion_tabs_available(target) || self.active_suggestion_tab() == tab {
             return;
         }
-        self.delegation_edit_agent = None;
-        self.delegation_edit_entries.clear();
         self.suggestion_tab = tab;
         self.reseat_suggestion_selection(true);
         cx.notify();
@@ -76110,10 +75928,18 @@ impl VibexWorkbench {
         let generation_status = self.render_agent_generation_status(session_running, cx);
         let failover_prompt = self.render_failover_prompt(cx);
         let failover_notices = self.render_failover_notices(cx);
+        // The cascade edits one selection, so pointing it at the chip the caret
+        // is on turns the same controls into that collaborator's parameter
+        // panel. No mode, no second widget: move the caret off the chip and the
+        // next frame is the session's controls again.
+        let delegation_subject = self.composer_delegation_subject(cx);
+        let composer_runtime = self
+            .composer_runtime_selection(cx)
+            .or_else(|| selected_runtime.clone());
         // The catalog handle is shared and the projection memoized, so a group
         // workspace derives one projection per distinct selection per frame
         // instead of one per pane.
-        let runtime_projection = selected_runtime.as_ref().and_then(|selection| {
+        let runtime_projection = composer_runtime.as_ref().and_then(|selection| {
             let catalog = self.runtime_catalog.clone()?;
             let projection = self.runtime_cascade_projection_for(&catalog, selection);
             Some((selection.clone(), catalog, projection))
@@ -76985,6 +76811,36 @@ impl VibexWorkbench {
                                                     "開啟用量統計",
                                                 ),
                                             ))
+                                            .when_some(
+                                                delegation_subject.as_ref().and_then(|mention| {
+                                                    mention.agent_id.as_ref().map(|agent_id| {
+                                                        mention
+                                                            .label
+                                                            .clone()
+                                                            .unwrap_or_else(|| agent_id.to_string())
+                                                    })
+                                                }),
+                                                |row, agent_label| {
+                                                    // The same controls, pointed at somebody
+                                                    // else's work: say so, or the reader
+                                                    // cannot tell which session they are
+                                                    // tuning.
+                                                    row.child(
+                                                        Tag::color(ColorName::Blue)
+                                                            .xsmall()
+                                                            .rounded_full()
+                                                            .h(px(20.0))
+                                                            .px_2()
+                                                            .font_medium()
+                                                            .child(locale::text(
+                                                                "Delegating to",
+                                                                "委派给",
+                                                                "委派給",
+                                                            ))
+                                                            .child(format!(" {agent_label}")),
+                                                    )
+                                                },
+                                            )
                                             .child(runtime_controls_cascade),
                                     )
                                     .child(
@@ -83783,6 +83639,71 @@ fn composer_mentions(tokens: &[InlineTokenSpan]) -> Vec<VibexUseMention> {
         }
     }
     mentions
+}
+
+/// Which `@Agent` chip the runtime controls are editing, if any.
+///
+/// The composer's runtime cascade normally edits the session it belongs to. A
+/// draft that addresses a collaborator can instead tune *that* collaborator, and
+/// the controls are the same ones — the cascade only needs a selection, not a
+/// session. Rather than adding a mode the reader has to enter and leave, the
+/// subject is derived from what the draft already shows:
+///
+/// 1. the chip the caret sits in or immediately after,
+/// 2. else the only chip the draft carries,
+/// 3. else nothing, and the controls belong to the session.
+///
+/// A mode would have to answer "which chip?" the moment a draft names two, and
+/// would need an exit gesture for every way focus can leave a text field. This
+/// answers both by construction: delete the chip, or move the caret away, and
+/// the controls are the session's again.
+fn delegation_edit_subject(tokens: &[InlineTokenSpan], cursor: usize) -> Option<VibexUseMention> {
+    let agent_mentions = || {
+        tokens.iter().filter_map(|span| {
+            let mention = VibexUseMention::parse(span.token().id().as_ref())?;
+            (mention.kind == vibex_core::VibexUseMentionKind::Agent
+                && mention.agent_id.is_some()
+                && mention.reference.kind == vibex_core::VibexUseResourceKind::RuntimeOption)
+                .then_some((span.range(), mention))
+        })
+    };
+    // The caret just past a chip counts as being on it: a reader who typed
+    // `@Codex ` and stopped has their caret one character beyond the range.
+    if let Some((_, mention)) =
+        agent_mentions().find(|(range, _)| cursor >= range.start && cursor <= range.end)
+    {
+        return Some(mention);
+    }
+    let mut all = agent_mentions();
+    match (all.next(), all.next()) {
+        (Some((_, mention)), None) => Some(mention),
+        _ => None,
+    }
+}
+
+/// The catalogue entry an `@Agent` chip's reference names.
+///
+/// The chip carries a runtime option reference, which is a fingerprint of a
+/// complete selection. A tuned chip names a depth or a mode the catalogue does
+/// not publish as its own entry, so the lookup also accepts an entry whose
+/// selection carries the same Agent, source and model.
+fn delegation_chip_option<'a>(
+    catalog: &'a SessionRuntimeOptionCatalog,
+    mention: &VibexUseMention,
+) -> Option<&'a SessionRuntimeOption> {
+    let reference = mention.reference.as_uri();
+    let exact = catalog
+        .options
+        .iter()
+        .find(|option| runtime_option_ref(option) == reference);
+    if exact.is_some() {
+        return exact;
+    }
+    let agent_id = mention.agent_id.as_ref()?;
+    catalog
+        .options
+        .iter()
+        .find(|option| &option.selection.agent_id == agent_id)
 }
 
 /// Rebuilds editing tokens only from references the user already selected.
@@ -102761,6 +102682,128 @@ mod tests {
         }
     }
 
+    /// A draft's runtime controls follow the caret to the chip it is on.
+    ///
+    /// This is what replaces an explicit "delegation editing" mode: the subject
+    /// is derived, so there is no state to enter, leave, or leak. A caret on the
+    /// chip tunes it; a caret anywhere else with one chip still tunes it; two
+    /// chips and a caret away from both belongs to the session.
+    #[test]
+    fn the_delegation_subject_follows_the_caret_and_the_only_chip() {
+        let codex = AgentId::parse("codex").unwrap();
+        let claude = AgentId::parse("claude").unwrap();
+        let codex_mention = VibexUseMention::agent(
+            &codex,
+            &vibex_core::VibexUseRef::runtime_option("option_codex"),
+            Some("@Codex"),
+        );
+        let claude_mention = VibexUseMention::agent(
+            &claude,
+            &vibex_core::VibexUseRef::runtime_option("option_claude"),
+            Some("@Claude"),
+        );
+
+        // One chip, caret inside it.
+        let single = composer_content_with_mentions("@Codex fix it", &[codex_mention.clone()]);
+        assert_eq!(
+            delegation_edit_subject(single.tokens(), 2).and_then(|mention| mention.agent_id),
+            Some(codex.clone())
+        );
+        // One chip, caret far away: still that chip, because there is no other.
+        assert_eq!(
+            delegation_edit_subject(single.tokens(), 12).and_then(|mention| mention.agent_id),
+            Some(codex.clone())
+        );
+
+        // Two chips: the caret decides, and away from both there is no subject.
+        let both = composer_content_with_mentions(
+            "@Codex @Claude compare",
+            &[codex_mention.clone(), claude_mention.clone()],
+        );
+        assert_eq!(
+            delegation_edit_subject(both.tokens(), 1).and_then(|mention| mention.agent_id),
+            Some(codex.clone())
+        );
+        assert_eq!(
+            delegation_edit_subject(both.tokens(), 8).and_then(|mention| mention.agent_id),
+            Some(claude.clone())
+        );
+        assert_eq!(
+            delegation_edit_subject(both.tokens(), 20).and_then(|mention| mention.agent_id),
+            None,
+            "with two chips and the caret away from both, the session owns the controls"
+        );
+
+        // A caret just past a chip still counts as being on it: a reader who
+        // typed `@Codex ` and stopped has their caret one past the range.
+        let chip_end = both.tokens()[0].range().end;
+        assert_eq!(
+            delegation_edit_subject(both.tokens(), chip_end).and_then(|mention| mention.agent_id),
+            Some(codex)
+        );
+    }
+
+    /// A tuned chip still resolves to the catalogue entry it came from.
+    ///
+    /// The chip's reference fingerprints the whole selection, so a chip the
+    /// reader set to `high` names a configuration the catalogue never publishes
+    /// as its own entry. Falling back to the Agent's entry keeps the controls
+    /// usable; the reference itself still carries the tuning to the authority.
+    #[test]
+    fn a_tuned_chip_resolves_to_the_entry_it_tunes() {
+        let agent_id = AgentId::parse("codex").unwrap();
+        let option = SessionRuntimeOption {
+            selection: SessionRuntimeSelection::provider(
+                agent_id.clone(),
+                ProviderProfileId::parse("provider_local").unwrap(),
+                "gpt-5",
+            ),
+            agent_label: "Codex".to_string(),
+            auth_source_label: "Local".to_string(),
+            model_label: "gpt-5".to_string(),
+            reasoning_efforts: vec![SessionConfigValue {
+                value: "high".to_string(),
+                label: None,
+            }],
+            modes: Vec::new(),
+            features: Vec::new(),
+            availability: RuntimeOptionAvailability::Available,
+            member_count: 1,
+            auto_routes: false,
+        };
+        let catalog = SessionRuntimeOptionCatalog {
+            revision: 1,
+            agents: Vec::new(),
+            auth_sources: Vec::new(),
+            options: vec![option.clone()],
+        };
+
+        // The bare reference matches exactly.
+        let bare = VibexUseMention::agent(
+            &agent_id,
+            &vibex_core::VibexUseRef::parse(&runtime_option_ref(&option)).unwrap(),
+            None,
+        );
+        assert!(delegation_chip_option(&catalog, &bare).is_some());
+
+        // A tuned reference falls back to the Agent's entry rather than
+        // disappearing from the controls entirely.
+        let mut tuned = option.selection.clone();
+        tuned.reasoning_effort = Some("high".to_string());
+        let tuned_mention = VibexUseMention::agent(
+            &agent_id,
+            &vibex_core::VibexUseRef::runtime_option(
+                &vibex_desktop_runtime::selection_fingerprint(&tuned),
+            ),
+            None,
+        );
+        assert_eq!(
+            delegation_chip_option(&catalog, &tuned_mention)
+                .map(|entry| entry.selection.model_id().map(str::to_string)),
+            Some(Some("gpt-5".to_string()))
+        );
+    }
+
     fn availability_with(reason: Option<ComputerUnavailableReason>) -> ComputerAvailability {
         match reason {
             Some(reason) => ComputerAvailability {
@@ -107904,113 +107947,73 @@ mod tests {
     }
 
     #[test]
-    fn delegation_edit_rows_round_trip_the_agent_and_selection() {
-        let option = new_session_runtime_option("codex", "Codex");
-        let agent_id = option.selection.agent_id.clone();
-        let catalog = SessionRuntimeOptionCatalog {
-            revision: 0,
-            agents: Vec::new(),
-            auth_sources: Vec::new(),
-            options: vec![option.clone()],
-        };
-
-        let rows = delegation_runtime_edit_entries(&catalog, &agent_id, None, &BTreeMap::new());
-
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].label, "@Codex model");
-        assert_eq!(delegation_agent_id(&rows[0]).as_ref(), Some(&agent_id));
-        let (row_agent, selection_ref) =
-            delegation_edit_target(&rows[0]).expect("the row names the choice it writes");
-        assert_eq!(row_agent, agent_id);
-        assert_eq!(selection_ref, runtime_option_ref(&option));
+    fn composer_suggestion_popup_uses_the_tracked_scroll_region() {
+        let source = include_str!("app.rs");
+        let popup = source
+            .split_once("    fn render_composer_suggestions(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// One tab of the `/` popup header."))
+            .map(|(body, _)| body)
+            .expect("the suggestion popup should remain inspectable");
+        assert!(popup.contains("composer_suggestion_scroll("));
+        assert!(!popup.contains(".overflow_y_scrollbar()"));
     }
 
-    #[test]
-    fn a_delegation_choice_rewrites_the_agent_row_in_place() {
-        let option = new_session_runtime_option("codex", "Codex");
-        let agent_id = option.selection.agent_id.clone();
-        let mut entry = command_entry(
-            AgentCommandSourceKind::Reference,
-            AgentCommandTrigger::Mention,
-            None,
-        );
-        entry.id = "reference:agent:codex:stale".into();
-        entry.label = "@Codex".into();
-        entry.metadata = vec![
-            vibex_core::ProviderBindingMetadata {
-                key: COMPOSER_AGENT_REFERENCE_KEY.to_string(),
-                value: agent_id.as_str().to_string(),
-            },
-            vibex_core::ProviderBindingMetadata {
-                key: COMPOSER_SELECTION_REFERENCE_KEY.to_string(),
-                value: "stale".into(),
-            },
-        ];
-
-        apply_delegation_selection_to_entry(&mut entry, &agent_id, &option);
-
-        assert_eq!(
-            entry.id,
-            format!("reference:agent:codex:{}", runtime_option_ref(&option))
-        );
-        assert_eq!(delegation_agent_id(&entry), Some(agent_id));
-        assert_eq!(
-            delegation_selection_ref(&entry),
-            Some(runtime_option_ref(&option).as_str())
-        );
-        assert_eq!(
-            entry.description.as_deref(),
-            Some("Codex profile · Codex model")
-        );
-    }
-
-    /// A collaborator row is not a generic reference: its left column is the
-    /// Agent's own mark, and its right column is the provider/model copy that
-    /// used to sit under the name (or, before that, nowhere at all).
+    /// A quick phrase is the text it inserts, so the phrase row has to show that
+    /// text. A free-text name used to claim the whole row, which collapsed the
+    /// preview to nothing and pushed the source badge out of the popup.
     #[gpui::test]
-    fn agent_suggestion_rows_draw_the_agent_mark_and_move_provider_copy_right(
-        cx: &mut TestAppContext,
-    ) {
+    fn quick_phrase_rows_keep_a_long_phrase_inside_the_row(cx: &mut TestAppContext) {
         cx.update(gpui_component::init);
-        let mut entry = command_entry(
-            AgentCommandSourceKind::Reference,
-            AgentCommandTrigger::Mention,
+        let body = "开始处理这些问题，不用建任务。完成后我来看即可，不用截图。\
+                    修改完提交，commit 使用 type(scope): subject 的格式，subject 用英文";
+        let mut phrase = command_entry(
+            AgentCommandSourceKind::Prompt,
+            AgentCommandTrigger::Slash,
             None,
         );
-        entry.id = "reference:agent:codex:sha256:test".into();
-        entry.label = "@Codex".into();
-        entry.description = Some("oc · deepseek-v4.1-flash".into());
+        phrase.id = "phrase:probe".into();
+        // A name that is itself a paragraph: the row still owes the preview its
+        // own room and the badge its own width.
+        phrase.label = format!("{body} 的完整说明与后续步骤都写在名称里");
+        phrase.description = Some(body.to_string());
+        phrase.insertion_text = body.to_string();
+        phrase.execution_behavior = AgentCommandExecutionBehavior::None;
 
-        let (_, cx) = cx.add_window_view(|_, _| ComposerSuggestionRowProbe {
-            entry,
-            phrase_layout: false,
-            agent_identity: Some("codex Codex".into()),
-            width: px(420.0),
-        });
-        cx.run_until_parked();
-        cx.update(|window, cx| {
-            let _ = window.draw(cx);
-        });
+        let (row, name, preview, source) = composer_suggestion_row_bounds(cx, phrase, true, 420.0);
 
-        let row = cx
-            .debug_bounds("composer-suggestion-row")
-            .expect("the row is laid out");
-        let logo = cx
-            .debug_bounds("composer-suggestion-agent-logo")
-            .expect("the Agent mark is laid out");
-        let provider = cx
-            .debug_bounds("composer-suggestion-source")
-            .expect("the provider copy is laid out");
-        assert!(logo.left() >= row.left());
+        assert_eq!(
+            row.size.height,
+            px(COMPOSER_SUGGESTION_MENU_PHRASE_ROW_HEIGHT),
+            "a phrase row owns two lines of preview"
+        );
         assert!(
-            provider.right() <= row.right() + px(0.5),
-            "provider copy {} escaped the row {}",
-            provider.right(),
+            source.right() <= row.right() + px(0.5),
+            "source badge {} escaped the row {}",
+            source.right(),
             row.right()
         );
         assert!(
-            cx.debug_bounds("composer-suggestion-description").is_none(),
-            "the provider copy must not be painted twice"
+            preview.right() <= source.left() + px(0.5),
+            "preview {} ran under the source badge {}",
+            preview.right(),
+            source.left()
+        );
+        assert!(
+            name.right() <= preview.left() + px(0.5),
+            "name {} ran under the preview {}",
+            name.right(),
+            preview.left()
+        );
+        assert!(
+            name.size.width <= row.size.width * COMPOSER_SUGGESTION_NAME_WIDTH_FRACTION + px(1.0),
+            "name took {} of a {} row",
+            name.size.width,
+            row.size.width
+        );
+        assert!(
+            preview.size.width > px(80.0),
+            "preview collapsed to {}",
+            preview.size.width
         );
     }
 
@@ -108116,107 +108119,6 @@ mod tests {
             before_reveal,
             observed.offset()
         );
-    }
-
-    /// The popup must go through the tracked viewport helper above. Rendering
-    /// the list inline was how it drifted back into `overflow_y_scrollbar()`,
-    /// which leaves the popup's handle attached to a region nothing scrolls.
-    #[test]
-    fn composer_suggestion_popup_uses_the_tracked_scroll_region() {
-        let source = include_str!("app.rs");
-        let popup = source
-            .split_once("    fn render_composer_suggestions(")
-            .and_then(|(_, tail)| tail.split_once("\n    /// One tab of the `/` popup header."))
-            .map(|(body, _)| body)
-            .expect("the suggestion popup should remain inspectable");
-        assert!(popup.contains("composer_suggestion_scroll("));
-        assert!(!popup.contains(".overflow_y_scrollbar()"));
-    }
-
-    /// A quick phrase is the text it inserts, so the phrase row has to show that
-    /// text. A free-text name used to claim the whole row, which collapsed the
-    /// preview to nothing and pushed the source badge out of the popup.
-    #[gpui::test]
-    fn quick_phrase_rows_keep_a_long_phrase_inside_the_row(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
-        let body = "开始处理这些问题，不用建任务。完成后我来看即可，不用截图。\
-                    修改完提交，commit 使用 type(scope): subject 的格式，subject 用英文";
-        let mut phrase = command_entry(
-            AgentCommandSourceKind::Prompt,
-            AgentCommandTrigger::Slash,
-            None,
-        );
-        phrase.id = "phrase:probe".into();
-        // A name that is itself a paragraph: the row still owes the preview its
-        // own room and the badge its own width.
-        phrase.label = format!("{body} 的完整说明与后续步骤都写在名称里");
-        phrase.description = Some(body.to_string());
-        phrase.insertion_text = body.to_string();
-        phrase.execution_behavior = AgentCommandExecutionBehavior::None;
-
-        let (row, name, preview, source) = composer_suggestion_row_bounds(cx, phrase, true, 420.0);
-
-        assert_eq!(
-            row.size.height,
-            px(COMPOSER_SUGGESTION_MENU_PHRASE_ROW_HEIGHT),
-            "a phrase row owns two lines of preview"
-        );
-        assert!(
-            source.right() <= row.right() + px(0.5),
-            "source badge {} escaped the row {}",
-            source.right(),
-            row.right()
-        );
-        assert!(
-            preview.right() <= source.left() + px(0.5),
-            "preview {} ran under the source badge {}",
-            preview.right(),
-            source.left()
-        );
-        assert!(
-            name.right() <= preview.left() + px(0.5),
-            "name {} ran under the preview {}",
-            name.right(),
-            preview.left()
-        );
-        assert!(
-            name.size.width <= row.size.width * COMPOSER_SUGGESTION_NAME_WIDTH_FRACTION + px(1.0),
-            "name took {} of a {} row",
-            name.size.width,
-            row.size.width
-        );
-        assert!(
-            preview.size.width > px(80.0),
-            "preview collapsed to {}",
-            preview.size.width
-        );
-    }
-
-    /// The command tab keeps its one-line rows: the phrase tab's second line is
-    /// paid for only where it carries the inserted text.
-    #[gpui::test]
-    fn command_rows_stay_one_line_tall(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
-        let mut command = command_entry(
-            AgentCommandSourceKind::Provider,
-            AgentCommandTrigger::Slash,
-            Some("review"),
-        );
-        command.id = "command:probe".into();
-        command.label = "/review".into();
-        command.description = Some("Review the changes on this branch".into());
-
-        let (row, name, preview, source) =
-            composer_suggestion_row_bounds(cx, command, false, 420.0);
-
-        assert_eq!(
-            row.size.height,
-            px(COMPOSER_SUGGESTION_MENU_ROW_HEIGHT),
-            "a command row stays one line"
-        );
-        assert!(source.right() <= row.right() + px(0.5));
-        assert!(preview.right() <= source.left() + px(0.5));
-        assert!(name.right() <= preview.left() + px(0.5));
     }
 
     #[test]

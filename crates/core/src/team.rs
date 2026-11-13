@@ -4,6 +4,8 @@
 //! the authenticated human submission boundary may turn these tokens into a
 //! read grant. Control is always an explicit access mutation.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -182,6 +184,21 @@ pub struct HumanDelegationRequest {
     pub title: Option<String>,
     #[serde(default)]
     pub runtime_option_ref: Option<VibexUseRef>,
+    /// The thinking depth to run this delegation at, when the reader picked one.
+    ///
+    /// A catalogue option is an Agent, an authentication source and a model;
+    /// the depth and the conversation mode are how that option runs, not which
+    /// option it is. They therefore travel beside `runtime_option_ref` and are
+    /// validated against the choices that option publishes, instead of forcing
+    /// the catalogue to publish one option per depth × mode combination.
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
+    /// The conversation mode to run this delegation at.
+    #[serde(default)]
+    pub mode_id: Option<String>,
+    /// Feature values (auto-approve and friends) to run this delegation with.
+    #[serde(default)]
+    pub config_values: BTreeMap<String, String>,
     #[serde(default)]
     pub existing_session_id: Option<VibexSessionId>,
     #[serde(default = "human_completion_policy")]
@@ -207,6 +224,9 @@ impl HumanDelegationRequest {
             task: task.into(),
             title: None,
             runtime_option_ref: None,
+            reasoning_effort: None,
+            mode_id: None,
+            config_values: BTreeMap::new(),
             existing_session_id: None,
             completion_policy: DelegationCompletionPolicy::OwnerReview,
             acceptance_criteria: Vec::new(),

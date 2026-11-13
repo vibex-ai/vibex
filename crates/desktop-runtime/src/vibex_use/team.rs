@@ -38,6 +38,44 @@ fn page_limit(limit: Option<usize>) -> usize {
     limit.unwrap_or(40).clamp(1, TEAM_PAGE_LIMIT)
 }
 
+/// The `target` object one human delegation hands to `vibex_delegate`.
+///
+/// The option reference names the Agent, authentication source and model. The
+/// thinking depth, the conversation mode and the feature values are *how* that
+/// option runs, so they ride beside it instead of becoming their own catalogue
+/// entries — otherwise a picker would have to list every depth × mode
+/// combination. The resolver validates each one against the choices the named
+/// option publishes.
+fn delegation_target_arguments(request: &HumanDelegationRequest) -> VibexResult<serde_json::Value> {
+    let mut target = request
+        .runtime_option_ref
+        .as_ref()
+        .map(|reference| serde_json::json!({"selectionRef": reference.as_uri()}))
+        .unwrap_or_else(|| serde_json::json!({}));
+    let Some(object) = target.as_object_mut() else {
+        return Ok(target);
+    };
+    if let Some(effort) = request.reasoning_effort.as_ref() {
+        object.insert(
+            "reasoningEffort".to_string(),
+            serde_json::Value::String(effort.clone()),
+        );
+    }
+    if let Some(mode_id) = request.mode_id.as_ref() {
+        object.insert(
+            "modeId".to_string(),
+            serde_json::Value::String(mode_id.clone()),
+        );
+    }
+    if !request.config_values.is_empty() {
+        object.insert(
+            "configValues".to_string(),
+            serde_json::to_value(&request.config_values).map_err(internal_encode_error)?,
+        );
+    }
+    Ok(target)
+}
+
 fn selected_delegation_context(request: &mut HumanDelegationRequest) -> VibexResult<()> {
     let mut runtime_refs = std::collections::BTreeSet::new();
     for mention in &request.mentions {
@@ -605,11 +643,7 @@ impl VibexUseService {
         selected_delegation_context(&mut request)?;
         self.selected_team_references(&request, &key, &granted_by)?;
         let actor = self.human_actor(&self.open()?, &request.parent_session_id)?;
-        let target = request
-            .runtime_option_ref
-            .as_ref()
-            .map(|reference| serde_json::json!({"selectionRef": reference.as_uri()}))
-            .unwrap_or_else(|| serde_json::json!({}));
+        let target = delegation_target_arguments(&request)?;
         let session = request.existing_session_id.as_ref().map(|id| serde_json::json!({"kind": "existing", "sessionRef": VibexUseRef::session(id).as_uri()})).unwrap_or_else(|| serde_json::json!({"kind": "new"}));
         let context: Vec<_> = request.context_refs.iter().map(|reference| serde_json::json!({"sessionRef": VibexUseRef::session(&reference.session_id).as_uri(), "fromSequence": reference.from_sequence, "throughSequence": reference.through_sequence})).collect();
         let mut args = serde_json::json!({"idempotencyKey": human_key(&granted_by, &key), "target": target, "session": session,

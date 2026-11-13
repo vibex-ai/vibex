@@ -2852,11 +2852,8 @@ impl VibexUseService {
             )
             .with_diagnostic("catalogRevision", catalog.revision.to_string()));
         }
-        let option = catalog
-            .options
-            .iter()
-            .find(|option| runtime_option_ref(option) == reference.as_uri())
-            .ok_or_else(|| {
+        let option =
+            resolve_runtime_option_reference(&catalog, &reference, &target).ok_or_else(|| {
                 VibexError::validation(
                     use_codes::TARGET_UNAVAILABLE,
                     "that runtime option is no longer offered by this runtime",
@@ -2873,22 +2870,24 @@ impl VibexUseService {
         if bound_mention {
             // The user's own row is the answer, not a starting point for the
             // caller to overrule. A field that disagrees with it is a conflict;
-            // a field that merely restates it is allowed, but the exact option
-            // still wins so mode, effort and feature values cannot drift.
-            if selected.is_none() {
-                return Err(VibexError::validation(
+            // a field that merely restates it is allowed, and a field that tunes
+            // how it runs (depth, mode, feature values) is the reader's own
+            // edit, which `select_option` already validated against the choices
+            // that row publishes.
+            selected.ok_or_else(|| {
+                VibexError::validation(
                     use_codes::TARGET_MISMATCH,
                     "the delegation target conflicts with the collaborator and configuration the user addressed",
-                ));
-            }
-            return Ok(option.selection.clone());
+                )
+            })
+        } else {
+            selected.ok_or_else(|| {
+                VibexError::validation(
+                    use_codes::TARGET_UNAVAILABLE,
+                    "target fields conflict with selectionRef",
+                )
+            })
         }
-        selected.ok_or_else(|| {
-            VibexError::validation(
-                use_codes::TARGET_UNAVAILABLE,
-                "target fields conflict with selectionRef",
-            )
-        })
     }
 
     /// Resolves a selection the caller named field by field.
@@ -4652,7 +4651,38 @@ pub fn runtime_option_ref(option: &SessionRuntimeOption) -> String {
     VibexUseRef::runtime_option(&selection_fingerprint(&option.selection)).as_uri()
 }
 
-fn selection_fingerprint(selection: &SessionRuntimeSelection) -> String {
+/// The catalogue entry a runtime option reference names.
+///
+/// A reference is a fingerprint of a *complete* selection, so a chip that
+/// carries a thinking depth or a mode names a configuration the catalogue never
+/// publishes as its own entry: the depth is how an option runs, not which option
+/// it is. The exact match therefore runs first, and a miss re-fingerprints each
+/// option after applying the request's overrides. That way one reference form
+/// serves both a bare option and one the reader tuned, and the catalogue never
+/// has to enumerate depth × mode combinations.
+fn resolve_runtime_option_reference<'a>(
+    catalog: &'a vibex_core::SessionRuntimeOptionCatalog,
+    reference: &VibexUseRef,
+    target: &serde_json::Value,
+) -> Option<&'a SessionRuntimeOption> {
+    catalog
+        .options
+        .iter()
+        .find(|option| runtime_option_ref(option) == reference.as_uri())
+        .or_else(|| {
+            catalog.options.iter().find(|option| {
+                selection::select_option(option, target)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|selection| {
+                        VibexUseRef::runtime_option(&selection_fingerprint(&selection)).as_uri()
+                            == reference.as_uri()
+                    })
+            })
+        })
+}
+
+pub fn selection_fingerprint(selection: &SessionRuntimeSelection) -> String {
     fingerprint_of(&[
         selection.agent_id.as_str(),
         &serde_json::to_string(&selection.auth_source).unwrap_or_default(),
@@ -5517,6 +5547,64 @@ mod tests {
             VibexUseRef::parse(&first)
                 .is_some_and(|reference| { reference.kind == VibexUseResourceKind::RuntimeOption })
         );
+    }
+
+    /// A reference the reader tuned still names the catalogue entry it came from.
+    ///
+    /// The reference fingerprints the whole selection, so picking `high` on an
+    /// option the catalogue publishes at its default produces a reference no
+    /// entry matches exactly. Without the override-aware lookup, every tuned
+    /// delegation failed with "no longer offered".
+    #[test]
+    fn a_tuned_option_reference_resolves_against_the_entry_it_tunes() {
+        let selection = SessionRuntimeSelection::provider(
+            AgentId::parse("codex").unwrap(),
+            vibex_core::ProviderProfileId::parse("provider_local").unwrap(),
+            "gpt-5",
+        );
+        let option = SessionRuntimeOption {
+            selection: selection.clone(),
+            agent_label: "Codex".to_string(),
+            auth_source_label: "Local".to_string(),
+            model_label: "gpt-5".to_string(),
+            reasoning_efforts: vec![
+                vibex_core::SessionConfigValue {
+                    value: "low".to_string(),
+                    label: None,
+                },
+                vibex_core::SessionConfigValue {
+                    value: "high".to_string(),
+                    label: None,
+                },
+            ],
+            modes: Vec::new(),
+            features: Vec::new(),
+            availability: vibex_core::RuntimeOptionAvailability::Available,
+            member_count: 1,
+            auto_routes: false,
+        };
+        let catalog = vibex_core::SessionRuntimeOptionCatalog {
+            revision: 1,
+            agents: Vec::new(),
+            auth_sources: Vec::new(),
+            options: vec![option],
+        };
+        let tuned = serde_json::json!({ "reasoningEffort": "high" });
+        let mut tuned_selection = selection;
+        tuned_selection.reasoning_effort = Some("high".to_string());
+        let reference = VibexUseRef::runtime_option(&selection_fingerprint(&tuned_selection));
+        let resolved = resolve_runtime_option_reference(&catalog, &reference, &tuned)
+            .expect("a tuned reference must resolve against the entry it tunes");
+        assert_eq!(resolved.selection.model_id(), Some("gpt-5"));
+        assert_eq!(
+            resolved.selection.reasoning_effort, None,
+            "the entry stays bare"
+        );
+
+        // A depth the option does not advertise resolves to nothing instead of
+        // silently picking a neighbour.
+        let unknown = serde_json::json!({ "reasoningEffort": "max" });
+        assert!(resolve_runtime_option_reference(&catalog, &reference, &unknown).is_none());
     }
 
     fn temporary_connection(label: &str) -> (DbConnection, tempfile::TempDir) {

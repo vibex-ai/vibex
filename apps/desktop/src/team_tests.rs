@@ -3662,29 +3662,18 @@ fn a_group_pane_draws_a_terminal_session_as_a_terminal(cx: &mut TestAppContext) 
     );
 }
 
+/// Asking to tune a collaborator puts the caret on its chip.
+///
+/// This is the whole entry point: the runtime controls follow the caret, so
+/// landing the caret on the chip is what makes them that collaborator's. A draft
+/// that does not name the Agent yet gets the chip inserted, which is the same
+/// gesture as picking it from the `@` popup.
 #[gpui::test]
-async fn editing_the_delegation_row_rewrites_an_existing_agent_token(cx: &mut TestAppContext) {
+async fn tuning_a_collaborator_puts_the_caret_on_its_chip(cx: &mut TestAppContext) {
     let (workbench, cx, _) = fixture(cx, 1);
     let agent_id = AgentId::parse("claude").expect("agent id");
-    let old = VibexUseRef::runtime_option("option-old");
-    let mention = VibexUseMention::agent(&agent_id, &old, Some("@Claude"));
-    let option = SessionRuntimeOption {
-        selection: SessionRuntimeSelection::provider(
-            agent_id.clone(),
-            ProviderProfileId::new(),
-            "sonnet",
-        ),
-        agent_label: "Claude".into(),
-        auth_source_label: "Profile".into(),
-        model_label: "Sonnet".into(),
-        reasoning_efforts: Vec::new(),
-        modes: Vec::new(),
-        features: Vec::new(),
-        availability: RuntimeOptionAvailability::Available,
-        member_count: 1,
-        auto_routes: false,
-    };
-    let expected = VibexUseRef::parse(&runtime_option_ref(&option)).expect("option reference");
+    let reference = VibexUseRef::runtime_option("option_claude");
+    let mention = VibexUseMention::agent(&agent_id, &reference, Some("@Claude"));
 
     cx.update(|window, cx| {
         workbench.update(cx, |workbench, cx| {
@@ -3699,20 +3688,13 @@ async fn editing_the_delegation_row_rewrites_an_existing_agent_token(cx: &mut Te
                     .expect("the token replaces its label");
             });
 
-            workbench.rewrite_delegation_mention_tokens(
-                ComposerTarget::Session,
-                &agent_id,
-                &option,
-                window,
-                cx,
-            );
+            workbench.tune_delegation_chip(&agent_id, window, cx);
 
-            let mentions = composer_mentions(input.read(cx).tokens());
-            assert_eq!(mentions.len(), 1, "the chip was lost");
-            assert_eq!(
-                mentions[0].reference, expected,
-                "the chip still carries the row's previous configuration"
-            );
+            let subject = workbench
+                .composer_delegation_subject(cx)
+                .expect("the caret must land on the chip it tunes");
+            assert_eq!(subject.agent_id.as_ref(), Some(&agent_id));
+            assert_eq!(subject.reference, reference);
         });
     });
 }
