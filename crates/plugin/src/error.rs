@@ -77,6 +77,8 @@ pub enum PluginError {
     NotFound(String),
     #[error("the market has no usable catalog yet")]
     NoCatalog,
+    #[error("the catalog could not be built: {0}")]
+    Catalog(String),
     #[error("the plugin package does not carry a manifest")]
     MissingManifest,
     #[error("the scripting host refused the plugin: {0}")]
@@ -111,6 +113,7 @@ impl From<PluginError> for VibexError {
             PluginError::HostTooOld { .. } => "plugin_host_too_old",
             PluginError::NotFound(_) => "plugin_not_found",
             PluginError::NoCatalog => "plugin_market_unavailable",
+            PluginError::Catalog(_) => "plugin_catalog_invalid",
             PluginError::MissingManifest => "plugin_manifest_missing",
             PluginError::Host(_) => "plugin_host_rejected",
             PluginError::HostUnavailable => "plugin_host_unavailable",
@@ -121,6 +124,7 @@ impl From<PluginError> for VibexError {
             | PluginError::Json(_)
             | PluginError::Archive(_)
             | PluginError::UnpackRejected(_)
+            | PluginError::Catalog(_)
             | PluginError::MissingManifest => ErrorCategory::Validation,
             PluginError::HashMismatch
             | PluginError::SignatureInvalid

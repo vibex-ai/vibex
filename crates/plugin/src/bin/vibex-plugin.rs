@@ -8,21 +8,27 @@
 //! vibex-plugin sign <package> --key <seed>       sign a package with a release key
 //! vibex-plugin sign-index <index.json> --key <seed-base64> [--output <file>]
 //! vibex-plugin publish <dir> --key <seed>        sign and describe a submission
+//! vibex-plugin index build --catalog <dir> --key <seed>   build and sign the catalog
+//! vibex-plugin index validate --catalog <dir>    check a catalog without signing
 //! ```
 //!
 //! `publish` is the author's side of the market: it builds the package,
-//! signs it, and prints the index entry a submission carries. It deliberately
-//! writes nothing into the index — the catalog is built and signed by whoever
-//! maintains it, so an author's tool cannot add itself to the marketplace.
+//! signs it, and prints the index entry a submission carries. `index build` is
+//! the maintainer's side: it reads the catalog repository's entries and writes
+//! the signed `dist/index.json`. An author's tool cannot add itself to the
+//! marketplace, and the maintainer's tool cannot sign a package.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use sha2::{Digest, Sha256};
-use vibex_plugin::market::{encode_verifying_key, sign_document};
-use vibex_plugin::{read_package_manifest, sha256_hex, sha512_hex, write_package};
+use vibex_plugin::market::{PublisherKey, encode_verifying_key, sign_document};
+use vibex_plugin::{
+    build_index_file, load_catalog_entries, read_package_manifest, sha256_hex, sha512_hex,
+    utc_now_rfc3339, write_package, write_signed_index,
+};
 
 fn main() {
     if let Err(error) = run() {
@@ -45,6 +51,7 @@ fn run() -> Result<(), String> {
         "sign" => sign(&arguments[1..]),
         "sign-index" => sign_index(&arguments[1..]),
         "publish" => publish(&arguments[1..]),
+        "index" => index_command(&arguments[1..]),
         "--help" | "-h" | "help" => {
             usage();
             Ok(())
@@ -63,7 +70,9 @@ fn usage() {
            keygen [--output <file>]                              make a signing key pair\n\
            sign <package> --key <seed-base64> [--output <file>]  sign a package\n\
            sign-index <index.json> --key <seed-base64> [--output <file>]\n\
-           publish <dir> --key <seed-base64> [--output <file>]   build and sign a submission\n"
+           publish <dir> --key <seed-base64> [--output <file>]   build and sign a submission\n\
+           index build --catalog <dir> --key <seed-base64> [--revision N] [--generated-at RFC3339] [--publisher-keys <file>]\n\
+           index validate --catalog <dir>                        check a catalog without signing\n"
     );
 }
 
@@ -223,6 +232,63 @@ fn publish(args: &[String]) -> Result<(), String> {
     println!("sha256:    {}", sha256_hex(&bytes));
     println!();
     println!("{}", serde_json::to_string_pretty(&entry).unwrap());
+    Ok(())
+}
+
+/// The maintainer's side: validate or build the catalog repository's index.
+fn index_command(args: &[String]) -> Result<(), String> {
+    match args.first().map(String::as_str) {
+        Some("build") => index_build(&args[1..]),
+        Some("validate") => index_validate(&args[1..]),
+        _ => Err("index needs `build` or `validate`".to_string()),
+    }
+}
+
+fn index_validate(args: &[String]) -> Result<(), String> {
+    let catalog = option(args, "--catalog").ok_or("index validate needs --catalog <dir>")?;
+    let entries = load_catalog_entries(Path::new(&catalog)).map_err(|error| error.to_string())?;
+    println!("catalog: {}", Path::new(&catalog).display());
+    println!("entries: {}", entries.len());
+    for entry in &entries {
+        println!(
+            "  {} {} ({} version{})",
+            entry.entry.id,
+            entry.entry.latest_version.as_deref().unwrap_or("-"),
+            entry.versions.len(),
+            if entry.versions.len() == 1 { "" } else { "s" }
+        );
+    }
+    Ok(())
+}
+
+fn index_build(args: &[String]) -> Result<(), String> {
+    let catalog = option(args, "--catalog").ok_or("index build needs --catalog <dir>")?;
+    let key = option(args, "--key").ok_or("index build needs --key <seed-base64>")?;
+    let signing_key = signing_key(&key)?;
+    let revision = match option(args, "--revision") {
+        Some(value) => value
+            .parse::<u64>()
+            .map_err(|_| "--revision must be a non-negative integer".to_string())?,
+        None => 1,
+    };
+    let generated_at = option(args, "--generated-at").unwrap_or_else(utc_now_rfc3339);
+    let publisher_keys: Vec<PublisherKey> = match option(args, "--publisher-keys") {
+        Some(path) => {
+            let bytes = std::fs::read(&path).map_err(|error| error.to_string())?;
+            serde_json::from_slice(&bytes)
+                .map_err(|error| format!("{path} is not a publisher key list: {error}"))?
+        }
+        None => Vec::new(),
+    };
+    let entries = load_catalog_entries(Path::new(&catalog)).map_err(|error| error.to_string())?;
+    let index = build_index_file(entries, revision, generated_at, publisher_keys, 0);
+    let path = write_signed_index(Path::new(&catalog), &index, &signing_key)
+        .map_err(|error| error.to_string())?;
+    let bytes = std::fs::read(&path).map_err(|error| error.to_string())?;
+    println!("index:     {}", path.display());
+    println!("revision:  {revision}");
+    println!("keyId:     {}", key_id(&signing_key.verifying_key()));
+    println!("sha256:    {}", sha256_hex(&bytes));
     Ok(())
 }
 

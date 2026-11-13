@@ -17,6 +17,7 @@
 
 pub mod error;
 pub mod fingerprint;
+pub mod index_build;
 pub mod install;
 pub mod manifest;
 pub mod market;
@@ -29,6 +30,10 @@ pub mod shell;
 
 pub use error::{ManifestError, PluginError};
 pub use fingerprint::consent_fingerprint;
+pub use index_build::{
+    CATALOG_ENTRY_FILE, CATALOG_INDEX_FILE, CATALOG_SIGNATURE_FILE, build_index_file,
+    load_catalog_entries, utc_now_rfc3339, utc_rfc3339, write_signed_index,
+};
 pub use install::{
     ExtractReport, PendingInstall, PluginStore, RecoveryOutcome, extract_zip,
     read_package_manifest, safe_relative_path, sha256_hex, sha512_hex, verify_checksums,
