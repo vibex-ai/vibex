@@ -101,7 +101,7 @@ pub use runtime::{
     SwitchOperationJournalRepository, SwitchOperationRecord,
 };
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 90;
+pub const CURRENT_SCHEMA_VERSION: i64 = 92;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Copy)]
@@ -12782,6 +12782,8 @@ pub fn apply_migrations(conn: &mut Connection) -> VibexResult<Vec<String>> {
     // recorded last and independent of the ACP tables above.
     apply_session_transport(conn, &mut applied)?;
     apply_plugin_version_pin(conn, &mut applied)?;
+    apply_plugin_local_reviews(conn, &mut applied)?;
+    apply_plugin_user_sources(conn, &mut applied)?;
     Ok(applied)
 }
 
@@ -12827,6 +12829,98 @@ fn apply_plugin_version_pin(conn: &mut Connection, applied: &mut Vec<String>) ->
     tx.commit().map_err(storage_err(
         "migration_commit_failed",
         "failed to commit the plugin version pin migration",
+    ))?;
+    applied.push(format!("{VERSION}:{NAME}"));
+    Ok(())
+}
+
+/// Stores the ratings the reader left, before there is a service to publish them.
+fn apply_plugin_local_reviews(conn: &mut Connection, applied: &mut Vec<String>) -> VibexResult<()> {
+    const VERSION: i64 = 91;
+    const NAME: &str = "plugin_local_reviews";
+    if migration_applied(conn, VERSION)? {
+        return Ok(());
+    }
+    let tx = conn.transaction().map_err(storage_err(
+        "migration_transaction_failed",
+        "failed to start the plugin local reviews migration",
+    ))?;
+    tx.execute_batch(
+        "
+            CREATE TABLE IF NOT EXISTS plugin_reviews (
+                plugin_id     TEXT PRIMARY KEY,
+                rating        INTEGER NOT NULL,
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL
+            );
+        ",
+    )
+    .map_err(storage_err(
+        "migration_apply_failed",
+        "failed to create the plugin reviews table",
+    ))?;
+    tx.execute(
+        "INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
+        params![VERSION, NAME, unix_timestamp_ms()],
+    )
+    .map_err(storage_err(
+        "migration_record_failed",
+        "failed to record the plugin local reviews migration",
+    ))?;
+    tx.commit().map_err(storage_err(
+        "migration_commit_failed",
+        "failed to commit the plugin local reviews migration",
+    ))?;
+    applied.push(format!("{VERSION}:{NAME}"));
+    Ok(())
+}
+
+/// Stores the catalogs the reader added themselves.
+///
+/// A user source is an ordinary signed index at an address the reader typed.
+/// Its id is derived from the address, so re-adding the same URL updates the
+/// row instead of listing the catalog twice.
+fn apply_plugin_user_sources(conn: &mut Connection, applied: &mut Vec<String>) -> VibexResult<()> {
+    const VERSION: i64 = 92;
+    const NAME: &str = "plugin_user_sources";
+    if migration_applied(conn, VERSION)? {
+        return Ok(());
+    }
+    let tx = conn.transaction().map_err(storage_err(
+        "migration_transaction_failed",
+        "failed to start the plugin user sources migration",
+    ))?;
+    tx.execute_batch(
+        "
+            CREATE TABLE IF NOT EXISTS plugin_sources (
+                source_id      TEXT PRIMARY KEY,
+                name           TEXT NOT NULL,
+                index_url      TEXT NOT NULL,
+                public_key     TEXT NULL,
+                enabled        INTEGER NOT NULL DEFAULT 1,
+                added_at_ms    INTEGER NOT NULL,
+                updated_at_ms  INTEGER NULL,
+                last_error     TEXT NULL
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_plugin_sources_url
+                ON plugin_sources(index_url);
+        ",
+    )
+    .map_err(storage_err(
+        "migration_apply_failed",
+        "failed to create the plugin sources table",
+    ))?;
+    tx.execute(
+        "INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
+        params![VERSION, NAME, unix_timestamp_ms()],
+    )
+    .map_err(storage_err(
+        "migration_record_failed",
+        "failed to record the plugin user sources migration",
+    ))?;
+    tx.commit().map_err(storage_err(
+        "migration_commit_failed",
+        "failed to commit the plugin user sources migration",
     ))?;
     applied.push(format!("{VERSION}:{NAME}"));
     Ok(())
@@ -19679,6 +19773,8 @@ mod tests {
                 "87:opencode_session_header",
                 "88:agent_session_transport",
                 "90:plugin_version_pin",
+                "91:plugin_local_reviews",
+                "92:plugin_user_sources",
             ]
         );
         let agent_models: (Option<String>, Option<String>) = conn
@@ -19853,6 +19949,8 @@ mod tests {
                 "87:opencode_session_header",
                 "88:agent_session_transport",
                 "90:plugin_version_pin",
+                "91:plugin_local_reviews",
+                "92:plugin_user_sources",
             ]
         );
         let activation_completed_at_ms: Option<i64> = conn
@@ -20012,6 +20110,8 @@ mod tests {
                 "87:opencode_session_header",
                 "88:agent_session_transport",
                 "90:plugin_version_pin",
+                "91:plugin_local_reviews",
+                "92:plugin_user_sources",
             ]
         );
         let stored: (String, Option<String>, Option<i64>) = conn
@@ -20205,6 +20305,8 @@ mod tests {
                 "87:opencode_session_header",
                 "88:agent_session_transport",
                 "90:plugin_version_pin",
+                "91:plugin_local_reviews",
+                "92:plugin_user_sources",
             ]
         );
         assert_eq!(
@@ -21667,6 +21769,8 @@ mod tests {
                 "87:opencode_session_header",
                 "88:agent_session_transport",
                 "90:plugin_version_pin",
+                "91:plugin_local_reviews",
+                "92:plugin_user_sources",
             ]
         );
         let managed = ManagedWorktreeRepository::get_by_id(&conn, &worktree_id)

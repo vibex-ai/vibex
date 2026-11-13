@@ -3,9 +3,9 @@
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use vibex_core::{
-    InstalledPlugin, InstalledPluginStatus, PluginContribution, PluginKind, PluginPermission,
-    PluginPermissionGrant, PluginPermissionRisk, PluginPublisher, PluginSource, PluginTrust,
-    VibexResult,
+    InstalledPlugin, InstalledPluginStatus, PluginContribution, PluginKind, PluginLocalReview,
+    PluginPermission, PluginPermissionGrant, PluginPermissionRisk, PluginPublisher, PluginSource,
+    PluginTrust, PluginUserSource, VibexResult,
 };
 
 use super::{enum_from_db_sql, enum_to_db, json_from_db_sql, json_to_db};
@@ -623,6 +623,207 @@ impl PluginRepository {
         .map_err(db_err("plugin_contribution_enable_failed"))?;
         Ok(())
     }
+
+    /// Inserts or replaces the rating this machine left for a plugin.
+    pub fn upsert_review(
+        conn: &Connection,
+        review: &PluginLocalReview,
+        now_ms: i64,
+    ) -> VibexResult<()> {
+        conn.execute(
+            "INSERT INTO plugin_reviews (
+                plugin_id, rating, created_at_ms, updated_at_ms
+            ) VALUES (?1, ?2, ?3, ?3)
+            ON CONFLICT(plugin_id) DO UPDATE SET rating = ?2, updated_at_ms = ?3",
+            params![review.plugin_id, review.rating, now_ms],
+        )
+        .map_err(db_err("plugin_review_upsert_failed"))?;
+        Ok(())
+    }
+
+    /// The rating this machine left for a plugin, if any.
+    pub fn get_review(
+        conn: &Connection,
+        plugin_id: &str,
+    ) -> VibexResult<Option<PluginLocalReview>> {
+        conn.query_row(
+            "SELECT plugin_id, rating, updated_at_ms FROM plugin_reviews WHERE plugin_id = ?1",
+            params![plugin_id],
+            |row| {
+                Ok(PluginLocalReview {
+                    plugin_id: row.get(0)?,
+                    rating: row.get::<_, i64>(1)?.clamp(0, 255) as u8,
+                    updated_at_ms: row.get(2)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(db_err("plugin_review_read_failed"))
+    }
+
+    /// Every rating this machine left, oldest first.
+    pub fn list_reviews(conn: &Connection) -> VibexResult<Vec<PluginLocalReview>> {
+        let mut statement = conn
+            .prepare(
+                "SELECT plugin_id, rating, updated_at_ms FROM plugin_reviews \
+                 ORDER BY updated_at_ms, plugin_id",
+            )
+            .map_err(db_err("plugin_reviews_list_failed"))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok(PluginLocalReview {
+                    plugin_id: row.get(0)?,
+                    rating: row.get::<_, i64>(1)?.clamp(0, 255) as u8,
+                    updated_at_ms: row.get(2)?,
+                })
+            })
+            .map_err(db_err("plugin_reviews_list_failed"))?;
+        let mut reviews = Vec::new();
+        for row in rows {
+            reviews.push(row.map_err(db_err("plugin_reviews_list_failed"))?);
+        }
+        Ok(reviews)
+    }
+
+    /// Removes the rating; `false` when there was none.
+    pub fn delete_review(conn: &Connection, plugin_id: &str) -> VibexResult<bool> {
+        let changed = conn
+            .execute(
+                "DELETE FROM plugin_reviews WHERE plugin_id = ?1",
+                params![plugin_id],
+            )
+            .map_err(db_err("plugin_review_delete_failed"))?;
+        Ok(changed > 0)
+    }
+
+    // ---- catalogs the reader added ----
+
+    /// Inserts or replaces one user source, keyed by its address.
+    pub fn upsert_source(conn: &Connection, source: &PluginUserSource) -> VibexResult<()> {
+        conn.execute(
+            "INSERT INTO plugin_sources (
+                source_id, name, index_url, public_key, enabled,
+                added_at_ms, updated_at_ms, last_error
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            ON CONFLICT(source_id) DO UPDATE SET
+                name = excluded.name,
+                index_url = excluded.index_url,
+                public_key = excluded.public_key,
+                enabled = excluded.enabled,
+                updated_at_ms = excluded.updated_at_ms,
+                last_error = excluded.last_error",
+            params![
+                source.source_id,
+                source.name,
+                source.index_url,
+                source.public_key,
+                source.enabled,
+                source.added_at_ms,
+                source.updated_at_ms,
+                source.last_error,
+            ],
+        )
+        .map_err(db_err("plugin_source_upsert_failed"))?;
+        Ok(())
+    }
+
+    /// Every user source, in the order they were added.
+    pub fn list_sources(conn: &Connection) -> VibexResult<Vec<PluginUserSource>> {
+        let mut statement = conn
+            .prepare(
+                "SELECT source_id, name, index_url, public_key, enabled, \
+                 added_at_ms, updated_at_ms, last_error \
+                 FROM plugin_sources ORDER BY added_at_ms, source_id",
+            )
+            .map_err(db_err("plugin_sources_list_failed"))?;
+        let rows = statement
+            .query_map([], source_from_row)
+            .map_err(db_err("plugin_sources_list_failed"))?;
+        let mut sources = Vec::new();
+        for row in rows {
+            sources.push(row.map_err(db_err("plugin_sources_list_failed"))?);
+        }
+        Ok(sources)
+    }
+
+    /// The enabled sources only, which is what a refresh reads.
+    pub fn list_enabled_sources(conn: &Connection) -> VibexResult<Vec<PluginUserSource>> {
+        Ok(Self::list_sources(conn)?
+            .into_iter()
+            .filter(|source| source.enabled)
+            .collect())
+    }
+
+    /// One source by id.
+    pub fn get_source(conn: &Connection, source_id: &str) -> VibexResult<Option<PluginUserSource>> {
+        conn.query_row(
+            "SELECT source_id, name, index_url, public_key, enabled, \
+             added_at_ms, updated_at_ms, last_error \
+             FROM plugin_sources WHERE source_id = ?1",
+            params![source_id],
+            source_from_row,
+        )
+        .optional()
+        .map_err(db_err("plugin_source_read_failed"))
+    }
+
+    /// Turns one source on or off; `false` when there was no such source.
+    pub fn set_source_enabled(
+        conn: &Connection,
+        source_id: &str,
+        enabled: bool,
+        now_ms: i64,
+    ) -> VibexResult<bool> {
+        let changed = conn
+            .execute(
+                "UPDATE plugin_sources SET enabled = ?2, updated_at_ms = ?3 \
+                 WHERE source_id = ?1",
+                params![source_id, enabled, now_ms],
+            )
+            .map_err(db_err("plugin_source_enable_failed"))?;
+        Ok(changed > 0)
+    }
+
+    /// Records why a refresh failed, or clears it with `None`.
+    pub fn set_source_error(
+        conn: &Connection,
+        source_id: &str,
+        error: Option<&str>,
+        now_ms: i64,
+    ) -> VibexResult<()> {
+        conn.execute(
+            "UPDATE plugin_sources SET last_error = ?2, updated_at_ms = ?3 \
+             WHERE source_id = ?1",
+            params![source_id, error, now_ms],
+        )
+        .map_err(db_err("plugin_source_error_failed"))?;
+        Ok(())
+    }
+
+    /// Removes one source; `false` when there was none.
+    pub fn delete_source(conn: &Connection, source_id: &str) -> VibexResult<bool> {
+        let changed = conn
+            .execute(
+                "DELETE FROM plugin_sources WHERE source_id = ?1",
+                params![source_id],
+            )
+            .map_err(db_err("plugin_source_delete_failed"))?;
+        Ok(changed > 0)
+    }
+}
+
+/// Reads one `plugin_sources` row.
+fn source_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PluginUserSource> {
+    Ok(PluginUserSource {
+        source_id: row.get(0)?,
+        name: row.get(1)?,
+        index_url: row.get(2)?,
+        public_key: row.get(3)?,
+        enabled: row.get(4)?,
+        added_at_ms: row.get(5)?,
+        updated_at_ms: row.get(6)?,
+        last_error: row.get(7)?,
+    })
 }
 
 const PLUGIN_SELECT: &str = "
@@ -793,5 +994,120 @@ mod tests {
         let mut duplicate = native.clone();
         duplicate.plugin_id = "vibex.system.files.other".to_string();
         assert!(PluginRepository::upsert(&connection, &duplicate).is_err());
+    }
+
+    #[test]
+    fn a_local_review_is_replaced_not_duplicated() {
+        let connection = connection();
+        let review = PluginLocalReview {
+            plugin_id: "acme.widgets".to_string(),
+            rating: 4,
+            updated_at_ms: 0,
+        };
+        PluginRepository::upsert_review(&connection, &review, 100).unwrap();
+        let stored = PluginRepository::get_review(&connection, "acme.widgets")
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.rating, 4);
+        assert_eq!(stored.updated_at_ms, 100);
+
+        let updated = PluginLocalReview {
+            rating: 2,
+            ..review.clone()
+        };
+        PluginRepository::upsert_review(&connection, &updated, 200).unwrap();
+        let stored = PluginRepository::get_review(&connection, "acme.widgets")
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.rating, 2);
+        assert_eq!(stored.updated_at_ms, 200);
+        assert_eq!(
+            PluginRepository::list_reviews(&connection).unwrap().len(),
+            1
+        );
+
+        assert!(PluginRepository::delete_review(&connection, "acme.widgets").unwrap());
+        assert!(
+            PluginRepository::get_review(&connection, "acme.widgets")
+                .unwrap()
+                .is_none()
+        );
+        assert!(!PluginRepository::delete_review(&connection, "acme.widgets").unwrap());
+    }
+
+    #[test]
+    fn a_user_source_round_trips_and_toggles() {
+        let connection = connection();
+        let source = PluginUserSource {
+            source_id: "0123456789abcdef".to_string(),
+            name: "Acme".to_string(),
+            index_url: "https://acme.example/index.json".to_string(),
+            public_key: Some("key".to_string()),
+            enabled: true,
+            added_at_ms: 100,
+            updated_at_ms: None,
+            last_error: None,
+        };
+        PluginRepository::upsert_source(&connection, &source).unwrap();
+
+        let read = PluginRepository::get_source(&connection, "0123456789abcdef")
+            .unwrap()
+            .unwrap();
+        assert_eq!(read.name, "Acme");
+        assert_eq!(read.public_key.as_deref(), Some("key"));
+        assert!(read.enabled);
+        assert_eq!(
+            PluginRepository::list_sources(&connection).unwrap().len(),
+            1
+        );
+
+        assert!(
+            PluginRepository::set_source_enabled(&connection, "0123456789abcdef", false, 200)
+                .unwrap()
+        );
+        assert!(
+            PluginRepository::list_enabled_sources(&connection)
+                .unwrap()
+                .is_empty()
+        );
+
+        PluginRepository::set_source_error(&connection, "0123456789abcdef", Some("offline"), 300)
+            .unwrap();
+        let read = PluginRepository::get_source(&connection, "0123456789abcdef")
+            .unwrap()
+            .unwrap();
+        assert_eq!(read.last_error.as_deref(), Some("offline"));
+        assert_eq!(read.updated_at_ms, Some(300));
+
+        assert!(PluginRepository::delete_source(&connection, "0123456789abcdef").unwrap());
+        assert!(!PluginRepository::delete_source(&connection, "0123456789abcdef").unwrap());
+        assert!(
+            PluginRepository::get_source(&connection, "0123456789abcdef")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn re_adding_a_source_updates_it_instead_of_duplicating() {
+        let connection = connection();
+        let mut source = PluginUserSource {
+            source_id: "0123456789abcdef".to_string(),
+            name: "Acme".to_string(),
+            index_url: "https://acme.example/index.json".to_string(),
+            public_key: None,
+            enabled: true,
+            added_at_ms: 100,
+            updated_at_ms: None,
+            last_error: None,
+        };
+        PluginRepository::upsert_source(&connection, &source).unwrap();
+        source.name = "Acme Renamed".to_string();
+        PluginRepository::upsert_source(&connection, &source).unwrap();
+
+        let sources = PluginRepository::list_sources(&connection).unwrap();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].name, "Acme Renamed");
+        assert_eq!(sources[0].added_at_ms, 100);
     }
 }

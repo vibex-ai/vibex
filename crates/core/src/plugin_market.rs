@@ -180,6 +180,8 @@ pub enum PluginListingSource {
     Github,
     /// Shipped with the application.
     Bundled,
+    /// A catalog the reader added themselves.
+    User,
 }
 
 impl Default for PluginListingSource {
@@ -436,6 +438,12 @@ pub struct PluginMarketEntry {
     pub size_bytes: Option<u64>,
     #[serde(default)]
     pub featured: bool,
+    /// The catalog the reader added this entry through, when it was one.
+    ///
+    /// An entry from the official index or topic discovery has no source name:
+    /// only a catalog the reader typed needs saying where it came from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_name: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub i18n: BTreeMap<String, PluginMarketLocalized>,
 }
@@ -677,6 +685,51 @@ pub struct PluginMarketDetailRequest {
     pub entry_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
+}
+
+/// The lowest rating a review may carry.
+pub const MIN_PLUGIN_REVIEW_RATING: u8 = 1;
+/// The highest rating a review may carry.
+pub const MAX_PLUGIN_REVIEW_RATING: u8 = 5;
+
+/// One rating the reader left, kept on this machine.
+///
+/// There is no review service yet, so a rating is local: the detail page shows
+/// it beside the catalog's published aggregate rather than folding it in. When
+/// a service exists, it can publish what this stores.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginLocalReview {
+    pub plugin_id: String,
+    /// One to five stars.
+    pub rating: u8,
+    pub updated_at_ms: i64,
+}
+
+/// Sets or replaces the reader's rating.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginReviewSubmitRequest {
+    pub plugin_id: String,
+    pub rating: u8,
+}
+
+/// Clears the reader's rating.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginReviewClearRequest {
+    pub plugin_id: String,
+}
+
+/// Checks a rating is within the star range.
+pub fn validate_plugin_review_rating(rating: u8) -> Result<(), String> {
+    if (MIN_PLUGIN_REVIEW_RATING..=MAX_PLUGIN_REVIEW_RATING).contains(&rating) {
+        Ok(())
+    } else {
+        Err(format!(
+            "a rating is between {MIN_PLUGIN_REVIEW_RATING} and {MAX_PLUGIN_REVIEW_RATING} stars"
+        ))
+    }
 }
 
 /// A permission the user granted.
@@ -966,6 +1019,125 @@ pub const MAX_PLUGIN_BUNDLE_FILE_BYTES: u64 = 4 * 1024 * 1024;
 /// Upper bound on one icon or screenshot.
 pub const MAX_PLUGIN_ICON_BYTES: u64 = 1024 * 1024;
 
+/// The largest number of catalogs a reader may add.
+///
+/// The list is drawn in one card and every source is fetched on a refresh, so
+/// the bound keeps a paste-happy reader from turning the catalog into a crawl.
+pub const MAX_PLUGIN_USER_SOURCES: usize = 8;
+
+/// One catalog the reader added themselves.
+///
+/// A user source is an ordinary signed index — the same document the official
+/// catalog publishes — at an address the reader typed. It is not signed by the
+/// root key the application embeds, so it can never grant `Official` or
+/// `Verified`: everything it lists is `Community` at best, and its packages
+/// still have to match the hashes it publishes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginUserSource {
+    /// A stable id derived from the address, so two sources cannot collide.
+    pub source_id: String,
+    /// The name the reader gave it, shown on every entry it lists.
+    pub name: String,
+    /// The index address.
+    pub index_url: String,
+    /// The public key its signature is checked against.
+    ///
+    /// Absent means the reader accepted an unsigned catalog, which is only
+    /// allowed for a source they added themselves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_key: Option<String>,
+    #[serde(default)]
+    pub enabled: bool,
+    pub added_at_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at_ms: Option<i64>,
+    /// Why the last refresh failed, kept so the page can say so.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
+/// Adds a catalog the reader typed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginUserSourceAddRequest {
+    pub name: String,
+    pub index_url: String,
+    /// The index signer's public key, base64. Required unless the reader
+    /// explicitly accepts an unsigned catalog.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_key: Option<String>,
+    /// Whether the reader accepts a catalog with no signature at all.
+    #[serde(default)]
+    pub allow_unsigned: bool,
+}
+
+/// Removes one catalog the reader added.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginUserSourceRemoveRequest {
+    pub source_id: String,
+}
+
+/// Turns one catalog the reader added on or off.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginUserSourceEnabledRequest {
+    pub source_id: String,
+    pub enabled: bool,
+}
+
+/// Checks a source the reader typed before it is stored.
+///
+/// The address must be an absolute `https` URL: a catalog is fetched over the
+/// same public-https policy as the official one, so a plaintext or local
+/// address would either be refused later or reach a machine on the network.
+pub fn validate_plugin_user_source(
+    name: &str,
+    index_url: &str,
+    public_key: Option<&str>,
+    allow_unsigned: bool,
+) -> Result<(), String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("the source needs a name".to_string());
+    }
+    if name.chars().count() > 60 {
+        return Err("the source name is too long".to_string());
+    }
+    let url = url::Url::parse(index_url.trim())
+        .map_err(|error| format!("the index address is not a URL: {error}"))?;
+    if url.scheme() != "https" {
+        return Err("the index address must be https".to_string());
+    }
+    if url.host_str().is_none() {
+        return Err("the index address has no host".to_string());
+    }
+    match public_key.map(str::trim).filter(|key| !key.is_empty()) {
+        Some(_) => Ok(()),
+        None if allow_unsigned => Ok(()),
+        None => Err(
+            "the source needs the index signer's public key, or an explicit \
+             acceptance of an unsigned catalog"
+                .to_string(),
+        ),
+    }
+}
+
+/// The stable id for a catalog address.
+///
+/// Derived from the address alone so re-adding the same URL updates the source
+/// instead of duplicating it, and so the id survives a rename.
+pub fn plugin_user_source_id(index_url: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(index_url.trim().as_bytes());
+    let mut id = String::with_capacity(16);
+    for byte in &digest[..8] {
+        id.push_str(&format!("{byte:02x}"));
+    }
+    id
+}
+
 const fn default_true() -> bool {
     true
 }
@@ -1065,5 +1237,44 @@ mod tests {
     fn trust_decides_auto_update() {
         assert!(PluginTrust::Verified.allows_auto_update());
         assert!(!PluginTrust::Unverified.allows_auto_update());
+    }
+
+    #[test]
+    fn a_source_needs_https_a_name_and_an_explicit_unsigned_acceptance() {
+        assert!(
+            validate_plugin_user_source("Acme", "https://acme.example/i.json", None, false)
+                .is_err()
+        );
+        assert!(
+            validate_plugin_user_source("Acme", "https://acme.example/i.json", None, true).is_ok()
+        );
+        assert!(
+            validate_plugin_user_source("Acme", "https://acme.example/i.json", Some("key"), false)
+                .is_ok()
+        );
+        assert!(
+            validate_plugin_user_source("", "https://acme.example/i.json", Some("key"), false)
+                .is_err()
+        );
+        assert!(
+            validate_plugin_user_source("Acme", "http://acme.example/i.json", Some("key"), false)
+                .is_err()
+        );
+        assert!(validate_plugin_user_source("Acme", "not a url", Some("key"), false).is_err());
+        assert!(
+            validate_plugin_user_source("Acme", "https://acme.example/i.json", Some("  "), false)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn a_source_id_is_stable_and_address_derived() {
+        let first = plugin_user_source_id("https://acme.example/i.json");
+        let second = plugin_user_source_id(" https://acme.example/i.json ");
+        let other = plugin_user_source_id("https://other.example/i.json");
+        assert_eq!(first, second);
+        assert_ne!(first, other);
+        assert_eq!(first.len(), 16);
+        assert!(first.chars().all(|c| c.is_ascii_hexdigit()));
     }
 }
