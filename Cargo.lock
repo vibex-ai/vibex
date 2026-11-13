@@ -10512,6 +10512,7 @@ version = "0.1.5"
 dependencies = [
  "async-trait",
  "axum",
+ "futures-util",
  "reqwest",
  "rusqlite",
  "serde",
@@ -10520,6 +10521,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-tungstenite 0.28.0",
  "tracing",
  "uuid",
  "vibex-config-switch",

@@ -411,6 +411,7 @@ async fn telegram_pairing_commands_and_approval_round_trip() {
             home_dir: home,
             agent: agent_port,
             telegram_api_base: Some(format!("http://{address}")),
+            lark_api_base: None,
             locale: Some("en".to_string()),
         })
         .expect("service"),

@@ -8,6 +8,7 @@ mod adapter;
 mod agent_port;
 mod error;
 mod i18n;
+mod lark;
 mod render;
 mod service;
 mod telegram;
@@ -17,6 +18,7 @@ pub use adapter::ImAdapter;
 pub use agent_port::ImAgentPort;
 pub use error::{ImError, ImResult};
 pub use i18n::ImLocale;
+pub use lark::LarkAdapter;
 pub use service::{ImChannelService, ImChannelServiceConfig};
 pub use telegram::TelegramAdapter;
 pub use types::{

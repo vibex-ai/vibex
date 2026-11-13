@@ -98,11 +98,11 @@ use crate::{
     BackendOperation, BackendProjection, BackendRefetch, BackendResult, BrowserBackend,
     BrowserDialogResolution, BrowserFrameBatch, BrowserFrameSubscription, BrowserInputRequest,
     BrowserSessionOpenRequest, BrowserTabOpenRequest, BrowserTabSelection, BrowserViewportRequest,
-    DeviceBackend, FileBackend, GitBackend, ImChannelDefaultSessionUpdate, ImChannelEnabledRequest,
-    ImChannelSecretUpdateRequest, ManagementBackend, ManagementProfileSelectionRequest,
-    MutationRequest, RelayConnectionState, RelayStatusSummary, SidebarBackend, TerminalBackend,
-    TerminalFrame, TerminalFrameBatch, TerminalFrameSubscription, WorkspaceBackend,
-    WorkspaceSummary,
+    DeviceBackend, FileBackend, GitBackend, ImChannelAppSecretUpdateRequest,
+    ImChannelDefaultSessionUpdate, ImChannelEnabledRequest, ImChannelSecretUpdateRequest,
+    ManagementBackend, ManagementProfileSelectionRequest, MutationRequest, RelayConnectionState,
+    RelayStatusSummary, SidebarBackend, TerminalBackend, TerminalFrame, TerminalFrameBatch,
+    TerminalFrameSubscription, WorkspaceBackend, WorkspaceSummary,
 };
 use vibex_desktop_model::{SidebarMutationOutcome, SidebarOrganizationView, UiStateStore};
 
@@ -5296,6 +5296,23 @@ impl ManagementBackend for NativeBackend {
                 .management()
                 .im_channels()
                 .set_bot_token(&request.payload.channel_id, &request.payload.bot_token)
+                .await
+                .map_err(Into::into)
+        })
+    }
+
+    fn set_im_channel_app_secret(
+        &self,
+        request: MutationRequest<ImChannelAppSecretUpdateRequest>,
+    ) -> BackendFuture<'_, ()> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .im_channels()
+                .set_app_secret(&request.payload.channel_id, &request.payload.app_secret)
                 .await
                 .map_err(Into::into)
         })

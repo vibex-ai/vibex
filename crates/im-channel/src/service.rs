@@ -12,9 +12,9 @@ use vibex_core::{
     CreateAgentSessionRequest, FetchTimelineRequest, ImActionId, ImBindingId, ImBindingStatus,
     ImBindingSummary, ImChannelConfig, ImChannelConfigEnvelope, ImChannelDraft, ImChannelId,
     ImChannelKind, ImChannelState, ImChannelStatus, ImChannelSummary, ImChannelTestReport,
-    ImMessageId, ImPairingCodeInfo, ImPairingId, ImPairingRequest, ImPrincipalId, ImPrincipalRole,
-    ImPrincipalStatus, ImPrincipalSummary, ImSessionDefaults, MessageProvenance, PermissionRequest,
-    PermissionRequestStatus, PermissionResolution, PermissionResponseKind,
+    ImLarkTransport, ImMessageId, ImPairingCodeInfo, ImPairingId, ImPairingRequest, ImPrincipalId,
+    ImPrincipalRole, ImPrincipalStatus, ImPrincipalSummary, ImSessionDefaults, MessageProvenance,
+    PermissionRequest, PermissionRequestStatus, PermissionResolution, PermissionResponseKind,
     PermissionResponseOption, ResolvePermissionRequest, SendAgentMessageRequest, TimelineLiveEvent,
     TimelinePayload, VibexError, VibexResult, VibexSessionId, unix_timestamp_ms,
 };
@@ -30,6 +30,7 @@ use crate::adapter::ImAdapter;
 use crate::agent_port::ImAgentPort;
 use crate::error::ImError;
 use crate::i18n::ImLocale;
+use crate::lark::LarkAdapter;
 use crate::render;
 use crate::telegram::TelegramAdapter;
 use crate::types::{ImButton, ImChatType, ImInboundEvent, ImSentMessage, ImTarget};
@@ -45,6 +46,8 @@ pub struct ImChannelServiceConfig {
     pub agent: Arc<dyn ImAgentPort>,
     /// Test-only override for the Telegram API root.
     pub telegram_api_base: Option<String>,
+    /// Test-only override for the Lark API root.
+    pub lark_api_base: Option<String>,
     pub locale: Option<String>,
 }
 
@@ -194,10 +197,13 @@ impl ImChannelService {
                 "IM channel name is required",
             ));
         }
-        if !matches!(draft.config, ImChannelConfig::Telegram(_)) {
+        if matches!(
+            draft.config,
+            ImChannelConfig::WeCom(_) | ImChannelConfig::WeChatPersonal(_)
+        ) {
             return Err(VibexError::capability(
                 "im_channel_kind_unsupported",
-                "this build supports Telegram IM channels only",
+                "this build supports Telegram and Lark IM channels only",
             ));
         }
         let now = unix_timestamp_ms();
@@ -286,18 +292,44 @@ impl ImChannelService {
     }
 
     pub async fn set_bot_token(&self, channel_id: &ImChannelId, token: &str) -> VibexResult<()> {
+        self.set_secret(
+            channel_id,
+            "bot_token",
+            token,
+            "Telegram bot token is required",
+        )
+        .await
+    }
+
+    pub async fn set_app_secret(&self, channel_id: &ImChannelId, secret: &str) -> VibexResult<()> {
+        self.set_secret(
+            channel_id,
+            "app_secret",
+            secret,
+            "Lark app secret is required",
+        )
+        .await
+    }
+
+    async fn set_secret(
+        &self,
+        channel_id: &ImChannelId,
+        secret_kind: &str,
+        value: &str,
+        required_message: &str,
+    ) -> VibexResult<()> {
         let conn = self.open()?;
         let _record = ImChannelRepository::get(&conn, channel_id)?.ok_or_else(|| {
             VibexError::validation("im_channel_not_found", "IM channel was not found")
         })?;
-        if token.trim().is_empty() {
+        if value.trim().is_empty() {
             return Err(VibexError::validation(
-                "im_bot_token_required",
-                "Telegram bot token is required",
+                "im_channel_secret_required",
+                required_message,
             ));
         }
-        let lookup_key = format!("im:{}:bot_token", channel_id.as_str());
-        vibex_config_switch::secrets::store_im_secret(&lookup_key, token.trim())?;
+        let lookup_key = format!("im:{}:{}", channel_id.as_str(), secret_kind);
+        vibex_config_switch::secrets::store_im_secret(&lookup_key, value.trim())?;
         let backend = vibex_config_switch::secrets::im_secret_write_backend();
         let backend = match backend {
             vibex_core::ProviderSecretBackend::HostFile => "host_file",
@@ -305,7 +337,7 @@ impl ImChannelService {
         };
         let record = ImChannelSecretRecord {
             channel_id: channel_id.clone(),
-            secret_kind: "bot_token".to_string(),
+            secret_kind: secret_kind.to_string(),
             backend: backend.to_string(),
             lookup_key,
             setup_state: "configured".to_string(),
@@ -355,7 +387,6 @@ impl ImChannelService {
         let record = ImChannelRepository::get(&conn, channel_id)?.ok_or_else(|| {
             VibexError::validation("im_channel_not_found", "IM channel was not found")
         })?;
-        let (token, _) = self.telegram_credentials(&conn, &record)?;
         let envelope: ImChannelConfigEnvelope =
             serde_json::from_str(&record.config_json).map_err(|_| {
                 VibexError::validation(
@@ -363,22 +394,49 @@ impl ImChannelService {
                     "IM channel configuration is not valid",
                 )
             })?;
-        let ImChannelConfig::Telegram(config) = envelope.config else {
-            return Err(VibexError::capability(
+        let status = Arc::new(Mutex::new(ImChannelStatus::default()));
+        match envelope.config {
+            ImChannelConfig::Telegram(config) => {
+                let (token, _) = self.channel_secret(&conn, &record, "bot_token")?;
+                TelegramAdapter::new(
+                    record.channel_id.clone(),
+                    token,
+                    config.chat_id,
+                    config.require_mention_in_groups,
+                    self.inner.config.telegram_api_base.clone(),
+                    status,
+                )
+                .map_err(im_error_to_vibex)?
+                .probe()
+                .await
+                .map_err(im_error_to_vibex)
+            }
+            ImChannelConfig::Lark(config) => {
+                if config.transport != ImLarkTransport::LongConnection {
+                    return Err(VibexError::capability(
+                        "im_lark_transport_unsupported",
+                        "this build supports the Lark long connection only",
+                    ));
+                }
+                let (app_secret, _) = self.channel_secret(&conn, &record, "app_secret")?;
+                LarkAdapter::new(
+                    record.channel_id.clone(),
+                    config.app_id,
+                    app_secret,
+                    config.chat_id,
+                    self.inner.config.lark_api_base.clone(),
+                    status,
+                )
+                .map_err(im_error_to_vibex)?
+                .probe()
+                .await
+                .map_err(im_error_to_vibex)
+            }
+            _ => Err(VibexError::capability(
                 "im_channel_kind_unsupported",
-                "this build supports Telegram IM channels only",
-            ));
-        };
-        let adapter = TelegramAdapter::new(
-            record.channel_id.clone(),
-            token,
-            config.chat_id,
-            config.require_mention_in_groups,
-            self.inner.config.telegram_api_base.clone(),
-            Arc::new(Mutex::new(ImChannelStatus::default())),
-        )
-        .map_err(im_error_to_vibex)?;
-        adapter.probe().await.map_err(im_error_to_vibex)
+                "this build supports Telegram and Lark IM channels only",
+            )),
+        }
     }
 
     pub async fn create_pairing_code(
@@ -510,9 +568,10 @@ impl ImChannelService {
         status: ImChannelStatus,
     ) -> VibexResult<ImChannelSummary> {
         let secrets = ImChannelSecretRepository::list_for_channel(conn, &record.channel_id)?;
-        let configured = secrets
-            .iter()
-            .any(|secret| secret.secret_kind == "bot_token" && secret.setup_state == "configured");
+        let configured = secrets.iter().any(|secret| {
+            matches!(secret.secret_kind.as_str(), "bot_token" | "app_secret")
+                && secret.setup_state == "configured"
+        });
         let default_session = serde_json::from_str::<ImChannelConfigEnvelope>(&record.config_json)
             .ok()
             .and_then(|envelope| envelope.default_session);
@@ -584,35 +643,64 @@ impl ImChannelService {
                     "IM channel configuration is not valid",
                 )
             })?;
-        let ImChannelConfig::Telegram(config) = envelope.config else {
-            return Err(VibexError::capability(
-                "im_channel_kind_unsupported",
-                "this build supports Telegram IM channels only",
-            ));
-        };
         let conn = self.open()?;
-        let (token, _) = self.telegram_credentials(&conn, record)?;
         let status = self.status_slot(&record.channel_id).await;
         if let Ok(mut status) = status.lock() {
             status.state = ImChannelState::Starting;
             status.since_ms = unix_timestamp_ms();
         }
-        let adapter = Arc::new(
-            TelegramAdapter::new(
-                record.channel_id.clone(),
-                token,
-                config.chat_id,
-                config.require_mention_in_groups,
-                self.inner.config.telegram_api_base.clone(),
-                status,
-            )
-            .map_err(im_error_to_vibex)?,
-        );
-        let task = adapter.spawn(
-            self.inner.inbound_tx.clone(),
-            self.inner.shutdown.subscribe(),
-        );
-        let adapter: Arc<dyn ImAdapter> = adapter;
+        let (adapter, task): (Arc<dyn ImAdapter>, JoinHandle<()>) = match envelope.config {
+            ImChannelConfig::Telegram(config) => {
+                let (token, _) = self.channel_secret(&conn, record, "bot_token")?;
+                let adapter = Arc::new(
+                    TelegramAdapter::new(
+                        record.channel_id.clone(),
+                        token,
+                        config.chat_id,
+                        config.require_mention_in_groups,
+                        self.inner.config.telegram_api_base.clone(),
+                        Arc::clone(&status),
+                    )
+                    .map_err(im_error_to_vibex)?,
+                );
+                let task = adapter.spawn(
+                    self.inner.inbound_tx.clone(),
+                    self.inner.shutdown.subscribe(),
+                );
+                (adapter, task)
+            }
+            ImChannelConfig::Lark(config) => {
+                if config.transport != ImLarkTransport::LongConnection {
+                    return Err(VibexError::capability(
+                        "im_lark_transport_unsupported",
+                        "this build supports the Lark long connection only",
+                    ));
+                }
+                let (app_secret, _) = self.channel_secret(&conn, record, "app_secret")?;
+                let adapter = Arc::new(
+                    LarkAdapter::new(
+                        record.channel_id.clone(),
+                        config.app_id,
+                        app_secret,
+                        config.chat_id,
+                        self.inner.config.lark_api_base.clone(),
+                        Arc::clone(&status),
+                    )
+                    .map_err(im_error_to_vibex)?,
+                );
+                let task = adapter.spawn(
+                    self.inner.inbound_tx.clone(),
+                    self.inner.shutdown.subscribe(),
+                );
+                (adapter, task)
+            }
+            _ => {
+                return Err(VibexError::capability(
+                    "im_channel_kind_unsupported",
+                    "this build supports Telegram and Lark IM channels only",
+                ));
+            }
+        };
         let runtime = ChannelRuntime {
             adapter,
             task,
@@ -650,26 +738,27 @@ impl ImChannelService {
         Ok(())
     }
 
-    fn telegram_credentials(
+    fn channel_secret(
         &self,
         conn: &vibex_db::DbConnection,
         record: &ImChannelRecord,
+        secret_kind: &str,
     ) -> VibexResult<(String, String)> {
-        let secret = ImChannelSecretRepository::get(conn, &record.channel_id, "bot_token")?
+        let secret = ImChannelSecretRepository::get(conn, &record.channel_id, secret_kind)?
             .ok_or_else(|| {
                 VibexError::validation(
-                    "im_bot_token_missing",
-                    "Telegram bot token is not configured",
+                    "im_channel_secret_missing",
+                    "the channel secret is not configured",
                 )
             })?;
-        let token = vibex_config_switch::secrets::resolve_im_secret(&secret.lookup_key)?
+        let value = vibex_config_switch::secrets::resolve_im_secret(&secret.lookup_key)?
             .ok_or_else(|| {
                 VibexError::validation(
-                    "im_bot_token_missing",
-                    "Telegram bot token is not configured",
+                    "im_channel_secret_missing",
+                    "the channel secret is not configured",
                 )
             })?;
-        Ok((token, secret.lookup_key))
+        Ok((value, secret.lookup_key))
     }
 
     async fn router_loop(this: Weak<Self>, mut rx: mpsc::Receiver<ImInboundEvent>) {
@@ -1980,6 +2069,7 @@ mod tests {
             home_dir: dir.path().to_path_buf(),
             agent: Arc::new(MockAgent::new()),
             telegram_api_base: None,
+            lark_api_base: None,
             locale: None,
         })
         .expect("service");
@@ -2029,6 +2119,40 @@ mod tests {
             .expect("pairing code");
         assert!(pairing.code.starts_with("VBX-"));
         assert_eq!(pairing.role, ImPrincipalRole::Approver);
+    }
+
+    #[tokio::test]
+    async fn default_session_round_trips_through_channel_config() {
+        let (service, _dir) = service().await;
+        let channel = service
+            .create_channel(telegram_draft())
+            .await
+            .expect("create channel");
+        let selection = vibex_core::SessionRuntimeSelection::provider(
+            vibex_core::AgentId::parse("claude").expect("agent"),
+            vibex_core::ProviderProfileId::new(),
+            "test-model",
+        );
+        let defaults = ImSessionDefaults {
+            workspace_root: "/tmp/vibex-default".to_string(),
+            workspace_mode: vibex_core::WorkspaceMode::CurrentCheckout,
+            agent_id: selection.agent_id.clone(),
+            auth_source: selection.auth_source.clone(),
+            model: selection.model.clone(),
+            reasoning_effort: selection.reasoning_effort.clone(),
+            mode_id: selection.mode_id.clone(),
+            config_values: selection.config_values.clone(),
+        };
+        let summary = service
+            .set_default_session(&channel.channel_id, Some(defaults.clone()))
+            .await
+            .expect("set default");
+        assert_eq!(summary.default_session, Some(defaults));
+        let summary = service
+            .set_default_session(&channel.channel_id, None)
+            .await
+            .expect("clear default");
+        assert!(summary.default_session.is_none());
     }
 
     #[test]

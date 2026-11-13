@@ -3413,6 +3413,7 @@ impl DesktopRuntime {
                     runtime_selection.clone(),
                 )),
                 telegram_api_base: None,
+                lark_api_base: None,
                 locale: std::env::var("VIBEX_IM_DEFAULT_LOCALE").ok(),
             },
         )?);

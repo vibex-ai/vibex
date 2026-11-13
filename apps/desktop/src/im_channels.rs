@@ -19,9 +19,9 @@ use gpui_component::{
 };
 use vibex_backend::BackendError;
 use vibex_core::{
-    AgentSession, ImBindingSummary, ImChannelConfig, ImChannelDraft, ImChannelId, ImChannelSummary,
-    ImPairingCodeInfo, ImPairingRequest, ImPrincipalId, ImPrincipalRole, ImPrincipalSummary,
-    ImSessionDefaults, ImTelegramConfig,
+    AgentSession, ImBindingSummary, ImChannelConfig, ImChannelDraft, ImChannelId, ImChannelKind,
+    ImChannelSummary, ImLarkConfig, ImLarkTransport, ImPairingCodeInfo, ImPairingRequest,
+    ImPrincipalId, ImPrincipalRole, ImPrincipalSummary, ImSessionDefaults, ImTelegramConfig,
 };
 
 use crate::app::VibexWorkbench;
@@ -31,6 +31,9 @@ pub struct ImChannelsView {
     name_input: Entity<InputState>,
     token_input: Entity<InputState>,
     chat_input: Entity<InputState>,
+    lark_app_id_input: Entity<InputState>,
+    lark_app_secret_input: Entity<InputState>,
+    lark_chat_input: Entity<InputState>,
     channels: Vec<ImChannelSummary>,
     selected: Option<ImChannelId>,
     principals: Vec<ImPrincipalSummary>,
@@ -55,11 +58,20 @@ impl ImChannelsView {
         let token_input = cx.new(|cx| InputState::new(window, cx).placeholder("123456:ABC-DEF..."));
         let chat_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("-1001234567890 or @channel"));
+        let lark_app_id_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("cli_xxxxxxxxx"));
+        let lark_app_secret_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Lark app secret"));
+        let lark_chat_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("oc_xxxxxxxxx (optional)"));
         Self {
             workbench,
             name_input,
             token_input,
             chat_input,
+            lark_app_id_input,
+            lark_app_secret_input,
+            lark_chat_input,
             channels: Vec::new(),
             selected: None,
             principals: Vec::new(),
@@ -196,6 +208,91 @@ impl ImChannelsView {
                         Ok(Ok(sessions)) => this.default_sessions = sessions,
                         Ok(Err(error)) => this.error = Some(error),
                         Err(error) => this.error = Some(error.to_string()),
+                    }
+                    cx.notify();
+                });
+            },
+        ));
+    }
+
+    fn create_lark_channel(&mut self, cx: &mut Context<Self>) {
+        if self.busy {
+            return;
+        }
+        let app_id = self.lark_app_id_input.read(cx).value().to_string();
+        let app_secret = self.lark_app_secret_input.read(cx).value().to_string();
+        let chat_id = self.lark_chat_input.read(cx).value().to_string();
+        if app_id.trim().is_empty() || app_secret.trim().is_empty() {
+            self.error = Some("Lark app id and app secret are required.".to_string());
+            cx.notify();
+            return;
+        }
+        let Some(backend) = self.backend(cx) else {
+            self.error = Some("The runtime has no active backend.".to_string());
+            cx.notify();
+            return;
+        };
+        self.busy = true;
+        self.error = None;
+        self.notice = None;
+        self.task = Some(cx.spawn(
+            async move |weak: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let display_name = if chat_id.trim().is_empty() {
+                    "Lark bot".to_string()
+                } else {
+                    chat_id.trim().to_string()
+                };
+                let draft = ImChannelDraft {
+                    display_name,
+                    config: ImChannelConfig::Lark(ImLarkConfig {
+                        app_id: app_id.trim().to_string(),
+                        chat_id: (!chat_id.trim().is_empty())
+                            .then(|| chat_id.trim().to_string()),
+                        transport: ImLarkTransport::LongConnection,
+                    }),
+                    default_session: None,
+                    event_filter: Vec::new(),
+                    locale: None,
+                };
+                let result = async {
+                    let channel = backend
+                        .management()
+                        .create_im_channel(vibex_backend::MutationRequest::new(draft))
+                        .await
+                        .map_err(backend_error)?;
+                    backend
+                        .management()
+                        .set_im_channel_app_secret(vibex_backend::MutationRequest::new(
+                            vibex_backend::ImChannelAppSecretUpdateRequest {
+                                channel_id: channel.channel_id.clone(),
+                                app_secret: app_secret.trim().to_string(),
+                            },
+                        ))
+                        .await
+                        .map_err(backend_error)?;
+                    backend
+                        .management()
+                        .set_im_channel_enabled(vibex_backend::MutationRequest::new(
+                            vibex_backend::ImChannelEnabledRequest {
+                                channel_id: channel.channel_id,
+                                enabled: true,
+                            },
+                        ))
+                        .await
+                        .map(|_| ())
+                        .map_err(backend_error)
+                }
+                .await;
+                let _ = weak.update(cx, |this, cx| {
+                    this.busy = false;
+                    match result {
+                        Ok(()) => {
+                            this.notice = Some("Lark channel created. Generate a pairing code, then send /pair <code> in a direct message.".to_string());
+                            this.loaded = false;
+                            this.loading = false;
+                            this.reload(cx);
+                        }
+                        Err(error) => this.error = Some(error),
                     }
                     cx.notify();
                 });
@@ -537,6 +634,15 @@ impl ImChannelsView {
         cx.notify();
     }
 
+    fn channel_kind_label(&self, kind: ImChannelKind) -> &'static str {
+        match kind {
+            ImChannelKind::Telegram => "Telegram",
+            ImChannelKind::Lark => "Lark",
+            ImChannelKind::WeCom => "WeCom",
+            ImChannelKind::WeChatPersonal => "WeChat",
+        }
+    }
+
     fn status_dot(&self, channel: &ImChannelSummary, cx: &App) -> AnyElement {
         let color = match channel.status.state {
             vibex_core::ImChannelState::Connected => cx.theme().success,
@@ -613,6 +719,47 @@ impl Render for ImChannelsView {
                     ),
             );
 
+        let add_lark_form = v_flex()
+            .gap_2()
+            .p_3()
+            .rounded(px(8.0))
+            .border_1()
+            .border_color(border)
+            .bg(surface)
+            .child(
+                div()
+                    .text_sm()
+                    .font_semibold()
+                    .text_color(foreground)
+                    .child("Add Lark / Feishu channel"),
+            )
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(Input::new(&self.lark_app_id_input).small().w_full())
+                    .child(Input::new(&self.lark_chat_input).small().w_full()),
+            )
+            .child(Input::new(&self.lark_app_secret_input).small().w_full())
+            .child(
+                h_flex()
+                    .justify_between()
+                    .items_center()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(muted)
+                            .child("The app secret is stored in the OS keychain (or the runtime's host secret file). Lark approvals use the text fallback for now."),
+                    )
+                    .child(
+                        Button::new("im-lark-create")
+                            .small()
+                            .primary()
+                            .label(if self.busy { "Working…" } else { "Add Lark channel" })
+                            .disabled(self.busy)
+                            .on_click(cx.listener(|this, _, _, cx| this.create_lark_channel(cx))),
+                    ),
+            );
+
         let list = if self.channels.is_empty() {
             div()
                 .text_sm()
@@ -620,7 +767,7 @@ impl Render for ImChannelsView {
                 .child(if self.loading {
                     "Loading channels…"
                 } else {
-                    "No IM channels yet. Add a Telegram bot above."
+                    "No IM channels yet. Add a Telegram bot or Lark app above."
                 })
                 .into_any_element()
         } else {
@@ -646,12 +793,13 @@ impl Render for ImChannelsView {
                                         .child(channel.display_name.clone()),
                                 )
                                 .child(div().text_xs().text_color(muted).child(format!(
-                                    "Telegram · {} · {}",
+                                    "{} · {} · {}",
+                                    self.channel_kind_label(channel.kind),
                                     self.status_label(channel),
                                     if channel.configured {
-                                        "token configured"
+                                        "secret configured"
                                     } else {
-                                        "token missing"
+                                        "secret missing"
                                     }
                                 ))),
                         )
@@ -965,6 +1113,7 @@ impl Render for ImChannelsView {
                 )
             })
             .child(add_form)
+            .child(add_lark_form)
             .child(list)
             .child(selected_panel)
             .child(

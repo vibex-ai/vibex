@@ -131,6 +131,23 @@ pub struct ImChannelDefaultSessionUpdate {
     pub default_session: Option<ImSessionDefaults>,
 }
 
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImChannelAppSecretUpdateRequest {
+    pub channel_id: ImChannelId,
+    pub app_secret: String,
+}
+
+impl std::fmt::Debug for ImChannelAppSecretUpdateRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ImChannelAppSecretUpdateRequest")
+            .field("channel_id", &self.channel_id)
+            .field("app_secret", &"<redacted>")
+            .finish()
+    }
+}
+
 pub trait ManagementBackend: BackendBound {
     fn list_agents(&self, request: AgentListRequest) -> BackendFuture<'_, AgentListResponse>;
 
@@ -965,6 +982,19 @@ pub trait ManagementBackend: BackendBound {
     fn set_im_channel_bot_token(
         &self,
         request: MutationRequest<ImChannelSecretUpdateRequest>,
+    ) -> BackendFuture<'_, ()> {
+        let _ = request;
+        Box::pin(async {
+            Err(BackendError::unsupported(
+                "im_channels_unavailable",
+                "IM channels are unavailable on this backend",
+            ))
+        })
+    }
+
+    fn set_im_channel_app_secret(
+        &self,
+        request: MutationRequest<ImChannelAppSecretUpdateRequest>,
     ) -> BackendFuture<'_, ()> {
         let _ = request;
         Box::pin(async {
