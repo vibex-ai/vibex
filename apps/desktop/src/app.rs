@@ -18707,23 +18707,29 @@ impl VibexWorkbench {
             self.wsl_watch_task = None;
         }
         self.runtime_remove_pending = None;
+        let was_active_remote = self
+            .remote_client
+            .as_ref()
+            .map(|client| client.runtime_id.as_str())
+            == Some(id.as_str());
+        if was_active_remote {
+            self.remote_client = None;
+        }
+        // Settings reads the runtime registry from disk when it reloads. The
+        // registry has to be on disk first, or the page re-reads the file that
+        // still contains the removed runtime and paints its row back until the
+        // page is reopened. This is especially visible for a directly paired
+        // runtime, whose row has no profile store to disappear on its own.
+        self.persist_runtime_registry(cx);
+        if was_active_remote {
+            self.activate_local_runtime(cx);
+        } else {
+            cx.notify();
+        }
         self.settings_view.update(cx, |settings, cx| {
             settings.reload_connections_profiles();
             cx.notify();
         });
-        if self
-            .remote_client
-            .as_ref()
-            .map(|client| client.runtime_id.as_str())
-            == Some(id.as_str())
-        {
-            self.remote_client = None;
-            self.persist_runtime_registry(cx);
-            self.activate_local_runtime(cx);
-            return;
-        }
-        self.persist_runtime_registry(cx);
-        cx.notify();
     }
 
     /// Deletes the runtime side of a removed SSH connection.
@@ -122882,6 +122888,40 @@ mod tests {
         assert!(!source.contains(concat!("ssh_connection::", "feature")));
         assert!(!source.contains(concat!("VIBEX_SSH_REMOTE", "_RUNTIME")));
         assert!(!source.contains(concat!("developer.ssh_remote", "_runtime")));
+    }
+
+    /// Settings reads the runtime registry from disk, so removal has to write
+    /// it before asking the page to reload.
+    ///
+    /// Reloading first re-read the file that still contained the runtime and
+    /// painted the removed row back; the actual file write happened after the
+    /// repaint, so the row only disappeared when the page was reopened. A
+    /// directly paired runtime shows this most clearly because it has no
+    /// profile store whose removal would independently hide its row.
+    #[test]
+    fn removing_a_runtime_persists_before_the_connections_page_reloads() {
+        let source = include_str!("app.rs");
+        let body = source
+            .split_once("    fn remove_runtime(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// Deletes the runtime side of a removed SSH connection")
+            })
+            .map(|(body, _)| body)
+            .expect("the runtime removal should remain inspectable");
+        let persist = body
+            .find("self.persist_runtime_registry(cx);")
+            .expect("removal must persist the registry");
+        let reload = body
+            .find("settings.reload_connections_profiles();")
+            .expect("removal must refresh the Connections page");
+        assert!(
+            persist < reload,
+            "the registry must be on disk before the page re-reads it"
+        );
+        assert!(
+            body.contains("self.activate_local_runtime(cx);"),
+            "removing the active runtime still returns to the embedded authority"
+        );
     }
 
     /// A pairing link and a bare code are two shapes of the same entry.
