@@ -158,6 +158,7 @@ impl NativePluginDescriptor {
                 kind: contribution.kind.to_string(),
                 contribution_id: contribution.contribution_id.to_string(),
                 title: Some(contribution.title.to_string()),
+                detail: None,
                 enabled: self.enabled_by_default,
             })
             .collect()

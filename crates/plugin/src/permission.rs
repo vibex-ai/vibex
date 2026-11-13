@@ -188,6 +188,11 @@ impl PluginPermissionCatalog {
                 push("agent.tool", None);
             }
         }
+        if let Some(process) = &capabilities.process
+            && !process.executables.is_empty()
+        {
+            push("process.execute", Some(process.executables.join(", ")));
+        }
 
         permissions.sort_by(|left, right| left.key.cmp(&right.key));
         permissions.dedup_by(|left, right| left.key == right.key);
@@ -235,6 +240,93 @@ mod tests {
         let fs = permissions.iter().find(|p| p.key == "fs.read").unwrap();
         assert_eq!(fs.scope.as_deref(), Some("${workspace}"));
         assert_eq!(fs.risk, PluginPermissionRisk::High);
+    }
+
+    #[test]
+    fn a_process_declaration_names_its_executables_as_its_scope() {
+        use crate::manifest::PluginProcessCapability;
+
+        let capabilities = PluginCapabilities {
+            process: Some(PluginProcessCapability {
+                executables: vec!["git".to_string(), "rg".to_string()],
+            }),
+            ..Default::default()
+        };
+        let permissions = permissions_for(&capabilities);
+        assert_eq!(permissions.len(), 1);
+        assert_eq!(permissions[0].key, "process.execute");
+        // The scope is the grant: "may run git, rg" is a sentence a person can
+        // judge, so it is what the consent sheet shows.
+        assert_eq!(permissions[0].scope.as_deref(), Some("git, rg"));
+        assert_eq!(permissions[0].risk, PluginPermissionRisk::High);
+    }
+
+    #[test]
+    fn a_process_declaration_with_no_program_asks_for_nothing() {
+        use crate::manifest::PluginProcessCapability;
+
+        let capabilities = PluginCapabilities {
+            process: Some(PluginProcessCapability {
+                executables: Vec::new(),
+            }),
+            ..Default::default()
+        };
+        assert!(permissions_for(&capabilities).is_empty());
+    }
+
+    #[test]
+    fn every_capability_a_manifest_can_declare_maps_to_a_known_permission() {
+        use crate::manifest::{PluginAgentCapability, PluginProcessCapability};
+
+        // One manifest that asks for everything, so a capability added without
+        // its permission shows up here rather than at consent time.
+        let capabilities = PluginCapabilities {
+            panel: true,
+            command: true,
+            storage: true,
+            clipboard: true,
+            network: Some(PluginNetworkCapability {
+                hosts: vec!["api.example.com".to_string()],
+                http: Vec::new(),
+            }),
+            fs: Some(PluginFsCapability {
+                read: vec!["${workspace}".to_string()],
+                write: vec!["${workspace}/out".to_string()],
+            }),
+            agent: Some(PluginAgentCapability {
+                read: true,
+                send: true,
+                tool: true,
+            }),
+            process: Some(PluginProcessCapability {
+                executables: vec!["git".to_string()],
+            }),
+        };
+        let catalog = PluginPermissionCatalog::builtin();
+        let permissions = permissions_for(&capabilities);
+        let keys: Vec<&str> = permissions
+            .iter()
+            .map(|permission| permission.key.as_str())
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                "agent.read",
+                "agent.send",
+                "agent.tool",
+                "clipboard",
+                "fs.read",
+                "fs.write",
+                "net.fetch",
+                "process.execute",
+                "storage",
+                "ui.command",
+                "ui.panel",
+            ]
+        );
+        for key in keys {
+            assert!(catalog.knows(key), "{key} is not in the catalog");
+        }
     }
 
     #[test]

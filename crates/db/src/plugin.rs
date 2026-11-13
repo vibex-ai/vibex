@@ -563,13 +563,14 @@ impl PluginRepository {
         for contribution in contributions {
             conn.execute(
                 "INSERT OR REPLACE INTO plugin_contributions (
-                    plugin_id, kind, contribution_id, title, enabled
-                ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    plugin_id, kind, contribution_id, title, detail, enabled
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![
                     plugin_id,
                     contribution.kind,
                     contribution.contribution_id,
                     contribution.title,
+                    contribution.detail,
                     contribution.enabled,
                 ],
             )
@@ -585,7 +586,7 @@ impl PluginRepository {
     ) -> VibexResult<Vec<PluginContribution>> {
         let mut statement = conn
             .prepare(
-                "SELECT plugin_id, kind, contribution_id, title, enabled \
+                "SELECT plugin_id, kind, contribution_id, title, detail, enabled \
                  FROM plugin_contributions WHERE plugin_id = ?1 ORDER BY kind, contribution_id",
             )
             .map_err(db_err("plugin_contributions_list_failed"))?;
@@ -596,7 +597,8 @@ impl PluginRepository {
                     kind: row.get(1)?,
                     contribution_id: row.get(2)?,
                     title: row.get(3)?,
-                    enabled: row.get(4)?,
+                    detail: row.get(4)?,
+                    enabled: row.get(5)?,
                 })
             })
             .map_err(db_err("plugin_contributions_list_failed"))?;

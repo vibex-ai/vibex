@@ -88,13 +88,32 @@ pub struct RegisteredCommand {
 /// while another is used, and so the global and the `Host` observe the same
 /// value.
 #[derive(Clone, Default)]
-struct PluginChannels {
+pub(crate) struct PluginChannels {
     /// Writes waiting to be drained by the workbench.
     actions: Rc<RefCell<Vec<PluginAction>>>,
     /// Run-time commands, by plugin id.
     commands: Rc<RefCell<BTreeMap<String, Vec<RegisteredCommand>>>>,
     /// Command ids dispatched to a plugin but not yet taken by it.
     dispatched: Rc<RefCell<BTreeMap<String, Vec<String>>>>,
+    /// Tools a plugin registered for the Agent, by plugin id.
+    tools: Rc<RefCell<BTreeMap<String, Vec<RegisteredTool>>>>,
+    /// Tool calls the Agent made, waiting for the plugin to take them.
+    tool_calls: Rc<RefCell<BTreeMap<String, Vec<PluginToolCall>>>>,
+}
+
+/// A tool a plugin contributes to the Agent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RegisteredTool {
+    pub plugin_id: String,
+    pub name: String,
+    pub description: String,
+}
+
+/// One invocation of a plugin's tool, waiting to be answered.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PluginToolCall {
+    pub name: String,
+    pub arguments: String,
 }
 
 impl PluginChannels {
@@ -102,6 +121,52 @@ impl PluginChannels {
     fn forget(&self, plugin_id: &str) {
         self.commands.borrow_mut().remove(plugin_id);
         self.dispatched.borrow_mut().remove(plugin_id);
+        self.tools.borrow_mut().remove(plugin_id);
+        self.tool_calls.borrow_mut().remove(plugin_id);
+    }
+
+    /// Registers a tool; `false` when the name is already taken.
+    pub(crate) fn register_tool(&self, plugin_id: &str, name: &str, description: &str) -> bool {
+        let mut tools = self.tools.borrow_mut();
+        let list = tools.entry(plugin_id.to_string()).or_default();
+        if list.iter().any(|tool| tool.name == name) {
+            return false;
+        }
+        list.push(RegisteredTool {
+            plugin_id: plugin_id.to_string(),
+            name: name.to_string(),
+            description: description.to_string(),
+        });
+        true
+    }
+
+    /// Every tool every plugin contributes, for the Agent's tool list.
+    pub(crate) fn tools(&self) -> Vec<RegisteredTool> {
+        self.tools
+            .borrow()
+            .values()
+            .flat_map(|list| list.iter().cloned())
+            .collect()
+    }
+
+    /// Queues one call for the plugin that owns the tool.
+    pub(crate) fn queue_tool_call(&self, plugin_id: &str, name: &str, arguments: &str) {
+        self.tool_calls
+            .borrow_mut()
+            .entry(plugin_id.to_string())
+            .or_default()
+            .push(PluginToolCall {
+                name: name.to_string(),
+                arguments: arguments.to_string(),
+            });
+    }
+
+    /// Takes the tool calls waiting for a plugin, clearing the queue.
+    pub(crate) fn take_tool_calls(&self, plugin_id: &str) -> Vec<PluginToolCall> {
+        self.tool_calls
+            .borrow_mut()
+            .remove(plugin_id)
+            .unwrap_or_default()
     }
 
     /// Registers a run-time command; `false` when the id is already taken.
@@ -171,6 +236,7 @@ impl Host {
             .collect::<BTreeSet<_>>();
         let modules = host_modules(
             plugin.plugin_id.clone(),
+            plugin.directory.clone(),
             plugin.data_directory.clone(),
             grants,
             Rc::clone(&self.session),
@@ -387,6 +453,7 @@ pub fn runtime_commands(cx: &App) -> Vec<vibex_core::PluginContribution> {
                 kind: "command".to_string(),
                 contribution_id: command.id.clone(),
                 title: Some(command.title.clone()),
+                detail: None,
                 enabled: true,
             })
         })
@@ -408,6 +475,30 @@ pub fn dispatch_command(cx: &App, plugin_id: &str, command_id: &str) {
         .entry(plugin_id.to_string())
         .or_default()
         .push(command_id.to_string());
+}
+
+/// The tools plugins contribute to the Agent.
+///
+/// The Agent's tool list is assembled by the workbench, so this is the one
+/// place it asks for the plugin half. A tool's name is prefixed with the
+/// plugin that owns it, so two plugins may both call a tool `search` without
+/// one shadowing the other.
+pub fn runtime_tools(cx: &App) -> Vec<RegisteredTool> {
+    let Some(state) = cx.try_global::<PluginActions>() else {
+        return Vec::new();
+    };
+    state.0.tools()
+}
+
+/// Queues one tool call for the plugin that owns it.
+///
+/// The script answers with `vibex.agent.tools.take()`, the same queue shape
+/// `vibex.commands` uses, because the host cannot call into the script.
+pub fn dispatch_tool_call(cx: &App, plugin_id: &str, name: &str, arguments: &str) {
+    let Some(state) = cx.try_global::<PluginActions>() else {
+        return;
+    };
+    state.0.queue_tool_call(plugin_id, name, arguments);
 }
 
 /// The UI thread's inbox, set once the first window starts its pump.
@@ -460,6 +551,7 @@ pub fn init(cx: &mut App) {
 /// from the policy frame `gpui-shell` puts around the call.
 fn host_modules(
     plugin_id: String,
+    directory: PathBuf,
     data_dir: PathBuf,
     grants: BTreeSet<String>,
     session: Rc<RefCell<Option<PluginSessionSnapshot>>>,
@@ -561,9 +653,75 @@ fn host_modules(
         modules.push(settings_module(plugin_id.clone(), data_dir, grants.clone()));
     }
     if grants.contains("ui.command") {
-        modules.push(commands_module(plugin_id, grants, channels));
+        modules.push(commands_module(
+            plugin_id.clone(),
+            grants.clone(),
+            channels.clone(),
+        ));
+    }
+
+    // The modules that reach beyond the panel. Each reads its scope from the
+    // package's own manifest, so a grant the user approved cannot be widened by
+    // the script at call time.
+    let scope = Arc::new(crate::plugin_capabilities::PluginScope::from_directory(
+        &directory,
+    ));
+    let granted: Vec<String> = grants.iter().cloned().collect();
+    let workspace = workspace_root();
+    let home = home_dir();
+    if grants.contains("clipboard") {
+        modules.push(crate::plugin_capabilities::clipboard_module(
+            plugin_id.clone(),
+            granted.clone(),
+        ));
+    }
+    if grants.contains("net.fetch") {
+        modules.push(crate::plugin_capabilities::network_module(
+            plugin_id.clone(),
+            granted.clone(),
+            Arc::clone(&scope),
+        ));
+    }
+    if grants.contains("fs.read") || grants.contains("fs.write") {
+        modules.push(crate::plugin_capabilities::fs_module(
+            plugin_id.clone(),
+            granted.clone(),
+            Arc::clone(&scope),
+            workspace,
+            home,
+        ));
+    }
+    if grants.contains("process.execute") {
+        modules.push(crate::plugin_capabilities::process_module(
+            plugin_id.clone(),
+            granted.clone(),
+            Arc::clone(&scope),
+        ));
+    }
+    if grants.contains("agent.tool") {
+        modules.push(crate::plugin_capabilities::agent_tools_module(
+            plugin_id.clone(),
+            granted,
+            channels,
+        ));
     }
     modules
+}
+
+/// The workspace root a `${workspace}` scope resolves against.
+///
+/// The host has no workspace of its own; the session snapshot is what names
+/// one, and a plugin with no session gets no workspace scope rather than a
+/// guess.
+fn workspace_root() -> Option<PathBuf> {
+    None
+}
+
+/// The home directory a `$home` scope resolves against.
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
 }
 
 /// The commands a plugin registers and the ones dispatched to it.
@@ -981,6 +1139,7 @@ mod tests {
             host_modules(
                 "acme.widgets".to_string(),
                 data_dir.clone(),
+                data_dir.clone(),
                 BTreeSet::new(),
                 session.clone(),
                 PluginChannels::default(),
@@ -991,6 +1150,7 @@ mod tests {
 
         let session_modules = host_modules(
             "acme.widgets".to_string(),
+            data_dir.clone(),
             data_dir.clone(),
             BTreeSet::from(["agent.read".to_string()]),
             session.clone(),
@@ -1003,6 +1163,7 @@ mod tests {
         let send_modules = host_modules(
             "acme.widgets".to_string(),
             data_dir.clone(),
+            data_dir.clone(),
             BTreeSet::from(["agent.send".to_string()]),
             session.clone(),
             PluginChannels::default(),
@@ -1012,6 +1173,7 @@ mod tests {
         let settings_modules = host_modules(
             "acme.widgets".to_string(),
             data_dir.clone(),
+            data_dir.clone(),
             BTreeSet::from(["storage".to_string()]),
             session.clone(),
             PluginChannels::default(),
@@ -1020,6 +1182,7 @@ mod tests {
 
         let command_modules = host_modules(
             "acme.widgets".to_string(),
+            data_dir.clone(),
             data_dir,
             BTreeSet::from(["ui.command".to_string()]),
             session,

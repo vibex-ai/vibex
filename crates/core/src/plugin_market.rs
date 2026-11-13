@@ -998,6 +998,14 @@ pub struct PluginContribution {
     pub contribution_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// What the contribution points at, when it points at something.
+    ///
+    /// A web panel carries its address here; a command or a script panel has
+    /// nothing to put in it. The field is one string rather than a per-kind
+    /// object because every contribution kind the host has so far needs at
+    /// most one piece of extra data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
     #[serde(default)]
     pub enabled: bool,
 }

@@ -4636,10 +4636,19 @@ fn catalog_right_rail_entries(contributions: &[PluginContribution]) -> Vec<Right
             .find(|activity| activity.id() == contribution.contribution_id);
         let entry = match builtin {
             Some(activity) => RightRailEntry::Builtin(activity),
+            // A contribution that names an address is a web panel: the
+            // embedded browser draws it, and there is no script to mount.
+            None if contribution.detail.is_some() => RightRailEntry::Web {
+                panel_id: contribution.contribution_id.clone(),
+                title: contribution
+                    .title
+                    .clone()
+                    .unwrap_or_else(|| contribution.contribution_id.clone()),
+                url: contribution.detail.clone().unwrap_or_default(),
+            },
             // A first-party panel this build draws in Rust but that has no
-            // button yet — the web panel, until the unified `panel.web`
-            // contribution lands — must not be offered as a script panel: it
-            // has no script to run, so the button would open nothing.
+            // button yet must not be offered as a script panel: it has no
+            // script to run, so the button would open nothing.
             None if native.get(&contribution.plugin_id).is_some() => continue,
             None => RightRailEntry::Script {
                 plugin_id: contribution.plugin_id.clone(),
@@ -109751,6 +109760,7 @@ mod tests {
             kind: kind.to_string(),
             contribution_id: id.to_string(),
             title: Some(id.to_string()),
+            detail: None,
             enabled: true,
         };
 

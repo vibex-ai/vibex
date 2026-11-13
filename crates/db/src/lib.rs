@@ -101,7 +101,7 @@ pub use runtime::{
     SwitchOperationJournalRepository, SwitchOperationRecord,
 };
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 93;
+pub const CURRENT_SCHEMA_VERSION: i64 = 94;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Copy)]
@@ -12824,6 +12824,7 @@ pub fn apply_migrations(conn: &mut Connection) -> VibexResult<Vec<String>> {
     apply_plugin_local_reviews(conn, &mut applied)?;
     apply_plugin_user_sources(conn, &mut applied)?;
     apply_plugin_user_source_kind(conn, &mut applied)?;
+    apply_plugin_contribution_detail(conn, &mut applied)?;
     Ok(applied)
 }
 
@@ -13024,7 +13025,59 @@ fn apply_plugin_user_source_kind(
     Ok(())
 }
 
+/// Gives a contribution a place to say what it points at.
 ///
+/// A web panel contributes its address; the other kinds leave it empty. The
+/// column is added rather than a second table because a contribution is
+/// already one row keyed by plugin, kind and id.
+fn apply_plugin_contribution_detail(
+    conn: &mut Connection,
+    applied: &mut Vec<String>,
+) -> VibexResult<()> {
+    const VERSION: i64 = 94;
+    const NAME: &str = "plugin_contribution_detail";
+    if migration_applied(conn, VERSION)? {
+        return Ok(());
+    }
+    let tx = conn.transaction().map_err(storage_err(
+        "migration_transaction_failed",
+        "failed to start the plugin contribution detail migration",
+    ))?;
+    // `ALTER TABLE` has no `IF NOT EXISTS`; a rewound migration row over a
+    // schema that already carries the column would fail without this check.
+    let has_column =
+        tx.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('plugin_contributions') WHERE name = 'detail'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(storage_err(
+            "migration_lookup_failed",
+            "failed to inspect the plugin contribution detail column",
+        ))? > 0;
+    if !has_column {
+        tx.execute_batch("ALTER TABLE plugin_contributions ADD COLUMN detail TEXT NULL;")
+            .map_err(storage_err(
+                "migration_apply_failed",
+                "failed to add the plugin contribution detail column",
+            ))?;
+    }
+    tx.execute(
+        "INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
+        params![VERSION, NAME, unix_timestamp_ms()],
+    )
+    .map_err(storage_err(
+        "migration_record_failed",
+        "failed to record the plugin contribution detail migration",
+    ))?;
+    tx.commit().map_err(storage_err(
+        "migration_commit_failed",
+        "failed to commit the plugin contribution detail migration",
+    ))?;
+    applied.push(format!("{VERSION}:{NAME}"));
+    Ok(())
+}
+
 /// An Agent that authenticates as itself — `claude login`, a Codex subscription —
 /// has a launch command and no Provider endpoint. The column required one, so such
 /// an Agent got a placeholder Provider row with no address and no Key purely to
@@ -19873,6 +19926,7 @@ mod tests {
                 "91:plugin_local_reviews",
                 "92:plugin_user_sources",
                 "93:plugin_user_source_kind",
+                "94:plugin_contribution_detail",
             ]
         );
         let agent_models: (Option<String>, Option<String>) = conn
@@ -20050,6 +20104,7 @@ mod tests {
                 "91:plugin_local_reviews",
                 "92:plugin_user_sources",
                 "93:plugin_user_source_kind",
+                "94:plugin_contribution_detail",
             ]
         );
         let activation_completed_at_ms: Option<i64> = conn
@@ -20212,6 +20267,7 @@ mod tests {
                 "91:plugin_local_reviews",
                 "92:plugin_user_sources",
                 "93:plugin_user_source_kind",
+                "94:plugin_contribution_detail",
             ]
         );
         let stored: (String, Option<String>, Option<i64>) = conn
@@ -20408,6 +20464,7 @@ mod tests {
                 "91:plugin_local_reviews",
                 "92:plugin_user_sources",
                 "93:plugin_user_source_kind",
+                "94:plugin_contribution_detail",
             ]
         );
         assert_eq!(
@@ -21873,6 +21930,7 @@ mod tests {
                 "91:plugin_local_reviews",
                 "92:plugin_user_sources",
                 "93:plugin_user_source_kind",
+                "94:plugin_contribution_detail",
             ]
         );
         let managed = ManagedWorktreeRepository::get_by_id(&conn, &worktree_id)

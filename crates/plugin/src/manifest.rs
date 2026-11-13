@@ -63,6 +63,23 @@ pub struct PluginCapabilities {
     /// Agent access.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<PluginAgentCapability>,
+    /// Running programs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process: Option<PluginProcessCapability>,
+}
+
+/// The programs a plugin may run.
+///
+/// A plugin never names a shell command line: it names the executables it may
+/// start, and the host runs exactly those with the arguments it is given. That
+/// keeps the grant reviewable — "may run `git`" is a sentence a person can
+/// judge, "may run anything" is not.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginProcessCapability {
+    /// Executable names, without a path: `git`, `node`, `rg`.
+    #[serde(default)]
+    pub executables: Vec<String>,
 }
 
 /// The hosts and HTTP rules a plugin may reach.
@@ -124,6 +141,68 @@ pub struct PluginContributions {
     pub commands: Vec<PluginCommandContribution>,
     #[serde(default)]
     pub settings: Vec<PluginSettingContribution>,
+    #[serde(default)]
+    pub panels: Vec<PluginPanelContribution>,
+}
+
+/// One panel a plugin contributes to the right rail.
+///
+/// A panel is either the plugin's own view — the `ui.panel` surface, drawn by
+/// the script — or a web page the embedded browser opens. The two are one
+/// contribution kind because the rail treats them alike: an activity, a title,
+/// and something to show. A `web` panel needs no script at all, so a plugin
+/// that only pins a page still asks for `ui.panel`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginPanelContribution {
+    pub id: String,
+    pub title: String,
+    /// The https address a web panel opens.
+    ///
+    /// Absent means the panel is the plugin's own view.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub web: Option<String>,
+}
+
+impl PluginPanelContribution {
+    /// Whether this panel is a web page rather than the plugin's own view.
+    pub fn is_web(&self) -> bool {
+        self.web.is_some()
+    }
+
+    /// Checks the id, title and address of one panel.
+    pub fn validate(&self) -> Result<(), ManifestError> {
+        if self.id.trim().is_empty() {
+            return Err(ManifestError::InvalidId(self.id.clone()));
+        }
+        if !self.id.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
+        }) {
+            return Err(ManifestError::InvalidId(self.id.clone()));
+        }
+        if self.title.trim().is_empty() {
+            return Err(ManifestError::EmptyName);
+        }
+        if self.title.chars().count() > 64 {
+            return Err(ManifestError::NameTooLong);
+        }
+        if let Some(web) = &self.web {
+            let url = url::Url::parse(web.trim())
+                .map_err(|_| ManifestError::InvalidEntry(web.clone()))?;
+            // A web panel is a page in the embedded browser, so it follows the
+            // same rule the rail's own pinned pages do: https only, and a
+            // loopback address is allowed for local development.
+            let allowed = url.scheme() == "https"
+                || (url.scheme() == "http"
+                    && url
+                        .host_str()
+                        .is_some_and(|host| host == "localhost" || host == "127.0.0.1"));
+            if !allowed {
+                return Err(ManifestError::InvalidEntry(web.clone()));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// One command a plugin registers.

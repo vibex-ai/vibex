@@ -13633,7 +13633,7 @@ impl ManagementCenter {
             let toggle_id = source.source_id.clone();
             let remove_id = source.source_id.clone();
             let enabled = source.enabled;
-            let mut row = h_flex()
+            let row = h_flex()
                 .id(SharedString::from(format!(
                     "management-plugin-source-{}",
                     source.source_id

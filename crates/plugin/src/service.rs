@@ -474,6 +474,7 @@ impl PluginService {
                 &updated.display_name,
                 &updated.permissions,
                 &manifest.contributes.commands,
+                &manifest.contributes.panels,
             ),
         )?;
         let record = PluginRepository::get(conn, plugin_id)?
@@ -909,7 +910,8 @@ impl PluginService {
                 return Err(VibexError::from(error));
             }
         };
-        let commands = manifest.contributes.commands;
+        let commands = manifest.contributes.commands.clone();
+        let panels = manifest.contributes.panels.clone();
 
         let size = crate::install::directory_size(&staging);
         let destination = self
@@ -988,7 +990,13 @@ impl PluginService {
         PluginRepository::replace_contributions(
             conn,
             &entry.id,
-            &contributions_for(&entry.id, &entry.name, &version.permissions, &commands),
+            &contributions_for(
+                &entry.id,
+                &entry.name,
+                &version.permissions,
+                &commands,
+                &panels,
+            ),
         )?;
         PluginRepository::set_active_version(
             conn,
@@ -1078,14 +1086,20 @@ impl PluginService {
                     &previous.permissions,
                     now,
                 )?;
-                let previous_commands = PluginManifest::from_file(
+                let previous_manifest = PluginManifest::from_file(
                     &self
                         .store
                         .version_dir(&entry.id, &previous.version)
                         .join(AUTHOR_MANIFEST_FILE),
                 )
-                .map(|manifest| manifest.contributes.commands)
-                .unwrap_or_default();
+                .ok();
+                let previous_commands = previous_manifest
+                    .as_ref()
+                    .map(|manifest| manifest.contributes.commands.clone())
+                    .unwrap_or_default();
+                let previous_panels = previous_manifest
+                    .map(|manifest| manifest.contributes.panels)
+                    .unwrap_or_default();
                 PluginRepository::replace_contributions(
                     conn,
                     &entry.id,
@@ -1094,6 +1108,7 @@ impl PluginService {
                         &entry.name,
                         &previous.permissions,
                         &previous_commands,
+                        &previous_panels,
                     ),
                 )?;
                 if previous.version != failed_version {
@@ -1443,17 +1458,43 @@ fn contributions_for(
     name: &str,
     permissions: &[PluginPermission],
     commands: &[crate::manifest::PluginCommandContribution],
+    panels: &[crate::manifest::PluginPanelContribution],
 ) -> Vec<PluginContribution> {
     let mut contributions = Vec::new();
-    if permissions
+    let has_panel = permissions
         .iter()
-        .any(|permission| permission.key == "ui.panel")
-    {
+        .any(|permission| permission.key == "ui.panel");
+
+    // A web panel is its own rail activity: the embedded browser draws it, so
+    // the contribution carries the address rather than a script surface. The
+    // script panel is the fallback, and only when the plugin actually has one —
+    // a plugin made of web panels alone should not also get an empty view.
+    // Every panel contribution needs `ui.panel`: the rail is not a plugin's to
+    // add to without the grant, and a web panel is still a place in the rail.
+    let web_panels: Vec<_> = if has_panel {
+        panels.iter().filter(|panel| panel.is_web()).collect()
+    } else {
+        Vec::new()
+    };
+    for panel in &web_panels {
+        contributions.push(PluginContribution {
+            plugin_id: plugin_id.to_string(),
+            kind: crate::native::RIGHT_RAIL_ACTIVITY.to_string(),
+            contribution_id: format!("rail_web_{plugin_id}_{}", panel.id),
+            title: Some(panel.title.clone()),
+            detail: panel.web.clone(),
+            enabled: true,
+        });
+    }
+    let has_script_panel =
+        has_panel && (panels.is_empty() || panels.iter().any(|panel| !panel.is_web()));
+    if has_script_panel {
         contributions.push(PluginContribution {
             plugin_id: plugin_id.to_string(),
             kind: crate::native::RIGHT_RAIL_ACTIVITY.to_string(),
             contribution_id: format!("rail_plugin_{plugin_id}"),
             title: Some(name.to_string()),
+            detail: None,
             enabled: true,
         });
     }
@@ -1463,6 +1504,7 @@ fn contributions_for(
             kind: "command".to_string(),
             contribution_id: format!("plugin_command_{plugin_id}_{}", command.id),
             title: Some(command.title.clone()),
+            detail: None,
             enabled: true,
         });
     }
@@ -1868,6 +1910,7 @@ mod tests {
                 kind: activity.kind.to_string(),
                 contribution_id: activity.contribution_id.to_string(),
                 title: Some(activity.title.to_string()),
+                detail: None,
                 enabled: true,
             }
         };
@@ -1903,8 +1946,13 @@ mod tests {
     #[test]
     fn an_installed_script_contributes_the_panel_it_asked_for() {
         let panel = PluginPermission::new("ui.panel", PluginPermissionRisk::Low);
-        let contributions =
-            contributions_for("acme.widgets", "Widgets", std::slice::from_ref(&panel), &[]);
+        let contributions = contributions_for(
+            "acme.widgets",
+            "Widgets",
+            std::slice::from_ref(&panel),
+            &[],
+            &[],
+        );
         assert_eq!(contributions.len(), 1);
         assert_eq!(contributions[0].kind, crate::native::RIGHT_RAIL_ACTIVITY);
         assert_eq!(contributions[0].contribution_id, "rail_plugin_acme.widgets");
@@ -1912,7 +1960,7 @@ mod tests {
 
         let background = PluginPermission::new("storage", PluginPermissionRisk::Low);
         assert!(
-            contributions_for("acme.widgets", "Widgets", &[background], &[]).is_empty(),
+            contributions_for("acme.widgets", "Widgets", &[background], &[], &[]).is_empty(),
             "a plugin that declared no panel must not reach the rail"
         );
     }
@@ -2089,6 +2137,77 @@ mod tests {
     }
 
     #[test]
+    fn a_web_panel_becomes_a_rail_activity_that_carries_its_address() {
+        use crate::manifest::PluginPanelContribution;
+
+        let panel = PluginPermission::new("ui.panel", PluginPermissionRisk::Low);
+        let panels = vec![PluginPanelContribution {
+            id: "docs".to_string(),
+            title: "Docs".to_string(),
+            web: Some("https://example.com/docs".to_string()),
+        }];
+        let contributions = contributions_for("acme.widgets", "Widgets", &[panel], &[], &panels);
+
+        // One activity, and it is the web panel rather than the script view:
+        // a plugin made of web panels has no script surface to offer.
+        assert_eq!(contributions.len(), 1);
+        assert_eq!(contributions[0].kind, crate::native::RIGHT_RAIL_ACTIVITY);
+        assert_eq!(
+            contributions[0].contribution_id,
+            "rail_web_acme.widgets_docs"
+        );
+        assert_eq!(contributions[0].title.as_deref(), Some("Docs"));
+        assert_eq!(
+            contributions[0].detail.as_deref(),
+            Some("https://example.com/docs")
+        );
+    }
+
+    #[test]
+    fn a_script_panel_and_a_web_panel_can_live_side_by_side() {
+        use crate::manifest::PluginPanelContribution;
+
+        let panel = PluginPermission::new("ui.panel", PluginPermissionRisk::Low);
+        let panels = vec![
+            PluginPanelContribution {
+                id: "docs".to_string(),
+                title: "Docs".to_string(),
+                web: Some("https://example.com/docs".to_string()),
+            },
+            PluginPanelContribution {
+                id: "own".to_string(),
+                title: "Widgets".to_string(),
+                web: None,
+            },
+        ];
+        let contributions = contributions_for("acme.widgets", "Widgets", &[panel], &[], &panels);
+        let ids: Vec<&str> = contributions
+            .iter()
+            .map(|contribution| contribution.contribution_id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["rail_web_acme.widgets_docs", "rail_plugin_acme.widgets"]
+        );
+        // The script panel carries no address; the rail mounts a view for it.
+        assert!(contributions[1].detail.is_none());
+    }
+
+    #[test]
+    fn a_web_panel_without_the_panel_permission_contributes_nothing() {
+        use crate::manifest::PluginPanelContribution;
+
+        let panels = vec![PluginPanelContribution {
+            id: "docs".to_string(),
+            title: "Docs".to_string(),
+            web: Some("https://example.com/docs".to_string()),
+        }];
+        // No `ui.panel` grant: the rail is not this plugin's to add to.
+        let contributions = contributions_for("acme.widgets", "Widgets", &[], &[], &panels);
+        assert!(contributions.is_empty());
+    }
+
+    #[test]
     fn a_manifest_command_becomes_a_contribution() {
         let contributions = contributions_for(
             "acme.widgets",
@@ -2098,6 +2217,7 @@ mod tests {
                 id: "say-hello".to_string(),
                 title: "Say hello".to_string(),
             }],
+            &[],
         );
         assert_eq!(contributions.len(), 1);
         assert_eq!(contributions[0].kind, "command");
@@ -2277,7 +2397,7 @@ mod tests {
         PluginRepository::replace_contributions(
             &connection,
             "acme.widgets",
-            &contributions_for(&entry.id, &entry.name, &failed.permissions, &[]),
+            &contributions_for(&entry.id, &entry.name, &failed.permissions, &[], &[]),
         )
         .unwrap();
 

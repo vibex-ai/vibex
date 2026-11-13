@@ -67,6 +67,125 @@ The store is scoped to the plugin's data directory and survives upgrades. Values
 are JSON: null, boolean, number, string, array or object. The file is written
 atomically (temporary file, then rename).
 
+## `vibex.clipboard` (requires `clipboard`)
+
+```js
+import { readText, writeText } from "vibex.clipboard";
+
+readText();            // "" when the clipboard holds nothing textual
+writeText("hello");    // true
+```
+
+Text only. An image on the clipboard is not returned, because a script has no
+surface to draw one on and the value would be a handle it could not use.
+
+## `vibex.network` (requires `net.fetch`)
+
+```js
+import { fetch } from "vibex.network";
+
+const { status, body } = await fetch("https://api.example.com/data");
+```
+
+The address must be `https` and its host must be one the manifest named:
+
+```json
+"capabilities": {
+  "network": { "hosts": ["api.example.com", "*.githubusercontent.com"] }
+}
+```
+
+A pattern is `*` (every host), `*.example.com` (the domain and its subdomains),
+or an exact host; matching is anchored, so `*.example.com` does not admit
+`evil-example.com`. A private or loopback address is refused even when a
+pattern would match it, and the response is capped at 8 MiB. Redirects are not
+followed: a hop to an undeclared host would be a grant the user never saw.
+
+## `vibex.fs` (requires `fs.read` / `fs.write`)
+
+```js
+import { readText, writeText, list } from "vibex.fs";
+
+readText("/home/me/project/Cargo.toml");
+writeText("/home/me/project/notes.md", "# Notes");
+list("/home/me/project/src");
+```
+
+Every path must be inside a root the manifest declared:
+
+```json
+"capabilities": {
+  "fs": { "read": ["${workspace}"], "write": ["${workspace}/out"] }
+}
+```
+
+`${workspace}` and `${home}` are the only variables; an absolute path works
+too. A path is normalized before it is compared, so `src/../Cargo.toml` is
+inside `${workspace}` while `../secret` is not. A relative root is refused: it
+would resolve against whatever the process happened to be running in. One file
+is capped at 8 MiB.
+
+## `vibex.process` (requires `process.execute`)
+
+```js
+import { run } from "vibex.process";
+
+const { status, stdout, stderr } = await run("git", ["status", "--short"]);
+```
+
+A plugin names the executables it may start, never a command line:
+
+```json
+"capabilities": { "process": { "executables": ["git", "rg"] } }
+```
+
+The name is a plain file name, so a grant for `git` does not admit `./git` or
+`/usr/bin/git` — those are different programs that share a name. No shell is
+involved: the arguments are passed as an argv array. A run is killed after 30
+seconds.
+
+## `vibex.agent.tools` (requires `agent.tool`)
+
+```js
+import { register, take } from "vibex.agent.tools";
+
+register("search-notes", "Search the notes in this workspace");
+
+// Invocations the Agent made since the last call, cleared as they are returned.
+for (const call of take()) {
+  // call.name, call.arguments (a JSON string)
+}
+```
+
+The queue shape is the same one `vibex.commands` uses, and for the same reason:
+`gpui-shell` has no function value, so the host cannot call back into the
+script. The Agent's tool list is assembled from what plugins registered; an
+invocation lands in the owning plugin's queue and the panel answers it on its
+next render.
+
+## Panels
+
+A plugin can contribute a rail panel two ways. The default is its own view —
+the `ui.panel` surface the script draws. A `web` panel is a page the embedded
+browser opens instead:
+
+```json
+{
+  "capabilities": { "panel": true },
+  "contributes": {
+    "panels": [
+      { "id": "docs", "title": "Docs", "web": "https://example.com/docs" },
+      { "id": "own", "title": "Widgets" }
+    ]
+  }
+}
+```
+
+Both need `ui.panel`: the rail is not a plugin's to add to without the grant.
+A `web` address must be `https`, or `http` on `localhost` for development. A
+plugin made only of `web` panels contributes no script view, so the rail shows
+exactly the pages it declared.
+
 ## Commands
 
 A plugin can contribute commands through its manifest:
@@ -122,7 +241,12 @@ Request the permission in `vibex-plugin.json`:
   "capabilities": {
     "panel": true,
     "command": true,
-    "agent": { "read": true, "send": true }
+    "storage": true,
+    "clipboard": true,
+    "network": { "hosts": ["api.example.com"] },
+    "fs": { "read": ["${workspace}"] },
+    "process": { "executables": ["git"] },
+    "agent": { "read": true, "send": true, "tool": true }
   }
 }
 ```

@@ -319,6 +319,20 @@ pub fn sign_document(raw: &[u8], signing_key: &SigningKey) -> String {
     BASE64.encode(signature.to_bytes())
 }
 
+/// The short id a publisher key is named by.
+///
+/// Eight bytes of the key's SHA-256, in hex. The id is derived rather than
+/// chosen so two keys cannot share one, and short because a manifest carries
+/// it.
+pub fn key_id(key: &VerifyingKey) -> String {
+    use sha2::{Digest as _, Sha256};
+    let digest = Sha256::digest(key.to_bytes());
+    digest[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 /// Encodes a verifying key as the base64 form the client embeds.
 pub fn encode_verifying_key(key: &VerifyingKey) -> String {
     BASE64.encode(key.to_bytes())
@@ -404,6 +418,53 @@ mod tests {
     /// Point `VIBEX_TEST_INDEX` at a downloaded `index.json` (and
     /// `VIBEX_TEST_ROOT_KEY` at its signer) to check the real published files;
     /// without them the test is a no-op, so the ordinary suite stays offline.
+    /// The third-party path: a package signed by an author's own key, verified
+    /// against the key the signed index carries.
+    ///
+    /// This is the round trip `PublisherKey` exists for. The author key here is
+    /// generated in the test rather than shipped, so the test proves the code
+    /// path rather than a particular key.
+    #[test]
+    fn a_publisher_signature_verifies_against_the_index_key() {
+        let signing_key = SigningKey::from_bytes(&[42u8; 32]);
+        let public_key = encode_verifying_key(&signing_key.verifying_key());
+        let key_id = crate::market::index::key_id(&signing_key.verifying_key());
+
+        let package = b"the package bytes";
+        let signature = sign_package(package, &signing_key);
+
+        // The index vouches for this key; the package names it.
+        let key = PublisherKey {
+            publisher_id: "acme".to_string(),
+            key_id: key_id.clone(),
+            public_key,
+        };
+        verify_package_signature(&key.public_key, &signature, package).unwrap();
+
+        // A different package is refused under the same signature.
+        assert!(verify_package_signature(&key.public_key, &signature, b"other bytes").is_err());
+        // So is the same package under a different key.
+        let other = SigningKey::from_bytes(&[7u8; 32]);
+        assert!(
+            verify_package_signature(
+                &encode_verifying_key(&other.verifying_key()),
+                &signature,
+                package
+            )
+            .is_err()
+        );
+        // A signature naming a key the index does not carry cannot be checked
+        // at all, which is what the installer reports as `SignatureInvalid`.
+        assert!(
+            verify_package_signature(
+                &encode_verifying_key(&SigningKey::from_bytes(&[1u8; 32]).verifying_key()),
+                &signature,
+                package
+            )
+            .is_err()
+        );
+    }
+
     #[test]
     fn a_published_index_verifies_against_the_key_it_was_signed_with() {
         let Ok(index) = std::env::var("VIBEX_TEST_INDEX") else {
