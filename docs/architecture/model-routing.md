@@ -132,11 +132,13 @@ motion. There is no random particle traffic and no per-token animation.
   rejected credential does not heal with time. The override is read when a
   failure is recorded, so it applies from the next rest onward.
 - **A model-list fetch is a picker, not a write.** Asking a shared Provider for
-  its catalogue fills a dialog with one row per advertised Model; the reader
-  chooses which of them the Provider should offer and can open any row's
-  settings before confirming. Nothing is written until the confirm, and the
-  confirm adds the chosen Models rather than replacing the list, so a row the
-  user authored keeps its capabilities, display name, and enabled state.
+  its catalogue opens the same two-pane picker the Agent dialog uses: the
+  fetched Models on the left, the selected Model's settings on the right, and
+  both panes filling the dialog so a short catalogue leaves no blank band. The
+  reader chooses which of them the Provider should offer and configures each
+  one before confirming. Nothing is written until the confirm, and the confirm
+  adds the chosen Models rather than replacing the list, so a row the user
+  authored keeps its capabilities, display name, and enabled state.
 - **AutoInclude** is the shared Provider's `autoRefreshModels` flag. It only
   decides how the picker opens: with the flag, the vendor's new Models arrive
   already checked; without it, every row starts unchecked. Either way the

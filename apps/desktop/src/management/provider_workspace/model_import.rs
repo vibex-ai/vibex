@@ -81,9 +81,9 @@ impl ManagementProviderModelPickerDialog {
 }
 
 impl Render for ManagementProviderModelPickerDialog {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.center.update(cx, |center, cx| {
-            center.render_provider_model_import_body(cx)
+            center.render_provider_model_import_body(window, cx)
         })
     }
 }
@@ -291,8 +291,17 @@ impl ManagementCenter {
             .as_ref()
             .map(|draft| draft.profile_name.clone())
             .unwrap_or_default();
-        let (dialog_width, dialog_height) = management_authoring_dialog_size(window);
-        window.open_dialog(cx, move |dialog, _, cx| {
+        window.open_dialog(cx, move |dialog, window, cx| {
+            // The Agent dialog's picker is the model this one follows, and it is
+            // a two-pane surface: a narrow dialog would stack the panes and turn
+            // the settings into a second scroll region. It takes the window
+            // instead, and reads the size per frame so a resize while it is open
+            // is followed rather than left behind.
+            let viewport = window.viewport_size();
+            let (dialog_width, dialog_height) = (
+                (f32::from(viewport.width) - 32.0).max(360.0),
+                (f32::from(viewport.height) - 32.0).max(360.0),
+            );
             let confirm_center = confirm_center.clone();
             let close_center = close_center.clone();
             let picked = confirm_center
@@ -473,11 +482,33 @@ impl ManagementCenter {
         true
     }
 
-    /// Points the settings pane at one row, offering it as it opens.
+    /// Points the settings pane at one row.
     ///
     /// A click on a row is the same gesture as checking it, exactly as in the
     /// Agent dialog's picker: the Model the reader is looking at is the Model
-    /// they mean.
+    /// they mean. A row the record already offers is not editable here — its
+    /// settings belong to the Models tab — so clicking it does nothing.
+    pub(in crate::management) fn select_provider_model_import_row(
+        &mut self,
+        model_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(existing) = self
+            .provider_model_import
+            .as_ref()
+            .and_then(|draft| draft.rows.iter().find(|row| row.model.id == model_id))
+            .map(|row| row.existing)
+        else {
+            return;
+        };
+        if existing {
+            return;
+        }
+        self.open_provider_model_import_row(model_id, window, cx);
+    }
+
+    /// Points the settings pane at one row, offering it as it opens.
     pub(in crate::management) fn open_provider_model_import_row(
         &mut self,
         model_id: String,
@@ -529,7 +560,8 @@ impl ManagementCenter {
         if opens {
             self.load_provider_model_import_editor(window, cx);
         } else {
-            self.model_editor.clear(window, cx);
+            self.close_provider_model_import_row(window, cx);
+            return;
         }
         cx.notify();
     }
@@ -580,9 +612,16 @@ impl ManagementCenter {
         self.model_editor.target_id = Some(model.id);
     }
 
-    /// The picker's body: what the fetch answered, and the choices made so far.
+    /// The picker's body: the fetched Models on the left, the chosen Model's
+    /// settings on the right.
+    ///
+    /// It is the Agent dialog's model picker, for a saved Provider: discovery
+    /// fills a list, the reader chooses, and the chosen row's settings are
+    /// edited beside it. Both panes fill the dialog, so a short catalogue
+    /// leaves the reader a real settings pane rather than a blank band.
     pub(in crate::management) fn render_provider_model_import_body(
         &mut self,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let Some(draft) = self.provider_model_import.as_ref() else {
@@ -594,42 +633,11 @@ impl ManagementCenter {
                 if action == &format!("shared-models:{}", draft.profile_id.as_str())
         );
         let error = draft.error.clone();
-        let total = draft.rows.len();
-        let existing = draft.rows.iter().filter(|row| row.existing).count();
-        let chosen = draft.chosen_count();
-        let profile_id = draft.profile_id.clone();
-        let rows = draft.rows.clone();
-        let expanded = draft.expanded.clone();
-        let query = self.provider_model_import_query(cx);
-        let visible = rows
-            .iter()
-            .filter(|row| provider_model_import_matches(&row.model, &query))
-            .cloned()
-            .collect::<Vec<_>>();
-        let selectable = visible.iter().filter(|row| !row.existing).count();
-        let all_visible_chosen = selectable > 0
-            && visible
-                .iter()
-                .filter(|row| !row.existing)
-                .all(|row| row.chosen);
-
         let hint = draft.hint.clone();
-        let intro = management_locale_text(
-            "Choose which of these models this Provider should offer. Nothing is added until you confirm, and each model's settings can be adjusted before it is.",
-            "选择该供应商要提供哪些模型。确认前不会写入任何模型，也可以先逐个调整模型设置。",
-            "選擇該供應商要提供哪些模型。確認前不會寫入任何模型，也可以先逐個調整模型設定。",
-        );
-        // The dialog body is already a scroll region, so the picker sizes to
-        // its own content: `size_full` here would resolve against that region
-        // and stretch a short catalogue over the whole surface.
-        let mut body = v_flex().w_full().min_w_0().gap_3().child(
-            div()
-                .w_full()
-                .min_w_0()
-                .text_xs()
-                .text_color(cx.theme().muted_foreground)
-                .child(intro),
-        );
+        let profile_id = draft.profile_id.clone();
+        let wide = f32::from(window.viewport_size().width) >= MANAGEMENT_PROFILE_PANES_MIN_WIDTH;
+
+        let mut body = v_flex().size_full().min_h_0().min_w_0().gap_3();
         if let Some(hint) = hint {
             body = body.child(
                 div()
@@ -640,32 +648,8 @@ impl ManagementCenter {
                     .child(hint),
             );
         }
-
-        if loading {
-            return body
-                .child(
-                    h_flex()
-                        .w_full()
-                        .items_center()
-                        .justify_center()
-                        .gap_2()
-                        .py_10()
-                        .child(Spinner::new().with_size(Size::Small))
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(management_locale_text(
-                                    "Reading the Provider's model list…",
-                                    "正在读取供应商的模型列表…",
-                                    "正在讀取供應商的模型清單…",
-                                )),
-                        ),
-                )
-                .into_any_element();
-        }
-
         if let Some(error) = error {
+            let retry_id = profile_id.clone();
             return body
                 .child(
                     v_flex()
@@ -695,7 +679,7 @@ impl ManagementCenter {
                                     .label(management_locale_text("Retry", "重试", "重試"))
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.fetch_shared_provider_model_catalogue(
-                                            profile_id.clone(),
+                                            retry_id.clone(),
                                             cx,
                                         )
                                     })),
@@ -705,80 +689,200 @@ impl ManagementCenter {
                 .into_any_element();
         }
 
-        if rows.is_empty() {
+        if loading {
             return body
-                .child(bare_empty_state(
-                    management_locale_text(
-                        "The endpoint listed no models",
-                        "接口没有返回模型",
-                        "介面沒有回傳模型",
-                    ),
-                    management_locale_text(
-                        "Add a model id from the Models tab instead.",
-                        "可以在“模型”标签页直接添加模型 ID。",
-                        "可以在「模型」標籤頁直接新增模型 ID。",
-                    ),
-                    cx,
-                ))
-                .into_any_element();
-        }
-
-        body = body.child(
-            h_flex()
-                .w_full()
-                .min_w_0()
-                .items_center()
-                .gap_2()
                 .child(
-                    div()
-                        .min_w_0()
+                    h_flex()
+                        .w_full()
                         .flex_1()
-                        .child(management_search_input_compact(
-                            &self.provider_model_import_search,
-                            cx,
-                        )),
-                )
-                .child(
-                    Checkbox::new("management-provider-model-import-select-all")
-                        .small()
-                        .checked(all_visible_chosen)
-                        .accessibility_label(management_locale_text("Select all", "全选", "全選"))
-                        .disabled(selectable == 0)
+                        .items_center()
+                        .justify_center()
+                        .gap_2()
+                        .py_10()
+                        .child(Spinner::new().with_size(Size::Small))
                         .child(
                             div()
                                 .text_xs()
                                 .text_color(cx.theme().muted_foreground)
-                                .child(management_locale_text("Select all", "全选", "全選")),
-                        )
-                        .on_click(cx.listener(move |this, checked, window, cx| {
-                            this.set_visible_provider_model_import_rows(*checked, window, cx);
-                        })),
+                                .child(management_locale_text(
+                                    "Reading the Provider's model list…",
+                                    "正在读取供应商的模型列表…",
+                                    "正在讀取供應商的模型清單…",
+                                )),
+                        ),
                 )
-                .child(
-                    div()
-                        .flex_none()
-                        .whitespace_nowrap()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(format!(
-                            "{chosen}/{total} · {}",
-                            management_model_count(existing)
-                        )),
-                ),
+                .into_any_element();
+        }
+
+        // The two panes share the dialog's remaining height, so the list keeps
+        // a bounded well under its rows and the settings get the rest.
+        let panes = if wide {
+            h_flex()
+                .w_full()
+                .flex_1()
+                .min_h_0()
+                .items_stretch()
+                .gap_3()
+                .child(self.render_provider_model_import_candidates_pane(true, cx))
+                .child(self.render_provider_model_import_settings_pane(true, window, cx))
+                .into_any_element()
+        } else {
+            v_flex()
+                .w_full()
+                .flex_1()
+                .min_h_0()
+                .gap_3()
+                .child(self.render_provider_model_import_candidates_pane(false, cx))
+                .child(self.render_provider_model_import_settings_pane(false, window, cx))
+                .into_any_element()
+        };
+        body.child(panes).into_any_element()
+    }
+
+    /// The left pane: what the fetch answered, with the checkbox that decides
+    /// which of those Models the Provider should offer.
+    fn render_provider_model_import_candidates_pane(
+        &mut self,
+        bounded: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Some(draft) = self.provider_model_import.as_ref() else {
+            return div().into_any_element();
+        };
+        let profile_id = draft.profile_id.clone();
+        let total = draft.rows.len();
+        let existing = draft.rows.iter().filter(|row| row.existing).count();
+        let chosen = draft.chosen_count();
+        let rows = draft.rows.clone();
+        let expanded = draft.expanded.clone();
+        let query = self.provider_model_import_query(cx);
+        let visible = rows
+            .iter()
+            .filter(|row| provider_model_import_matches(&row.model, &query))
+            .cloned()
+            .collect::<Vec<_>>();
+        let selectable = visible.iter().filter(|row| !row.existing).count();
+        let all_visible_chosen = selectable > 0
+            && visible
+                .iter()
+                .filter(|row| !row.existing)
+                .all(|row| row.chosen);
+
+        let fetching = matches!(
+            &self.mutation,
+            Some(ManagementMutation::ProviderProbe(action))
+                if action == &format!("shared-models:{}", profile_id.as_str())
         );
+        let offered = if chosen == 0 {
+            management_locale_text("None chosen", "尚未选择", "尚未選擇").to_string()
+        } else {
+            management_model_count(chosen)
+        };
+        let fetch = Button::new("management-provider-model-import-refetch")
+            .xsmall()
+            .outline()
+            .icon(Icon::default().path("icons/vibex/rotate-ccw.svg"))
+            .label(management_fetch_models_label())
+            .loading(fetching)
+            .disabled(self.mutation.is_some())
+            .on_click(cx.listener({
+                let id = profile_id.clone();
+                move |this, _, _, cx| this.fetch_shared_provider_model_catalogue(id.clone(), cx)
+            }));
+        let header = profile_pane_header(
+            management_locale_text("Available models", "可选模型", "可選模型"),
+            Some(offered.into()),
+            Some(fetch.into_any_element()),
+            cx,
+        );
+
+        let mut controls = h_flex()
+            .w_full()
+            .min_w_0()
+            .flex_none()
+            .flex_wrap()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .py_1p5()
+            .border_b_1()
+            .border_color(cx.theme().border)
+            .child(
+                div()
+                    .min_w_0()
+                    .flex_1()
+                    .child(management_search_input_compact(
+                        &self.provider_model_import_search,
+                        cx,
+                    )),
+            )
+            .child(
+                Checkbox::new("management-provider-model-import-select-all")
+                    .small()
+                    .checked(all_visible_chosen)
+                    .accessibility_label(management_locale_text("Select all", "全选", "全選"))
+                    .disabled(selectable == 0)
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(management_locale_text("Select all", "全选", "全選")),
+                    )
+                    .on_click(cx.listener(move |this, checked, window, cx| {
+                        this.set_visible_provider_model_import_rows(*checked, window, cx);
+                    })),
+            );
+        if existing > 0 {
+            controls = controls.child(
+                div()
+                    .flex_none()
+                    .whitespace_nowrap()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(format!(
+                        "{} · {}",
+                        management_model_count(total),
+                        management_locale_text("already offered", "已提供", "已提供")
+                    )),
+            );
+        }
 
         let mut list = v_flex().w_full().min_w_0().gap_0p5().p_1();
         if visible.is_empty() {
             list = list.child(bare_empty_state(
                 management_locale_text(
-                    "No model matches this filter",
-                    "没有匹配该筛选的模型",
-                    "沒有符合這個篩選的模型",
+                    if total == 0 {
+                        "The endpoint listed no models"
+                    } else {
+                        "No model matches this filter"
+                    },
+                    if total == 0 {
+                        "接口没有返回模型"
+                    } else {
+                        "没有匹配该筛选的模型"
+                    },
+                    if total == 0 {
+                        "介面沒有回傳模型"
+                    } else {
+                        "沒有符合這個篩選的模型"
+                    },
                 ),
                 management_locale_text(
-                    "Clear the filter to see the fetched models again.",
-                    "清除筛选后可重新看到拉取到的模型。",
-                    "清除篩選後可重新看到擷取到的模型。",
+                    if total == 0 {
+                        "Add a model id from the Models tab instead."
+                    } else {
+                        "Clear the filter to see the fetched models again."
+                    },
+                    if total == 0 {
+                        "可以在“模型”标签页直接添加模型 ID。"
+                    } else {
+                        "清除筛选后可重新看到拉取到的模型。"
+                    },
+                    if total == 0 {
+                        "可以在「模型」標籤頁直接新增模型 ID。"
+                    } else {
+                        "清除篩選後可重新看到擷取到的模型。"
+                    },
                 ),
                 cx,
             ));
@@ -790,7 +894,6 @@ impl ManagementCenter {
             let opened = expanded.as_deref() == Some(model_id.as_str());
             let toggled_id = model_id.clone();
             let clicked_id = model_id.clone();
-            let close_id = model_id.clone();
             let title = row
                 .model
                 .display_name
@@ -809,238 +912,298 @@ impl ManagementCenter {
             }
             let meta = meta.join(" · ");
             let debug_id = model_id.clone();
-            let mut entry = v_flex().w_full().min_w_0().child(
-                h_flex()
-                    .id(SharedString::from(format!(
-                        "management-provider-model-import-row-{model_id}"
-                    )))
-                    .debug_selector(move || {
-                        format!("management-provider-model-import-row-{debug_id}")
-                    })
-                    .w_full()
-                    .min_w_0()
-                    .items_center()
-                    .gap_2()
-                    .px_2()
-                    .py_1p5()
-                    .rounded(cx.theme().radius * 0.5)
-                    .when(opened, |row| {
-                        row.bg(cx
-                            .theme()
-                            .primary
-                            .opacity(MANAGEMENT_PANEL_ROW_SELECTED_WASH))
-                    })
-                    .when(!opened, |row| {
-                        row.hover(|row| {
-                            row.bg(management_surface_wash(cx, MANAGEMENT_PANEL_ROW_HOVER_WASH))
+            list =
+                list.child(
+                    h_flex()
+                        .id(SharedString::from(format!(
+                            "management-provider-model-import-row-{model_id}"
+                        )))
+                        .debug_selector(move || {
+                            format!("management-provider-model-import-row-{debug_id}")
                         })
-                    })
-                    .when(!is_existing, |row| {
-                        row.cursor_pointer()
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.open_provider_model_import_row(clicked_id.clone(), window, cx)
-                            }))
-                    })
-                    .child(
-                        // The checkbox answers the same question the row does,
-                        // and it is the one control that can release a choice.
-                        div()
-                            .id(SharedString::from(format!(
-                                "management-provider-model-import-check-wrap-{model_id}"
-                            )))
-                            .flex_none()
-                            .on_click(|_, _, cx| cx.stop_propagation())
-                            .child(
-                                Checkbox::new(SharedString::from(format!(
-                                    "management-provider-model-import-check-{model_id}"
+                        .w_full()
+                        .min_w_0()
+                        .items_center()
+                        .gap_2()
+                        .rounded(px(4.0))
+                        // The leading edge is reserved at rest so the row does not
+                        // shift when it becomes the one the settings pane shows.
+                        .border_l_2()
+                        .pl_1p5()
+                        .pr_2()
+                        .py_1p5()
+                        .border_color(if opened {
+                            cx.theme().primary.opacity(0.75)
+                        } else {
+                            cx.theme().transparent
+                        })
+                        .when(opened, |row| {
+                            row.bg(cx
+                                .theme()
+                                .primary
+                                .opacity(MANAGEMENT_PANEL_ROW_SELECTED_WASH))
+                        })
+                        .when(!opened, |row| {
+                            row.hover(|row| {
+                                row.bg(management_surface_wash(cx, MANAGEMENT_PANEL_ROW_HOVER_WASH))
+                            })
+                        })
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.select_provider_model_import_row(clicked_id.clone(), window, cx)
+                        }))
+                        .child(
+                            // The checkbox answers the same question the row does,
+                            // and it is the one control that can release a choice.
+                            div()
+                                .id(SharedString::from(format!(
+                                    "management-provider-model-import-check-wrap-{model_id}"
                                 )))
-                                .small()
-                                .checked(row_chosen)
-                                .disabled(is_existing)
-                                .accessibility_label(SharedString::from(title.clone()))
-                                .on_click(cx.listener(
-                                    move |this, checked, window, cx| {
+                                .flex_none()
+                                .on_click(|_, _, cx| cx.stop_propagation())
+                                .child(
+                                    Checkbox::new(SharedString::from(format!(
+                                        "management-provider-model-import-check-{model_id}"
+                                    )))
+                                    .small()
+                                    .checked(row_chosen)
+                                    .disabled(is_existing)
+                                    .accessibility_label(SharedString::from(title.clone()))
+                                    .on_click(cx.listener(move |this, checked, window, cx| {
                                         this.toggle_provider_model_import_row(
                                             toggled_id.clone(),
                                             *checked,
                                             window,
                                             cx,
                                         )
-                                    },
-                                )),
-                            ),
-                    )
-                    .child(
-                        v_flex()
-                            .min_w_0()
-                            .flex_1()
-                            .gap_0p5()
-                            .child(
-                                div()
-                                    .truncate()
-                                    .text_sm()
-                                    .when(!row_chosen, |text| {
-                                        text.text_color(cx.theme().foreground.opacity(0.78))
-                                    })
-                                    .child(title),
-                            )
-                            .when(!meta.is_empty(), |column| {
-                                column.child(
-                                    div()
-                                        .truncate()
-                                        .text_xs()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child(meta),
-                                )
-                            }),
-                    )
-                    .when(is_existing, |row| {
-                        row.child(
-                            div()
-                                .flex_none()
-                                .child(Tag::color(ColorName::Neutral).xsmall().child(
-                                    management_locale_text("Already offered", "已提供", "已提供"),
-                                )),
-                        )
-                    })
-                    .when(!is_existing, |row| {
-                        let icon = if opened {
-                            IconName::ChevronDown
-                        } else {
-                            IconName::ChevronRight
-                        };
-                        row.child(
-                            // The row's own press offers the Model, so the
-                            // disclosure keeps its press to itself rather than
-                            // toggling the row it sits in.
-                            div()
-                                .id(SharedString::from(format!(
-                                    "management-provider-model-import-expand-wrap-{model_id}"
-                                )))
-                                .flex_none()
-                                .on_click(|_, _, cx| cx.stop_propagation())
-                                .child(
-                                    Button::new(SharedString::from(format!(
-                                        "management-provider-model-import-expand-{model_id}"
-                                    )))
-                                    .xsmall()
-                                    .ghost()
-                                    .compact()
-                                    .icon(icon)
-                                    .tooltip(management_locale_text(
-                                        "Model settings",
-                                        "模型设置",
-                                        "模型設定",
-                                    ))
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        if this
-                                            .provider_model_import
-                                            .as_ref()
-                                            .and_then(|draft| draft.expanded.as_deref())
-                                            == Some(close_id.as_str())
-                                        {
-                                            this.close_provider_model_import_row(window, cx);
-                                        } else {
-                                            this.open_provider_model_import_row(
-                                                close_id.clone(),
-                                                window,
-                                                cx,
-                                            );
-                                        }
                                     })),
                                 ),
                         )
-                    }),
-            );
-            if opened {
-                entry = entry.child(self.render_provider_model_import_settings(cx));
-            }
-            list = list.child(entry);
+                        .child(
+                            v_flex()
+                                .min_w_0()
+                                .flex_1()
+                                .gap_0p5()
+                                .child(
+                                    div()
+                                        .truncate()
+                                        .text_sm()
+                                        .font_medium()
+                                        .when(!row_chosen, |text| {
+                                            text.text_color(cx.theme().foreground.opacity(0.75))
+                                        })
+                                        .child(title),
+                                )
+                                .when(!meta.is_empty(), |column| {
+                                    column.child(
+                                        div()
+                                            .truncate()
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(meta),
+                                    )
+                                }),
+                        )
+                        .when(is_existing, |row| {
+                            row.child(div().flex_none().child(
+                                Tag::color(ColorName::Neutral).xsmall().child(
+                                    management_locale_text("Already offered", "已提供", "已提供"),
+                                ),
+                            ))
+                        }),
+                );
         }
 
-        body.child(
+        let list = if bounded {
             div()
+                .id("management-provider-model-import-list")
+                .debug_selector(|| "management-provider-model-import-list".to_string())
                 .w_full()
                 .min_w_0()
-                .rounded(cx.theme().radius)
-                .border_1()
-                .border_color(cx.theme().border)
-                .child(
-                    div()
-                        .id("management-provider-model-import-list")
-                        .debug_selector(|| "management-provider-model-import-list".to_string())
-                        .w_full()
-                        .min_w_0()
-                        .max_h(px(420.0))
-                        .overflow_y_scroll()
-                        .scroll_gutter()
-                        .child(list),
-                ),
+                .min_h_0()
+                .flex_1()
+                .overflow_y_scrollbar()
+                .scroll_gutter()
+                .child(list)
+                .into_any_element()
+        } else {
+            div()
+                .id("management-provider-model-import-list")
+                .debug_selector(|| "management-provider-model-import-list".to_string())
+                .w_full()
+                .min_w_0()
+                .max_h(px(MANAGEMENT_PROFILE_PANE_MAX_HEIGHT))
+                .overflow_y_scroll()
+                .scroll_gutter()
+                .child(list)
+                .into_any_element()
+        };
+
+        let body = v_flex()
+            .w_full()
+            .min_h_0()
+            .min_w_0()
+            .flex_1()
+            .child(controls)
+            .child(list)
+            .into_any_element();
+        profile_pane_shell(
+            "provider-model-import-candidates-pane",
+            bounded,
+            header,
+            body,
+            None,
+            cx,
         )
-        .into_any_element()
     }
 
-    /// The settings of the picker's open row.
+    /// The right pane: the settings of the Model the list is showing.
     ///
     /// It is the one Model editor, so a Model chosen here is configured with
     /// the same fields and rules as one edited on the Models tab. The edit
     /// writes through into the picker's row rather than the saved record.
-    fn render_provider_model_import_settings(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let title = self
+    fn render_provider_model_import_settings_pane(
+        &mut self,
+        bounded: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let selection = self
             .provider_model_import
             .as_ref()
-            .and_then(|draft| draft.expanded.as_deref())
-            .map(str::to_string)
-            .unwrap_or_default();
-        v_flex()
-            .w_full()
-            .min_w_0()
-            .mt_1()
-            .rounded(px(6.0))
-            .border_1()
-            .border_color(cx.theme().border)
-            .bg(cx.theme().muted.opacity(0.20))
-            .child(
-                h_flex()
+            .and_then(|draft| draft.expanded.clone());
+        let selected_title = selection.as_deref().and_then(|id| {
+            self.provider_model_import
+                .as_ref()?
+                .rows
+                .iter()
+                .find(|row| row.model.id == id)
+                .map(|row| {
+                    row.model
+                        .display_name
+                        .clone()
+                        .unwrap_or_else(|| row.model.id.clone())
+                })
+        });
+        let header = profile_pane_header(
+            management_locale_text("Model settings", "模型设置", "模型設定"),
+            selected_title.clone().map(SharedString::from),
+            None,
+            cx,
+        );
+
+        let body = match selected_title {
+            Some(_) => {
+                // The editor is pointed at the selected row on every frame, so
+                // a row the reader just clicked never shows the previous
+                // Model's values.
+                if self.model_editor.target_id.as_deref() != selection.as_deref() {
+                    self.load_provider_model_import_editor(window, cx);
+                }
+                let chosen = self
+                    .provider_model_import
+                    .as_ref()
+                    .and_then(|draft| {
+                        let id = draft.expanded.as_deref()?;
+                        draft
+                            .rows
+                            .iter()
+                            .find(|row| row.model.id == id)
+                            .map(|row| row.chosen)
+                    })
+                    .unwrap_or(false);
+                let selection_id = selection.clone().unwrap_or_default();
+                let footer = h_flex()
                     .w_full()
                     .items_center()
+                    .justify_between()
                     .gap_2()
-                    .p_2()
                     .child(
                         div()
                             .min_w_0()
-                            .flex_1()
-                            .truncate()
                             .text_xs()
-                            .font_medium()
-                            .child(title),
+                            .text_color(cx.theme().muted_foreground)
+                            .child(if chosen {
+                                management_locale_text(
+                                    "This model will be added when you confirm.",
+                                    "确认后会添加该模型。",
+                                    "確認後會新增該模型。",
+                                )
+                            } else {
+                                management_locale_text(
+                                    "This model will not be added.",
+                                    "该模型不会被添加。",
+                                    "該模型不會被新增。",
+                                )
+                            }),
                     )
                     .child(
-                        Button::new("management-provider-model-import-settings-close")
+                        Button::new("management-provider-model-import-add-selected")
                             .xsmall()
-                            .ghost()
-                            .icon(IconName::Close)
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.close_provider_model_import_row(window, cx)
+                            .secondary()
+                            .icon(IconName::Plus)
+                            .label(management_locale_text(
+                                "Add this model",
+                                "添加该模型",
+                                "新增該模型",
+                            ))
+                            .disabled(chosen)
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.toggle_provider_model_import_row(
+                                    selection_id.clone(),
+                                    true,
+                                    window,
+                                    cx,
+                                )
                             })),
-                    ),
-            )
-            .child(self.render_model_editor(
-                provider_workspace::ModelEditorConfig {
-                    id_prefix: "provider-model-import",
-                    wire_choices: provider_workspace::all_wire_choices(),
-                    editable_id: false,
-                    catalog_choices: Vec::new(),
-                    pending: false,
-                    // The same switch the Agent dialog's picker offers: a
-                    // chosen Model can join the record already turned off.
-                    shows_enabled: true,
-                    write_through: true,
-                },
-                Empty.into_any_element(),
+                    );
+                let editor = self.render_model_editor(
+                    provider_workspace::ModelEditorConfig {
+                        id_prefix: "provider-model-import",
+                        wire_choices: provider_workspace::all_wire_choices(),
+                        editable_id: false,
+                        catalog_choices: Vec::new(),
+                        pending: false,
+                        // The same switch the Agent dialog's picker offers: a
+                        // chosen Model can join the record already turned off.
+                        shows_enabled: true,
+                        write_through: true,
+                    },
+                    footer.into_any_element(),
+                    cx,
+                );
+                if bounded {
+                    v_flex()
+                        .w_full()
+                        .min_h_0()
+                        .flex_1()
+                        .overflow_y_scrollbar()
+                        .scroll_gutter()
+                        .child(editor)
+                        .into_any_element()
+                } else {
+                    editor
+                }
+            }
+            None => bare_empty_state(
+                management_locale_text("No model selected", "未选择模型", "未選擇模型"),
+                management_locale_text(
+                    "Pick a model on the left to set it up before adding it.",
+                    "在左侧点选模型，这里可以调整它的设置再添加。",
+                    "在左側點選模型，這裡可以調整它的設定再新增。",
+                ),
                 cx,
-            ))
-            .into_any_element()
+            ),
+        };
+
+        profile_pane_shell(
+            "provider-model-import-settings-pane",
+            bounded,
+            header,
+            body,
+            None,
+            cx,
+        )
     }
 
     /// Closes the picker's open row, keeping what was typed into it.
@@ -1307,6 +1470,81 @@ mod picker_tests {
         assert!(
             state.2.iter().any(|(id, chosen)| id == "beta" && !chosen),
             "checking one row leaves its neighbour alone"
+        );
+    }
+
+    /// The picker is the Agent dialog's two-pane surface, and it fills the
+    /// dialog: a short catalogue must not leave a blank band under the list.
+    #[gpui::test]
+    fn the_picker_fills_the_dialog_with_a_list_and_a_settings_pane(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        // A dialog needs the kit's root, so the test builds the same window the
+        // app does rather than a bare view.
+        let mut built = None;
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            let center = cx.new(|cx| ManagementCenter::new(window, cx));
+            let root = gpui_base::Root::new(center.clone(), window, cx);
+            built = Some(center);
+            root
+        });
+        let center = built.expect("the management window builds its center");
+        let profile = profile(Vec::new());
+        let profile_id = profile.id.clone();
+        cx.update(|window, cx| {
+            center.update(cx, |center, cx| {
+                center.navigation.active = ManagementSection::Providers;
+                center.selected_global_provider_id = Some(profile_id.as_str().to_string());
+                center.provider_detail_tab = ProviderDetailTab::Models;
+                center.providers = vec![profile];
+                center.provider_model_import = Some(ProviderModelImportDraft {
+                    profile_id: profile_id.clone(),
+                    profile_name: "Vendor".to_string(),
+                    rows: vec![ProviderModelImportRow {
+                        model: entry("alpha", Some("Alpha")),
+                        chosen: false,
+                        existing: false,
+                    }],
+                    expanded: Some("alpha".to_string()),
+                    error: None,
+                    hint: None,
+                });
+                center.present_provider_model_picker(window, cx);
+                cx.notify();
+            });
+        });
+        cx.simulate_resize(gpui::size(px(1440.0), px(900.0)));
+        for _ in 0..3 {
+            cx.update(|window, cx| {
+                let _ = window.draw(cx);
+            });
+            cx.run_until_parked();
+        }
+        let list = cx
+            .debug_bounds("provider-model-import-candidates-pane")
+            .expect("the picker draws its candidates pane");
+        let settings = cx
+            .debug_bounds("provider-model-import-settings-pane")
+            .expect("the picker draws its settings pane");
+        let editor = cx
+            .debug_bounds("provider-model-import-model-editor")
+            .expect("the chosen row's settings are drawn");
+        // Side by side, and the list on the leading edge.
+        assert!(
+            list.right() <= settings.left() + px(1.0),
+            "the two panes sit beside each other: list={list:?} settings={settings:?}"
+        );
+        // Both panes take the dialog's height rather than their content's.
+        assert!(
+            (list.size.height - settings.size.height).abs() <= px(1.0),
+            "the panes share the dialog's height: list={list:?} settings={settings:?}"
+        );
+        assert!(
+            list.size.height > px(420.0),
+            "a one-row catalogue still fills the pane: {list:?}"
+        );
+        assert!(
+            editor.top() >= settings.top() && editor.bottom() <= settings.bottom() + px(1.0),
+            "the settings stay inside their pane: editor={editor:?} pane={settings:?}"
         );
     }
 
