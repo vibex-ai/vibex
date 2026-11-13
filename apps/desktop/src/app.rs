@@ -42793,6 +42793,13 @@ impl VibexWorkbench {
             mode_id: selection.mode_id.clone(),
             config_values: selection.config_values.clone(),
         };
+        // The chip is rewritten to the Agent the choice names, not the one it
+        // used to carry. Changing the provider can move the selection to a
+        // different Agent, and reusing the old id left the chip pointing at the
+        // previous Agent's reference: the trigger showed the new configuration
+        // while the mention still named the old collaborator.
+        let next_agent_id = selection.agent_id.clone();
+        let agent_labels = self.agent_snapshots.clone();
         let updates = input
             .read(cx)
             .tokens()
@@ -42804,11 +42811,15 @@ impl VibexWorkbench {
                 {
                     return None;
                 }
-                let next = VibexUseMention::tuned_agent(agent_id, &reference, None, tuning.clone());
+                let next =
+                    VibexUseMention::tuned_agent(&next_agent_id, &reference, None, tuning.clone());
+                // The visible text names the Agent, so it moves with the id.
+                // Keeping the old text would leave a chip labelled `@Claude`
+                // that sends a Codex mention.
+                let label = format!("@{}", runtime_agent_label(&agent_labels, &next_agent_id));
                 Some((
                     span.range(),
-                    InlineToken::new(next.encode(), span.token().text().clone())
-                        .with_label(span.token().label().to_string()),
+                    InlineToken::new(next.encode(), label.clone()).with_label(label),
                 ))
             })
             .collect::<Vec<_>>();
@@ -42951,7 +42962,11 @@ impl VibexWorkbench {
         self.runtime_choice_menu_open = None;
         self.runtime_provider_scroll_to_selection = true;
         self.runtime_agent_row_reveal_pending = true;
-        let selection = self.selected_runtime_selection();
+        // Open on whatever the cascade is pointed at, which is the chip the
+        // caret is on when the reader is tuning a collaborator. Reading the
+        // session here listed the session's Agent's providers while the trigger
+        // above showed the chip's — two different configurations on one control.
+        let selection = self.composer_runtime_selection(cx);
         // Reopen at the selected provider/model group so an active session
         // does not make the user repeat the Agent selection step.
         self.composer_runtime_menu_view = ComposerRuntimeMenuView::AuthSource;
@@ -43053,10 +43068,12 @@ impl VibexWorkbench {
         self.runtime_provider_scroll_to_selection = true;
         self.runtime_agent_row_reveal_pending = true;
         self.new_session_runtime_menu_view = ComposerRuntimeMenuView::AuthSource;
+        // Same rule as the session composer: open on whatever the cascade is
+        // pointed at, so a chip being tuned lists its own providers rather than
+        // the page's Agent's.
         self.new_session_runtime_menu_auth_source = self
-            .new_session_runtime_selection
-            .as_ref()
-            .map(|selection| selection.auth_source.clone());
+            .composer_runtime_selection_for(ComposerTarget::NewSession, cx)
+            .map(|selection| selection.auth_source);
         cx.notify();
     }
 
@@ -60217,7 +60234,15 @@ impl VibexWorkbench {
             });
         let content =
             runtime_selector_dropdown_content(model_icon, selected_runtime_label, compact, cx);
-        let agent_id = self.new_session_agent_id.clone();
+        // The cascade is pointed at whatever `selection` holds — the chip when
+        // one is being tuned — so the Agent it lists must come from there too.
+        // Reading the page's Agent listed the page's providers under a trigger
+        // that showed the chip's, and choosing one left the chip's Agent
+        // unchanged.
+        let agent_id = selection
+            .as_ref()
+            .map(|selection| selection.agent_id.clone())
+            .or_else(|| self.new_session_agent_id.clone());
         let mut auth_source_choices = agent_id
             .as_ref()
             .and_then(|agent_id| {
@@ -102871,6 +102896,60 @@ mod tests {
             version: Some("28 tools".to_string()),
             responsive: true,
         }
+    }
+
+    /// Changing the provider moves the chip's Agent with the configuration.
+    ///
+    /// A provider choice can name a different Agent, and the chip has to follow
+    /// both halves: leaving the old Agent id in the mention kept the trigger on
+    /// the new configuration while the chip still addressed the old
+    /// collaborator, so the message went to one Agent and the controls showed
+    /// another.
+    #[test]
+    fn a_chip_follows_the_agent_a_new_provider_names() {
+        let claude = AgentId::parse("claude").unwrap();
+        let codex = AgentId::parse("codex").unwrap();
+
+        // The chip as it stands: Claude, with an unset depth.
+        let before = VibexUseMention::agent(
+            &claude,
+            &vibex_core::VibexUseRef::runtime_option("option_claude"),
+            Some("@Claude"),
+        );
+        assert_eq!(before.agent_id.as_ref(), Some(&claude));
+
+        // The reader picks a Codex entry with a depth.
+        let mut chosen = SessionRuntimeSelection::provider(
+            codex.clone(),
+            ProviderProfileId::parse("provider_local").unwrap(),
+            "gpt-5",
+        );
+        chosen.reasoning_effort = Some("high".to_string());
+        let reference = vibex_core::VibexUseRef::runtime_option(
+            &vibex_desktop_runtime::selection_fingerprint(&chosen),
+        );
+
+        // What the writer produces: the Agent comes from the choice, not from
+        // the chip it replaced.
+        let after = VibexUseMention::tuned_agent(
+            &chosen.agent_id,
+            &reference,
+            Some("@Codex"),
+            vibex_core::MentionTuning {
+                reasoning_effort: chosen.reasoning_effort.clone(),
+                ..Default::default()
+            },
+        );
+        assert_eq!(after.agent_id.as_ref(), Some(&codex));
+        assert_ne!(after.agent_id, before.agent_id);
+        assert_eq!(
+            after
+                .tuning
+                .as_ref()
+                .and_then(|t| t.reasoning_effort.as_deref()),
+            Some("high"),
+            "the tuning travels with the Agent change"
+        );
     }
 
     /// The chip lights up exactly when the controls edit it.
