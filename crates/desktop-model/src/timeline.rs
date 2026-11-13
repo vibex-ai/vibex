@@ -698,6 +698,7 @@ mod tests {
                         provider_resolution_id: None,
                         note: None,
                         resolved_at_ms: 3,
+                        responder: None,
                     }),
                 ),
             ],
@@ -862,6 +863,7 @@ mod tests {
                 provider_resolution_id: None,
                 note: None,
                 resolved_at_ms: 5,
+                responder: None,
             }),
         ));
         assert!(live_turn_pending_permission_ids(&items).is_empty());

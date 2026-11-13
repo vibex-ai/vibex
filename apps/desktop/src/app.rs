@@ -39380,6 +39380,8 @@ impl VibexWorkbench {
                         provider_resolution_id,
                         note: None,
                         resolved_at_ms: unix_timestamp_ms(),
+                        // A person pressed the card in this window.
+                        responder: Some(vibex_core::ApprovalResponder::Human),
                     },
                 }))
                 .await

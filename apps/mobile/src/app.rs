@@ -13650,6 +13650,8 @@ impl MobileApp {
                 provider_resolution_id: None,
                 note: None,
                 resolved_at_ms: unix_timestamp_ms(),
+                // A person pressed the card on this device.
+                responder: Some(vibex_core::ApprovalResponder::Human),
             },
         });
         let ticket = match controller.begin_resolve_permission(&request) {

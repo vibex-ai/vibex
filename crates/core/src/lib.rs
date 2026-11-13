@@ -258,8 +258,9 @@ pub use pairing_code_link::{
     certificate_fingerprint, is_local_network_address, url_host_is_local_network,
 };
 pub use permission::{
-    PermissionActionDetail, PermissionMode, PermissionRequest, PermissionRequestStatus,
-    PermissionResolution, PermissionResponseKind, PermissionResponseOption, PermissionRiskCategory,
+    ApprovalResponder, PermissionActionDetail, PermissionMode, PermissionRequest,
+    PermissionRequestStatus, PermissionResolution, PermissionResponseKind,
+    PermissionResponseOption, PermissionRiskCategory,
 };
 pub use provider::{
     AcpProcessStrategy, AcpProviderCatalogListResponse, AcpProviderCatalogPreset,

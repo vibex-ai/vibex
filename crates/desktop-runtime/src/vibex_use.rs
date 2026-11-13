@@ -4098,6 +4098,161 @@ impl VibexUseService {
     }
 
     // -----------------------------------------------------------------------
+    // approval delegation
+    // -----------------------------------------------------------------------
+
+    /// Answers a card one of the caller's own child tasks is parked on.
+    ///
+    /// The parent can answer because the child inherited the parent's sandbox
+    /// and tool set: whatever the child is asking for, the parent could have
+    /// done itself. That equivalence is also the boundary. A card the parent
+    /// could not have produced on its own authority — an irreversible action —
+    /// is escalated to the human instead of answered here, because approving it
+    /// would let a delegation launder a permission the parent never had.
+    ///
+    /// The card's own text is untrusted. It is never echoed into the parent's
+    /// answer; the decision is approve or deny, with the parent's own reason.
+    async fn decide_approval(
+        &self,
+        actor: &VibexUseActor,
+        arguments: &serde_json::Value,
+    ) -> VibexResult<serde_json::Value> {
+        let caller_key =
+            required_string(arguments, "idempotencyKey", VIBEX_USE_IDEMPOTENCY_KEY_CHARS)?;
+        let task_ref = parse_ref(arguments, "taskRef", VibexUseResourceKind::Task)?;
+        let request_id = required_string(arguments, "requestId", 256)?;
+        let decision = required_string(arguments, "decision", 32)?;
+        let reason = optional_string(arguments, "reason", 2_000);
+        let response = match decision.as_str() {
+            "approve" => vibex_core::PermissionResponseKind::Approve,
+            "deny" => vibex_core::PermissionResponseKind::Deny,
+            // `always_allow` is deliberately absent: a parent answers one card,
+            // never a category, so it cannot widen its child's authority for the
+            // rest of the session.
+            _ => {
+                return Err(VibexError::validation(
+                    use_codes::REQUEST_INVALID,
+                    "decision must be approve or deny",
+                ));
+            }
+        };
+        let fingerprint = arguments_fingerprint(arguments);
+        let conn = self.open()?;
+        let (operation, claimed) = self.reserve_operation(
+            &conn,
+            actor,
+            VibexUseTool::DecideApproval,
+            &caller_key,
+            &fingerprint,
+            arguments,
+        )?;
+        if !claimed {
+            return self.operation_view(&conn, &operation);
+        }
+        let task_id = task_ref.task_id().ok_or_else(|| {
+            VibexError::validation(use_codes::REQUEST_INVALID, "taskRef is invalid")
+        })?;
+        let task = AgentDelegationRepository::get(&conn, &task_id)?.ok_or_else(|| {
+            VibexError::new(
+                ErrorCategory::Permission,
+                use_codes::NOT_FOUND_OR_NOT_AUTHORIZED,
+                "task not found",
+            )
+        })?;
+        // Only the task's own parent may answer it. A sibling, an ancestor
+        // further up, or an unrelated caller is refused: the card belongs to
+        // the parent/child pair, and letting anyone in the tree answer would
+        // turn one approval into a tree-wide capability.
+        if task.parent_session_id != actor.session_id {
+            return Err(VibexError::new(
+                ErrorCategory::Permission,
+                use_codes::NOT_FOUND_OR_NOT_AUTHORIZED,
+                "only the session that delegated this task may answer its approval",
+            ));
+        }
+        self.require_writable(&conn, actor, &task.parent_session_id)?;
+        let child = task.child_session_id.clone().ok_or_else(|| {
+            VibexError::validation(
+                use_codes::REQUEST_INVALID,
+                "this task has no child session to answer for",
+            )
+        })?;
+        if !task.phase().is_active() {
+            return Err(VibexError::conflict(
+                use_codes::REQUEST_INVALID,
+                "the task is no longer running, so it has no card to answer",
+            ));
+        }
+        let request = PermissionRepository::get_request(
+            &conn,
+            &vibex_core::RequestId::parse(&request_id).map_err(|_| {
+                VibexError::validation(use_codes::REQUEST_INVALID, "requestId is invalid")
+            })?,
+        )?
+        .ok_or_else(|| {
+            VibexError::validation(use_codes::REQUEST_INVALID, "approval request not found")
+        })?;
+        if request.session_id != child {
+            return Err(VibexError::new(
+                ErrorCategory::Permission,
+                use_codes::NOT_FOUND_OR_NOT_AUTHORIZED,
+                "that approval does not belong to this task's child",
+            ));
+        }
+        if request.status != vibex_core::PermissionRequestStatus::Pending {
+            return Err(VibexError::conflict(
+                use_codes::REQUEST_INVALID,
+                "the approval was already answered",
+            ));
+        }
+        // The boundary: what a parent may not answer on its own authority stays
+        // with the human. `response` is checked before the card is touched, so a
+        // refusal leaves the card exactly as it was for the reader.
+        if response == vibex_core::PermissionResponseKind::Approve
+            && requires_human_approval(request.risk_category)
+        {
+            return Err(VibexError::new(
+                ErrorCategory::Permission,
+                use_codes::SCOPE_DENIED,
+                "this approval needs a human: the action cannot be undone and the child's sandbox does not make it safe",
+            )
+            .with_diagnostic("riskCategory", format!("{:?}", request.risk_category)));
+        }
+        self.record_operation_resource(&conn, &operation, "task", VibexUseRef::task(&task.id))?;
+        let resolution = vibex_core::PermissionResolution {
+            request_id: request.id.clone(),
+            session_id: child.clone(),
+            response,
+            responder_device_id: None,
+            provider_resolution_id: None,
+            note: reason
+                .clone()
+                .or_else(|| Some("answered by the owning Agent".to_string())),
+            resolved_at_ms: vibex_core::unix_timestamp_ms(),
+            responder: Some(vibex_core::ApprovalResponder::ParentAgent {
+                session_id: actor.session_id.clone(),
+                task_id: task.id.clone(),
+            }),
+        };
+        drop(conn);
+        self.manager
+            .resolve_permission(vibex_core::ResolvePermissionRequest {
+                session_id: child.clone(),
+                request_id: request.id.clone(),
+                resolution: resolution.clone(),
+            })
+            .await?;
+        let conn = self.open()?;
+        self.settle_operation(&conn, &operation, VibexUseOperationState::Succeeded, None)?;
+        Ok(serde_json::json!({
+            "taskRef": VibexUseRef::task(&task.id).as_uri(),
+            "requestId": request.id.as_str(),
+            "decision": decision,
+            "responder": "parent_agent",
+        }))
+    }
+
+    // -----------------------------------------------------------------------
     // events
     // -----------------------------------------------------------------------
 
@@ -4495,6 +4650,7 @@ impl VibexUseToolHost for VibexUseService {
                 VibexUseTool::FinishTask => self.finish_task(&actor, &arguments),
                 VibexUseTool::Interrupt => self.interrupt(&actor, &arguments).await,
                 VibexUseTool::CancelTask => self.cancel_task(&actor, &arguments).await,
+                VibexUseTool::DecideApproval => self.decide_approval(&actor, &arguments).await,
                 VibexUseTool::GetEvents => self.get_events(&actor, &arguments),
                 VibexUseTool::AckEvents => self.ack_events(&actor, &arguments),
                 VibexUseTool::ListGroups => self.list_groups(&actor, &arguments),
@@ -4542,6 +4698,26 @@ impl VibexUseToolHost for VibexUseService {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Whether an approval of this risk has to come from a person.
+///
+/// The parent Agent may answer its child because the child inherited the
+/// parent's sandbox and tools — whatever the child asks for, the parent could
+/// have done itself. That equivalence is exactly what these categories break:
+/// they are irreversible or they reach outside the sandbox, so a parent's
+/// approval would let a delegation obtain a permission the parent never had.
+/// `Network` is here by default because the sandbox does not bound it.
+fn requires_human_approval(category: vibex_core::PermissionRiskCategory) -> bool {
+    use vibex_core::PermissionRiskCategory;
+    matches!(
+        category,
+        PermissionRiskCategory::FileDeleteOrMove
+            | PermissionRiskCategory::GitDestructive
+            | PermissionRiskCategory::ProviderConfigExport
+            | PermissionRiskCategory::CustomTool
+            | PermissionRiskCategory::Network
+    )
+}
 
 /// The Agent mentions carried by the newest user message of `session_id`.
 ///

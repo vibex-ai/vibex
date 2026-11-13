@@ -1228,6 +1228,10 @@ mod tests {
                     provider_resolution_id: None,
                     note: None,
                     resolved_at_ms: unix_timestamp_ms(),
+                    // A scheduled run approves on its own policy, not on
+                    // anyone's judgment; leaving the responder unset keeps the
+                    // audit trail from naming a person who never looked.
+                    responder: None,
                 },
             })
             .await
@@ -1273,6 +1277,10 @@ mod tests {
                     provider_resolution_id: None,
                     note: None,
                     resolved_at_ms: unix_timestamp_ms(),
+                    // A scheduled run approves on its own policy, not on
+                    // anyone's judgment; leaving the responder unset keeps the
+                    // audit trail from naming a person who never looked.
+                    responder: None,
                 },
             })
             .await
@@ -1307,6 +1315,10 @@ mod tests {
                     provider_resolution_id: None,
                     note: None,
                     resolved_at_ms: unix_timestamp_ms(),
+                    // A scheduled run approves on its own policy, not on
+                    // anyone's judgment; leaving the responder unset keeps the
+                    // audit trail from naming a person who never looked.
+                    responder: None,
                 },
             })
             .await

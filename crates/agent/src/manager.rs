@@ -5620,6 +5620,10 @@ impl AgentManager {
                 provider_resolution_id: None,
                 note: Some(note.to_string()),
                 resolved_at_ms,
+                // Not a person and not the owning Agent: the system closed
+                // this card. Leaving it unset keeps the audit trail from
+                // claiming an answer nobody gave.
+                responder: None,
             };
             // The permission write is now a pending-only compare-and-set, so
             // a reader (or the expiry reaper) that answered between the list
@@ -5757,6 +5761,7 @@ impl AgentManager {
                 provider_resolution_id: None,
                 note: Some("expired".to_string()),
                 resolved_at_ms: now_ms,
+                responder: None,
             };
             self.append_timeline_item(
                 &mut conn,
@@ -10428,6 +10433,7 @@ mod tests {
             provider_resolution_id: None,
             note: None,
             resolved_at_ms: unix_timestamp_ms(),
+            responder: Some(vibex_core::ApprovalResponder::Human),
         };
         manager
             .resolve_permission(ResolvePermissionRequest {
@@ -10705,6 +10711,7 @@ mod tests {
                     provider_resolution_id: None,
                     note: None,
                     resolved_at_ms: unix_timestamp_ms(),
+                    responder: Some(vibex_core::ApprovalResponder::Human),
                 },
             })
             .await
@@ -11477,6 +11484,7 @@ mod tests {
                     provider_resolution_id: None,
                     note: None,
                     resolved_at_ms: 103,
+                    responder: Some(vibex_core::ApprovalResponder::Human),
                 }),
             ),
             item(
