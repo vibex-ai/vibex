@@ -702,11 +702,12 @@ impl PluginRepository {
     pub fn upsert_source(conn: &Connection, source: &PluginUserSource) -> VibexResult<()> {
         conn.execute(
             "INSERT INTO plugin_sources (
-                source_id, name, index_url, public_key, enabled,
+                source_id, name, kind, index_url, public_key, enabled,
                 added_at_ms, updated_at_ms, last_error
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
             ON CONFLICT(source_id) DO UPDATE SET
                 name = excluded.name,
+                kind = excluded.kind,
                 index_url = excluded.index_url,
                 public_key = excluded.public_key,
                 enabled = excluded.enabled,
@@ -715,6 +716,7 @@ impl PluginRepository {
             params![
                 source.source_id,
                 source.name,
+                enum_to_db(&source.kind)?,
                 source.index_url,
                 source.public_key,
                 source.enabled,
@@ -731,7 +733,7 @@ impl PluginRepository {
     pub fn list_sources(conn: &Connection) -> VibexResult<Vec<PluginUserSource>> {
         let mut statement = conn
             .prepare(
-                "SELECT source_id, name, index_url, public_key, enabled, \
+                "SELECT source_id, name, kind, index_url, public_key, enabled, \
                  added_at_ms, updated_at_ms, last_error \
                  FROM plugin_sources ORDER BY added_at_ms, source_id",
             )
@@ -757,7 +759,7 @@ impl PluginRepository {
     /// One source by id.
     pub fn get_source(conn: &Connection, source_id: &str) -> VibexResult<Option<PluginUserSource>> {
         conn.query_row(
-            "SELECT source_id, name, index_url, public_key, enabled, \
+            "SELECT source_id, name, kind, index_url, public_key, enabled, \
              added_at_ms, updated_at_ms, last_error \
              FROM plugin_sources WHERE source_id = ?1",
             params![source_id],
@@ -814,15 +816,17 @@ impl PluginRepository {
 
 /// Reads one `plugin_sources` row.
 fn source_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PluginUserSource> {
+    let kind: String = row.get(2)?;
     Ok(PluginUserSource {
         source_id: row.get(0)?,
         name: row.get(1)?,
-        index_url: row.get(2)?,
-        public_key: row.get(3)?,
-        enabled: row.get(4)?,
-        added_at_ms: row.get(5)?,
-        updated_at_ms: row.get(6)?,
-        last_error: row.get(7)?,
+        kind: enum_from_db_sql(kind)?,
+        index_url: row.get(3)?,
+        public_key: row.get(4)?,
+        enabled: row.get(5)?,
+        added_at_ms: row.get(6)?,
+        updated_at_ms: row.get(7)?,
+        last_error: row.get(8)?,
     })
 }
 
@@ -1041,6 +1045,7 @@ mod tests {
         let source = PluginUserSource {
             source_id: "0123456789abcdef".to_string(),
             name: "Acme".to_string(),
+            kind: Default::default(),
             index_url: "https://acme.example/index.json".to_string(),
             public_key: Some("key".to_string()),
             enabled: true,
@@ -1094,6 +1099,7 @@ mod tests {
         let mut source = PluginUserSource {
             source_id: "0123456789abcdef".to_string(),
             name: "Acme".to_string(),
+            kind: Default::default(),
             index_url: "https://acme.example/index.json".to_string(),
             public_key: None,
             enabled: true,

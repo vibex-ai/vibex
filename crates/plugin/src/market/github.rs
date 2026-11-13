@@ -197,6 +197,35 @@ impl GithubTopicSource {
         };
         Ok(PluginManifest::parse(&bytes).ok())
     }
+
+    /// Reads one repository the reader named, as an entry.
+    ///
+    /// The topic search answers with a full `RepoItem`; a repository the reader
+    /// typed only has a name, so everything the card would have taken from the
+    /// search response — stars, description, license, avatar — is absent, and
+    /// the manifest supplies what it can. The entry is `Unverified` for the same
+    /// reason a discovered one is: nothing signed it.
+    pub async fn read_named_repository(&self, repo: &str) -> Result<PluginIndexEntry, PluginError> {
+        let Some(manifest) = self.read_manifest_file(repo).await? else {
+            return Err(PluginError::NotFound(repo.to_string()));
+        };
+        let owner = repo.split_once('/').map_or(repo, |(owner, _)| owner);
+        let item = RepoItem {
+            full_name: repo.to_string(),
+            html_url: format!("https://github.com/{repo}"),
+            description: None,
+            default_branch: String::new(),
+            pushed_at: String::new(),
+            archived: false,
+            fork: false,
+            owner: RepoOwner {
+                login: owner.to_string(),
+                avatar_url: None,
+            },
+            license: None,
+        };
+        Ok(entry_for(&item, &manifest))
+    }
 }
 
 fn entry_for(item: &RepoItem, manifest: &PluginManifest) -> PluginIndexEntry {

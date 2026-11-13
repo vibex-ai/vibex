@@ -62,12 +62,21 @@ pub struct MarketConfig {
 pub struct UserSourceConfig {
     /// The reader's name for the catalog, shown on every entry it lists.
     pub name: String,
-    /// The index address.
-    pub url: Url,
-    /// The key its signature is checked against.
-    ///
-    /// `None` means the reader accepted an unsigned catalog.
-    pub public_key: Option<VerifyingKey>,
+    /// What the source is, and therefore how it is read.
+    pub kind: UserSourceKind,
+}
+
+/// How one catalog the reader added is read.
+#[derive(Debug, Clone)]
+pub enum UserSourceKind {
+    /// A signed static index at an `https` address.
+    Index {
+        url: Url,
+        /// `None` means the reader accepted an unsigned catalog.
+        public_key: Option<VerifyingKey>,
+    },
+    /// A Git repository whose root carries a plugin manifest.
+    Repository { repo: String },
 }
 
 impl MarketConfig {
@@ -265,13 +274,28 @@ impl MarketCatalog {
         &self,
         source: &UserSourceConfig,
     ) -> Result<Vec<PluginIndexEntry>, PluginError> {
-        let raw = self
-            .client
-            .fetch_bytes(&source.url, MAX_INDEX_BYTES)
-            .await?;
-        match &source.public_key {
+        match &source.kind {
+            UserSourceKind::Index { url, public_key } => {
+                self.fetch_user_index(url, public_key.as_ref(), &source.name)
+                    .await
+            }
+            UserSourceKind::Repository { repo } => {
+                self.fetch_user_repository(repo, &source.name).await
+            }
+        }
+    }
+
+    /// Reads one signed index the reader added.
+    async fn fetch_user_index(
+        &self,
+        url: &Url,
+        public_key: Option<&VerifyingKey>,
+        name: &str,
+    ) -> Result<Vec<PluginIndexEntry>, PluginError> {
+        let raw = self.client.fetch_bytes(url, MAX_INDEX_BYTES).await?;
+        match public_key {
             Some(key) => {
-                let signature_url = signature_url(&source.url)?;
+                let signature_url = signature_url(url)?;
                 let signature_bytes = self
                     .client
                     .fetch_bytes(&signature_url, MAX_SIGNATURE_BYTES)
@@ -302,7 +326,24 @@ impl MarketCatalog {
             }
             let _ = self.config.cache.write_user_publisher_keys(&keys);
         }
-        Ok(mark_user_entries(index.plugins, &source.name))
+        Ok(mark_user_entries(index.plugins, name))
+    }
+
+    /// Reads one repository the reader named.
+    ///
+    /// It publishes no index and no hashes, so there is nothing to verify here;
+    /// the entry it yields installs through the same pinned-commit path topic
+    /// discovery uses, and is marked `Unverified` for the same reason.
+    async fn fetch_user_repository(
+        &self,
+        repo: &str,
+        name: &str,
+    ) -> Result<Vec<PluginIndexEntry>, PluginError> {
+        let Some(github) = &self.config.github else {
+            return Err(PluginError::NoCatalog);
+        };
+        let entry = github.read_named_repository(repo).await?;
+        Ok(mark_user_entries(vec![entry], name))
     }
 
     async fn fetch_index_from(&self, url: &Url) -> Result<PluginIndexFile, PluginError> {
@@ -646,8 +687,10 @@ mod tests {
         let mut config = MarketConfig::empty(cache);
         config.user_sources = vec![UserSourceConfig {
             name: "Acme".to_string(),
-            url: Url::parse(&format!("http://{address}/index.json")).unwrap(),
-            public_key: Some(signing_key.verifying_key()),
+            kind: UserSourceKind::Index {
+                url: Url::parse(&format!("http://{address}/index.json")).unwrap(),
+                public_key: Some(signing_key.verifying_key()),
+            },
         }];
         let catalog = MarketCatalog::new(MarketHttpClient::new(MarketUrlPolicy::Testing), config);
         let mut reason = None;
@@ -714,8 +757,10 @@ mod tests {
         let mut config = MarketConfig::empty(MarketCache::new(directory.path()));
         config.user_sources = vec![UserSourceConfig {
             name: "Acme".to_string(),
-            url: Url::parse(&format!("http://{address}/index.json")).unwrap(),
-            public_key: Some(signing_key.verifying_key()),
+            kind: UserSourceKind::Index {
+                url: Url::parse(&format!("http://{address}/index.json")).unwrap(),
+                public_key: Some(signing_key.verifying_key()),
+            },
         }];
         let catalog = MarketCatalog::new(MarketHttpClient::new(MarketUrlPolicy::Testing), config);
         let mut reason = None;

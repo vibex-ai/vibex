@@ -14,8 +14,8 @@ use vibex_core::{
     PluginMarketInstallRequest, PluginMarketInstallResult, PluginMarketSearchRequest,
     PluginMarketSearchResponse, PluginMarketVersion, PluginPermission, PluginPermissionDiff,
     PluginPermissionGrant, PluginSource, PluginTrust, PluginUpdate, PluginUpdateCheckRequest,
-    PluginUpdateCheckResponse, PluginUserSource, PluginUserSourceAddRequest, VibexError,
-    VibexResult, unix_timestamp_ms,
+    PluginUpdateCheckResponse, PluginUserSource, PluginUserSourceAddRequest, PluginUserSourceKind,
+    VibexError, VibexResult, unix_timestamp_ms,
 };
 use vibex_db::{PluginRecord, PluginRepository, PluginVersionRecord};
 
@@ -500,12 +500,25 @@ impl PluginService {
     ) -> VibexResult<PluginUserSource> {
         vibex_core::validate_plugin_user_source(
             &request.name,
+            request.kind,
             &request.index_url,
             request.public_key.as_deref(),
             request.allow_unsigned,
         )
         .map_err(|message| VibexError::validation("plugin_source_invalid", message))?;
-        let index_url = request.index_url.trim().to_string();
+        // A repository is stored as `owner/repo` however the reader spelled it,
+        // so the same repository added twice is one row and one cache entry.
+        let index_url = match request.kind {
+            PluginUserSourceKind::Index => request.index_url.trim().to_string(),
+            PluginUserSourceKind::Repository => {
+                vibex_core::parse_plugin_repository(&request.index_url).ok_or_else(|| {
+                    VibexError::validation(
+                        "plugin_source_invalid",
+                        "the repository must be `owner/repo`",
+                    )
+                })?
+            }
+        };
         let source_id = vibex_core::plugin_user_source_id(&index_url);
         let existing = PluginRepository::get_source(conn, &source_id)?;
         if existing.is_none() {
@@ -524,13 +537,17 @@ impl PluginService {
         let source = PluginUserSource {
             source_id,
             name: request.name.trim().to_string(),
+            kind: request.kind,
             index_url,
-            public_key: request
-                .public_key
-                .as_deref()
-                .map(str::trim)
-                .filter(|key| !key.is_empty())
-                .map(str::to_string),
+            public_key: match request.kind {
+                PluginUserSourceKind::Index => request
+                    .public_key
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|key| !key.is_empty())
+                    .map(str::to_string),
+                PluginUserSourceKind::Repository => None,
+            },
             enabled: existing.as_ref().is_none_or(|source| source.enabled),
             added_at_ms: existing.as_ref().map_or(now, |source| source.added_at_ms),
             updated_at_ms: Some(now),
@@ -1605,6 +1622,7 @@ mod tests {
                     &connection,
                     &PluginUserSourceAddRequest {
                         name: "Acme".to_string(),
+                        kind: Default::default(),
                         index_url: "https://acme.example/index.json".to_string(),
                         public_key: None,
                         allow_unsigned: false,
@@ -1618,6 +1636,7 @@ mod tests {
                 &connection,
                 &PluginUserSourceAddRequest {
                     name: "Acme".to_string(),
+                    kind: Default::default(),
                     index_url: "https://acme.example/index.json".to_string(),
                     public_key: None,
                     allow_unsigned: true,
@@ -1634,6 +1653,7 @@ mod tests {
                 &connection,
                 &PluginUserSourceAddRequest {
                     name: "Acme Renamed".to_string(),
+                    kind: Default::default(),
                     index_url: "https://acme.example/index.json".to_string(),
                     public_key: None,
                     allow_unsigned: true,
@@ -1673,6 +1693,71 @@ mod tests {
     }
 
     #[test]
+    fn a_repository_source_is_stored_normalized_and_needs_no_key() {
+        let directory = tempfile::tempdir().unwrap();
+        let service = service(directory.path());
+        let connection = connection();
+
+        let added = service
+            .add_user_source(
+                &connection,
+                &PluginUserSourceAddRequest {
+                    name: "Acme".to_string(),
+                    kind: PluginUserSourceKind::Repository,
+                    index_url: "https://github.com/acme/widgets/".to_string(),
+                    public_key: None,
+                    allow_unsigned: false,
+                },
+            )
+            .unwrap();
+        assert_eq!(added.kind, PluginUserSourceKind::Repository);
+        // The address is stored as `owner/repo` however the reader spelled it.
+        assert_eq!(added.index_url, "acme/widgets");
+        // A repository publishes no signed document, so a key is never kept.
+        assert!(added.public_key.is_none());
+
+        // Adding the bare form again is the same row, not a second one.
+        let again = service
+            .add_user_source(
+                &connection,
+                &PluginUserSourceAddRequest {
+                    name: "Acme Renamed".to_string(),
+                    kind: PluginUserSourceKind::Repository,
+                    index_url: "acme/widgets".to_string(),
+                    public_key: None,
+                    allow_unsigned: false,
+                },
+            )
+            .unwrap();
+        assert_eq!(again.source_id, added.source_id);
+        let sources = service.user_sources(&connection).unwrap();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].name, "Acme Renamed");
+    }
+
+    #[test]
+    fn a_repository_source_rejects_something_that_is_not_a_repository() {
+        let directory = tempfile::tempdir().unwrap();
+        let service = service(directory.path());
+        let connection = connection();
+        assert!(
+            service
+                .add_user_source(
+                    &connection,
+                    &PluginUserSourceAddRequest {
+                        name: "Acme".to_string(),
+                        kind: PluginUserSourceKind::Repository,
+                        index_url: "https://gitlab.com/acme/widgets".to_string(),
+                        public_key: None,
+                        allow_unsigned: true,
+                    },
+                )
+                .is_err()
+        );
+        assert!(service.user_sources(&connection).unwrap().is_empty());
+    }
+
+    #[test]
     fn a_plaintext_catalog_address_is_refused() {
         let directory = tempfile::tempdir().unwrap();
         let service = service(directory.path());
@@ -1683,6 +1768,7 @@ mod tests {
                     &connection,
                     &PluginUserSourceAddRequest {
                         name: "Acme".to_string(),
+                        kind: Default::default(),
                         index_url: "http://acme.example/index.json".to_string(),
                         public_key: None,
                         allow_unsigned: true,

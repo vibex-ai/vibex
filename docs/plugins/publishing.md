@@ -1,9 +1,10 @@
 # Publishing plugins
 
 The desktop market reads one signed static index. Nothing runs a server: the
-index is a JSON file and a detached Ed25519 signature, hosted anywhere that can
-serve two files over HTTPS. `plugins.peatboy.com` is the default address; a
-build can point elsewhere with `VIBEX_PLUGIN_INDEX`.
+index is a JSON file and a detached Ed25519 signature, served straight out of
+the catalog repository on GitHub. There is no dedicated plugins domain — the
+two hosts below are the address, and a build can point elsewhere with
+`VIBEX_PLUGIN_INDEX`.
 
 ## The two sides
 
@@ -130,10 +131,13 @@ address must serve the same `index.json.sig`.
 
 ## Catalogs a reader adds
 
-The three sources are fixed — the official index, GitHub topic discovery, and
-the catalogs the reader types into **Plugins → Discover → Catalogs you added** —
-but only the first two are the application's. A reader may add up to
-`MAX_PLUGIN_USER_SOURCES` (8) catalogs of their own:
+The sources are fixed — the official index, GitHub topic discovery, and the
+catalogs the reader types into **Plugins → Discover → Catalogs you added** — but
+only the first two are the application's. A reader may add up to
+`MAX_PLUGIN_USER_SOURCES` (8) sources of their own, of two kinds:
+
+**A signed index** is the same document the official catalog publishes, at an
+address the reader typed:
 
 - The address must be absolute `https`. A plaintext or local address is
   refused before it is stored, because the catalog is fetched under the same
@@ -142,14 +146,29 @@ but only the first two are the application's. A reader may add up to
   accepting an **unsigned** catalog, and the form says so; the acceptance is
   stored, not implied, so a key that later turns out malformed disables the
   source instead of silently reading it unchecked.
-- The source id is `sha256(indexUrl)[..8]` in hex, so re-adding the same
-  address renames and updates the row instead of listing the catalog twice.
+
+**A Git repository** is a repository whose root carries `vibex-plugin.json` —
+the same manifest topic discovery reads. It needs no key because it publishes
+no signed document:
+
+- The address is `owner/repo` or `https://github.com/owner/repo`; both are
+  normalized to `owner/repo`, so the same repository added twice is one row.
+  Another host or a deeper path is refused rather than guessed at.
+- It yields exactly one entry, marked `Unverified`, and installs from the
+  repository's archive at a **pinned commit** — resolved once and reused, so a
+  push between preview and install cannot swap what gets installed.
+- That path carries no published hash and nothing signs it, so it never
+  auto-updates and never becomes `Verified`.
+
+Both kinds share one id rule: `sha256(address)[..8]` in hex, so re-adding the
+same address renames and updates the row instead of listing the source twice.
 
 What a user catalog can and cannot claim is the point of the feature:
 
 | It can | It cannot |
 | --- | --- |
 | List plugins with its own categories, screenshots and README | Mint `Official` or `Verified` — both are rewritten to `Community` |
+| Point at a repository instead of building an index at all | Claim a reviewed signature: a repository entry stays `Unverified` |
 | Sign its packages with keys it publishes | Borrow the official index's publisher keys; the two lists are stored apart |
 | Fail on its own without emptying the catalog | Hide the failure: its reason is appended to the response's `partialReason` |
 

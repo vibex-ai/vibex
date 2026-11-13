@@ -2132,6 +2132,8 @@ pub struct ManagementCenter {
     plugin_user_sources: Vec<vibex_core::PluginUserSource>,
     /// Whether the "add a catalog" form is showing.
     plugin_user_source_form_open: bool,
+    /// Which kind the form is adding: a signed index or a repository.
+    plugin_user_source_kind: vibex_core::PluginUserSourceKind,
     plugin_user_source_name: Entity<InputState>,
     plugin_user_source_url: Entity<InputState>,
     plugin_user_source_key: Entity<InputState>,
@@ -3326,6 +3328,7 @@ impl ManagementCenter {
             plugin_market_generation: 0,
             plugin_user_sources: Vec::new(),
             plugin_user_source_form_open: false,
+            plugin_user_source_kind: vibex_core::PluginUserSourceKind::Index,
             plugin_user_source_name,
             plugin_user_source_url,
             plugin_user_source_key,
@@ -12232,13 +12235,15 @@ impl ManagementCenter {
         if name.is_empty() || index_url.is_empty() {
             self.plugin_market_error = Some(management_market_error_text(
                 "plugin_source_invalid",
-                "A catalog needs a name and an https index address.",
+                "A source needs a name and an address.",
             ));
             return;
         }
-        // No key means the reader is accepting an unsigned catalog, which the
-        // consent text on the form says out loud.
-        let allow_unsigned = public_key.is_empty();
+        // A repository publishes no signed document, so it has no key to ask
+        // for; only an index needs the unsigned acceptance.
+        let kind = self.plugin_user_source_kind;
+        let allow_unsigned =
+            kind == vibex_core::PluginUserSourceKind::Index && public_key.is_empty();
         let entity = cx.weak_entity();
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
             backend
@@ -12246,6 +12251,7 @@ impl ManagementCenter {
                 .add_plugin_user_source(MutationRequest::new(
                     vibex_core::PluginUserSourceAddRequest {
                         name,
+                        kind,
                         index_url,
                         public_key: (!public_key.is_empty()).then_some(public_key),
                         allow_unsigned,
@@ -13532,22 +13538,69 @@ impl ManagementCenter {
                     ),
             );
         if form_open {
+            let kind = self.plugin_user_source_kind;
+            let mut kinds = h_flex().w_full().gap_2();
+            for candidate in [
+                vibex_core::PluginUserSourceKind::Index,
+                vibex_core::PluginUserSourceKind::Repository,
+            ] {
+                let selected = kind == candidate;
+                let label = match candidate {
+                    vibex_core::PluginUserSourceKind::Index => {
+                        management_locale_text("Signed index", "签名索引", "簽名索引")
+                    }
+                    vibex_core::PluginUserSourceKind::Repository => {
+                        management_locale_text("Git repository", "Git 仓库", "Git 儲存庫")
+                    }
+                };
+                let button = Button::new(SharedString::from(format!(
+                    "management-plugin-source-kind-{}",
+                    candidate.label()
+                )))
+                .small()
+                .label(label);
+                let button = if selected {
+                    button.primary()
+                } else {
+                    button.outline()
+                };
+                kinds = kinds.child(button.on_click(cx.listener(move |this, _, _, cx| {
+                    this.plugin_user_source_kind = candidate;
+                    cx.notify();
+                })));
+            }
             card = card.child(
                 v_flex()
                     .w_full()
                     .gap_2()
+                    .child(kinds)
                     .child(Input::new(&self.plugin_user_source_name).small())
                     .child(Input::new(&self.plugin_user_source_url).small())
-                    .child(Input::new(&self.plugin_user_source_key).small())
+                    // A repository has no signed document, so a key field would
+                    // be a question with no answer.
+                    .when(kind == vibex_core::PluginUserSourceKind::Index, |column| {
+                        column.child(Input::new(&self.plugin_user_source_key).small())
+                    })
                     .child(
                         div()
                             .text_xs()
                             .text_color(cx.theme().muted_foreground)
-                            .child(management_locale_text(
-                                "Leave the key empty to accept an unsigned catalog. Only the address you type is fetched, over https.",
-                                "公钥留空即表示接受未签名的目录。只会以 https 访问你填写的地址。",
-                                "公鑰留空即表示接受未簽名的目錄。只會以 https 存取你填寫的位址。",
-                            )),
+                            .child(match kind {
+                                vibex_core::PluginUserSourceKind::Index => {
+                                    management_locale_text(
+                                        "Leave the key empty to accept an unsigned catalog. Only the address you type is fetched, over https.",
+                                        "公钥留空即表示接受未签名的目录。只会以 https 访问你填写的地址。",
+                                        "公鑰留空即表示接受未簽名的目錄。只會以 https 存取你填寫的位址。",
+                                    )
+                                }
+                                vibex_core::PluginUserSourceKind::Repository => {
+                                    management_locale_text(
+                                        "`owner/repo` or its GitHub address. Its manifest is read and its archive installs at a pinned commit, so it stays Unverified and never auto-updates.",
+                                        "填 `owner/repo` 或它的 GitHub 地址。读取仓库里的清单，按固定 commit 安装压缩包，因此始终是未验证，且不会自动更新。",
+                                        "填 `owner/repo` 或它的 GitHub 位址。讀取儲存庫裡的清單，按固定 commit 安裝壓縮包，因此始終是未驗證，且不會自動更新。",
+                                    )
+                                }
+                            }),
                     )
                     .child(
                         h_flex().w_full().justify_end().child(
@@ -13600,6 +13653,14 @@ impl ManagementCenter {
                                 .items_center()
                                 .gap_2()
                                 .child(div().text_sm().font_semibold().child(source.name.clone()))
+                                .child(management_market_chip(match source.kind {
+                                    vibex_core::PluginUserSourceKind::Index => {
+                                        management_locale_text("Index", "索引", "索引")
+                                    }
+                                    vibex_core::PluginUserSourceKind::Repository => {
+                                        management_locale_text("Repository", "仓库", "儲存庫")
+                                    }
+                                }))
                                 .child(management_market_chip(if enabled {
                                     management_locale_text("On", "已启用", "已啟用")
                                 } else {

@@ -15,6 +15,7 @@ pub mod merge;
 pub use cache::MarketCache;
 pub use catalog::{
     GITHUB_TTL, INDEX_MAX_AGE, INDEX_TTL, MarketCatalog, MarketConfig, UserSourceConfig,
+    UserSourceKind,
 };
 pub use fetch::{MARKET_REQUEST_TIMEOUT, MAX_MARKET_REDIRECTS, MarketHttpClient, MarketUrlPolicy};
 pub use github::{DEFAULT_TOPIC, GITHUB_API_BASE, GITHUB_RAW_BASE, GithubTopicSource};

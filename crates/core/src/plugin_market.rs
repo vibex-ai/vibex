@@ -1025,13 +1025,44 @@ pub const MAX_PLUGIN_ICON_BYTES: u64 = 1024 * 1024;
 /// the bound keeps a paste-happy reader from turning the catalog into a crawl.
 pub const MAX_PLUGIN_USER_SOURCES: usize = 8;
 
+/// What a catalog the reader added is.
+///
+/// The two kinds read different documents: an index source is the same signed
+/// `index.json` the official catalog publishes, while a repository source is a
+/// Git repository whose root carries plugin manifests. A repository needs no
+/// signature because it publishes no packages and no hashes — every entry it
+/// yields installs through the same unverified path topic discovery uses.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginUserSourceKind {
+    /// A signed static index, fetched over https.
+    #[default]
+    Index,
+    /// A Git repository whose root carries plugin manifests.
+    Repository,
+}
+
+impl PluginUserSourceKind {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Index => "index",
+            Self::Repository => "repository",
+        }
+    }
+}
+
 /// One catalog the reader added themselves.
 ///
-/// A user source is an ordinary signed index — the same document the official
+/// An index source is an ordinary signed index — the same document the official
 /// catalog publishes — at an address the reader typed. It is not signed by the
 /// root key the application embeds, so it can never grant `Official` or
 /// `Verified`: everything it lists is `Community` at best, and its packages
 /// still have to match the hashes it publishes.
+///
+/// A repository source is a Git repository, read the way topic discovery reads
+/// one: its manifest becomes an entry, and its archive at a pinned commit is
+/// what installs. That path carries no published hash, so it is `Unverified`
+/// and never auto-updates.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PluginUserSource {
@@ -1039,12 +1070,15 @@ pub struct PluginUserSource {
     pub source_id: String,
     /// The name the reader gave it, shown on every entry it lists.
     pub name: String,
-    /// The index address.
+    #[serde(default)]
+    pub kind: PluginUserSourceKind,
+    /// The index address, or the repository's `owner/repo`.
     pub index_url: String,
     /// The public key its signature is checked against.
     ///
     /// Absent means the reader accepted an unsigned catalog, which is only
-    /// allowed for a source they added themselves.
+    /// allowed for a source they added themselves. A repository source never
+    /// uses one: it publishes no signed document.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public_key: Option<String>,
     #[serde(default)]
@@ -1062,6 +1096,10 @@ pub struct PluginUserSource {
 #[serde(rename_all = "camelCase")]
 pub struct PluginUserSourceAddRequest {
     pub name: String,
+    #[serde(default)]
+    pub kind: PluginUserSourceKind,
+    /// An `https` index address, or a repository the reader named as
+    /// `owner/repo` or a `https://github.com/owner/repo` address.
     pub index_url: String,
     /// The index signer's public key, base64. Required unless the reader
     /// explicitly accepts an unsigned catalog.
@@ -1089,12 +1127,16 @@ pub struct PluginUserSourceEnabledRequest {
 
 /// Checks a source the reader typed before it is stored.
 ///
-/// The address must be an absolute `https` URL: a catalog is fetched over the
+/// An index address must be an absolute `https` URL: it is fetched over the
 /// same public-https policy as the official one, so a plaintext or local
 /// address would either be refused later or reach a machine on the network.
+/// A repository is named `owner/repo` or as a `https://github.com/owner/repo`
+/// address, which is normalized to the former; it publishes no signed
+/// document, so it never needs a key.
 pub fn validate_plugin_user_source(
     name: &str,
-    index_url: &str,
+    kind: PluginUserSourceKind,
+    address: &str,
     public_key: Option<&str>,
     allow_unsigned: bool,
 ) -> Result<(), String> {
@@ -1105,23 +1147,66 @@ pub fn validate_plugin_user_source(
     if name.chars().count() > 60 {
         return Err("the source name is too long".to_string());
     }
-    let url = url::Url::parse(index_url.trim())
-        .map_err(|error| format!("the index address is not a URL: {error}"))?;
-    if url.scheme() != "https" {
-        return Err("the index address must be https".to_string());
+    match kind {
+        PluginUserSourceKind::Index => {
+            let url = url::Url::parse(address.trim())
+                .map_err(|error| format!("the index address is not a URL: {error}"))?;
+            if url.scheme() != "https" {
+                return Err("the index address must be https".to_string());
+            }
+            if url.host_str().is_none() {
+                return Err("the index address has no host".to_string());
+            }
+            match public_key.map(str::trim).filter(|key| !key.is_empty()) {
+                Some(_) => Ok(()),
+                None if allow_unsigned => Ok(()),
+                None => Err(
+                    "the source needs the index signer's public key, or an explicit \
+                     acceptance of an unsigned catalog"
+                        .to_string(),
+                ),
+            }
+        }
+        PluginUserSourceKind::Repository => {
+            parse_plugin_repository(address).map(|_| ()).ok_or_else(|| {
+                "the repository must be `owner/repo` or https://github.com/owner/repo".to_string()
+            })
+        }
     }
-    if url.host_str().is_none() {
-        return Err("the index address has no host".to_string());
+}
+
+/// Normalizes a repository the reader typed to `owner/repo`.
+///
+/// Both `owner/repo` and `https://github.com/owner/repo` (with or without a
+/// trailing `.git` or slash) are accepted, because those are the two forms a
+/// person copies. Anything else — another host, a deep path, a branch — is
+/// refused rather than guessed at.
+pub fn parse_plugin_repository(address: &str) -> Option<String> {
+    let address = address.trim().trim_end_matches('/');
+    let path = if let Some(rest) = address
+        .strip_prefix("https://github.com/")
+        .or_else(|| address.strip_prefix("http://github.com/"))
+    {
+        rest
+    } else if address.contains("://") {
+        return None;
+    } else {
+        address
+    };
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    let mut segments = path.split('/');
+    let owner = segments.next()?;
+    let repo = segments.next()?;
+    if segments.next().is_some() {
+        return None;
     }
-    match public_key.map(str::trim).filter(|key| !key.is_empty()) {
-        Some(_) => Ok(()),
-        None if allow_unsigned => Ok(()),
-        None => Err(
-            "the source needs the index signer's public key, or an explicit \
-             acceptance of an unsigned catalog"
-                .to_string(),
-        ),
-    }
+    let valid = |part: &str| {
+        !part.is_empty()
+            && part.chars().all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
+            })
+    };
+    (valid(owner) && valid(repo)).then(|| format!("{owner}/{repo}"))
 }
 
 /// The stable id for a catalog address.
@@ -1242,27 +1327,116 @@ mod tests {
     #[test]
     fn a_source_needs_https_a_name_and_an_explicit_unsigned_acceptance() {
         assert!(
-            validate_plugin_user_source("Acme", "https://acme.example/i.json", None, false)
-                .is_err()
+            validate_plugin_user_source(
+                "Acme",
+                PluginUserSourceKind::Index,
+                "https://acme.example/i.json",
+                None,
+                false
+            )
+            .is_err()
         );
         assert!(
-            validate_plugin_user_source("Acme", "https://acme.example/i.json", None, true).is_ok()
+            validate_plugin_user_source(
+                "Acme",
+                PluginUserSourceKind::Index,
+                "https://acme.example/i.json",
+                None,
+                true
+            )
+            .is_ok()
         );
         assert!(
-            validate_plugin_user_source("Acme", "https://acme.example/i.json", Some("key"), false)
-                .is_ok()
+            validate_plugin_user_source(
+                "Acme",
+                PluginUserSourceKind::Index,
+                "https://acme.example/i.json",
+                Some("key"),
+                false
+            )
+            .is_ok()
         );
         assert!(
-            validate_plugin_user_source("", "https://acme.example/i.json", Some("key"), false)
-                .is_err()
+            validate_plugin_user_source(
+                "",
+                PluginUserSourceKind::Index,
+                "https://acme.example/i.json",
+                Some("key"),
+                false
+            )
+            .is_err()
         );
         assert!(
-            validate_plugin_user_source("Acme", "http://acme.example/i.json", Some("key"), false)
-                .is_err()
+            validate_plugin_user_source(
+                "Acme",
+                PluginUserSourceKind::Index,
+                "http://acme.example/i.json",
+                Some("key"),
+                false
+            )
+            .is_err()
         );
-        assert!(validate_plugin_user_source("Acme", "not a url", Some("key"), false).is_err());
         assert!(
-            validate_plugin_user_source("Acme", "https://acme.example/i.json", Some("  "), false)
+            validate_plugin_user_source(
+                "Acme",
+                PluginUserSourceKind::Index,
+                "not a url",
+                Some("key"),
+                false
+            )
+            .is_err()
+        );
+        assert!(
+            validate_plugin_user_source(
+                "Acme",
+                PluginUserSourceKind::Index,
+                "https://acme.example/i.json",
+                Some("  "),
+                false
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn a_repository_is_named_or_pasted_and_normalized_to_owner_repo() {
+        for address in [
+            "acme/widgets",
+            "https://github.com/acme/widgets",
+            "https://github.com/acme/widgets/",
+            "https://github.com/acme/widgets.git",
+            "  acme/widgets  ",
+        ] {
+            assert_eq!(
+                parse_plugin_repository(address).as_deref(),
+                Some("acme/widgets"),
+                "{address}"
+            );
+        }
+        // Another host, a deep path, or a missing half is refused rather than
+        // guessed at: fetching the wrong repository is worse than refusing.
+        for address in [
+            "https://gitlab.com/acme/widgets",
+            "https://github.com/acme/widgets/tree/main",
+            "acme",
+            "",
+            "acme/widgets/extra",
+            "acme//widgets",
+        ] {
+            assert_eq!(parse_plugin_repository(address), None, "{address}");
+        }
+    }
+
+    #[test]
+    fn a_repository_source_needs_no_key_but_an_index_one_does() {
+        let kind = PluginUserSourceKind::Repository;
+        assert!(validate_plugin_user_source("Acme", kind, "acme/widgets", None, false).is_ok());
+        assert!(validate_plugin_user_source("Acme", kind, "nonsense", None, false).is_err());
+        assert!(validate_plugin_user_source("", kind, "acme/widgets", None, false).is_err());
+
+        let index = PluginUserSourceKind::Index;
+        assert!(
+            validate_plugin_user_source("Acme", index, "https://acme.example/i.json", None, false)
                 .is_err()
         );
     }

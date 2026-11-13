@@ -101,7 +101,7 @@ pub use runtime::{
     SwitchOperationJournalRepository, SwitchOperationRecord,
 };
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 92;
+pub const CURRENT_SCHEMA_VERSION: i64 = 93;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Copy)]
@@ -12823,6 +12823,7 @@ pub fn apply_migrations(conn: &mut Connection) -> VibexResult<Vec<String>> {
     apply_plugin_version_pin(conn, &mut applied)?;
     apply_plugin_local_reviews(conn, &mut applied)?;
     apply_plugin_user_sources(conn, &mut applied)?;
+    apply_plugin_user_source_kind(conn, &mut applied)?;
     Ok(applied)
 }
 
@@ -12965,7 +12966,64 @@ fn apply_plugin_user_sources(conn: &mut Connection, applied: &mut Vec<String>) -
     Ok(())
 }
 
-/// Lets a binding name no Provider, and clears the ones that named a placeholder.
+/// Records what kind of catalog each reader-added source is.
+///
+/// Every row written before this migration is an index, which is the default
+/// the column carries, so the migration only has to add the column.
+fn apply_plugin_user_source_kind(
+    conn: &mut Connection,
+    applied: &mut Vec<String>,
+) -> VibexResult<()> {
+    const VERSION: i64 = 93;
+    const NAME: &str = "plugin_user_source_kind";
+    if migration_applied(conn, VERSION)? {
+        return Ok(());
+    }
+    let tx = conn.transaction().map_err(storage_err(
+        "migration_transaction_failed",
+        "failed to start the plugin source kind migration",
+    ))?;
+    // A rewound migration row can sit over a schema that already has the
+    // column; adding it again would fail. Check first, so the migration is
+    // safe to re-run on both a real old database and a test fixture.
+    let has_column =
+        tx.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('plugin_sources') WHERE name = 'kind'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(storage_err(
+            "migration_lookup_failed",
+            "failed to inspect the plugin source kind column",
+        ))? > 0;
+    if !has_column {
+        tx.execute_batch(
+            "
+                ALTER TABLE plugin_sources
+                    ADD COLUMN kind TEXT NOT NULL DEFAULT 'index';
+            ",
+        )
+        .map_err(storage_err(
+            "migration_apply_failed",
+            "failed to add the plugin source kind column",
+        ))?;
+    }
+    tx.execute(
+        "INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
+        params![VERSION, NAME, unix_timestamp_ms()],
+    )
+    .map_err(storage_err(
+        "migration_record_failed",
+        "failed to record the plugin source kind migration",
+    ))?;
+    tx.commit().map_err(storage_err(
+        "migration_commit_failed",
+        "failed to commit the plugin source kind migration",
+    ))?;
+    applied.push(format!("{VERSION}:{NAME}"));
+    Ok(())
+}
+
 ///
 /// An Agent that authenticates as itself — `claude login`, a Codex subscription —
 /// has a launch command and no Provider endpoint. The column required one, so such
@@ -19814,6 +19872,7 @@ mod tests {
                 "90:plugin_version_pin",
                 "91:plugin_local_reviews",
                 "92:plugin_user_sources",
+                "93:plugin_user_source_kind",
             ]
         );
         let agent_models: (Option<String>, Option<String>) = conn
@@ -19990,6 +20049,7 @@ mod tests {
                 "90:plugin_version_pin",
                 "91:plugin_local_reviews",
                 "92:plugin_user_sources",
+                "93:plugin_user_source_kind",
             ]
         );
         let activation_completed_at_ms: Option<i64> = conn
@@ -20151,6 +20211,7 @@ mod tests {
                 "90:plugin_version_pin",
                 "91:plugin_local_reviews",
                 "92:plugin_user_sources",
+                "93:plugin_user_source_kind",
             ]
         );
         let stored: (String, Option<String>, Option<i64>) = conn
@@ -20346,6 +20407,7 @@ mod tests {
                 "90:plugin_version_pin",
                 "91:plugin_local_reviews",
                 "92:plugin_user_sources",
+                "93:plugin_user_source_kind",
             ]
         );
         assert_eq!(
@@ -21810,6 +21872,7 @@ mod tests {
                 "90:plugin_version_pin",
                 "91:plugin_local_reviews",
                 "92:plugin_user_sources",
+                "93:plugin_user_source_kind",
             ]
         );
         let managed = ManagedWorktreeRepository::get_by_id(&conn, &worktree_id)

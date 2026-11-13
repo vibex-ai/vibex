@@ -134,6 +134,9 @@ impl PluginHandle {
     /// through unsigned: a broken key is a reason not to read the catalog, not
     /// a reason to read it without checking anything.
     fn market_user_sources(&self) -> Vec<vibex_plugin::market::UserSourceConfig> {
+        use vibex_core::PluginUserSourceKind;
+        use vibex_plugin::market::{UserSourceConfig, UserSourceKind};
+
         // `service()` must not call `connection()`, which calls `service()`;
         // the sources are read through a plain connection of their own.
         let Ok(connection) = open_database(&self.database_path) else {
@@ -145,24 +148,34 @@ impl PluginHandle {
         sources
             .into_iter()
             .filter_map(|source| {
-                let url = url::Url::parse(&source.index_url).ok()?;
-                let public_key = match source.public_key.as_deref() {
-                    Some(key) => match vibex_plugin::market::decode_verifying_key(key) {
-                        Ok(key) => Some(key),
-                        Err(error) => {
-                            eprintln!(
-                                "vibex-plugin-market: the catalog `{}` has an invalid key: {error}",
-                                source.name
-                            );
-                            return None;
-                        }
+                let kind = match source.kind {
+                    PluginUserSourceKind::Index => {
+                        let url = url::Url::parse(&source.index_url).ok()?;
+                        let public_key = match source.public_key.as_deref() {
+                            Some(key) => match vibex_plugin::market::decode_verifying_key(key) {
+                                Ok(key) => Some(key),
+                                Err(error) => {
+                                    // A broken key is a reason not to read the
+                                    // catalog, not a reason to read it without
+                                    // checking anything.
+                                    eprintln!(
+                                        "vibex-plugin-market: the catalog `{}` has an invalid key: {error}",
+                                        source.name
+                                    );
+                                    return None;
+                                }
+                            },
+                            None => None,
+                        };
+                        UserSourceKind::Index { url, public_key }
+                    }
+                    PluginUserSourceKind::Repository => UserSourceKind::Repository {
+                        repo: source.index_url.clone(),
                     },
-                    None => None,
                 };
-                Some(vibex_plugin::market::UserSourceConfig {
+                Some(UserSourceConfig {
                     name: source.name,
-                    url,
-                    public_key,
+                    kind,
                 })
             })
             .collect()
