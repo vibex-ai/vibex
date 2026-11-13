@@ -24435,33 +24435,22 @@ impl ManagementCenter {
             self.mutation.is_some() || self.agent_mutations.contains_key(&selected_agent_id);
         let updating = self.editing_profile_id.is_some();
         // Creating a Provider starts from "which existing one, or a new one?".
-        // The step owns the body because there is nothing to save yet; the only
-        // action that ends it is Cancel.
+        // The step owns the body because there is nothing to save yet: it binds
+        // an existing record or opens a form, so it has nothing of its own to
+        // commit.
         if !updating && self.provider_preset_picker {
+            // The manual path is pinned under the list rather than scrolling
+            // with it: a long library used to bury "Custom provider" past the
+            // fold, so the one answer the library cannot offer was the hardest
+            // to reach. There is no Cancel row: the dialog's own close control
+            // and Escape already abandon the step, and a second way out under
+            // the list only competed with the choice itself.
+            let pending = self.mutation.is_some();
             return v_flex()
                 .size_full()
                 .min_h_0()
                 .child(self.render_provider_picker_step(window, cx))
-                .child(
-                    h_flex()
-                        .w_full()
-                        .flex_none()
-                        .items_center()
-                        .justify_end()
-                        .gap_2()
-                        .border_t_1()
-                        .border_color(cx.theme().border)
-                        .pt_3()
-                        .child(
-                            Button::new("provider-picker-close")
-                                .small()
-                                .ghost()
-                                .label(management_locale_text("Cancel", "取消", "取消"))
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.close_profile_editor(window, cx)
-                                })),
-                        ),
-                )
+                .child(self.render_provider_picker_custom_band(pending, cx))
                 .into_any_element();
         }
         let saving = matches!(
@@ -25601,7 +25590,6 @@ impl ManagementCenter {
             );
         }
 
-        let custom_selected = selected_choice.as_ref() == Some(&ProviderPickerChoice::Custom);
         v_flex()
             .w_full()
             .min_h_0()
@@ -25687,11 +25675,28 @@ impl ManagementCenter {
             // so the field sits apart from the switch instead of touching it.
             .child(div().w_full().flex_none().pt_3().child(search))
             .child(body)
-            // A new source starts from an empty form, which is the one answer
-            // neither tab's list can offer. Importing no longer lives in this
-            // step: it reads every Agent's native configuration and writes
-            // shared records, so it belongs to the Providers list's own header.
-            .child(Separator::horizontal())
+            .into_any_element()
+    }
+
+    /// The chooser's pinned footer: the manual path that starts a form instead
+    /// of choosing a row.
+    ///
+    /// A new source is the one answer neither tab's list can offer, so it is
+    /// not one more row in the library. It is drawn outside the list's scroll
+    /// region, under its own rule, so it stays reachable without scrolling to
+    /// the end of a long library.
+    fn render_provider_picker_custom_band(
+        &mut self,
+        pending: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let providers_tab = self.provider_picker_tab == ProviderPickerTab::Providers;
+        let custom_selected =
+            self.provider_picker_choice.as_ref() == Some(&ProviderPickerChoice::Custom);
+        v_flex()
+            .debug_selector(|| "management-provider-picker-custom-band".to_string())
+            .w_full()
+            .flex_none()
             .child(
                 // The manual path is not one more row in the library: it is the
                 // answer for a source the library does not list, so it sits on
@@ -25702,6 +25707,7 @@ impl ManagementCenter {
                 div().w_full().pb_2().child(
                     h_flex()
                         .id("management-provider-preset-custom")
+                        .debug_selector(|| "management-provider-preset-custom".to_string())
                         .w_full()
                         .min_w_0()
                         .items_center()
@@ -53300,6 +53306,98 @@ mod gateway_surface_tests {
         // Each half's scroll region is the only thing that scrolls.
         assert!(picker.contains(".id(\"provider-picker-list\")"));
         assert!(picker.contains(".id(\"provider-picker-groups\")"));
+    }
+
+    /// "Custom provider" and "New route group" are pinned under the list.
+    ///
+    /// A long library used to push the one answer it cannot offer past the
+    /// fold, so reaching it meant scrolling to the end. The band now sits
+    /// outside the scroll region, above the dialog's own edge, and the step has
+    /// no Cancel row of its own.
+    #[gpui::test]
+    fn the_custom_band_stays_visible_under_a_long_library(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let mut built = None;
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            let center = cx.new(|cx| ManagementCenter::new(window, cx));
+            let root = gpui_base::Root::new(center.clone(), window, cx);
+            built = Some(center);
+            root
+        });
+        let center = built.expect("the management window builds its center");
+        cx.update(|window, cx| {
+            center.update(cx, |center, cx| {
+                // A library longer than the chooser's list can show at once.
+                center.providers = (0..24)
+                    .map(|index| vibex_core::ModelProviderProfile {
+                        display_name: format!("Vendor {index:02}"),
+                        ..Default::default()
+                    })
+                    .collect();
+                center.provider_preset_picker = true;
+                center.profile_editor_open = true;
+                center.present_profile_editor_dialog(window, cx);
+            });
+        });
+        cx.simulate_resize(gpui::size(px(1280.0), px(720.0)));
+        for _ in 0..3 {
+            cx.update(|window, cx| {
+                let _ = window.draw(cx);
+            });
+            cx.run_until_parked();
+        }
+        let dialog = cx
+            .debug_bounds("dialog-0")
+            .expect("the chooser's overlay is drawn");
+        let list = cx
+            .debug_bounds("provider-picker-list")
+            .expect("the library list is drawn");
+        let band = cx
+            .debug_bounds("management-provider-picker-custom-band")
+            .expect("the manual path's band is drawn");
+        let custom = cx
+            .debug_bounds("management-provider-preset-custom")
+            .expect("the manual path's row is drawn");
+        // The library overflows its viewport, which is the state that used to
+        // bury the band.
+        assert!(
+            list.size.height > dialog.size.height,
+            "the fixture library must be longer than the dialog: list={list:?} dialog={dialog:?}"
+        );
+        // The band is inside the dialog and below the list's first row.
+        assert!(
+            band.top() > list.top(),
+            "the band follows the list: band={band:?} list={list:?}"
+        );
+        assert!(
+            custom.bottom() <= dialog.bottom() + px(1.0),
+            "the band stays inside the dialog: custom={custom:?} dialog={dialog:?}"
+        );
+        // Scrolling the library to its end must not move the band: it is
+        // outside the scroll region, not the last row of it.
+        cx.simulate_event(gpui::ScrollEvent {
+            position: list.center(),
+            delta: ScrollDelta::Lines(point(0.0, -40.0)),
+            modifiers: Default::default(),
+            touch_phase: gpui::TouchPhase::Moved,
+            ..Default::default()
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+        });
+        let band_after = cx
+            .debug_bounds("management-provider-picker-custom-band")
+            .expect("the band is still drawn");
+        assert_eq!(
+            band, band_after,
+            "the band stays put while the library scrolls"
+        );
+        // The step has no Cancel row of its own any more.
+        assert!(
+            cx.debug_bounds("provider-picker-close").is_none(),
+            "the chooser must not carry a second way out under the list"
+        );
     }
 
     /// "Custom provider" changes the step, it does not open a second dialog.
