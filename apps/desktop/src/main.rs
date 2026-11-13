@@ -154,6 +154,7 @@ fn main() {
 }
 
 fn run() {
+    vibex_desktop::install_crypto_provider();
     configure_allocator();
     let arguments = std::env::args().skip(1).collect::<Vec<_>>();
     // Both self-exec sidecar modes are dispatched here. They run before any

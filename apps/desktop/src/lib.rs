@@ -115,6 +115,17 @@ pub struct FirstFrameProbe {
     pub computer_use_contract: testing::ComputerUseContractProbe,
 }
 
+/// Selects the process-wide rustls crypto provider.
+///
+/// The dependency graph enables both the `ring` and `aws_lc_rs` features (the
+/// workspace pins `aws_lc_rs`, while `tokio-rustls` pulls `ring` in through
+/// another crate), so rustls refuses to guess and panics the first time a TLS
+/// client is built. The choice is made once here — before any Tokio worker
+/// starts — and is a no-op when a provider is already installed.
+pub fn install_crypto_provider() {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+}
+
 pub fn first_frame_probe() -> FirstFrameProbe {
     let (release_channel, application_id, home_directory) = compiled_release_identity();
     FirstFrameProbe {
@@ -170,6 +181,15 @@ fn compiled_release_identity() -> (&'static str, &'static str, &'static str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_tls_client_builds_after_the_provider_is_installed() {
+        install_crypto_provider();
+        assert!(rustls::crypto::CryptoProvider::get_default().is_some());
+        // `ClientConfig::builder` is the call that panics when no provider was
+        // installed and both provider features are enabled.
+        let _ = rustls::ClientConfig::builder();
+    }
 
     #[test]
     fn probe_keeps_the_window_and_dependency_source_contract() {
