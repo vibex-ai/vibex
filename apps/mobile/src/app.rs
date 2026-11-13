@@ -45025,6 +45025,7 @@ fn session_opened(cx: &mut Context<Self>) {
                 provider_resolution_id: None,
                 note: None,
                 resolved_at_ms: 2,
+                responder: Some(vibex_core::ApprovalResponder::Human),
             }),
         );
         assert!(track_pending_user_request(&mut pending, &resolution));
