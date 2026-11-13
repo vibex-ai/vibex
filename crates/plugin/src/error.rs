@@ -63,6 +63,8 @@ pub enum PluginError {
     NotUninstallable(String),
     #[error("the plugin `{0}` is blocked: {1}")]
     Blocked(String, String),
+    #[error("the plugin `{0}` is pinned to version {1}")]
+    Pinned(String, String),
     #[error("the permission `{0}` was not granted")]
     PermissionDenied(String),
     #[error("the plugin id `{0}` conflicts with a built-in plugin")]
@@ -102,6 +104,7 @@ impl From<PluginError> for VibexError {
             PluginError::AlreadyInstalled(_) => "plugin_already_installed",
             PluginError::NotUninstallable(_) => "plugin_not_uninstallable",
             PluginError::Blocked(_, _) => "plugin_blocked",
+            PluginError::Pinned(_, _) => "plugin_pinned",
             PluginError::PermissionDenied(_) => "plugin_permission_denied",
             PluginError::BuiltinConflict(_) => "plugin_builtin_conflict",
             PluginError::Yanked(_) => "plugin_yanked",
@@ -124,6 +127,7 @@ impl From<PluginError> for VibexError {
             | PluginError::IndexSignatureInvalid
             | PluginError::PermissionDenied(_)
             | PluginError::Blocked(_, _)
+            | PluginError::Pinned(_, _)
             | PluginError::BuiltinConflict(_)
             | PluginError::Yanked(_) => ErrorCategory::Permission,
             PluginError::AlreadyInstalled(_) => ErrorCategory::Conflict,

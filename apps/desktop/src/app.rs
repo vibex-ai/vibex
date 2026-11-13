@@ -975,6 +975,8 @@ const COMMAND_PALETTE_RECENT_SESSION_LIMIT: usize = 8;
 /// enough to list whole, so this only guards against a future catalog pushing
 /// the other groups out of the dialog.
 const COMMAND_PALETTE_AGENT_LIMIT: usize = 6;
+/// How many plugin commands the palette lists for one query.
+const COMMAND_PALETTE_PLUGIN_LIMIT: usize = 8;
 const COMMAND_PALETTE_SESSION_ROW_HEIGHT: f32 = 60.0;
 /// Result rows the indexing placeholder stands in for. The real count is only
 /// known once the index finishes, so the placeholder fills the dialog rather
@@ -10033,6 +10035,8 @@ enum CommandPaletteEntry {
     /// whether it can run right now. The row dispatches its own Action, so
     /// confirming it only has to dismiss the palette.
     Action(&'static str, bool),
+    /// A command a plugin contributed. Confirming it opens that plugin's panel.
+    PluginCommand(vibex_core::PluginContribution),
 }
 
 /// One Agent the palette can hand over to the Config Center.
@@ -44940,6 +44944,14 @@ impl VibexWorkbench {
             Some(CommandPaletteEntry::Setting(candidate)) => {
                 self.activate_command_palette_setting(candidate, window, cx)
             }
+            Some(CommandPaletteEntry::PluginCommand(contribution)) => {
+                self.close_command_palette(window, cx);
+                let title = contribution
+                    .title
+                    .clone()
+                    .unwrap_or_else(|| contribution.contribution_id.clone());
+                self.open_script_panel(contribution.plugin_id, title, cx);
+            }
             // The row's Action already ran during the same confirm; the palette
             // only has to get out of its way.
             Some(CommandPaletteEntry::Action(..)) | None => self.close_command_palette(window, cx),
@@ -46592,6 +46604,11 @@ impl VibexWorkbench {
             self.close_right_rail(cx);
             return;
         }
+        self.open_script_panel(plugin_id, title, cx);
+    }
+
+    /// Opens a plugin's panel without toggling it closed when it is already up.
+    fn open_script_panel(&mut self, plugin_id: String, title: String, cx: &mut Context<Self>) {
         self.right_rail_script_panel = Some(plugin_id.clone());
         self.right_rail_script_title = Some(title);
         self.right_rail_script_error = None;
@@ -75567,6 +75584,33 @@ impl VibexWorkbench {
             }
         }
 
+        if !query_empty && let Some(runtime) = &self.runtime {
+            let plugin_commands = runtime
+                .plugins()
+                .contributions()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|contribution| contribution.kind == "command" && contribution.enabled)
+                .filter(|contribution| {
+                    contribution
+                        .title
+                        .as_deref()
+                        .unwrap_or(&contribution.contribution_id)
+                        .to_lowercase()
+                        .contains(&query)
+                        || contribution.plugin_id.to_lowercase().contains(&query)
+                })
+                .take(COMMAND_PALETTE_PLUGIN_LIMIT)
+                .map(CommandPaletteEntry::PluginCommand)
+                .collect::<Vec<_>>();
+            if !plugin_commands.is_empty() {
+                sections.push(CommandPaletteSection {
+                    heading: locale::text("Plugin commands", "插件命令", "外掛命令").into(),
+                    entries: plugin_commands,
+                });
+            }
+        }
+
         let actions = COMMAND_PALETTE_ACTIONS
             .iter()
             .copied()
@@ -86610,7 +86654,8 @@ fn command_palette_entry_enabled(entry: &CommandPaletteEntry) -> bool {
         CommandPaletteEntry::Action(_, enabled) => *enabled,
         CommandPaletteEntry::Session(_)
         | CommandPaletteEntry::Agent(_)
-        | CommandPaletteEntry::Setting(_) => true,
+        | CommandPaletteEntry::Setting(_)
+        | CommandPaletteEntry::PluginCommand(_) => true,
     }
 }
 
@@ -86824,6 +86869,59 @@ fn command_palette_row(
                                         .text_xs()
                                         .text_color(cx.theme().muted_foreground)
                                         .child(section),
+                                ),
+                        )
+                        .into_any_element()
+                })
+        }
+        CommandPaletteEntry::PluginCommand(contribution) => {
+            let title = contribution
+                .title
+                .clone()
+                .unwrap_or_else(|| contribution.contribution_id.clone());
+            let plugin_id = contribution.plugin_id.clone();
+            let query = query.to_string();
+            CommandItem::new()
+                .label(title.clone())
+                .keywords([plugin_id.clone()])
+                .child(move |_window, cx| {
+                    let highlight = palette_match_highlight(cx);
+                    h_flex()
+                        .w_full()
+                        .min_w_0()
+                        .items_center()
+                        .gap_3()
+                        .pr(px(COMMAND_PALETTE_ROW_LANE))
+                        .child(
+                            div()
+                                .size(px(28.0))
+                                .flex_none()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded(px(6.0))
+                                .bg(cx.theme().muted.opacity(0.55))
+                                .child(Icon::new(IconName::Frame).size(px(16.0))),
+                        )
+                        .child(
+                            v_flex()
+                                .min_w_0()
+                                .flex_1()
+                                .gap(px(3.0))
+                                .child(div().min_w_0().truncate().text_sm().font_medium().child(
+                                    session_search_highlighted_text(
+                                        title.clone(),
+                                        &query,
+                                        highlight,
+                                    ),
+                                ))
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(plugin_id.clone()),
                                 ),
                         )
                         .into_any_element()

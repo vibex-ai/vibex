@@ -101,8 +101,9 @@ use vibex_core::{
     InstalledPlugin, PluginAutoUpdateRequest, PluginEnabledRequest, PluginLocalInstallRequest,
     PluginMarketDetail, PluginMarketDetailRequest, PluginMarketIndexRequest,
     PluginMarketIndexResponse, PluginMarketInstallRequest, PluginMarketInstallResult,
-    PluginMarketSearchRequest, PluginMarketSearchResponse, PluginUninstallRequest,
-    PluginUpdateApplyRequest, PluginUpdateCheckRequest, PluginUpdateCheckResponse,
+    PluginMarketSearchRequest, PluginMarketSearchResponse, PluginRollbackRequest,
+    PluginUninstallRequest, PluginUpdateApplyRequest, PluginUpdateCheckRequest,
+    PluginUpdateCheckResponse, PluginVersionPinRequest,
 };
 
 pub trait ManagementBackend: BackendBound {
@@ -940,6 +941,16 @@ pub trait ManagementBackend: BackendBound {
     fn set_plugin_auto_update(
         &self,
         request: MutationRequest<PluginAutoUpdateRequest>,
+    ) -> BackendFuture<'_, InstalledPlugin>;
+
+    fn set_plugin_version_pin(
+        &self,
+        request: MutationRequest<PluginVersionPinRequest>,
+    ) -> BackendFuture<'_, InstalledPlugin>;
+
+    fn rollback_plugin(
+        &self,
+        request: MutationRequest<PluginRollbackRequest>,
     ) -> BackendFuture<'_, InstalledPlugin>;
 
     fn uninstall_plugin(

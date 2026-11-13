@@ -5332,6 +5332,34 @@ impl ManagementBackend for NativeBackend {
         })
     }
 
+    fn set_plugin_version_pin(
+        &self,
+        request: MutationRequest<vibex_core::PluginVersionPinRequest>,
+    ) -> BackendFuture<'_, vibex_core::InstalledPlugin> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .plugins()
+                .set_pinned_version(request.payload)
+                .map_err(Into::into)
+        })
+    }
+
+    fn rollback_plugin(
+        &self,
+        request: MutationRequest<vibex_core::PluginRollbackRequest>,
+    ) -> BackendFuture<'_, vibex_core::InstalledPlugin> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .plugins()
+                .rollback(request.payload)
+                .map_err(Into::into)
+        })
+    }
+
     fn uninstall_plugin(
         &self,
         request: MutationRequest<vibex_core::PluginUninstallRequest>,

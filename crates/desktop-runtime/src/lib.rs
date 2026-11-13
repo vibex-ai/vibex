@@ -3497,6 +3497,13 @@ impl DesktopRuntime {
                 "plugin recovery failed; plugins stay on their stored state"
             );
         }
+        if let Err(error) = runtime.spawn_plugin_auto_update() {
+            tracing::warn!(
+                target: "vibex_plugin",
+                error_code = %error.code,
+                "plugin auto-update could not be scheduled"
+            );
+        }
         // The endpoint is bound synchronously: a session created before it is
         // listening would otherwise be offered no browser tools at all, and the
         // race would look like a capability gap rather than a startup ordering
@@ -3802,6 +3809,35 @@ impl DesktopRuntime {
             let _ = self.agent.runtime_lifecycle.stop().await;
             return Err(error);
         }
+        Ok(())
+    }
+
+    /// Checks auto-updating plugins once after startup and then every six hours.
+    ///
+    /// The task is tracked with the runtime's other long-lived tasks, so
+    /// shutdown aborts it instead of leaving a network request behind.
+    fn spawn_plugin_auto_update(self: &Arc<Self>) -> VibexResult<()> {
+        let mut tasks = self.tasks.lock().map_err(|_| {
+            VibexError::process(
+                "desktop_runtime_task_lock_failed",
+                "desktop runtime task ownership is unavailable",
+            )
+        })?;
+        let runtime = Arc::clone(self);
+        tasks.push(tokio::spawn(async move {
+            // Let the window settle before the first network pass.
+            tokio::time::sleep(std::time::Duration::from_secs(5 * 60)).await;
+            loop {
+                if runtime
+                    .shutting_down
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    break;
+                }
+                let _ = runtime.plugins().auto_update().await;
+                tokio::time::sleep(std::time::Duration::from_secs(6 * 60 * 60)).await;
+            }
+        }));
         Ok(())
     }
 

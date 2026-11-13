@@ -857,6 +857,12 @@ pub struct InstalledPlugin {
     pub enabled: bool,
     #[serde(default)]
     pub auto_update: bool,
+    /// The version the user pinned, if any. A pinned plugin is not updated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinned_version: Option<String>,
+    /// The older kept version a rollback would use, when one exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollback_version: Option<String>,
     #[serde(default)]
     pub status: InstalledPluginStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -910,6 +916,24 @@ pub struct PluginUninstallRequest {
 pub struct PluginAutoUpdateRequest {
     pub plugin_id: String,
     pub auto_update: bool,
+}
+
+/// Pins a plugin to a version, or clears the pin with `version: null`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginVersionPinRequest {
+    pub plugin_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+}
+
+/// Rolls a plugin back to an older kept version, or to the previous one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginRollbackRequest {
+    pub plugin_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
 }
 
 /// A contribution one plugin registered with the host.
@@ -1019,6 +1043,8 @@ mod tests {
             categories: vec![PluginCategory::Panels],
             enabled: true,
             auto_update: false,
+            pinned_version: None,
+            rollback_version: None,
             status: InstalledPluginStatus::Enabled,
             install_path: None,
             data_path: None,

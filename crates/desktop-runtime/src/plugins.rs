@@ -16,8 +16,8 @@ use vibex_core::{
     PluginLocalInstallRequest, PluginMarketDetail, PluginMarketDetailRequest,
     PluginMarketIndexRequest, PluginMarketIndexResponse, PluginMarketInstallRequest,
     PluginMarketInstallResult, PluginMarketSearchRequest, PluginMarketSearchResponse,
-    PluginUninstallRequest, PluginUpdateApplyRequest, PluginUpdateCheckRequest,
-    PluginUpdateCheckResponse, VibexResult,
+    PluginRollbackRequest, PluginUninstallRequest, PluginUpdateApplyRequest,
+    PluginUpdateCheckRequest, PluginUpdateCheckResponse, PluginVersionPinRequest, VibexResult,
 };
 use vibex_db::{PluginRepository, open_database};
 use vibex_plugin::{
@@ -185,6 +185,25 @@ impl PluginHandle {
             .set_auto_update(&self.connection()?, &request.plugin_id, request.auto_update)
     }
 
+    pub fn set_pinned_version(
+        &self,
+        request: PluginVersionPinRequest,
+    ) -> VibexResult<InstalledPlugin> {
+        self.service().set_pinned_version(
+            &self.connection()?,
+            &request.plugin_id,
+            request.version.as_deref(),
+        )
+    }
+
+    pub fn rollback(&self, request: PluginRollbackRequest) -> VibexResult<InstalledPlugin> {
+        self.service().rollback(
+            &self.connection()?,
+            &request.plugin_id,
+            request.version.as_deref(),
+        )
+    }
+
     pub fn uninstall(&self, request: PluginUninstallRequest) -> VibexResult<()> {
         self.service()
             .uninstall(&self.connection()?, &request.plugin_id, request.remove_data)
@@ -277,6 +296,75 @@ impl PluginHandle {
             plugin_id.to_string(),
             blocked.reason,
         )))
+    }
+
+    /// Applies updates for plugins that opted into automatic updates.
+    ///
+    /// Never widens permissions: an update that adds a key is left for the
+    /// user, and a pinned or yanked version is skipped.
+    pub async fn auto_update(&self) -> VibexResult<Vec<PluginMarketInstallResult>> {
+        let connection = self.connection()?;
+        let plugin_ids = PluginRepository::list(&connection)?
+            .into_iter()
+            .filter(|record| {
+                record.kind == vibex_core::PluginKind::Script
+                    && record.auto_update
+                    && record.trust.allows_auto_update()
+                    && record.pinned_version.is_none()
+            })
+            .map(|record| record.plugin_id)
+            .collect::<Vec<_>>();
+        if plugin_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let updates = self
+            .service()
+            .check_updates(
+                self.connection()?,
+                &PluginUpdateCheckRequest {
+                    plugin_ids,
+                    refresh: true,
+                },
+            )
+            .await?;
+        let mut installed = Vec::new();
+        for update in updates.updates {
+            if update.yanked || !update.permission_diff.added.is_empty() {
+                continue;
+            }
+            let Some(fingerprint) = update.consent_fingerprint.clone() else {
+                continue;
+            };
+            let connection = self.connection()?;
+            let record =
+                PluginRepository::get(&connection, &update.plugin_id)?.ok_or_else(|| {
+                    vibex_core::VibexError::validation(
+                        "plugin_not_installed",
+                        format!("the plugin `{}` is not installed", update.plugin_id),
+                    )
+                })?;
+            let request = PluginMarketInstallRequest {
+                entry_id: update.plugin_id.clone(),
+                version: Some(update.available_version.clone()),
+                granted_permissions: update
+                    .requested_permissions
+                    .iter()
+                    .map(vibex_core::PluginPermissionGrant::from)
+                    .collect(),
+                consent_fingerprint: Some(fingerprint),
+                enable: record.enabled,
+                auto_update: true,
+            };
+            // One bad package must not stop the rest of the batch.
+            match self.service().install(connection, &request).await {
+                Ok(result) => installed.push(result),
+                Err(error) => eprintln!(
+                    "vibex-plugin: auto-update of {} failed: {error}",
+                    update.plugin_id
+                ),
+            }
+        }
+        Ok(installed)
     }
 
     /// Recovers an interrupted install.

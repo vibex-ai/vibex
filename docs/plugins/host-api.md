@@ -39,6 +39,38 @@ The workspace module is part of the same read-only session context as
 `vibex.session`; a plugin that only needs the workspace still requests
 `agent.read`.
 
+## `vibex.settings` (requires `storage`)
+
+```js
+import { get, save } from "vibex.settings";
+
+const theme = get("theme");        // null when unset
+save("theme", "dark");             // true
+```
+
+The store is scoped to the plugin's data directory and survives upgrades. Values
+are JSON: null, boolean, number, string, array or object. The file is written
+atomically (temporary file, then rename).
+
+## Commands
+
+A plugin can contribute commands through its manifest:
+
+```json
+{
+  "contributes": {
+    "commands": [
+      { "id": "open-session-card", "title": "Open session card" }
+    ]
+  }
+}
+```
+
+Each command appears in the command palette under **Plugin commands**. Selecting
+one opens that plugin's panel; the panel decides what the command does. This is
+the safe first shape: the host does not execute arbitrary script callbacks from
+the palette, and a command cannot run without the plugin's panel surface.
+
 ## Manifest
 
 Request the permission in `vibex-plugin.json`:

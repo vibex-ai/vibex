@@ -7343,6 +7343,26 @@ impl ManagementBackend for WebRemoteBackend {
         )
     }
 
+    fn set_plugin_version_pin(
+        &self,
+        _request: MutationRequest<vibex_core::PluginVersionPinRequest>,
+    ) -> BackendFuture<'_, vibex_core::InstalledPlugin> {
+        self.unsupported(
+            "plugin_remote_unsupported",
+            "Plugin management belongs to the local desktop runtime",
+        )
+    }
+
+    fn rollback_plugin(
+        &self,
+        _request: MutationRequest<vibex_core::PluginRollbackRequest>,
+    ) -> BackendFuture<'_, vibex_core::InstalledPlugin> {
+        self.unsupported(
+            "plugin_remote_unsupported",
+            "Plugin management belongs to the local desktop runtime",
+        )
+    }
+
     fn uninstall_plugin(
         &self,
         _request: MutationRequest<vibex_core::PluginUninstallRequest>,

@@ -188,6 +188,13 @@ impl PluginService {
             plugin.size_bytes = plugin
                 .size_bytes
                 .or_else(|| Some(self.store.data_size(&plugin.plugin_id)));
+            if plugin.kind == PluginKind::Script {
+                let versions = PluginRepository::list_versions(conn, &plugin.plugin_id)?;
+                plugin.rollback_version = versions
+                    .iter()
+                    .find(|version| is_newer(&plugin.version, &version.version))
+                    .map(|version| version.version.clone());
+            }
         }
         Ok(plugins)
     }
@@ -321,6 +328,152 @@ impl PluginService {
         Ok(record.to_installed())
     }
 
+    /// Pins a plugin to a version, or clears the pin.
+    pub fn set_pinned_version(
+        &self,
+        conn: &rusqlite::Connection,
+        plugin_id: &str,
+        version: Option<&str>,
+    ) -> VibexResult<InstalledPlugin> {
+        let record = PluginRepository::get(conn, plugin_id)?
+            .ok_or_else(|| PluginError::NotInstalled(plugin_id.to_string()))?;
+        if record.kind == PluginKind::Native {
+            return Err(PluginError::NotUninstallable(plugin_id.to_string()).into());
+        }
+        if let Some(version) = version
+            && !PluginRepository::list_versions(conn, plugin_id)?
+                .iter()
+                .any(|candidate| candidate.version == version)
+        {
+            return Err(PluginError::NotInstalled(format!("{plugin_id} {version}")).into());
+        }
+        PluginRepository::set_pinned_version(conn, plugin_id, version, Self::now_ms())?;
+        let record = PluginRepository::get(conn, plugin_id)?
+            .ok_or_else(|| PluginError::NotInstalled(plugin_id.to_string()))?;
+        Ok(record.to_installed())
+    }
+
+    /// Rolls back to an older kept version.
+    ///
+    /// The permissions are read from the version's own manifest and must be a
+    /// subset of the grants in force. A rollback never widens the grant; if the
+    /// older version needs a permission the update removed, the rollback is
+    /// refused and the user can install that version explicitly.
+    pub fn rollback(
+        &self,
+        conn: &rusqlite::Connection,
+        plugin_id: &str,
+        version: Option<&str>,
+    ) -> VibexResult<InstalledPlugin> {
+        let record = PluginRepository::get(conn, plugin_id)?
+            .ok_or_else(|| PluginError::NotInstalled(plugin_id.to_string()))?;
+        if record.kind == PluginKind::Native {
+            return Err(PluginError::NotUninstallable(plugin_id.to_string()).into());
+        }
+        let versions = PluginRepository::list_versions(conn, plugin_id)?;
+        let target = match version {
+            Some(version) => versions
+                .iter()
+                .find(|candidate| candidate.version == version),
+            None => versions
+                .iter()
+                .find(|candidate| is_newer(&record.version, &candidate.version)),
+        }
+        .cloned()
+        .ok_or_else(|| PluginError::NotFound(plugin_id.to_string()))?;
+        if target.version == record.version {
+            return Ok(record.to_installed());
+        }
+        let target_dir = self.store.version_dir(plugin_id, &target.version);
+        if !target_dir.is_dir() {
+            return Err(PluginError::NotInstalled(plugin_id.to_string()).into());
+        }
+        let manifest = PluginManifest::from_file(&target_dir.join(AUTHOR_MANIFEST_FILE))
+            .map_err(PluginError::from)?;
+        let permissions = manifest.permissions();
+        let granted: Vec<PluginPermissionGrant> = record
+            .granted_permissions
+            .iter()
+            .filter(|grant| {
+                permissions.iter().any(|permission| {
+                    permission.key == grant.key && permission.scope == grant.scope
+                })
+            })
+            .cloned()
+            .collect();
+        if let Some(missing) = missing_grant(&permissions, &granted) {
+            return Err(PluginError::PermissionDenied(missing.key.clone()).into());
+        }
+        let fingerprint = consent_fingerprint_for(
+            plugin_id,
+            &target.version,
+            SCRIPT_EXECUTION_MODEL,
+            &permissions,
+        );
+        let was_enabled = record.enabled;
+        let _ = self.runtime.unload(plugin_id);
+        if was_enabled {
+            self.store
+                .activate(plugin_id, &target.version)
+                .map_err(VibexError::from)?;
+            let loaded = LoadedPlugin::new(
+                plugin_id,
+                target.version.clone(),
+                target_dir.clone(),
+                self.store.data_dir(plugin_id),
+            )
+            .with_granted_permissions(granted.iter().map(|grant| grant.key.clone()));
+            if let Err(error) = self.runtime.load(&loaded) {
+                let _ = self.store.activate(plugin_id, &record.version);
+                return Err(error.into());
+            }
+        } else {
+            let _ = self.store.deactivate(plugin_id);
+        }
+
+        let now = Self::now_ms();
+        let mut updated = record.clone();
+        updated.version = target.version.clone();
+        updated.install_dir = Some(target_dir.to_string_lossy().to_string());
+        updated.data_dir = Some(self.store.data_dir(plugin_id).to_string_lossy().to_string());
+        updated.size_bytes = target.size_bytes;
+        updated.permissions = permissions;
+        updated.granted_permissions = granted;
+        updated.consent_fingerprint = Some(fingerprint);
+        // A rollback is an explicit change of version; a pin that still names
+        // the old current version would be a lie.
+        updated.pinned_version = None;
+        updated.status = if was_enabled {
+            InstalledPluginStatus::Enabled
+        } else {
+            InstalledPluginStatus::Disabled
+        };
+        updated.last_error = None;
+        updated.updated_at_ms = now;
+        PluginRepository::upsert(conn, &updated)?;
+        PluginRepository::set_active(conn, plugin_id, &target.version)?;
+        PluginRepository::replace_grants(
+            conn,
+            plugin_id,
+            &updated.granted_permissions,
+            &updated.permissions,
+            now,
+        )?;
+        PluginRepository::replace_contributions(
+            conn,
+            plugin_id,
+            &contributions_for(
+                plugin_id,
+                &updated.display_name,
+                &updated.permissions,
+                &manifest.contributes.commands,
+            ),
+        )?;
+        let record = PluginRepository::get(conn, plugin_id)?
+            .ok_or_else(|| PluginError::NotInstalled(plugin_id.to_string()))?;
+        Ok(record.to_installed())
+    }
+
     /// Uninstalls a script plugin, optionally removing its data.
     pub fn uninstall(
         &self,
@@ -406,6 +559,12 @@ impl PluginService {
         }
         if let Some(blocked) = self.market.blocked(&entry.id, &version.version) {
             return Err(PluginError::Blocked(entry.id.clone(), blocked.reason).into());
+        }
+        if let Some(record) = PluginRepository::get(&conn, &entry.id)?
+            && let Some(pinned) = record.pinned_version.as_deref()
+            && pinned != version.version
+        {
+            return Err(PluginError::Pinned(entry.id.clone(), pinned.to_string()).into());
         }
 
         // Consent: the fingerprint the UI approved must be this version's, and
@@ -601,7 +760,7 @@ impl PluginService {
             .create_staging(&entry.id)
             .map_err(PluginError::from)
             .map_err(VibexError::from)?;
-        let extract_result = (|| -> Result<(), PluginError> {
+        let manifest = match (|| -> Result<PluginManifest, PluginError> {
             extract_zip(bytes, &staging)?;
             crate::install::flatten_single_root(&staging)?;
             if !staging.join(AUTHOR_MANIFEST_FILE).is_file() {
@@ -624,12 +783,15 @@ impl PluginService {
                 },
             )
             .map_err(PluginError::Io)?;
-            Ok(())
-        })();
-        if let Err(error) = extract_result {
-            let _ = std::fs::remove_dir_all(&staging);
-            return Err(VibexError::from(error));
-        }
+            Ok(manifest)
+        })() {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                let _ = std::fs::remove_dir_all(&staging);
+                return Err(VibexError::from(error));
+            }
+        };
+        let commands = manifest.contributes.commands;
 
         let size = crate::install::directory_size(&staging);
         let destination = self
@@ -708,7 +870,7 @@ impl PluginService {
         PluginRepository::replace_contributions(
             conn,
             &entry.id,
-            &contributions_for(entry, &version.permissions),
+            &contributions_for(&entry.id, &entry.name, &version.permissions, &commands),
         )?;
         PluginRepository::set_active_version(
             conn,
@@ -798,10 +960,23 @@ impl PluginService {
                     &previous.permissions,
                     now,
                 )?;
+                let previous_commands = PluginManifest::from_file(
+                    &self
+                        .store
+                        .version_dir(&entry.id, &previous.version)
+                        .join(AUTHOR_MANIFEST_FILE),
+                )
+                .map(|manifest| manifest.contributes.commands)
+                .unwrap_or_default();
                 PluginRepository::replace_contributions(
                     conn,
                     &entry.id,
-                    &contributions_for(entry, &previous.permissions),
+                    &contributions_for(
+                        &entry.id,
+                        &entry.name,
+                        &previous.permissions,
+                        &previous_commands,
+                    ),
                 )?;
                 if previous.version != failed_version {
                     let _ = self.store.remove_version(&entry.id, failed_version);
@@ -867,6 +1042,7 @@ impl PluginService {
         let mut updates = Vec::new();
         for record in installed {
             if record.kind == PluginKind::Native
+                || record.pinned_version.is_some()
                 || (!request.plugin_ids.is_empty()
                     && !request.plugin_ids.contains(&record.plugin_id))
             {
@@ -1145,22 +1321,34 @@ impl PluginService {
 /// package that asked for no panel contributes nothing, so installing a
 /// background helper does not put a dead button on the bar.
 fn contributions_for(
-    entry: &PluginMarketEntry,
+    plugin_id: &str,
+    name: &str,
     permissions: &[PluginPermission],
+    commands: &[crate::manifest::PluginCommandContribution],
 ) -> Vec<PluginContribution> {
-    if !permissions
+    let mut contributions = Vec::new();
+    if permissions
         .iter()
         .any(|permission| permission.key == "ui.panel")
     {
-        return Vec::new();
+        contributions.push(PluginContribution {
+            plugin_id: plugin_id.to_string(),
+            kind: crate::native::RIGHT_RAIL_ACTIVITY.to_string(),
+            contribution_id: format!("rail_plugin_{plugin_id}"),
+            title: Some(name.to_string()),
+            enabled: true,
+        });
     }
-    vec![PluginContribution {
-        plugin_id: entry.id.clone(),
-        kind: crate::native::RIGHT_RAIL_ACTIVITY.to_string(),
-        contribution_id: format!("rail_plugin_{}", entry.id),
-        title: Some(entry.name.clone()),
-        enabled: true,
-    }]
+    for command in commands {
+        contributions.push(PluginContribution {
+            plugin_id: plugin_id.to_string(),
+            kind: "command".to_string(),
+            contribution_id: format!("plugin_command_{plugin_id}_{}", command.id),
+            title: Some(command.title.clone()),
+            enabled: true,
+        });
+    }
+    contributions
 }
 
 /// Refuses an install whose consent fingerprint is absent or stale.
@@ -1254,11 +1442,15 @@ mod tests {
     }
 
     fn package() -> Vec<u8> {
+        package_version("1.0.0")
+    }
+
+    fn package_version(version: &str) -> Vec<u8> {
         let manifest = serde_json::json!({
             "schemaVersion": 1,
             "id": "acme.widgets",
             "name": "Widgets",
-            "version": "1.0.0",
+            "version": version,
             "license": "MIT",
             "entry": "main.js",
             "capabilities": { "panel": true, "storage": true }
@@ -1421,13 +1613,9 @@ mod tests {
     /// script gets none, and neither is registered under the wrong kind.
     #[test]
     fn an_installed_script_contributes_the_panel_it_asked_for() {
-        let entry = PluginMarketEntry {
-            id: "acme.widgets".to_string(),
-            name: "Widgets".to_string(),
-            ..Default::default()
-        };
         let panel = PluginPermission::new("ui.panel", PluginPermissionRisk::Low);
-        let contributions = contributions_for(&entry, std::slice::from_ref(&panel));
+        let contributions =
+            contributions_for("acme.widgets", "Widgets", std::slice::from_ref(&panel), &[]);
         assert_eq!(contributions.len(), 1);
         assert_eq!(contributions[0].kind, crate::native::RIGHT_RAIL_ACTIVITY);
         assert_eq!(contributions[0].contribution_id, "rail_plugin_acme.widgets");
@@ -1435,7 +1623,7 @@ mod tests {
 
         let background = PluginPermission::new("storage", PluginPermissionRisk::Low);
         assert!(
-            contributions_for(&entry, &[background]).is_empty(),
+            contributions_for("acme.widgets", "Widgets", &[background], &[]).is_empty(),
             "a plugin that declared no panel must not reach the rail"
         );
     }
@@ -1595,6 +1783,125 @@ mod tests {
     }
 
     #[test]
+    fn a_manifest_command_becomes_a_contribution() {
+        let contributions = contributions_for(
+            "acme.widgets",
+            "Widgets",
+            &[],
+            &[crate::manifest::PluginCommandContribution {
+                id: "say-hello".to_string(),
+                title: "Say hello".to_string(),
+            }],
+        );
+        assert_eq!(contributions.len(), 1);
+        assert_eq!(contributions[0].kind, "command");
+        assert_eq!(
+            contributions[0].contribution_id,
+            "plugin_command_acme.widgets_say-hello"
+        );
+        assert_eq!(contributions[0].title.as_deref(), Some("Say hello"));
+    }
+
+    #[test]
+    fn a_version_pin_is_durable_and_clearable() {
+        let directory = tempfile::tempdir().unwrap();
+        let service = service(directory.path());
+        let connection = connection();
+        let package_path = directory.path().join("acme.widgets.vibexplug");
+        std::fs::write(&package_path, package()).unwrap();
+        service
+            .install_from_file(&connection, package_path.to_str().unwrap(), true)
+            .unwrap();
+
+        let pinned = service
+            .set_pinned_version(&connection, "acme.widgets", Some("1.0.0"))
+            .unwrap();
+        assert_eq!(pinned.pinned_version.as_deref(), Some("1.0.0"));
+        let record = PluginRepository::get(&connection, "acme.widgets")
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.pinned_version.as_deref(), Some("1.0.0"));
+
+        let cleared = service
+            .set_pinned_version(&connection, "acme.widgets", None)
+            .unwrap();
+        assert!(cleared.pinned_version.is_none());
+    }
+
+    #[test]
+    fn rollback_restores_the_previous_version() {
+        let directory = tempfile::tempdir().unwrap();
+        let service = service(directory.path());
+        let connection = connection();
+        let package_path = directory.path().join("acme.widgets.vibexplug");
+        std::fs::write(&package_path, package()).unwrap();
+        service
+            .install_from_file(&connection, package_path.to_str().unwrap(), true)
+            .unwrap();
+
+        let next_path = directory.path().join("acme.widgets-1.1.0.vibexplug");
+        std::fs::write(&next_path, package_version("1.1.0")).unwrap();
+        service
+            .install_from_file(&connection, next_path.to_str().unwrap(), true)
+            .unwrap();
+        assert_eq!(
+            service.store().current_version("acme.widgets").as_deref(),
+            Some("1.1.0")
+        );
+
+        let rolled = service
+            .rollback(&connection, "acme.widgets", Some("1.0.0"))
+            .unwrap();
+        assert_eq!(rolled.version, "1.0.0");
+        assert_eq!(
+            service.store().current_version("acme.widgets").as_deref(),
+            Some("1.0.0")
+        );
+        let record = PluginRepository::get(&connection, "acme.widgets")
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.version, "1.0.0");
+    }
+
+    #[test]
+    fn a_rollback_never_widens_the_grant() {
+        let directory = tempfile::tempdir().unwrap();
+        let service = service(directory.path());
+        let connection = connection();
+        let package_path = directory.path().join("acme.widgets.vibexplug");
+        std::fs::write(&package_path, package()).unwrap();
+        service
+            .install_from_file(&connection, package_path.to_str().unwrap(), true)
+            .unwrap();
+
+        let next_path = directory.path().join("acme.widgets-1.1.0.vibexplug");
+        std::fs::write(&next_path, package_version("1.1.0")).unwrap();
+        service
+            .install_from_file(&connection, next_path.to_str().unwrap(), true)
+            .unwrap();
+
+        // The old version now asks for a permission the current grants lack.
+        let manifest_path = service
+            .store()
+            .version_dir("acme.widgets", "1.0.0")
+            .join("vibex-plugin.json");
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        manifest["capabilities"]["clipboard"] = serde_json::Value::Bool(true);
+        std::fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+
+        let error = service
+            .rollback(&connection, "acme.widgets", Some("1.0.0"))
+            .unwrap_err();
+        assert_eq!(error.code, "plugin_permission_denied");
+        assert_eq!(
+            service.store().current_version("acme.widgets").as_deref(),
+            Some("1.1.0"),
+            "a refused rollback must leave the current version in place"
+        );
+    }
+
+    #[test]
     fn a_failed_update_restores_the_previous_version() {
         let directory = tempfile::tempdir().unwrap();
         let service = service(directory.path());
@@ -1663,7 +1970,7 @@ mod tests {
         PluginRepository::replace_contributions(
             &connection,
             "acme.widgets",
-            &contributions_for(&entry, &failed.permissions),
+            &contributions_for(&entry.id, &entry.name, &failed.permissions, &[]),
         )
         .unwrap();
 

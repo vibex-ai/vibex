@@ -1774,6 +1774,20 @@ impl ManagementBackend for DisconnectedBackend {
         disconnected_future!()
     }
 
+    fn set_plugin_version_pin(
+        &self,
+        _request: MutationRequest<vibex_core::PluginVersionPinRequest>,
+    ) -> BackendFuture<'_, vibex_core::InstalledPlugin> {
+        disconnected_future!()
+    }
+
+    fn rollback_plugin(
+        &self,
+        _request: MutationRequest<vibex_core::PluginRollbackRequest>,
+    ) -> BackendFuture<'_, vibex_core::InstalledPlugin> {
+        disconnected_future!()
+    }
+
     fn uninstall_plugin(
         &self,
         _request: MutationRequest<vibex_core::PluginUninstallRequest>,

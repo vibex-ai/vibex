@@ -82,11 +82,21 @@ impl Host {
             .iter()
             .cloned()
             .collect::<BTreeSet<_>>();
-        let modules = host_modules(plugin.plugin_id.clone(), grants, Rc::clone(&self.session));
-        PluginManager::new(vec![plugins_root])
-            .with_data_home(data_root)
-            .with_host_modules(modules)
-            .map_err(|error| format!("the plugin host modules are invalid: {error}"))
+        let modules = host_modules(
+            plugin.plugin_id.clone(),
+            plugin.data_directory.clone(),
+            grants,
+            Rc::clone(&self.session),
+        );
+        let mut manager = PluginManager::new(vec![plugins_root]).with_data_home(data_root);
+        // `gpui-shell` has no plural builder: each host module is one call,
+        // and the manager gives every module to every plugin it loads.
+        for module in modules {
+            manager = manager
+                .with_host_module(module)
+                .map_err(|error| format!("the plugin host modules are invalid: {error}"))?;
+        }
+        Ok(manager)
     }
 }
 
@@ -312,6 +322,7 @@ pub fn init(cx: &mut App) {
 /// from the policy frame `gpui-shell` puts around the call.
 fn host_modules(
     plugin_id: String,
+    data_dir: PathBuf,
     grants: BTreeSet<String>,
     session: Rc<RefCell<Option<PluginSessionSnapshot>>>,
 ) -> Vec<HostModule> {
@@ -376,10 +387,120 @@ fn host_modules(
             })
     };
 
+    let mut modules = Vec::new();
     if grants.contains("agent.read") {
-        vec![session_reader, workspace_reader]
-    } else {
-        Vec::new()
+        modules.push(session_reader);
+        modules.push(workspace_reader);
+    }
+    if grants.contains("storage") {
+        modules.push(settings_module(plugin_id, data_dir, grants));
+    }
+    modules
+}
+
+/// The plugin's own durable settings store, namespaced by its data directory.
+fn settings_module(plugin_id: String, data_dir: PathBuf, grants: BTreeSet<String>) -> HostModule {
+    let get = {
+        let data_dir = data_dir.clone();
+        let grants = grants.clone();
+        let plugin_id = plugin_id.clone();
+        move |arguments: &gpui_shell::HostArguments| {
+            require_permission(&grants, "storage", &plugin_id)?;
+            let key = arguments.string(0)?.to_string();
+            let settings = read_settings(&data_dir);
+            Ok(settings
+                .get(&key)
+                .cloned()
+                .map(json_to_host_value)
+                .unwrap_or(HostValue::Null))
+        }
+    };
+    let set = {
+        let data_dir = data_dir;
+        let grants = grants;
+        let plugin_id = plugin_id;
+        move |arguments: &gpui_shell::HostArguments| {
+            require_permission(&grants, "storage", &plugin_id)?;
+            let key = arguments.string(0)?.to_string();
+            let value = host_value_to_json(arguments.value(1)?);
+            let mut settings = read_settings(&data_dir);
+            settings.insert(key, value);
+            let path = data_dir.join("vibex-settings.json");
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let bytes = serde_json::to_vec_pretty(&settings).map_err(|error| {
+                HostError::new(format!("settings could not be encoded: {error}"))
+            })?;
+            let temporary = path.with_extension("json.tmp");
+            std::fs::write(&temporary, bytes).map_err(|error| {
+                HostError::new(format!("settings could not be written: {error}"))
+            })?;
+            // Unix replaces an existing file with rename; Windows does not.
+            if std::fs::rename(&temporary, &path).is_err() {
+                let _ = std::fs::remove_file(&path);
+                std::fs::rename(&temporary, &path).map_err(|error| {
+                    HostError::new(format!("settings could not be saved: {error}"))
+                })?;
+            }
+            Ok(HostValue::Bool(true))
+        }
+    };
+
+    HostModule::new("vibex.settings")
+        .declarations(
+            "export function get(key: string): unknown;\nexport function save(key: string, value: unknown): boolean;",
+        )
+        .function("get", get)
+        .function("save", set)
+}
+
+fn read_settings(data_dir: &Path) -> serde_json::Map<String, serde_json::Value> {
+    std::fs::read(data_dir.join("vibex-settings.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default()
+}
+
+fn host_value_to_json(value: &HostValue) -> serde_json::Value {
+    match value {
+        HostValue::Null => serde_json::Value::Null,
+        HostValue::Bool(value) => serde_json::Value::Bool(*value),
+        HostValue::Number(value) => serde_json::Number::from_f64(*value)
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null),
+        HostValue::Str(value) => serde_json::Value::String(value.clone()),
+        HostValue::Array(values) => {
+            serde_json::Value::Array(values.iter().map(host_value_to_json).collect())
+        }
+        HostValue::Object(values) => serde_json::Value::Object(
+            values
+                .iter()
+                .map(|(key, value)| (key.clone(), host_value_to_json(value)))
+                .collect(),
+        ),
+    }
+}
+
+fn json_to_host_value(value: serde_json::Value) -> HostValue {
+    match value {
+        serde_json::Value::Null => HostValue::Null,
+        serde_json::Value::Bool(value) => HostValue::Bool(value),
+        serde_json::Value::Number(value) => value
+            .as_f64()
+            .map(HostValue::Number)
+            .unwrap_or(HostValue::Null),
+        serde_json::Value::String(value) => HostValue::Str(value),
+        serde_json::Value::Array(values) => {
+            HostValue::Array(values.into_iter().map(json_to_host_value).collect())
+        }
+        serde_json::Value::Object(values) => HostValue::Object(
+            values
+                .into_iter()
+                .map(|(key, value)| (key, json_to_host_value(value)))
+                .collect(),
+        ),
     }
 }
 
@@ -614,24 +735,54 @@ mod tests {
     }
 
     #[test]
-    fn the_vibex_modules_are_only_offered_with_agent_read() {
+    fn the_vibex_modules_follow_the_grants() {
         let session = Rc::new(RefCell::new(None));
+        let data_dir = PathBuf::from("/tmp/vibex-plugin-test");
         assert!(
-            host_modules("acme.widgets".to_string(), BTreeSet::new(), session.clone()).is_empty(),
-            "a plugin without agent.read must not get the session surface"
+            host_modules(
+                "acme.widgets".to_string(),
+                data_dir.clone(),
+                BTreeSet::new(),
+                session.clone(),
+            )
+            .is_empty(),
+            "a plugin with no grants must not get a host module"
         );
 
-        let modules = host_modules(
+        let session_modules = host_modules(
             "acme.widgets".to_string(),
+            data_dir.clone(),
             BTreeSet::from(["agent.read".to_string()]),
+            session.clone(),
+        );
+        assert_eq!(session_modules.len(), 2);
+
+        let settings_modules = host_modules(
+            "acme.widgets".to_string(),
+            data_dir,
+            BTreeSet::from(["storage".to_string()]),
             session,
         );
-        assert_eq!(modules.len(), 2);
-        for module in modules {
+        assert_eq!(settings_modules.len(), 1);
+        for module in session_modules.into_iter().chain(settings_modules) {
             module
                 .validate()
                 .expect("the built-in host modules must be valid");
         }
+    }
+
+    #[test]
+    fn settings_values_round_trip_through_json() {
+        let value = HostValue::Object(vec![
+            ("title".to_string(), HostValue::Str("hello".to_string())),
+            ("count".to_string(), HostValue::Number(3.0)),
+            (
+                "items".to_string(),
+                HostValue::Array(vec![HostValue::Bool(true), HostValue::Null]),
+            ),
+        ]);
+        let json = host_value_to_json(&value);
+        assert_eq!(json_to_host_value(json), value);
     }
 
     #[test]

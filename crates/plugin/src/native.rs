@@ -127,6 +127,8 @@ impl NativePluginDescriptor {
             categories: self.categories.to_vec(),
             enabled,
             auto_update: false,
+            pinned_version: None,
+            rollback_version: None,
             status: if enabled {
                 InstalledPluginStatus::Enabled
             } else {

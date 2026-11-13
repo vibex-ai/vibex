@@ -99,7 +99,7 @@ pub use runtime::{
     SwitchOperationJournalRepository, SwitchOperationRecord,
 };
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 89;
+pub const CURRENT_SCHEMA_VERSION: i64 = 90;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Copy)]
@@ -12779,7 +12779,55 @@ pub fn apply_migrations(conn: &mut Connection) -> VibexResult<Vec<String>> {
     // terminal they run in beside it, so the column and the link table are
     // recorded last and independent of the ACP tables above.
     apply_session_transport(conn, &mut applied)?;
+    apply_plugin_version_pin(conn, &mut applied)?;
     Ok(applied)
+}
+
+/// Records the version a plugin is pinned to, if any.
+fn apply_plugin_version_pin(conn: &mut Connection, applied: &mut Vec<String>) -> VibexResult<()> {
+    const VERSION: i64 = 90;
+    const NAME: &str = "plugin_version_pin";
+    if migration_applied(conn, VERSION)? {
+        return Ok(());
+    }
+    let tx = conn.transaction().map_err(storage_err(
+        "migration_transaction_failed",
+        "failed to start the plugin version pin migration",
+    ))?;
+    // A rewound migration row can sit over a schema that already has the
+    // column; adding it again would fail. Check first, so the migration is
+    // safe to re-run on both a real old database and a test fixture.
+    let has_column =
+        tx.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('plugins') WHERE name = 'pinned_version'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(storage_err(
+            "migration_lookup_failed",
+            "failed to inspect the plugin version pin column",
+        ))? > 0;
+    if !has_column {
+        tx.execute_batch("ALTER TABLE plugins ADD COLUMN pinned_version TEXT NULL;")
+            .map_err(storage_err(
+                "migration_apply_failed",
+                "failed to add the plugin version pin column",
+            ))?;
+    }
+    tx.execute(
+        "INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
+        params![VERSION, NAME, unix_timestamp_ms()],
+    )
+    .map_err(storage_err(
+        "migration_record_failed",
+        "failed to record the plugin version pin migration",
+    ))?;
+    tx.commit().map_err(storage_err(
+        "migration_commit_failed",
+        "failed to commit the plugin version pin migration",
+    ))?;
+    applied.push(format!("{VERSION}:{NAME}"));
+    Ok(())
 }
 
 /// Lets a binding name no Provider, and clears the ones that named a placeholder.
@@ -19628,6 +19676,7 @@ mod tests {
                 "86:agent_session_tool_settings",
                 "87:opencode_session_header",
                 "88:agent_session_transport",
+                "90:plugin_version_pin",
             ]
         );
         let agent_models: (Option<String>, Option<String>) = conn
@@ -19801,6 +19850,7 @@ mod tests {
                 "86:agent_session_tool_settings",
                 "87:opencode_session_header",
                 "88:agent_session_transport",
+                "90:plugin_version_pin",
             ]
         );
         let activation_completed_at_ms: Option<i64> = conn
@@ -19959,6 +20009,7 @@ mod tests {
                 "86:agent_session_tool_settings",
                 "87:opencode_session_header",
                 "88:agent_session_transport",
+                "90:plugin_version_pin",
             ]
         );
         let stored: (String, Option<String>, Option<i64>) = conn
@@ -20151,6 +20202,7 @@ mod tests {
                 "86:agent_session_tool_settings",
                 "87:opencode_session_header",
                 "88:agent_session_transport",
+                "90:plugin_version_pin",
             ]
         );
         assert_eq!(
@@ -21612,6 +21664,7 @@ mod tests {
                 "86:agent_session_tool_settings",
                 "87:opencode_session_header",
                 "88:agent_session_transport",
+                "90:plugin_version_pin",
             ]
         );
         let managed = ManagedWorktreeRepository::get_by_id(&conn, &worktree_id)

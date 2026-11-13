@@ -12353,6 +12353,182 @@ impl ManagementCenter {
         }));
     }
 
+    fn set_plugin_pinned(&mut self, plugin_id: String, pinned: bool, cx: &mut Context<Self>) {
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        let version = if pinned {
+            let Some(plugin) = self
+                .plugin_market_installed
+                .iter()
+                .find(|plugin| plugin.plugin_id == plugin_id)
+            else {
+                return;
+            };
+            Some(plugin.version.clone())
+        } else {
+            None
+        };
+        let entity = cx.weak_entity();
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            backend
+                .management()
+                .set_plugin_version_pin(MutationRequest::new(vibex_core::PluginVersionPinRequest {
+                    plugin_id,
+                    version,
+                }))
+                .await
+                .map_err(crate::app::remote_error_into_vibex)
+        });
+        self.mutation_task = Some(cx.spawn(async move |_, cx| {
+            let outcome = runner.await;
+            let _ = entity.update(cx, |this, cx| {
+                match outcome {
+                    Ok(Ok(_)) => {
+                        this.load_installed_plugins(cx);
+                        cx.emit(ManagementEvent::PluginsChanged);
+                    }
+                    Ok(Err(error)) => {
+                        this.plugin_market_error =
+                            Some(management_market_error_text(&error.code, &error.message));
+                    }
+                    Err(error) => this.plugin_market_error = Some(format!("{error}")),
+                }
+                cx.notify();
+            });
+        }));
+    }
+
+    fn rollback_plugin(&mut self, plugin_id: String, version: String, cx: &mut Context<Self>) {
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        let entity = cx.weak_entity();
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            backend
+                .management()
+                .rollback_plugin(MutationRequest::new(vibex_core::PluginRollbackRequest {
+                    plugin_id,
+                    version: Some(version),
+                }))
+                .await
+                .map_err(crate::app::remote_error_into_vibex)
+        });
+        self.mutation_task = Some(cx.spawn(async move |_, cx| {
+            let outcome = runner.await;
+            let _ = entity.update(cx, |this, cx| {
+                match outcome {
+                    Ok(Ok(_)) => {
+                        this.load_installed_plugins(cx);
+                        cx.emit(ManagementEvent::PluginsChanged);
+                    }
+                    Ok(Err(error)) => {
+                        this.plugin_market_error =
+                            Some(management_market_error_text(&error.code, &error.message));
+                    }
+                    Err(error) => this.plugin_market_error = Some(format!("{error}")),
+                }
+                cx.notify();
+            });
+        }));
+    }
+
+    fn set_plugin_auto_update(
+        &mut self,
+        plugin_id: String,
+        auto_update: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        let entity = cx.weak_entity();
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            backend
+                .management()
+                .set_plugin_auto_update(MutationRequest::new(vibex_core::PluginAutoUpdateRequest {
+                    plugin_id,
+                    auto_update,
+                }))
+                .await
+                .map_err(crate::app::remote_error_into_vibex)
+        });
+        self.mutation_task = Some(cx.spawn(async move |_, cx| {
+            let outcome = runner.await;
+            let _ = entity.update(cx, |this, cx| {
+                match outcome {
+                    Ok(Ok(plugin)) => {
+                        if let Some(existing) = this
+                            .plugin_market_installed
+                            .iter_mut()
+                            .find(|candidate| candidate.plugin_id == plugin.plugin_id)
+                        {
+                            *existing = plugin;
+                        }
+                    }
+                    Ok(Err(error)) => {
+                        this.plugin_market_error =
+                            Some(management_market_error_text(&error.code, &error.message));
+                    }
+                    Err(error) => this.plugin_market_error = Some(format!("{error}")),
+                }
+                cx.notify();
+            });
+        }));
+    }
+
+    fn install_plugin_from_file(&mut self, cx: &mut Context<Self>) {
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        let entity = cx.weak_entity();
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            let Some(file) = rfd::AsyncFileDialog::new()
+                .set_title(locale::text(
+                    "Choose a Vibex plugin package",
+                    "选择 Vibex 插件包",
+                    "選擇 Vibex 外掛包",
+                ))
+                .add_filter("Vibex plugin", &["vibexplug"])
+                .pick_file()
+                .await
+            else {
+                return Ok(None);
+            };
+            backend
+                .management()
+                .install_plugin_from_file(MutationRequest::new(
+                    vibex_core::PluginLocalInstallRequest {
+                        path: file.path().to_string_lossy().to_string(),
+                        enable: true,
+                    },
+                ))
+                .await
+                .map(Some)
+                .map_err(crate::app::remote_error_into_vibex)
+        });
+        self.mutation_task = Some(cx.spawn(async move |_, cx| {
+            let outcome = runner.await;
+            let _ = entity.update(cx, |this, cx| {
+                match outcome {
+                    Ok(Ok(Some(result))) => {
+                        this.plugin_market_installed
+                            .retain(|plugin| plugin.plugin_id != result.plugin.plugin_id);
+                        this.plugin_market_installed.push(result.plugin);
+                        cx.emit(ManagementEvent::PluginsChanged);
+                    }
+                    Ok(Ok(None)) => {}
+                    Ok(Err(error)) => {
+                        this.plugin_market_error =
+                            Some(management_market_error_text(&error.code, &error.message));
+                    }
+                    Err(error) => this.plugin_market_error = Some(format!("{error}")),
+                }
+                cx.notify();
+            });
+        }));
+    }
+
     fn uninstall_plugin(&mut self, plugin_id: String, cx: &mut Context<Self>) {
         let Some(backend) = self.backend.clone() else {
             return;
@@ -13063,6 +13239,22 @@ impl ManagementCenter {
     fn render_plugin_installed(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let installed = self.plugin_market_installed.clone();
         let mut column = v_flex().w_full().gap_3();
+        column = column.child(
+            h_flex().w_full().justify_end().child(
+                Button::new("management-plugin-install-file")
+                    .small()
+                    .outline()
+                    .label(management_locale_text(
+                        "Install from file…",
+                        "从文件安装…",
+                        "從檔案安裝…",
+                    ))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.install_plugin_from_file(cx);
+                        cx.notify();
+                    })),
+            ),
+        );
         if installed.is_empty() {
             column = column.child(management_market_empty_row(
                 management_locale_text(
@@ -13084,6 +13276,12 @@ impl ManagementCenter {
             let uninstall_id = plugin.plugin_id.clone();
             let enabled = plugin.enabled;
             let uninstallable = plugin.can_uninstall();
+            let pinned = plugin.pinned_version.is_some();
+            let auto_update = plugin.auto_update;
+            let rollback_version = plugin.rollback_version.clone();
+            let pin_id = plugin.plugin_id.clone();
+            let auto_id = plugin.plugin_id.clone();
+            let rollback_id = plugin.plugin_id.clone();
             let status_tag = plugin_status_tag(plugin.status, cx);
             let mut row = h_flex()
                 .w_full()
@@ -13118,6 +13316,54 @@ impl ManagementCenter {
                 );
             if let Some(tag) = status_tag {
                 row = row.child(tag);
+            }
+            if plugin.kind == vibex_core::PluginKind::Script {
+                row = row.child(
+                    Button::new(SharedString::from(format!(
+                        "management-plugin-pin-{pin_id}"
+                    )))
+                    .small()
+                    .outline()
+                    .label(if pinned {
+                        management_locale_text("Unpin", "取消锁定", "取消鎖定")
+                    } else {
+                        management_locale_text("Pin version", "锁定版本", "鎖定版本")
+                    })
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.set_plugin_pinned(pin_id.clone(), !pinned, cx);
+                        cx.notify();
+                    })),
+                );
+                row = row.child(
+                    Button::new(SharedString::from(format!(
+                        "management-plugin-auto-{auto_id}"
+                    )))
+                    .small()
+                    .outline()
+                    .label(if auto_update {
+                        management_locale_text("Auto-update on", "自动更新开", "自動更新開")
+                    } else {
+                        management_locale_text("Auto-update off", "自动更新关", "自動更新關")
+                    })
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.set_plugin_auto_update(auto_id.clone(), !auto_update, cx);
+                        cx.notify();
+                    })),
+                );
+                if let Some(version) = rollback_version {
+                    row = row.child(
+                        Button::new(SharedString::from(format!(
+                            "management-plugin-rollback-{rollback_id}"
+                        )))
+                        .small()
+                        .outline()
+                        .label(management_locale_text("Roll back", "回滚", "回滾"))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.rollback_plugin(rollback_id.clone(), version.clone(), cx);
+                            cx.notify();
+                        })),
+                    );
+                }
             }
             row = row.child(
                 Button::new(SharedString::from(format!(

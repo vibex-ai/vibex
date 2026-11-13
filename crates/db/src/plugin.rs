@@ -36,6 +36,7 @@ pub struct PluginRecord {
     pub data_dir: Option<String>,
     pub enabled: bool,
     pub auto_update: bool,
+    pub pinned_version: Option<String>,
     pub status: InstalledPluginStatus,
     pub permissions: Vec<PluginPermission>,
     pub granted_permissions: Vec<PluginPermissionGrant>,
@@ -75,6 +76,7 @@ impl PluginRecord {
             data_dir: None,
             enabled: true,
             auto_update: false,
+            pinned_version: None,
             status: InstalledPluginStatus::Disabled,
             permissions: Vec::new(),
             granted_permissions: Vec::new(),
@@ -110,6 +112,8 @@ impl PluginRecord {
             categories: Vec::new(),
             enabled: self.enabled,
             auto_update: self.auto_update,
+            pinned_version: self.pinned_version.clone(),
+            rollback_version: None,
             status: self.status,
             install_path: self.install_dir.clone(),
             data_path: self.data_dir.clone(),
@@ -156,10 +160,10 @@ impl PluginRepository {
                 index_id, install_dir, data_dir, enabled, auto_update, status,
                 permissions_json, granted_permissions_json, consent_fingerprint,
                 min_vibex, size_bytes, last_error, last_checked_at_ms,
-                installed_at_ms, updated_at_ms, deleted_at_ms
+                installed_at_ms, updated_at_ms, deleted_at_ms, pinned_version
             ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
-                ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28
+                ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29
             )
             ON CONFLICT(plugin_id) DO UPDATE SET
                 display_name = excluded.display_name,
@@ -187,7 +191,8 @@ impl PluginRepository {
                 last_error = excluded.last_error,
                 last_checked_at_ms = excluded.last_checked_at_ms,
                 updated_at_ms = excluded.updated_at_ms,
-                deleted_at_ms = excluded.deleted_at_ms
+                deleted_at_ms = excluded.deleted_at_ms,
+                pinned_version = excluded.pinned_version
             ",
             params![
                 record.plugin_id,
@@ -218,6 +223,7 @@ impl PluginRepository {
                 record.installed_at_ms,
                 record.updated_at_ms,
                 record.deleted_at_ms,
+                record.pinned_version,
             ],
         )
         .map_err(db_err("plugin_upsert_failed"))?;
@@ -298,6 +304,21 @@ impl PluginRepository {
             params![plugin_id, auto_update, now_ms],
         )
         .map_err(db_err("plugin_auto_update_failed"))?;
+        Ok(())
+    }
+
+    /// Pins a plugin to a version, or clears the pin.
+    pub fn set_pinned_version(
+        conn: &Connection,
+        plugin_id: &str,
+        version: Option<&str>,
+        now_ms: i64,
+    ) -> VibexResult<()> {
+        conn.execute(
+            "UPDATE plugins SET pinned_version = ?2, updated_at_ms = ?3 WHERE plugin_id = ?1",
+            params![plugin_id, version, now_ms],
+        )
+        .map_err(db_err("plugin_pin_failed"))?;
         Ok(())
     }
 
@@ -610,7 +631,7 @@ const PLUGIN_SELECT: &str = "
         index_id, install_dir, data_dir, enabled, auto_update, status,
         permissions_json, granted_permissions_json, consent_fingerprint,
         min_vibex, size_bytes, last_error, last_checked_at_ms,
-        installed_at_ms, updated_at_ms, deleted_at_ms
+        installed_at_ms, updated_at_ms, deleted_at_ms, pinned_version
     FROM plugins
 ";
 
@@ -650,6 +671,7 @@ fn read_plugin_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PluginRecord> {
         installed_at_ms: row.get(25)?,
         updated_at_ms: row.get(26)?,
         deleted_at_ms: row.get(27)?,
+        pinned_version: row.get(28)?,
     })
 }
 
