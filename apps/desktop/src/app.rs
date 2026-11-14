@@ -83917,18 +83917,41 @@ fn delegation_chip_option<'a>(
     // entry it came from is found by replaying the tuning: apply it to each
     // candidate and compare fingerprints. That recovers the exact entry instead
     // of guessing the Agent's first one.
-    let tuning = mention.tuning.as_ref()?;
-    catalog.options.iter().find(|option| {
+    //
+    // A chip can also carry a tuned reference with no tuning beside it: a draft
+    // written before the tuning was stored, a token pasted from another window,
+    // or a mention rebuilt from the message it produced. Those still have to
+    // resolve — falling through to the Agent's entry is far better than the
+    // empty controls a `None` here would produce.
+    let agent_id = mention.agent_id.as_ref()?;
+    let candidates = catalog
+        .options
+        .iter()
+        .filter(|option| &option.selection.agent_id == agent_id);
+    for option in candidates {
         let mut candidate = option.selection.clone();
-        candidate.reasoning_effort = tuning.reasoning_effort.clone();
-        candidate.mode_id = tuning.mode_id.clone();
-        candidate.config_values = tuning.config_values.clone();
-        vibex_core::VibexUseRef::runtime_option(&vibex_desktop_runtime::selection_fingerprint(
+        if let Some(tuning) = mention.tuning.as_ref() {
+            candidate.reasoning_effort = tuning.reasoning_effort.clone();
+            candidate.mode_id = tuning.mode_id.clone();
+            candidate.config_values = tuning.config_values.clone();
+        }
+        if vibex_core::VibexUseRef::runtime_option(&vibex_desktop_runtime::selection_fingerprint(
             &candidate,
         ))
         .as_uri()
             == reference
-    })
+        {
+            return Some(option);
+        }
+    }
+    // The reference names a configuration this catalogue no longer publishes —
+    // the model was removed, or the depth it named is gone. The Agent's own
+    // entry is still a truthful answer to "which collaborator is this", and the
+    // controls stay usable instead of going blank.
+    catalog
+        .options
+        .iter()
+        .find(|option| &option.selection.agent_id == agent_id)
 }
 
 /// The exact selection one `@Agent` chip names.
@@ -102978,6 +103001,104 @@ mod tests {
                 .and_then(|t| t.reasoning_effort.as_deref()),
             Some("high"),
             "the tuning travels with the Agent change"
+        );
+    }
+
+    /// The chip lights up exactly when the controls edit it.
+    ///
+    /// The input's own highlight is a strict range overlap, which leaves both
+    /// edges dark. A caret resting against the chip is still editing it, so a
+    /// chip drawn from that rule looked inert while the controls below were
+    /// pointed at it.
+    #[test]
+    /// A chip always resolves to some entry of its Agent, never to nothing.
+    ///
+    /// Three shapes reach the lookup: the row's own reference, a tuned reference
+    /// with its tuning beside it, and a tuned reference whose tuning is missing
+    /// (a draft from before tuning was stored, a token pasted from another
+    /// window). The first two resolve exactly; the third falls back to the
+    /// Agent's entry, because blank controls are worse than a conservative
+    /// answer.
+    #[test]
+    fn a_chip_always_resolves_to_one_of_its_agents_entries() {
+        let agent_id = AgentId::parse("codex").unwrap();
+        let option = SessionRuntimeOption {
+            selection: SessionRuntimeSelection::provider(
+                agent_id.clone(),
+                ProviderProfileId::parse("provider_local").unwrap(),
+                "gpt-5",
+            ),
+            agent_label: "Codex".to_string(),
+            auth_source_label: "Local".to_string(),
+            model_label: "gpt-5".to_string(),
+            reasoning_efforts: vec![SessionConfigValue {
+                value: "high".to_string(),
+                label: None,
+            }],
+            modes: Vec::new(),
+            features: Vec::new(),
+            availability: RuntimeOptionAvailability::Available,
+            member_count: 1,
+            auto_routes: false,
+        };
+        let catalog = SessionRuntimeOptionCatalog {
+            revision: 1,
+            agents: Vec::new(),
+            auth_sources: Vec::new(),
+            options: vec![option.clone()],
+        };
+
+        // 1. The row's own reference: exact match.
+        let bare = VibexUseMention::agent(
+            &agent_id,
+            &vibex_core::VibexUseRef::parse(&runtime_option_ref(&option)).unwrap(),
+            Some("@Codex"),
+        );
+        assert_eq!(
+            delegation_chip_selection(&catalog, &bare),
+            Some(option.selection.clone())
+        );
+
+        // 2. A tuned reference with its tuning: replayed exactly.
+        let mut tuned = option.selection.clone();
+        tuned.reasoning_effort = Some("high".to_string());
+        let tuned_ref = vibex_core::VibexUseRef::runtime_option(
+            &vibex_desktop_runtime::selection_fingerprint(&tuned),
+        );
+        let with_tuning = VibexUseMention::tuned_agent(
+            &agent_id,
+            &tuned_ref,
+            Some("@Codex"),
+            vibex_core::MentionTuning {
+                reasoning_effort: Some("high".to_string()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            delegation_chip_selection(&catalog, &with_tuning),
+            Some(tuned)
+        );
+
+        // 3. The same tuned reference with no tuning beside it: the controls
+        // still resolve, to the Agent's entry.
+        let without_tuning = VibexUseMention::agent(&agent_id, &tuned_ref, Some("@Codex"));
+        assert_eq!(
+            delegation_chip_selection(&catalog, &without_tuning),
+            Some(option.selection.clone()),
+            "a tuned reference without its tuning must not leave the controls blank"
+        );
+
+        // 4. A reference to a model this catalogue no longer publishes.
+        let mut gone = option.selection.clone();
+        gone.model = vibex_core::RuntimeModelSelection::explicit("removed-model");
+        let gone_ref = vibex_core::VibexUseRef::runtime_option(
+            &vibex_desktop_runtime::selection_fingerprint(&gone),
+        );
+        let stale = VibexUseMention::agent(&agent_id, &gone_ref, Some("@Codex"));
+        assert_eq!(
+            delegation_chip_selection(&catalog, &stale),
+            Some(option.selection.clone()),
+            "a removed model falls back to the Agent instead of going blank"
         );
     }
 
