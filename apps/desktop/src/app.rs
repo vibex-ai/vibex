@@ -83561,6 +83561,11 @@ fn replace_composer_trigger(
 ) {
     if let Some(token) = composer_token_for_entry(entry) {
         let token_text = token.text().clone();
+        // Whether this insertion is a collaborator chip, decided before the
+        // token is moved into the editor.
+        let collaborator = composer_entry_mention(entry).is_some_and(|mention| {
+            mention.kind == vibex_core::VibexUseMentionKind::Agent && mention.agent_id.is_some()
+        });
         if input
             .replace_range_with_token(range.clone(), token, window, cx)
             .is_ok()
@@ -83568,6 +83573,21 @@ fn replace_composer_trigger(
             let separator = &entry.insertion_text[token_text.len()..];
             if !separator.is_empty() {
                 input.replace(separator, window, cx);
+            }
+            if collaborator {
+                // Put the caret on the chip's right edge, which is what clicking
+                // the chip does: the reader has just chosen this collaborator, so
+                // the runtime controls should already be pointed at it. One Enter
+                // both picks the collaborator and opens its parameters.
+                //
+                // `end` — not `end + 1` — is the chip's own edge: the separator
+                // stays ordinary text the reader can keep typing after, and
+                // moving the caret off the chip exits the mode as usual.
+                //
+                // The write has to come after the separator insert, which moves
+                // the caret to its own end.
+                let end = range.start + token_text.len();
+                input.set_selected_range(end..end, cx);
             }
             return;
         }
@@ -107065,6 +107085,64 @@ mod tests {
             .clone()
             .expect("composer input should be created with the root view");
         (input, cx)
+    }
+
+    /// Picking a collaborator with Enter also opens its parameters.
+    ///
+    /// The chip is the thing the reader just chose, so the runtime controls
+    /// should already be pointed at it. Leaving the caret after the separator
+    /// put the chip one keystroke out of reach: the reader had to walk back into
+    /// it before the controls became the collaborator's.
+    #[gpui::test]
+    fn an_accepted_collaborator_lands_the_caret_on_its_chip(cx: &mut TestAppContext) {
+        let (input, cx) = composer_token_window("@Co", None, cx);
+        let agent_id = AgentId::parse("codex").unwrap();
+        let reference = vibex_core::VibexUseRef::runtime_option("option_codex");
+        let mut entry = command_entry(
+            AgentCommandSourceKind::Reference,
+            AgentCommandTrigger::Mention,
+            None,
+        );
+        entry.id = format!("reference:agent:codex:{}", reference.id);
+        entry.label = "@Codex".into();
+        entry.insertion_text = "@Codex ".into();
+        entry.metadata = vec![
+            vibex_core::ProviderBindingMetadata {
+                key: vibex_desktop_runtime::COMPOSER_AGENT_REFERENCE_KEY.to_string(),
+                value: agent_id.as_str().to_string(),
+            },
+            vibex_core::ProviderBindingMetadata {
+                key: vibex_desktop_runtime::COMPOSER_SELECTION_REFERENCE_KEY.to_string(),
+                // The metadata carries the full `vibex://` reference, not the id.
+                value: reference.as_uri(),
+            },
+        ];
+
+        cx.update(|window, cx| {
+            input.update(cx, |input, cx| {
+                replace_composer_trigger(input, &entry, 0..3, window, cx);
+            });
+        });
+
+        let (text, cursor, tokens) = input.read_with(cx, |input, _| {
+            (
+                input.value().to_string(),
+                input.cursor(),
+                input.tokens().to_vec(),
+            )
+        });
+        assert_eq!(text, "@Codex ", "the separator is still ordinary text");
+        assert_eq!(tokens.len(), 1);
+        let chip = tokens[0].range();
+        assert_eq!(
+            cursor, chip.end,
+            "the caret rests on the chip's right edge, not past the separator"
+        );
+        assert_eq!(
+            delegation_edit_subject(&tokens, cursor).and_then(|m| m.agent_id),
+            Some(agent_id),
+            "one Enter both picks the collaborator and opens its parameters"
+        );
     }
 
     /// A picked reference is one editing unit.
