@@ -37,6 +37,59 @@ fn selected_delegation_mentions_preserve_explicit_ranges_and_exact_runtime() {
     assert_eq!(request.context_refs.len(), 2);
 }
 
+/// The delegation target carries the reader's tuning beside the option.
+///
+/// A catalogue option is an Agent, a source and a model. Depth, mode and
+/// feature values are how that option runs, so they travel in `target` and the
+/// resolver validates them against what the option advertises. Sending them as
+/// part of the reference would force the catalogue to publish one entry per
+/// combination.
+#[test]
+fn a_delegation_target_carries_the_depth_mode_and_features_beside_the_option() {
+    let mut request = HumanDelegationRequest::new(VibexSessionId::new(), "Tune the target");
+    let reference = VibexUseRef::runtime_option("option_abc");
+    request.runtime_option_ref = Some(reference.clone());
+    request.reasoning_effort = Some("high".to_string());
+    request.mode_id = Some("build".to_string());
+    request
+        .config_values
+        .insert("auto_approve".to_string(), "true".to_string());
+
+    let target = delegation_target_arguments(&request).unwrap();
+    assert_eq!(
+        target.get("selectionRef").and_then(|value| value.as_str()),
+        Some(reference.as_uri().as_str())
+    );
+    assert_eq!(
+        target
+            .get("reasoningEffort")
+            .and_then(|value| value.as_str()),
+        Some("high")
+    );
+    assert_eq!(
+        target.get("modeId").and_then(|value| value.as_str()),
+        Some("build")
+    );
+    assert_eq!(
+        target
+            .get("configValues")
+            .and_then(|value| value.get("auto_approve"))
+            .and_then(|value| value.as_str()),
+        Some("true")
+    );
+
+    // An untuned delegation stays a bare reference, so an older client's
+    // payload is byte-for-byte what it always was.
+    let mut bare = HumanDelegationRequest::new(VibexSessionId::new(), "Bare target");
+    bare.runtime_option_ref = Some(reference.clone());
+    let target = delegation_target_arguments(&bare).unwrap();
+    assert_eq!(target.as_object().map(serde_json::Map::len), Some(1));
+    assert_eq!(
+        target.get("selectionRef").and_then(|value| value.as_str()),
+        Some(reference.as_uri().as_str())
+    );
+}
+
 impl Fixture {
     fn new() -> Self {
         let directory = tempfile::tempdir().unwrap();

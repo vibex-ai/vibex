@@ -46,7 +46,7 @@ use gpui::{
     WindowControls, WindowDecorations, WindowId, WindowKind, WindowOptions, div, img,
     linear_color_stop, linear_gradient, point, prelude::*, px, relative, rgb, size,
 };
-use gpui_base::text::MarkdownExtensions;
+use gpui_base::{TextSelection, text::MarkdownExtensions};
 use gpui_component::{
     ActiveTheme as _, ColorName, Colorize as _, Disableable as _, ElementExt as _, Icon, IconName,
     IndexPath, InteractiveElementExt as _, Root, Selectable as _, Sizable as _, StyledExt as _,
@@ -120,10 +120,10 @@ use vibex_core::{
     AgentAuthContextStatus, AgentAuthContextVerifyRequest, AgentAuthMethodEffect,
     AgentAuthMethodKind, AgentAuthenticationOperationId, AgentBuiltinTool,
     AgentCommandDiscoverRequest, AgentCommandEntry, AgentCommandExecuteRequest,
-    AgentCommandExecutionBehavior, AgentCommandSelectionBehavior, AgentCommandSourceKind,
-    AgentCommandTrigger, AgentGoalControlRequest, AgentId, AgentListRequest,
-    AgentManagedInstallStatus, AgentMessagePhase, AgentSession, AgentSessionRuntimeSelectionState,
-    AgentSessionSafety, AgentSessionState, AgentSnapshotEntry, AgentTimelineDisplaySettings,
+    AgentCommandExecutionBehavior, AgentCommandSourceKind, AgentCommandTrigger,
+    AgentGoalControlRequest, AgentId, AgentListRequest, AgentManagedInstallStatus,
+    AgentMessagePhase, AgentSession, AgentSessionRuntimeSelectionState, AgentSessionSafety,
+    AgentSessionState, AgentSnapshotEntry, AgentTimelineDisplaySettings,
     AgentTimelineReasoningDisplayMode, AgentTokenUsage, AgentToolPreferences, AttachRuntimeRequest,
     BrowserCaptureQuality, BrowserDataClearReport, BrowserLoginImportReport,
     BrowserLoginImportRequest, BrowserProfileSource, CancelAgentSessionRuntimeSwitchRequest,
@@ -193,11 +193,11 @@ use vibex_desktop_model::{
 };
 use vibex_desktop_runtime::DriverState;
 use vibex_desktop_runtime::{
-    AuthoritativeRefetch, COMPOSER_AGENT_REFERENCE_KEY, COMPOSER_SELECTION_REFERENCE_KEY,
-    DesktopEvent, DesktopEventStream, DesktopRuntime, DesktopRuntimeConfig, DesktopRuntimeFacade,
-    DesktopRuntimeMode, LocalClientsSnapshot, PREVIEW_APP_ID, ProviderConfigChangePhase, RC_APP_ID,
-    STABLE_DESKTOP_APP_ID, SessionGroupPresentationRequest, SidebarOrganizationRequest,
-    StorageCleanupKind, StorageCleanupReport, runtime_option_ref, validate_external_open_url,
+    AuthoritativeRefetch, DesktopEvent, DesktopEventStream, DesktopRuntime, DesktopRuntimeConfig,
+    DesktopRuntimeFacade, DesktopRuntimeMode, LocalClientsSnapshot, PREVIEW_APP_ID,
+    ProviderConfigChangePhase, RC_APP_ID, STABLE_DESKTOP_APP_ID, SessionGroupPresentationRequest,
+    SidebarOrganizationRequest, StorageCleanupKind, StorageCleanupReport, runtime_option_ref,
+    validate_external_open_url,
 };
 use vibex_ui::{
     AgentFileGitController, ElicitationFormDraft, GpuiThemeMode, ManagementWorkflowCapabilities,
@@ -207,9 +207,9 @@ use vibex_ui::{
 
 use crate::markdown::{
     MarkdownLinkKind, MarkdownPresentation, RangeHighlight, RenderedText, TextView, TextViewState,
-    escape_markdown_literal, is_file_url, is_windows_drive_path, markdown_link_kind,
-    plain_text as markdown_plain_text, resolve_workspace_path, resources as markdown_resources,
-    text_view_style, utf8_prefix,
+    escape_markdown_literal, is_file_url, is_windows_drive_path, local_file_path,
+    markdown_link_kind, plain_text as markdown_plain_text, resolve_workspace_path,
+    resources as markdown_resources, text_view_style, utf8_prefix,
 };
 use crate::typography::{apply_code_font_weight, apply_terminal_visuals, code_font_weight};
 
@@ -1310,8 +1310,6 @@ const COMPOSER_SUGGESTION_MAX_ROWS: usize = 50;
 ///
 /// These rows never travel to the authority: they are the second layer of the
 /// `@` popup, built from the catalogue this client already holds.
-const COMPOSER_DELEGATION_EDIT_AGENT_KEY: &str = "vibexUseDelegationEditAgent";
-const COMPOSER_DELEGATION_EDIT_SELECTION_KEY: &str = "vibexUseDelegationEditSelection";
 const NEW_SESSION_RUNTIME_MENU_MAX_HEIGHT: f32 = 360.0;
 const NEW_SESSION_RUNTIME_MENU_MIN_HEIGHT: f32 = 104.0;
 const RUNTIME_MENU_VIEWPORT_MARGIN: f32 = 12.0;
@@ -1872,176 +1870,6 @@ fn split_mention_suggestions(
     (delegation_suggestions(collaborators), conversations)
 }
 
-/// The Agent id one delegation row names.
-///
-/// A row from the authority carries the reference metadata; a client-built
-/// configuration row names its Agent under the edit key. The id shape is the
-/// last resort so an older paired authority still resolves.
-fn delegation_agent_id(entry: &AgentCommandEntry) -> Option<AgentId> {
-    entry
-        .metadata
-        .iter()
-        .find(|metadata| {
-            metadata.key == COMPOSER_AGENT_REFERENCE_KEY
-                || metadata.key == COMPOSER_DELEGATION_EDIT_AGENT_KEY
-        })
-        .and_then(|metadata| AgentId::parse(&metadata.value).ok())
-        .or_else(|| {
-            entry
-                .id
-                .strip_prefix("reference:agent:")
-                .or_else(|| entry.id.strip_prefix("delegate-now:"))
-                .and_then(|rest| rest.split(':').next())
-                .and_then(|id| AgentId::parse(id).ok())
-        })
-}
-
-/// The runtime option ref one delegation row carries.
-fn delegation_selection_ref(entry: &AgentCommandEntry) -> Option<&str> {
-    entry
-        .metadata
-        .iter()
-        .find(|metadata| {
-            metadata.key == COMPOSER_SELECTION_REFERENCE_KEY
-                || metadata.key == COMPOSER_DELEGATION_EDIT_SELECTION_KEY
-        })
-        .map(|metadata| metadata.value.as_str())
-}
-
-/// One row per available configuration of `agent_id`, for the delegation
-/// panel's edit layer.
-///
-/// The configuration the row already carries leads, then the models the reader
-/// uses most, then catalogue order. Each row is a client-only choice: its
-/// metadata names the Agent and the option to write down, not a mention to
-/// insert.
-fn delegation_runtime_edit_entries(
-    catalog: &SessionRuntimeOptionCatalog,
-    agent_id: &AgentId,
-    selected: Option<&SessionRuntimeSelection>,
-    usage: &BTreeMap<String, u64>,
-) -> Vec<AgentCommandEntry> {
-    let mut options = catalog
-        .options
-        .iter()
-        .filter(|option| {
-            &option.selection.agent_id == agent_id
-                && option.availability == vibex_core::RuntimeOptionAvailability::Available
-        })
-        .collect::<Vec<_>>();
-    options.sort_by_key(|option| {
-        let selected = selected.is_some_and(|selected| {
-            runtime_selection_identity_matches(&option.selection, selected)
-        });
-        let uses = runtime_selection_use_count(usage, &option.selection);
-        (!selected, std::cmp::Reverse(uses))
-    });
-    options
-        .into_iter()
-        .map(|option| AgentCommandEntry {
-            id: format!(
-                "delegation-edit:{}:{}",
-                agent_id.as_str(),
-                runtime_option_ref(option)
-            ),
-            trigger: AgentCommandTrigger::Mention,
-            source_kind: AgentCommandSourceKind::Reference,
-            label: format!("@{}", option.model_label),
-            description: Some(option.auth_source_label.clone()),
-            insertion_text: String::new(),
-            command_name: None,
-            provider_kind: Some(vibex_core::ProviderKind::Acp),
-            prompt_id: None,
-            skill_id: None,
-            reference_path: None,
-            selection_behavior: AgentCommandSelectionBehavior::Insert,
-            execution_behavior: AgentCommandExecutionBehavior::None,
-            destructive: false,
-            metadata: vec![
-                vibex_core::ProviderBindingMetadata {
-                    key: COMPOSER_DELEGATION_EDIT_AGENT_KEY.to_string(),
-                    value: agent_id.as_str().to_string(),
-                },
-                vibex_core::ProviderBindingMetadata {
-                    key: COMPOSER_DELEGATION_EDIT_SELECTION_KEY.to_string(),
-                    value: runtime_option_ref(option),
-                },
-            ],
-        })
-        .collect()
-}
-
-/// The Agent and selection a click on one configuration row chooses.
-fn delegation_edit_target(entry: &AgentCommandEntry) -> Option<(AgentId, String)> {
-    let agent_id = entry
-        .metadata
-        .iter()
-        .find(|metadata| metadata.key == COMPOSER_DELEGATION_EDIT_AGENT_KEY)
-        .and_then(|metadata| AgentId::parse(&metadata.value).ok())?;
-    let selection_ref = entry
-        .metadata
-        .iter()
-        .find(|metadata| metadata.key == COMPOSER_DELEGATION_EDIT_SELECTION_KEY)
-        .map(|metadata| metadata.value.clone())?;
-    Some((agent_id, selection_ref))
-}
-
-/// The description one runtime option shows beside its Agent.
-///
-/// Mirrors the authority's own projection so a row the client re-points reads
-/// the same as the row the next discovery sends.
-fn delegation_runtime_description(option: &SessionRuntimeOption) -> String {
-    let mut parts = vec![
-        option.auth_source_label.as_str(),
-        option.model_label.as_str(),
-    ];
-    for (selected, choices) in [
-        (option.selection.mode_id.as_deref(), &option.modes),
-        (
-            option.selection.reasoning_effort.as_deref(),
-            &option.reasoning_efforts,
-        ),
-    ] {
-        if let Some(selected) = selected {
-            parts.push(
-                choices
-                    .iter()
-                    .find(|choice| choice.value == selected)
-                    .and_then(|choice| choice.label.as_deref())
-                    .unwrap_or(selected),
-            );
-        }
-    }
-    parts.join(" · ")
-}
-
-/// Points one delegation entry at `option`.
-///
-/// Only the reference and the labels move: the row still names the same Agent,
-/// and the send path reads the same two metadata keys it read before.
-fn apply_delegation_selection_to_entry(
-    entry: &mut AgentCommandEntry,
-    agent_id: &AgentId,
-    option: &SessionRuntimeOption,
-) {
-    let selection_ref = runtime_option_ref(option);
-    entry.id = format!("reference:agent:{}:{selection_ref}", agent_id.as_str());
-    entry.label = format!("@{}", option.agent_label);
-    entry.description = Some(delegation_runtime_description(option));
-    entry.metadata.retain(|metadata| {
-        metadata.key != COMPOSER_AGENT_REFERENCE_KEY
-            && metadata.key != COMPOSER_SELECTION_REFERENCE_KEY
-    });
-    entry.metadata.push(vibex_core::ProviderBindingMetadata {
-        key: COMPOSER_AGENT_REFERENCE_KEY.to_string(),
-        value: agent_id.as_str().to_string(),
-    });
-    entry.metadata.push(vibex_core::ProviderBindingMetadata {
-        key: COMPOSER_SELECTION_REFERENCE_KEY.to_string(),
-        value: selection_ref,
-    });
-}
-
 /// One row of the composer's `/` popup, without the app-specific handlers the
 /// caller attaches.
 ///
@@ -2066,25 +1894,25 @@ fn composer_suggestion_row(
     theme: &Theme,
 ) -> Stateful<Div> {
     let agent_row = agent_identity.is_some();
-    let agent_copy = agent_row
-        .then(|| composer_suggestion_description(entry))
-        .flatten();
     let display_label = entry.label.trim_start_matches(['/', '$', '@']).to_string();
     let description = if agent_row {
         None
     } else {
         composer_suggestion_description(entry)
     };
-    let source_label = agent_copy.clone().unwrap_or_else(|| {
-        if agent_row {
-            "Agent".to_string()
-        } else {
-            command_source_label(entry.source_kind).to_string()
-        }
-    });
+    // A collaborator row is the choice of *who*, not *what they will run on*.
+    // The configuration belongs to the chip the row inserts: picking the row
+    // puts the caret on that chip, and the composer's own controls then show —
+    // and change — the provider, model, depth and mode. Printing a provider and
+    // model here would describe a configuration the reader has not chosen yet,
+    // and would go stale the moment they tune the chip.
+    let source_label = if agent_row {
+        "Agent".to_string()
+    } else {
+        command_source_label(entry.source_kind).to_string()
+    };
     let aria_label = description
         .as_ref()
-        .or(agent_copy.as_ref())
         .map(|description| format!("{display_label}, {description}"))
         .unwrap_or_else(|| display_label.clone());
 
@@ -5969,9 +5797,7 @@ pub struct SessionView {
     /// While this is set the popup shows that Agent's available
     /// configurations instead of the collaborator list; choosing one writes
     /// the row's explicit delegation selection.
-    delegation_edit_agent: Option<AgentId>,
     /// The rows of the open delegation configuration picker.
-    delegation_edit_entries: Vec<AgentCommandEntry>,
     suggestion_tab: ComposerSuggestionTab,
     suggestion_selection: ComposerSuggestionSelection,
     /// Which half of the selected delegation row owns Enter.
@@ -6119,8 +5945,6 @@ impl SessionView {
             phrase_suggestions: Vec::new(),
             delegation_suggestions: Vec::new(),
             session_suggestions: Vec::new(),
-            delegation_edit_agent: None,
-            delegation_edit_entries: Vec::new(),
             suggestion_tab: ComposerSuggestionTab::default(),
             suggestion_selection: ComposerSuggestionSelection::default(),
             suggestion_delegation_action: ComposerDelegationAction::default(),
@@ -7526,6 +7350,67 @@ enum UserMessageEditActionState {
     Hidden,
     Disabled,
     Enabled,
+}
+
+#[derive(Clone)]
+struct UserMessageMenuContext {
+    row: TimelineRow,
+    row_id: String,
+    session_id: Option<VibexSessionId>,
+    turn_id: Option<String>,
+    first_sequence: i64,
+    last_sequence: i64,
+    authoritative_end_sequence: i64,
+    latest_user_message: bool,
+    turn_complete: bool,
+    edit_action_state: UserMessageEditActionState,
+    row_is_live_view: bool,
+    child_session: Option<String>,
+    copy_item: ClipboardItem,
+    attachments: Vec<MessageAttachment>,
+    mentions: Vec<VibexUseMention>,
+    timestamp: Option<i64>,
+}
+
+#[derive(Clone)]
+struct AgentMessageMenuContext {
+    row: TimelineRow,
+    row_id: String,
+    session_id: Option<VibexSessionId>,
+    turn_id: Option<String>,
+    last_sequence: i64,
+    streaming: bool,
+    foldable: bool,
+    row_is_live_view: bool,
+    child_session: Option<String>,
+    timestamp: Option<i64>,
+}
+
+#[derive(Clone)]
+struct TurnMenuContext {
+    turn_id: String,
+    session_id: Option<VibexSessionId>,
+    fork_sequence: i64,
+    process_collapsible: bool,
+    process_expanded: bool,
+    row_is_live_view: bool,
+    fork_disabled: bool,
+}
+
+#[derive(Clone)]
+struct SelectionMenuContext {
+    text: String,
+    markdown: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActivityCopyMode {
+    Primary,
+    Input,
+    Output,
+    Details,
+    Diff,
+    Path,
 }
 
 #[derive(Clone)]
@@ -11010,6 +10895,15 @@ pub struct VibexWorkbench {
     /// this records rather than from what `new_session_agent_id` already says.
     new_session_logo_swap: Option<NewSessionLogoSwap>,
     new_session_runtime_selection: Option<SessionRuntimeSelection>,
+    /// A chip tuning a new-session draft asked for, waiting for a frame that has
+    /// a window to write it with.
+    ///
+    /// The feature toggles run from a dialog callback that borrows the window,
+    /// so they cannot rewrite the composer's token themselves. Recording the
+    /// choice and applying it on the next frame keeps one write path — the same
+    /// one the cascade uses — instead of a second, window-free way to edit
+    /// tokens.
+    pending_new_session_chip_selection: Option<(AgentId, SessionRuntimeSelection)>,
     /// Which built-in tool panels this draft asks for.
     ///
     /// Empty follows whichever Agent is selected, which is what the row shows
@@ -11224,9 +11118,13 @@ pub struct VibexWorkbench {
     composer_queue_ready_after_continuation_session_ids: BTreeSet<String>,
     composer_queue_interrupted_session_ids: BTreeSet<String>,
     composer_queue_steering_session_ids: BTreeSet<String>,
-    /// The queued message whose turn the queue is waiting on before it may hand
-    /// over the next entry. See [`ComposerQueueDispatchFence`].
-    composer_queue_dispatch_fence: Option<ComposerQueueDispatchFence>,
+    /// One fence per session whose handed-over message the queue is still
+    /// waiting on. See [`ComposerQueueDispatchFence`].
+    ///
+    /// One entry per session rather than a single slot: a turn that never
+    /// settles used to freeze every other session's queue with it, so a stuck
+    /// child Agent stopped the reader from sending anything anywhere.
+    composer_queue_dispatch_fences: BTreeMap<String, ComposerQueueDispatchFence>,
     /// Sessions whose live Agent runtime advertised native steering. The queue
     /// exposes the native steer action only for these sessions.
     native_steering_supported_session_ids: BTreeSet<String>,
@@ -12755,6 +12653,7 @@ impl VibexWorkbench {
             new_session_agent_id: None,
             new_session_logo_swap: None,
             new_session_runtime_selection: None,
+            pending_new_session_chip_selection: None,
             new_session_tools: SessionToolSettings::default(),
             new_session_runtime_menu_open: false,
             new_session_runtime_menu_view: ComposerRuntimeMenuView::AuthSource,
@@ -12841,7 +12740,7 @@ impl VibexWorkbench {
             composer_queue_ready_after_continuation_session_ids: BTreeSet::new(),
             composer_queue_interrupted_session_ids: BTreeSet::new(),
             composer_queue_steering_session_ids: BTreeSet::new(),
-            composer_queue_dispatch_fence: None,
+            composer_queue_dispatch_fences: BTreeMap::new(),
             native_steering_supported_session_ids: BTreeSet::new(),
             native_steering_probed_generations: BTreeMap::new(),
             optimistic_user_messages: BTreeMap::new(),
@@ -18713,23 +18612,29 @@ impl VibexWorkbench {
             self.wsl_watch_task = None;
         }
         self.runtime_remove_pending = None;
+        let was_active_remote = self
+            .remote_client
+            .as_ref()
+            .map(|client| client.runtime_id.as_str())
+            == Some(id.as_str());
+        if was_active_remote {
+            self.remote_client = None;
+        }
+        // Settings reads the runtime registry from disk when it reloads. The
+        // registry has to be on disk first, or the page re-reads the file that
+        // still contains the removed runtime and paints its row back until the
+        // page is reopened. This is especially visible for a directly paired
+        // runtime, whose row has no profile store to disappear on its own.
+        self.persist_runtime_registry(cx);
+        if was_active_remote {
+            self.activate_local_runtime(cx);
+        } else {
+            cx.notify();
+        }
         self.settings_view.update(cx, |settings, cx| {
             settings.reload_connections_profiles();
             cx.notify();
         });
-        if self
-            .remote_client
-            .as_ref()
-            .map(|client| client.runtime_id.as_str())
-            == Some(id.as_str())
-        {
-            self.remote_client = None;
-            self.persist_runtime_registry(cx);
-            self.activate_local_runtime(cx);
-            return;
-        }
-        self.persist_runtime_registry(cx);
-        cx.notify();
     }
 
     /// Deletes the runtime side of a removed SSH connection.
@@ -21706,6 +21611,30 @@ impl VibexWorkbench {
         }
     }
 
+    /// Releases the optimistic dispatch flags of sessions whose submission
+    /// never reached the provider.
+    ///
+    /// The flag exists to paint a locally dispatched turn as running before the
+    /// authority admits it, and only an authoritative snapshot can normally
+    /// answer it. A submission that failed or was cancelled before
+    /// `dispatched_at_ms` is that same authority saying the turn never started:
+    /// no snapshot will follow to release the flag, so the queue it holds would
+    /// wait for a turn that does not exist.
+    fn release_unadmitted_turn_flags(&mut self, session_ids: &BTreeSet<String>) {
+        if session_ids.is_empty() {
+            return;
+        }
+        for session_id in session_ids {
+            let Ok(session_id) = VibexSessionId::parse(session_id.clone()) else {
+                continue;
+            };
+            if self.session_turn_pending(&session_id) {
+                self.set_session_turn_pending(&session_id, false);
+            }
+            self.mark_composer_queue_for_recheck(&session_id);
+        }
+    }
+
     fn release_initial_turn_interrupt_lock(&mut self, interrupted: bool) {
         if interrupted {
             self.agent_action_pending = false;
@@ -21955,9 +21884,8 @@ impl VibexWorkbench {
         // turn the queue is waiting on has to wake the same re-evaluation as a
         // session that still holds an entry.
         let holds_the_fence = self
-            .composer_queue_dispatch_fence
-            .as_ref()
-            .is_some_and(|fence| fence.session_id == *session_id);
+            .composer_queue_dispatch_fences
+            .contains_key(session_id.as_str());
         if holds_an_entry || holds_the_fence {
             self.composer_queue_ready_after_continuation_session_ids
                 .insert(session_id.as_str().to_string());
@@ -21979,9 +21907,11 @@ impl VibexWorkbench {
             .iter()
             .map(|message| message.session_id.clone())
             .collect::<BTreeSet<_>>();
-        if let Some(fence) = self.composer_queue_dispatch_fence.as_ref() {
-            referenced.insert(fence.session_id.clone());
-        }
+        referenced.extend(
+            self.composer_queue_dispatch_fences
+                .values()
+                .map(|fence| fence.session_id.clone()),
+        );
         for session_id in referenced {
             let Some((state, revision)) = self
                 .registered_session(session_id.as_str())
@@ -28797,6 +28727,75 @@ impl VibexWorkbench {
         self.runtime_selection_for_session(&session_id)
     }
 
+    /// The `@Agent` chip the composer's runtime controls are tuning, if any.
+    ///
+    /// Reads the draft's tokens and the caret. `None` means the controls belong
+    /// to the session, which is the ordinary state and the one every caller
+    /// predating delegation assumes.
+    fn composer_delegation_subject(&self, cx: &App) -> Option<VibexUseMention> {
+        self.delegation_subject_for(ComposerTarget::Session, cx)
+    }
+
+    /// The `@Agent` chip the runtime controls are tuning in one composer.
+    ///
+    /// Both composers have the same controls and the same kind of chip, so both
+    /// derive their subject the same way. A new-session draft that addresses a
+    /// collaborator used to ignore the chip entirely: the page's controls
+    /// always described the Agent being started, so tuning a chip there changed
+    /// nothing the reader could see.
+    fn delegation_subject_for(&self, target: ComposerTarget, cx: &App) -> Option<VibexUseMention> {
+        let input = self.input_for_composer_target(target)?;
+        let input = input.read(cx);
+        delegation_edit_subject(input.tokens(), input.cursor())
+    }
+
+    /// The byte range of the chip one composer's controls are tuning.
+    ///
+    /// The renderer cannot see the caret, so the caret's verdict is resolved
+    /// here, once per frame, and handed to it. That keeps the chip's highlight
+    /// and the controls pointed at exactly the same chip.
+    fn delegation_chip_range_for(
+        &self,
+        target: ComposerTarget,
+        cx: &App,
+    ) -> Option<std::ops::Range<usize>> {
+        self.delegation_subject_for(target, cx)?;
+        let input = self.input_for_composer_target(target)?;
+        let input = input.read(cx);
+        let cursor = input.cursor();
+        input
+            .tokens()
+            .iter()
+            .map(|span| span.range())
+            .find(|range| delegation_chip_is_active(range, cursor))
+    }
+
+    /// The selection one composer's runtime controls should show.
+    fn composer_runtime_selection_for(
+        &self,
+        target: ComposerTarget,
+        cx: &App,
+    ) -> Option<SessionRuntimeSelection> {
+        if let Some(mention) = self.delegation_subject_for(target, cx) {
+            return self
+                .runtime_catalog
+                .as_deref()
+                .and_then(|catalog| delegation_chip_selection(catalog, &mention));
+        }
+        match target {
+            ComposerTarget::Session => self.view_runtime_selection(),
+            ComposerTarget::NewSession => self.new_session_runtime_selection.clone(),
+        }
+    }
+
+    /// The runtime selection the session composer's controls should show.
+    ///
+    /// A draft that is tuning a collaborator shows that collaborator's
+    /// selection; otherwise it shows the session's.
+    fn composer_runtime_selection(&self, cx: &App) -> Option<SessionRuntimeSelection> {
+        self.composer_runtime_selection_for(ComposerTarget::Session, cx)
+    }
+
     /// The runtime selection a session renders, selected or not.
     fn runtime_selection_for_session(
         &self,
@@ -31889,6 +31888,10 @@ impl VibexWorkbench {
             .session
             .enhanced_file_operation_display
             .hash(&mut hasher);
+        self.ui_state
+            .session
+            .auto_collapse_tool_calls
+            .hash(&mut hasher);
         turn.process_rows.len().hash(&mut hasher);
         // A thought that is still arriving draws its window without being
         // opened, so the trailing row's streaming flag is part of the turn's
@@ -31972,6 +31975,10 @@ impl VibexWorkbench {
             .session
             .enhanced_file_operation_display
             .hash(&mut hasher);
+        self.ui_state
+            .session
+            .auto_collapse_tool_calls
+            .hash(&mut hasher);
 
         turn.process_rows.len().hash(&mut hasher);
         {
@@ -32034,6 +32041,7 @@ impl VibexWorkbench {
                         turn,
                         group,
                         self.timeline_command_expansion.get(&group.id).copied(),
+                        self.ui_state.session.auto_collapse_tool_calls,
                     )
                     .hash(&mut hasher);
                 }
@@ -32088,6 +32096,10 @@ impl VibexWorkbench {
         self.ui_state
             .session
             .enhanced_file_operation_display
+            .hash(&mut hasher);
+        self.ui_state
+            .session
+            .auto_collapse_tool_calls
             .hash(&mut hasher);
         // The estimate wraps its row bodies against the pane the timeline last
         // painted into, so a memoized estimate stops being valid the moment
@@ -32960,8 +32972,6 @@ impl VibexWorkbench {
         self.phrase_suggestions.clear();
         self.delegation_suggestions.clear();
         self.session_suggestions.clear();
-        self.delegation_edit_agent = None;
-        self.delegation_edit_entries.clear();
         self.suggestion_tab = ComposerSuggestionTab::default();
         self.suggestion_selection.dismiss();
         self.suggestion_delegation_action = ComposerDelegationAction::default();
@@ -33132,17 +33142,6 @@ impl VibexWorkbench {
         };
         if self.suggestion_context.as_ref() == Some(&context) {
             return;
-        }
-        // Typing while a delegation configuration picker is open means the
-        // reader moved back to naming a file or collaborator: the picker is a
-        // layer of the old query, not a second mode of the composer.
-        if self
-            .suggestion_context
-            .as_ref()
-            .is_some_and(|current| current.request.query.as_deref() != request.query.as_deref())
-        {
-            self.delegation_edit_agent = None;
-            self.delegation_edit_entries.clear();
         }
         let preserve_rows = self
             .suggestion_context
@@ -33328,13 +33327,6 @@ impl VibexWorkbench {
 
     /// The rows the popup is showing right now.
     fn visible_suggestions(&self) -> &[AgentCommandEntry] {
-        // The delegation tab's second layer: one Agent's configurations, so
-        // the reader can choose the provider/model the row will carry.
-        if self.delegation_edit_agent.is_some()
-            && self.active_suggestion_tab() == ComposerSuggestionTab::Delegation
-        {
-            return &self.delegation_edit_entries;
-        }
         self.active_suggestion_tab().rows(
             &self.suggestions,
             &self.phrase_suggestions,
@@ -33380,8 +33372,6 @@ impl VibexWorkbench {
         if next == self.active_suggestion_tab() {
             return false;
         }
-        self.delegation_edit_agent = None;
-        self.delegation_edit_entries.clear();
         self.suggestion_tab = next;
         self.reseat_suggestion_selection(true);
         cx.notify();
@@ -33645,15 +33635,7 @@ impl VibexWorkbench {
                 cx.stop_propagation();
             }
             ComposerSuggestionAction::Dismiss => {
-                // Escape leaves the configuration layer first; only the next
-                // press closes the popup the reader came from.
-                if self.delegation_edit_agent.is_some() {
-                    self.delegation_edit_agent = None;
-                    self.delegation_edit_entries.clear();
-                    self.reseat_suggestion_selection(true);
-                } else {
-                    self.clear_suggestions();
-                }
+                self.clear_suggestions();
                 cx.stop_propagation();
                 cx.notify();
             }
@@ -33679,161 +33661,6 @@ impl VibexWorkbench {
         }
     }
 
-    /// Opens the delegation tab's configuration layer for one Agent.
-    ///
-    /// The rows are built from the catalogue this client already holds, so the
-    /// picker opens without another round trip. The row the Agent currently
-    /// carries leads; the rest keep the reader's use order.
-    fn open_delegation_runtime_edit(&mut self, agent_id: AgentId, cx: &mut Context<Self>) {
-        let Some(catalog) = self.runtime_catalog.as_deref() else {
-            return;
-        };
-        let selected = self
-            .delegation_suggestions
-            .iter()
-            .find(|entry| delegation_agent_id(entry).as_ref() == Some(&agent_id))
-            .and_then(delegation_selection_ref)
-            .and_then(|reference| {
-                catalog
-                    .options
-                    .iter()
-                    .find(|option| runtime_option_ref(option) == reference)
-            })
-            .map(|option| option.selection.clone());
-        let entries = delegation_runtime_edit_entries(
-            catalog,
-            &agent_id,
-            selected.as_ref(),
-            &self.ui_state.composer.runtime_selection_usage,
-        );
-        if entries.is_empty() {
-            return;
-        }
-        self.delegation_edit_agent = Some(agent_id);
-        self.delegation_edit_entries = entries;
-        self.suggestion_tab = ComposerSuggestionTab::Delegation;
-        self.suggestion_selection.dismiss();
-        self.reseat_suggestion_selection(true);
-        self.suggestion_scroll.scroll_to_item(0);
-        cx.notify();
-    }
-
-    /// Writes down the configuration the reader picked for one Agent and
-    /// re-points its delegation row at it.
-    ///
-    /// The choice lives in the UI state the authority reads, so it outlives the
-    /// popup and a restart, and applies to the next discovery as well as the
-    /// row on screen.
-    fn apply_delegation_edit_choice(
-        &mut self,
-        target: ComposerTarget,
-        agent_id: AgentId,
-        selection_ref: String,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(option) = self
-            .runtime_catalog
-            .as_deref()
-            .and_then(|catalog| {
-                catalog.options.iter().find(|option| {
-                    option.availability == vibex_core::RuntimeOptionAvailability::Available
-                        && runtime_option_ref(option) == selection_ref
-                })
-            })
-            .cloned()
-        else {
-            return;
-        };
-        let selection = option.selection.clone();
-        self.ui_state
-            .composer
-            .delegation_runtime_selections_by_agent
-            .insert(agent_id.clone(), selection.clone());
-        self.ui_state
-            .composer
-            .record_runtime_selection_use(&selection);
-        self.delegation_edit_agent = None;
-        self.delegation_edit_entries.clear();
-        self.queue_ui_state();
-        // The authority picks the row's one configuration from the same file,
-        // so the write must be visible before a later discovery asks again.
-        if let Some(writer) = self.ui_writer.as_mut() {
-            let _ = writer.flush();
-        }
-        if let Some(entry) = self
-            .delegation_suggestions
-            .iter_mut()
-            .find(|entry| delegation_agent_id(entry).as_ref() == Some(&agent_id))
-        {
-            apply_delegation_selection_to_entry(entry, &agent_id, &option);
-        }
-        // A draft may already carry this Agent's chip. It names the same
-        // collaborator but still remembers the old configuration; leaving it
-        // would make the message disagree with the row the reader just edited.
-        self.rewrite_delegation_mention_tokens(target, &agent_id, &option, window, cx);
-        self.suggestion_tab = ComposerSuggestionTab::Delegation;
-        let edited = self
-            .delegation_suggestions
-            .iter()
-            .position(|entry| delegation_agent_id(entry).as_ref() == Some(&agent_id));
-        self.reseat_suggestion_selection(true);
-        if let Some(index) = edited {
-            self.suggestion_selection.selected_index = Some(index);
-            self.suggestion_scroll.scroll_to_item(index);
-        }
-        cx.notify();
-    }
-
-    /// Re-points every `@Agent` chip already in `target`'s draft at `option`.
-    ///
-    /// The chip's visible label is only `@Agent`; the configuration lives in
-    /// the encoded mention id. Editing the row must therefore rewrite that id
-    /// too, or the next send would carry the configuration the reader just
-    /// replaced.
-    fn rewrite_delegation_mention_tokens(
-        &mut self,
-        target: ComposerTarget,
-        agent_id: &AgentId,
-        option: &SessionRuntimeOption,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(input) = self.input_for_composer_target(target) else {
-            return;
-        };
-        let Some(reference) = vibex_core::VibexUseRef::parse(&runtime_option_ref(option)) else {
-            return;
-        };
-        let updates = input
-            .read(cx)
-            .tokens()
-            .iter()
-            .filter_map(|span| {
-                let mention = VibexUseMention::parse(span.token().id().as_ref())?;
-                if mention.kind != vibex_core::VibexUseMentionKind::Agent
-                    || mention.agent_id.as_ref() != Some(agent_id)
-                {
-                    return None;
-                }
-                let next = VibexUseMention::agent(agent_id, &reference, None);
-                Some((
-                    span.range(),
-                    InlineToken::new(next.encode(), span.token().text().clone())
-                        .with_label(span.token().label().to_string()),
-                ))
-            })
-            .collect::<Vec<_>>();
-        if updates.is_empty() {
-            return;
-        }
-        input.update(cx, |input, cx| {
-            for (range, token) in updates {
-                let _ = input.replace_range_with_token(range, token, window, cx);
-            }
-        });
-    }
-
     fn apply_suggestion(
         &mut self,
         target: ComposerTarget,
@@ -33842,13 +33669,6 @@ impl VibexWorkbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // A configuration row in the delegation tab's edit layer is not a
-        // mention: it writes the Agent's explicit delegation choice and leaves
-        // the draft untouched.
-        if let Some((agent_id, selection_ref)) = delegation_edit_target(&entry) {
-            self.apply_delegation_edit_choice(target, agent_id, selection_ref, window, cx);
-            return;
-        }
         let Some(input) = self.input_for_composer_target(target) else {
             return;
         };
@@ -34726,7 +34546,31 @@ impl VibexWorkbench {
                 .take(vibex_core::VIBEX_USE_TITLE_CHARS)
                 .collect(),
         );
-        request.runtime_option_ref = Some(selection_ref);
+        // The chip is the source of truth for a tuned delegation: it carries the
+        // option reference *and* the depth, mode and feature values the reader
+        // set on it. Reading both from the same place is what keeps the
+        // reference and its overrides from disagreeing; a side table keyed by
+        // Agent could only hold one configuration no matter how many times the
+        // draft named that Agent.
+        let chip_selection = self.runtime_catalog.as_deref().and_then(|catalog| {
+            composer_mentions(composer_input.read(cx).tokens())
+                .into_iter()
+                .find(|mention| {
+                    mention.kind == vibex_core::VibexUseMentionKind::Agent
+                        && mention.agent_id.as_ref().map(AgentId::as_str) == Some(agent_id.as_str())
+                })
+                .and_then(|mention| delegation_chip_selection(catalog, &mention))
+        });
+        if let Some(selection) = chip_selection {
+            request.runtime_option_ref = Some(vibex_core::VibexUseRef::runtime_option(
+                &vibex_desktop_runtime::selection_fingerprint(&selection),
+            ));
+            request.reasoning_effort = selection.reasoning_effort.clone();
+            request.mode_id = selection.mode_id.clone();
+            request.config_values = selection.config_values.clone();
+        } else {
+            request.runtime_option_ref = Some(selection_ref);
+        }
         request.attachments = attachments;
         request.context_refs = mentions
             .iter()
@@ -34940,13 +34784,8 @@ impl VibexWorkbench {
                 // A remote submission that never landed cannot produce the
                 // completion the pre-send queue is waiting on, so it releases the
                 // fence instead of stranding every message behind it.
-                if !completed
-                    && this
-                        .composer_queue_dispatch_fence
-                        .as_ref()
-                        .is_some_and(|fence| fence.message_id == message_id)
-                {
-                    this.composer_queue_dispatch_fence = None;
+                if !completed {
+                    this.release_composer_queue_fence(message_id);
                 }
                 let _ = window;
                 cx.notify();
@@ -35243,13 +35082,8 @@ impl VibexWorkbench {
                 // conversational turn of its own, cannot produce the completion
                 // the pre-send queue is waiting on. Releasing the fence here
                 // keeps one failed send from stranding every message behind it.
-                if (!completed || is_command)
-                    && this
-                        .composer_queue_dispatch_fence
-                        .as_ref()
-                        .is_some_and(|fence| fence.message_id == message_id)
-                {
-                    this.composer_queue_dispatch_fence = None;
+                if !completed || is_command {
+                    this.release_composer_queue_fence(message_id);
                 }
                 if completed || steering || interrupted {
                     this.maybe_dispatch_next_composer_queue_message(
@@ -35392,20 +35226,13 @@ impl VibexWorkbench {
         // front of it.
         //
         // The fence keeps the queue one-at-a-time behind the turn the last
-        // hand-over started. A schedule is a promise about a moment, and a turn
-        // running in a *different* session has no claim on that moment: waiting
-        // for it can hold the due message for as long as the other Agent runs,
-        // which is how a schedule misses its time while its own session is
-        // settled. The target session's own state and pending flag below already
-        // keep a schedule from overlapping a turn in the session it sends to.
-        let schedule_overtakes_another_sessions_turn = scheduled_at_ms.is_some()
-            && self
-                .composer_queue_dispatch_fence
-                .as_ref()
-                .is_some_and(|fence| fence.session_id != session_id);
+        // hand-over started, and it is scoped to the session that hand-over
+        // belongs to. A turn running in another session has no claim on this
+        // message: waiting for it could hold a due schedule for as long as the
+        // other Agent runs, and — before the fence was per-session — let one
+        // stuck child Agent freeze every session's queue.
         let fence_blocks = !composer_queue_behavior_is_explicit(behavior)
-            && !schedule_overtakes_another_sessions_turn
-            && self.composer_queue_fence_blocks();
+            && self.composer_queue_fence_blocks(&session_id);
         // An unobserved revision is not proof of a normal completion, so the
         // queue asks for a verdict. When nothing can judge the boundary right
         // now, the session's own settled state is the best evidence the queue
@@ -35431,11 +35258,14 @@ impl VibexWorkbench {
         }
         let message = self.composer_queue.remove(index);
         let message_id = message.id;
-        self.composer_queue_dispatch_fence = Some(ComposerQueueDispatchFence {
-            session_id: message.session_id.clone(),
-            message_id,
-            awaits_turn: message.command_invocation.is_none(),
-        });
+        self.composer_queue_dispatch_fences.insert(
+            message.session_id.as_str().to_string(),
+            ComposerQueueDispatchFence {
+                session_id: message.session_id.clone(),
+                message_id,
+                awaits_turn: message.command_invocation.is_none(),
+            },
+        );
         self.publish_sidebar_invalidation();
         self.dispatch_admitted_composer_message(message, behavior, window, cx);
         // The one hand-over the submission path still refuses — a local runtime
@@ -35452,7 +35282,7 @@ impl VibexWorkbench {
                 let message = self.composer_queue.remove(bounced);
                 self.composer_queue.insert(0, message);
             }
-            self.composer_queue_dispatch_fence = None;
+            self.release_composer_queue_fence(message_id);
         }
         // The send left the queue, so its name no longer stands and the
         // persisted queue must not bring the message back on the next launch.
@@ -35465,14 +35295,18 @@ impl VibexWorkbench {
     }
 
     /// Whether the pre-send queue is still waiting for the turn of the message it
-    /// handed over last.
+    /// handed over last in `session_id`.
     ///
     /// The queue advances one message at a time: after an entry leaves it, the
     /// entries behind it wait while that message's turn still occupies its
     /// session. The fence never waits on an asynchronous verdict, so a session
     /// that cannot answer a probe still releases the queue once it settles.
-    fn composer_queue_fence_blocks(&self) -> bool {
-        let Some(fence) = self.composer_queue_dispatch_fence.as_ref() else {
+    ///
+    /// Only the target session's own fence can hold its next entry. A turn
+    /// running in another session used to hold every session's queue, so one
+    /// stuck child Agent stopped the reader from sending anywhere.
+    fn composer_queue_fence_blocks(&self, session_id: &VibexSessionId) -> bool {
+        let Some(fence) = self.composer_queue_dispatch_fences.get(session_id.as_str()) else {
             return false;
         };
         if !fence.awaits_turn {
@@ -35483,6 +35317,16 @@ impl VibexWorkbench {
             self.registered_session(fence.session_id.as_str())
                 .map(|session| session.state),
         )
+    }
+
+    /// Drops the fence of the handed-over message `message_id`.
+    ///
+    /// Keyed by message rather than by session: a completion may arrive after a
+    /// newer hand-over replaced the entry, and that newer fence must not be
+    /// released by the older message's settle.
+    fn release_composer_queue_fence(&mut self, message_id: u64) {
+        self.composer_queue_dispatch_fences
+            .retain(|_, fence| fence.message_id != message_id);
     }
 
     /// Re-evaluates the pre-send queue after a turn outcome became known.
@@ -36141,6 +35985,13 @@ impl VibexWorkbench {
     ) {
         let mut completed_session_ids = BTreeSet::new();
         let mut ambiguous_any = false;
+        // A submission that ended before it ever reached the provider proves no
+        // turn was admitted for its session. The local dispatch flag was armed
+        // optimistically, though, and only an authoritative snapshot written
+        // after the dispatch is allowed to answer it — a failed or cancelled
+        // submission writes no such snapshot. The flag then outlived the
+        // message it spoke for and held that session's queue forever.
+        let mut unadmitted_session_ids = BTreeSet::new();
         for state in &states {
             if matches!(
                 state.status,
@@ -36153,11 +36004,20 @@ impl VibexWorkbench {
                         && locator.message_idempotency_key == state.message_idempotency_key)
                 });
             }
+            if state.dispatched_at_ms.is_none()
+                && matches!(
+                    state.status,
+                    MessageSubmissionStatus::Failed | MessageSubmissionStatus::Cancelled
+                )
+            {
+                unadmitted_session_ids.insert(state.session_id.as_str().to_string());
+            }
             if state.status == MessageSubmissionStatus::Completed {
                 completed_session_ids.insert(state.session_id.as_str().to_string());
             }
             ambiguous_any |= state.status == MessageSubmissionStatus::AmbiguousPromptDispatch;
         }
+        self.release_unadmitted_turn_flags(&unadmitted_session_ids);
         if ambiguous_any {
             hint_layer::push(
                 window,
@@ -36210,6 +36070,26 @@ impl VibexWorkbench {
         self.composer_submission_states
             .retain(|state| state.message_idempotency_key != message_idempotency_key);
         cx.notify();
+    }
+
+    /// Dismisses an unsent message's status row and the row it painted.
+    ///
+    /// Dismissing alone left the optimistic user message on the timeline with
+    /// nothing behind it: the submission is terminal, so no authoritative row
+    /// will ever replace it. Discarding the draft is the other half of the
+    /// reader's answer that this message is gone.
+    fn discard_failed_submission(
+        &mut self,
+        session_id: &VibexSessionId,
+        message_idempotency_key: String,
+        cx: &mut Context<Self>,
+    ) {
+        // A newer dispatch owns the session's optimistic row now; the row being
+        // dismissed belongs to the failed message, which has no other trace.
+        if !self.session_turn_pending(session_id) {
+            self.discard_optimistic_user_message(session_id);
+        }
+        self.dismiss_submission_status(message_idempotency_key, cx);
     }
 
     fn submission_runtime_label(&self, selection: &SessionRuntimeSelection) -> String {
@@ -36297,6 +36177,22 @@ impl VibexWorkbench {
                             .to_string(),
                     };
                     let dismiss_key = state.message_idempotency_key.clone();
+                    let dismiss_session = state.session_id.clone();
+                    // A row that only reports "not sent" leaves the reader with
+                    // nothing to do about it: the text is gone from the composer
+                    // and the durable submission will never be delivered. The
+                    // draft is still held in the optimistic message, so it can
+                    // be handed back to the composer as an ordinary draft and
+                    // sent again under a fresh key.
+                    let recoverable = terminal
+                        && self
+                            .optimistic_user_messages
+                            .get(state.session_id.as_str())
+                            .is_some_and(|message| {
+                                !message.text.trim().is_empty() || !message.attachments.is_empty()
+                            });
+                    let recover_key = state.message_idempotency_key.clone();
+                    let recover_session = state.session_id.clone();
                     h_flex()
                         .w_full()
                         .min_w_0()
@@ -36331,7 +36227,32 @@ impl VibexWorkbench {
                                 .child(label),
                         )
                         .when(terminal, |this| {
-                            this.child(
+                            this.when(recoverable, |this| {
+                                this.child(
+                                    Button::new(SharedString::from(format!(
+                                        "retry-submission-{}",
+                                        state.message_idempotency_key
+                                    )))
+                                    .xsmall()
+                                    .ghost()
+                                    .compact()
+                                    .label(locale::text("Retry", "重试", "重試"))
+                                    .tooltip(locale::text(
+                                        "Put this message back in the composer",
+                                        "把这条消息放回输入框",
+                                        "把這則訊息放回輸入框",
+                                    ))
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.requeue_failed_submission(
+                                            &recover_session,
+                                            &recover_key,
+                                            window,
+                                            cx,
+                                        );
+                                    })),
+                                )
+                            })
+                            .child(
                                 Button::new(SharedString::from(format!(
                                     "dismiss-submission-{}",
                                     state.message_idempotency_key
@@ -36342,13 +36263,17 @@ impl VibexWorkbench {
                                 .size(px(24.0))
                                 .icon(IconName::Close)
                                 .tooltip(locale::text(
-                                    "Dismiss submission status",
-                                    "关闭提交状态",
-                                    "關閉提交狀態",
+                                    "Discard this unsent message",
+                                    "丢弃这条未发送的消息",
+                                    "丟棄這則未傳送的訊息",
                                 ))
                                 .on_click(cx.listener(
                                     move |this, _, _, cx| {
-                                        this.dismiss_submission_status(dismiss_key.clone(), cx)
+                                        this.discard_failed_submission(
+                                            &dismiss_session,
+                                            dismiss_key.clone(),
+                                            cx,
+                                        )
                                     },
                                 )),
                             )
@@ -36357,6 +36282,69 @@ impl VibexWorkbench {
                 }))
                 .into_any_element(),
         )
+    }
+
+    /// Hands one unsent message back to the composer as an ordinary draft.
+    ///
+    /// The durable submission is already terminal, so it will never be
+    /// delivered; the text lives only in the optimistic row the failed dispatch
+    /// installed. Restoring it — mentions included — is what makes the row's
+    /// "not sent" a recoverable state instead of a dead end, and the retry goes
+    /// out under a fresh idempotency key because the old one is spent.
+    fn requeue_failed_submission(
+        &mut self,
+        session_id: &VibexSessionId,
+        message_idempotency_key: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(message) = self
+            .optimistic_user_messages
+            .get(session_id.as_str())
+            .cloned()
+        else {
+            self.dismiss_submission_status(message_idempotency_key.to_string(), cx);
+            return;
+        };
+        self.discard_optimistic_user_message(session_id);
+        self.dismiss_submission_status(message_idempotency_key.to_string(), cx);
+        // The text an unsent message carries may refer to its attachments by
+        // marker, so the two have to be rebuilt together: a bare text restore
+        // would show `attachment_1_…_vbx` instead of the picture.
+        let (text, attachments, serial) = composer_queue_edit_insertion(
+            &message.text,
+            &message.attachments,
+            self.composer_attachment_serial,
+        );
+        let content = composer_content_with_mentions(&text, &message.mentions);
+        if self.selected_session_id.as_ref() != Some(session_id) {
+            // The row belongs to a session that is not on screen; the draft is
+            // what the reader will find when they go back to it.
+            self.composer_attachment_serial = serial;
+            self.composer_drafts.save(
+                session_id.as_str(),
+                ComposerDraft {
+                    content,
+                    attachments,
+                    command_entry: None,
+                    attachment_serial: serial,
+                    schedule: None,
+                },
+            );
+            cx.notify();
+            return;
+        }
+        self.composer_attachment_serial = serial;
+        let input = self.ensure_composer_input(window, cx);
+        input.update(cx, |input, cx| {
+            input.set_value(content, window, cx);
+            input.focus(window, cx);
+        });
+        self.composer_attachments = attachments;
+        self.composer_command_entry = None;
+        self.agent_error = None;
+        self.remember_composer_draft(cx);
+        cx.notify();
     }
 
     fn sync_inline_composer_attachments(&mut self, new_session: bool, cx: &App) {
@@ -38535,9 +38523,11 @@ impl VibexWorkbench {
         // A `file:` URL or a Windows drive path is a platform path, not a
         // workspace link: the first parses as its own scheme and the second as
         // a one-letter scheme, and `resolve_workspace_path` rejects the drive's
-        // `:`. Both are handed to the resolver that compares real paths.
+        // `:`. Both are handed to the resolver that compares real paths, with
+        // any editor location and POSIX drive slash removed first.
         if is_file_url(url) || is_windows_drive_path(url) {
-            if let Some(target) = agent_file_operation_preview_path(url, workspace_root) {
+            let destination = local_file_path(url);
+            if let Some(target) = agent_file_operation_preview_path(&destination, workspace_root) {
                 self.open_code_file(target, window, cx);
             }
             return;
@@ -39421,6 +39411,8 @@ impl VibexWorkbench {
                         provider_resolution_id,
                         note: None,
                         resolved_at_ms: unix_timestamp_ms(),
+                        // A person pressed the card in this window.
+                        responder: Some(vibex_core::ApprovalResponder::Human),
                     },
                 }))
                 .await
@@ -41378,6 +41370,29 @@ impl VibexWorkbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // A draft that names a collaborator tunes that collaborator. Taking the
+        // page's branch instead would repoint the page's Agent at the choice —
+        // the very overwrite the chip exists to avoid — and leave the chip
+        // showing a configuration nobody asked for.
+        if let Some(agent_id) = self
+            .delegation_subject_for(ComposerTarget::NewSession, cx)
+            .and_then(|mention| mention.agent_id)
+        {
+            self.clear_runtime_provider_keyboard_selection();
+            self.runtime_choice_menu_open = None;
+            self.new_session_runtime_menu_auth_source = None;
+            self.begin_runtime_menu_close(window, cx);
+            self.record_runtime_selection_use(&selection);
+            self.apply_delegation_chip_selection_for(
+                ComposerTarget::NewSession,
+                &agent_id,
+                &selection,
+                window,
+                cx,
+            );
+            self.new_session_error = None;
+            return;
+        }
         // The runtime cascade is the page's main way to change Agent, so a
         // choice made here is the one that most needs the sentence's mark to
         // cross rather than blink: the same cut the chips start, from the Agent
@@ -41431,6 +41446,19 @@ impl VibexWorkbench {
         next.config_values.insert(feature.id.clone(), value);
         match target {
             RuntimeFeatureTarget::NewSession => {
+                // A draft that names a collaborator tunes that collaborator, so
+                // the value belongs on its chip rather than on the page. The
+                // write needs a window this callback does not own, so it is
+                // recorded and applied by the next frame.
+                if let Some(agent_id) = self
+                    .delegation_subject_for(ComposerTarget::NewSession, cx)
+                    .and_then(|mention| mention.agent_id)
+                {
+                    self.pending_new_session_chip_selection = Some((agent_id, next.clone()));
+                    self.new_session_error = None;
+                    cx.notify();
+                    return;
+                }
                 self.set_new_session_runtime_selection(Some(next.clone()));
                 self.remember_runtime_selection(&next);
                 self.new_session_error = None;
@@ -41857,9 +41885,15 @@ impl VibexWorkbench {
         }
         // Creation is an authority operation: the local runtime is not required
         // because the backend facade also serves a paired remote runtime.
+        //
+        // A draft that names a collaborator runs on that collaborator's
+        // configuration, tuning included. Reading the page's own selection here
+        // would start the session on the Agent the page shows while the chip the
+        // reader tuned was silently ignored — the same disagreement the chip
+        // work exists to remove.
         let (Some(catalog), Some(selection)) = (
             self.runtime_catalog.as_ref(),
-            self.new_session_runtime_selection.clone(),
+            self.composer_runtime_selection_for(ComposerTarget::NewSession, cx),
         ) else {
             self.new_session_error = Some("No available Agent runtime is configured".into());
             cx.notify();
@@ -42170,6 +42204,7 @@ impl VibexWorkbench {
             let message_backend = backend.clone();
             let initial_message = if has_initial_message {
                 let initial_attachments = attachments;
+                let message_mentions = mentions.clone();
                 Some(async move {
                     let desired_runtime = message_backend
                         .agent()
@@ -42250,7 +42285,12 @@ impl VibexWorkbench {
                                     delivery: UserMessageDelivery::Prompt,
                                     prompt_context: None,
                                     provenance: vibex_core::MessageProvenance::HumanInput,
-                                    mentions: Vec::new(),
+                                    // The draft's chips belong to the message, so
+                                    // the turn's route note names the collaborator
+                                    // the reader addressed. Sending an empty list
+                                    // dropped that binding for every new session's
+                                    // first message.
+                                    mentions: message_mentions,
                                 },
                             })
                             .with_idempotency_key(format!(
@@ -42672,8 +42712,15 @@ impl VibexWorkbench {
         cx.notify();
     }
 
+    /// Commits one runtime choice made in a composer's cascade.
+    ///
+    /// `target` is which composer the choice came from. It used to be implied —
+    /// always the session — which meant the new-session page's own controls
+    /// wrote to the session the reader happened to have selected: opening the
+    /// page and changing a provider silently moved the conversation behind it.
     fn choose_runtime_selection(
         &mut self,
+        target: ComposerTarget,
         selection: SessionRuntimeSelection,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -42687,11 +42734,133 @@ impl VibexWorkbench {
         self.composer_runtime_menu_auth_source = None;
         self.begin_runtime_menu_close(window, cx);
         self.record_runtime_selection_use(&selection);
-        if self.selected_session_runtime_uninitialized() {
-            self.initialize_uninitialized_session_runtime(selection, cx);
+        // A draft that is tuning a collaborator owns this choice: it rewrites
+        // the chip the caret is on, and the composer's own runtime keeps what it
+        // had. Switching the session instead would silently move the reader's
+        // conversation while they were configuring somebody else's work.
+        if let Some(agent_id) = self
+            .delegation_subject_for(target, cx)
+            .and_then(|mention| mention.agent_id)
+        {
+            self.apply_delegation_chip_selection_for(target, &agent_id, &selection, window, cx);
             return;
         }
-        self.request_runtime_selection(selection, false, cx);
+        match target {
+            ComposerTarget::Session => {
+                if self.selected_session_runtime_uninitialized() {
+                    self.initialize_uninitialized_session_runtime(selection, cx);
+                    return;
+                }
+                self.request_runtime_selection(selection, false, cx);
+            }
+            ComposerTarget::NewSession => {
+                self.set_new_session_runtime_selection(Some(selection.clone()));
+                self.remember_runtime_selection(&selection);
+                self.new_session_error = None;
+                self.refresh_active_suggestions(ComposerTarget::NewSession, cx);
+                cx.notify();
+            }
+        }
+    }
+
+    /// Writes one tuned selection into the chip the reader is editing.
+    ///
+    /// The chip's encoded id is the whole contract: a draft, a clipboard copy
+    /// and a remote client all read the configuration from it, so the tuning
+    /// travels with the mention instead of living in a side table keyed by
+    /// Agent — which could only ever hold one configuration per Agent, no
+    /// matter how many times the draft named it.
+    /// Writes one tuned selection into the chip of one composer.
+    ///
+    /// Both composers carry the same kind of chip, so both write it the same
+    /// way. A new-session draft that addresses a collaborator would otherwise
+    /// silently discard the tuning: the page's controls accepted the choice and
+    /// then reported the page's own Agent again on the next frame.
+    fn apply_delegation_chip_selection_for(
+        &mut self,
+        target: ComposerTarget,
+        agent_id: &AgentId,
+        selection: &SessionRuntimeSelection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(input) = self.input_for_composer_target(target) else {
+            return;
+        };
+        let reference = vibex_core::VibexUseRef::runtime_option(
+            &vibex_desktop_runtime::selection_fingerprint(selection),
+        );
+        // The tuning rides in the chip so the controls can show it back exactly.
+        // Without it a tuned chip matches no catalogue entry, and the next
+        // frame would report the Agent's first entry as if the reader had
+        // chosen it.
+        let tuning = vibex_core::MentionTuning {
+            reasoning_effort: selection.reasoning_effort.clone(),
+            mode_id: selection.mode_id.clone(),
+            config_values: selection.config_values.clone(),
+        };
+        // The chip is rewritten to the Agent the choice names, not the one it
+        // used to carry. Changing the provider can move the selection to a
+        // different Agent, and reusing the old id left the chip pointing at the
+        // previous Agent's reference: the trigger showed the new configuration
+        // while the mention still named the old collaborator.
+        let next_agent_id = selection.agent_id.clone();
+        let agent_labels = self.agent_snapshots.clone();
+        let updates = input
+            .read(cx)
+            .tokens()
+            .iter()
+            .filter_map(|span| {
+                let mention = VibexUseMention::parse(span.token().id().as_ref())?;
+                if mention.kind != vibex_core::VibexUseMentionKind::Agent
+                    || mention.agent_id.as_ref() != Some(agent_id)
+                {
+                    return None;
+                }
+                let next =
+                    VibexUseMention::tuned_agent(&next_agent_id, &reference, None, tuning.clone());
+                // The visible text names the Agent, so it moves with the id.
+                // Keeping the old text would leave a chip labelled `@Claude`
+                // that sends a Codex mention.
+                let label = format!("@{}", runtime_agent_label(&agent_labels, &next_agent_id));
+                Some((
+                    span.range(),
+                    InlineToken::new(next.encode(), label.clone()).with_label(label),
+                ))
+            })
+            .collect::<Vec<_>>();
+        if updates.is_empty() {
+            // No chip to tune after all (the caret moved while the menu was
+            // open); fall back to the composer's own runtime so the choice is
+            // not dropped.
+            match target {
+                ComposerTarget::Session => {
+                    self.request_runtime_selection(selection.clone(), false, cx)
+                }
+                ComposerTarget::NewSession => {
+                    self.set_new_session_runtime_selection(Some(selection.clone()));
+                    self.remember_runtime_selection(selection);
+                    cx.notify();
+                }
+            }
+            return;
+        }
+        input.update(cx, |input, cx| {
+            for (range, token) in updates {
+                let _ = input.replace_range_with_token(range, token, window, cx);
+            }
+        });
+        // Remember the choice for the row that will be built next time. Without
+        // this the chip carried the configuration but nothing recorded it, so the
+        // next discovery fell back to the Agent's default and the row silently
+        // disagreed with the chip the reader had just tuned.
+        //
+        // The write goes to the same preference store a session switch uses, so
+        // "the last pair used" and "what the row carries" are one fact rather
+        // than two that can drift.
+        self.remember_runtime_selection(selection);
+        self.remember_composer_draft(cx);
+        cx.notify();
     }
 
     fn initialize_uninitialized_session_runtime(
@@ -42808,7 +42977,11 @@ impl VibexWorkbench {
         self.runtime_choice_menu_open = None;
         self.runtime_provider_scroll_to_selection = true;
         self.runtime_agent_row_reveal_pending = true;
-        let selection = self.selected_runtime_selection();
+        // Open on whatever the cascade is pointed at, which is the chip the
+        // caret is on when the reader is tuning a collaborator. Reading the
+        // session here listed the session's Agent's providers while the trigger
+        // above showed the chip's — two different configurations on one control.
+        let selection = self.composer_runtime_selection(cx);
         // Reopen at the selected provider/model group so an active session
         // does not make the user repeat the Agent selection step.
         self.composer_runtime_menu_view = ComposerRuntimeMenuView::AuthSource;
@@ -42910,10 +43083,12 @@ impl VibexWorkbench {
         self.runtime_provider_scroll_to_selection = true;
         self.runtime_agent_row_reveal_pending = true;
         self.new_session_runtime_menu_view = ComposerRuntimeMenuView::AuthSource;
+        // Same rule as the session composer: open on whatever the cascade is
+        // pointed at, so a chip being tuned lists its own providers rather than
+        // the page's Agent's.
         self.new_session_runtime_menu_auth_source = self
-            .new_session_runtime_selection
-            .as_ref()
-            .map(|selection| selection.auth_source.clone());
+            .composer_runtime_selection_for(ComposerTarget::NewSession, cx)
+            .map(|selection| selection.auth_source);
         cx.notify();
     }
 
@@ -48306,6 +48481,24 @@ impl VibexWorkbench {
         cx.notify();
     }
 
+    /// Keeps runs of tool calls folded while the Agent works.
+    ///
+    /// The fold changes which rows are drawn, not which rows exist, so the
+    /// measured heights are dropped and the page is rebuilt from the new
+    /// disclosure. It does not clear the reader's own choices: a run they
+    /// opened stays open, and a folded one can always be opened again.
+    fn set_auto_collapse_tool_calls(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if self.ui_state.session.auto_collapse_tool_calls == enabled {
+            return;
+        }
+        self.ui_state.session.auto_collapse_tool_calls = enabled;
+        self.invalidate_timeline_layout_measurements();
+        self.rebuild_timeline_sizes();
+        self.queue_ui_state();
+        self.sync_timeline_display_settings_to_runtime();
+        cx.notify();
+    }
+
     fn set_show_agent_generation_status(&mut self, enabled: bool, cx: &mut Context<Self>) {
         self.ui_state.session.show_agent_generation_status = enabled;
         if !enabled {
@@ -48334,6 +48527,7 @@ impl VibexWorkbench {
                 .session
                 .enhanced_command_execution_display,
             enhanced_file_operation_display: self.ui_state.session.enhanced_file_operation_display,
+            auto_collapse_tool_calls: self.ui_state.session.auto_collapse_tool_calls,
         });
     }
 
@@ -58257,7 +58451,12 @@ impl VibexWorkbench {
                             this.choose_new_session_runtime(selection.clone(), window, cx)
                         }
                         RuntimeChoiceMenuAction::ActiveSession(selection) => {
-                            this.choose_runtime_selection(selection.clone(), window, cx)
+                            this.choose_runtime_selection(
+                                ComposerTarget::Session,
+                                selection.clone(),
+                                window,
+                                cx,
+                            )
                         }
                         RuntimeChoiceMenuAction::Feature {
                             target,
@@ -58939,7 +59138,7 @@ impl VibexWorkbench {
                 if new_session {
                     self.choose_new_session_runtime(selection, window, cx);
                 } else {
-                    self.choose_runtime_selection(selection, window, cx);
+                    self.choose_runtime_selection(ComposerTarget::Session, selection, window, cx);
                 }
                 cx.stop_propagation();
             }
@@ -59353,6 +59552,7 @@ impl VibexWorkbench {
                                     );
                                 } else {
                                     this.choose_runtime_selection(
+                                        ComposerTarget::Session,
                                         click_selection.clone(),
                                         window,
                                         cx,
@@ -59517,7 +59717,12 @@ impl VibexWorkbench {
                                     cx,
                                 );
                             } else {
-                                this.choose_runtime_selection(click_selection.clone(), window, cx);
+                                this.choose_runtime_selection(
+                                    ComposerTarget::Session,
+                                    click_selection.clone(),
+                                    window,
+                                    cx,
+                                );
                             }
                         }))
                         .child(icon)
@@ -60044,7 +60249,15 @@ impl VibexWorkbench {
             });
         let content =
             runtime_selector_dropdown_content(model_icon, selected_runtime_label, compact, cx);
-        let agent_id = self.new_session_agent_id.clone();
+        // The cascade is pointed at whatever `selection` holds — the chip when
+        // one is being tuned — so the Agent it lists must come from there too.
+        // Reading the page's Agent listed the page's providers under a trigger
+        // that showed the chip's, and choosing one left the chip's Agent
+        // unchanged.
+        let agent_id = selection
+            .as_ref()
+            .map(|selection| selection.agent_id.clone())
+            .or_else(|| self.new_session_agent_id.clone());
         let mut auth_source_choices = agent_id
             .as_ref()
             .and_then(|agent_id| {
@@ -60133,7 +60346,11 @@ impl VibexWorkbench {
                 .flex_none()
                 .bg(cx.theme().border.opacity(0.70))
         };
+        let closing = self.runtime_menu_closing_since;
+        // See the current-session twin: a closed popover never paints this.
+        let menu_mounted = self.new_session_runtime_menu_open || closing.is_some();
         let menu_content = match menu_view {
+            _ if !menu_mounted => div().into_any_element(),
             ComposerRuntimeMenuView::AuthSource => match (catalog.as_ref(), agent_id.as_ref()) {
                 (Some(catalog), Some(agent_id)) => self.render_provider_model_groups(
                     agent_id,
@@ -60296,7 +60513,6 @@ impl VibexWorkbench {
             .shadow_lg()
             .child(menu_content);
 
-        let closing = self.runtime_menu_closing_since;
         let popover = Popover::new("new-session-runtime-cascade")
             .anchor(menu_placement.anchor)
             .appearance(false)
@@ -60324,7 +60540,32 @@ impl VibexWorkbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let selection = self.new_session_runtime_selection.clone();
+        // A chip tuning recorded by a callback that could not touch the input
+        // is applied here, where a window is available. It goes through the
+        // same writer the cascade uses, so there is one way to edit a token.
+        if let Some((agent_id, selection)) = self.pending_new_session_chip_selection.take() {
+            self.apply_delegation_chip_selection_for(
+                ComposerTarget::NewSession,
+                &agent_id,
+                &selection,
+                window,
+                cx,
+            );
+            self.remember_runtime_selection(&selection);
+        }
+        // A draft that names a collaborator is tuning that collaborator, exactly
+        // as the session composer does. Without this the page's controls always
+        // described the Agent being started, so a chip's depth, mode or feature
+        // values were unreachable from here.
+        let delegation_subject = self.delegation_subject_for(ComposerTarget::NewSession, cx);
+        let chip_selection = delegation_subject.as_ref().and_then(|mention| {
+            self.runtime_catalog
+                .as_deref()
+                .and_then(|catalog| delegation_chip_selection(catalog, mention))
+        });
+        let selection = chip_selection
+            .clone()
+            .or_else(|| self.new_session_runtime_selection.clone());
         let projection = selection.as_ref().and_then(|selection| {
             self.runtime_catalog
                 .as_ref()
@@ -62046,9 +62287,17 @@ impl VibexWorkbench {
                                                             .token({
                                                                 let agents = self
                                                                     .composer_agent_token_identities();
+                                                                let active = self
+                                                                    .delegation_chip_range_for(
+                                                                        ComposerTarget::NewSession,
+                                                                        cx,
+                                                                    );
                                                                 move |context, _, cx| {
                                                                     render_composer_inline_token(
-                                                                        context, &agents, cx,
+                                                                        context,
+                                                                        &agents,
+                                                                        active.clone(),
+                                                                        cx,
                                                                     )
                                                                 }
                                                             })
@@ -62164,6 +62413,47 @@ impl VibexWorkbench {
                                                         .flex_none()
                                                         .items_center()
                                                         .gap_1()
+                                                        // Same badge as the session composer:
+                                                        // without it the reader cannot tell
+                                                        // that these controls are tuning the
+                                                        // chip rather than the page.
+                                                        .when_some(
+                                                            delegation_subject
+                                                                .as_ref()
+                                                                .and_then(|mention| {
+                                                                    mention.agent_id.as_ref().map(
+                                                                        |agent_id| {
+                                                                            mention
+                                                                                .label
+                                                                                .clone()
+                                                                                .unwrap_or_else(
+                                                                                    || {
+                                                                                        agent_id
+                                                                                            .to_string()
+                                                                                    },
+                                                                                )
+                                                                        },
+                                                                    )
+                                                                }),
+                                                            |row, agent_label| {
+                                                                row.child(
+                                                                    Tag::color(ColorName::Blue)
+                                                                        .xsmall()
+                                                                        .rounded_full()
+                                                                        .h(px(20.0))
+                                                                        .px_2()
+                                                                        .font_medium()
+                                                                        .child(locale::text(
+                                                                            "Delegating to",
+                                                                            "委派给",
+                                                                            "委派給",
+                                                                        ))
+                                                                        .child(format!(
+                                                                            " {agent_label}"
+                                                                        )),
+                                                                )
+                                                            },
+                                                        )
                                                         .child(runtime_controls_cascade),
                                                 )
                                                 .child(
@@ -62787,6 +63077,7 @@ impl VibexWorkbench {
             .when(!turns.is_empty(), |this| {
                 this.child(
                     v_flex()
+                        .id("agent-timeline-context")
                         .size_full()
                         .min_h_0()
                         .min_w_0()
@@ -62934,7 +63225,18 @@ impl VibexWorkbench {
                             .py_4()
                             .gap_0(),
                         )
-                        .pinned_scrollbar(&self.timeline_scroll, ScrollbarAxis::Vertical),
+                        .pinned_scrollbar(&self.timeline_scroll, ScrollbarAxis::Vertical)
+                        .context_menu({
+                            let menu_entity = cx.weak_entity();
+                            move |menu, _, cx| {
+                                let Some(entity) = menu_entity.upgrade() else {
+                                    return menu;
+                                };
+                                entity.update(cx, |this, _| {
+                                    this.build_timeline_context_menu(menu, menu_entity.clone())
+                                })
+                            }
+                        }),
                 )
             });
         let runtime_controls = self.render_runtime_controls(live_session_id.as_ref(), cx);
@@ -63551,7 +63853,21 @@ impl VibexWorkbench {
                 .flex_none()
                 .bg(cx.theme().border.opacity(0.70))
         };
+        // One pane owns the cascade. Every other pane's Composer shares the
+        // flag, and a popover keys its open state by element id, so without both
+        // the scope and the id below a chip pressed in one pane opened in all of
+        // them — each one anchored to the last pane that painted a trigger.
+        let focused_pane = self.composer_menu_scope_focused();
+        let menu_open = self.composer_runtime_menu_open && focused_pane;
+        let closing = self.runtime_menu_closing_since.filter(|_| focused_pane);
+        let scope = self.composer_menu_scope();
+        // The Composer is rebuilt on every timeline frame, and a closed popover
+        // drops its content unpainted. Building the provider list anyway cost
+        // more than the rest of the frame: it walks and copies the whole model
+        // catalog.
+        let menu_mounted = menu_open || closing.is_some();
         let menu_content = match self.composer_runtime_menu_view {
+            _ if !menu_mounted => div().into_any_element(),
             ComposerRuntimeMenuView::AuthSource => self.render_provider_model_groups(
                 &menu_agent_id,
                 &catalog,
@@ -63632,7 +63948,12 @@ impl VibexWorkbench {
                         )
                         .on_click(cx.listener(
                             move |this, _, window, cx| {
-                                this.choose_runtime_selection(selection.clone(), window, cx)
+                                this.choose_runtime_selection(
+                                    ComposerTarget::Session,
+                                    selection.clone(),
+                                    window,
+                                    cx,
+                                )
                             },
                         ))
                     })
@@ -63744,15 +64065,6 @@ impl VibexWorkbench {
             .bg(cx.theme().popover)
             .shadow_lg()
             .child(menu_content);
-        // One pane owns the cascade. Every other pane's Composer shares the
-        // flag, and a popover keys its open state by element id, so without both
-        // the scope and the id below a chip pressed in one pane opened in all of
-        // them — each one anchored to the last pane that painted a trigger.
-        let focused_pane = self.composer_menu_scope_focused();
-        let menu_open = self.composer_runtime_menu_open && focused_pane;
-        let closing = self.runtime_menu_closing_since.filter(|_| focused_pane);
-        let scope = self.composer_menu_scope();
-
         let popover = Popover::new(format!("composer-runtime-cascade{scope}"))
             .anchor(menu_placement.anchor)
             .appearance(false)
@@ -65629,7 +65941,41 @@ impl VibexWorkbench {
             content = content.child(file_changes);
         }
 
-        content.into_any_element()
+        let fork_sequence = turn
+            .conclusion_row
+            .as_ref()
+            .map(|row| row.last_sequence)
+            .or_else(|| turn.process_rows.last().map(|row| row.last_sequence))
+            .or_else(|| turn.user_row.as_ref().map(|row| row.last_sequence))
+            .unwrap_or(0);
+        let menu_entity = cx.weak_entity();
+        let menu_context = TurnMenuContext {
+            turn_id: turn.id.clone(),
+            session_id: self.timeline.session_id.clone(),
+            fork_sequence,
+            process_collapsible,
+            process_expanded,
+            row_is_live_view: self.timeline.session_id.as_ref() == self.view_session_id.as_ref(),
+            fork_disabled: self.agent_action_pending
+                || self.fork_session_pending
+                || self.timeline.needs_authoritative_refetch,
+        };
+        // The child Agent rail reads a transcript that is not the borrowed view,
+        // so its turn commands would copy or toggle the focused session's turn.
+        // The rail keeps the per-message copy and quote menus instead.
+        if self.rendering_child_agent_timeline() {
+            return content.into_any_element();
+        }
+        content
+            .context_menu(move |menu, _, cx| {
+                let Some(entity) = menu_entity.upgrade() else {
+                    return menu;
+                };
+                entity.update(cx, |this, _| {
+                    this.build_turn_context_menu(menu, menu_entity.clone(), menu_context.clone())
+                })
+            })
+            .into_any_element()
     }
 
     fn render_turn_file_changes_card(
@@ -66014,47 +66360,6 @@ impl VibexWorkbench {
             .iter()
             .map(|agent| (agent.label.clone(), agent_brand_identity(agent)))
             .collect()
-    }
-
-    /// The pencil that opens one collaborator's configuration picker.
-    ///
-    /// It sits between the provider/model copy and the `Mention | Delegate`
-    /// halves: the copy says which configuration the row carries, and this is
-    /// the way to change it. The click is swallowed before the row's own
-    /// mention action can fire.
-    fn composer_delegation_edit_button(
-        &self,
-        target: ComposerTarget,
-        entry: &AgentCommandEntry,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let Some(agent_id) = delegation_agent_id(entry) else {
-            return Empty.into_any_element();
-        };
-        Button::new(format!(
-            "composer-delegation-edit:{}:{}",
-            target.id(),
-            entry.id
-        ))
-        .xsmall()
-        .ghost()
-        .compact()
-        .size(px(24.0))
-        .icon(Icon::default().path("icons/vibex/pencil.svg"))
-        .tooltip(locale::text(
-            "Change provider and model",
-            "修改供应商配置与模型",
-            "修改供應商設定與模型",
-        ))
-        .on_mouse_down(MouseButton::Left, |_, window, cx| {
-            window.prevent_default();
-            cx.stop_propagation();
-        })
-        .on_click(cx.listener(move |this, _, _, cx| {
-            cx.stop_propagation();
-            this.open_delegation_runtime_edit(agent_id.clone(), cx);
-        }))
-        .into_any_element()
     }
 
     /// The `Mention | Delegate` half of one collaborator row.
@@ -67184,6 +67489,43 @@ impl VibexWorkbench {
         } else {
             element
         };
+        // Process rows in the child Agent rail belong to a transcript that is
+        // not the borrowed view, so the activity menu could not read the row it
+        // was opened on. The rail stays read-only for process lines.
+        let element = if self.rendering_child_agent_timeline()
+            || matches!(
+                row.kind,
+                TimelineRowKind::UserMessage | TimelineRowKind::AgentMessage
+            ) {
+            element
+        } else {
+            let menu_entity = cx.weak_entity();
+            let menu_row_id = row.id.clone();
+            let menu_row_is_live_view =
+                self.timeline.session_id.as_ref() == self.view_session_id.as_ref();
+            div()
+                .id(format!("timeline-row-context:{}", row.id))
+                .w_full()
+                .min_w_0()
+                .context_menu(move |menu, window, cx| {
+                    let Some(entity) = menu_entity.upgrade() else {
+                        return menu;
+                    };
+                    let row_id = menu_row_id.clone();
+                    entity.update(cx, |this, cx| {
+                        this.build_activity_context_menu(
+                            menu,
+                            window,
+                            cx,
+                            menu_entity.clone(),
+                            row_id,
+                            menu_row_is_live_view,
+                        )
+                    })
+                })
+                .child(element)
+                .into_any_element()
+        };
         self.highlight_session_search_rows(std::slice::from_ref(row), element, cx)
     }
 
@@ -67766,6 +68108,1281 @@ impl VibexWorkbench {
         if let Some(body) = body {
             cx.write_to_clipboard(ClipboardItem::new_string(body));
         }
+    }
+
+    /// The row with `row_id` in the conversation this view is drawing.
+    fn timeline_row_by_id(&self, row_id: &str) -> Option<&TimelineRow> {
+        self.conversation_turns_cache.iter().find_map(|turn| {
+            turn.user_row
+                .as_ref()
+                .filter(|row| row.id == row_id)
+                .or_else(|| turn.process_rows.iter().find(|row| row.id == row_id))
+                .or_else(|| turn.conclusion_row.as_ref().filter(|row| row.id == row_id))
+        })
+    }
+
+    /// Copy the conversation as prose: user messages and Agent answers only.
+    ///
+    /// Process rows are deliberately left out. A reader asking for the
+    /// conversation wants a transcript they can paste into an issue or a
+    /// document, not every command the Agent ran on the way there.
+    fn copy_conversation(&mut self, cx: &mut Context<Self>) {
+        let title = self
+            .view_session()
+            .map(|session| session.title.trim().to_string())
+            .filter(|title| !title.is_empty());
+        let turns = self.conversation_turns_cached();
+        let mut out = String::new();
+        if let Some(title) = title {
+            out.push_str("# ");
+            out.push_str(&title);
+            out.push_str("\n\n");
+        }
+        for turn in turns.iter() {
+            if let Some(row) = turn.user_row.as_ref() {
+                push_conversation_row(&mut out, "You", &row.body);
+            }
+            if let Some(row) = turn.conclusion_row.as_ref() {
+                push_conversation_row(&mut out, "Agent", &row.body);
+            }
+        }
+        if !out.trim().is_empty() {
+            cx.write_to_clipboard(ClipboardItem::new_string(out.trim_end().to_string()));
+        }
+    }
+
+    /// Copy one turn's user message and final answer.
+    fn copy_turn(&mut self, turn_id: &str, cx: &mut Context<Self>) {
+        let turns = self.conversation_turns_cached();
+        let Some(turn) = turns.iter().find(|turn| turn.id == turn_id) else {
+            return;
+        };
+        let mut out = String::new();
+        if let Some(row) = turn.user_row.as_ref() {
+            push_conversation_row(&mut out, "You", &row.body);
+        }
+        if let Some(row) = turn.conclusion_row.as_ref() {
+            push_conversation_row(&mut out, "Agent", &row.body);
+        }
+        if !out.trim().is_empty() {
+            cx.write_to_clipboard(ClipboardItem::new_string(out.trim_end().to_string()));
+        }
+    }
+
+    /// Insert `text` as a Markdown blockquote at the composer caret.
+    ///
+    /// The quote is inserted rather than replacing the draft: a reader can
+    /// select a paragraph, quote it, and keep writing around it. The composer
+    /// keeps the keyboard afterwards so the follow-up can be typed straight
+    /// away.
+    fn quote_in_composer(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let quoted = context_menu_blockquote(text);
+        if quoted.is_empty() {
+            return;
+        }
+        let input = self.ensure_composer_input(window, cx);
+        let existing = input.read(cx).value().to_string();
+        let prefix = if existing.trim().is_empty() || existing.ends_with("\n\n") {
+            ""
+        } else if existing.ends_with('\n') {
+            "\n"
+        } else {
+            "\n\n"
+        };
+        let insertion = format!("{prefix}{quoted}\n\n");
+        input.update(cx, |input, cx| {
+            input.insert(insertion, window, cx);
+            input.focus(window, cx);
+        });
+        cx.notify();
+    }
+
+    /// Open the conversation find bar, optionally seeded with a query.
+    fn open_conversation_find_with_query(
+        &mut self,
+        query: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.conversation_context_active() {
+            return;
+        }
+        self.conversation_find_open = true;
+        self.conversation_find.update(cx, |input, cx| {
+            if let Some(query) = query.as_ref().filter(|query| !query.trim().is_empty()) {
+                input.set_value(query.clone(), window, cx);
+            }
+            input.focus(window, cx);
+        });
+        self.reveal_active_conversation_find_match(cx);
+        cx.notify();
+    }
+
+    /// The Markdown source behind a selection that stays inside one surface.
+    ///
+    /// A selection spanning rows has no single source range, so it copies as
+    /// plain text. User messages are escaped for rendering, so their source is
+    /// not useful as Markdown and they are deliberately excluded by the caller.
+    fn selected_markdown_source(
+        &self,
+        child_session: Option<&str>,
+        prefixes: &[String],
+        window_text: &str,
+        cx: &App,
+    ) -> Option<String> {
+        let table = match child_session {
+            Some(session_id) => self.child_agent_markdown_states.get(session_id)?,
+            None => &self.markdown_text_states,
+        };
+        let mut matches = 0;
+        let mut source = None;
+        for (id, entry) in table {
+            if !markdown_surface_matches(id, prefixes) {
+                continue;
+            }
+            let (selected, range) = {
+                let state = entry.state.read(cx);
+                (state.selected_text(), state.selected_source_range())
+            };
+            if selected.is_empty() {
+                continue;
+            }
+            matches += 1;
+            if selected.trim() != window_text.trim() {
+                continue;
+            }
+            if let Some(range) = range
+                && let Some(text) = entry.source.get(range)
+            {
+                source = Some(text.to_string());
+            }
+        }
+        (matches == 1).then_some(source).flatten()
+    }
+
+    /// Whether the right-clicked row participates in the current selection.
+    fn row_has_markdown_selection(
+        &self,
+        child_session: Option<&str>,
+        prefixes: &[String],
+        cx: &App,
+    ) -> bool {
+        let table = match child_session {
+            Some(session_id) => self.child_agent_markdown_states.get(session_id),
+            None => Some(&self.markdown_text_states),
+        };
+        table.is_some_and(|table| {
+            table.iter().any(|(id, entry)| {
+                markdown_surface_matches(id, prefixes)
+                    && !entry.state.read(cx).selected_text().is_empty()
+            })
+        })
+    }
+
+    /// The shared readable detail projection behind an activity row.
+    fn activity_details(&self, row: &TimelineRow) -> Vec<vibex_ui::tool_detail::Detail> {
+        let payload = self.timeline_row_latest_item(row).map(|item| &item.payload);
+        let workspace_root = self
+            .view_session()
+            .map(|session| session.workspace_root.as_str());
+        vibex_ui::tool_detail::project(
+            row,
+            payload,
+            workspace_root,
+            locale::current_locale().shared(),
+        )
+    }
+
+    /// Copy the text an activity row is asking about.
+    fn copy_activity_text(&mut self, row_id: &str, mode: ActivityCopyMode, cx: &mut Context<Self>) {
+        let Some(row) = self.timeline_row_by_id(row_id).cloned() else {
+            return;
+        };
+        let payload = self
+            .timeline_row_latest_item(&row)
+            .map(|item| item.payload.clone());
+        let details = self.activity_details(&row);
+        let text = match mode {
+            ActivityCopyMode::Primary => match payload.as_ref() {
+                Some(TimelinePayload::Command(command)) => command.command.clone(),
+                Some(TimelinePayload::FileOperation(operation)) => operation.path.clone(),
+                _ => row.body.clone(),
+            },
+            ActivityCopyMode::Path => match payload.as_ref() {
+                Some(TimelinePayload::FileOperation(operation)) => operation.path.clone(),
+                _ => row.body.clone(),
+            },
+            ActivityCopyMode::Diff => match payload.as_ref() {
+                Some(TimelinePayload::FileOperation(operation)) => operation
+                    .canonical_patch()
+                    .map(|patch| patch.text)
+                    .unwrap_or_default(),
+                _ => String::new(),
+            },
+            ActivityCopyMode::Output => match payload.as_ref() {
+                Some(TimelinePayload::Command(command)) => timeline_tool_detail::output(
+                    command.raw_extension.as_ref(),
+                    command.output_summary.as_deref(),
+                    command.exit_code,
+                )
+                .unwrap_or_default(),
+                Some(TimelinePayload::ToolCall(_)) | Some(TimelinePayload::WebSearch(_)) => {
+                    let label = locale::text("Output", "输出", "輸出");
+                    details
+                        .iter()
+                        .find(|detail| detail.label() == label)
+                        .map(|detail| detail.text())
+                        .unwrap_or_default()
+                }
+                _ => String::new(),
+            },
+            ActivityCopyMode::Input => match payload.as_ref() {
+                Some(TimelinePayload::Command(command)) => command.command.clone(),
+                Some(TimelinePayload::ToolCall(_)) | Some(TimelinePayload::WebSearch(_)) => {
+                    let label = locale::text("Input", "输入", "輸入");
+                    details
+                        .iter()
+                        .find(|detail| detail.label() == label)
+                        .map(|detail| detail.copy_text())
+                        .unwrap_or_default()
+                }
+                _ => String::new(),
+            },
+            ActivityCopyMode::Details => {
+                let text = vibex_ui::tool_detail::text(&details);
+                if text.trim().is_empty() {
+                    row.body.clone()
+                } else {
+                    text
+                }
+            }
+        };
+        if !text.trim().is_empty() {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        }
+    }
+
+    /// The selection a right-click on `row` should act on, if any.
+    fn selection_menu_context_for_row(
+        &self,
+        window: &mut Window,
+        cx: &mut App,
+        child_session: Option<&str>,
+        prefixes: &[String],
+        allow_markdown: bool,
+    ) -> Option<SelectionMenuContext> {
+        if !TextSelection::has_selection(window, cx)
+            || !TextSelection::is_selectable_at(window.mouse_position(), window, cx)
+        {
+            return None;
+        }
+        let text = TextSelection::selected_text(window, cx);
+        if text.trim().is_empty() || !self.row_has_markdown_selection(child_session, prefixes, cx) {
+            return None;
+        }
+        let markdown = allow_markdown
+            .then(|| self.selected_markdown_source(child_session, prefixes, &text, cx))
+            .flatten();
+        Some(SelectionMenuContext { text, markdown })
+    }
+
+    fn build_selection_context_menu(
+        &mut self,
+        menu: PopupMenu,
+        entity: WeakEntity<Self>,
+        selection: SelectionMenuContext,
+    ) -> PopupMenu {
+        let count = selection.text.chars().count();
+        let mut menu = menu
+            .min_w(px(220.0))
+            .max_w(px(320.0))
+            .item(PopupMenuItem::label(selection_menu_header(count)))
+            .separator();
+
+        let copy_text = selection.text.clone();
+        menu = menu.item(
+            PopupMenuItem::new(locale::text("Copy", "复制", "複製"))
+                .icon(IconName::Copy)
+                .on_click(move |_, _, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(copy_text.clone()));
+                }),
+        );
+
+        if let Some(markdown) = selection.markdown.clone() {
+            menu = menu.item(
+                PopupMenuItem::new(locale::text(
+                    "Copy as Markdown",
+                    "复制为 Markdown",
+                    "複製為 Markdown",
+                ))
+                .on_click(move |_, _, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(markdown.clone()));
+                }),
+            );
+        }
+
+        let quote_entity = entity.clone();
+        let quote_text = selection
+            .markdown
+            .clone()
+            .unwrap_or_else(|| selection.text.clone());
+        menu = menu.item(
+            PopupMenuItem::new(locale::text(
+                "Quote in Composer",
+                "引用到输入框",
+                "引用到輸入框",
+            ))
+            .on_click(move |_, window, cx| {
+                let text = quote_text.clone();
+                let _ = quote_entity.update(cx, |this, cx| {
+                    this.quote_in_composer(&text, window, cx);
+                });
+            }),
+        );
+
+        let find_entity = entity.clone();
+        let find_query = selection_find_query(&selection.text);
+        menu = menu.separator().item(
+            PopupMenuItem::new(locale::text(
+                "Find in Conversation",
+                "在会话中查找",
+                "在工作階段中尋找",
+            ))
+            .icon(IconName::Search)
+            .disabled(find_query.is_empty())
+            .on_click(move |_, window, cx| {
+                let query = find_query.clone();
+                let _ = find_entity.update(cx, |this, cx| {
+                    this.open_conversation_find_with_query(Some(query), window, cx);
+                });
+            }),
+        );
+
+        if let Some(url) = single_external_url(&selection.text) {
+            menu = menu.item(
+                PopupMenuItem::new(locale::text("Open Link", "打开链接", "開啟連結")).on_click(
+                    move |_, _, cx| {
+                        cx.open_url(&url);
+                    },
+                ),
+            );
+        }
+
+        menu
+    }
+
+    fn build_user_message_context_menu(
+        &mut self,
+        menu: PopupMenu,
+        window: &mut Window,
+        cx: &mut App,
+        entity: WeakEntity<Self>,
+        context: UserMessageMenuContext,
+    ) -> PopupMenu {
+        let prefixes = vec![format!("user-message-text:{}", context.row_id)];
+        if let Some(selection) = self.selection_menu_context_for_row(
+            window,
+            cx,
+            context.child_session.as_deref(),
+            &prefixes,
+            false,
+        ) {
+            return self.build_selection_context_menu(menu, entity, selection);
+        }
+
+        let has_body = !context.row.body.trim().is_empty();
+        let has_attachments = !context.attachments.is_empty();
+        let timestamp = context.timestamp;
+        let locale = self.resolved_locale();
+        let mut header = locale::text("You", "你", "你").to_string();
+        if let Some(timestamp) = timestamp {
+            header.push_str(" · ");
+            header.push_str(&format_timeline_hover_time(timestamp, locale));
+        }
+        if !context.row_is_live_view {
+            header.push_str(" · ");
+            header.push_str(locale::text("Read only", "只读", "唯讀"));
+        }
+
+        let mut menu = menu
+            .min_w(px(220.0))
+            .max_w(px(320.0))
+            .item(PopupMenuItem::label(header))
+            .separator();
+
+        if has_body || has_attachments {
+            let copy_item = context.copy_item.clone();
+            menu = menu.item(
+                PopupMenuItem::new(locale::text("Copy", "复制", "複製"))
+                    .icon(IconName::Copy)
+                    .on_click(move |_, _, cx| {
+                        cx.write_to_clipboard(copy_item.clone());
+                    }),
+            );
+        }
+
+        if has_body {
+            let quote_entity = entity.clone();
+            let quote_text = context.row.body.clone();
+            menu = menu.item(
+                PopupMenuItem::new(locale::text(
+                    "Quote in Composer",
+                    "引用到输入框",
+                    "引用到輸入框",
+                ))
+                .on_click(move |_, window, cx| {
+                    let text = quote_text.clone();
+                    let _ = quote_entity.update(cx, |this, cx| {
+                        this.quote_in_composer(&text, window, cx);
+                    });
+                }),
+            );
+        }
+
+        let fork_disabled = self.agent_action_pending
+            || self.fork_session_pending
+            || self.timeline.needs_authoritative_refetch
+            || !context.turn_complete;
+        let show_fork =
+            context.session_id.is_some() && context.row_is_live_view && context.last_sequence > 0;
+        let show_edit = context.latest_user_message
+            && context.row_is_live_view
+            && context.edit_action_state != UserMessageEditActionState::Hidden;
+
+        if show_fork || show_edit {
+            menu = menu.separator();
+        }
+        if show_fork {
+            let fork_entity = entity.clone();
+            let fork_session_id = context.session_id.clone();
+            let fork_sequence = context.last_sequence;
+            menu = menu.item(
+                PopupMenuItem::new(locale::text("Fork from Here", "从此处分叉", "從此處分支"))
+                    .icon(Icon::default().path("icons/vibex/git-branch.svg"))
+                    .disabled(fork_disabled)
+                    .on_click(move |_, window, cx| {
+                        let Some(session_id) = fork_session_id.clone() else {
+                            return;
+                        };
+                        let _ = fork_entity.update(cx, |this, cx| {
+                            this.fork_session_at(session_id, fork_sequence, window, cx);
+                        });
+                    }),
+            );
+        }
+        if show_edit {
+            if show_fork {
+                menu = menu.separator();
+            }
+            let edit_entity = entity.clone();
+            let edit_row_id = context.row.id.clone();
+            let edit_turn_id = context
+                .turn_id
+                .clone()
+                .unwrap_or_else(|| context.row.id.clone());
+            let edit_session_id = context.session_id.clone();
+            let edit_user_sequence = context.first_sequence;
+            let edit_end_sequence = context.authoritative_end_sequence;
+            let edit_body = context.row.body.clone();
+            let edit_attachments = context.attachments.clone();
+            let edit_mentions = context.mentions.clone();
+            menu = menu.item(
+                PopupMenuItem::new(locale::text(
+                    "Edit and Resend",
+                    "编辑并重新发送",
+                    "編輯並重新傳送",
+                ))
+                .icon(Icon::default().path("icons/vibex/pencil.svg"))
+                .disabled(context.edit_action_state != UserMessageEditActionState::Enabled)
+                .on_click(move |_, window, cx| {
+                    let Some(source_session_id) = edit_session_id.clone() else {
+                        return;
+                    };
+                    let row_id = edit_row_id.clone();
+                    let turn_id = edit_turn_id.clone();
+                    let body = edit_body.clone();
+                    let attachments = edit_attachments.clone();
+                    let mentions = edit_mentions.clone();
+                    let _ = edit_entity.update(cx, |this, cx| {
+                        this.begin_inline_user_message_edit(
+                            turn_id,
+                            row_id,
+                            source_session_id,
+                            edit_user_sequence,
+                            edit_end_sequence,
+                            body,
+                            attachments,
+                            mentions,
+                            window,
+                            cx,
+                        );
+                    });
+                }),
+            );
+        }
+
+        menu
+    }
+
+    fn build_agent_message_context_menu(
+        &mut self,
+        menu: PopupMenu,
+        window: &mut Window,
+        cx: &mut App,
+        entity: WeakEntity<Self>,
+        context: AgentMessageMenuContext,
+    ) -> PopupMenu {
+        let prefixes = vec![
+            format!("markdown:{}", context.row_id),
+            format!("markdown-chunk:{}", context.row_id),
+        ];
+        if let Some(selection) = self.selection_menu_context_for_row(
+            window,
+            cx,
+            context.child_session.as_deref(),
+            &prefixes,
+            true,
+        ) {
+            return self.build_selection_context_menu(menu, entity, selection);
+        }
+
+        let has_body = !context.row.body.trim().is_empty();
+        let timestamp = context.timestamp;
+        let locale = self.resolved_locale();
+        let mut header = locale::text("Agent", "Agent", "Agent").to_string();
+        if let Some(timestamp) = timestamp {
+            header.push_str(" · ");
+            header.push_str(&format_timeline_hover_time(timestamp, locale));
+        }
+        if context.streaming {
+            header.push_str(" · ");
+            header.push_str(locale::text("Responding…", "响应中…", "回應中…"));
+        }
+
+        let mut menu = menu
+            .min_w(px(220.0))
+            .max_w(px(320.0))
+            .item(PopupMenuItem::label(header))
+            .separator();
+
+        if has_body {
+            let copy_body = context.row.body.clone();
+            menu = menu.item(
+                PopupMenuItem::new(if context.streaming {
+                    locale::text("Copy Current Text", "复制当前内容", "複製目前內容")
+                } else {
+                    locale::text("Copy", "复制", "複製")
+                })
+                .icon(IconName::Copy)
+                .on_click(move |_, _, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(copy_body.clone()));
+                }),
+            );
+        }
+
+        if has_body && !context.streaming {
+            let plain_body = markdown_plain_text(&context.row.body);
+            menu = menu.item(
+                PopupMenuItem::new(locale::text(
+                    "Copy as Plain Text",
+                    "复制为纯文本",
+                    "複製為純文字",
+                ))
+                .on_click(move |_, _, cx| {
+                    if !plain_body.trim().is_empty() {
+                        cx.write_to_clipboard(ClipboardItem::new_string(plain_body.clone()));
+                    }
+                }),
+            );
+
+            let quote_entity = entity.clone();
+            let quote_text = context.row.body.clone();
+            menu = menu.item(
+                PopupMenuItem::new(locale::text(
+                    "Quote in Composer",
+                    "引用到输入框",
+                    "引用到輸入框",
+                ))
+                .on_click(move |_, window, cx| {
+                    let text = quote_text.clone();
+                    let _ = quote_entity.update(cx, |this, cx| {
+                        this.quote_in_composer(&text, window, cx);
+                    });
+                }),
+            );
+        }
+
+        if context.foldable && !context.streaming && context.child_session.is_none() {
+            let toggle_entity = entity.clone();
+            let toggle_row_id = context.row.id.clone();
+            let toggle_turn_id = context.turn_id.clone();
+            let revealed = self.timeline_row_body_revealed(&context.row.id);
+            menu = menu.separator().item(
+                PopupMenuItem::new(if revealed {
+                    locale::text("Collapse Answer", "收起回答", "收合回答")
+                } else {
+                    locale::text("Expand Answer", "展开回答", "展開回答")
+                })
+                .on_click(move |_, _, cx| {
+                    let row_id = toggle_row_id.clone();
+                    let turn_id = toggle_turn_id.clone();
+                    let _ = toggle_entity.update(cx, |this, cx| {
+                        this.toggle_timeline_row_body(row_id, turn_id, cx);
+                    });
+                }),
+            );
+        }
+
+        let fork_disabled = self.agent_action_pending
+            || self.fork_session_pending
+            || self.timeline.needs_authoritative_refetch;
+        // The child Agent rail is a read-only transcript: forking or stopping
+        // from it would act on the focused session instead of the one on screen.
+        if !context.streaming
+            && context.row_is_live_view
+            && context.last_sequence > 0
+            && context.child_session.is_none()
+        {
+            let fork_entity = entity.clone();
+            let fork_session_id = context.session_id.clone();
+            let fork_sequence = context.last_sequence;
+            menu = menu.separator().item(
+                PopupMenuItem::new(locale::text("Fork from Here", "从此处分叉", "從此處分支"))
+                    .icon(Icon::default().path("icons/vibex/git-branch.svg"))
+                    .disabled(fork_disabled)
+                    .on_click(move |_, window, cx| {
+                        let Some(session_id) = fork_session_id.clone() else {
+                            return;
+                        };
+                        let _ = fork_entity.update(cx, |this, cx| {
+                            this.fork_session_at(session_id, fork_sequence, window, cx);
+                        });
+                    }),
+            );
+        }
+
+        if context.streaming && context.row_is_live_view && context.child_session.is_none() {
+            let stop_entity = entity.clone();
+            let stop_session_id = context.session_id.clone();
+            menu = menu.separator().item(
+                PopupMenuItem::new(locale::text("Stop Response", "停止响应", "停止回應")).on_click(
+                    move |_, window, cx| {
+                        let _ = stop_entity.update(cx, |this, cx| {
+                            // Act on the session whose menu was opened, not on
+                            // whichever view the workbench currently borrows.
+                            this.with_session_view_for_render(stop_session_id.as_ref(), |this| {
+                                this.interrupt_session(window, cx)
+                            });
+                        });
+                    },
+                ),
+            );
+        }
+
+        menu
+    }
+
+    fn activity_copy_item(
+        entity: WeakEntity<Self>,
+        row_id: &str,
+        label: &'static str,
+        mode: ActivityCopyMode,
+    ) -> PopupMenuItem {
+        let row_id = row_id.to_string();
+        PopupMenuItem::new(label)
+            .icon(IconName::Copy)
+            .on_click(move |_, _, cx| {
+                let row_id = row_id.clone();
+                let _ = entity.update(cx, |this, cx| {
+                    this.copy_activity_text(&row_id, mode, cx);
+                });
+            })
+    }
+
+    fn build_activity_context_menu(
+        &mut self,
+        menu: PopupMenu,
+        window: &mut Window,
+        cx: &mut App,
+        entity: WeakEntity<Self>,
+        row_id: String,
+        row_is_live_view: bool,
+    ) -> PopupMenu {
+        let Some(row) = self.timeline_row_by_id(&row_id).cloned() else {
+            return menu;
+        };
+
+        if matches!(
+            row.kind,
+            TimelineRowKind::Reasoning | TimelineRowKind::Plan | TimelineRowKind::TodoUpdate
+        ) {
+            let prefixes = vec![format!("thought:{}", row.id)];
+            if let Some(selection) = self.selection_menu_context_for_row(
+                window,
+                cx,
+                self.child_agent_render_session
+                    .as_ref()
+                    .map(|session_id| session_id.as_str()),
+                &prefixes,
+                true,
+            ) {
+                return self.build_selection_context_menu(menu, entity, selection);
+            }
+        }
+
+        let payload = self
+            .timeline_row_latest_item(&row)
+            .map(|item| item.payload.clone());
+        let details = self.activity_details(&row);
+        let input_label = locale::text("Input", "输入", "輸入");
+        let output_label = locale::text("Output", "输出", "輸出");
+        let has_input = details.iter().any(|detail| detail.label() == input_label);
+        let has_output = details.iter().any(|detail| detail.label() == output_label);
+        let has_details = !details.is_empty() || !row.body.trim().is_empty();
+        let timestamp = self.timeline_row_timestamp(&row);
+        let locale = self.resolved_locale();
+        let mut header = activity_row_kind_label(row.kind).to_string();
+        if let Some(timestamp) = timestamp {
+            header.push_str(" · ");
+            header.push_str(&format_timeline_hover_time(timestamp, locale));
+        }
+
+        let mut menu = menu
+            .min_w(px(220.0))
+            .max_w(px(320.0))
+            .item(PopupMenuItem::label(header))
+            .separator();
+
+        match row.kind {
+            TimelineRowKind::Reasoning => {
+                let open = self.reasoning_row_open(&row.id);
+                let toggle_entity = entity.clone();
+                let toggle_row_id = row.id.clone();
+                let toggle_turn_id = row.turn_id.clone();
+                menu = menu
+                    .item(Self::activity_copy_item(
+                        entity.clone(),
+                        &row.id,
+                        locale::text("Copy Thought", "复制思考", "複製思考"),
+                        ActivityCopyMode::Primary,
+                    ))
+                    .when(row_is_live_view && !row.body.trim().is_empty(), |menu| {
+                        let quote_entity = entity.clone();
+                        let quote_row_id = row.id.clone();
+                        menu.item(
+                            PopupMenuItem::new(locale::text(
+                                "Quote in Composer",
+                                "引用到输入框",
+                                "引用到輸入框",
+                            ))
+                            .on_click(move |_, window, cx| {
+                                let row_id = quote_row_id.clone();
+                                let _ = quote_entity.update(cx, |this, cx| {
+                                    let body = this
+                                        .timeline_row_by_id(&row_id)
+                                        .map(|row| row.body.clone())
+                                        .unwrap_or_default();
+                                    this.quote_in_composer(&body, window, cx);
+                                });
+                            }),
+                        )
+                    })
+                    .separator()
+                    .item(
+                        PopupMenuItem::new(if open {
+                            locale::text("Collapse Thought", "收起思考", "收合思考")
+                        } else {
+                            locale::text("Expand Thought", "展开思考", "展開思考")
+                        })
+                        .on_click(move |_, _, cx| {
+                            let row_id = toggle_row_id.clone();
+                            let turn_id = toggle_turn_id.clone();
+                            let _ = toggle_entity.update(cx, |this, cx| {
+                                this.toggle_reasoning_expansion(row_id, turn_id, open, cx);
+                            });
+                        }),
+                    );
+            }
+            TimelineRowKind::Plan | TimelineRowKind::TodoUpdate => {
+                let open = self
+                    .timeline_command_expansion
+                    .get(&row.id)
+                    .copied()
+                    .unwrap_or(false);
+                let toggle_entity = entity.clone();
+                let toggle_row_id = row.id.clone();
+                let toggle_turn_id = row.turn_id.clone();
+                menu = menu
+                    .item(Self::activity_copy_item(
+                        entity.clone(),
+                        &row.id,
+                        locale::text("Copy Plan", "复制计划", "複製計畫"),
+                        ActivityCopyMode::Primary,
+                    ))
+                    .when(row_is_live_view && !row.body.trim().is_empty(), |menu| {
+                        let quote_entity = entity.clone();
+                        let quote_row_id = row.id.clone();
+                        menu.item(
+                            PopupMenuItem::new(locale::text(
+                                "Quote in Composer",
+                                "引用到输入框",
+                                "引用到輸入框",
+                            ))
+                            .on_click(move |_, window, cx| {
+                                let row_id = quote_row_id.clone();
+                                let _ = quote_entity.update(cx, |this, cx| {
+                                    let body = this
+                                        .timeline_row_by_id(&row_id)
+                                        .map(|row| row.body.clone())
+                                        .unwrap_or_default();
+                                    this.quote_in_composer(&body, window, cx);
+                                });
+                            }),
+                        )
+                    })
+                    .separator()
+                    .item(
+                        PopupMenuItem::new(if open {
+                            locale::text("Collapse Plan", "收起计划", "收合計畫")
+                        } else {
+                            locale::text("Expand Plan", "展开计划", "展開計畫")
+                        })
+                        .on_click(move |_, _, cx| {
+                            let row_id = toggle_row_id.clone();
+                            let turn_id = toggle_turn_id.clone();
+                            let _ = toggle_entity.update(cx, |this, cx| {
+                                this.set_timeline_disclosure(row_id, turn_id.as_deref(), !open);
+                                cx.notify();
+                            });
+                        }),
+                    );
+            }
+            TimelineRowKind::Command => {
+                let open = self
+                    .timeline_command_expansion
+                    .get(&row.id)
+                    .copied()
+                    .unwrap_or(false);
+                let toggle_entity = entity.clone();
+                let toggle_row_id = row.id.clone();
+                let toggle_turn_id = row.turn_id.clone();
+                menu = menu
+                    .item(Self::activity_copy_item(
+                        entity.clone(),
+                        &row.id,
+                        locale::text("Copy Command", "复制命令", "複製命令"),
+                        ActivityCopyMode::Primary,
+                    ))
+                    .when(has_output, |menu| {
+                        menu.item(Self::activity_copy_item(
+                            entity.clone(),
+                            &row.id,
+                            locale::text("Copy Output", "复制输出", "複製輸出"),
+                            ActivityCopyMode::Output,
+                        ))
+                    })
+                    .item(Self::activity_copy_item(
+                        entity.clone(),
+                        &row.id,
+                        locale::text("Copy Details", "复制详情", "複製詳細資料"),
+                        ActivityCopyMode::Details,
+                    ))
+                    .separator()
+                    .item(
+                        PopupMenuItem::new(if open {
+                            locale::text("Hide Details", "隐藏详情", "隱藏詳細資料")
+                        } else {
+                            locale::text("Show Details", "显示详情", "顯示詳細資料")
+                        })
+                        .on_click(move |_, _, cx| {
+                            let row_id = toggle_row_id.clone();
+                            let turn_id = toggle_turn_id.clone();
+                            let _ = toggle_entity.update(cx, |this, cx| {
+                                this.set_timeline_disclosure(row_id, turn_id.as_deref(), !open);
+                                cx.notify();
+                            });
+                        }),
+                    );
+            }
+            TimelineRowKind::FileOperation => {
+                let open = self
+                    .timeline_command_expansion
+                    .get(&row.id)
+                    .copied()
+                    .unwrap_or(false);
+                let file_path = payload.as_ref().and_then(|payload| match payload {
+                    TimelinePayload::FileOperation(operation) => Some(operation.path.clone()),
+                    _ => None,
+                });
+                let workspace_root = self
+                    .view_session()
+                    .map(|session| session.workspace_root.clone())
+                    .unwrap_or_default();
+                let open_path = file_path.as_deref().and_then(|path| {
+                    agent_file_operation_preview_path(path, Some(workspace_root.as_str()))
+                });
+                let has_diff = payload.as_ref().is_some_and(|payload| {
+                    matches!(
+                        payload,
+                        TimelinePayload::FileOperation(operation)
+                            if operation.canonical_patch().is_some()
+                    )
+                });
+                let toggle_entity = entity.clone();
+                let toggle_row_id = row.id.clone();
+                let toggle_turn_id = row.turn_id.clone();
+                let open_entity = entity.clone();
+                let reveal_entity = entity.clone();
+                let reveal_path = open_path.clone();
+                menu = menu
+                    .when_some(open_path.clone(), |menu, path| {
+                        let open_path = path.clone();
+                        menu.item(
+                            PopupMenuItem::new(locale::text(
+                                "Open in Editor",
+                                "在编辑器中打开",
+                                "在編輯器中開啟",
+                            ))
+                            .icon(IconName::FolderOpen)
+                            .on_click(move |_, window, cx| {
+                                let path = open_path.clone();
+                                let _ = open_entity.update(cx, |this, cx| {
+                                    this.open_code_file(path, window, cx);
+                                });
+                            }),
+                        )
+                    })
+                    .when_some(reveal_path, |menu, path| {
+                        let reveal_path = path.clone();
+                        menu.item(
+                            PopupMenuItem::new(locale::text(
+                                "Reveal in Files",
+                                "在文件树中显示",
+                                "在檔案樹中顯示",
+                            ))
+                            .on_click(move |_, window, cx| {
+                                let path = reveal_path.clone();
+                                let _ = reveal_entity.update(cx, |this, cx| {
+                                    this.reveal_session_image_in_files(&path, window, cx);
+                                });
+                            }),
+                        )
+                    })
+                    .item(Self::activity_copy_item(
+                        entity.clone(),
+                        &row.id,
+                        locale::text("Copy Path", "复制路径", "複製路徑"),
+                        ActivityCopyMode::Path,
+                    ))
+                    .when(has_diff, |menu| {
+                        menu.item(Self::activity_copy_item(
+                            entity.clone(),
+                            &row.id,
+                            locale::text("Copy Diff", "复制差异", "複製差異"),
+                            ActivityCopyMode::Diff,
+                        ))
+                    })
+                    .when(has_details, |menu| {
+                        menu.separator().item(
+                            PopupMenuItem::new(if open {
+                                locale::text("Hide Details", "隐藏详情", "隱藏詳細資料")
+                            } else {
+                                locale::text("Show Details", "显示详情", "顯示詳細資料")
+                            })
+                            .on_click({
+                                let toggle_entity = toggle_entity.clone();
+                                let row_id = toggle_row_id.clone();
+                                let turn_id = toggle_turn_id.clone();
+                                move |_, _, cx| {
+                                    let row_id = row_id.clone();
+                                    let turn_id = turn_id.clone();
+                                    let _ = toggle_entity.update(cx, |this, cx| {
+                                        this.set_timeline_disclosure(
+                                            row_id,
+                                            turn_id.as_deref(),
+                                            !open,
+                                        );
+                                        cx.notify();
+                                    });
+                                }
+                            }),
+                        )
+                    });
+            }
+            TimelineRowKind::ToolCall
+            | TimelineRowKind::WebSearch
+            | TimelineRowKind::Collaboration => {
+                let open = self
+                    .timeline_command_expansion
+                    .get(&row.id)
+                    .copied()
+                    .unwrap_or(false);
+                let toggle_entity = entity.clone();
+                let toggle_row_id = row.id.clone();
+                let toggle_turn_id = row.turn_id.clone();
+                menu = menu
+                    .when(has_input, |menu| {
+                        menu.item(Self::activity_copy_item(
+                            entity.clone(),
+                            &row.id,
+                            locale::text("Copy Input", "复制输入", "複製輸入"),
+                            ActivityCopyMode::Input,
+                        ))
+                    })
+                    .when(has_output, |menu| {
+                        menu.item(Self::activity_copy_item(
+                            entity.clone(),
+                            &row.id,
+                            locale::text("Copy Output", "复制输出", "複製輸出"),
+                            ActivityCopyMode::Output,
+                        ))
+                    })
+                    .item(Self::activity_copy_item(
+                        entity.clone(),
+                        &row.id,
+                        locale::text("Copy Details", "复制详情", "複製詳細資料"),
+                        ActivityCopyMode::Details,
+                    ))
+                    .separator()
+                    .item(
+                        PopupMenuItem::new(if open {
+                            locale::text("Hide Details", "隐藏详情", "隱藏詳細資料")
+                        } else {
+                            locale::text("Show Details", "显示详情", "顯示詳細資料")
+                        })
+                        .on_click(move |_, _, cx| {
+                            let row_id = toggle_row_id.clone();
+                            let turn_id = toggle_turn_id.clone();
+                            let _ = toggle_entity.update(cx, |this, cx| {
+                                this.set_timeline_disclosure(row_id, turn_id.as_deref(), !open);
+                                cx.notify();
+                            });
+                        }),
+                    );
+            }
+            TimelineRowKind::Error => {
+                menu = menu
+                    .item(Self::activity_copy_item(
+                        entity.clone(),
+                        &row.id,
+                        locale::text("Copy Error", "复制错误", "複製錯誤"),
+                        ActivityCopyMode::Primary,
+                    ))
+                    .when(row_is_live_view && !row.body.trim().is_empty(), |menu| {
+                        let quote_entity = entity.clone();
+                        let quote_row_id = row.id.clone();
+                        menu.item(
+                            PopupMenuItem::new(locale::text(
+                                "Quote in Composer",
+                                "引用到输入框",
+                                "引用到輸入框",
+                            ))
+                            .on_click(move |_, window, cx| {
+                                let row_id = quote_row_id.clone();
+                                let _ = quote_entity.update(cx, |this, cx| {
+                                    let body = this
+                                        .timeline_row_by_id(&row_id)
+                                        .map(|row| row.body.clone())
+                                        .unwrap_or_default();
+                                    this.quote_in_composer(&body, window, cx);
+                                });
+                            }),
+                        )
+                    });
+            }
+            TimelineRowKind::PermissionRequest => {
+                let request = self.permission_request_for_row(&row);
+                let pending = request
+                    .as_ref()
+                    .is_some_and(|request| permission_request_is_pending(&row, request));
+                let review_entity = entity.clone();
+                let copy_entity = entity.clone();
+                let copy_row_id = row.id.clone();
+                menu = menu
+                    .when(pending, |menu| {
+                        menu.item(
+                            PopupMenuItem::new(locale::text(
+                                "Review Request",
+                                "查看请求",
+                                "查看請求",
+                            ))
+                            .icon(IconName::Eye)
+                            .on_click(move |_, _, cx| {
+                                let _ = review_entity
+                                    .update(cx, |this, cx| this.reveal_pending_permission_card(cx));
+                            }),
+                        )
+                    })
+                    .item(
+                        PopupMenuItem::new(locale::text(
+                            "Copy Request",
+                            "复制请求内容",
+                            "複製請求內容",
+                        ))
+                        .icon(IconName::Copy)
+                        .on_click(move |_, _, cx| {
+                            let row_id = copy_row_id.clone();
+                            let _ = copy_entity.update(cx, |this, cx| {
+                                this.copy_permission_request_text(&row_id, cx);
+                            });
+                        }),
+                    );
+            }
+            _ => {
+                menu = menu.item(Self::activity_copy_item(
+                    entity.clone(),
+                    &row.id,
+                    locale::text("Copy", "复制", "複製"),
+                    ActivityCopyMode::Primary,
+                ));
+            }
+        }
+
+        menu
+    }
+
+    fn build_turn_context_menu(
+        &self,
+        menu: PopupMenu,
+        entity: WeakEntity<Self>,
+        context: TurnMenuContext,
+    ) -> PopupMenu {
+        let mut menu = menu
+            .min_w(px(220.0))
+            .max_w(px(320.0))
+            .item(PopupMenuItem::label(
+                locale::text("This Turn", "本轮", "本輪").to_string(),
+            ))
+            .separator();
+
+        if context.process_collapsible {
+            let toggle_entity = entity.clone();
+            let turn_id = context.turn_id.clone();
+            let expanded = context.process_expanded;
+            menu = menu.item(
+                PopupMenuItem::new(if expanded {
+                    locale::text("Collapse Process", "收起过程", "收合過程")
+                } else {
+                    locale::text("Expand Process", "展开过程", "展開過程")
+                })
+                .on_click(move |_, _, cx| {
+                    let turn_id = turn_id.clone();
+                    let _ = toggle_entity.update(cx, |this, cx| {
+                        this.prepare_timeline_disclosure(Some(&turn_id), !expanded);
+                        this.timeline_process_expansion.insert(turn_id, !expanded);
+                        cx.notify();
+                    });
+                }),
+            );
+        }
+
+        let copy_entity = entity.clone();
+        let copy_turn_id = context.turn_id.clone();
+        menu = menu.item(
+            PopupMenuItem::new(locale::text("Copy Turn", "复制本轮", "複製本輪"))
+                .icon(IconName::Copy)
+                .on_click(move |_, _, cx| {
+                    let turn_id = copy_turn_id.clone();
+                    let _ = copy_entity.update(cx, |this, cx| this.copy_turn(&turn_id, cx));
+                }),
+        );
+
+        if context.row_is_live_view && context.fork_sequence > 0 {
+            let fork_entity = entity.clone();
+            let fork_session_id = context.session_id.clone();
+            let fork_sequence = context.fork_sequence;
+            menu = menu.separator().item(
+                PopupMenuItem::new(locale::text("Fork from Here", "从此处分叉", "從此處分支"))
+                    .icon(Icon::default().path("icons/vibex/git-branch.svg"))
+                    .disabled(context.fork_disabled)
+                    .on_click(move |_, window, cx| {
+                        let Some(session_id) = fork_session_id.clone() else {
+                            return;
+                        };
+                        let _ = fork_entity.update(cx, |this, cx| {
+                            this.fork_session_at(session_id, fork_sequence, window, cx);
+                        });
+                    }),
+            );
+        }
+
+        menu
+    }
+
+    fn build_timeline_context_menu(&self, menu: PopupMenu, entity: WeakEntity<Self>) -> PopupMenu {
+        let has_conversation = !self.conversation_turns_cache.is_empty();
+        let mut menu = menu
+            .min_w(px(220.0))
+            .max_w(px(320.0))
+            .item(PopupMenuItem::label(
+                locale::text("Conversation", "会话", "工作階段").to_string(),
+            ))
+            .separator();
+
+        if has_conversation {
+            let copy_entity = entity.clone();
+            menu = menu.item(
+                PopupMenuItem::new(locale::text(
+                    "Copy Conversation",
+                    "复制会话",
+                    "複製工作階段",
+                ))
+                .icon(IconName::Copy)
+                .on_click(move |_, _, cx| {
+                    let _ = copy_entity.update(cx, |this, cx| this.copy_conversation(cx));
+                }),
+            );
+        }
+
+        let find_entity = entity.clone();
+        menu = menu.item(
+            PopupMenuItem::new(locale::text(
+                "Find in Conversation",
+                "在会话中查找",
+                "在工作階段中尋找",
+            ))
+            .icon(IconName::Search)
+            .disabled(!has_conversation)
+            .on_click(move |_, window, cx| {
+                let _ = find_entity.update(cx, |this, cx| {
+                    this.open_conversation_find_with_query(None, window, cx)
+                });
+            }),
+        );
+
+        if !self.timeline_follow.following_bottom {
+            let jump_entity = entity.clone();
+            menu = menu.item(
+                PopupMenuItem::new(locale::text("Jump to Latest", "跳到最新", "跳至最新"))
+                    .on_click(move |_, _, cx| {
+                        let _ = jump_entity.update(cx, |this, cx| {
+                            this.timeline_scroll_wheel_idle_task = None;
+                            this.timeline_follow.set_following_bottom(true);
+                            this.request_timeline_scroll_to_latest();
+                            cx.notify();
+                        });
+                    }),
+            );
+        }
+
+        menu
+    }
+
+    fn copy_permission_request_text(&self, row_id: &str, cx: &mut Context<Self>) {
+        let Some(row) = self.timeline_row_by_id(row_id) else {
+            return;
+        };
+        let Some(request) = self.permission_request_for_row(row) else {
+            return;
+        };
+        let mut text = request.title;
+        for detail in request.details {
+            text.push('\n');
+            text.push_str(&detail.label);
+            text.push_str(": ");
+            text.push_str(&detail.value);
+        }
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
     }
 
     /// Whether the turn a row belongs to is still producing output.
@@ -68557,6 +70174,7 @@ impl VibexWorkbench {
             turn,
             group,
             self.timeline_command_expansion.get(&group.id).copied(),
+            self.ui_state.session.auto_collapse_tool_calls,
         );
         let Some(rows) = turn
             .process_rows
@@ -68720,6 +70338,7 @@ impl VibexWorkbench {
                         turn,
                         group,
                         self.timeline_command_expansion.get(&group.id).copied(),
+                        self.ui_state.session.auto_collapse_tool_calls,
                     ),
                 ));
                 units.push(TimelineProcessUnit {
@@ -69160,98 +70779,135 @@ impl VibexWorkbench {
                     .as_ref()
                     .is_some_and(|session_id| self.session_turn_pending(session_id)),
         );
+        let menu_entity = cx.weak_entity();
+        let menu_context = UserMessageMenuContext {
+            row: row.clone(),
+            row_id: row.id.clone(),
+            session_id: self.timeline.session_id.clone(),
+            turn_id: turn_id.map(str::to_string),
+            first_sequence: row.first_sequence,
+            last_sequence: row.last_sequence,
+            authoritative_end_sequence: edit_source_end_sequence.unwrap_or(row.last_sequence),
+            latest_user_message,
+            turn_complete,
+            edit_action_state,
+            row_is_live_view: self.timeline.session_id.as_ref() == self.view_session_id.as_ref(),
+            child_session: self
+                .child_agent_render_session
+                .as_ref()
+                .map(|session_id| session_id.as_str().to_string()),
+            copy_item: copy_item.clone(),
+            attachments: edit_attachments.clone(),
+            mentions: mentions.clone(),
+            timestamp,
+        };
+        let content = v_flex()
+            .id(row.id.clone())
+            .min_w_0()
+            .w(relative(USER_MESSAGE_COLUMN_WIDTH_RATIO))
+            .items_end()
+            .gap_1()
+            .child(render_user_message_bubble(
+                inline_content,
+                edge_reactions,
+                cx.theme().muted,
+                cx.theme().foreground,
+                editing,
+            ))
+            .when(!editing, |this| {
+                this.child(
+                    h_flex()
+                        .items_center()
+                        .gap_2()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .opacity(0.0)
+                        .group_hover(hover_group.clone(), |style| style.opacity(1.0))
+                        .when_some(timestamp, |this, timestamp| {
+                            this.child(format_timeline_hover_time(timestamp, locale))
+                        })
+                        .child(
+                            Button::new(format!("copy-user-message:{}", row.id))
+                                .xsmall()
+                                .ghost()
+                                .compact()
+                                .size(px(24.0))
+                                .icon(IconName::Copy)
+                                .tooltip(locale::text("Copy", "复制", "複製"))
+                                .on_click(move |_, _, cx| {
+                                    cx.write_to_clipboard(copy_item.clone());
+                                }),
+                        )
+                        .when(
+                            edit_action_state != UserMessageEditActionState::Hidden,
+                            |this| {
+                                this.child(
+                                    Button::new(format!("edit-user-message:{}", row.id))
+                                        .xsmall()
+                                        .ghost()
+                                        .compact()
+                                        .size(px(24.0))
+                                        .icon(Icon::default().path("icons/vibex/pencil.svg"))
+                                        .tooltip(locale::text("Edit", "编辑", "編輯"))
+                                        .disabled(
+                                            edit_action_state
+                                                != UserMessageEditActionState::Enabled,
+                                        )
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            let (
+                                                Some(source_session_id),
+                                                Some(source_end_sequence),
+                                            ) = (
+                                                edit_source_session_id.clone(),
+                                                edit_source_end_sequence,
+                                            )
+                                            else {
+                                                return;
+                                            };
+                                            this.begin_inline_user_message_edit(
+                                                edit_turn_id.clone(),
+                                                edit_row_id.clone(),
+                                                source_session_id,
+                                                edit_user_sequence,
+                                                source_end_sequence,
+                                                edit_text.clone(),
+                                                edit_attachments.clone(),
+                                                mentions.clone(),
+                                                window,
+                                                cx,
+                                            )
+                                        })),
+                                )
+                            },
+                        ),
+                )
+            });
+        let content = if editing {
+            content.into_any_element()
+        } else {
+            content
+                .context_menu(move |menu, window, cx| {
+                    let Some(entity) = menu_entity.upgrade() else {
+                        return menu;
+                    };
+                    entity.update(cx, |this, cx| {
+                        this.build_user_message_context_menu(
+                            menu,
+                            window,
+                            cx,
+                            menu_entity.clone(),
+                            menu_context.clone(),
+                        )
+                    })
+                })
+                .into_any_element()
+        };
         div()
             .flex()
             .w_full()
             .justify_end()
             .group(hover_group.clone())
-            .child(
-                v_flex()
-                    .id(row.id.clone())
-                    .min_w_0()
-                    .w(relative(USER_MESSAGE_COLUMN_WIDTH_RATIO))
-                    .items_end()
-                    .gap_1()
-                    .child(render_user_message_bubble(
-                        inline_content,
-                        edge_reactions,
-                        cx.theme().muted,
-                        cx.theme().foreground,
-                        editing,
-                    ))
-                    .when(!editing, |this| {
-                        this.child(
-                            h_flex()
-                                .items_center()
-                                .gap_2()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .opacity(0.0)
-                                .group_hover(hover_group, |style| style.opacity(1.0))
-                                .when_some(timestamp, |this, timestamp| {
-                                    this.child(format_timeline_hover_time(timestamp, locale))
-                                })
-                                .child(
-                                    Button::new(format!("copy-user-message:{}", row.id))
-                                        .xsmall()
-                                        .ghost()
-                                        .compact()
-                                        .size(px(24.0))
-                                        .icon(IconName::Copy)
-                                        .tooltip(locale::text("Copy", "复制", "複製"))
-                                        .on_click(move |_, _, cx| {
-                                            cx.write_to_clipboard(copy_item.clone());
-                                        }),
-                                )
-                                .when(
-                                    edit_action_state != UserMessageEditActionState::Hidden,
-                                    |this| {
-                                        this.child(
-                                            Button::new(format!("edit-user-message:{}", row.id))
-                                                .xsmall()
-                                                .ghost()
-                                                .compact()
-                                                .size(px(24.0))
-                                                .icon(
-                                                    Icon::default().path("icons/vibex/pencil.svg"),
-                                                )
-                                                .tooltip(locale::text("Edit", "编辑", "編輯"))
-                                                .disabled(
-                                                    edit_action_state
-                                                        != UserMessageEditActionState::Enabled,
-                                                )
-                                                .on_click(cx.listener(
-                                                    move |this, _, window, cx| {
-                                                        let (
-                                                            Some(source_session_id),
-                                                            Some(source_end_sequence),
-                                                        ) = (
-                                                            edit_source_session_id.clone(),
-                                                            edit_source_end_sequence,
-                                                        )
-                                                        else {
-                                                            return;
-                                                        };
-                                                        this.begin_inline_user_message_edit(
-                                                            edit_turn_id.clone(),
-                                                            edit_row_id.clone(),
-                                                            source_session_id,
-                                                            edit_user_sequence,
-                                                            source_end_sequence,
-                                                            edit_text.clone(),
-                                                            edit_attachments.clone(),
-                                                            mentions.clone(),
-                                                            window,
-                                                            cx,
-                                                        )
-                                                    },
-                                                )),
-                                        )
-                                    },
-                                ),
-                        )
-                    }),
-            )
+            .child(content)
             .into_any_element()
     }
 
@@ -69260,42 +70916,86 @@ impl VibexWorkbench {
         row: &TimelineRow,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let attachments = self
+        let (attachments, mentions) = self
             .timeline_row_latest_item(row)
             .and_then(|item| match &item.payload {
                 vibex_core::TimelinePayload::UserMessage(message) => {
-                    Some(message.attachments.clone())
+                    Some((message.attachments.clone(), message.mentions.clone()))
                 }
                 _ => None,
             })
             .unwrap_or_default();
+        let copy_item =
+            user_message_clipboard_item_with_mentions(&row.body, &attachments, &mentions);
+        let timestamp = self.timeline_row_timestamp(row);
         let search_highlight = self.session_search_highlight_for_rows(std::slice::from_ref(row));
         let inline_content = self.render_user_message_inline_content(
             &row.id,
             row.body.clone(),
-            attachments,
+            attachments.clone(),
             search_highlight,
             None,
             cx,
         );
+        let menu_entity = cx.weak_entity();
+        let menu_context = UserMessageMenuContext {
+            row: row.clone(),
+            row_id: row.id.clone(),
+            session_id: self.timeline.session_id.clone(),
+            turn_id: row.turn_id.clone(),
+            first_sequence: row.first_sequence,
+            last_sequence: row.last_sequence,
+            authoritative_end_sequence: self
+                .timeline
+                .authoritative_end_sequence
+                .unwrap_or(row.last_sequence),
+            latest_user_message: false,
+            turn_complete: true,
+            edit_action_state: UserMessageEditActionState::Hidden,
+            row_is_live_view: false,
+            child_session: self
+                .child_agent_render_session
+                .as_ref()
+                .map(|session_id| session_id.as_str().to_string()),
+            copy_item,
+            attachments,
+            mentions,
+            timestamp,
+        };
+        let content = v_flex()
+            .id(row.id.clone())
+            .min_w_0()
+            .w(relative(USER_MESSAGE_COLUMN_WIDTH_RATIO))
+            .items_end()
+            .gap_1()
+            .child(render_user_message_bubble(
+                inline_content,
+                None,
+                cx.theme().muted,
+                cx.theme().foreground,
+                false,
+            ));
         div()
             .flex()
             .w_full()
             .justify_end()
             .child(
-                v_flex()
-                    .id(row.id.clone())
-                    .min_w_0()
-                    .w(relative(USER_MESSAGE_COLUMN_WIDTH_RATIO))
-                    .items_end()
-                    .gap_1()
-                    .child(render_user_message_bubble(
-                        inline_content,
-                        None,
-                        cx.theme().muted,
-                        cx.theme().foreground,
-                        false,
-                    )),
+                content
+                    .context_menu(move |menu, window, cx| {
+                        let Some(entity) = menu_entity.upgrade() else {
+                            return menu;
+                        };
+                        entity.update(cx, |this, cx| {
+                            this.build_user_message_context_menu(
+                                menu,
+                                window,
+                                cx,
+                                menu_entity.clone(),
+                                menu_context.clone(),
+                            )
+                        })
+                    })
+                    .into_any_element(),
             )
             .into_any_element()
     }
@@ -69344,9 +71044,9 @@ impl VibexWorkbench {
         // back even when the surface draws the whole of it. A body that is not
         // folded has nothing behind the control, so a windowed body alone does
         // not carry one.
-        let body_reveal_control = (hidden_body_bytes > 0
-            || (body_revealed && self.row_body_folds(row)))
-        .then(|| self.timeline_body_reveal_control(row, hidden_body_bytes, cx));
+        let context_foldable = hidden_body_bytes > 0 || (body_revealed && self.row_body_folds(row));
+        let body_reveal_control =
+            context_foldable.then(|| self.timeline_body_reveal_control(row, hidden_body_bytes, cx));
         let markdown_view = (!body_windowed).then(|| {
             let arriving = self.row_is_arriving(row);
             let image_plugin = self.session_image_plugin(cx.weak_entity());
@@ -69465,7 +71165,23 @@ impl VibexWorkbench {
             Vec::new()
         };
         let show_answer_footer = answer_metadata.is_some() || show_answer_actions;
-        v_flex()
+        let menu_entity = cx.weak_entity();
+        let menu_context = AgentMessageMenuContext {
+            row: row.clone(),
+            row_id: row.id.clone(),
+            session_id: self.timeline.session_id.clone(),
+            turn_id: row.turn_id.clone(),
+            last_sequence: row.last_sequence,
+            streaming: self.row_is_arriving(row),
+            foldable: context_foldable,
+            row_is_live_view: self.timeline.session_id.as_ref() == self.view_session_id.as_ref(),
+            child_session: self
+                .child_agent_render_session
+                .as_ref()
+                .map(|session_id| session_id.as_str().to_string()),
+            timestamp: self.timeline_row_timestamp(row),
+        };
+        let content = v_flex()
             .id(row.id.clone())
             .w_full()
             .min_w_0()
@@ -69508,6 +71224,21 @@ impl VibexWorkbench {
                             )
                         }),
                 )
+            });
+        content
+            .context_menu(move |menu, window, cx| {
+                let Some(entity) = menu_entity.upgrade() else {
+                    return menu;
+                };
+                entity.update(cx, |this, cx| {
+                    this.build_agent_message_context_menu(
+                        menu,
+                        window,
+                        cx,
+                        menu_entity.clone(),
+                        menu_context.clone(),
+                    )
+                })
             })
             .into_any_element()
     }
@@ -70057,6 +71788,7 @@ impl VibexWorkbench {
             turn,
             group,
             self.timeline_command_expansion.get(&group.id).copied(),
+            self.ui_state.session.auto_collapse_tool_calls,
         );
         let progress = self.timeline_disclosure_progress(&group.id, expanded, window, cx);
         let group_id = group.id.clone();
@@ -70084,12 +71816,19 @@ impl VibexWorkbench {
             this.set_timeline_disclosure(group_id.clone(), Some(&turn_id), !expanded);
             cx.notify();
         }));
+        let summary_selector = format!("activity-summary:{}", group.id);
+        let group_selector = format!("activity-group:{}", group.id);
         let mut body = v_flex()
             .id(group.id.clone())
+            .debug_selector(move || group_selector.clone())
             .w_full()
             .min_w_0()
             .flex_none()
-            .child(header);
+            .child(
+                div()
+                    .debug_selector(move || summary_selector.clone())
+                    .child(header),
+            );
         if progress > 0.0 {
             // A pending reveal points at one row of the group and scrolls to
             // it, and the spike's window has no pin: while one is pending the
@@ -72798,29 +74537,20 @@ impl VibexWorkbench {
             .map(|(index, entry)| {
                 let selected = self.suggestion_selection.selected_index == Some(index);
                 let selected_entry = entry.clone();
-                let editing_delegation = self.delegation_edit_agent.is_some();
-                let edit_agent_identity =
-                    self.delegation_edit_agent.as_ref().and_then(|agent_id| {
-                        self.agent_snapshots
-                            .iter()
-                            .find(|agent| &agent.id == agent_id)
-                            .map(agent_brand_identity)
-                    });
-                let agent_identity = if editing_delegation {
-                    edit_agent_identity.clone()
-                } else {
-                    self.composer_suggestion_agent_identity(&entry)
-                };
+                let agent_identity = self.composer_suggestion_agent_identity(&entry);
                 let agent_row = target == ComposerTarget::Session
                     && active_tab == ComposerSuggestionTab::Delegation
-                    && !editing_delegation
                     && composer_suggestion_is_agent(&entry);
+                // The row offers the two halves of the choice and nothing else.
+                // Picking the Agent already puts the caret on its chip, which is
+                // what turns the composer's own controls into that
+                // collaborator's; a pencil beside the row repeated that gesture
+                // and, worse, implied the row was where the configuration lived.
                 let trailing = agent_row.then(|| {
                     h_flex()
                         .flex_none()
                         .items_center()
                         .gap_1()
-                        .child(self.composer_delegation_edit_button(target, &entry, cx))
                         .child(self.composer_delegation_action_control(
                             target,
                             &entry,
@@ -73097,8 +74827,6 @@ impl VibexWorkbench {
         if !self.composer_suggestion_tabs_available(target) || self.active_suggestion_tab() == tab {
             return;
         }
-        self.delegation_edit_agent = None;
-        self.delegation_edit_entries.clear();
         self.suggestion_tab = tab;
         self.reseat_suggestion_selection(true);
         cx.notify();
@@ -74354,10 +76082,18 @@ impl VibexWorkbench {
         let generation_status = self.render_agent_generation_status(session_running, cx);
         let failover_prompt = self.render_failover_prompt(cx);
         let failover_notices = self.render_failover_notices(cx);
+        // The cascade edits one selection, so pointing it at the chip the caret
+        // is on turns the same controls into that collaborator's parameter
+        // panel. No mode, no second widget: move the caret off the chip and the
+        // next frame is the session's controls again.
+        let delegation_subject = self.composer_delegation_subject(cx);
+        let composer_runtime = self
+            .composer_runtime_selection(cx)
+            .or_else(|| selected_runtime.clone());
         // The catalog handle is shared and the projection memoized, so a group
         // workspace derives one projection per distinct selection per frame
         // instead of one per pane.
-        let runtime_projection = selected_runtime.as_ref().and_then(|selection| {
+        let runtime_projection = composer_runtime.as_ref().and_then(|selection| {
             let catalog = self.runtime_catalog.clone()?;
             let projection = self.runtime_cascade_projection_for(&catalog, selection);
             Some((selection.clone(), catalog, projection))
@@ -75078,9 +76814,16 @@ impl VibexWorkbench {
                                                     .token({
                                                         let agents = self
                                                             .composer_agent_token_identities();
+                                                        let active = self.delegation_chip_range_for(
+                                                            ComposerTarget::Session,
+                                                            cx,
+                                                        );
                                                         move |context, _, cx| {
                                                             render_composer_inline_token(
-                                                                context, &agents, cx,
+                                                                context,
+                                                                &agents,
+                                                                active.clone(),
+                                                                cx,
                                                             )
                                                         }
                                                     })
@@ -75229,6 +76972,36 @@ impl VibexWorkbench {
                                                     "開啟用量統計",
                                                 ),
                                             ))
+                                            .when_some(
+                                                delegation_subject.as_ref().and_then(|mention| {
+                                                    mention.agent_id.as_ref().map(|agent_id| {
+                                                        mention
+                                                            .label
+                                                            .clone()
+                                                            .unwrap_or_else(|| agent_id.to_string())
+                                                    })
+                                                }),
+                                                |row, agent_label| {
+                                                    // The same controls, pointed at somebody
+                                                    // else's work: say so, or the reader
+                                                    // cannot tell which session they are
+                                                    // tuning.
+                                                    row.child(
+                                                        Tag::color(ColorName::Blue)
+                                                            .xsmall()
+                                                            .rounded_full()
+                                                            .h(px(20.0))
+                                                            .px_2()
+                                                            .font_medium()
+                                                            .child(locale::text(
+                                                                "Delegating to",
+                                                                "委派给",
+                                                                "委派給",
+                                                            ))
+                                                            .child(format!(" {agent_label}")),
+                                                    )
+                                                },
+                                            )
                                             .child(runtime_controls_cascade),
                                     )
                                     .child(
@@ -81690,6 +83463,13 @@ fn composer_entry_mention(entry: &AgentCommandEntry) -> Option<VibexUseMention> 
 /// The label is the fast path; a restored mention also carries a
 /// `vibex://runtime-option/...` id, which survives a rename of the visible
 /// label. A file or session token returns `None` and keeps the stock chip.
+/// Whether one token names a collaborator, by its typed id.
+fn composer_token_is_collaborator(token: &InlineToken) -> bool {
+    VibexUseMention::parse(token.id()).is_some_and(|mention| {
+        mention.kind == vibex_core::VibexUseMentionKind::Agent && mention.agent_id.is_some()
+    })
+}
+
 fn composer_token_agent_identity(
     token: &InlineToken,
     agents: &[(String, String)],
@@ -81719,13 +83499,24 @@ fn composer_token_agent_identity(
 fn render_composer_inline_token(
     context: &InlineTokenContext,
     agents: &[(String, String)],
+    active: Option<std::ops::Range<usize>>,
     cx: &mut App,
 ) -> AnyElement {
     let Some(identity) = composer_token_agent_identity(context.token(), agents) else {
         return InputToken::new(context).into_any_element();
     };
     let theme = cx.theme();
-    let selected = context.is_selected();
+    // A collaborator chip lights up whenever the controls below are pointed at
+    // it, which is a superset of the input's own range-overlap highlight: that
+    // one leaves both edges dark, so the chip being edited looked inert with the
+    // caret resting against it. Every other token keeps the input's answer.
+    let selected = if composer_token_is_collaborator(context.token()) {
+        active
+            .as_ref()
+            .is_some_and(|range| *range == context.range())
+    } else {
+        context.is_selected()
+    };
     div()
         .id("input-token")
         .flex()
@@ -81785,6 +83576,11 @@ fn replace_composer_trigger(
 ) {
     if let Some(token) = composer_token_for_entry(entry) {
         let token_text = token.text().clone();
+        // Whether this insertion is a collaborator chip, decided before the
+        // token is moved into the editor.
+        let collaborator = composer_entry_mention(entry).is_some_and(|mention| {
+            mention.kind == vibex_core::VibexUseMentionKind::Agent && mention.agent_id.is_some()
+        });
         if input
             .replace_range_with_token(range.clone(), token, window, cx)
             .is_ok()
@@ -81792,6 +83588,21 @@ fn replace_composer_trigger(
             let separator = &entry.insertion_text[token_text.len()..];
             if !separator.is_empty() {
                 input.replace(separator, window, cx);
+            }
+            if collaborator {
+                // Put the caret on the chip's right edge, which is what clicking
+                // the chip does: the reader has just chosen this collaborator, so
+                // the runtime controls should already be pointed at it. One Enter
+                // both picks the collaborator and opens its parameters.
+                //
+                // `end` — not `end + 1` — is the chip's own edge: the separator
+                // stays ordinary text the reader can keep typing after, and
+                // moving the caret off the chip exits the mode as usual.
+                //
+                // The write has to come after the separator insert, which moves
+                // the caret to its own end.
+                let end = range.start + token_text.len();
+                input.set_selected_range(end..end, cx);
             }
             return;
         }
@@ -82027,6 +83838,146 @@ fn composer_mentions(tokens: &[InlineTokenSpan]) -> Vec<VibexUseMention> {
         }
     }
     mentions
+}
+
+/// Which `@Agent` chip the runtime controls are editing, if any.
+///
+/// The composer's runtime cascade normally edits the session it belongs to. A
+/// draft that addresses a collaborator can instead tune *that* collaborator, and
+/// the controls are the same ones — the cascade only needs a selection, not a
+/// session. Rather than adding a mode the reader has to enter and leave, the
+/// subject is derived from what the draft already shows:
+///
+/// 1. the chip the caret sits in or immediately after,
+/// 2. else the only chip the draft carries,
+/// 3. else nothing, and the controls belong to the session.
+///
+/// A mode would have to answer "which chip?" the moment a draft names two, and
+/// would need an exit gesture for every way focus can leave a text field. This
+/// answers both by construction: delete the chip, or move the caret away, and
+/// the controls are the session's again.
+fn delegation_edit_subject(tokens: &[InlineTokenSpan], cursor: usize) -> Option<VibexUseMention> {
+    let agent_mentions = || {
+        tokens.iter().filter_map(|span| {
+            let mention = VibexUseMention::parse(span.token().id().as_ref())?;
+            (mention.kind == vibex_core::VibexUseMentionKind::Agent
+                && mention.agent_id.is_some()
+                && mention.reference.kind == vibex_core::VibexUseResourceKind::RuntimeOption)
+                .then_some((span.range(), mention))
+        })
+    };
+    // The caret decides, and nothing else. An earlier version also claimed the
+    // only chip in the draft, which made the mode inescapable exactly where it
+    // matters most: with one chip there was no caret position that returned the
+    // controls to the session, so the reader could not get back to their own
+    // runtime without deleting the chip.
+    //
+    // The chip owns its own characters and nothing past them. A token covers
+    // `start..end`, so `end` is the caret that sits immediately after its last
+    // character and still reads as "on the chip". One byte further is the
+    // separator an insertion appends — that position belongs to the sentence,
+    // not to the chip, and the reader who pressed Right past it has left.
+    //
+    // This used to accept `end + 1` as well, which kept the controls pointed at
+    // the chip after the caret had visibly moved off it: the reader had to walk
+    // two characters away before the composer was theirs again.
+    agent_mentions()
+        .find(|(range, _)| cursor >= range.start && cursor <= range.end)
+        .map(|(_, mention)| mention)
+}
+
+/// Whether one chip should paint its selected state for `cursor`.
+///
+/// The chip's highlight and the runtime controls have to agree, or the reader
+/// sees a chip that is not lit while the controls below it edit that chip. The
+/// input's own highlight is a range overlap (`start < caret && caret < end`),
+/// which leaves both edges dark — and `start` is exactly where a caret rests
+/// after the chip when the reader walks left into it, so the chip that *is*
+/// being edited looked inert.
+///
+/// `delegation_edit_subject` is the authority here: whatever it returns is what
+/// the controls edit, so it is also what the chip must show as selected.
+fn delegation_chip_is_active(range: &std::ops::Range<usize>, cursor: usize) -> bool {
+    cursor >= range.start && cursor <= range.end
+}
+
+/// The catalogue entry an `@Agent` chip's reference names.
+///
+/// The chip carries a runtime option reference, which is a fingerprint of a
+/// complete selection. A tuned chip names a depth or a mode the catalogue does
+/// not publish as its own entry, so the lookup also accepts an entry whose
+/// selection carries the same Agent, source and model.
+fn delegation_chip_option<'a>(
+    catalog: &'a SessionRuntimeOptionCatalog,
+    mention: &VibexUseMention,
+) -> Option<&'a SessionRuntimeOption> {
+    let reference = mention.reference.as_uri();
+    if let Some(exact) = catalog
+        .options
+        .iter()
+        .find(|option| runtime_option_ref(option) == reference)
+    {
+        return Some(exact);
+    }
+    // A tuned chip names a selection the catalogue never publishes, so the
+    // entry it came from is found by replaying the tuning: apply it to each
+    // candidate and compare fingerprints. That recovers the exact entry instead
+    // of guessing the Agent's first one.
+    //
+    // A chip can also carry a tuned reference with no tuning beside it: a draft
+    // written before the tuning was stored, a token pasted from another window,
+    // or a mention rebuilt from the message it produced. Those still have to
+    // resolve — falling through to the Agent's entry is far better than the
+    // empty controls a `None` here would produce.
+    let agent_id = mention.agent_id.as_ref()?;
+    let candidates = catalog
+        .options
+        .iter()
+        .filter(|option| &option.selection.agent_id == agent_id);
+    for option in candidates {
+        let mut candidate = option.selection.clone();
+        if let Some(tuning) = mention.tuning.as_ref() {
+            candidate.reasoning_effort = tuning.reasoning_effort.clone();
+            candidate.mode_id = tuning.mode_id.clone();
+            candidate.config_values = tuning.config_values.clone();
+        }
+        if vibex_core::VibexUseRef::runtime_option(&vibex_desktop_runtime::selection_fingerprint(
+            &candidate,
+        ))
+        .as_uri()
+            == reference
+        {
+            return Some(option);
+        }
+    }
+    // The reference names a configuration this catalogue no longer publishes —
+    // the model was removed, or the depth it named is gone. The Agent's own
+    // entry is still a truthful answer to "which collaborator is this", and the
+    // controls stay usable instead of going blank.
+    catalog
+        .options
+        .iter()
+        .find(|option| &option.selection.agent_id == agent_id)
+}
+
+/// The exact selection one `@Agent` chip names.
+///
+/// The chip's reference fingerprints a complete selection, so a tuned chip
+/// matches no catalogue entry as-is. Its tuning is carried beside the reference
+/// precisely so the controls can show what the reader chose instead of falling
+/// back to the Agent's first entry — which would silently report a provider and
+/// model they never picked.
+fn delegation_chip_selection(
+    catalog: &SessionRuntimeOptionCatalog,
+    mention: &VibexUseMention,
+) -> Option<SessionRuntimeSelection> {
+    let mut selection = delegation_chip_option(catalog, mention)?.selection.clone();
+    if let Some(tuning) = mention.tuning.as_ref() {
+        selection.reasoning_effort = tuning.reasoning_effort.clone();
+        selection.mode_id = tuning.mode_id.clone();
+        selection.config_values = tuning.config_values.clone();
+    }
+    Some(selection)
 }
 
 /// Rebuilds editing tokens only from references the user already selected.
@@ -86484,6 +88435,21 @@ fn settings_search_candidates(strings: &'static Strings) -> Vec<SettingsSearchCa
         ),
         settings_search_candidate(
             SettingsSection::Session,
+            strings.auto_collapse_tool_calls,
+            strings.auto_collapse_tool_calls_description,
+            &[
+                "tool",
+                "tool call",
+                "collapse",
+                "fold",
+                "工具",
+                "呼叫",
+                "折叠",
+                "折疊",
+            ],
+        ),
+        settings_search_candidate(
+            SettingsSection::Session,
             locale::text("Queue sending", "队列发送", "佇列傳送"),
             locale::text(
                 "Choose the default behavior while an Agent is running.",
@@ -90179,6 +92145,13 @@ impl FoundationSettings {
         cx.notify();
     }
 
+    fn set_auto_collapse_tool_calls(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        let _ = self.workbench.update(cx, |this, cx| {
+            this.set_auto_collapse_tool_calls(enabled, cx)
+        });
+        cx.notify();
+    }
+
     fn set_show_agent_generation_status(&mut self, enabled: bool, cx: &mut Context<Self>) {
         let _ = self.workbench.update(cx, |this, cx| {
             this.set_show_agent_generation_status(enabled, cx)
@@ -91902,6 +93875,13 @@ impl FoundationSettings {
             .on_click(cx.listener(|this, enabled, _, cx| {
                 this.set_enhanced_file_operation_display(*enabled, cx)
             }));
+        let auto_collapse_tool_calls_switch = Switch::new("auto-collapse-tool-calls")
+            .small()
+            .checked(session.auto_collapse_tool_calls)
+            .tooltip(strings.auto_collapse_tool_calls)
+            .on_click(
+                cx.listener(|this, enabled, _, cx| this.set_auto_collapse_tool_calls(*enabled, cx)),
+            );
         let queue_manual = self
             .workbench
             .read_with(cx, |this, _| {
@@ -92081,6 +94061,13 @@ impl FoundationSettings {
                             strings.enhanced_file_operation_display,
                             strings.enhanced_file_operation_display_description,
                             enhanced_file_operation_switch,
+                            stacked,
+                            cx,
+                        ),
+                        setting_row(
+                            strings.auto_collapse_tool_calls,
+                            strings.auto_collapse_tool_calls_description,
+                            auto_collapse_tool_calls_switch,
                             stacked,
                             cx,
                         ),
@@ -100604,7 +102591,11 @@ fn agent_file_operation_preview_path(path: &str, workspace_root: Option<&str>) -
         Err(_) => std::path::PathBuf::from(path),
     };
     let path = if path.is_absolute() {
-        path.strip_prefix(std::path::Path::new(workspace_root?))
+        // The root may itself have been written from a POSIX shell with a
+        // leading `/` before the drive; normalizing both sides keeps the
+        // prefix comparison working for either spelling.
+        let root = local_file_path(workspace_root?);
+        path.strip_prefix(std::path::Path::new(&root))
             .ok()?
             .to_path_buf()
     } else {
@@ -100902,6 +102893,96 @@ fn render_user_message_bubble(
         )
 }
 
+/// Whether a retained Markdown surface belongs to the row a menu was opened on.
+fn markdown_surface_matches(id: &str, prefixes: &[String]) -> bool {
+    prefixes
+        .iter()
+        .any(|prefix| id == prefix || id.starts_with(&format!("{prefix}:")))
+}
+
+/// Turn arbitrary selected text into a Markdown blockquote.
+fn context_menu_blockquote(text: &str) -> String {
+    let trimmed = text.trim_end();
+    if trimmed.trim().is_empty() {
+        return String::new();
+    }
+    trimmed
+        .lines()
+        .map(|line| {
+            if line.trim().is_empty() {
+                ">".to_string()
+            } else {
+                format!("> {line}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn selection_menu_header(count: usize) -> String {
+    match locale::current_locale() {
+        locale::ResolvedLocale::ZhCn => format!("已选 {count} 个字符"),
+        locale::ResolvedLocale::ZhTw => format!("已選 {count} 個字元"),
+        _ => format!("{count} characters selected"),
+    }
+}
+
+/// The first useful line of a selection, bounded for the find field.
+fn selection_find_query(text: &str) -> String {
+    text.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(|line| line.chars().take(120).collect())
+        .unwrap_or_default()
+}
+
+/// The URL a selection names, when it names exactly one external destination.
+fn single_external_url(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || trimmed.chars().any(char::is_whitespace) {
+        return None;
+    }
+    validate_external_open_url(trimmed).ok().map(|url| url.url)
+}
+
+fn activity_row_kind_label(kind: TimelineRowKind) -> &'static str {
+    match kind {
+        TimelineRowKind::UserMessage => locale::text("You", "你", "你"),
+        TimelineRowKind::AgentMessage => locale::text("Agent", "Agent", "Agent"),
+        TimelineRowKind::Reasoning => locale::text("Thought", "思考", "思考"),
+        TimelineRowKind::Plan | TimelineRowKind::TodoUpdate => locale::text("Plan", "计划", "計畫"),
+        TimelineRowKind::ToolCall => locale::text("Tool", "工具", "工具"),
+        TimelineRowKind::Command => locale::text("Command", "命令", "命令"),
+        TimelineRowKind::FileOperation => locale::text("File Change", "文件变更", "檔案變更"),
+        TimelineRowKind::WebSearch => locale::text("Web Search", "网页搜索", "網頁搜尋"),
+        TimelineRowKind::Collaboration => locale::text("Collaboration", "协作", "協作"),
+        TimelineRowKind::ImageGeneration => locale::text("Image", "图片", "圖片"),
+        TimelineRowKind::GitNotice | TimelineRowKind::SystemNotice => {
+            locale::text("Notice", "通知", "通知")
+        }
+        TimelineRowKind::PermissionRequest => {
+            locale::text("Permission Request", "权限请求", "權限請求")
+        }
+        TimelineRowKind::PermissionResolution => locale::text("Permission", "权限", "權限"),
+        TimelineRowKind::ElicitationRequest => locale::text("Question", "提问", "提問"),
+        TimelineRowKind::ElicitationResolution => locale::text("Answer", "回答", "回答"),
+        TimelineRowKind::Retry => locale::text("Retry", "重试", "重試"),
+        TimelineRowKind::Error => locale::text("Error", "错误", "錯誤"),
+    }
+}
+
+fn push_conversation_row(out: &mut String, speaker: &str, body: &str) {
+    let body = body.trim();
+    if body.is_empty() {
+        return;
+    }
+    out.push_str("## ");
+    out.push_str(speaker);
+    out.push_str("\n\n");
+    out.push_str(body);
+    out.push_str("\n\n");
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::{Cell, RefCell};
@@ -100927,6 +103008,401 @@ mod tests {
             version: Some("28 tools".to_string()),
             responsive: true,
         }
+    }
+
+    /// Changing the provider moves the chip's Agent with the configuration.
+    ///
+    /// A provider choice can name a different Agent, and the chip has to follow
+    /// both halves: leaving the old Agent id in the mention kept the trigger on
+    /// the new configuration while the chip still addressed the old
+    /// collaborator, so the message went to one Agent and the controls showed
+    /// another.
+    #[test]
+    fn a_chip_follows_the_agent_a_new_provider_names() {
+        let claude = AgentId::parse("claude").unwrap();
+        let codex = AgentId::parse("codex").unwrap();
+
+        // The chip as it stands: Claude, with an unset depth.
+        let before = VibexUseMention::agent(
+            &claude,
+            &vibex_core::VibexUseRef::runtime_option("option_claude"),
+            Some("@Claude"),
+        );
+        assert_eq!(before.agent_id.as_ref(), Some(&claude));
+
+        // The reader picks a Codex entry with a depth.
+        let mut chosen = SessionRuntimeSelection::provider(
+            codex.clone(),
+            ProviderProfileId::parse("provider_local").unwrap(),
+            "gpt-5",
+        );
+        chosen.reasoning_effort = Some("high".to_string());
+        let reference = vibex_core::VibexUseRef::runtime_option(
+            &vibex_desktop_runtime::selection_fingerprint(&chosen),
+        );
+
+        // What the writer produces: the Agent comes from the choice, not from
+        // the chip it replaced.
+        let after = VibexUseMention::tuned_agent(
+            &chosen.agent_id,
+            &reference,
+            Some("@Codex"),
+            vibex_core::MentionTuning {
+                reasoning_effort: chosen.reasoning_effort.clone(),
+                ..Default::default()
+            },
+        );
+        assert_eq!(after.agent_id.as_ref(), Some(&codex));
+        assert_ne!(after.agent_id, before.agent_id);
+        assert_eq!(
+            after
+                .tuning
+                .as_ref()
+                .and_then(|t| t.reasoning_effort.as_deref()),
+            Some("high"),
+            "the tuning travels with the Agent change"
+        );
+    }
+
+    /// The chip lights up exactly when the controls edit it.
+    ///
+    /// The input's own highlight is a strict range overlap, which leaves both
+    /// edges dark. A caret resting against the chip is still editing it, so a
+    /// chip drawn from that rule looked inert while the controls below were
+    /// pointed at it.
+    #[test]
+    /// A chip always resolves to some entry of its Agent, never to nothing.
+    ///
+    /// Three shapes reach the lookup: the row's own reference, a tuned reference
+    /// with its tuning beside it, and a tuned reference whose tuning is missing
+    /// (a draft from before tuning was stored, a token pasted from another
+    /// window). The first two resolve exactly; the third falls back to the
+    /// Agent's entry, because blank controls are worse than a conservative
+    /// answer.
+    #[test]
+    fn a_chip_always_resolves_to_one_of_its_agents_entries() {
+        let agent_id = AgentId::parse("codex").unwrap();
+        let option = SessionRuntimeOption {
+            selection: SessionRuntimeSelection::provider(
+                agent_id.clone(),
+                ProviderProfileId::parse("provider_local").unwrap(),
+                "gpt-5",
+            ),
+            agent_label: "Codex".to_string(),
+            auth_source_label: "Local".to_string(),
+            model_label: "gpt-5".to_string(),
+            reasoning_efforts: vec![SessionConfigValue {
+                value: "high".to_string(),
+                label: None,
+            }],
+            modes: Vec::new(),
+            features: Vec::new(),
+            availability: RuntimeOptionAvailability::Available,
+            member_count: 1,
+            auto_routes: false,
+        };
+        let catalog = SessionRuntimeOptionCatalog {
+            revision: 1,
+            agents: Vec::new(),
+            auth_sources: Vec::new(),
+            options: vec![option.clone()],
+        };
+
+        // 1. The row's own reference: exact match.
+        let bare = VibexUseMention::agent(
+            &agent_id,
+            &vibex_core::VibexUseRef::parse(&runtime_option_ref(&option)).unwrap(),
+            Some("@Codex"),
+        );
+        assert_eq!(
+            delegation_chip_selection(&catalog, &bare),
+            Some(option.selection.clone())
+        );
+
+        // 2. A tuned reference with its tuning: replayed exactly.
+        let mut tuned = option.selection.clone();
+        tuned.reasoning_effort = Some("high".to_string());
+        let tuned_ref = vibex_core::VibexUseRef::runtime_option(
+            &vibex_desktop_runtime::selection_fingerprint(&tuned),
+        );
+        let with_tuning = VibexUseMention::tuned_agent(
+            &agent_id,
+            &tuned_ref,
+            Some("@Codex"),
+            vibex_core::MentionTuning {
+                reasoning_effort: Some("high".to_string()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            delegation_chip_selection(&catalog, &with_tuning),
+            Some(tuned)
+        );
+
+        // 3. The same tuned reference with no tuning beside it: the controls
+        // still resolve, to the Agent's entry.
+        let without_tuning = VibexUseMention::agent(&agent_id, &tuned_ref, Some("@Codex"));
+        assert_eq!(
+            delegation_chip_selection(&catalog, &without_tuning),
+            Some(option.selection.clone()),
+            "a tuned reference without its tuning must not leave the controls blank"
+        );
+
+        // 4. A reference to a model this catalogue no longer publishes.
+        let mut gone = option.selection.clone();
+        gone.model = vibex_core::RuntimeModelSelection::explicit("removed-model");
+        let gone_ref = vibex_core::VibexUseRef::runtime_option(
+            &vibex_desktop_runtime::selection_fingerprint(&gone),
+        );
+        let stale = VibexUseMention::agent(&agent_id, &gone_ref, Some("@Codex"));
+        assert_eq!(
+            delegation_chip_selection(&catalog, &stale),
+            Some(option.selection.clone()),
+            "a removed model falls back to the Agent instead of going blank"
+        );
+    }
+
+    /// The chip lights up exactly when the controls edit it.
+    ///
+    /// The input's own highlight is a strict range overlap, which leaves both
+    /// edges dark. A caret resting against the chip is still editing it, so a
+    /// chip drawn from that rule looked inert while the controls below were
+    /// pointed at it.
+    #[test]
+    fn the_chip_lights_up_exactly_when_the_controls_edit_it() {
+        let codex = AgentId::parse("codex").unwrap();
+        let mention = VibexUseMention::agent(
+            &codex,
+            &vibex_core::VibexUseRef::runtime_option("option_codex"),
+            Some("@Codex"),
+        );
+        let content = composer_content_with_mentions("@Codex rest", &[mention]);
+        let chip = content.tokens()[0].range();
+
+        for cursor in chip.clone() {
+            assert!(
+                delegation_chip_is_active(&chip, cursor),
+                "a caret at {cursor} inside {chip:?} edits the chip, so it must light up"
+            );
+            assert!(
+                delegation_edit_subject(content.tokens(), cursor).is_some(),
+                "the highlight and the subject must agree at {cursor}"
+            );
+        }
+        // The right edge is the caret after the last character: still editing.
+        assert!(delegation_chip_is_active(&chip, chip.end));
+        assert!(delegation_edit_subject(content.tokens(), chip.end).is_some());
+
+        // One byte past it is the separator, and both must agree it has left.
+        assert!(!delegation_chip_is_active(&chip, chip.end + 1));
+        assert!(delegation_edit_subject(content.tokens(), chip.end + 1).is_none());
+    }
+
+    /// A new-session draft runs on the chip it names, tuning included.
+    ///
+    /// The page's own selection describes the Agent being started; the chip
+    /// describes the collaborator the reader addressed. Reading the page's
+    /// selection on submit started the session on the wrong configuration while
+    /// the composer showed the tuned one.
+    #[test]
+    fn a_new_session_draft_reads_its_chip_selection() {
+        let agent_id = AgentId::parse("codex").unwrap();
+        let option = SessionRuntimeOption {
+            selection: SessionRuntimeSelection::provider(
+                agent_id.clone(),
+                ProviderProfileId::parse("provider_local").unwrap(),
+                "gpt-5",
+            ),
+            agent_label: "Codex".to_string(),
+            auth_source_label: "Local".to_string(),
+            model_label: "gpt-5".to_string(),
+            reasoning_efforts: vec![SessionConfigValue {
+                value: "high".to_string(),
+                label: None,
+            }],
+            modes: Vec::new(),
+            features: Vec::new(),
+            availability: RuntimeOptionAvailability::Available,
+            member_count: 1,
+            auto_routes: false,
+        };
+        let catalog = SessionRuntimeOptionCatalog {
+            revision: 1,
+            agents: Vec::new(),
+            auth_sources: Vec::new(),
+            options: vec![option.clone()],
+        };
+
+        // A tuned chip resolves to the tuned selection, which is what the create
+        // request now sends.
+        let mut tuned = option.selection.clone();
+        tuned.reasoning_effort = Some("high".to_string());
+        let mention = VibexUseMention::tuned_agent(
+            &agent_id,
+            &vibex_core::VibexUseRef::runtime_option(
+                &vibex_desktop_runtime::selection_fingerprint(&tuned),
+            ),
+            None,
+            vibex_core::MentionTuning {
+                reasoning_effort: Some("high".to_string()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            delegation_chip_selection(&catalog, &mention),
+            Some(tuned.clone())
+        );
+        // The page's own validation accepts it, so the tuned selection is not
+        // rejected as "no longer available" on the way out.
+        assert!(catalog_has_runtime_selection(&catalog, &tuned));
+    }
+
+    /// The caret decides which chip the controls edit, and moving it away is
+    /// the way out.
+    ///
+    /// An earlier version also claimed the only chip in the draft, which made
+    /// the mode inescapable exactly where it matters most: with one chip no
+    /// caret position returned the controls to the session, so the reader had
+    /// to delete the chip to get their own runtime back.
+    #[test]
+    fn the_delegation_subject_follows_the_caret() {
+        let codex = AgentId::parse("codex").unwrap();
+        let claude = AgentId::parse("claude").unwrap();
+        let codex_mention = VibexUseMention::agent(
+            &codex,
+            &vibex_core::VibexUseRef::runtime_option("option_codex"),
+            Some("@Codex"),
+        );
+        let claude_mention = VibexUseMention::agent(
+            &claude,
+            &vibex_core::VibexUseRef::runtime_option("option_claude"),
+            Some("@Claude"),
+        );
+
+        // A real draft after picking a chip: the insertion appends one space, so
+        // the caret rests one byte past the token.
+        let single = composer_content_with_mentions("@Codex fix it", &[codex_mention.clone()]);
+        let chip = single.tokens()[0].range();
+        assert_eq!(
+            delegation_edit_subject(single.tokens(), chip.end).and_then(|m| m.agent_id),
+            Some(codex.clone()),
+            "a caret inside the chip edits it"
+        );
+        assert_eq!(
+            delegation_edit_subject(single.tokens(), chip.end + 1).and_then(|m| m.agent_id),
+            None,
+            "one byte past the chip is the separator: the caret has left it"
+        );
+
+        // The escape hatch: with one chip, moving the caret away returns the
+        // controls to the session. This is the case that used to be a trap —
+        // the old rule claimed the only chip from anywhere in the draft, so the
+        // mode could not be left without deleting the chip.
+        assert_eq!(
+            delegation_edit_subject(single.tokens(), 12).and_then(|m| m.agent_id),
+            None,
+            "a caret away from the only chip must return the session's controls"
+        );
+
+        // Two chips: the caret picks one, and between or after them there is
+        // none.
+        let both = composer_content_with_mentions(
+            "@Codex @Claude compare",
+            &[codex_mention, claude_mention],
+        );
+        let first = both.tokens()[0].range();
+        let second = both.tokens()[1].range();
+        assert_eq!(
+            delegation_edit_subject(both.tokens(), first.start).and_then(|m| m.agent_id),
+            Some(codex.clone())
+        );
+        assert_eq!(
+            delegation_edit_subject(both.tokens(), second.start).and_then(|m| m.agent_id),
+            Some(claude.clone())
+        );
+        assert_eq!(
+            delegation_edit_subject(both.tokens(), second.end + 1).and_then(|m| m.agent_id),
+            None,
+            "the separator past the last chip belongs to the sentence"
+        );
+        assert_eq!(
+            delegation_edit_subject(both.tokens(), 20).and_then(|m| m.agent_id),
+            None,
+            "with the caret away from both, the session owns the controls"
+        );
+    }
+
+    /// A tuned chip shows back the exact configuration the reader chose.
+    ///
+    /// The reference fingerprints a complete selection, so a tuned chip matches
+    /// no catalogue entry. Its tuning rides in the token id for exactly this
+    /// reason: falling back to the Agent's first entry would report a provider
+    /// and model the reader never picked.
+    #[test]
+    fn a_tuned_chip_shows_back_the_selection_it_names() {
+        let agent_id = AgentId::parse("codex").unwrap();
+        let option = SessionRuntimeOption {
+            selection: SessionRuntimeSelection::provider(
+                agent_id.clone(),
+                ProviderProfileId::parse("provider_local").unwrap(),
+                "gpt-5",
+            ),
+            agent_label: "Codex".to_string(),
+            auth_source_label: "Local".to_string(),
+            model_label: "gpt-5".to_string(),
+            reasoning_efforts: vec![
+                SessionConfigValue {
+                    value: "low".to_string(),
+                    label: None,
+                },
+                SessionConfigValue {
+                    value: "high".to_string(),
+                    label: None,
+                },
+            ],
+            modes: Vec::new(),
+            features: Vec::new(),
+            availability: RuntimeOptionAvailability::Available,
+            member_count: 1,
+            auto_routes: false,
+        };
+        let catalog = SessionRuntimeOptionCatalog {
+            revision: 1,
+            agents: Vec::new(),
+            auth_sources: Vec::new(),
+            options: vec![option.clone()],
+        };
+
+        // The bare chip matches its entry exactly.
+        let bare = VibexUseMention::agent(
+            &agent_id,
+            &vibex_core::VibexUseRef::parse(&runtime_option_ref(&option)).unwrap(),
+            None,
+        );
+        assert_eq!(
+            delegation_chip_selection(&catalog, &bare),
+            Some(option.selection.clone())
+        );
+
+        // The tuned chip reports `high`, not the entry's own unset depth.
+        let mut tuned = option.selection.clone();
+        tuned.reasoning_effort = Some("high".to_string());
+        let tuned_mention = VibexUseMention::tuned_agent(
+            &agent_id,
+            &vibex_core::VibexUseRef::runtime_option(
+                &vibex_desktop_runtime::selection_fingerprint(&tuned),
+            ),
+            None,
+            vibex_core::MentionTuning {
+                reasoning_effort: Some("high".to_string()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            delegation_chip_selection(&catalog, &tuned_mention),
+            Some(tuned),
+            "the controls must show the depth the reader picked"
+        );
     }
 
     fn availability_with(reason: Option<ComputerUnavailableReason>) -> ComputerAvailability {
@@ -104765,7 +107241,9 @@ mod tests {
             let textarea = match self.agent_identity.clone() {
                 Some(identity) => textarea.token({
                     let agents = vec![("Claude Code".to_string(), identity)];
-                    move |context, _, cx| render_composer_inline_token(context, &agents, cx)
+                    // The probe pins the chip's own rendering, not the caret
+                    // rule, so it passes no active range.
+                    move |context, _, cx| render_composer_inline_token(context, &agents, None, cx)
                 }),
                 None => textarea,
             };
@@ -104797,6 +107275,64 @@ mod tests {
             .clone()
             .expect("composer input should be created with the root view");
         (input, cx)
+    }
+
+    /// Picking a collaborator with Enter also opens its parameters.
+    ///
+    /// The chip is the thing the reader just chose, so the runtime controls
+    /// should already be pointed at it. Leaving the caret after the separator
+    /// put the chip one keystroke out of reach: the reader had to walk back into
+    /// it before the controls became the collaborator's.
+    #[gpui::test]
+    fn an_accepted_collaborator_lands_the_caret_on_its_chip(cx: &mut TestAppContext) {
+        let (input, cx) = composer_token_window("@Co", None, cx);
+        let agent_id = AgentId::parse("codex").unwrap();
+        let reference = vibex_core::VibexUseRef::runtime_option("option_codex");
+        let mut entry = command_entry(
+            AgentCommandSourceKind::Reference,
+            AgentCommandTrigger::Mention,
+            None,
+        );
+        entry.id = format!("reference:agent:codex:{}", reference.id);
+        entry.label = "@Codex".into();
+        entry.insertion_text = "@Codex ".into();
+        entry.metadata = vec![
+            vibex_core::ProviderBindingMetadata {
+                key: vibex_desktop_runtime::COMPOSER_AGENT_REFERENCE_KEY.to_string(),
+                value: agent_id.as_str().to_string(),
+            },
+            vibex_core::ProviderBindingMetadata {
+                key: vibex_desktop_runtime::COMPOSER_SELECTION_REFERENCE_KEY.to_string(),
+                // The metadata carries the full `vibex://` reference, not the id.
+                value: reference.as_uri(),
+            },
+        ];
+
+        cx.update(|window, cx| {
+            input.update(cx, |input, cx| {
+                replace_composer_trigger(input, &entry, 0..3, window, cx);
+            });
+        });
+
+        let (text, cursor, tokens) = input.read_with(cx, |input, _| {
+            (
+                input.value().to_string(),
+                input.cursor(),
+                input.tokens().to_vec(),
+            )
+        });
+        assert_eq!(text, "@Codex ", "the separator is still ordinary text");
+        assert_eq!(tokens.len(), 1);
+        let chip = tokens[0].range();
+        assert_eq!(
+            cursor, chip.end,
+            "the caret rests on the chip's right edge, not past the separator"
+        );
+        assert_eq!(
+            delegation_edit_subject(&tokens, cursor).and_then(|m| m.agent_id),
+            Some(agent_id),
+            "one Enter both picks the collaborator and opens its parameters"
+        );
     }
 
     /// A picked reference is one editing unit.
@@ -106072,113 +108608,73 @@ mod tests {
     }
 
     #[test]
-    fn delegation_edit_rows_round_trip_the_agent_and_selection() {
-        let option = new_session_runtime_option("codex", "Codex");
-        let agent_id = option.selection.agent_id.clone();
-        let catalog = SessionRuntimeOptionCatalog {
-            revision: 0,
-            agents: Vec::new(),
-            auth_sources: Vec::new(),
-            options: vec![option.clone()],
-        };
-
-        let rows = delegation_runtime_edit_entries(&catalog, &agent_id, None, &BTreeMap::new());
-
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].label, "@Codex model");
-        assert_eq!(delegation_agent_id(&rows[0]).as_ref(), Some(&agent_id));
-        let (row_agent, selection_ref) =
-            delegation_edit_target(&rows[0]).expect("the row names the choice it writes");
-        assert_eq!(row_agent, agent_id);
-        assert_eq!(selection_ref, runtime_option_ref(&option));
+    fn composer_suggestion_popup_uses_the_tracked_scroll_region() {
+        let source = include_str!("app.rs");
+        let popup = source
+            .split_once("    fn render_composer_suggestions(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// One tab of the `/` popup header."))
+            .map(|(body, _)| body)
+            .expect("the suggestion popup should remain inspectable");
+        assert!(popup.contains("composer_suggestion_scroll("));
+        assert!(!popup.contains(".overflow_y_scrollbar()"));
     }
 
-    #[test]
-    fn a_delegation_choice_rewrites_the_agent_row_in_place() {
-        let option = new_session_runtime_option("codex", "Codex");
-        let agent_id = option.selection.agent_id.clone();
-        let mut entry = command_entry(
-            AgentCommandSourceKind::Reference,
-            AgentCommandTrigger::Mention,
-            None,
-        );
-        entry.id = "reference:agent:codex:stale".into();
-        entry.label = "@Codex".into();
-        entry.metadata = vec![
-            vibex_core::ProviderBindingMetadata {
-                key: COMPOSER_AGENT_REFERENCE_KEY.to_string(),
-                value: agent_id.as_str().to_string(),
-            },
-            vibex_core::ProviderBindingMetadata {
-                key: COMPOSER_SELECTION_REFERENCE_KEY.to_string(),
-                value: "stale".into(),
-            },
-        ];
-
-        apply_delegation_selection_to_entry(&mut entry, &agent_id, &option);
-
-        assert_eq!(
-            entry.id,
-            format!("reference:agent:codex:{}", runtime_option_ref(&option))
-        );
-        assert_eq!(delegation_agent_id(&entry), Some(agent_id));
-        assert_eq!(
-            delegation_selection_ref(&entry),
-            Some(runtime_option_ref(&option).as_str())
-        );
-        assert_eq!(
-            entry.description.as_deref(),
-            Some("Codex profile · Codex model")
-        );
-    }
-
-    /// A collaborator row is not a generic reference: its left column is the
-    /// Agent's own mark, and its right column is the provider/model copy that
-    /// used to sit under the name (or, before that, nowhere at all).
+    /// A quick phrase is the text it inserts, so the phrase row has to show that
+    /// text. A free-text name used to claim the whole row, which collapsed the
+    /// preview to nothing and pushed the source badge out of the popup.
     #[gpui::test]
-    fn agent_suggestion_rows_draw_the_agent_mark_and_move_provider_copy_right(
-        cx: &mut TestAppContext,
-    ) {
+    fn quick_phrase_rows_keep_a_long_phrase_inside_the_row(cx: &mut TestAppContext) {
         cx.update(gpui_component::init);
-        let mut entry = command_entry(
-            AgentCommandSourceKind::Reference,
-            AgentCommandTrigger::Mention,
+        let body = "开始处理这些问题，不用建任务。完成后我来看即可，不用截图。\
+                    修改完提交，commit 使用 type(scope): subject 的格式，subject 用英文";
+        let mut phrase = command_entry(
+            AgentCommandSourceKind::Prompt,
+            AgentCommandTrigger::Slash,
             None,
         );
-        entry.id = "reference:agent:codex:sha256:test".into();
-        entry.label = "@Codex".into();
-        entry.description = Some("oc · deepseek-v4.1-flash".into());
+        phrase.id = "phrase:probe".into();
+        // A name that is itself a paragraph: the row still owes the preview its
+        // own room and the badge its own width.
+        phrase.label = format!("{body} 的完整说明与后续步骤都写在名称里");
+        phrase.description = Some(body.to_string());
+        phrase.insertion_text = body.to_string();
+        phrase.execution_behavior = AgentCommandExecutionBehavior::None;
 
-        let (_, cx) = cx.add_window_view(|_, _| ComposerSuggestionRowProbe {
-            entry,
-            phrase_layout: false,
-            agent_identity: Some("codex Codex".into()),
-            width: px(420.0),
-        });
-        cx.run_until_parked();
-        cx.update(|window, cx| {
-            let _ = window.draw(cx);
-        });
+        let (row, name, preview, source) = composer_suggestion_row_bounds(cx, phrase, true, 420.0);
 
-        let row = cx
-            .debug_bounds("composer-suggestion-row")
-            .expect("the row is laid out");
-        let logo = cx
-            .debug_bounds("composer-suggestion-agent-logo")
-            .expect("the Agent mark is laid out");
-        let provider = cx
-            .debug_bounds("composer-suggestion-source")
-            .expect("the provider copy is laid out");
-        assert!(logo.left() >= row.left());
+        assert_eq!(
+            row.size.height,
+            px(COMPOSER_SUGGESTION_MENU_PHRASE_ROW_HEIGHT),
+            "a phrase row owns two lines of preview"
+        );
         assert!(
-            provider.right() <= row.right() + px(0.5),
-            "provider copy {} escaped the row {}",
-            provider.right(),
+            source.right() <= row.right() + px(0.5),
+            "source badge {} escaped the row {}",
+            source.right(),
             row.right()
         );
         assert!(
-            cx.debug_bounds("composer-suggestion-description").is_none(),
-            "the provider copy must not be painted twice"
+            preview.right() <= source.left() + px(0.5),
+            "preview {} ran under the source badge {}",
+            preview.right(),
+            source.left()
+        );
+        assert!(
+            name.right() <= preview.left() + px(0.5),
+            "name {} ran under the preview {}",
+            name.right(),
+            preview.left()
+        );
+        assert!(
+            name.size.width <= row.size.width * COMPOSER_SUGGESTION_NAME_WIDTH_FRACTION + px(1.0),
+            "name took {} of a {} row",
+            name.size.width,
+            row.size.width
+        );
+        assert!(
+            preview.size.width > px(80.0),
+            "preview collapsed to {}",
+            preview.size.width
         );
     }
 
@@ -106284,107 +108780,6 @@ mod tests {
             before_reveal,
             observed.offset()
         );
-    }
-
-    /// The popup must go through the tracked viewport helper above. Rendering
-    /// the list inline was how it drifted back into `overflow_y_scrollbar()`,
-    /// which leaves the popup's handle attached to a region nothing scrolls.
-    #[test]
-    fn composer_suggestion_popup_uses_the_tracked_scroll_region() {
-        let source = include_str!("app.rs");
-        let popup = source
-            .split_once("    fn render_composer_suggestions(")
-            .and_then(|(_, tail)| tail.split_once("\n    /// One tab of the `/` popup header."))
-            .map(|(body, _)| body)
-            .expect("the suggestion popup should remain inspectable");
-        assert!(popup.contains("composer_suggestion_scroll("));
-        assert!(!popup.contains(".overflow_y_scrollbar()"));
-    }
-
-    /// A quick phrase is the text it inserts, so the phrase row has to show that
-    /// text. A free-text name used to claim the whole row, which collapsed the
-    /// preview to nothing and pushed the source badge out of the popup.
-    #[gpui::test]
-    fn quick_phrase_rows_keep_a_long_phrase_inside_the_row(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
-        let body = "开始处理这些问题，不用建任务。完成后我来看即可，不用截图。\
-                    修改完提交，commit 使用 type(scope): subject 的格式，subject 用英文";
-        let mut phrase = command_entry(
-            AgentCommandSourceKind::Prompt,
-            AgentCommandTrigger::Slash,
-            None,
-        );
-        phrase.id = "phrase:probe".into();
-        // A name that is itself a paragraph: the row still owes the preview its
-        // own room and the badge its own width.
-        phrase.label = format!("{body} 的完整说明与后续步骤都写在名称里");
-        phrase.description = Some(body.to_string());
-        phrase.insertion_text = body.to_string();
-        phrase.execution_behavior = AgentCommandExecutionBehavior::None;
-
-        let (row, name, preview, source) = composer_suggestion_row_bounds(cx, phrase, true, 420.0);
-
-        assert_eq!(
-            row.size.height,
-            px(COMPOSER_SUGGESTION_MENU_PHRASE_ROW_HEIGHT),
-            "a phrase row owns two lines of preview"
-        );
-        assert!(
-            source.right() <= row.right() + px(0.5),
-            "source badge {} escaped the row {}",
-            source.right(),
-            row.right()
-        );
-        assert!(
-            preview.right() <= source.left() + px(0.5),
-            "preview {} ran under the source badge {}",
-            preview.right(),
-            source.left()
-        );
-        assert!(
-            name.right() <= preview.left() + px(0.5),
-            "name {} ran under the preview {}",
-            name.right(),
-            preview.left()
-        );
-        assert!(
-            name.size.width <= row.size.width * COMPOSER_SUGGESTION_NAME_WIDTH_FRACTION + px(1.0),
-            "name took {} of a {} row",
-            name.size.width,
-            row.size.width
-        );
-        assert!(
-            preview.size.width > px(80.0),
-            "preview collapsed to {}",
-            preview.size.width
-        );
-    }
-
-    /// The command tab keeps its one-line rows: the phrase tab's second line is
-    /// paid for only where it carries the inserted text.
-    #[gpui::test]
-    fn command_rows_stay_one_line_tall(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
-        let mut command = command_entry(
-            AgentCommandSourceKind::Provider,
-            AgentCommandTrigger::Slash,
-            Some("review"),
-        );
-        command.id = "command:probe".into();
-        command.label = "/review".into();
-        command.description = Some("Review the changes on this branch".into());
-
-        let (row, name, preview, source) =
-            composer_suggestion_row_bounds(cx, command, false, 420.0);
-
-        assert_eq!(
-            row.size.height,
-            px(COMPOSER_SUGGESTION_MENU_ROW_HEIGHT),
-            "a command row stays one line"
-        );
-        assert!(source.right() <= row.right() + px(0.5));
-        assert!(preview.right() <= source.left() + px(0.5));
-        assert!(name.right() <= preview.left() + px(0.5));
     }
 
     #[test]
@@ -119055,6 +121450,58 @@ mod tests {
         );
     }
 
+    /// The provider menu opens on the same configuration its trigger shows.
+    ///
+    /// Both used to resolve their own subject: the trigger took the cascade's
+    /// selection, the menu re-read the session's. A chip being tuned then showed
+    /// one configuration and listed another Agent's providers, and choosing from
+    /// that list wrote a selection for the wrong Agent. This pins the single
+    /// source so the two cannot drift apart again.
+    #[test]
+    fn the_provider_menu_opens_on_the_configuration_its_trigger_shows() {
+        let source = include_str!("app.rs");
+        let opener = source
+            .split_once("    fn set_composer_runtime_menu_open(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn set_new_session_runtime_menu_open("))
+            .map(|(body, _)| body)
+            .expect("the composer runtime menu opener should remain inspectable");
+        assert!(
+            opener.contains("self.composer_runtime_selection(cx)"),
+            "the menu must take its subject from the same place the trigger does"
+        );
+        assert!(
+            !opener.contains("self.selected_runtime_selection()"),
+            "reading the session here listed the session's Agent's providers"
+        );
+
+        let new_session_opener = source
+            .split_once("    fn set_new_session_runtime_menu_open(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn set_runtime_choice_menu_open("))
+            .map(|(body, _)| body)
+            .expect("the new-session menu opener should remain inspectable");
+        assert!(
+            new_session_opener
+                .contains("composer_runtime_selection_for(ComposerTarget::NewSession"),
+            "the new-session menu must open on its own composer's subject"
+        );
+        assert!(
+            !new_session_opener.contains("self.new_session_runtime_selection"),
+            "reading the page's selection here listed the page's Agent's providers"
+        );
+
+        // The new-session cascade must list the Agent it is rendering, not the
+        // page's, or a chip's providers are unreachable from it.
+        let cascade = source
+            .split_once("    fn render_new_session_runtime_cascade(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_composer_runtime_cascade("))
+            .map(|(body, _)| body)
+            .expect("the new-session cascade should remain inspectable");
+        assert!(
+            cascade.contains("selection\n            .as_ref()\n            .map(|selection| selection.agent_id.clone())"),
+            "the cascade must derive its Agent from the selection it renders"
+        );
+    }
+
     #[test]
     fn runtime_menu_opens_below_the_trigger_and_stays_attached() {
         let trigger_bounds = Bounds {
@@ -122938,6 +125385,40 @@ mod tests {
         assert!(!source.contains(concat!("developer.ssh_remote", "_runtime")));
     }
 
+    /// Settings reads the runtime registry from disk, so removal has to write
+    /// it before asking the page to reload.
+    ///
+    /// Reloading first re-read the file that still contained the runtime and
+    /// painted the removed row back; the actual file write happened after the
+    /// repaint, so the row only disappeared when the page was reopened. A
+    /// directly paired runtime shows this most clearly because it has no
+    /// profile store whose removal would independently hide its row.
+    #[test]
+    fn removing_a_runtime_persists_before_the_connections_page_reloads() {
+        let source = include_str!("app.rs");
+        let body = source
+            .split_once("    fn remove_runtime(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// Deletes the runtime side of a removed SSH connection")
+            })
+            .map(|(body, _)| body)
+            .expect("the runtime removal should remain inspectable");
+        let persist = body
+            .find("self.persist_runtime_registry(cx);")
+            .expect("removal must persist the registry");
+        let reload = body
+            .find("settings.reload_connections_profiles();")
+            .expect("removal must refresh the Connections page");
+        assert!(
+            persist < reload,
+            "the registry must be on disk before the page re-reads it"
+        );
+        assert!(
+            body.contains("self.activate_local_runtime(cx);"),
+            "removing the active runtime still returns to the embedded authority"
+        );
+    }
+
     /// A pairing link and a bare code are two shapes of the same entry.
     ///
     /// The dialog decides from the text itself whether the address field is
@@ -123467,6 +125948,11 @@ mod tests {
         }));
         assert!(notification_candidates.iter().any(|candidate| {
             candidate.section == SettingsSection::Session && candidate.keywords.contains(&"failed")
+        }));
+        let collapse_candidates = settings_search_candidates_for_query("collapse", english);
+        assert!(collapse_candidates.iter().any(|candidate| {
+            candidate.section == SettingsSection::Session
+                && candidate.title == "Auto-collapse tool calls"
         }));
         assert!(settings_search_candidates_for_query("", english).is_empty());
     }
@@ -124476,6 +126962,8 @@ mod tests {
         assert!(session.contains("set_enhanced_command_execution_display"));
         assert!(session.contains("enhanced_file_operation_display"));
         assert!(session.contains("set_enhanced_file_operation_display"));
+        assert!(session.contains("auto_collapse_tool_calls"));
+        assert!(session.contains("set_auto_collapse_tool_calls"));
         assert!(session.contains("notify-completed"));
         assert!(session.contains("notify-needs-input"));
         assert!(session.contains("notify-failed"));
@@ -124928,10 +127416,17 @@ mod tests {
         let file_operation_display = source
             .split_once("    fn set_enhanced_file_operation_display(")
             .and_then(|(_, tail)| {
-                tail.split_once("\n    fn sync_timeline_display_settings_to_runtime(")
+                tail.split_once("\n    /// Keeps runs of tool calls folded while the Agent works.")
             })
             .map(|(body, _)| body)
             .expect("file operation display setter should remain inspectable");
+        let auto_collapse = source
+            .split_once("    fn set_auto_collapse_tool_calls(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    fn sync_timeline_display_settings_to_runtime(")
+            })
+            .map(|(body, _)| body)
+            .expect("auto-collapse setter should remain inspectable");
         let invalidation = source
             .split_once("    fn invalidate_timeline_layout_measurements(")
             .and_then(|(_, tail)| tail.split_once("\n    fn refresh_last_timeline_size("))
@@ -124941,6 +127436,8 @@ mod tests {
         assert!(content_width.contains("self.invalidate_timeline_layout_measurements();"));
         assert!(command_display.contains("self.invalidate_timeline_layout_measurements();"));
         assert!(file_operation_display.contains("self.invalidate_timeline_layout_measurements();"));
+        assert!(auto_collapse.contains("self.invalidate_timeline_layout_measurements();"));
+        assert!(auto_collapse.contains("self.queue_ui_state();"));
         assert!(invalidation.contains("self.timeline_measured_turn_heights.clear();"));
         assert!(invalidation.contains("self.timeline_measured_turn_layout_signatures.clear();"));
         assert!(invalidation.contains("self.timeline_pending_turn_heights.clear();"));
@@ -124958,6 +127455,7 @@ mod tests {
 
         assert!(signature.contains("enhanced_command_execution_display"));
         assert!(signature.contains("enhanced_file_operation_display"));
+        assert!(signature.contains("auto_collapse_tool_calls"));
         assert!(signature.contains("process_activity_groups_with_commands"));
         assert!(signature.contains("process_activity_groups_with_file_operations"));
 
@@ -131990,5 +134488,78 @@ mod route_picker_tests {
             group.choices[0].label, "deepseek-chat",
             "the model is named, not its storage id"
         );
+    }
+
+    #[test]
+    fn session_context_quotes_each_line_and_keeps_blank_lines() {
+        assert_eq!(context_menu_blockquote("one\n\ntwo\n"), "> one\n>\n> two");
+        assert_eq!(context_menu_blockquote("   \n"), "");
+    }
+
+    #[test]
+    fn session_context_find_query_takes_the_first_useful_line() {
+        assert_eq!(selection_find_query("\n\n  hello  \nworld"), "hello");
+        let long = "x".repeat(200);
+        assert_eq!(selection_find_query(&long).chars().count(), 120);
+    }
+
+    #[test]
+    fn session_context_links_must_be_one_external_url() {
+        assert!(single_external_url(" https://example.com/a ").is_some());
+        assert_eq!(
+            single_external_url("https://example.com/a https://example.com/b"),
+            None,
+        );
+        assert_eq!(single_external_url("javascript:alert(1)"), None);
+    }
+
+    #[test]
+    fn session_context_markdown_surfaces_match_their_row_only() {
+        let prefixes = vec!["markdown:row".to_string()];
+        assert!(markdown_surface_matches("markdown:row", &prefixes));
+        assert!(markdown_surface_matches("markdown:row:0", &prefixes));
+        assert!(!markdown_surface_matches("markdown:row-extra", &prefixes));
+        assert!(!markdown_surface_matches("markdown:other", &prefixes));
+    }
+
+    /// The child Agent rail renders another session's transcript through the
+    /// same row renderers as the focused timeline, so its row menus must not
+    /// fork, stop, fold or act on the borrowed view. They stay copy and quote.
+    #[test]
+    fn session_context_child_agent_rail_menus_stay_copy_only() {
+        let source = include_str!("app.rs");
+
+        let agent_menu = source
+            .split_once("    fn build_agent_message_context_menu(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn activity_copy_item("))
+            .map(|(body, _)| body)
+            .expect("the Agent message menu should remain inspectable");
+        assert!(agent_menu.contains("context.child_session.is_none()"));
+        assert!(agent_menu.contains("ClipboardItem::new_string(copy_body"));
+
+        let user_menu = source
+            .split_once("    fn build_user_message_context_menu(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn build_agent_message_context_menu("))
+            .map(|(body, _)| body)
+            .expect("the user message menu should remain inspectable");
+        assert!(user_menu.contains("let copy_item = context.copy_item.clone();"));
+
+        let turn = source
+            .split_once("    fn render_timeline_turn(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_turn_file_changes_card("))
+            .map(|(body, _)| body)
+            .expect("the turn renderer should remain inspectable");
+        assert!(turn.contains(
+            "if self.rendering_child_agent_timeline() {\n            return content.into_any_element();\n        }\n        content\n            .context_menu("
+        ));
+
+        let row = source
+            .split_once("    fn render_timeline_row(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn highlight_session_search_rows("))
+            .map(|(body, _)| body)
+            .expect("the row renderer should remain inspectable");
+        assert!(row.contains(
+            "let element = if self.rendering_child_agent_timeline()\n            || matches!("
+        ));
     }
 }

@@ -165,13 +165,38 @@ pub fn is_file_url(destination: &str) -> bool {
 ///
 /// The test is lexical and host-independent, so a client can recognise the
 /// shape everywhere and route it to the platform path resolver instead of the
-/// URL parser.
+/// URL parser. A POSIX spelling of the same path keeps a leading `/` before
+/// the drive (`/C:/work/a.md`), which a shell such as Git Bash produces; both
+/// name the drive.
 pub fn is_windows_drive_path(destination: &str) -> bool {
+    let destination = destination.trim();
     let bytes = destination.as_bytes();
-    bytes.len() >= 3
-        && bytes[0].is_ascii_alphabetic()
-        && bytes[1] == b':'
-        && matches!(bytes[2], b'\\' | b'/')
+    let drive = if bytes.first() == Some(&b'/') {
+        &bytes[1..]
+    } else {
+        bytes
+    };
+    drive.len() >= 3
+        && drive[0].is_ascii_alphabetic()
+        && drive[1] == b':'
+        && matches!(drive[2], b'\\' | b'/')
+}
+
+/// The platform path a local Markdown destination names.
+///
+/// An editor location (`:line` or `:line:column`) belongs to the click, not to
+/// the file, and a Windows path written from a POSIX shell keeps a leading `/`
+/// before its drive. Both are removed here so the platform path resolver sees
+/// the path the filesystem actually has.
+pub fn local_file_path(destination: &str) -> String {
+    let destination = destination.trim();
+    let path = destination.split(['?', '#']).next().unwrap_or(destination);
+    let path = strip_editor_location(path);
+    if is_windows_drive_path(path) {
+        path.trim_start_matches('/').to_string()
+    } else {
+        path.to_string()
+    }
 }
 
 fn normalize_base_path(base_path: &str) -> String {
@@ -442,6 +467,8 @@ mod tests {
         for local in [
             r"C:\work\notes.md",
             "C:/work/notes.md",
+            "/C:/10000000/vibex/apps/desktop/src/timeline_activity.rs:354",
+            r"/C:\work\notes.md",
             "file:///C:/work/notes.md",
             "FILE:///tmp/notes.md",
             "docs/notes.md",
@@ -466,6 +493,33 @@ mod tests {
                 "{unsupported}"
             );
         }
+    }
+
+    #[test]
+    fn local_file_paths_drop_the_editor_location_and_posix_drive_slash() {
+        // The exact shape a Windows tool prints from a POSIX shell: a leading
+        // slash before the drive and a trailing `:line`.
+        assert_eq!(
+            local_file_path("/C:/10000000/vibex/apps/desktop/src/timeline_activity.rs:354"),
+            "C:/10000000/vibex/apps/desktop/src/timeline_activity.rs"
+        );
+        assert_eq!(
+            local_file_path(r"/C:\work\notes.md:12:3"),
+            r"C:\work\notes.md"
+        );
+        // A plain Windows path and a relative path keep their shape.
+        assert_eq!(local_file_path(r"C:\work\notes.md:12"), r"C:\work\notes.md");
+        assert_eq!(local_file_path("docs/notes.md:12:3"), "docs/notes.md");
+        // A POSIX absolute path is not a drive path and stays untouched.
+        assert_eq!(
+            local_file_path("/home/user/notes.md:9"),
+            "/home/user/notes.md"
+        );
+        // A `file:` URL keeps its scheme for the URL-aware resolver.
+        assert_eq!(
+            local_file_path("file:///C:/work/notes.md:354"),
+            "file:///C:/work/notes.md"
+        );
     }
 
     #[test]

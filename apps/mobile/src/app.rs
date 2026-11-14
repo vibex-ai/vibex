@@ -13650,6 +13650,8 @@ impl MobileApp {
                 provider_resolution_id: None,
                 note: None,
                 resolved_at_ms: unix_timestamp_ms(),
+                // A person pressed the card on this device.
+                responder: Some(vibex_core::ApprovalResponder::Human),
             },
         });
         let ticket = match controller.begin_resolve_permission(&request) {
@@ -45023,6 +45025,7 @@ fn session_opened(cx: &mut Context<Self>) {
                 provider_resolution_id: None,
                 note: None,
                 resolved_at_ms: 2,
+                responder: Some(vibex_core::ApprovalResponder::Human),
             }),
         );
         assert!(track_pending_user_request(&mut pending, &resolution));

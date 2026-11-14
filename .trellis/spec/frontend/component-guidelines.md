@@ -1109,15 +1109,21 @@ result remains readable.
 UI tests verify hover colors and painted surfaces, narrow-width disclosure
 geometry, and that settled or reduced-motion text requests no further frames.
 
-`timeline_activity::group_open(turn, group, explicit)` gives the reader's
-choice precedence. Otherwise, an unfinished turn without a conclusion opens
-its trailing activity group and any earlier group containing an active
-operation; settled groups collapse when commentary follows or the turn ends.
-File-operation detail preferences choose the renderer inside the group rather
-than splitting the activity run. Enhanced command cards retain their separate
-approval surface. The effective group expansion is part of the measured-unit
-revision: an automatic collapse must release the old height even when the
-tool's sequence has not advanced.
+`timeline_activity::group_open(turn, group, explicit, auto_collapse)` gives
+the reader's choice precedence. Otherwise, an unfinished turn without a
+conclusion opens its trailing activity group and any earlier group containing
+an active operation; settled groups collapse when commentary follows or the
+turn ends. `auto_collapse` (the session's **Auto-collapse tool calls**
+preference, mirrored to mobile through `AgentTimelineDisplaySettings`) folds
+a live run to its one-line summary instead of opening it, because the summary
+already counts changed files, commands, reads and failures. A run holding an
+approval-pending row still opens itself: the request is an affordance, not
+activity, and must never wait behind a summary. File-operation detail
+preferences choose the renderer inside the group rather than splitting the
+activity run. Enhanced command cards retain their separate approval surface.
+The effective group expansion is part of the measured-unit revision and of
+every timeline height fingerprint: an automatic collapse must release the old
+height even when the tool's sequence has not advanced.
 
 Commentary and final answers use the normal body foreground. Reasoning retains
 its muted text presentation so progress explanations read above tool metadata.

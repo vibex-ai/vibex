@@ -32,6 +32,7 @@ use vibex_core::{
     SessionListPage, SessionReadAnchor, SessionReadCursor, SessionReadEntry, SessionReadPage,
     SessionReadView, SessionRuntimeOption, SessionRuntimeSelection, SessionTreeNode, TaskListPage,
     TimelineItem, TimelineItemKind, TimelinePayload, UserMessageDelivery,
+    VIBEX_USE_APPROVAL_READ_CHARS, VIBEX_USE_APPROVAL_UNTRUSTED_NOTICE,
     VIBEX_USE_DEFAULT_READ_CHARS, VIBEX_USE_DEFAULT_READ_ITEMS, VIBEX_USE_IDEMPOTENCY_KEY_CHARS,
     VIBEX_USE_MAX_BATCH_REFS, VIBEX_USE_MAX_CONTEXT_REFS, VIBEX_USE_MAX_GROUP_MEMBERS,
     VIBEX_USE_MAX_LIVE_PANES, VIBEX_USE_MAX_READ_CHARS, VIBEX_USE_MAX_READ_ITEMS,
@@ -2784,7 +2785,7 @@ impl VibexUseService {
         arguments: &serde_json::Value,
         bind_human_mentions: bool,
     ) -> VibexResult<SessionRuntimeSelection> {
-        let target = arguments.get("target").cloned().unwrap_or_default();
+        let mut target = arguments.get("target").cloned().unwrap_or_default();
         let mut selection_ref = optional_string(&target, "selectionRef", 512)
             .or_else(|| optional_string(arguments, "selectionRef", 512));
         let mut bound_mention = false;
@@ -2794,6 +2795,20 @@ impl VibexUseService {
             if let Some(reference) =
                 bound_mention_target(&mentions, &target, selection_ref.as_deref())?
             {
+                // The chip's tuning is part of what the user chose, and the
+                // reference alone cannot carry it: a tuned reference fingerprints
+                // a selection the catalogue never publishes, so resolving it
+                // needs the same overrides the chip holds. Without this the
+                // delegation either failed to find the entry or silently ran at
+                // the option's default depth while the composer showed the
+                // reader's.
+                if let Some(tuning) = mentions
+                    .iter()
+                    .find(|mention| mention.reference == reference)
+                    .and_then(|mention| mention.tuning.as_ref())
+                {
+                    apply_mention_tuning(&mut target, tuning)?;
+                }
                 selection_ref = Some(reference.as_uri());
                 bound_mention = true;
             }
@@ -2852,11 +2867,8 @@ impl VibexUseService {
             )
             .with_diagnostic("catalogRevision", catalog.revision.to_string()));
         }
-        let option = catalog
-            .options
-            .iter()
-            .find(|option| runtime_option_ref(option) == reference.as_uri())
-            .ok_or_else(|| {
+        let option =
+            resolve_runtime_option_reference(&catalog, &reference, &target).ok_or_else(|| {
                 VibexError::validation(
                     use_codes::TARGET_UNAVAILABLE,
                     "that runtime option is no longer offered by this runtime",
@@ -2873,22 +2885,24 @@ impl VibexUseService {
         if bound_mention {
             // The user's own row is the answer, not a starting point for the
             // caller to overrule. A field that disagrees with it is a conflict;
-            // a field that merely restates it is allowed, but the exact option
-            // still wins so mode, effort and feature values cannot drift.
-            if selected.is_none() {
-                return Err(VibexError::validation(
+            // a field that merely restates it is allowed, and a field that tunes
+            // how it runs (depth, mode, feature values) is the reader's own
+            // edit, which `select_option` already validated against the choices
+            // that row publishes.
+            selected.ok_or_else(|| {
+                VibexError::validation(
                     use_codes::TARGET_MISMATCH,
                     "the delegation target conflicts with the collaborator and configuration the user addressed",
-                ));
-            }
-            return Ok(option.selection.clone());
+                )
+            })
+        } else {
+            selected.ok_or_else(|| {
+                VibexError::validation(
+                    use_codes::TARGET_UNAVAILABLE,
+                    "target fields conflict with selectionRef",
+                )
+            })
         }
-        selected.ok_or_else(|| {
-            VibexError::validation(
-                use_codes::TARGET_UNAVAILABLE,
-                "target fields conflict with selectionRef",
-            )
-        })
     }
 
     /// Resolves a selection the caller named field by field.
@@ -4099,6 +4113,291 @@ impl VibexUseService {
     }
 
     // -----------------------------------------------------------------------
+    // approval delegation
+    // -----------------------------------------------------------------------
+
+    /// Reads the approval cards one of the caller's own child tasks is parked on.
+    ///
+    /// A parent can only answer a card it can read, and `vibex_get_tasks` only
+    /// reports the card's id. This is the missing half: the card's own text,
+    /// fenced and bounded, plus whether this parent may answer it at all.
+    ///
+    /// The fence is not decoration. The text was written by the child's
+    /// provider, so it is untrusted input arriving in the parent's context; a
+    /// parent that treats it as instruction has been talked into an approval.
+    /// `may_answer` reports the same boundary `vibex_decide_approval` enforces,
+    /// so an irreversible action reads as "a human has to answer this" instead
+    /// of failing only when the parent tries.
+    fn read_approvals(
+        &self,
+        actor: &VibexUseActor,
+        arguments: &serde_json::Value,
+    ) -> VibexResult<serde_json::Value> {
+        let conn = self.open()?;
+        let mut task_ids = Vec::new();
+        if let Some(list) = arguments
+            .get("taskRefs")
+            .and_then(serde_json::Value::as_array)
+        {
+            if list.len() > VIBEX_USE_MAX_BATCH_REFS {
+                return Err(VibexError::validation(
+                    use_codes::REQUEST_INVALID,
+                    format!("at most {VIBEX_USE_MAX_BATCH_REFS} task references are accepted"),
+                ));
+            }
+            for entry in list {
+                let raw = entry.as_str().ok_or_else(|| {
+                    VibexError::validation(
+                        use_codes::REQUEST_INVALID,
+                        "taskRefs entries must be strings",
+                    )
+                })?;
+                let reference = VibexUseRef::parse(raw).ok_or_else(|| {
+                    VibexError::validation(use_codes::REQUEST_INVALID, "taskRefs entry is invalid")
+                })?;
+                task_ids.push(reference.task_id().ok_or_else(|| {
+                    VibexError::validation(
+                        use_codes::REQUEST_INVALID,
+                        "taskRefs entry is not a task",
+                    )
+                })?);
+            }
+        } else {
+            // No explicit list: every task this caller delegated that is parked
+            // on an approval right now. That is what a parent actually wants —
+            // "is anything of mine waiting on me?" — without having to poll each
+            // task it ever created.
+            let root = self.actor_root(&conn, actor)?;
+            for task in vibex_db::list_delegations_for_root(&conn, &root, false)? {
+                if task.parent_session_id == actor.session_id {
+                    task_ids.push(task.id);
+                }
+            }
+        }
+        let max_items = bounded_usize(
+            arguments,
+            "maxItems",
+            VIBEX_USE_DEFAULT_READ_ITEMS,
+            VIBEX_USE_MAX_READ_ITEMS,
+        );
+        let mut cards = Vec::new();
+        for task_id in task_ids {
+            if cards.len() >= max_items {
+                break;
+            }
+            let Some(task) = AgentDelegationRepository::get(&conn, &task_id)? else {
+                continue;
+            };
+            // Only the delegating session reads its own child's cards. A
+            // sibling reading them would learn what another branch was asked to
+            // do, which is a different disclosure than reading the task.
+            if task.parent_session_id != actor.session_id {
+                continue;
+            }
+            let Some(DelegationBlockedOn::Permission { request_id }) = task.blocked_on.as_ref()
+            else {
+                continue;
+            };
+            let Some(child) = task.child_session_id.as_ref() else {
+                continue;
+            };
+            let Some(request) = PermissionRepository::get_request(
+                &conn,
+                &vibex_core::RequestId::parse(request_id).map_err(|_| {
+                    VibexError::validation(use_codes::REQUEST_INVALID, "requestId is invalid")
+                })?,
+            )?
+            else {
+                continue;
+            };
+            if request.status != vibex_core::PermissionRequestStatus::Pending {
+                continue;
+            }
+            let escalate = requires_human_approval(request.risk_category);
+            let mut body = String::new();
+            body.push_str(&request.title);
+            for detail in &request.details {
+                body.push('\n');
+                body.push_str(&detail.label);
+                body.push_str(": ");
+                body.push_str(&detail.value);
+            }
+            let (body, truncated) = vibex_core::bounded_chars(&body, VIBEX_USE_APPROVAL_READ_CHARS);
+            cards.push(vibex_core::ApprovalCardView {
+                request_id: request.id.as_str().to_string(),
+                task_ref: VibexUseRef::task(&task.id),
+                child_session_ref: VibexUseRef::session(child),
+                risk_category: format!("{:?}", request.risk_category),
+                title: vibex_core::bounded_chars(&request.title, VIBEX_USE_TITLE_CHARS).0,
+                fenced: vibex_core::fence_untrusted_approval(&body),
+                truncated,
+                may_answer: !escalate,
+                escalate_reason: escalate.then(|| {
+                    "this action cannot be undone; only a human may approve it".to_string()
+                }),
+                requested_at_ms: request.requested_at_ms,
+                expires_at_ms: request.expires_at_ms,
+            });
+        }
+        serde_json::to_value(vibex_core::ApprovalListPage {
+            notice: VIBEX_USE_APPROVAL_UNTRUSTED_NOTICE.to_string(),
+            cards,
+        })
+        .map_err(internal_encode_error)
+    }
+
+    /// Answers a card one of the caller's own child tasks is parked on.
+    ///
+    /// The parent can answer because the child inherited the parent's sandbox
+    /// and tool set: whatever the child is asking for, the parent could have
+    /// done itself. That equivalence is also the boundary. A card the parent
+    /// could not have produced on its own authority — an irreversible action —
+    /// is escalated to the human instead of answered here, because approving it
+    /// would let a delegation launder a permission the parent never had.
+    ///
+    /// The card's own text is untrusted. It is never echoed into the parent's
+    /// answer; the decision is approve or deny, with the parent's own reason.
+    async fn decide_approval(
+        &self,
+        actor: &VibexUseActor,
+        arguments: &serde_json::Value,
+    ) -> VibexResult<serde_json::Value> {
+        let caller_key =
+            required_string(arguments, "idempotencyKey", VIBEX_USE_IDEMPOTENCY_KEY_CHARS)?;
+        let task_ref = parse_ref(arguments, "taskRef", VibexUseResourceKind::Task)?;
+        let request_id = required_string(arguments, "requestId", 256)?;
+        let decision = required_string(arguments, "decision", 32)?;
+        let reason = optional_string(arguments, "reason", 2_000);
+        let response = match decision.as_str() {
+            "approve" => vibex_core::PermissionResponseKind::Approve,
+            "deny" => vibex_core::PermissionResponseKind::Deny,
+            // `always_allow` is deliberately absent: a parent answers one card,
+            // never a category, so it cannot widen its child's authority for the
+            // rest of the session.
+            _ => {
+                return Err(VibexError::validation(
+                    use_codes::REQUEST_INVALID,
+                    "decision must be approve or deny",
+                ));
+            }
+        };
+        let fingerprint = arguments_fingerprint(arguments);
+        let conn = self.open()?;
+        let (operation, claimed) = self.reserve_operation(
+            &conn,
+            actor,
+            VibexUseTool::DecideApproval,
+            &caller_key,
+            &fingerprint,
+            arguments,
+        )?;
+        if !claimed {
+            return self.operation_view(&conn, &operation);
+        }
+        let task_id = task_ref.task_id().ok_or_else(|| {
+            VibexError::validation(use_codes::REQUEST_INVALID, "taskRef is invalid")
+        })?;
+        let task = AgentDelegationRepository::get(&conn, &task_id)?.ok_or_else(|| {
+            VibexError::new(
+                ErrorCategory::Permission,
+                use_codes::NOT_FOUND_OR_NOT_AUTHORIZED,
+                "task not found",
+            )
+        })?;
+        // Only the task's own parent may answer it. A sibling, an ancestor
+        // further up, or an unrelated caller is refused: the card belongs to
+        // the parent/child pair, and letting anyone in the tree answer would
+        // turn one approval into a tree-wide capability.
+        if task.parent_session_id != actor.session_id {
+            return Err(VibexError::new(
+                ErrorCategory::Permission,
+                use_codes::NOT_FOUND_OR_NOT_AUTHORIZED,
+                "only the session that delegated this task may answer its approval",
+            ));
+        }
+        self.require_writable(&conn, actor, &task.parent_session_id)?;
+        let child = task.child_session_id.clone().ok_or_else(|| {
+            VibexError::validation(
+                use_codes::REQUEST_INVALID,
+                "this task has no child session to answer for",
+            )
+        })?;
+        if !task.phase().is_active() {
+            return Err(VibexError::conflict(
+                use_codes::REQUEST_INVALID,
+                "the task is no longer running, so it has no card to answer",
+            ));
+        }
+        let request = PermissionRepository::get_request(
+            &conn,
+            &vibex_core::RequestId::parse(&request_id).map_err(|_| {
+                VibexError::validation(use_codes::REQUEST_INVALID, "requestId is invalid")
+            })?,
+        )?
+        .ok_or_else(|| {
+            VibexError::validation(use_codes::REQUEST_INVALID, "approval request not found")
+        })?;
+        if request.session_id != child {
+            return Err(VibexError::new(
+                ErrorCategory::Permission,
+                use_codes::NOT_FOUND_OR_NOT_AUTHORIZED,
+                "that approval does not belong to this task's child",
+            ));
+        }
+        if request.status != vibex_core::PermissionRequestStatus::Pending {
+            return Err(VibexError::conflict(
+                use_codes::REQUEST_INVALID,
+                "the approval was already answered",
+            ));
+        }
+        // The boundary: what a parent may not answer on its own authority stays
+        // with the human. `response` is checked before the card is touched, so a
+        // refusal leaves the card exactly as it was for the reader.
+        if response == vibex_core::PermissionResponseKind::Approve
+            && requires_human_approval(request.risk_category)
+        {
+            return Err(VibexError::new(
+                ErrorCategory::Permission,
+                use_codes::SCOPE_DENIED,
+                "this approval needs a human: the action cannot be undone and the child's sandbox does not make it safe",
+            )
+            .with_diagnostic("riskCategory", format!("{:?}", request.risk_category)));
+        }
+        self.record_operation_resource(&conn, &operation, "task", VibexUseRef::task(&task.id))?;
+        let resolution = vibex_core::PermissionResolution {
+            request_id: request.id.clone(),
+            session_id: child.clone(),
+            response,
+            responder_device_id: None,
+            provider_resolution_id: None,
+            note: reason
+                .clone()
+                .or_else(|| Some("answered by the owning Agent".to_string())),
+            resolved_at_ms: vibex_core::unix_timestamp_ms(),
+            responder: Some(vibex_core::ApprovalResponder::ParentAgent {
+                session_id: actor.session_id.clone(),
+                task_id: task.id.clone(),
+            }),
+        };
+        drop(conn);
+        self.manager
+            .resolve_permission(vibex_core::ResolvePermissionRequest {
+                session_id: child.clone(),
+                request_id: request.id.clone(),
+                resolution: resolution.clone(),
+            })
+            .await?;
+        let conn = self.open()?;
+        self.settle_operation(&conn, &operation, VibexUseOperationState::Succeeded, None)?;
+        Ok(serde_json::json!({
+            "taskRef": VibexUseRef::task(&task.id).as_uri(),
+            "requestId": request.id.as_str(),
+            "decision": decision,
+            "responder": "parent_agent",
+        }))
+    }
+
+    // -----------------------------------------------------------------------
     // events
     // -----------------------------------------------------------------------
 
@@ -4496,6 +4795,8 @@ impl VibexUseToolHost for VibexUseService {
                 VibexUseTool::FinishTask => self.finish_task(&actor, &arguments),
                 VibexUseTool::Interrupt => self.interrupt(&actor, &arguments).await,
                 VibexUseTool::CancelTask => self.cancel_task(&actor, &arguments).await,
+                VibexUseTool::DecideApproval => self.decide_approval(&actor, &arguments).await,
+                VibexUseTool::ReadApprovals => self.read_approvals(&actor, &arguments),
                 VibexUseTool::GetEvents => self.get_events(&actor, &arguments),
                 VibexUseTool::AckEvents => self.ack_events(&actor, &arguments),
                 VibexUseTool::ListGroups => self.list_groups(&actor, &arguments),
@@ -4544,6 +4845,26 @@ impl VibexUseToolHost for VibexUseService {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Whether an approval of this risk has to come from a person.
+///
+/// The parent Agent may answer its child because the child inherited the
+/// parent's sandbox and tools — whatever the child asks for, the parent could
+/// have done itself. That equivalence is exactly what these categories break:
+/// they are irreversible or they reach outside the sandbox, so a parent's
+/// approval would let a delegation obtain a permission the parent never had.
+/// `Network` is here by default because the sandbox does not bound it.
+fn requires_human_approval(category: vibex_core::PermissionRiskCategory) -> bool {
+    use vibex_core::PermissionRiskCategory;
+    matches!(
+        category,
+        PermissionRiskCategory::FileDeleteOrMove
+            | PermissionRiskCategory::GitDestructive
+            | PermissionRiskCategory::ProviderConfigExport
+            | PermissionRiskCategory::CustomTool
+            | PermissionRiskCategory::Network
+    )
+}
+
 /// The Agent mentions carried by the newest user message of `session_id`.
 ///
 /// The newest user message is the turn that is running: the authority appends
@@ -4566,6 +4887,42 @@ fn latest_agent_mentions(
                 && mention.reference.kind == VibexUseResourceKind::RuntimeOption
         })
         .collect())
+}
+
+/// Copies a chip's tuning into a delegation target.
+///
+/// The chip's reference fingerprints a complete selection, so a tuned reference
+/// names a configuration the catalogue never publishes as its own entry. The
+/// resolver applies the target's overrides before comparing fingerprints, which
+/// is why the tuning has to travel here: without it the entry is either not
+/// found or found at the option's default depth, and the child would run
+/// differently from what the composer showed.
+fn apply_mention_tuning(
+    target: &mut serde_json::Value,
+    tuning: &vibex_core::MentionTuning,
+) -> VibexResult<()> {
+    let Some(object) = target.as_object_mut() else {
+        return Ok(());
+    };
+    if let Some(effort) = tuning.reasoning_effort.as_ref() {
+        object.insert(
+            "reasoningEffort".to_string(),
+            serde_json::Value::String(effort.clone()),
+        );
+    }
+    if let Some(mode_id) = tuning.mode_id.as_ref() {
+        object.insert(
+            "modeId".to_string(),
+            serde_json::Value::String(mode_id.clone()),
+        );
+    }
+    if !tuning.config_values.is_empty() {
+        object.insert(
+            "configValues".to_string(),
+            serde_json::to_value(&tuning.config_values).map_err(internal_encode_error)?,
+        );
+    }
+    Ok(())
 }
 
 /// The reference a user's Agent mention binds one delegation to.
@@ -4652,7 +5009,38 @@ pub fn runtime_option_ref(option: &SessionRuntimeOption) -> String {
     VibexUseRef::runtime_option(&selection_fingerprint(&option.selection)).as_uri()
 }
 
-fn selection_fingerprint(selection: &SessionRuntimeSelection) -> String {
+/// The catalogue entry a runtime option reference names.
+///
+/// A reference is a fingerprint of a *complete* selection, so a chip that
+/// carries a thinking depth or a mode names a configuration the catalogue never
+/// publishes as its own entry: the depth is how an option runs, not which option
+/// it is. The exact match therefore runs first, and a miss re-fingerprints each
+/// option after applying the request's overrides. That way one reference form
+/// serves both a bare option and one the reader tuned, and the catalogue never
+/// has to enumerate depth × mode combinations.
+fn resolve_runtime_option_reference<'a>(
+    catalog: &'a vibex_core::SessionRuntimeOptionCatalog,
+    reference: &VibexUseRef,
+    target: &serde_json::Value,
+) -> Option<&'a SessionRuntimeOption> {
+    catalog
+        .options
+        .iter()
+        .find(|option| runtime_option_ref(option) == reference.as_uri())
+        .or_else(|| {
+            catalog.options.iter().find(|option| {
+                selection::select_option(option, target)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|selection| {
+                        VibexUseRef::runtime_option(&selection_fingerprint(&selection)).as_uri()
+                            == reference.as_uri()
+                    })
+            })
+        })
+}
+
+pub fn selection_fingerprint(selection: &SessionRuntimeSelection) -> String {
     fingerprint_of(&[
         selection.agent_id.as_str(),
         &serde_json::to_string(&selection.auth_source).unwrap_or_default(),
@@ -5420,6 +5808,41 @@ mod tests {
         assert_eq!(bound, Some(mention.reference));
     }
 
+    /// A tuned chip's tuning reaches the delegation target.
+    ///
+    /// The reference fingerprints a complete selection, so resolving a tuned
+    /// chip needs the same overrides the chip holds. Without them the entry is
+    /// either not found or found at the option's default depth, and the child
+    /// runs differently from what the composer showed.
+    #[test]
+    fn a_tuned_mention_hands_its_tuning_to_the_delegation_target() {
+        let mut target = serde_json::json!({ "selectionRef": "vibex://runtime-option/a" });
+        let tuning = vibex_core::MentionTuning {
+            reasoning_effort: Some("high".to_string()),
+            mode_id: Some("build".to_string()),
+            config_values: BTreeMap::from([("auto_approve".to_string(), "true".to_string())]),
+        };
+        apply_mention_tuning(&mut target, &tuning).unwrap();
+        assert_eq!(
+            target.get("reasoningEffort").and_then(|v| v.as_str()),
+            Some("high")
+        );
+        assert_eq!(target.get("modeId").and_then(|v| v.as_str()), Some("build"));
+        assert_eq!(
+            target
+                .get("configValues")
+                .and_then(|v| v.get("auto_approve"))
+                .and_then(|v| v.as_str()),
+            Some("true")
+        );
+
+        // An empty tuning adds nothing, so an untuned chip's target stays the
+        // exact object it always was.
+        let mut bare = serde_json::json!({ "selectionRef": "vibex://runtime-option/a" });
+        apply_mention_tuning(&mut bare, &vibex_core::MentionTuning::default()).unwrap();
+        assert_eq!(bare.as_object().map(serde_json::Map::len), Some(1));
+    }
+
     #[test]
     fn a_different_runtime_option_is_a_target_mismatch() {
         let mention = VibexUseMention::agent(
@@ -5517,6 +5940,64 @@ mod tests {
             VibexUseRef::parse(&first)
                 .is_some_and(|reference| { reference.kind == VibexUseResourceKind::RuntimeOption })
         );
+    }
+
+    /// A reference the reader tuned still names the catalogue entry it came from.
+    ///
+    /// The reference fingerprints the whole selection, so picking `high` on an
+    /// option the catalogue publishes at its default produces a reference no
+    /// entry matches exactly. Without the override-aware lookup, every tuned
+    /// delegation failed with "no longer offered".
+    #[test]
+    fn a_tuned_option_reference_resolves_against_the_entry_it_tunes() {
+        let selection = SessionRuntimeSelection::provider(
+            AgentId::parse("codex").unwrap(),
+            vibex_core::ProviderProfileId::parse("provider_local").unwrap(),
+            "gpt-5",
+        );
+        let option = SessionRuntimeOption {
+            selection: selection.clone(),
+            agent_label: "Codex".to_string(),
+            auth_source_label: "Local".to_string(),
+            model_label: "gpt-5".to_string(),
+            reasoning_efforts: vec![
+                vibex_core::SessionConfigValue {
+                    value: "low".to_string(),
+                    label: None,
+                },
+                vibex_core::SessionConfigValue {
+                    value: "high".to_string(),
+                    label: None,
+                },
+            ],
+            modes: Vec::new(),
+            features: Vec::new(),
+            availability: vibex_core::RuntimeOptionAvailability::Available,
+            member_count: 1,
+            auto_routes: false,
+        };
+        let catalog = vibex_core::SessionRuntimeOptionCatalog {
+            revision: 1,
+            agents: Vec::new(),
+            auth_sources: Vec::new(),
+            options: vec![option],
+        };
+        let tuned = serde_json::json!({ "reasoningEffort": "high" });
+        let mut tuned_selection = selection;
+        tuned_selection.reasoning_effort = Some("high".to_string());
+        let reference = VibexUseRef::runtime_option(&selection_fingerprint(&tuned_selection));
+        let resolved = resolve_runtime_option_reference(&catalog, &reference, &tuned)
+            .expect("a tuned reference must resolve against the entry it tunes");
+        assert_eq!(resolved.selection.model_id(), Some("gpt-5"));
+        assert_eq!(
+            resolved.selection.reasoning_effort, None,
+            "the entry stays bare"
+        );
+
+        // A depth the option does not advertise resolves to nothing instead of
+        // silently picking a neighbour.
+        let unknown = serde_json::json!({ "reasoningEffort": "max" });
+        assert!(resolve_runtime_option_reference(&catalog, &reference, &unknown).is_none());
     }
 
     fn temporary_connection(label: &str) -> (DbConnection, tempfile::TempDir) {

@@ -143,7 +143,9 @@ pub use sidebar_organization::{
 pub use storage::{StorageCleanupKind, StorageCleanupReport};
 pub use timeline_display_settings::TimelineDisplaySettingsBridge;
 pub use usage::AgentUsageService;
-pub use vibex_use::{LOCAL_AUTHORITY, VibexUseService, fingerprint_of, runtime_option_ref};
+pub use vibex_use::{
+    LOCAL_AUTHORITY, VibexUseService, fingerprint_of, runtime_option_ref, selection_fingerprint,
+};
 pub use worktree::{WorktreeCoordinator, WorktreeCreateContext};
 
 pub const STABLE_DESKTOP_APP_ID: &str = "dev.vibex.desktop";

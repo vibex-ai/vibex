@@ -1483,15 +1483,30 @@ fn timeline_rows_from_refs(items: &[&TimelineItem]) -> Vec<TimelineRow> {
                     && !resolved_permission_ids.contains(request.id.as_str());
                 rows.push(row);
             }
-            TimelinePayload::PermissionResolution(resolution) => rows.push(simple_row(
-                item,
-                format!("permission-resolution:{}", resolution.request_id),
-                TimelineRowKind::PermissionResolution,
-                "Permission resolved",
-                format!("{:?}", resolution.response),
-                false,
-                false,
-            )),
+            TimelinePayload::PermissionResolution(resolution) => {
+                // Who answered is part of the record. A parent Agent may answer
+                // its own child's card, and a reader looking at an approved
+                // command has to be able to tell that from their own approval —
+                // otherwise the transcript claims they allowed something they
+                // never saw.
+                let body = match resolution.responder.as_ref() {
+                    Some(vibex_core::ApprovalResponder::ParentAgent { .. }) => {
+                        format!("{:?} · answered by the owning Agent", resolution.response)
+                    }
+                    Some(vibex_core::ApprovalResponder::Human) | None => {
+                        format!("{:?}", resolution.response)
+                    }
+                };
+                rows.push(simple_row(
+                    item,
+                    format!("permission-resolution:{}", resolution.request_id),
+                    TimelineRowKind::PermissionResolution,
+                    "Permission resolved",
+                    body,
+                    false,
+                    false,
+                ))
+            }
             TimelinePayload::ElicitationRequest(request) => {
                 let mut body = request.message.clone();
                 if let Some(description) = request.description.as_deref()
@@ -4357,6 +4372,7 @@ mod tests {
                     provider_resolution_id: None,
                     note: None,
                     resolved_at_ms: 4,
+                    responder: None,
                 }),
             ),
         ]);
@@ -4583,5 +4599,50 @@ mod tests {
         }
 
         assert!(tick >= duration_seconds as i64 * 25);
+    }
+
+    /// The transcript says who answered a card, not just what the answer was.
+    ///
+    /// A parent Agent may answer its own child's approval. If the row only said
+    /// "Approved", a reader would reasonably conclude they had allowed it — and
+    /// they never saw it.
+    #[test]
+    fn a_permission_row_names_the_owning_agent_when_it_answered() {
+        let request_id = vibex_core::RequestId::new();
+        let resolution = |responder| {
+            item(
+                1,
+                None,
+                TimelinePayload::PermissionResolution(vibex_core::PermissionResolution {
+                    request_id: request_id.clone(),
+                    session_id: VibexSessionId::parse("session_current").unwrap(),
+                    response: vibex_core::PermissionResponseKind::Approve,
+                    responder_device_id: None,
+                    provider_resolution_id: None,
+                    note: None,
+                    resolved_at_ms: 1,
+                    responder,
+                }),
+            )
+        };
+
+        let by_parent = timeline_rows(&[resolution(Some(
+            vibex_core::ApprovalResponder::ParentAgent {
+                session_id: VibexSessionId::parse("session_parent").unwrap(),
+                task_id: AgentDelegationId::new(),
+            },
+        ))]);
+        assert!(
+            by_parent[0].body.contains("answered by the owning Agent"),
+            "got {:?}",
+            by_parent[0].body
+        );
+
+        let by_human = timeline_rows(&[resolution(Some(vibex_core::ApprovalResponder::Human))]);
+        assert!(
+            !by_human[0].body.contains("answered by the owning Agent"),
+            "a human approval must not be attributed to an Agent: {:?}",
+            by_human[0].body
+        );
     }
 }

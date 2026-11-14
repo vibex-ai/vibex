@@ -1794,6 +1794,15 @@ pub struct ManagementCenter {
     model_editor: provider_workspace::ModelEditDraft,
     /// The Models tab's "add a model by id" field.
     provider_model_add_input: Entity<InputState>,
+    /// The fetch picker's check state for a saved Provider's catalogue.
+    ///
+    /// A fetch no longer writes the whole answer into the record: it opens this
+    /// draft, the reader chooses which Models the Provider should offer, and
+    /// only the confirm writes. `None` means no picker is open.
+    provider_model_import: Option<provider_workspace::ProviderModelImportDraft>,
+    /// The fetch picker's own filter, so a long catalogue is scannable without
+    /// narrowing the Models tab behind it.
+    provider_model_import_search: Entity<InputState>,
     provider_endpoint_probes: Option<Vec<vibex_core::ModelProviderEndpointProbe>>,
     provider_endpoint_probes_profile: Option<vibex_core::ModelProviderProfileId>,
     shared_provider_advanced_target: Option<vibex_core::ModelProviderProfileId>,
@@ -2560,6 +2569,13 @@ impl ManagementCenter {
                 "篩選模型",
             ))
         });
+        let provider_model_import_search = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(management_locale_text(
+                "Filter the fetched models",
+                "筛选拉取到的模型",
+                "篩選擷取到的模型",
+            ))
+        });
         let provider_search = cx.new(|cx| {
             InputState::new(window, cx).placeholder(management_locale_text(
                 "Search Providers and groups",
@@ -2849,6 +2865,15 @@ impl ManagementCenter {
                 }
                 cx.notify();
             }),
+            cx.subscribe(
+                &provider_model_import_search,
+                |_, _, event: &InputEvent, cx| {
+                    if !management_input_changed(event) {
+                        return;
+                    }
+                    cx.notify();
+                },
+            ),
             cx.subscribe(&route_group_model_query, |_, _, event: &InputEvent, cx| {
                 if management_input_changed(event) {
                     cx.notify();
@@ -3278,6 +3303,8 @@ impl ManagementCenter {
             traffic_range: TrafficRange::Day,
             provider_model_edit_id: None,
             provider_models_list: None,
+            provider_model_import: None,
+            provider_model_import_search: provider_model_import_search.clone(),
             provider_model_capability_task: None,
             model_editor: provider_workspace::ModelEditDraft::new(window, cx),
             provider_model_add_input,
@@ -7289,10 +7316,12 @@ impl ManagementCenter {
         } else {
             management_locale_text("Add model provider", "添加模型供应商", "新增模型供應商")
         };
+        let content_view = dialog_content.clone();
         window.open_dialog(cx, move |dialog, _, _| {
             let dialog_center = dialog_center.clone();
             let confirm_center = confirm_center.clone();
             let cancel_center = cancel_center.clone();
+            let content_view = content_view.clone();
             dialog
                 .title(title)
                 .w(px(dialog_width))
@@ -7304,7 +7333,17 @@ impl ManagementCenter {
                 // the drop-in every time the reader moved one step, so the
                 // surface appears at rest.
                 .entrance(DialogEntrance::None)
-                .child(dialog_content.clone())
+                // `content`, not `child`: the kit's default body is one
+                // auto-height scroll region, which makes the whole dialog page
+                // scroll. The Model picker and its settings are two panes that
+                // must share the dialog's height and scroll inside themselves,
+                // so the body is handed a definite one.
+                .content(move |content, _, _| {
+                    content
+                        .min_h_0()
+                        .overflow_hidden()
+                        .child(content_view.clone())
+                })
                 // The Dialog answers Enter with its own confirm action, whose
                 // default is "close this overlay". The step decides what Enter
                 // means: on the picker it runs the highlighted source, and in
@@ -17553,122 +17592,6 @@ impl ManagementCenter {
         }));
     }
 
-    fn refresh_shared_provider_models(
-        &mut self,
-        profile_id: vibex_core::ModelProviderProfileId,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(backend) = self.backend.clone() else {
-            return;
-        };
-        if self.mutation.is_some() {
-            return;
-        }
-        self.mutation = Some(ManagementMutation::ProviderProbe(format!(
-            "shared-models:{}",
-            profile_id.as_str()
-        )));
-        self.error = None;
-        self.notice = None;
-        let this = cx.entity();
-        self.mutation_task = Some(cx.spawn(async move |_, cx| {
-            let outcome = management_off_thread(cx, async move {
-                backend
-                    .management()
-                    .fetch_model_provider_profile_models(
-                        vibex_core::ModelProviderFetchModelsRequest {
-                            model_provider_profile_id: profile_id,
-                        },
-                    )
-                    .await
-            })
-            .await;
-            this.update(cx, |this, cx| {
-                this.mutation = None;
-                match outcome {
-                    Ok(response) => {
-                        let Some(mut profile) = this
-                            .providers
-                            .iter()
-                            .find(|profile| profile.id == response.model_provider_profile_id)
-                            .cloned()
-                        else {
-                            this.error = Some(
-                                management_locale_text(
-                                    "The Provider is no longer listed",
-                                    "该供应商已不在列表中",
-                                    "該供應商已不在清單中",
-                                )
-                                .to_string(),
-                            );
-                            cx.notify();
-                            return;
-                        };
-                        if response.models.is_empty() {
-                            this.error = Some(
-                                management_locale_text(
-                                    "The endpoint returned no models",
-                                    "接口没有返回模型",
-                                    "介面沒有回傳模型",
-                                )
-                                .to_string(),
-                            );
-                            cx.notify();
-                            return;
-                        }
-                        profile.configured_models = if profile.metadata.auto_refresh_models {
-                            // AutoInclude adds newly discovered models while
-                            // keeping the user's existing rows: their
-                            // capabilities, names, and disabled state are
-                            // hand-authored data, not discovery output.
-                            merge_discovered_provider_models(
-                                &profile.configured_models,
-                                response.models,
-                            )
-                        } else {
-                            response.models
-                        };
-                        if profile.default_model_id.as_ref().is_none_or(|default| {
-                            !profile
-                                .configured_models
-                                .iter()
-                                .any(|model| model.enabled && &model.id == default)
-                        }) {
-                            profile.default_model_id = profile
-                                .configured_models
-                                .iter()
-                                .find(|model| model.enabled)
-                                .map(|model| model.id.clone());
-                        }
-                        this.notice = Some(format!(
-                            "{} · {}",
-                            management_locale_text(
-                                "Model list refreshed",
-                                "模型列表已刷新",
-                                "模型清單已重新整理",
-                            ),
-                            profile.configured_models.len()
-                        ));
-                        this.update_shared_provider(
-                            profile,
-                            management_locale_text(
-                                "Model list refreshed",
-                                "模型列表已刷新",
-                                "模型清單已重新整理",
-                            ),
-                            cx,
-                        );
-                        cx.notify();
-                    }
-                    Err(error) => {
-                        this.error = Some(format!("{}: {}", error.code, error.message));
-                        cx.notify();
-                    }
-                }
-            });
-        }));
-    }
-
     fn render_shared_provider_endpoint_probes(
         &mut self,
         profile: &vibex_core::ModelProviderProfile,
@@ -24512,33 +24435,22 @@ impl ManagementCenter {
             self.mutation.is_some() || self.agent_mutations.contains_key(&selected_agent_id);
         let updating = self.editing_profile_id.is_some();
         // Creating a Provider starts from "which existing one, or a new one?".
-        // The step owns the body because there is nothing to save yet; the only
-        // action that ends it is Cancel.
+        // The step owns the body because there is nothing to save yet: it binds
+        // an existing record or opens a form, so it has nothing of its own to
+        // commit.
         if !updating && self.provider_preset_picker {
+            // The manual path is pinned under the list rather than scrolling
+            // with it: a long library used to bury "Custom provider" past the
+            // fold, so the one answer the library cannot offer was the hardest
+            // to reach. There is no Cancel row: the dialog's own close control
+            // and Escape already abandon the step, and a second way out under
+            // the list only competed with the choice itself.
+            let pending = self.mutation.is_some();
             return v_flex()
                 .size_full()
                 .min_h_0()
                 .child(self.render_provider_picker_step(window, cx))
-                .child(
-                    h_flex()
-                        .w_full()
-                        .flex_none()
-                        .items_center()
-                        .justify_end()
-                        .gap_2()
-                        .border_t_1()
-                        .border_color(cx.theme().border)
-                        .pt_3()
-                        .child(
-                            Button::new("provider-picker-close")
-                                .small()
-                                .ghost()
-                                .label(management_locale_text("Cancel", "取消", "取消"))
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.close_profile_editor(window, cx)
-                                })),
-                        ),
-                )
+                .child(self.render_provider_picker_custom_band(pending, cx))
                 .into_any_element();
         }
         let saving = matches!(
@@ -25678,7 +25590,6 @@ impl ManagementCenter {
             );
         }
 
-        let custom_selected = selected_choice.as_ref() == Some(&ProviderPickerChoice::Custom);
         v_flex()
             .w_full()
             .min_h_0()
@@ -25764,11 +25675,28 @@ impl ManagementCenter {
             // so the field sits apart from the switch instead of touching it.
             .child(div().w_full().flex_none().pt_3().child(search))
             .child(body)
-            // A new source starts from an empty form, which is the one answer
-            // neither tab's list can offer. Importing no longer lives in this
-            // step: it reads every Agent's native configuration and writes
-            // shared records, so it belongs to the Providers list's own header.
-            .child(Separator::horizontal())
+            .into_any_element()
+    }
+
+    /// The chooser's pinned footer: the manual path that starts a form instead
+    /// of choosing a row.
+    ///
+    /// A new source is the one answer neither tab's list can offer, so it is
+    /// not one more row in the library. It is drawn outside the list's scroll
+    /// region, under its own rule, so it stays reachable without scrolling to
+    /// the end of a long library.
+    fn render_provider_picker_custom_band(
+        &mut self,
+        pending: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let providers_tab = self.provider_picker_tab == ProviderPickerTab::Providers;
+        let custom_selected =
+            self.provider_picker_choice.as_ref() == Some(&ProviderPickerChoice::Custom);
+        v_flex()
+            .debug_selector(|| "management-provider-picker-custom-band".to_string())
+            .w_full()
+            .flex_none()
             .child(
                 // The manual path is not one more row in the library: it is the
                 // answer for a source the library does not list, so it sits on
@@ -25779,6 +25707,7 @@ impl ManagementCenter {
                 div().w_full().pb_2().child(
                     h_flex()
                         .id("management-provider-preset-custom")
+                        .debug_selector(|| "management-provider-preset-custom".to_string())
                         .w_full()
                         .min_w_0()
                         .items_center()
@@ -31266,10 +31195,12 @@ impl ManagementCenter {
         } else {
             management_locale_text("New route group", "新建路由组", "新增路由組")
         };
+        let content_view = dialog_content.clone();
         window.open_dialog(cx, move |dialog, _, _| {
             let dialog_center = dialog_center.clone();
             let confirm_center = confirm_center.clone();
             let cancel_center = cancel_center.clone();
+            let content_view = content_view.clone();
             dialog
                 .title(title)
                 .w(px(dialog_width))
@@ -31279,7 +31210,14 @@ impl ManagementCenter {
                 // are steps of one flow, so neither may replay an entrance when
                 // the reader steps between them.
                 .entrance(DialogEntrance::None)
-                .child(dialog_content.clone())
+                // Same body contract as the Provider form: a definite height,
+                // so the form's own sections scroll rather than the overlay.
+                .content(move |content, _, _| {
+                    content
+                        .min_h_0()
+                        .overflow_hidden()
+                        .child(content_view.clone())
+                })
                 .on_ok(move |_, window, cx| {
                     confirm_center.update(cx, |center, cx| center.save_route_group(window, cx));
                     false
@@ -48350,6 +48288,89 @@ fn save(cx: &mut Context<Self>) {
         assert!(row.size.width > px(0.0) && row.size.height > px(0.0));
     }
 
+    /// The Agent dialog's two panes scroll inside themselves, the way the
+    /// Provider's fetch picker does: a wheel over the catalogue moves its rows
+    /// and leaves the panes, the form band, and the dialog page where they are.
+    #[gpui::test]
+    fn the_agent_model_panes_scroll_inside_themselves(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let (center, cx) = cx.add_window_view(ManagementCenter::new);
+        // Enough Models that the picker's well overflows at this size.
+        let catalogue = (0..40)
+            .map(|index| {
+                test_provider_model(
+                    &format!("model-{index:02}"),
+                    Some(&format!("Model {index:02}")),
+                )
+            })
+            .collect::<Vec<_>>();
+        center.update(cx, |center, _| {
+            center.profile_editor_open = true;
+            center
+                .projection_editor
+                .replace_capability(projection_capability_with_models());
+            center.profile_available_models = catalogue;
+            let mut chosen = test_provider_model("model-00", Some("Model 00"));
+            chosen.capabilities.context_tokens = Some(128_000);
+            center.profile_configured_models = vec![chosen];
+            center.profile_model_selection = Some("model-00".to_string());
+        });
+        let dialog = cx.new(|cx| ManagementProfileDialog::new(center.clone(), cx));
+        let (_, cx) = cx.add_window_view(move |_, _| ProfileDialogHarness {
+            dialog: dialog.clone(),
+        });
+        let handle = cx.windows().pop().expect("test window");
+        cx.simulate_window_resize(handle, gpui::size(px(1080.0), px(720.0)));
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+        });
+
+        let picker = cx
+            .debug_bounds("provider-candidates-pane")
+            .expect("the picker is drawn");
+        let settings = cx
+            .debug_bounds("provider-chosen-pane")
+            .expect("the settings are drawn");
+        let band = cx
+            .debug_bounds("provider-form-band")
+            .expect("the form band is drawn");
+        let first_row = cx
+            .debug_bounds("provider-candidate-row-model-00")
+            .expect("the first row is drawn");
+
+        cx.simulate_event(gpui::ScrollEvent {
+            position: picker.center(),
+            delta: ScrollDelta::Lines(point(0.0, -12.0)),
+            modifiers: Default::default(),
+            touch_phase: gpui::TouchPhase::Moved,
+            ..Default::default()
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+        });
+        let picker_after = cx
+            .debug_bounds("provider-candidates-pane")
+            .expect("the picker is still drawn");
+        let settings_after = cx
+            .debug_bounds("provider-chosen-pane")
+            .expect("the settings are still drawn");
+        let band_after = cx
+            .debug_bounds("provider-form-band")
+            .expect("the form band is still drawn");
+        let first_row_after = cx
+            .debug_bounds("provider-candidate-row-model-00")
+            .expect("the first row is still drawn");
+        assert!(
+            first_row_after.top() < first_row.top(),
+            "the wheel moved the picker's own rows: before={first_row:?} after={first_row_after:?}"
+        );
+        assert_eq!(picker, picker_after, "the picker pane does not move");
+        assert_eq!(settings, settings_after, "the settings pane does not move");
+        assert_eq!(band, band_after, "the form band above them does not move");
+    }
+
     /// A row click offers the Model and opens its settings, while the checkbox
     /// stays the only control that can release an offered Model.
     #[gpui::test]
@@ -53285,6 +53306,98 @@ mod gateway_surface_tests {
         // Each half's scroll region is the only thing that scrolls.
         assert!(picker.contains(".id(\"provider-picker-list\")"));
         assert!(picker.contains(".id(\"provider-picker-groups\")"));
+    }
+
+    /// "Custom provider" and "New route group" are pinned under the list.
+    ///
+    /// A long library used to push the one answer it cannot offer past the
+    /// fold, so reaching it meant scrolling to the end. The band now sits
+    /// outside the scroll region, above the dialog's own edge, and the step has
+    /// no Cancel row of its own.
+    #[gpui::test]
+    fn the_custom_band_stays_visible_under_a_long_library(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let mut built = None;
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            let center = cx.new(|cx| ManagementCenter::new(window, cx));
+            let root = gpui_base::Root::new(center.clone(), window, cx);
+            built = Some(center);
+            root
+        });
+        let center = built.expect("the management window builds its center");
+        cx.update(|window, cx| {
+            center.update(cx, |center, cx| {
+                // A library longer than the chooser's list can show at once.
+                center.providers = (0..24)
+                    .map(|index| vibex_core::ModelProviderProfile {
+                        display_name: format!("Vendor {index:02}"),
+                        ..Default::default()
+                    })
+                    .collect();
+                center.provider_preset_picker = true;
+                center.profile_editor_open = true;
+                center.present_profile_editor_dialog(window, cx);
+            });
+        });
+        cx.simulate_resize(gpui::size(px(1280.0), px(720.0)));
+        for _ in 0..3 {
+            cx.update(|window, cx| {
+                let _ = window.draw(cx);
+            });
+            cx.run_until_parked();
+        }
+        let dialog = cx
+            .debug_bounds("dialog-0")
+            .expect("the chooser's overlay is drawn");
+        let list = cx
+            .debug_bounds("provider-picker-list")
+            .expect("the library list is drawn");
+        let band = cx
+            .debug_bounds("management-provider-picker-custom-band")
+            .expect("the manual path's band is drawn");
+        let custom = cx
+            .debug_bounds("management-provider-preset-custom")
+            .expect("the manual path's row is drawn");
+        // The library overflows its viewport, which is the state that used to
+        // bury the band.
+        assert!(
+            list.size.height > dialog.size.height,
+            "the fixture library must be longer than the dialog: list={list:?} dialog={dialog:?}"
+        );
+        // The band is inside the dialog and below the list's first row.
+        assert!(
+            band.top() > list.top(),
+            "the band follows the list: band={band:?} list={list:?}"
+        );
+        assert!(
+            custom.bottom() <= dialog.bottom() + px(1.0),
+            "the band stays inside the dialog: custom={custom:?} dialog={dialog:?}"
+        );
+        // Scrolling the library to its end must not move the band: it is
+        // outside the scroll region, not the last row of it.
+        cx.simulate_event(gpui::ScrollEvent {
+            position: list.center(),
+            delta: ScrollDelta::Lines(point(0.0, -40.0)),
+            modifiers: Default::default(),
+            touch_phase: gpui::TouchPhase::Moved,
+            ..Default::default()
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+        });
+        let band_after = cx
+            .debug_bounds("management-provider-picker-custom-band")
+            .expect("the band is still drawn");
+        assert_eq!(
+            band, band_after,
+            "the band stays put while the library scrolls"
+        );
+        // The step has no Cancel row of its own any more.
+        assert!(
+            cx.debug_bounds("provider-picker-close").is_none(),
+            "the chooser must not carry a second way out under the list"
+        );
     }
 
     /// "Custom provider" changes the step, it does not open a second dialog.

@@ -368,8 +368,8 @@ fn activity_groups_follow_execution_until_the_reader_overrides_them() {
         0..2,
         "enhanced commands keep their standalone card while files stay grouped"
     );
-    assert!(group_open(&turn, &group, None));
-    assert!(!group_open(&turn, &group, Some(false)));
+    assert!(group_open(&turn, &group, None, false));
+    assert!(!group_open(&turn, &group, Some(false), false));
     turn.process_rows
         .push(row_for(&TimelinePayload::AgentMessage(
             AgentMessagePayload {
@@ -377,31 +377,65 @@ fn activity_groups_follow_execution_until_the_reader_overrides_them() {
                 is_final: false,
             },
         )));
-    assert!(!group_open(&turn, &group, None));
-    assert!(group_open(&turn, &group, Some(true)));
+    assert!(!group_open(&turn, &group, None, false));
+    assert!(group_open(&turn, &group, Some(true), false));
     turn.process_rows[0].streaming = true;
     assert!(
-        group_open(&turn, &group, None),
+        group_open(&turn, &group, None, false),
         "a parallel operation must remain visible after commentary"
     );
     turn.process_rows[0].streaming = false;
     turn.process_rows[0].pending_permission = true;
-    assert!(group_open(&turn, &group, None));
+    assert!(group_open(&turn, &group, None, false));
     turn.conclusion_row = Some(row_for(&TimelinePayload::AgentMessage(
         AgentMessagePayload {
             text: "Done".into(),
             is_final: true,
         },
     )));
-    assert!(!group_open(&turn, &group, None));
+    assert!(!group_open(&turn, &group, None, false));
     turn.conclusion_row = None;
     turn.complete = true;
-    assert!(!group_open(&turn, &group, None));
-    assert!(group_open(&turn, &group, Some(true)));
+    assert!(!group_open(&turn, &group, None, false));
+    assert!(group_open(&turn, &group, Some(true), false));
     turn.complete = false;
     turn.superseded = true;
-    assert!(!group_open(&turn, &group, None));
-    assert!(group_open(&turn, &group, Some(true)));
+    assert!(!group_open(&turn, &group, None, false));
+    assert!(group_open(&turn, &group, Some(true), false));
+}
+
+/// With folding on, the summary line is the whole account of a run while the
+/// Agent works. A request for approval is the one thing that must not wait
+/// behind it, and the reader's own click always wins.
+#[test]
+fn auto_collapse_keeps_tool_runs_folded_but_never_hides_an_approval() {
+    let mut turn = running_turn();
+    let group = timeline_process_activity_groups_for_display(&turn, false)[0].clone();
+    assert!(group_open(&turn, &group, None, false));
+    assert!(
+        !group_open(&turn, &group, None, true),
+        "a running turn folds its work when auto-collapse is on"
+    );
+    assert!(
+        group_open(&turn, &group, Some(true), true),
+        "an explicit open outranks the fold"
+    );
+
+    turn.process_rows[1].pending_permission = true;
+    assert!(
+        group_open(&turn, &group, None, true),
+        "an approval prompt is never hidden behind a summary"
+    );
+
+    turn.process_rows[1].pending_permission = false;
+    turn.complete = true;
+    turn.conclusion_row = Some(row_for(&TimelinePayload::AgentMessage(
+        AgentMessagePayload {
+            text: "Done".into(),
+            is_final: true,
+        },
+    )));
+    assert!(!group_open(&turn, &group, None, true));
 }
 
 #[test]

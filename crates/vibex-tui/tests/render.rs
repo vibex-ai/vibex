@@ -5808,6 +5808,7 @@ fn a_tool_heavy_turn_stays_a_short_run_of_rows() {
             provider_resolution_id: None,
             note: None,
             resolved_at_ms: 1_000,
+            responder: Some(vibex_core::ApprovalResponder::Human),
         }),
     ));
     items.push(seeded_item(

@@ -9,8 +9,8 @@ use std::time::Duration;
 
 use crate::markdown::{
     MarkdownLinkKind, MarkdownPresentation, RangeHighlight, RenderedText, TextView, TextViewState,
-    base_path_for_file, data_url_image, is_file_url, is_windows_drive_path, markdown_link_kind,
-    resolve_workspace_path, resources as markdown_resources, text_view_style,
+    base_path_for_file, data_url_image, is_file_url, is_windows_drive_path, local_file_path,
+    markdown_link_kind, resolve_workspace_path, resources as markdown_resources, text_view_style,
 };
 use crate::terminal_transport::{
     LocalTerminalTransport, RemoteTerminalTransport, TerminalTransport,
@@ -20996,15 +20996,15 @@ fn is_local_external_path(path: &str) -> bool {
 /// is decoded here and handed to [`Self::open_file`], which accepts absolute
 /// external paths unchanged.
 fn local_file_destination_path(destination: &str) -> Option<String> {
-    let destination = destination.trim();
-    if is_file_url(destination) {
-        return url::Url::parse(destination)
+    let destination = local_file_path(destination);
+    if is_file_url(&destination) {
+        return url::Url::parse(&destination)
             .ok()?
             .to_file_path()
             .ok()
             .map(|path| path.to_string_lossy().into_owned());
     }
-    is_windows_drive_path(destination).then(|| destination.to_string())
+    is_windows_drive_path(&destination).then_some(destination)
 }
 
 /// The workspace-relative form of a file the preview panel's browser picked.

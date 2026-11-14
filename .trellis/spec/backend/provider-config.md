@@ -6630,12 +6630,13 @@ GatewayRouteDecisionTrace {
   The override is read when a failure is recorded, so it applies from the next
   rest onward and does not change a Key already cooling.
 - **Provider reliability P2 is the two confirmed behaviours.** AutoInclude is
-  the shared Provider's `autoRefreshModels` flag: a model-list refresh adds
-  newly discovered entries and never rewrites a row the user authored
-  (capabilities, display name, enabled state), while a Provider without the
-  flag keeps the replace-the-list refresh. Cooldown overrides are the policy
-  above. There is no Provider budget, quota, or compatibility flag in this
-  wave.
+  the shared Provider's `autoRefreshModels` flag, and it now only seeds the
+  fetch picker: with the flag a fetched Model arrives checked, without it every
+  row starts unchecked. The picker is the write gate either way — confirming it
+  adds the chosen Models and never rewrites a row the user authored
+  (capabilities, display name, enabled state). A fetch must not write the
+  endpoint's whole answer on its own. Cooldown overrides are the policy above.
+  There is no Provider budget, quota, or compatibility flag in this wave.
 - **The first-token deadline can fail over, and the last member never times
   out.** When a member is not the last, the gateway reads its first body byte
   before committing; a timeout or an empty body is recorded as a skipped member
@@ -6730,8 +6731,10 @@ GatewayRouteDecisionTrace {
   palette expose the virtual id, model/alias palette, pipeline, policy,
   templates, suggestions, patience, and Unlists/Sink; the save
   path writes the model-group fields; the dashboard and live card read real
-  gateway state and expose no money metric; AutoInclude adds a discovered model
-  without rewriting an authored row; cooldown inputs write the policy map.
+  gateway state and expose no money metric; a model fetch fills a picker whose
+  confirm adds the chosen Models without rewriting an authored row, and
+  AutoInclude only pre-checks the vendor's new rows; cooldown inputs write the
+  policy map.
 - Manual: 10k request rows, 20–30 concurrent inflight attempts, reduced motion,
   keyboard-only editing, and a legacy provider group that must not regress.
 

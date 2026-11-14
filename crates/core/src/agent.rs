@@ -562,6 +562,10 @@ pub struct AgentTimelineDisplaySettings {
     pub enhanced_command_execution_display: bool,
     #[serde(default = "default_enhanced_file_operation_display")]
     pub enhanced_file_operation_display: bool,
+    /// Keep runs of tool calls folded into their one-line summary while the
+    /// Agent is still working, instead of opening them as work arrives.
+    #[serde(default)]
+    pub auto_collapse_tool_calls: bool,
 }
 
 impl Default for AgentTimelineDisplaySettings {
@@ -572,6 +576,7 @@ impl Default for AgentTimelineDisplaySettings {
             reasoning_expanded_by_default: false,
             enhanced_command_execution_display: false,
             enhanced_file_operation_display: true,
+            auto_collapse_tool_calls: false,
         }
     }
 }

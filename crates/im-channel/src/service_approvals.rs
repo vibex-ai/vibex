@@ -18,6 +18,7 @@ impl ImChannelService {
             response: option.response,
             responder_device_id: None,
             provider_resolution_id: Some(option.option_id.clone()),
+            responder: Some(vibex_core::ApprovalResponder::Human),
             note: Some(format!(
                 "via IM channel ({}, {})",
                 principal.display_name,

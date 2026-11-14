@@ -91,4 +91,38 @@ pub struct PermissionResolution {
     pub provider_resolution_id: Option<String>,
     pub note: Option<String>,
     pub resolved_at_ms: i64,
+    /// Who answered, when the answer did not come from a person.
+    ///
+    /// A parent Agent may answer its own child's card when the child inherited
+    /// the parent's sandbox and tool set. Recording that is what keeps the
+    /// timeline honest: a reader looking at an approved command has to be able
+    /// to tell "I approved this" from "the Agent that owns this task approved it
+    /// on my behalf".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub responder: Option<ApprovalResponder>,
+}
+
+/// Who answered a permission card.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", tag = "kind")]
+pub enum ApprovalResponder {
+    /// A person, through a surface.
+    Human,
+    /// The Agent that owns the task the card belongs to.
+    ParentAgent {
+        /// The session that answered.
+        session_id: VibexSessionId,
+        /// The task whose child asked.
+        task_id: crate::AgentDelegationId,
+    },
+}
+
+impl ApprovalResponder {
+    /// The label a timeline row shows beside the resolution.
+    pub const fn label(&self) -> &'static str {
+        match self {
+            Self::Human => "human",
+            Self::ParentAgent { .. } => "parent_agent",
+        }
+    }
 }

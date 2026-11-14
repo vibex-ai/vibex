@@ -420,7 +420,14 @@ impl ManagementCenter {
     ///
     /// The Agent dialog has no Apply step: a field that still parses is the
     /// model's new value, so the whole dialog's Save carries it.
+    ///
+    /// The Models tab's fetch picker borrows this editor for a Model the record
+    /// does not hold yet, so an open picker row is answered first: its values
+    /// belong to the choice being made, not to the draft behind the dialog.
     pub(in crate::management) fn apply_model_editor(&mut self, cx: &mut Context<Self>) {
+        if self.apply_provider_model_import_editor(cx) {
+            return;
+        }
         let Some(index) = self.selected_profile_model_index() else {
             // The Models tab shares this draft but not the Agent's selection;
             // its fields still have to repaint.

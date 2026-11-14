@@ -25290,6 +25290,7 @@ mod tests {
                 response: PermissionResponseKind::Approve,
                 responder_device_id: None,
                 provider_resolution_id: None,
+                responder: None,
                 note: None,
                 resolved_at_ms: unix_timestamp_ms(),
             },
@@ -25311,6 +25312,7 @@ mod tests {
                     response: PermissionResponseKind::Deny,
                     responder_device_id: None,
                     provider_resolution_id: None,
+                    responder: None,
                     note: None,
                     resolved_at_ms: unix_timestamp_ms(),
                 },
@@ -27497,6 +27499,7 @@ mod permission_lifecycle_tests {
             response: PermissionResponseKind::Approve,
             responder_device_id: None,
             provider_resolution_id: None,
+            responder: None,
             note: None,
             resolved_at_ms: 200,
         };

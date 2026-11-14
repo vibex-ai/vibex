@@ -10,6 +10,64 @@ use vibex_db::{
     VibexUseInterruptRepository, VibexUseOperationRepository,
 };
 
+/// A provider that accepts permission resolutions.
+///
+/// `CompletingTurnProvider` declares the conservative capability set, which has
+/// `permission_requests: false` — the manager refuses to route a resolution to
+/// a provider that never raised one. This provider declares the capability and
+/// otherwise behaves like the completing one, so an approval can be exercised
+/// without a real ACP process.
+struct PermissionResolvingProvider;
+
+#[async_trait]
+impl AgentProvider for PermissionResolvingProvider {
+    fn kind(&self) -> ProviderKind {
+        ProviderKind::Acp
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        let mut capabilities = CompletingTurnProvider.capabilities();
+        capabilities.permission_requests = true;
+        capabilities
+    }
+
+    async fn create_session(
+        &self,
+        _request: ProviderCreateRequest,
+    ) -> VibexResult<ProviderSessionHandle> {
+        unreachable!("the test harness owns runtime materialization")
+    }
+
+    async fn resume_session(
+        &self,
+        binding: ProviderBinding,
+    ) -> VibexResult<ProviderSessionHandle> {
+        Ok(ProviderSessionHandle {
+            binding,
+            capabilities: self.capabilities(),
+        })
+    }
+
+    async fn send_turn(
+        &self,
+        handle: ProviderSessionHandle,
+        request: ProviderTurnRequest,
+    ) -> VibexResult<ProviderTurnResult> {
+        // The turn itself is the completing provider's; only the capability set
+        // differs, so the approval path is what this test exercises.
+        CompletingTurnProvider.send_turn(handle, request).await
+    }
+
+    async fn resolve_permission(
+        &self,
+        _request: ProviderPermissionResolution,
+    ) -> VibexResult<()> {
+        // Accepting is the point: the manager has already validated and stored
+        // the resolution, and a real ACP process would now unblock.
+        Ok(())
+    }
+}
+
 struct DelegationFixture {
     harness: TestRuntimeHarness,
     parent: AgentSession,
@@ -865,5 +923,241 @@ async fn an_interrupt_during_provider_preparation_stops_only_that_round_and_keep
             .await
             .unwrap();
         assert_eq!(provider.interrupts.load(Ordering::SeqCst), 1);
+    }
+}
+
+/// Cancelling a task takes its child's approval cards with it.
+///
+/// A card raised by the child is a question the child asked its own provider.
+/// The provider interrupt only silences the process: the durable row stays
+/// `Pending`, and an ACP card carries no deadline for the expiry sweep to
+/// reclaim. Left behind, the card stays clickable and a late approval runs the
+/// work the stop was meant to prevent.
+#[tokio::test]
+async fn cancelling_a_task_clears_the_child_approval_cards_it_left_open() {
+    let fixture = DelegationFixture::new().await;
+    let manager = fixture.harness.manager();
+    let first = manager
+        .create_task_delegation(fixture.request("cancel-open-card"))
+        .await
+        .unwrap();
+    let task = fixture.wait_for_task(&first.delegation.id).await;
+    let child = task.child_session_id.clone().unwrap();
+
+    let card = PermissionRequest {
+        id: vibex_core::RequestId::new(),
+        session_id: child.clone(),
+        project_id: None,
+        workspace_id: None,
+        provider_request_id: Some("acp-card-during-cancel".to_string()),
+        risk_category: PermissionRiskCategory::Command,
+        title: "Agent wants to run a command".to_string(),
+        details: Vec::new(),
+        allowed_responses: vec![
+            PermissionResponseKind::Approve,
+            PermissionResponseKind::Deny,
+        ],
+        response_options: Vec::new(),
+        status: PermissionRequestStatus::Pending,
+        requested_at_ms: unix_timestamp_ms(),
+        expires_at_ms: None,
+    };
+    manager.record_permission_request(card.clone()).await.unwrap();
+
+    manager
+        .cancel_agent_delegation(CancelAgentDelegationRequest {
+            parent_session_id: fixture.parent.id.clone(),
+            delegation_id: task.id.clone(),
+        })
+        .await
+        .unwrap();
+
+    let conn = manager.open_migrated().unwrap();
+    assert_eq!(
+        PermissionRepository::get_request(&conn, &card.id)
+            .unwrap()
+            .unwrap()
+            .status,
+        PermissionRequestStatus::Denied,
+        "the stop has to close the card it orphaned"
+    );
+    assert!(
+        PermissionRepository::pending_for_session(&conn, &child)
+            .unwrap()
+            .is_empty(),
+        "no card may stay pending after the task was cancelled"
+    );
+}
+
+/// A late approval of a cancelled task is refused instead of executed.
+///
+/// The card can outlive the stop on a surface that had not repainted yet, or on
+/// a client that queued the click before the cancel arrived. Accepting it would
+/// run the work in a task the ledger already calls cancelled, which is the one
+/// disagreement the parent can never reconcile.
+#[tokio::test]
+async fn a_late_approval_of_a_cancelled_task_is_refused() {
+    let fixture = DelegationFixture::new().await;
+    let manager = fixture.harness.manager();
+    let first = manager
+        .create_task_delegation(fixture.request("late-approval"))
+        .await
+        .unwrap();
+    let task = fixture.wait_for_task(&first.delegation.id).await;
+    let child = task.child_session_id.clone().unwrap();
+
+    let card = PermissionRequest {
+        id: vibex_core::RequestId::new(),
+        session_id: child.clone(),
+        project_id: None,
+        workspace_id: None,
+        provider_request_id: Some("acp-late-approval".to_string()),
+        risk_category: PermissionRiskCategory::Command,
+        title: "Agent wants to run a command".to_string(),
+        details: Vec::new(),
+        allowed_responses: vec![
+            PermissionResponseKind::Approve,
+            PermissionResponseKind::Deny,
+        ],
+        response_options: Vec::new(),
+        status: PermissionRequestStatus::Pending,
+        requested_at_ms: unix_timestamp_ms(),
+        expires_at_ms: None,
+    };
+    manager.record_permission_request(card.clone()).await.unwrap();
+
+    manager
+        .cancel_agent_delegation(CancelAgentDelegationRequest {
+            parent_session_id: fixture.parent.id.clone(),
+            delegation_id: task.id.clone(),
+        })
+        .await
+        .unwrap();
+
+    let resolution = PermissionResolution {
+        request_id: card.id.clone(),
+        session_id: child.clone(),
+        response: PermissionResponseKind::Approve,
+        responder_device_id: None,
+        provider_resolution_id: None,
+        note: None,
+        resolved_at_ms: unix_timestamp_ms(),
+        responder: Some(vibex_core::ApprovalResponder::Human),
+    };
+    let error = manager
+        .resolve_permission(ResolvePermissionRequest {
+            session_id: child.clone(),
+            request_id: card.id.clone(),
+            resolution,
+        })
+        .await
+        .expect_err("a cancelled task must not accept an approval");
+    assert_eq!(error.code, "task_cancelled_before_approval");
+    assert_eq!(
+        error
+            .diagnostics
+            .iter()
+            .find(|entry| entry.key == "taskId")
+            .map(|entry| entry.value.as_str()),
+        Some(task.id.as_str())
+    );
+
+    let conn = manager.open_migrated().unwrap();
+    assert_eq!(
+        PermissionRepository::get_request(&conn, &card.id)
+            .unwrap()
+            .unwrap()
+            .status,
+        PermissionRequestStatus::Denied,
+        "the refused approval must not overwrite the stop's own resolution"
+    );
+}
+
+/// A parent Agent answers its child's card, and the record names the parent.
+///
+/// The child inherited the parent's sandbox and tools, so approving is not a
+/// widening of authority. What it must not do is look like the reader approved
+/// it: the resolution carries the responder, so an audit reader can tell who
+/// answered. This is the whole point of the two-level approval — a child that
+/// stops for a routine command should not need a person, and a person reading
+/// the transcript later should still be able to see that.
+#[tokio::test]
+async fn a_parent_agent_answers_its_childs_card_and_the_record_names_it() {
+    let fixture =
+        DelegationFixture::with_provider(Arc::new(PermissionResolvingProvider)).await;
+    let manager = fixture.harness.manager();
+    let first = manager
+        .create_task_delegation(fixture.request("parent-answers"))
+        .await
+        .unwrap();
+    let task = fixture.wait_for_task(&first.delegation.id).await;
+    let child = task.child_session_id.clone().unwrap();
+    let card = PermissionRequest {
+        id: vibex_core::RequestId::new(),
+        session_id: child.clone(),
+        project_id: None,
+        workspace_id: None,
+        provider_request_id: Some("acp-command".to_string()),
+        risk_category: PermissionRiskCategory::Command,
+        title: "Run the test suite".to_string(),
+        details: Vec::new(),
+        allowed_responses: vec![
+            PermissionResponseKind::Approve,
+            PermissionResponseKind::Deny,
+        ],
+        response_options: Vec::new(),
+        status: PermissionRequestStatus::Pending,
+        requested_at_ms: unix_timestamp_ms(),
+        expires_at_ms: None,
+    };
+    manager.record_permission_request(card.clone()).await.unwrap();
+
+    let resolution = PermissionResolution {
+        request_id: card.id.clone(),
+        session_id: child.clone(),
+        response: PermissionResponseKind::Approve,
+        responder_device_id: None,
+        provider_resolution_id: None,
+        note: Some("the suite is the task".to_string()),
+        resolved_at_ms: unix_timestamp_ms(),
+        responder: Some(vibex_core::ApprovalResponder::ParentAgent {
+            session_id: fixture.parent.id.clone(),
+            task_id: task.id.clone(),
+        }),
+    };
+    manager
+        .resolve_permission(ResolvePermissionRequest {
+            session_id: child.clone(),
+            request_id: card.id.clone(),
+            resolution,
+        })
+        .await
+        .expect("the owning Agent may answer its child");
+
+    let conn = manager.open_migrated().unwrap();
+    assert_eq!(
+        PermissionRepository::get_request(&conn, &card.id)
+            .unwrap()
+            .unwrap()
+            .status,
+        PermissionRequestStatus::Approved
+    );
+    // The timeline is where an audit reader looks, so the responder has to
+    // survive the round trip through the payload.
+    let recorded = TimelineRepository::fetch_after(&conn, &child, None, 200)
+        .unwrap()
+        .items
+        .into_iter()
+        .find_map(|item| match item.payload {
+            vibex_core::TimelinePayload::PermissionResolution(resolution) => Some(resolution),
+            _ => None,
+        })
+        .expect("the answer is recorded on the timeline");
+    match recorded.responder {
+        Some(vibex_core::ApprovalResponder::ParentAgent { session_id, task_id }) => {
+            assert_eq!(session_id, fixture.parent.id);
+            assert_eq!(task_id, task.id);
+        }
+        other => panic!("expected the parent to be named, got {other:?}"),
     }
 }

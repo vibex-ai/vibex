@@ -141,6 +141,28 @@ impl VibexUseCancellationRepository {
             .map(|tasks| tasks.into_iter().flatten().collect())
     }
 
+    /// When the stop captured this execution, if it did.
+    ///
+    /// Settlement uses it to tell a round the stop owns from one the provider
+    /// had already finished: a capture is a claim on the future, never on a
+    /// result that landed before it.
+    pub(super) fn requested_at(
+        conn: &Connection,
+        execution_id: &VibexExecutionId,
+    ) -> VibexResult<Option<i64>> {
+        conn.query_row(
+            "SELECT requested_at_ms FROM vibex_use_cancellation_executions
+             WHERE execution_id = ?1 ORDER BY requested_at_ms ASC LIMIT 1",
+            params![execution_id.as_str()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(storage_err(
+            "vibex_use_cancellation_read_failed",
+            "failed to read execution cancellation time",
+        ))
+    }
+
     pub(super) fn capture(
         conn: &Connection,
         owner: &AgentDelegationId,

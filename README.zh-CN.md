@@ -8,7 +8,7 @@
   <img src="https://img.shields.io/badge/Rust-1.99.1-black?style=flat&logo=rust&logoColor=white" alt="Rust 1.99.1" />
   <img src="https://img.shields.io/badge/UI-GPUI-2563eb?style=flat" alt="GPUI" />
   <img src="https://img.shields.io/badge/platforms-macOS%20%7C%20Windows%20%7C%20Linux%20%7C%20iOS%20%7C%20Android-4493F8?style=flat" alt="支持平台: macOS、Windows、Linux、iOS 和 Android" />
-  <img src="https://img.shields.io/badge/status-0.1.5-22c55e?style=flat" alt="发布状态: 0.1.5" />
+  <img src="https://img.shields.io/badge/status-0.1.6-22c55e?style=flat" alt="发布状态: 0.1.6" />
   <a href="https://deepwiki.com/vibex-ai/vibex"><img src="docs/assets/badges/ask-deepwiki.svg" alt="在 DeepWiki 对 Vibex 提问" /></a>
 </p>
 
@@ -430,6 +430,16 @@ pnpm check:mobile-native   # 移动端 crate 与原生项目契约
 迭代时运行与改动相关的最小检查集。打包、移动端、Relay 和发布说明见[开发者指南](https://vibex.peatboy.com/docs/developer)与 [docs/operations/release.md](docs/operations/release.md)。
 
 ---
+
+## Star 历史
+
+<a href="https://www.star-history.com/?repos=vibex-ai%2Fvibex&type=date&legend=bottom-right">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=vibex-ai/vibex&type=date&theme=dark&legend=bottom-right" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=vibex-ai/vibex&type=date&legend=bottom-right" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=vibex-ai/vibex&type=date&legend=bottom-right" />
+ </picture>
+</a>
 
 ## 参与贡献
 感谢每一位为 Vibex 提供帮助的开发者，使用中存在问题时欢迎提交 Issue 和 Pull Request

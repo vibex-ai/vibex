@@ -1582,16 +1582,6 @@ pub struct ComposerUiState {
     pub terminal_ids: Vec<String>,
     #[serde(default)]
     pub runtime_selections_by_agent: BTreeMap<AgentId, SessionRuntimeSelection>,
-    /// The configuration the reader chose for one Agent in the delegation
-    /// panel.
-    ///
-    /// This is not the last session selection: editing a collaborator's route
-    /// is a choice about the next hand-off, not about running a session with
-    /// that Agent. The authority reads this map when it picks the one entry per
-    /// Agent, and it outranks both the default source and the Agent's last used
-    /// pair.
-    #[serde(default)]
-    pub delegation_runtime_selections_by_agent: BTreeMap<AgentId, SessionRuntimeSelection>,
     #[serde(default)]
     pub runtime_selections_by_model: Vec<SessionRuntimeSelection>,
     #[serde(default)]
@@ -1699,6 +1689,14 @@ pub struct SessionUiState {
     pub enhanced_command_execution_display: bool,
     #[serde(default = "default_enhanced_file_operation_display")]
     pub enhanced_file_operation_display: bool,
+    /// Whether runs of tool calls stay folded into their one-line summary
+    /// while the Agent is working.
+    ///
+    /// A folded run still counts what the turn did — changed files, commands,
+    /// reads and failures — so the summary stays the live account of the work
+    /// while the individual calls wait behind one click.
+    #[serde(default)]
+    pub auto_collapse_tool_calls: bool,
     /// Whether automatic continuation is the default for every project.
     ///
     /// It ships on: a session keeps itself going until the reader turns the
@@ -1749,6 +1747,7 @@ impl Default for SessionUiState {
             show_agent_generation_status: true,
             enhanced_command_execution_display: false,
             enhanced_file_operation_display: true,
+            auto_collapse_tool_calls: false,
             auto_continue_enabled_by_default: true,
             auto_continue_disabled_project_ids: BTreeSet::new(),
             auto_continue_project_ids: BTreeSet::new(),
@@ -2049,19 +2048,6 @@ impl DesktopUiStateV1 {
         self.browser.normalize();
         self.composer.runtime_selections_by_agent =
             std::mem::take(&mut self.composer.runtime_selections_by_agent)
-                .into_iter()
-                .filter_map(|(agent_id, mut selection)| {
-                    if selection.agent_id != agent_id
-                        || !normalize_runtime_selection(&mut selection)
-                    {
-                        return None;
-                    }
-                    Some((agent_id, selection))
-                })
-                .take(64)
-                .collect();
-        self.composer.delegation_runtime_selections_by_agent =
-            std::mem::take(&mut self.composer.delegation_runtime_selections_by_agent)
                 .into_iter()
                 .filter_map(|(agent_id, mut selection)| {
                     if selection.agent_id != agent_id
@@ -3842,6 +3828,10 @@ mod tests {
     fn session_display_preferences_are_backward_compatible() {
         assert!(SessionUiState::default().show_agent_generation_status);
         assert!(SessionUiState::default().enhanced_file_operation_display);
+        assert!(
+            !SessionUiState::default().auto_collapse_tool_calls,
+            "tool activity keeps opening itself until the reader asks for folds"
+        );
         assert_eq!(
             SessionUiState::default().reasoning_display_mode,
             ReasoningDisplayMode::LatestAtBottom
@@ -3869,6 +3859,7 @@ mod tests {
         session.remove("showAgentGenerationStatus");
         session.remove("enhancedCommandExecutionDisplay");
         session.remove("enhancedFileOperationDisplay");
+        session.remove("autoCollapseToolCalls");
         session.remove("reasoningDisplayMode");
         session.remove("reasoningExpandedByDefault");
         session.remove("reasoningExpansionMode");
@@ -3884,6 +3875,7 @@ mod tests {
         assert!(decoded.session.show_agent_generation_status);
         assert!(!decoded.session.enhanced_command_execution_display);
         assert!(decoded.session.enhanced_file_operation_display);
+        assert!(!decoded.session.auto_collapse_tool_calls);
         assert_eq!(
             decoded.session.reasoning_display_mode,
             ReasoningDisplayMode::LatestAtBottom

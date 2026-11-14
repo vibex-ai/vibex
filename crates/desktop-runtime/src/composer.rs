@@ -359,17 +359,6 @@ fn preferred_delegation_option<'a>(
     if available.is_empty() {
         return None;
     }
-    // An explicit edit is the reader's answer, so it outranks every rule below
-    // even when the Agent has a default source.
-    if let Some(preferred) = preferences.delegation_by_agent.get(agent_id)
-        && let Some(option) = available
-            .iter()
-            .copied()
-            .find(|option| delegation_selection_matches(&option.selection, preferred))
-    {
-        return Some(option);
-    }
-
     if let Some(source) = selection.default_sources.get(agent_id) {
         let scoped = available
             .iter()
@@ -787,6 +776,38 @@ mod tests {
     };
     use vibex_db::{WorkspaceRepository, apply_migrations, open_database};
 
+    /// The row carries the configuration the reader last chose for that Agent.
+    ///
+    /// Tuning a chip writes the choice to the same preference store a session
+    /// switch uses, so the next discovery's row agrees with the chip instead of
+    /// falling back to the Agent's default.
+    #[test]
+    fn a_delegation_row_carries_the_last_configuration_the_reader_chose() {
+        let agent_id = AgentId::parse("codex").unwrap();
+        let first = option("provider_a", "model-a");
+        let chosen = option("provider_b", "model-b");
+
+        // Nothing remembered yet: the row takes catalogue order.
+        let fresh = DelegationSelection::default();
+        let picked = preferred_delegation_option(&[&first, &chosen], &agent_id, &fresh)
+            .expect("an available option is always chosen");
+        assert_eq!(picked.selection.model_id(), Some("model-a"));
+
+        // After the reader tuned the chip to provider_b, the row follows.
+        let mut remembered = DelegationSelection::default();
+        remembered
+            .preferences
+            .by_agent
+            .insert(agent_id.clone(), chosen.selection.clone());
+        let picked = preferred_delegation_option(&[&first, &chosen], &agent_id, &remembered)
+            .expect("an available option is always chosen");
+        assert_eq!(
+            picked.selection.model_id(),
+            Some("model-b"),
+            "the row must carry the configuration the reader chose, not the default"
+        );
+    }
+
     fn option(profile: &str, model: &str) -> SessionRuntimeOption {
         agent_option("codex", "Codex", profile, model)
     }
@@ -988,29 +1009,6 @@ mod tests {
         assert_eq!(
             commands[0].description.as_deref(),
             Some("provider_b · model-b")
-        );
-    }
-
-    #[test]
-    fn an_explicit_delegation_choice_outranks_the_default_source() {
-        let agent_id = AgentId::parse("codex").unwrap();
-        let default = option("provider_main", "model-default");
-        let chosen = option("provider_other", "model-chosen");
-        let mut selection = DelegationSelection::default();
-        selection.default_sources.insert(
-            agent_id.clone(),
-            AgentModelSourceRef::provider(ProviderProfileId::parse("provider_main").unwrap()),
-        );
-        selection
-            .preferences
-            .delegation_by_agent
-            .insert(agent_id, chosen.selection.clone());
-
-        let commands = runtime_reference_commands(&[default, chosen], &request("", 50), &selection);
-        assert_eq!(commands.len(), 1);
-        assert_eq!(
-            commands[0].description.as_deref(),
-            Some("provider_other · model-chosen")
         );
     }
 

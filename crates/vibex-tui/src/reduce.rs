@@ -7024,6 +7024,8 @@ impl App {
             provider_resolution_id: None,
             note: None,
             resolved_at_ms: vibex_core::unix_timestamp_ms(),
+            // A person pressed the card in this terminal.
+            responder: Some(vibex_core::ApprovalResponder::Human),
         };
         // Optimistically grey the card out; a failure rolls it back with an
         // error toast from the worker.

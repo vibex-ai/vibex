@@ -406,12 +406,7 @@ impl AgentManager {
                     .get_agent_delegation(&delegation.parent_session_id, &delegation.id)
                     .and_then(|delegation| self.delegation_start_outcome(delegation));
             };
-            let item = self.append_delegation_timeline(
-                &mut conn,
-                &delegation,
-                AgentDelegationStatus::Starting,
-                None,
-            )?;
+            let item = self.append_delegation_timeline(&mut conn, &delegation, None)?;
             AgentDelegationRepository::attach_parent_timeline_item(
                 &conn,
                 &delegation.id,

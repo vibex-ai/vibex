@@ -1345,3 +1345,47 @@ fn cancellation_maintenance_rotates_past_ambiguous_tasks_and_fences_new_deadline
         );
     }
 }
+
+/// A round the provider finished before the stop is not rewritten as cancelled.
+///
+/// The stop owns work that is still in flight; it has no claim on a result that
+/// had already landed. Rewriting that into `Cancelled` threw away the only
+/// record of what ran, and the parent then waited for an answer the ledger said
+/// never existed — the late approval of a cancelled task produced exactly this
+/// shape.
+#[test]
+fn a_round_finished_before_the_stop_keeps_its_result() {
+    let fixture = Fixture::new();
+    fixture.policy(64, 64);
+    let root = fixture.session("Origin root", "codex");
+    let worker = fixture.session("Origin worker", "codex");
+    fixture.own(&root, &worker);
+    let task = fixture.task(&root, &worker, "finished-before-stop");
+    fixture.reserve(&task).unwrap();
+    let round = running_cancellation_round(&fixture, &root, &worker, Some(&task), "early-round");
+    let mut conn = fixture.open();
+
+    // The provider finished first: the result lands while the task is still
+    // active, which is the ordinary successful path.
+    let settled = settle_cancellation_round(&mut conn, &round, ExecutionOutcome::Completed);
+    assert_eq!(settled.outcome, ExecutionOutcome::Completed);
+    let settled_at = settled.finished_at_ms.unwrap();
+
+    // Only then does a stop arrive, and its capture is stamped after the round
+    // had already finished.
+    request_delegation_tree_cancellation(&mut conn, &task.id, false).unwrap();
+    conn.execute(
+        "UPDATE vibex_use_cancellation_executions SET requested_at_ms = ?2 WHERE execution_id = ?1",
+        params![round.id.as_str(), settled_at.saturating_add(1)],
+    )
+    .unwrap();
+    let replay = settle_vibex_use_execution(&mut conn, &settled)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        replay.outcome,
+        ExecutionOutcome::Completed,
+        "a stop cannot retroactively cancel a result that already landed"
+    );
+    assert_eq!(replay.stop_reason, settled.stop_reason);
+}
