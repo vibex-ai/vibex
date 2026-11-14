@@ -103064,13 +103064,6 @@ mod tests {
         );
     }
 
-    /// The chip lights up exactly when the controls edit it.
-    ///
-    /// The input's own highlight is a strict range overlap, which leaves both
-    /// edges dark. A caret resting against the chip is still editing it, so a
-    /// chip drawn from that rule looked inert while the controls below were
-    /// pointed at it.
-    #[test]
     /// A chip always resolves to some entry of its Agent, never to nothing.
     ///
     /// Three shapes reach the lookup: the row's own reference, a tuned reference
@@ -103281,7 +103274,8 @@ mod tests {
 
         // A real draft after picking a chip: the insertion appends one space, so
         // the caret rests one byte past the token.
-        let single = composer_content_with_mentions("@Codex fix it", &[codex_mention.clone()]);
+        let single =
+            composer_content_with_mentions("@Codex fix it", std::slice::from_ref(&codex_mention));
         let chip = single.tokens()[0].range();
         assert_eq!(
             delegation_edit_subject(single.tokens(), chip.end).and_then(|m| m.agent_id),
