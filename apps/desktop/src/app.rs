@@ -42844,6 +42844,15 @@ impl VibexWorkbench {
                 let _ = input.replace_range_with_token(range, token, window, cx);
             }
         });
+        // Remember the choice for the row that will be built next time. Without
+        // this the chip carried the configuration but nothing recorded it, so the
+        // next discovery fell back to the Agent's default and the row silently
+        // disagreed with the chip the reader had just tuned.
+        //
+        // The write goes to the same preference store a session switch uses, so
+        // "the last pair used" and "what the row carries" are one fact rather
+        // than two that can drift.
+        self.remember_runtime_selection(selection);
         self.remember_composer_draft(cx);
         cx.notify();
     }

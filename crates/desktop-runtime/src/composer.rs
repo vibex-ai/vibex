@@ -776,6 +776,38 @@ mod tests {
     };
     use vibex_db::{WorkspaceRepository, apply_migrations, open_database};
 
+    /// The row carries the configuration the reader last chose for that Agent.
+    ///
+    /// Tuning a chip writes the choice to the same preference store a session
+    /// switch uses, so the next discovery's row agrees with the chip instead of
+    /// falling back to the Agent's default.
+    #[test]
+    fn a_delegation_row_carries_the_last_configuration_the_reader_chose() {
+        let agent_id = AgentId::parse("codex").unwrap();
+        let first = option("provider_a", "model-a");
+        let chosen = option("provider_b", "model-b");
+
+        // Nothing remembered yet: the row takes catalogue order.
+        let fresh = DelegationSelection::default();
+        let picked = preferred_delegation_option(&[&first, &chosen], &agent_id, &fresh)
+            .expect("an available option is always chosen");
+        assert_eq!(picked.selection.model_id(), Some("model-a"));
+
+        // After the reader tuned the chip to provider_b, the row follows.
+        let mut remembered = DelegationSelection::default();
+        remembered
+            .preferences
+            .by_agent
+            .insert(agent_id.clone(), chosen.selection.clone());
+        let picked = preferred_delegation_option(&[&first, &chosen], &agent_id, &remembered)
+            .expect("an available option is always chosen");
+        assert_eq!(
+            picked.selection.model_id(),
+            Some("model-b"),
+            "the row must carry the configuration the reader chose, not the default"
+        );
+    }
+
     fn option(profile: &str, model: &str) -> SessionRuntimeOption {
         agent_option("codex", "Codex", profile, model)
     }
