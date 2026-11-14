@@ -982,6 +982,16 @@ const AGENT_TIMELINE_WINDOW_BYTES: u32 = 1_048_576;
 /// Resuming from a view a long background run left far behind would make the
 /// wait grow with the session again, which a windowed open exists to avoid.
 const AGENT_TIMELINE_RESUME_MAX_ITEMS: usize = 2_000;
+/// How far a replaced window may reach back to keep a reader's place.
+///
+/// A reader who scrolled up holds rows below the newest window, and a
+/// replacement that drops the turn they are reading cannot restore their
+/// position: the anchor would resolve to a row the new window does not have.
+/// The read walks back down the history instead, and this is where it stops —
+/// past this much of what the reader already had, re-reading the page costs
+/// more than the jump it prevents, so the view lands on the oldest row it does
+/// hold rather than on the newest one.
+const AGENT_TIMELINE_ANCHOR_RECOVERY_MAX_ITEMS: usize = AGENT_TIMELINE_RESUME_MAX_ITEMS;
 /// How many older pages may be outstanding at once.
 ///
 /// Prefetch keeps the next page on the way while the reader is still moving
@@ -2900,22 +2910,36 @@ async fn fetch_authoritative_timeline_via_backend(
 /// for this with `contiguous`, which takes the ordinary turn window: it pages
 /// the live turn row by row instead of handing it over in two bands, so it
 /// cannot leave a hole.
+///
+/// `cover_sequence` asks the read to hold on to a reader's place. A replacement
+/// that installs only the newest window drops the rows a scrolled-up reader is
+/// reading, and the preserved anchor then names a turn the new row table does
+/// not have — which is how a replacement used to end up clamped to the newest
+/// row. The window therefore reaches back down to that sequence through
+/// [`extend_timeline_window_back_to`], and `None` reads the newest page alone.
 async fn fetch_timeline_window_or_contiguous(
     runtime: Arc<DesktopRuntime>,
     session_id: VibexSessionId,
     contiguous: bool,
+    cover_sequence: Option<i64>,
 ) -> vibex_core::VibexResult<vibex_core::TimelinePage> {
-    runtime
+    let page = runtime
         .agent()
         .fetch_timeline(FetchTimelineRequest {
-            session_id,
+            session_id: session_id.clone(),
             after_sequence: None,
             before_sequence: None,
             limit: AGENT_TIMELINE_FETCH_PAGE_LIMIT,
             max_turns: (!contiguous).then_some(AGENT_TIMELINE_TURN_WINDOW),
             max_bytes: Some(AGENT_TIMELINE_WINDOW_BYTES),
         })
-        .await
+        .await?;
+    Ok(
+        extend_timeline_window_back_to(page, cover_sequence, |before_sequence| {
+            fetch_timeline_page_before(runtime.clone(), session_id.clone(), before_sequence, true)
+        })
+        .await,
+    )
 }
 
 /// Authority-agnostic twin of [`fetch_timeline_window_or_contiguous`].
@@ -2923,11 +2947,12 @@ async fn fetch_timeline_window_or_contiguous_via_backend(
     backend: BackendFacade,
     session_id: VibexSessionId,
     contiguous: bool,
+    cover_sequence: Option<i64>,
 ) -> vibex_core::VibexResult<vibex_core::TimelinePage> {
-    backend
+    let page = backend
         .agent()
         .fetch_timeline(FetchTimelineRequest {
-            session_id,
+            session_id: session_id.clone(),
             after_sequence: None,
             before_sequence: None,
             limit: AGENT_TIMELINE_FETCH_PAGE_LIMIT,
@@ -2935,7 +2960,96 @@ async fn fetch_timeline_window_or_contiguous_via_backend(
             max_bytes: Some(AGENT_TIMELINE_WINDOW_BYTES),
         })
         .await
-        .map_err(remote_error_into_vibex)
+        .map_err(remote_error_into_vibex)?;
+    Ok(
+        extend_timeline_window_back_to(page, cover_sequence, |before_sequence| {
+            fetch_timeline_page_before_via_backend(
+                backend.clone(),
+                session_id.clone(),
+                before_sequence,
+                true,
+            )
+        })
+        .await,
+    )
+}
+
+/// Reaches a replaced window back to the oldest sequence a reader still holds.
+///
+/// A replacement reads the newest page, which is not where a reader who has
+/// scrolled up is: their rows sit in pages below it, and the preserved anchor
+/// can only be restored onto a row the new window holds. Dropping the anchored
+/// turn therefore does not merely lose the pixel offset — it leaves an offset
+/// from a longer window behind, and the list clamps that to the newest row,
+/// which reads as the scroll being undone.
+///
+/// The read walks down one page at a time and stops at whichever comes first: a
+/// page that reaches `cover_sequence`, the end of the history, or the item
+/// budget in [`AGENT_TIMELINE_ANCHOR_RECOVERY_MAX_ITEMS`].
+///
+/// Best effort by design: a page that fails, or that answers a cursor it does
+/// not understand, leaves the window exactly as it arrived. Losing the reader's
+/// place is the bug this prevents; losing the refetch that repairs the stream
+/// as well would be worse.
+async fn extend_timeline_window_back_to<F, Fut>(
+    mut page: vibex_core::TimelinePage,
+    cover_sequence: Option<i64>,
+    mut fetch_before: F,
+) -> vibex_core::TimelinePage
+where
+    F: FnMut(i64) -> Fut,
+    Fut: std::future::Future<Output = vibex_core::VibexResult<vibex_core::TimelinePage>>,
+{
+    let Some(cover_sequence) = cover_sequence else {
+        return page;
+    };
+    while let Some(start_sequence) = page.start_sequence {
+        if start_sequence <= cover_sequence
+            || !page.has_older
+            || page.items.len() >= AGENT_TIMELINE_ANCHOR_RECOVERY_MAX_ITEMS
+        {
+            break;
+        }
+        let Ok(older) = fetch_before(start_sequence).await else {
+            break;
+        };
+        if !prepend_older_timeline_page(&mut page, older) {
+            break;
+        }
+    }
+    page
+}
+
+/// Puts a page below the window it was read for.
+///
+/// Returns whether the page really sat there: a page that belongs to another
+/// session, that is empty, or that runs into the rows already held describes
+/// some other cursor, and prepending it would duplicate or reorder the window
+/// instead of extending it.
+fn prepend_older_timeline_page(
+    page: &mut vibex_core::TimelinePage,
+    older: vibex_core::TimelinePage,
+) -> bool {
+    let Some(newer_start) = page.start_sequence else {
+        return false;
+    };
+    if older.session_id != page.session_id
+        || older.items.is_empty()
+        || older.items.iter().any(|item| item.sequence >= newer_start)
+    {
+        return false;
+    }
+    let mut items = older.items;
+    items.append(&mut page.items);
+    page.start_sequence = items.first().map(|item| item.sequence);
+    page.items = items;
+    // The page now opens where the older one did, so its leading end is what
+    // describes the merged window. `omitted` stays with the newest page: a hole
+    // it reported is in the middle of the span this read did not fill.
+    page.has_older = older.has_older;
+    page.starts_at_turn_start = older.starts_at_turn_start;
+    page.leading_turn_start = older.leading_turn_start;
+    true
 }
 
 /// Everything above `after_sequence`, for a refreshed cached window.
@@ -3042,10 +3156,17 @@ async fn fetch_timeline_tail_via_backend(
 }
 
 /// One page of history below `before_sequence`.
+///
+/// `contiguous` asks for a page that cannot skip stored rows. A page read to
+/// extend a replacement window has to be that one: it is prepended to rows the
+/// view is going to install, and a banded page's hole would make the merged
+/// window a projection of nothing. The ordinary older-history read keeps its
+/// turn window, which is what keeps each page opening on a turn boundary.
 async fn fetch_timeline_page_before(
     runtime: Arc<DesktopRuntime>,
     session_id: VibexSessionId,
     before_sequence: i64,
+    contiguous: bool,
 ) -> vibex_core::VibexResult<vibex_core::TimelinePage> {
     runtime
         .agent()
@@ -3054,7 +3175,7 @@ async fn fetch_timeline_page_before(
             after_sequence: None,
             before_sequence: Some(before_sequence),
             limit: AGENT_TIMELINE_FETCH_PAGE_LIMIT,
-            max_turns: Some(AGENT_TIMELINE_TURN_WINDOW),
+            max_turns: (!contiguous).then_some(AGENT_TIMELINE_TURN_WINDOW),
             max_bytes: Some(AGENT_TIMELINE_WINDOW_BYTES),
         })
         .await
@@ -3065,6 +3186,7 @@ async fn fetch_timeline_page_before_via_backend(
     backend: BackendFacade,
     session_id: VibexSessionId,
     before_sequence: i64,
+    contiguous: bool,
 ) -> vibex_core::VibexResult<vibex_core::TimelinePage> {
     backend
         .agent()
@@ -3073,7 +3195,7 @@ async fn fetch_timeline_page_before_via_backend(
             after_sequence: None,
             before_sequence: Some(before_sequence),
             limit: AGENT_TIMELINE_FETCH_PAGE_LIMIT,
-            max_turns: Some(AGENT_TIMELINE_TURN_WINDOW),
+            max_turns: (!contiguous).then_some(AGENT_TIMELINE_TURN_WINDOW),
             max_bytes: Some(AGENT_TIMELINE_WINDOW_BYTES),
         })
         .await
@@ -3092,6 +3214,13 @@ struct TimelineWindowRead {
     /// `omitted`. The recovery path after such a page is refused sets this:
     /// asking again with the ordinary window cannot produce another one.
     contiguous: bool,
+    /// The oldest sequence the replacement window must still hold.
+    ///
+    /// Only a reader who is not following the bottom has one: it is the turn
+    /// their preserved anchor names, so a window that reaches this sequence can
+    /// put them back exactly where they were. `None` reads the newest window
+    /// alone, which is every load that has nobody's place to keep.
+    cover_sequence: Option<i64>,
 }
 
 impl TimelineWindowRead {
@@ -3100,6 +3229,7 @@ impl TimelineWindowRead {
         Self {
             resume,
             contiguous: false,
+            cover_sequence: None,
         }
     }
 
@@ -3108,7 +3238,18 @@ impl TimelineWindowRead {
         Self {
             resume: None,
             contiguous: true,
+            cover_sequence: None,
         }
+    }
+
+    /// Asks a replacement to keep the turn the reader's anchor names.
+    ///
+    /// The window then reaches back far enough for [`Self::cover_sequence`] to
+    /// be installed, which is what lets the anchor resolve against it instead of
+    /// naming a turn the view no longer has.
+    fn covering(mut self, cover_sequence: Option<i64>) -> Self {
+        self.cover_sequence = cover_sequence;
+        self
     }
 }
 
@@ -11360,7 +11501,8 @@ impl VibexWorkbench {
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
             match runtime {
                 Some(runtime) => {
-                    fetch_timeline_page_before(runtime, request_session_id, before_sequence).await
+                    fetch_timeline_page_before(runtime, request_session_id, before_sequence, false)
+                        .await
                 }
                 None => {
                     let Some(backend) = backend else {
@@ -11373,6 +11515,7 @@ impl VibexWorkbench {
                         backend,
                         request_session_id,
                         before_sequence,
+                        false,
                     )
                     .await
                 }
@@ -29592,13 +29735,23 @@ impl VibexWorkbench {
         let workspace_id = self
             .registered_session(session_id.as_str())
             .map(|session| session.workspace_id.clone());
+        // The read patches this view's tail, or re-opens the newest window when
+        // the tail grew past what patching is worth. Re-opening drops the rows
+        // the view was holding, so it is asked to keep the turn the borrowed
+        // view's anchor names — the same rule a refetch follows. A view that
+        // was following the bottom has no anchor and reads the window alone.
+        self.capture_timeline_scroll_anchor();
+        let cover_sequence = self
+            .timeline_follow
+            .anchor_span
+            .map(|span| span.first_sequence);
         if let Some(runtime) = runtime.clone() {
             self.load_agent_session_timeline(
                 runtime.clone(),
                 session_id.clone(),
                 workspace_id.clone(),
                 generation,
-                TimelineWindowRead::resuming(resume),
+                TimelineWindowRead::resuming(resume).covering(cover_sequence),
                 cx,
             );
             if let Some(backend) = self.backend.clone() {
@@ -29660,7 +29813,7 @@ impl VibexWorkbench {
             self.load_agent_session_timeline_remote(
                 session_id,
                 generation,
-                TimelineWindowRead::resuming(resume),
+                TimelineWindowRead::resuming(resume).covering(cover_sequence),
                 cx,
             );
         }
@@ -29692,7 +29845,11 @@ impl VibexWorkbench {
         let load_revision = self
             .registered_session(session_id.as_str())
             .map(|session| session.updated_at_ms);
-        let TimelineWindowRead { resume, contiguous } = window;
+        let TimelineWindowRead {
+            resume,
+            contiguous,
+            cover_sequence,
+        } = window;
         // A resumed load keeps the prefix the view already holds, so its leading
         // end — and whether that end sits inside a turn — is whatever the view
         // had. Only the window a read fetches can move it.
@@ -29726,6 +29883,7 @@ impl VibexWorkbench {
                                 backend,
                                 request_session_id.clone(),
                                 contiguous,
+                                cover_sequence,
                             )
                             .await?;
                             let starts_mid_turn = !page.starts_at_turn_start;
@@ -29745,6 +29903,7 @@ impl VibexWorkbench {
                         backend,
                         request_session_id.clone(),
                         contiguous,
+                        cover_sequence,
                     )
                     .await?;
                     let starts_mid_turn = !page.starts_at_turn_start;
@@ -29856,7 +30015,11 @@ impl VibexWorkbench {
         let load_revision = self
             .registered_session(session_id.as_str())
             .map(|session| session.updated_at_ms);
-        let TimelineWindowRead { resume, contiguous } = window;
+        let TimelineWindowRead {
+            resume,
+            contiguous,
+            cover_sequence,
+        } = window;
         // A resumed load keeps the prefix the view already holds, so its leading
         // end — and whether that end sits inside a turn — is whatever the view
         // had. Only the window a read fetches can move it.
@@ -29893,6 +30056,7 @@ impl VibexWorkbench {
                                 runtime,
                                 request_session_id.clone(),
                                 contiguous,
+                                cover_sequence,
                             )
                             .await?;
                             let starts_mid_turn = !page.starts_at_turn_start;
@@ -29912,6 +30076,7 @@ impl VibexWorkbench {
                         runtime,
                         request_session_id.clone(),
                         contiguous,
+                        cover_sequence,
                     )
                     .await?;
                     let starts_mid_turn = !page.starts_at_turn_start;
@@ -30201,6 +30366,18 @@ impl VibexWorkbench {
             self.timeline.mark_lagged();
             return;
         }
+        // A replacement opens the newest window, which is not where a reader who
+        // scrolled up is. Record their place now — before the read, because the
+        // install cannot describe a position the new window has already dropped
+        // — and ask the read to reach back far enough to keep the turn it names.
+        // Without this, a lagged refetch during a stream put the reader back at
+        // the bottom: the anchor resolved to nothing, the old offset survived,
+        // and the list clamped it to the newest row.
+        self.capture_timeline_scroll_anchor();
+        let cover_sequence = self
+            .timeline_follow
+            .anchor_span
+            .map(|span| span.first_sequence);
         let (runtime, session_id) = (self.runtime.clone(), self.selected_session_id.clone());
         let (Some(runtime), Some(session_id)) = (runtime, session_id) else {
             if let Some(session_id) = self.selected_session_id.clone() {
@@ -30212,7 +30389,7 @@ impl VibexWorkbench {
                 self.load_agent_session_timeline_remote(
                     session_id,
                     generation,
-                    TimelineWindowRead::contiguous(),
+                    TimelineWindowRead::contiguous().covering(cover_sequence),
                     cx,
                 );
             }
@@ -30227,7 +30404,7 @@ impl VibexWorkbench {
             session_id,
             workspace_id,
             self.session_generation,
-            TimelineWindowRead::contiguous(),
+            TimelineWindowRead::contiguous().covering(cover_sequence),
             cx,
         );
     }
@@ -32732,25 +32909,62 @@ impl VibexWorkbench {
 
     /// Put the captured anchor back under the viewport top against the current
     /// row table. Returns whether an anchor was applied.
+    ///
+    /// An anchor this table cannot resolve is not left to the list to settle:
+    /// see [`Self::settle_timeline_anchor_on_oldest_row`].
     fn apply_timeline_scroll_anchor(&mut self) -> bool {
         if self.timeline_follow.following_bottom {
             return false;
         }
-        let Some(row_index) = self.timeline_anchor_row_index() else {
-            return false;
+        let offset_in_row = self.timeline_follow.anchor_offset_px as f32;
+        let offset_y = self.timeline_anchor_row_index().and_then(|row_index| {
+            timeline_scroll_offset_for_anchor(
+                &self.timeline_row_heights(),
+                row_index,
+                offset_in_row,
+                self.timeline_list_padding_top_px,
+            )
+        });
+        if let Some(offset_y) = offset_y {
+            self.timeline_scroll
+                .set_offset(point(px(0.0), px(offset_y)));
+            return true;
+        }
+        // An anchor that resolved to nothing means the row table no longer holds
+        // the turn the reader was reading — a replacement installed a window
+        // that starts somewhere below it, and no offset in the old window means
+        // anything here. The offset that was left behind is the old window's,
+        // and it is beyond this one's range, so the list clamps it to the newest
+        // row: the reader is thrown forward to the live edge, which is exactly
+        // the "scroll went back by itself" report. Land on the oldest row the
+        // window does hold instead, and move the anchor there with it, so a
+        // later geometry change or history page does not re-apply the lost turn.
+        if self.timeline_follow.has_anchor() {
+            self.settle_timeline_anchor_on_oldest_row();
+        }
+        false
+    }
+
+    /// Holds the oldest row of the current window, abandoning an anchor the
+    /// installed window cannot honour.
+    ///
+    /// The alternative — keeping the old offset — is not a neutral choice: it
+    /// describes a window with more content above it than this one has, and the
+    /// virtual list resolves that by clamping to the newest row.
+    fn settle_timeline_anchor_on_oldest_row(&mut self) {
+        self.timeline_scroll.set_offset(point(px(0.0), px(0.0)));
+        let Some((turn_id, span)) = self
+            .conversation_turns_cache
+            .first()
+            .and_then(|turn| timeline_turn_anchor_span(turn).map(|span| (turn.id.clone(), span)))
+        else {
+            return;
         };
-        let row_heights = self.timeline_row_heights();
-        let Some(offset_y) = timeline_scroll_offset_for_anchor(
-            &row_heights,
-            row_index,
-            self.timeline_follow.anchor_offset_px as f32,
-            self.timeline_list_padding_top_px,
-        ) else {
-            return false;
-        };
-        self.timeline_scroll
-            .set_offset(point(px(0.0), px(offset_y)));
-        true
+        // The offset that maps to the top of the list is the top padding
+        // cancelled out, which is the anchor `offset 0` resolves from.
+        let offset_in_row = -(self.timeline_list_padding_top_px.round() as i32);
+        self.timeline_follow
+            .preserve_anchor_at(turn_id, span, offset_in_row);
     }
 
     fn handle_timeline_scroll_wheel(&mut self, event: &ScrollEvent, cx: &mut Context<Self>) {
@@ -111092,6 +111306,12 @@ mod tests {
             .expect("timeline anchor restore should remain inspectable");
         assert!(restore.contains("self.timeline_anchor_row_index()"));
         assert!(!restore.contains(".position(|turn| turn.id == turn_id)"));
+        // An anchor the installed window cannot resolve is not left for the
+        // virtual list to settle: that clamps the taller window's offset to the
+        // newest row, which is the jump this path exists to prevent.
+        assert!(restore.contains("self.timeline_follow.has_anchor()"));
+        assert!(restore.contains("self.settle_timeline_anchor_on_oldest_row()"));
+        assert!(restore.contains("self.timeline_scroll.set_offset(point(px(0.0), px(0.0)))"));
 
         let resolve = source
             .split_once("    fn timeline_anchor_row_index(")
@@ -111143,6 +111363,20 @@ mod tests {
             assert!(capture < replace);
             assert!(body.contains("this.timeline_scroll_anchor_pending = true;"));
         }
+
+        // The replacement a lagged refetch installs reads the newest window,
+        // which is not where a reader who scrolled up is. The read is asked for
+        // the turn their anchor names, so the anchor can resolve against the
+        // window that replaces theirs instead of being clamped to the newest
+        // row.
+        let refresh = source
+            .split_once("    fn refresh_selected_agent_timeline(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn load_agent_session_projection("))
+            .map(|(body, _)| body)
+            .expect("the timeline refresh should remain inspectable");
+        assert!(refresh.contains("self.capture_timeline_scroll_anchor();"));
+        assert!(refresh.contains("TimelineWindowRead::contiguous().covering(cover_sequence)"));
+        assert!(refresh.contains(".anchor_span"));
     }
 
     #[test]
