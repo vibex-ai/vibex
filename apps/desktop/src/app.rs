@@ -8557,8 +8557,14 @@ fn agent_generation_token_rate(
         return None;
     };
     let elapsed_seconds = elapsed.as_secs_f32();
-    (current > previous && elapsed_seconds > 0.0)
-        .then_some((current - previous) as f32 / elapsed_seconds)
+    if current <= previous || elapsed_seconds <= 0.0 {
+        return None;
+    }
+    // The subtraction has to happen *after* the check. `then_some`'s argument
+    // is evaluated eagerly, so writing this as `.then_some(current - previous)`
+    // panics on underflow whenever the count goes down — a new turn resetting
+    // the baseline, or a session switch reporting a smaller total.
+    Some((current - previous) as f32 / elapsed_seconds)
 }
 
 fn timeline_session_state_for_render(
@@ -117158,6 +117164,33 @@ mod tests {
         );
         assert_eq!(
             agent_generation_token_rate(Some(30), Some(30), Duration::from_secs(2)),
+            None
+        );
+        // A count that goes *down* is normal — a new turn resets the baseline,
+        // and switching sessions reports a smaller total. It must yield no rate,
+        // not an underflow. This is the case the first version missed: the
+        // guard was right, but `then_some` evaluated the subtraction eagerly and
+        // panicked before the guard could reject it.
+        assert_eq!(
+            agent_generation_token_rate(Some(30), Some(10), Duration::from_secs(2)),
+            None
+        );
+        assert_eq!(
+            agent_generation_token_rate(Some(u64::MAX), Some(0), Duration::from_secs(2)),
+            None
+        );
+        // Zero elapsed time is no rate either, and must not divide by zero.
+        assert_eq!(
+            agent_generation_token_rate(Some(10), Some(30), Duration::ZERO),
+            None
+        );
+        // A first observation has nothing to compare against.
+        assert_eq!(
+            agent_generation_token_rate(None, Some(30), Duration::from_secs(2)),
+            None
+        );
+        assert_eq!(
+            agent_generation_token_rate(Some(10), None, Duration::from_secs(2)),
             None
         );
     }
