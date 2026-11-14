@@ -836,6 +836,57 @@ impl SessionRuntimeSelection {
                     .is_some_and(|effective| effective.value == *value)
             })
     }
+
+    /// Drops the optional fields this selection names that `config` does not
+    /// actually carry.
+    ///
+    /// An optional field is a request, and an Agent that has no such dimension
+    /// cannot confirm it: the apply path drops the field, the binding converges
+    /// without it, and the selection that named it no longer matches the
+    /// binding it was committed against. Every later dispatch is then refused
+    /// with `message_submission_runtime_binding_mismatch` — a message the user
+    /// cannot send, for a control this Agent never offered.
+    ///
+    /// Normalizing the selection against the configuration the binding really
+    /// converged on is what keeps the two describing the same thing. It is
+    /// applied where the selection is written durably, so the durable record
+    /// and the binding cannot disagree no matter which path dropped the field.
+    /// The Model is deliberately left alone: an Agent that substitutes a Model
+    /// answers with the one it runs, and that substitution is recorded on both
+    /// sides of the configuration rather than rewritten here.
+    ///
+    /// An empty configuration is not evidence that the Agent has no such
+    /// dimension: a binding whose state was never written by the apply path
+    /// carries no answer at all, and reading its absence as a refusal would drop
+    /// a selection the Agent does support. Only a configuration the apply path
+    /// actually confirmed is authoritative, which is what
+    /// `applied_activation_generation` records.
+    pub fn reconcile_with_effective_config(&mut self, config: &SessionRuntimeConfigState) {
+        if config.applied_activation_generation.is_none() {
+            return;
+        }
+        if self
+            .reasoning_effort
+            .as_ref()
+            .is_some_and(|_| config.effective_reasoning_effort.is_none())
+        {
+            self.reasoning_effort = None;
+        }
+        if self
+            .mode_id
+            .as_ref()
+            .is_some_and(|_| config.effective_mode.is_none())
+        {
+            self.mode_id = None;
+        }
+        self.config_values.retain(|key, _| {
+            config
+                .config_values
+                .get(key)
+                .and_then(|state| state.effective.as_ref())
+                .is_some()
+        });
+    }
 }
 
 impl Serialize for SessionRuntimeSelection {
@@ -2090,6 +2141,45 @@ mod tests {
         let encoded = serde_json::to_string(&state).unwrap();
         let decoded: SessionRuntimeConfigState = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded, state);
+    }
+
+    #[test]
+    fn reconcile_drops_only_the_fields_the_config_does_not_carry() {
+        let config = SessionRuntimeConfigState {
+            preferred_model: Some("loomy/DeepSeek-V4.1-Flash".to_string()),
+            effective_model: Some("loomy/DeepSeek-V4.1-Flash".to_string()),
+            preferred_reasoning_effort: None,
+            effective_reasoning_effort: None,
+            preferred_mode: Some("danger-full-access".to_string()),
+            effective_mode: Some("danger-full-access".to_string()),
+            // The apply path confirmed this state for generation 2, which is
+            // what makes its absences authoritative.
+            applied_activation_generation: Some(2),
+            ..Default::default()
+        };
+        let mut selection = SessionRuntimeSelection {
+            reasoning_effort: Some("max".to_string()),
+            mode_id: Some("danger-full-access".to_string()),
+            config_values: BTreeMap::from([("agent".to_string(), "standard".to_string())]),
+            ..SessionRuntimeSelection::provider(
+                AgentId::parse("deepseek-harness").unwrap(),
+                ProviderProfileId::parse("provider_magpie").unwrap(),
+                "loomy/DeepSeek-V4.1-Flash",
+            )
+        };
+        // The selection names an effort this Agent cannot express, so it does
+        // not match the configuration the binding converged on.
+        assert!(!selection.matches_effective_config(&config));
+
+        selection.reconcile_with_effective_config(&config);
+        assert_eq!(selection.reasoning_effort, None);
+        // The fields the config does carry are untouched: a mode it published
+        // and a Model it runs are still the selection's.
+        assert_eq!(selection.mode_id.as_deref(), Some("danger-full-access"));
+        assert_eq!(selection.model_id(), Some("loomy/DeepSeek-V4.1-Flash"));
+        // An unconfirmed generic value is dropped with it.
+        assert!(selection.config_values.is_empty());
+        assert!(selection.matches_effective_config(&config));
     }
 
     #[test]

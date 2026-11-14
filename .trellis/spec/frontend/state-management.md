@@ -545,6 +545,25 @@ but do not re-estimate a streaming turn merely because it became visible again.
 `timeline_loading.rs` tests cover unchanged turn identity, changed answers,
 concurrent appends/revisions, and request cancellation.
 
+### Convention: A scroll step starts from an offset the transcript can hold
+
+`Transcript::visible_lines` clamps the offset it draws to
+`total_height - viewport`, but it does not write that clamp back into
+`App::scroll`. The two therefore drift apart whenever the content under a parked
+offset shrinks — a prepend restores the reader's row against a longer transcript
+and a block above it is then re-measured shorter, an expansion collapses, or a
+summary replaces a detail.
+
+`App::scroll_lines` must resolve the clamp before it steps. Stepping from a stale
+offset past the end left the new offset past the end too, the `>= bottom` branch
+re-followed the tail, and an upward gesture moved the view nowhere: the reader
+could not scroll into history at all. Compute `bottom` first, start from
+`min(current, bottom)`, then step and clamp once.
+
+Regression tests drive `scroll_lines` with a parked offset beyond the end and
+assert the frame's offset actually decreased, plus a prepend followed by several
+upward steps that must each make progress.
+
 ### Convention: Sending a message returns the timeline to the new turn
 
 Sending is an explicit instruction to look at the turn that was sent, so it

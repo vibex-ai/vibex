@@ -1590,12 +1590,72 @@ impl RuntimeSwitchRepository {
                 "failed to start runtime switch commit transaction",
             ))?;
         let now = unix_timestamp_ms();
+        // The committed selection must describe what the target binding
+        // actually converged on, not what was asked for. An Agent with no
+        // reasoning dimension, or a Model that does not publish a mode, drops
+        // that field while applying the configuration; the binding then
+        // converges without it. Recording the requested value anyway left the
+        // durable selection naming a field the binding never carried, so
+        // `matches_effective_config` was false for every later turn and each
+        // dispatch was refused with
+        // `message_submission_runtime_binding_mismatch`.
+        let target_config_json: String = tx
+            .query_row(
+                "SELECT session_runtime_config_state_json
+                 FROM session_runtime_bindings WHERE binding_id = ?1",
+                params![request.target_binding_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(storage_err(
+                "runtime_switch_commit_failed",
+                "failed to read target runtime configuration",
+            ))?
+            .ok_or_else(|| {
+                VibexError::validation(
+                    "runtime_switch_target_binding_missing",
+                    "runtime switch target binding was not found during commit",
+                )
+            })?;
+        let mut target_config: SessionRuntimeConfigState = json_from_db(target_config_json)?;
+        if !target_config.is_converged() {
+            return Err(VibexError::conflict(
+                "runtime_switch_target_config_not_converged",
+                "runtime switch target configuration is not converged",
+            ));
+        }
+        // The generation this commit is about to activate is the one the target
+        // configuration applies to, so mark it before reconciling: an unmarked
+        // configuration reads as one the apply path never confirmed, and
+        // reconciliation deliberately ignores those.
+        let next_generation: i64 = tx
+            .query_row(
+                "SELECT activation_generation + 1 FROM agent_sessions WHERE session_id = ?1",
+                params![request.session_id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(storage_err(
+                "runtime_switch_commit_failed",
+                "failed to read the generation this commit activates",
+            ))?;
+        target_config.mark_generation_if_converged(next_generation);
+        let mut effective_selection = request.effective_selection.clone();
+        effective_selection.reconcile_with_effective_config(&target_config);
+        // The desired side settles with it. A turn is admitted only while the
+        // desired, effective, and required selections are the same value, so
+        // leaving the desired side naming a dropped field would only move the
+        // refusal from the binding fence to the runtime gate. This is not a new
+        // user selection — it is the same request settling on what the Agent
+        // could express — so `selection_revision` is deliberately unchanged and
+        // the switch keeps describing the selection it was requested for.
+        let settled_selection = json_to_db(&effective_selection)?;
 
         let changed = tx
             .execute(
                 "UPDATE agent_sessions
                  SET current_agent_id = ?2,
                      current_binding_id = ?3,
+                     desired_runtime_selection_json = ?4,
                      effective_runtime_selection_json = ?4,
                      runtime_selection_status = ?5,
                      runtime_selection_error_code = NULL,
@@ -1613,7 +1673,7 @@ impl RuntimeSwitchRepository {
                     request.session_id.as_str(),
                     request.target_agent_id.as_str(),
                     request.target_binding_id.as_str(),
-                    json_to_db(&request.effective_selection)?,
+                    settled_selection,
                     enum_to_db(&SessionRuntimeSelectionStatus::Ready)?,
                     now,
                     request.source_revision,
@@ -1701,31 +1761,11 @@ impl RuntimeSwitchRepository {
                 "runtime_switch_commit_failed",
                 "failed to read committed runtime generation",
             ))?;
-        let target_config_json: String = tx
-            .query_row(
-                "SELECT session_runtime_config_state_json
-                 FROM session_runtime_bindings WHERE binding_id = ?1",
-                params![request.target_binding_id.as_str()],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(storage_err(
-                "runtime_switch_commit_failed",
-                "failed to read target runtime configuration",
-            ))?
-            .ok_or_else(|| {
-                VibexError::validation(
-                    "runtime_switch_target_binding_missing",
-                    "runtime switch target binding was not found during commit",
-                )
-            })?;
-        let mut target_config: SessionRuntimeConfigState = json_from_db(target_config_json)?;
-        if !target_config.is_converged() {
-            return Err(VibexError::conflict(
-                "runtime_switch_target_config_not_converged",
-                "runtime switch target configuration is not converged",
-            ));
-        }
+        debug_assert_eq!(
+            Some(next_generation),
+            target_config.applied_activation_generation,
+            "the target configuration applies to the generation this commit activates"
+        );
         target_config.mark_generation_if_converged(next_generation);
 
         if let Some(source_binding_id) = &request.source_binding_id {
@@ -6302,6 +6342,111 @@ impl AgentSessionRuntimeRepository {
             runtime_selection_error_code: raw.10,
         }))
     }
+
+    /// Settles sessions whose committed selection names a field the binding it
+    /// was committed against never carried.
+    ///
+    /// A switch whose apply path dropped an option the Agent cannot express —
+    /// an effort on an Agent with no reasoning dimension, a mode a Model does
+    /// not publish — used to record the requested value as the effective
+    /// selection while the binding converged without it. Every later turn was
+    /// then refused with `message_submission_runtime_binding_mismatch`: the
+    /// session was idle, its binding was current, and the message still could
+    /// not be sent. Those rows are already durable, so the shape has to be
+    /// repaired where it is read rather than only prevented on write.
+    ///
+    /// Returns the ids it repaired so the caller can publish the new state.
+    pub fn settle_selections_with_effective_config(
+        conn: &mut Connection,
+    ) -> VibexResult<Vec<VibexSessionId>> {
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage_err(
+                "runtime_selection_settle_transaction_failed",
+                "failed to start runtime selection settlement",
+            ))?;
+        let rows: Vec<(String, String, String, String)> = {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT s.session_id, s.desired_runtime_selection_json,
+                            s.effective_runtime_selection_json,
+                            b.session_runtime_config_state_json
+                     FROM agent_sessions s
+                     JOIN session_runtime_bindings b
+                       ON b.binding_id = s.current_binding_id
+                     WHERE s.pending_switch_id IS NULL
+                       AND s.deleted_at_ms IS NULL
+                       AND b.binding_state = 'current'",
+                )
+                .map_err(storage_err(
+                    "runtime_selection_settle_scan_failed",
+                    "failed to scan committed runtime selections",
+                ))?;
+            let mapped = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                })
+                .map_err(storage_err(
+                    "runtime_selection_settle_scan_failed",
+                    "failed to scan committed runtime selections",
+                ))?;
+            let mut rows = Vec::new();
+            for row in mapped {
+                rows.push(row.map_err(storage_err(
+                    "runtime_selection_settle_scan_failed",
+                    "failed to scan committed runtime selections",
+                ))?);
+            }
+            rows
+        };
+        let mut repaired = Vec::new();
+        for (session_raw, desired_raw, effective_raw, config_raw) in rows {
+            let config: SessionRuntimeConfigState = json_from_db(config_raw)?;
+            let desired: SessionRuntimeSelection = json_from_db(desired_raw)?;
+            let effective: SessionRuntimeSelection = json_from_db(effective_raw)?;
+            let mut settled_desired = desired.clone();
+            settled_desired.reconcile_with_effective_config(&config);
+            let mut settled_effective = effective.clone();
+            settled_effective.reconcile_with_effective_config(&config);
+            if settled_desired == desired && settled_effective == effective {
+                continue;
+            }
+            tx.execute(
+                "UPDATE agent_sessions
+                 SET desired_runtime_selection_json = ?2,
+                     effective_runtime_selection_json = ?3,
+                     revision = revision + 1,
+                     updated_at_ms = ?4
+                 WHERE session_id = ?1",
+                params![
+                    session_raw.as_str(),
+                    json_to_db(&settled_desired)?,
+                    json_to_db(&settled_effective)?,
+                    unix_timestamp_ms(),
+                ],
+            )
+            .map_err(storage_err(
+                "runtime_selection_settle_failed",
+                "failed to settle a committed runtime selection",
+            ))?;
+            repaired.push(VibexSessionId::parse(&session_raw).map_err(|_| {
+                VibexError::storage(
+                    "runtime_selection_settle_failed",
+                    "a committed runtime selection names an invalid session",
+                )
+            })?);
+        }
+        tx.commit().map_err(storage_err(
+            "runtime_selection_settle_transaction_failed",
+            "failed to commit runtime selection settlement",
+        ))?;
+        Ok(repaired)
+    }
 }
 
 #[cfg(test)]
@@ -8716,6 +8861,151 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(state.pending_switch_id, None);
+        cleanup_db(temp);
+    }
+
+    #[test]
+    fn commit_records_the_selection_the_binding_actually_converged_on() {
+        let temp = temp_db_path("commit-settled-selection");
+        let mut conn = open_database(&temp).unwrap();
+        apply_migrations(&mut conn).unwrap();
+        let session_id = seeded_session(&conn, "commit-settled-selection");
+
+        // The requested selection names a reasoning effort and a mode, but the
+        // Agent it switched to has no reasoning dimension and reported no mode:
+        // its binding converged with both absent. Recording the request anyway
+        // is what left every later dispatch refused with
+        // `message_submission_runtime_binding_mismatch`.
+        let mut target = sample_binding(&session_id, BindingState::Preparing);
+        target.session_runtime_config_state = SessionRuntimeConfigState {
+            preferred_model: Some("claude-sonnet-4-5".to_string()),
+            effective_model: Some("claude-sonnet-4-5".to_string()),
+            preferred_reasoning_effort: None,
+            effective_reasoning_effort: None,
+            preferred_mode: None,
+            effective_mode: None,
+            ..Default::default()
+        };
+        RuntimeBindingRepository::insert(&conn, &target).unwrap();
+        let request = reserve_request(
+            &session_id,
+            "settled-key",
+            0,
+            Some(target.binding_id.clone()),
+        );
+        let reserved =
+            RuntimeSwitchRepository::reserve(&mut conn, RuntimeSwitchId::new(), &request).unwrap();
+
+        let requested = SessionRuntimeSelection {
+            reasoning_effort: Some("max".to_string()),
+            mode_id: Some("danger-full-access".to_string()),
+            ..sample_selection()
+        };
+        RuntimeSwitchRepository::commit(
+            &mut conn,
+            &RuntimeSwitchCommitRequest {
+                switch_id: reserved.switch_id.clone(),
+                session_id: session_id.clone(),
+                source_revision: 0,
+                desired_selection_revision: 0,
+                source_binding_id: None,
+                target_binding_id: target.binding_id.clone(),
+                target_agent_id: AgentId::parse("claude-code").unwrap(),
+                effective_selection: requested.clone(),
+            },
+        )
+        .unwrap();
+
+        let state = AgentSessionRuntimeRepository::get_runtime_state(&conn, &session_id)
+            .unwrap()
+            .unwrap();
+        let binding = RuntimeBindingRepository::get(&conn, &target.binding_id)
+            .unwrap()
+            .unwrap();
+        let effective = state
+            .effective_runtime_selection
+            .as_ref()
+            .expect("commit records an effective selection");
+        // The committed selection describes what the binding carries, so the
+        // turn fence's two halves agree and the next message can be sent.
+        assert!(effective.matches_effective_config(&binding.session_runtime_config_state));
+        assert_eq!(effective.reasoning_effort, None);
+        assert_eq!(effective.mode_id, None);
+        assert_eq!(effective.model_id(), Some("claude-sonnet-4-5"));
+        // The desired side settles with it: a turn is admitted only while the
+        // desired and effective selections are the same value.
+        assert_eq!(state.desired_runtime_selection.as_ref(), Some(effective));
+        // Settling is not a new user selection.
+        assert_eq!(state.selection_revision, 0);
+        cleanup_db(temp);
+    }
+
+    #[test]
+    fn settle_repairs_a_session_committed_with_an_unexpressible_field() {
+        let temp = temp_db_path("settle-repair");
+        let mut conn = open_database(&temp).unwrap();
+        apply_migrations(&mut conn).unwrap();
+        let session_id = seeded_session(&conn, "settle-repair");
+
+        // The shape a switch left behind before the commit path settled: the
+        // session names `max` and a mode, the current binding carries neither.
+        let mut binding = sample_binding(&session_id, BindingState::Current);
+        binding.session_runtime_config_state = SessionRuntimeConfigState {
+            preferred_model: Some("claude-sonnet-4-5".to_string()),
+            effective_model: Some("claude-sonnet-4-5".to_string()),
+            preferred_reasoning_effort: None,
+            effective_reasoning_effort: None,
+            preferred_mode: None,
+            effective_mode: None,
+            // The apply path confirmed this state for the generation the
+            // session committed, which is what makes its absences
+            // authoritative.
+            applied_activation_generation: Some(2),
+            ..Default::default()
+        };
+        RuntimeBindingRepository::insert(&conn, &binding).unwrap();
+        let stranded = SessionRuntimeSelection {
+            reasoning_effort: Some("max".to_string()),
+            mode_id: Some("danger-full-access".to_string()),
+            ..sample_selection()
+        };
+        conn.execute(
+            "UPDATE agent_sessions
+             SET current_binding_id = ?2,
+                 desired_runtime_selection_json = ?3,
+                 effective_runtime_selection_json = ?3,
+                 runtime_selection_status = 'ready',
+                 activation_generation = 2
+             WHERE session_id = ?1",
+            params![
+                session_id.as_str(),
+                binding.binding_id.as_str(),
+                json_to_db(&stranded).unwrap(),
+            ],
+        )
+        .unwrap();
+
+        let repaired =
+            AgentSessionRuntimeRepository::settle_selections_with_effective_config(&mut conn)
+                .unwrap();
+        assert_eq!(repaired, vec![session_id.clone()]);
+
+        let state = AgentSessionRuntimeRepository::get_runtime_state(&conn, &session_id)
+            .unwrap()
+            .unwrap();
+        let binding = RuntimeBindingRepository::get(&conn, &binding.binding_id)
+            .unwrap()
+            .unwrap();
+        let effective = state.effective_runtime_selection.as_ref().unwrap();
+        assert!(effective.matches_effective_config(&binding.session_runtime_config_state));
+        assert_eq!(effective.reasoning_effort, None);
+        assert_eq!(effective.mode_id, None);
+
+        // Idempotent: a settled session is not rewritten on the next start.
+        let again =
+            AgentSessionRuntimeRepository::settle_selections_with_effective_config(&mut conn)
+                .unwrap();
+        assert!(again.is_empty());
         cleanup_db(temp);
     }
 

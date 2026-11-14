@@ -5495,17 +5495,24 @@ impl App {
     /// reader to the top of the session — a different turn — on the first
     /// scroll after opening it.
     pub fn scroll_lines(&mut self, delta: i64) {
-        let current = if self.scroll.follow {
-            self.transcript.scroll_offset()
-        } else {
-            self.scroll.offset
-        } as i64;
-        self.scroll.offset = (current + delta).max(0) as usize;
         let bottom = self.transcript.bottom_offset(
             self.transcript_band_rows.max(1),
             &self.theme,
             self.strings,
         );
+        // The step starts from a position the transcript can actually hold. A
+        // parked offset can sit past the end — a history prepend restores the
+        // reader's row against a longer transcript, and content above it can
+        // then shrink — and stepping from that offset landed back on the tail
+        // every time: the clamp below re-followed the newest line on each
+        // gesture, so the reader could not move up at all.
+        let current = if self.scroll.follow {
+            self.transcript.scroll_offset()
+        } else {
+            self.scroll.offset
+        }
+        .min(bottom) as i64;
+        self.scroll.offset = (current + delta).max(0) as usize;
         if self.scroll.offset >= bottom {
             // At the bottom the reader is following the tail again: the newest
             // line is what they scrolled to.

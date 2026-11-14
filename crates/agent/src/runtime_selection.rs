@@ -583,6 +583,19 @@ impl RuntimeSelectionService {
                 self.start_watcher(&record)?;
             }
         }
+        // A session whose committed selection names a field its binding never
+        // carried cannot accept a message: the turn fence compares the two and
+        // refuses with `message_submission_runtime_binding_mismatch`. Settling
+        // those rows here repairs sessions that were already committed in that
+        // shape before the write path stopped producing it, so the fix reaches
+        // existing conversations instead of only new switches.
+        let settled = {
+            let mut conn = open_database(self.inner.coordinator.database_path())?;
+            AgentSessionRuntimeRepository::settle_selections_with_effective_config(&mut conn)?
+        };
+        for session_id in settled {
+            session_ids.insert(session_id);
+        }
         for session_id in session_ids {
             self.emit_authoritative(&session_id)?;
         }
