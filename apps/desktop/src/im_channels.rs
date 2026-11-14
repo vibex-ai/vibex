@@ -246,55 +246,64 @@ impl ImChannelsView {
         self.busy = true;
         self.error = None;
         self.notice = None;
+        // Enabling the channel connects the adapter, and the adapter spawns its
+        // long connection onto the Tokio runtime. The work has to be started
+        // there; polling it on the UI executor panics with "there is no reactor
+        // running".
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            let display_name = if chat_id.trim().is_empty() {
+                "Lark bot".to_string()
+            } else {
+                chat_id.trim().to_string()
+            };
+            let draft = ImChannelDraft {
+                display_name,
+                config: ImChannelConfig::Lark(ImLarkConfig {
+                    app_id: app_id.trim().to_string(),
+                    chat_id: (!chat_id.trim().is_empty()).then(|| chat_id.trim().to_string()),
+                    transport: ImLarkTransport::LongConnection,
+                    region,
+                }),
+                default_session: None,
+                event_filter: Vec::new(),
+                locale: None,
+            };
+            async {
+                let channel = backend
+                    .management()
+                    .create_im_channel(vibex_backend::MutationRequest::new(draft))
+                    .await
+                    .map_err(backend_error)?;
+                backend
+                    .management()
+                    .set_im_channel_app_secret(vibex_backend::MutationRequest::new(
+                        vibex_backend::ImChannelAppSecretUpdateRequest {
+                            channel_id: channel.channel_id.clone(),
+                            app_secret: app_secret.trim().to_string(),
+                        },
+                    ))
+                    .await
+                    .map_err(backend_error)?;
+                backend
+                    .management()
+                    .set_im_channel_enabled(vibex_backend::MutationRequest::new(
+                        vibex_backend::ImChannelEnabledRequest {
+                            channel_id: channel.channel_id,
+                            enabled: true,
+                        },
+                    ))
+                    .await
+                    .map(|_| ())
+                    .map_err(backend_error)
+            }
+            .await
+        });
         self.task = Some(cx.spawn(
             async move |weak: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
-                let display_name = if chat_id.trim().is_empty() {
-                    "Lark bot".to_string()
-                } else {
-                    chat_id.trim().to_string()
+                let result = match runner.await {
+                    Ok(result) => result,
+                    Err(error) => Err(error.to_string()),
                 };
-                let draft = ImChannelDraft {
-                    display_name,
-                    config: ImChannelConfig::Lark(ImLarkConfig {
-                        app_id: app_id.trim().to_string(),
-                        chat_id: (!chat_id.trim().is_empty())
-                            .then(|| chat_id.trim().to_string()),
-                        transport: ImLarkTransport::LongConnection,
-                        region,
-                    }),
-                    default_session: None,
-                    event_filter: Vec::new(),
-                    locale: None,
-                };
-                let result = async {
-                    let channel = backend
-                        .management()
-                        .create_im_channel(vibex_backend::MutationRequest::new(draft))
-                        .await
-                        .map_err(backend_error)?;
-                    backend
-                        .management()
-                        .set_im_channel_app_secret(vibex_backend::MutationRequest::new(
-                            vibex_backend::ImChannelAppSecretUpdateRequest {
-                                channel_id: channel.channel_id.clone(),
-                                app_secret: app_secret.trim().to_string(),
-                            },
-                        ))
-                        .await
-                        .map_err(backend_error)?;
-                    backend
-                        .management()
-                        .set_im_channel_enabled(vibex_backend::MutationRequest::new(
-                            vibex_backend::ImChannelEnabledRequest {
-                                channel_id: channel.channel_id,
-                                enabled: true,
-                            },
-                        ))
-                        .await
-                        .map(|_| ())
-                        .map_err(backend_error)
-                }
-                .await;
                 let _ = weak.update(cx, |this, cx| {
                     this.busy = false;
                     match result {
@@ -333,7 +342,7 @@ impl ImChannelsView {
         self.busy = true;
         self.error = None;
         self.notice = None;
-        self.task = Some(cx.spawn(async move |weak: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
             let draft = ImChannelDraft {
                 display_name: name.trim().to_string(),
                 config: ImChannelConfig::Telegram(ImTelegramConfig {
@@ -350,7 +359,7 @@ impl ImChannelsView {
                 .create_im_channel(vibex_backend::MutationRequest::new(draft))
                 .await
                 .map_err(backend_error);
-            let result = match created {
+            match created {
                 Ok(channel) => {
                     let token_result = backend
                         .management()
@@ -378,6 +387,12 @@ impl ImChannelsView {
                     }
                 }
                 Err(error) => Err(error),
+            }
+        });
+        self.task = Some(cx.spawn(async move |weak: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+            let result = match runner.await {
+                Ok(result) => result,
+                Err(error) => Err(error.to_string()),
             };
             let _ = weak.update(cx, |this, cx| {
                 this.busy = false;
@@ -400,18 +415,24 @@ impl ImChannelsView {
             return;
         };
         self.busy = true;
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            backend
+                .management()
+                .set_im_channel_enabled(vibex_backend::MutationRequest::new(
+                    vibex_backend::ImChannelEnabledRequest {
+                        channel_id,
+                        enabled,
+                    },
+                ))
+                .await
+                .map_err(backend_error)
+        });
         self.task = Some(cx.spawn(
             async move |weak: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
-                let result = backend
-                    .management()
-                    .set_im_channel_enabled(vibex_backend::MutationRequest::new(
-                        vibex_backend::ImChannelEnabledRequest {
-                            channel_id,
-                            enabled,
-                        },
-                    ))
-                    .await
-                    .map_err(backend_error);
+                let result = match runner.await {
+                    Ok(result) => result,
+                    Err(error) => Err(error.to_string()),
+                };
                 let _ = weak.update(cx, |this, cx| {
                     this.busy = false;
                     match result {
@@ -465,13 +486,19 @@ impl ImChannelsView {
             return;
         };
         self.busy = true;
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            backend
+                .management()
+                .test_im_channel(channel_id)
+                .await
+                .map_err(backend_error)
+        });
         self.task = Some(cx.spawn(
             async move |weak: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
-                let result = backend
-                    .management()
-                    .test_im_channel(channel_id)
-                    .await
-                    .map_err(backend_error);
+                let result = match runner.await {
+                    Ok(result) => result,
+                    Err(error) => Err(error.to_string()),
+                };
                 let _ = weak.update(cx, |this, cx| {
                     this.busy = false;
                     match result {
