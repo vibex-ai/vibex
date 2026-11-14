@@ -1168,6 +1168,44 @@ mod tests {
         conn
     }
 
+    fn table_count(conn: &Connection, name: &str) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            params![name],
+            |row| row.get(0),
+        )
+        .expect("count table")
+    }
+
+    /// A database written by a build that numbered its migrations differently
+    /// can already own the IM version while carrying none of the tables. The
+    /// migration has to create them anyway, or every channel write fails.
+    #[test]
+    fn im_schema_is_created_when_the_version_slot_is_taken() {
+        let mut conn = Connection::open_in_memory().expect("open in-memory db");
+        conn.pragma_update(None, "foreign_keys", "ON")
+            .expect("foreign keys");
+        conn.execute_batch(
+            "CREATE TABLE schema_migrations (
+                 version INTEGER PRIMARY KEY,
+                 name TEXT NOT NULL,
+                 applied_at_ms INTEGER NOT NULL
+             );
+             INSERT INTO schema_migrations (version, name, applied_at_ms)
+             VALUES (89, 'plugin_market_storage', 1);",
+        )
+        .expect("seed a foreign migration at the IM version");
+
+        super::super::apply_migrations(&mut conn).expect("apply migrations");
+        assert_eq!(table_count(&conn, "im_channels"), 1);
+        assert_eq!(table_count(&conn, "im_actions"), 1);
+
+        // A later open still sees the tables and stays a no-op, even though the
+        // version row belongs to another migration.
+        super::super::apply_migrations(&mut conn).expect("re-apply migrations");
+        assert_eq!(table_count(&conn, "im_channels"), 1);
+    }
+
     #[test]
     fn im_schema_migrates_and_cascades_channel_rows() {
         let conn = migrated();

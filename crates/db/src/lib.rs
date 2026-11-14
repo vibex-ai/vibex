@@ -28405,10 +28405,26 @@ fn map_session_terminal(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionTerm
 ///
 /// Recorded after the long-lived ad-hoc tail so a migrated database reports an
 /// ascending version list. The tables are independent of the ACP schema above.
+///
+/// The schema is gated on the tables themselves rather than only on the version
+/// slot: a database written by a build that numbered its migrations differently
+/// can already carry this version for an unrelated change, and trusting the
+/// slot alone then leaves the tables missing and every IM write failing with a
+/// storage error. The version row is recorded only while the slot is free.
 fn apply_im_chat_channels(conn: &mut Connection, applied: &mut Vec<String>) -> VibexResult<()> {
     const VERSION: i64 = 89;
     const NAME: &str = "im_chat_channels";
-    if migration_applied(conn, VERSION)? {
+    let present = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'im_channels'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(storage_err(
+            "schema_probe_failed",
+            "failed to inspect the IM channel schema",
+        ))?;
+    if present > 0 {
         return Ok(());
     }
     let tx = conn.transaction().map_err(storage_err(
@@ -28565,18 +28581,23 @@ fn apply_im_chat_channels(conn: &mut Connection, applied: &mut Vec<String>) -> V
         "migration_apply_failed",
         "failed to apply the IM channel migration",
     ))?;
-    tx.execute(
-        "INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
-        params![VERSION, NAME, unix_timestamp_ms()],
-    )
-    .map_err(storage_err(
-        "migration_record_failed",
-        "failed to record the IM channel migration",
-    ))?;
+    let already_recorded = migration_applied(&tx, VERSION)?;
+    if !already_recorded {
+        tx.execute(
+            "INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
+            params![VERSION, NAME, unix_timestamp_ms()],
+        )
+        .map_err(storage_err(
+            "migration_record_failed",
+            "failed to record the IM channel migration",
+        ))?;
+    }
     tx.commit().map_err(storage_err(
         "migration_commit_failed",
         "failed to commit the IM channel migration",
     ))?;
-    applied.push(format!("{VERSION}:{NAME}"));
+    if !already_recorded {
+        applied.push(format!("{VERSION}:{NAME}"));
+    }
     Ok(())
 }
