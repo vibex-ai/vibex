@@ -313,6 +313,25 @@ function main() {
   if (process.env.VIBEX_UPDATE_SIGNING_ENABLED === "true" && !process.env.VIBEX_UPDATE_PUBLIC_KEY?.trim()) {
     fail("VIBEX_UPDATE_PUBLIC_KEY is required when updater signing is enabled");
   }
+  // The plugin market's index is signed, and the public half is compiled in.
+  // Without it a build ships a market that refuses every index it is offered,
+  // with an error that reads like a network problem. A local preview is the
+  // common case, so this warns loudly rather than failing: a developer may
+  // deliberately build a market-less desktop.
+  if (!process.env.VIBEX_PLUGIN_ROOT_KEY?.trim()) {
+    console.warn(
+      [
+        "",
+        "warning: VIBEX_PLUGIN_ROOT_KEY is not set.",
+        "         This build will ship a plugin market that cannot verify any",
+        "         signed index, so Discover will report that the index could not",
+        "         be read.",
+        "         Set it to the catalog's root public key, or set",
+        "         VIBEX_PLUGIN_ALLOW_UNVERIFIED_INDEX=1 for a development build.",
+        ""
+      ].join("\n")
+    );
+  }
   if (process.env.VIBEX_UPDATE_SIGNING_ENABLED !== "true") {
     delete buildEnvironment.VIBEX_UPDATE_PUBLIC_KEY;
   }

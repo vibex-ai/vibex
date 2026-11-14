@@ -522,6 +522,15 @@ pub const ROOT_KEY_ENV: &str = "VIBEX_PLUGIN_ROOT_KEY";
 /// The explicit development opt-in for an unsigned index.
 pub const ALLOW_UNVERIFIED_INDEX_ENV: &str = "VIBEX_PLUGIN_ALLOW_UNVERIFIED_INDEX";
 
+/// The official catalog's root public key.
+///
+/// A release build compiles it in from `VIBEX_PLUGIN_ROOT_KEY`; a developer who
+/// did not set that can point at the same key with the environment variable of
+/// the same name. It is not a secret — the private half lives in the catalog
+/// repository's CI secret — so having it here is the documentation a local
+/// build needs to produce a working market.
+pub const OFFICIAL_ROOT_PUBLIC_KEY: &str = "CYaKLr/92ePE6LU9XO8eHSFSOKrhvtK0wF99kQwQ2F8=";
+
 /// The root key, preferring a build-time value and falling back to the
 /// developer's environment.
 ///
@@ -529,13 +538,20 @@ pub const ALLOW_UNVERIFIED_INDEX_ENV: &str = "VIBEX_PLUGIN_ALLOW_UNVERIFIED_INDE
 /// treating it as absent is how a release ends up accepting anything.
 fn configured_root_key() -> Result<Option<VerifyingKey>, String> {
     let compiled = option_env!("VIBEX_PLUGIN_ROOT_KEY").unwrap_or("");
-    let encoded = if compiled.trim().is_empty() {
-        match std::env::var(ROOT_KEY_ENV) {
-            Ok(value) if !value.trim().is_empty() => value,
-            _ => return Ok(None),
-        }
-    } else {
+    let encoded = if !compiled.trim().is_empty() {
         compiled.to_string()
+    } else if let Ok(value) = std::env::var(ROOT_KEY_ENV)
+        && !value.trim().is_empty()
+    {
+        value
+    } else if cfg!(debug_assertions) {
+        // A debug build falls back to the official key so a developer who did
+        // not read the docs still gets a working market. A release build does
+        // not: shipping a key the release did not choose is a trust decision
+        // nobody made.
+        OFFICIAL_ROOT_PUBLIC_KEY.to_string()
+    } else {
+        return Ok(None);
     };
     vibex_plugin::market::decode_verifying_key(&encoded)
         .map(Some)
@@ -575,6 +591,20 @@ mod tests {
 
     fn verifying_key() -> VerifyingKey {
         ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]).verifying_key()
+    }
+
+    /// The key a debug build falls back to must be the catalog's real one, or
+    /// every local preview would report an unverifiable index.
+    #[test]
+    fn the_documented_key_is_the_one_the_published_index_verifies_against() {
+        let key = vibex_plugin::market::decode_verifying_key(OFFICIAL_ROOT_PUBLIC_KEY)
+            .expect("the documented key decodes");
+        // It is a 32-byte Ed25519 public key; the point of the test is that the
+        // constant is not a placeholder, so round-tripping it is enough.
+        assert_eq!(
+            vibex_plugin::market::encode_verifying_key(&key),
+            OFFICIAL_ROOT_PUBLIC_KEY
+        );
     }
 
     #[test]

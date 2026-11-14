@@ -146,7 +146,25 @@ impl MarketCatalog {
                 (index.plugins, generated_at, revision)
             }
             Err(error) => {
-                partial_reason = Some(format!("the index could not be read: {error}"));
+                // The most common failure by far is a build that compiled in no
+                // root key: the fetch and the signature both succeed, and then
+                // there is nothing to verify against. Saying "the signature does
+                // not verify" for that sends the reader looking at the network,
+                // so the message names the actual cause.
+                let reason = if self.config.root_public_key.is_none()
+                    && !self.config.allow_unverified_index
+                {
+                    format!(
+                        "the index could not be verified: this build has no plugin catalog \
+                         root key. Set {root_key_env} when building, or \
+                         {allow_env}=1 for a development build. ({error})",
+                        root_key_env = "VIBEX_PLUGIN_ROOT_KEY",
+                        allow_env = "VIBEX_PLUGIN_ALLOW_UNVERIFIED_INDEX",
+                    )
+                } else {
+                    format!("the index could not be read: {error}")
+                };
+                partial_reason = Some(reason);
                 (Vec::new(), None, 0)
             }
         };
@@ -795,6 +813,29 @@ mod tests {
             );
             assert_eq!(entry.entry.source_name.as_deref(), Some("Acme"));
         }
+    }
+
+    /// A build with no root key cannot verify anything, and the message has to
+    /// say so: "the signature does not verify" would send the reader to look at
+    /// the network when the cause is the build.
+    #[tokio::test]
+    async fn a_build_without_a_root_key_says_which_variable_is_missing() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = MarketCache::new(directory.path());
+        let mut config = MarketConfig::empty(cache);
+        // A local address that will refuse the connection, so the failure is
+        // reached through the same path a real build takes.
+        config.index_urls = vec![Url::parse("http://127.0.0.1:1/index.json").unwrap()];
+        config.root_public_key = None;
+        config.allow_unverified_index = false;
+        let catalog = MarketCatalog::new(MarketHttpClient::new(MarketUrlPolicy::Testing), config);
+        let loaded = catalog.load(&PluginMarketIndexRequest::default()).await;
+        assert!(loaded.stale);
+        let reason = loaded.partial_reason.expect("a reason");
+        assert!(
+            reason.contains("VIBEX_PLUGIN_ROOT_KEY"),
+            "the reason must name the variable: {reason}"
+        );
     }
 
     #[tokio::test]

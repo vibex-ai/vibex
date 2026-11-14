@@ -88,6 +88,21 @@ defaults to the current UTC time.
 - The app embeds the index root public key at build time (`VIBEX_PLUGIN_ROOT_KEY`
   in CI). Without it, release builds refuse to load an unsigned index; a
   development build may set `VIBEX_PLUGIN_ALLOW_UNVERIFIED_INDEX=1`.
+
+  The official key is also written down in
+  `crates/desktop-runtime/src/plugins.rs` as `OFFICIAL_ROOT_PUBLIC_KEY`, so a
+  local build can be given it without hunting through CI configuration:
+
+  ```sh
+  VIBEX_PLUGIN_ROOT_KEY=CYaKLr/92ePE6LU9XO8eHSFSOKrhvtK0wF99kQwQ2F8= \
+    cargo run -p vibex-desktop
+  ```
+
+  **A build without this key still fetches the index successfully and then has
+  nothing to verify it against.** Discover then reports that the index could
+  not be verified, naming the missing variable — that message means the build
+  is missing the key, not that the catalog is broken. The packaging script
+  prints the same warning when the variable is absent.
 - A version's `signature` is a publisher signature. It verifies against the key
   named by `publisherKeyId` in `publisher-keys.json`; only then does the install
   count as **Verified**. A signature naming a key the index does not carry is
