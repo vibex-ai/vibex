@@ -8,7 +8,7 @@
   <img src="https://img.shields.io/badge/Rust-1.99.1-black?style=flat&logo=rust&logoColor=white" alt="Rust 1.99.1" />
   <img src="https://img.shields.io/badge/UI-GPUI-2563eb?style=flat" alt="GPUI" />
   <img src="https://img.shields.io/badge/platforms-macOS%20%7C%20Windows%20%7C%20Linux%20%7C%20iOS%20%7C%20Android-4493F8?style=flat" alt="Platforms: macOS, Windows, Linux, iOS, and Android" />
-  <img src="https://img.shields.io/badge/status-0.1.5-22c55e?style=flat" alt="Release status: 0.1.5" />
+  <img src="https://img.shields.io/badge/status-0.1.6-22c55e?style=flat" alt="Release status: 0.1.6" />
   <a href="https://deepwiki.com/vibex-ai/vibex"><img src="docs/assets/badges/ask-deepwiki.svg" alt="Ask DeepWiki" /></a>
 </p>
 
