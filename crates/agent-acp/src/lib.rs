@@ -75,7 +75,11 @@ mod session_config;
 mod session_restore;
 mod spawn_config;
 
-pub use adapter_activation::VerifiedAcpAdapterActivation;
+pub use adapter_activation::{
+    ACP_ACTIVATION_EVIDENCE_FILE, ACP_ACTIVATION_EVIDENCE_SCHEMA_VERSION,
+    AcpAdapterActivationEvidence, AcpAdapterArtifactObservation, VerifiedAcpAdapterActivation,
+    read_activation_evidence,
+};
 pub use bridge_contract::{
     AcpBridgeContractAdapterReport, AcpBridgeContractRunner, BridgeContractMcpFixture,
 };

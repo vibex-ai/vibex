@@ -130,6 +130,13 @@ pub struct ProviderConfigService {
     profile_change_listeners: Vec<Arc<dyn ProviderProfileChangeListener>>,
 }
 
+/// One persisted managed installation selected by the current runtime command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagedAgentInstallation {
+    pub version: String,
+    pub install_root: PathBuf,
+}
+
 impl std::fmt::Debug for ProviderConfigService {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -446,10 +453,35 @@ impl ProviderConfigService {
         agent_id: &AgentId,
         command: &AgentCommandConfig,
     ) -> VibexResult<Option<String>> {
+        Ok(self
+            .managed_agent_installation(agent_id, command)?
+            .map(|installation| installation.version))
+    }
+
+    /// Returns the installation directory and version of a Vibex-managed Agent
+    /// when the persisted installation is the exact command selected by this
+    /// runtime config. Activation evidence is read from that directory.
+    pub fn managed_agent_installation(
+        &self,
+        agent_id: &AgentId,
+        command: &AgentCommandConfig,
+    ) -> VibexResult<Option<ManagedAgentInstallation>> {
         let conn = self.open_connection()?;
-        Ok(AgentManagedInstallationRepository::get(&conn, agent_id)?
+        let Some(record) = AgentManagedInstallationRepository::get(&conn, agent_id)?
             .filter(|record| record.command.as_ref() == Some(command))
-            .and_then(|record| record.state.installed_version))
+        else {
+            return Ok(None);
+        };
+        let Some(version) = record.state.installed_version else {
+            return Ok(None);
+        };
+        let Some(install_root) = record.install_root else {
+            return Ok(None);
+        };
+        Ok(Some(ManagedAgentInstallation {
+            version,
+            install_root: PathBuf::from(install_root),
+        }))
     }
 
     /// Converges one built-in online Agent onto its ACP command while keeping
