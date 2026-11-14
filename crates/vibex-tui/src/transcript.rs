@@ -1762,6 +1762,16 @@ impl Transcript {
         self.offsets.get(index).copied().unwrap_or(0)
     }
 
+    /// Display height of the block at `index`, zero when it is folded away.
+    ///
+    /// A parked offset can sit beyond a block after the content above it
+    /// shrank. The height is what keeps a scroll anchor from carrying that
+    /// excess into the restored position.
+    pub fn height_of_block(&mut self, index: usize) -> usize {
+        let (start, end) = self.block_range(index);
+        end.saturating_sub(start)
+    }
+
     /// The display line of the block's own row: the one its mark is drawn on.
     ///
     /// A block does not always begin on its own row. A turn's fold draws its

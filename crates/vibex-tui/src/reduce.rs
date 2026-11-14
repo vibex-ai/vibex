@@ -11264,6 +11264,35 @@ mod tests {
     }
 
     #[test]
+    fn a_window_that_fits_the_band_still_reaches_for_the_history_above_it() {
+        let mut app = capable_app();
+        let session_id = VibexSessionId::new();
+        app.navigate_to(Page::Agent);
+        app.agent.state.selected_session_id = Some(session_id.clone());
+        app.agent.state.timeline.replace_authoritative(
+            session_id.clone(),
+            [history_item(&session_id, 3), history_item(&session_id, 4)],
+        );
+        app.agent.state.timeline_has_older = true;
+        app.sync_transcript();
+        // A band taller than the whole loaded window. The view follows the
+        // tail, which is also the top: scrolling cannot move it, so the only
+        // way to history is to load the page above the window.
+        app.transcript_band_rows = 40;
+        app.scroll.follow = true;
+        app.scroll.offset = 0;
+
+        let outcome = app.perform(Intent::ScrollHalfPageUp);
+        let [Effect::LoadOlder { ticket }] = outcome.effects.as_slice() else {
+            panic!(
+                "a scroll up on a window that fits the screen asked for nothing: {:?}",
+                outcome.effects
+            );
+        };
+        assert_eq!(ticket.before_sequence, 3);
+    }
+
+    #[test]
     fn every_response_kind_resolves_to_an_advertised_option() {
         let options = vec![vibex_core::PermissionResponseOption {
             option_id: "o1".into(),

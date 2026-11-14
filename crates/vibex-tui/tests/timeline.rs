@@ -1014,6 +1014,71 @@ fn a_parked_offset_past_the_end_still_scrolls_up() {
 }
 
 #[test]
+fn a_prepend_keeps_a_parked_anchor_inside_its_block() {
+    // The frame clamps an out-of-range offset for drawing, but the state keeps
+    // it. When an older page lands in that window, the anchor must not carry
+    // the excess into the restored position: a row past the block becomes an
+    // offset past the transcript, and an upward gesture has nothing to step
+    // from.
+    let long_answer = (0..40)
+        .map(|line| format!("answer line {line}\n\n"))
+        .collect::<String>();
+    let mut app = app(
+        vec![TimelinePayload::AgentMessage(AgentMessagePayload {
+            text: long_answer,
+            is_final: true,
+        })],
+        AgentSessionState::Idle,
+    );
+    let _ = draw(&mut app, 100, 30);
+    app.scroll.follow = false;
+    app.scroll.offset = 100_000;
+    let _ = draw(&mut app, 100, 30);
+
+    let session_id = app
+        .agent
+        .state
+        .timeline
+        .session_id
+        .clone()
+        .expect("the fixture has a session");
+    let mut items = app.agent.state.timeline.items.clone();
+    items.insert(
+        0,
+        TimelineItem {
+            id: TimelineItemId::new(),
+            session_id: session_id.clone(),
+            sequence: 0,
+            timestamp_ms: 0,
+            source: TimelineSource::User,
+            kind: TimelineItemKind::UserMessage,
+            correlation_id: None,
+            provider_correlation_id: None,
+            redaction_state: TimelineRedactionState::None,
+            execution_attribution: None,
+            payload_depth: TimelinePayloadDepth::Detail,
+            payload: TimelinePayload::UserMessage(UserMessagePayload {
+                text: "the question that began this turn".into(),
+                ..Default::default()
+            }),
+        },
+    );
+    app.agent
+        .state
+        .timeline
+        .replace_authoritative(session_id, items);
+    app.sync_transcript();
+
+    let total = app.transcript.total_height();
+    assert!(
+        app.scroll.offset < total,
+        "the anchor restored row {} past the {} rows of the transcript",
+        app.scroll.offset,
+        total
+    );
+}
+
+#[test]
 fn an_older_page_leaves_the_reader_able_to_keep_scrolling_up() {
     // The reported regression: after the anchor change, an older page could
     // land the reader at an offset the transcript cannot hold, and every later

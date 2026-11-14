@@ -6497,7 +6497,18 @@ impl App {
                 .and_then(|index| {
                     let id = self.transcript.block(index)?.id.clone();
                     let start = self.transcript.line_of_block(index);
-                    Some((id, self.scroll.offset.saturating_sub(start)))
+                    let height = self.transcript.height_of_block(index);
+                    // A parked offset can point past the block — and past the
+                    // end of the transcript entirely — after the content above
+                    // it shrank. Keep the row inside the block: an out-of-range
+                    // row would be restored as an out-of-range offset, and an
+                    // upward gesture would have nothing to step from.
+                    let row = self
+                        .scroll
+                        .offset
+                        .saturating_sub(start)
+                        .min(height.saturating_sub(1));
+                    Some((id, row))
                 })
         } else {
             None
@@ -6860,10 +6871,34 @@ impl App {
     pub fn prefetch_older_history(&mut self) -> Option<Effect> {
         // While the dock owns the list keys, `k` is moving its cursor, not
         // scrolling the transcript it happens to be sitting above.
-        if self.dock_is_focused() || !self.near_transcript_top() {
+        if self.dock_is_focused() {
+            return None;
+        }
+        // A loaded window shorter than the band has no row to move: its top
+        // and its bottom are the same offset, and an upward gesture leaves the
+        // view following the tail. The gesture is still a request for the
+        // history above the window, so a window that already fits the band
+        // counts as being at its top. Without this, a session whose page
+        // happened to fit the screen could never scroll back into history.
+        if self.page != Page::Agent
+            || self.overlay.is_some()
+            || self.filtering
+            || (!self.near_transcript_top() && !self.transcript_fits_band())
+        {
             return None;
         }
         self.load_older_history()
+    }
+
+    /// Whether the loaded transcript already fits inside the band.
+    ///
+    /// A window that fits has no scroll position to be near the top *of*: the
+    /// whole of it is on screen. The bottom offset is zero exactly then, and
+    /// the tail is already measured for the gesture that is asking.
+    fn transcript_fits_band(&mut self) -> bool {
+        self.transcript
+            .bottom_offset(self.transcript_band_rows.max(1), &self.theme, self.strings)
+            == 0
     }
 
     /// Whether the reader is within about a screen and a half of the top.
