@@ -121182,6 +121182,58 @@ mod tests {
         );
     }
 
+    /// The provider menu opens on the same configuration its trigger shows.
+    ///
+    /// Both used to resolve their own subject: the trigger took the cascade's
+    /// selection, the menu re-read the session's. A chip being tuned then showed
+    /// one configuration and listed another Agent's providers, and choosing from
+    /// that list wrote a selection for the wrong Agent. This pins the single
+    /// source so the two cannot drift apart again.
+    #[test]
+    fn the_provider_menu_opens_on_the_configuration_its_trigger_shows() {
+        let source = include_str!("app.rs");
+        let opener = source
+            .split_once("    fn set_composer_runtime_menu_open(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn set_new_session_runtime_menu_open("))
+            .map(|(body, _)| body)
+            .expect("the composer runtime menu opener should remain inspectable");
+        assert!(
+            opener.contains("self.composer_runtime_selection(cx)"),
+            "the menu must take its subject from the same place the trigger does"
+        );
+        assert!(
+            !opener.contains("self.selected_runtime_selection()"),
+            "reading the session here listed the session's Agent's providers"
+        );
+
+        let new_session_opener = source
+            .split_once("    fn set_new_session_runtime_menu_open(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn set_runtime_choice_menu_open("))
+            .map(|(body, _)| body)
+            .expect("the new-session menu opener should remain inspectable");
+        assert!(
+            new_session_opener
+                .contains("composer_runtime_selection_for(ComposerTarget::NewSession"),
+            "the new-session menu must open on its own composer's subject"
+        );
+        assert!(
+            !new_session_opener.contains("self.new_session_runtime_selection"),
+            "reading the page's selection here listed the page's Agent's providers"
+        );
+
+        // The new-session cascade must list the Agent it is rendering, not the
+        // page's, or a chip's providers are unreachable from it.
+        let cascade = source
+            .split_once("    fn render_new_session_runtime_cascade(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_composer_runtime_cascade("))
+            .map(|(body, _)| body)
+            .expect("the new-session cascade should remain inspectable");
+        assert!(
+            cascade.contains("selection\n            .as_ref()\n            .map(|selection| selection.agent_id.clone())"),
+            "the cascade must derive its Agent from the selection it renders"
+        );
+    }
+
     #[test]
     fn runtime_menu_opens_below_the_trigger_and_stays_attached() {
         let trigger_bounds = Bounds {
