@@ -71076,8 +71076,9 @@ impl VibexWorkbench {
         };
         // The Agent sets a reaction explicitly through vibex_react. It is read
         // from the hidden notice the tool wrote, so it appears only when the
-        // Agent decided to react and survives every later render.
-        let reaction = (!editing && self.ui_state.message_reactions.enabled)
+        // Agent decided to react and survives every later render. The feature
+        // switch stops new reactions; it must not hide the ones already here.
+        let reaction = (!editing)
             .then(|| user_message_reaction_from_items(&row.item_ids, &self.timeline.items))
             .flatten();
         let inline_content = if editing {
@@ -88609,16 +88610,6 @@ fn settings_search_candidates(strings: &'static Strings) -> Vec<SettingsSearchCa
         ),
         settings_search_candidate(
             SettingsSection::General,
-            locale::text("Message reactions", "消息 Reaction", "訊息 Reaction"),
-            locale::text(
-                "Show emoji reactions the Agent adds to your messages.",
-                "显示 Agent 给你的消息添加的表情回应。",
-                "顯示 Agent 給你的訊息添加的表情回應。",
-            ),
-            &["reaction", "emoji", "表情", "回应", "回應"],
-        ),
-        settings_search_candidate(
-            SettingsSection::General,
             locale::text("System notifications", "系统通知", "系統通知"),
             locale::text(
                 "Show desktop notifications for Agent activity.",
@@ -88930,6 +88921,16 @@ fn settings_search_candidates(strings: &'static Strings) -> Vec<SettingsSearchCa
                 "選擇 Enter 或 Cmd/Ctrl+Enter 傳送訊息。",
             ),
             &["enter", "send key", "message", "消息", "訊息"],
+        ),
+        settings_search_candidate(
+            SettingsSection::Session,
+            locale::text("Message reactions", "消息 Reaction", "訊息 Reaction"),
+            locale::text(
+                "Let the Agent add emoji reactions to your messages. Turning this off stops new reactions; existing ones stay visible.",
+                "允许 Agent 给你的消息添加表情回应。关闭后不再产生新的 reaction，已有的 reaction 仍会显示。",
+                "允許 Agent 給你的訊息添加表情回應。關閉後不再產生新的 reaction，已有的 reaction 仍會顯示。",
+            ),
+            &["reaction", "emoji", "表情", "回应", "回應"],
         ),
         settings_search_candidate(
             SettingsSection::Session,
@@ -93566,10 +93567,6 @@ impl FoundationSettings {
             Some(strings.system_default),
             cx,
         );
-        let message_reactions_enabled = self
-            .workbench
-            .read_with(cx, |this, _| this.ui_state.message_reactions.enabled)
-            .unwrap_or(true);
         // Closing the window either leaves the Agent running in the system
         // tray or ends the application, so the row offers both outcomes by name
         // instead of asking the reader to interpret a switch's polarity.
@@ -93693,13 +93690,6 @@ impl FoundationSettings {
             .small()
             .checked(desktop_behavior.launch_at_login)
             .on_click(cx.listener(|this, enabled, _, cx| this.set_launch_at_login(*enabled, cx)));
-        let message_reactions =
-            Switch::new("message-reactions-enabled")
-                .small()
-                .checked(message_reactions_enabled)
-                .on_click(cx.listener(|this, enabled, _, cx| {
-                    this.set_message_reactions_enabled(*enabled, cx)
-                }));
         let notifications = Switch::new("notifications-enabled")
             .small()
             .checked(desktop_behavior.notifications_enabled)
@@ -93756,17 +93746,6 @@ impl FoundationSettings {
                                 "登入系統時啟動 Vibex。",
                             ),
                             launch_at_login,
-                            stacked,
-                            cx,
-                        ),
-                        setting_row(
-                            locale::text("Message reactions", "消息 Reaction", "訊息 Reaction"),
-                            locale::text(
-                                "Show a friendly emoji on your message while the Agent works, and keep it after the reply.",
-                                "Agent 处理消息时在气泡上显示一个友好的表情，并在回复后保留。",
-                                "Agent 處理訊息時在氣泡上顯示一個友好的表情，並在回覆後保留。",
-                            ),
-                            message_reactions,
                             stacked,
                             cx,
                         ),
@@ -94284,6 +94263,22 @@ impl FoundationSettings {
         strings: &'static Strings,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let message_reactions_enabled = self
+            .workbench
+            .read_with(cx, |this, _| this.ui_state.message_reactions.enabled)
+            .unwrap_or(true);
+        let message_reactions_switch =
+            Switch::new("message-reactions-enabled")
+                .small()
+                .checked(message_reactions_enabled)
+                .tooltip(locale::text(
+                    "Message reactions",
+                    "消息 Reaction",
+                    "訊息 Reaction",
+                ))
+                .on_click(cx.listener(|this, enabled, _, cx| {
+                    this.set_message_reactions_enabled(*enabled, cx)
+                }));
         let turn_preview_rail_switch =
             Switch::new("session-turn-preview-rail")
                 .small()
@@ -94538,6 +94533,20 @@ impl FoundationSettings {
                             cx,
                         ),
                     ],
+                ),
+                SettingsGroup::new(
+                    locale::text("Reactions", "Reaction", "Reaction"),
+                    vec![setting_row(
+                        locale::text("Message reactions", "消息 Reaction", "訊息 Reaction"),
+                        locale::text(
+                            "Let the Agent add emoji reactions to your messages. Turning this off stops new reactions; existing ones stay visible.",
+                            "允许 Agent 给你的消息添加表情回应。关闭后不再产生新的 reaction，已有的 reaction 仍会显示。",
+                            "允許 Agent 給你的訊息添加表情回應。關閉後不再產生新的 reaction，已有的 reaction 仍會顯示。",
+                        ),
+                        message_reactions_switch,
+                        stacked,
+                        cx,
+                    )],
                 ),
                 SettingsGroup::new(
                     locale::text("Composer", "输入与发送", "輸入與傳送"),
@@ -124269,10 +124278,34 @@ mod tests {
         assert!(state.message_reactions.enabled);
 
         let source = include_str!("app.rs");
-        assert!(source.contains("message-reactions-enabled"));
         assert!(source.contains("set_message_reactions_enabled"));
         assert!(source.contains("ui_state.message_reactions.enabled"));
         assert!(source.contains("agent().manager().set_message_reactions_enabled"));
+
+        // The switch belongs to Session settings, not General.
+        let general = source
+            .split_once("    fn render_general_page(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_appearance_page("))
+            .map(|(body, _)| body)
+            .expect("general settings should remain inspectable");
+        assert!(!general.contains("message-reactions-enabled"));
+
+        let session = source
+            .split_once("    fn render_session_page(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_archived_page("))
+            .map(|(body, _)| body)
+            .expect("session settings should remain inspectable");
+        assert!(session.contains("message-reactions-enabled"));
+        assert!(session.contains("existing ones stay visible"));
+
+        // Turning the feature off stops new reactions but does not hide the
+        // ones already recorded on a message.
+        let row = source
+            .split_once("    fn render_user_message_row(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_agent_message_row("))
+            .map(|(body, _)| body)
+            .expect("user message row should remain inspectable");
+        assert!(!row.contains("message_reactions.enabled"));
     }
 
     #[test]
