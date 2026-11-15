@@ -95,6 +95,16 @@ pub const VIBEX_USE_APPROVAL_UNTRUSTED_BEGIN: &str = "----- BEGIN UNTRUSTED APPR
 /// Closing delimiter around card content returned to a parent Agent.
 pub const VIBEX_USE_APPROVAL_UNTRUSTED_END: &str = "----- END UNTRUSTED APPROVAL CARD -----";
 
+/// Prefix of the provider correlation that ties a reaction notice to the user
+/// message it decorates.
+///
+/// A reaction is presentation, not a second message: the runtime appends it as
+/// a hidden system notice and the shell finds it by this prefix. The notice
+/// stays readable as plain text to a client that does not know about reactions.
+pub const VIBEX_USE_REACTION_CORRELATION_PREFIX: &str = "vibex-reaction:";
+/// A reaction is one short expression, not a place to hide a paragraph.
+pub const VIBEX_USE_REACTION_MAX_CHARS: usize = 64;
+
 /// Wraps card-derived text in explicit untrusted-content delimiters.
 ///
 /// The notice alone is a sentence; the fence is what makes where the card stops
@@ -875,10 +885,11 @@ pub enum VibexUseTool {
     UpdateGroup,
     PresentGroup,
     DissolveGroup,
+    React,
 }
 
 impl VibexUseTool {
-    pub const ALL: [Self; 22] = [
+    pub const ALL: [Self; 23] = [
         Self::Discover,
         Self::ListSessions,
         Self::GetSession,
@@ -901,6 +912,7 @@ impl VibexUseTool {
         Self::UpdateGroup,
         Self::PresentGroup,
         Self::DissolveGroup,
+        Self::React,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -927,6 +939,7 @@ impl VibexUseTool {
             Self::UpdateGroup => "vibex_update_group",
             Self::PresentGroup => "vibex_present_group",
             Self::DissolveGroup => "vibex_dissolve_group",
+            Self::React => "vibex_react",
         }
     }
 
@@ -1126,6 +1139,11 @@ fn tool_description(tool: VibexUseTool) -> &'static str {
         }
         VibexUseTool::DissolveGroup => {
             "Dissolve a group the caller created. Sessions remain and tasks keep running."
+        }
+        VibexUseTool::React => {
+            "Attach an emoji reaction to a user message in this session. Call it only when a \
+             reaction genuinely fits the exchange; omit it otherwise. Any emoji is accepted. \
+             The reaction defaults to the newest user message; sequence names an earlier one."
         }
     }
 }
@@ -1457,6 +1475,20 @@ fn tool_input_schema(tool: VibexUseTool) -> Value {
                 "expectedRevision": { "type": "integer" }
             },
             "required": ["idempotencyKey", "groupRef"]
+        }),
+        VibexUseTool::React => json!({
+            "type": "object",
+            "properties": {
+                "emoji": string(
+                    "The emoji reaction to attach to the user message. Any emoji is accepted; \
+                     the caller decides whether a reaction is appropriate."
+                ),
+                "sequence": {
+                    "type": "integer",
+                    "description": "Optional sequence of the user message to react to; defaults to the newest user message."
+                }
+            },
+            "required": ["emoji"]
         }),
     }
 }
@@ -2997,6 +3029,7 @@ mod tests {
         let names: Vec<&str> = tools.iter().map(|tool| tool.name.as_str()).collect();
         assert!(names.contains(&"vibex_delegate"));
         assert!(names.contains(&"vibex_list_groups"));
+        assert!(names.contains(&"vibex_react"));
         assert!(!names.contains(&"vibex_create_group"));
         assert!(!names.contains(&"vibex_present_group"));
 

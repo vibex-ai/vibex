@@ -153,10 +153,10 @@ use vibex_core::{
     TerminalSession, TerminalStatus, TerminalSwitchShellRequest, TimelineItem, TimelineItemId,
     TimelineLiveEvent, TimelinePage, TimelinePayload, TimelineRedactionState, TimelineSource,
     TimelineTurnStart, UserMessageDelivery, UserMessagePayload, VIBEX_USE_MAX_MENTIONS,
-    VibexSessionId, VibexUseMention, VibexUsePresentationCapability, VibexUseUnavailableReason,
-    WorkspaceMode, WorkspaceRecord, agent_session_turn_requires_continuation,
-    latest_timeline_turn_ended_normally, managed_worktree_name_slug, normalize_agent_session_title,
-    unix_timestamp_ms,
+    VIBEX_USE_REACTION_CORRELATION_PREFIX, VibexSessionId, VibexUseMention,
+    VibexUsePresentationCapability, VibexUseUnavailableReason, WorkspaceMode, WorkspaceRecord,
+    agent_session_turn_requires_continuation, latest_timeline_turn_ended_normally,
+    managed_worktree_name_slug, normalize_agent_session_title, unix_timestamp_ms,
 };
 use vibex_desktop_model::{
     AgentOrderEntry, AgentOrdering, AgentPlanProjection, AgentSortStrategy, AppearanceUiState,
@@ -7519,21 +7519,16 @@ const AGENT_ANSWER_ACTION_ORDER: [AgentAnswerAction; 4] = [
 
 /// The turn facts a user message row reads.
 ///
-/// The receipt, the edit affordance, and the context menu all answer from the
-/// same facts; threading them one by one made the renderer take more arguments
-/// than its meaning.
+/// The edit affordance and the context menu answer from the same facts;
+/// threading them one by one made the renderer take more arguments than its
+/// meaning. A reaction is not one of these facts: it comes from the Agent's own
+/// notice and belongs to the message, not to the turn.
 #[derive(Clone, Copy, Debug, Default)]
 struct UserMessageTurnState {
-    /// The conversation's latest turn; only its message wears a receipt.
+    /// The conversation's latest turn; only its message can be edited.
     latest: bool,
     /// The turn has settled.
     complete: bool,
-    /// The agent has rendered an event for the turn: a thought, a tool call, a
-    /// permission card, or the answer.
-    started: bool,
-    /// The agent is working on the turn right now, as opposed to having
-    /// responded and then stopped.
-    working: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -14972,13 +14967,6 @@ impl VibexWorkbench {
             eprintln!("vibex-fonts: {error}");
         }
         self.ui_state = state;
-        // The reaction feature begins at this build's first load. Stamp that
-        // boundary once so messages written before it never gain a receipt
-        // retroactively; later loads keep the original stamp.
-        if self.ui_state.message_reactions.since_ms.is_none() {
-            self.ui_state.message_reactions.since_ms = Some(unix_timestamp_ms());
-            self.queue_ui_state();
-        }
         // The window is only known once the saved state is in memory, and the
         // overview load that applies it can already have finished — a remote
         // authority boots before this file is read. Re-arm the launch pass so
@@ -66042,27 +66030,9 @@ impl VibexWorkbench {
             .when(!is_first, |this| this.pt_5())
             .pb_5();
 
-        // The receipt waits for an event the agent actually rendered — a
-        // thought, a tool call, a permission card, or the answer — not merely
-        // for the send. The running session only decides whether that receipt
-        // still describes work in progress or a reply that has settled.
-        let session_working = is_last
-            && self
-                .timeline
-                .session_id
-                .as_ref()
-                .and_then(|session_id| self.registered_session(session_id.as_str()))
-                .is_some_and(|session| {
-                    matches!(
-                        session.state,
-                        AgentSessionState::Running | AgentSessionState::NeedsInput
-                    )
-                });
-        let has_visible_event = !turn.process_rows.is_empty()
-            || turn.conclusion_row.is_some()
-            || turn.live_status.is_some();
-        let turn_has_event = user_message_reaction_has_event(turn.failed, has_visible_event);
-
+        // Reactions are set explicitly by the Agent through vibex_react. The
+        // row reads them from the hidden timeline notices, not from the turn
+        // state, so the send and the answer timing no longer matter here.
         if let Some(user_row) = turn.user_row.as_ref() {
             let user_message = self.render_user_message_row(
                 user_row,
@@ -66070,8 +66040,6 @@ impl VibexWorkbench {
                 UserMessageTurnState {
                     latest: is_last,
                     complete: turn.complete,
-                    started: turn_has_event,
-                    working: !turn.complete && session_working,
                 },
                 window,
                 cx,
@@ -71103,24 +71071,12 @@ impl VibexWorkbench {
         } else {
             self.render_user_message_attachment_strip(&row.id, &row.body, &attachments, cx)
         };
-        // The receipt is chosen from what the reader wrote, not from the row
-        // or turn id, so replacing the optimistic item cannot change it
-        // mid-work. It belongs to messages written after the feature was
-        // introduced, waits for the turn to start, and stays after the turn
-        // settles; `complete` only changes what the label says.
-        let reaction = user_message_reaction_allowed(
-            self.ui_state.message_reactions.enabled,
-            self.ui_state.message_reactions.since_ms,
-            row.timestamp_ms,
-            turn.started,
-            editing,
-        )
-        .then(|| {
-            (
-                user_message_reaction(&user_message_reaction_seed(&row.body, &attachments)),
-                turn.working,
-            )
-        });
+        // The Agent sets a reaction explicitly through vibex_react. It is read
+        // from the hidden notice the tool wrote, so it appears only when the
+        // Agent decided to react and survives every later render.
+        let reaction = (!editing && self.ui_state.message_reactions.enabled)
+            .then(|| user_message_reaction_from_items(&row.item_ids, &self.timeline.items))
+            .flatten();
         let inline_content = if editing {
             self.render_inline_user_message_editor(&row.id, cx)
         } else {
@@ -88652,9 +88608,9 @@ fn settings_search_candidates(strings: &'static Strings) -> Vec<SettingsSearchCa
             SettingsSection::General,
             locale::text("Message reactions", "消息 Reaction", "訊息 Reaction"),
             locale::text(
-                "Show a friendly emoji on your message while the Agent works, and keep it after the reply.",
-                "Agent 处理消息时在气泡上显示一个友好的表情，并在回复后保留。",
-                "Agent 處理訊息時在氣泡上顯示一個友好的表情，並在回覆後保留。",
+                "Show emoji reactions the Agent adds to your messages.",
+                "显示 Agent 给你的消息添加的表情回应。",
+                "顯示 Agent 給你的訊息添加的表情回應。",
             ),
             &["reaction", "emoji", "表情", "回应", "回應"],
         ),
@@ -92898,17 +92854,10 @@ impl FoundationSettings {
         cx.notify();
     }
 
-    /// Turn the emoji receipt on or off for every conversation.
-    ///
-    /// Turning it on again keeps the original feature epoch, so messages from
-    /// before the feature stay without a receipt; only messages sent after it
-    /// can show one.
+    /// Turn Agent emoji reactions on or off for every conversation.
     fn set_message_reactions_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
         let _ = self.workbench.update(cx, |this, cx| {
             this.ui_state.message_reactions.enabled = enabled;
-            if enabled && this.ui_state.message_reactions.since_ms.is_none() {
-                this.ui_state.message_reactions.since_ms = Some(unix_timestamp_ms());
-            }
             this.queue_ui_state();
             cx.notify();
         });
@@ -103570,115 +103519,56 @@ fn render_user_message_goal_button(row_id: &str, cx: &App) -> Button {
         .tooltip(label)
 }
 
-/// The friendly receipt a user message wears once its turn has started.
+/// The emoji the Agent attached to a user message.
 ///
-/// Deliberately small and non-committal: the emoji says the message was
-/// received, not that the work is finished or that its content is being
-/// judged. The array is the selection wheel; a stable hash picks one.
-const USER_MESSAGE_REACTIONS: [&str; 7] = ["👀", "🤔", "👍", "💪", "❤️", "🫶", "🚀"];
-
-/// Pick the receipt a user message wears.
-///
-/// Hash the message rather than sampling a random source: the same message in a
-/// second pane, after an authoritative refresh, or after a restart must not
-/// change expression under the reader, and a render must never advance the pick.
-fn user_message_reaction(seed: &str) -> &'static str {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in seed.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    USER_MESSAGE_REACTIONS[(hash % USER_MESSAGE_REACTIONS.len() as u64) as usize]
-}
-
-/// The stable identity a receipt is chosen from.
-///
-/// A row's id, and the turn id built from it, change when an optimistic send is
-/// replaced by the authoritative item. Seeding from them made the emoji turn
-/// into a different one mid-work. The text and the attachment labels are the
-/// parts of the message the reader wrote, so they survive that replacement.
-fn user_message_reaction_seed(text: &str, attachments: &[MessageAttachment]) -> String {
-    let mut seed = String::with_capacity(text.len() + attachments.len() * 16);
-    seed.push_str(text);
-    for attachment in attachments {
-        seed.push('\u{1f}');
-        seed.push_str(attachment.display_label());
-    }
-    seed
-}
-
-/// Whether a user message has a receipt.
-///
-/// A receipt is not a read receipt for the send: it appears only once the turn
-/// has started, and it stays once the turn settles. A later message must not
-/// take it away from the message whose turn it acknowledges; editing that
-/// message swaps it for the editor.
-fn user_message_reaction_visible(turn_started: bool, editing: bool) -> bool {
-    !editing && turn_started
-}
-
-/// Whether a user message may wear its receipt at all.
-///
-/// The preference can switch every receipt off, and the stored epoch keeps
-/// messages written before the feature from gaining one retroactively. Inside
-/// that window the receipt still waits for the agent's first rendered event and
-/// yields to the inline editor.
-fn user_message_reaction_allowed(
-    enabled: bool,
-    since_ms: Option<i64>,
-    message_timestamp_ms: i64,
-    turn_has_event: bool,
-    editing: bool,
-) -> bool {
-    enabled
-        && since_ms.is_some_and(|since_ms| message_timestamp_ms >= since_ms)
-        && user_message_reaction_visible(turn_has_event, editing)
-}
-
-/// Whether the agent has put an event on screen for the turn.
-///
-/// A dispatched turn is not enough, and neither is a running session: the
-/// receipt follows something the agent actually rendered — a thought, a tool
-/// call, a permission card, or the answer. A failed turn earns none.
-fn user_message_reaction_has_event(failed: bool, has_visible_event: bool) -> bool {
-    !failed && has_visible_event
+/// The runtime records a reaction as a hidden system notice whose provider
+/// correlation names the target item; the conversation projection drops the
+/// notice from the rows, so this is the only place it is read. When the Agent
+/// changes its reaction, the newest notice for that item wins.
+fn user_message_reaction_from_items(
+    item_ids: &[String],
+    items: &[TimelineItem],
+) -> Option<SharedString> {
+    items
+        .iter()
+        .filter_map(|item| {
+            let TimelinePayload::SystemNotice(notice) = &item.payload else {
+                return None;
+            };
+            let target = item
+                .provider_correlation_id
+                .as_deref()?
+                .strip_prefix(VIBEX_USE_REACTION_CORRELATION_PREFIX)?;
+            item_ids
+                .iter()
+                .any(|item_id| item_id == target)
+                .then(|| (item.sequence, notice.message.clone()))
+        })
+        .max_by_key(|(sequence, _)| *sequence)
+        .map(|(_, emoji)| SharedString::from(emoji))
 }
 
 /// The bubble's lower-edge reaction region, holding every mark the row earned.
 ///
-/// The receipt leads; the goal badge and delivery accent keep the trailing
+/// The Agent's emoji leads; the goal badge and delivery accent keep the trailing
 /// corner. All share one pill so the row does not grow a second floating
-/// surface. The bool on the reaction distinguishes work in progress from a
-/// settled turn, which changes only the accessible description.
+/// surface.
 fn render_user_message_edge_reactions(
     row_id: &str,
     delivery: UserMessageDelivery,
     is_goal_message: bool,
-    reaction: Option<(&'static str, bool)>,
+    reaction: Option<SharedString>,
     cx: &App,
 ) -> Option<BubbleReactions> {
     let has_action = is_goal_message || delivery != UserMessageDelivery::Prompt;
     let mut reactions = BubbleReactions::new();
-    // A receipt that stands alone is the common case. Trim the library's
+    // A reaction that stands alone is the common case. Trim the library's
     // decorative inset a little so it reads as a quiet mark, not a badge.
     if reaction.is_some() && !has_action {
         reactions = reactions.px(px(4.0)).py(px(1.0));
     }
     let mut has_mark = false;
-    if let Some((emoji, working)) = reaction {
-        let label = if working {
-            locale::text(
-                "AI is working on this message",
-                "AI 正在处理这条消息",
-                "AI 正在處理這則訊息",
-            )
-        } else {
-            locale::text(
-                "AI responded to this message",
-                "AI 已回应这条消息",
-                "AI 已回應這則訊息",
-            )
-        };
+    if let Some(emoji) = reaction {
         reactions = reactions.child(
             div()
                 .id(SharedString::from(format!(
@@ -103690,7 +103580,11 @@ fn render_user_message_edge_reactions(
                 // library's decorative padding, so it pays for its own inset.
                 .when(has_action, |this| this.px(px(4.0)))
                 .text_sm()
-                .aria_label(label)
+                .aria_label(locale::text(
+                    "AI reacted to this message",
+                    "AI 回应了这条消息",
+                    "AI 回應了這則訊息",
+                ))
                 .child(emoji),
         );
         has_mark = true;
@@ -124361,157 +124255,52 @@ mod tests {
     }
 
     #[test]
-    fn user_message_reaction_is_stable_and_covers_the_wheel() {
-        assert_eq!(
-            USER_MESSAGE_REACTIONS,
-            ["👀", "🤔", "👍", "💪", "❤️", "🫶", "🚀"]
-        );
-
-        let mut seen = BTreeSet::new();
-        for index in 0..256 {
-            let seed = format!("message-{index}");
-            let reaction = user_message_reaction(&seed);
-            // The same message in another pane, after an authoritative
-            // refresh, or after a restart keeps the expression it showed.
-            assert_eq!(reaction, user_message_reaction(&seed));
-            assert!(USER_MESSAGE_REACTIONS.contains(&reaction));
-            seen.insert(reaction);
-        }
-        assert_eq!(
-            seen.len(),
-            USER_MESSAGE_REACTIONS.len(),
-            "every friendly reaction should be reachable"
-        );
-    }
-
-    #[test]
-    fn user_message_reaction_waits_for_a_rendered_event() {
-        // A dispatched turn, even while the runtime is running, has nothing on
-        // screen yet: the receipt should not pre-empt the agent.
-        assert!(!user_message_reaction_has_event(false, false));
-        // The first rendered event (a thought, tool call, permission card, or
-        // answer) earns the receipt.
-        assert!(user_message_reaction_has_event(false, true));
-        // A failed turn never wears a receipt.
-        assert!(!user_message_reaction_has_event(true, true));
-
-        // A rendered turn keeps its receipt even after later messages arrive;
-        // an unrendered turn and edit mode do not show one.
-        assert!(user_message_reaction_visible(true, false));
-        assert!(!user_message_reaction_visible(false, false));
-        assert!(!user_message_reaction_visible(true, true));
-    }
-
-    #[test]
-    fn user_message_reaction_survives_the_optimistic_row() {
-        let image = message_attachment("paste", Some(0));
-        let seed = user_message_reaction_seed("look", std::slice::from_ref(&image));
-
-        // The seed is what the reader wrote, not the row or turn id that
-        // changes when the optimistic item is replaced by the authoritative one.
-        assert_eq!(seed, "look\u{1f}paste");
-        assert_eq!(user_message_reaction(&seed), user_message_reaction(&seed));
-
-        let edited = user_message_reaction_seed("look again", std::slice::from_ref(&image));
-        assert_ne!(seed, edited);
-    }
-
-    #[test]
-    fn user_message_reaction_respects_the_setting_and_feature_epoch() {
-        let since = Some(1_000);
-        // A message written at or after the feature boundary may wear one.
-        assert!(user_message_reaction_allowed(
-            true, since, 1_000, true, false
-        ));
-        assert!(user_message_reaction_allowed(
-            true, since, 1_001, true, false
-        ));
-        // Messages from before the feature never gain one retroactively.
-        assert!(!user_message_reaction_allowed(
-            true, since, 999, true, false
-        ));
-        // The preference turns every receipt off.
-        assert!(!user_message_reaction_allowed(
-            false, since, 1_001, true, false
-        ));
-        // A state that has not stamped the boundary has no receipts yet.
-        assert!(!user_message_reaction_allowed(
-            true, None, 1_001, true, false
-        ));
-        // The turn still has to start, and editing still wins.
-        assert!(!user_message_reaction_allowed(
-            true, since, 1_001, false, false
-        ));
-        assert!(!user_message_reaction_allowed(
-            true, since, 1_001, true, true
-        ));
-    }
-
-    #[test]
     fn message_reactions_are_on_by_default_and_the_setting_is_wired() {
         let state = DesktopUiStateV1::default();
         assert!(state.message_reactions.enabled);
-        assert!(state.message_reactions.since_ms.is_none());
 
         let source = include_str!("app.rs");
         assert!(source.contains("message-reactions-enabled"));
         assert!(source.contains("set_message_reactions_enabled"));
         assert!(source.contains("ui_state.message_reactions.enabled"));
-        assert!(source.contains("message_reactions.since_ms"));
     }
 
     #[test]
-    fn user_message_reaction_follows_the_rendered_event() {
-        let source = include_str!("app.rs");
-        let row = source
-            .split_once("    fn render_user_message_row(")
-            .and_then(|(_, tail)| tail.split_once("\n    fn render_agent_message_row("))
-            .map(|(body, _)| body)
-            .expect("user message row should remain inspectable");
+    fn user_message_reaction_comes_from_the_agent_notice() {
+        let target = "item_user".to_string();
+        let item_ids = vec![target.clone()];
+        let notice = |sequence: i64, emoji: &str, target: &str| TimelineItem {
+            id: TimelineItemId::new(),
+            session_id: VibexSessionId::new(),
+            sequence,
+            timestamp_ms: 0,
+            source: TimelineSource::System,
+            kind: vibex_core::TimelineItemKind::SystemNotice,
+            correlation_id: None,
+            provider_correlation_id: Some(format!(
+                "{VIBEX_USE_REACTION_CORRELATION_PREFIX}{target}"
+            )),
+            redaction_state: vibex_core::TimelineRedactionState::None,
+            execution_attribution: None,
+            payload_depth: Default::default(),
+            payload: TimelinePayload::SystemNotice(vibex_core::SystemNoticePayload {
+                level: vibex_core::SystemNoticeLevel::Info,
+                message: emoji.to_string(),
+            }),
+        };
 
-        assert!(row.contains("turn.started"));
-        assert!(row.contains("turn.working"));
-        assert!(row.contains("user_message_reaction_allowed("));
-        assert!(row.contains("user_message_reaction_seed("));
-        assert!(row.contains("user_message_reaction("));
-        assert!(!row.contains("rand::"));
-
-        let starter = source
-            .split_once("        let has_visible_event =")
-            .and_then(|(_, tail)| tail.split_once("\n        if let Some(user_row)"))
-            .map(|(body, _)| body)
-            .expect("rendered-event gate should remain inspectable");
-        assert!(starter.contains("turn.failed"));
-        assert!(starter.contains("turn.process_rows"));
-        assert!(starter.contains("turn.conclusion_row"));
-        assert!(starter.contains("turn.live_status"));
-        assert!(starter.contains("has_visible_event"));
-        assert!(
-            !starter.contains("session_working"),
-            "visibility waits for a rendered event, not for the session state"
+        // No notice, no reaction.
+        assert!(user_message_reaction_from_items(&item_ids, &[]).is_none());
+        // A notice for another message does not decorate this one.
+        let other = notice(10, "🔥", "item_other");
+        assert!(user_message_reaction_from_items(&item_ids, &[other]).is_none());
+        // The newest notice for this message wins, so the Agent can change it.
+        let first = notice(11, "❤️", &target);
+        let second = notice(12, "🫶", &target);
+        assert_eq!(
+            user_message_reaction_from_items(&item_ids, &[first, second]).as_deref(),
+            Some("🫶")
         );
-        assert!(
-            source.contains("AgentSessionState::Running | AgentSessionState::NeedsInput"),
-            "the receipt's label still uses the running state"
-        );
-
-        let reactions = source
-            .split_once("fn render_user_message_edge_reactions(")
-            .and_then(|(_, tail)| tail.split_once("\n/// The strip an edge-anchored reaction"))
-            .map(|(body, _)| body)
-            .expect("edge reaction region should remain inspectable");
-
-        assert!(reactions.contains("reaction"));
-        assert!(reactions.contains("BubbleReactions::new()"));
-        // The receipt is a child of the pill, not an action button.
-        assert!(reactions.contains(".child(emoji)"));
-        // The receipt is a quiet mark: one type step down and a tighter inset
-        // than the first version, which read as a badge.
-        assert!(reactions.contains(".text_sm()"));
-        assert!(!reactions.contains(".text_base()"));
-        assert!(reactions.contains("px(px(4.0))"));
-        assert!(reactions.contains("AI is working on this message"));
-        assert!(reactions.contains("AI responded to this message"));
     }
 
     #[test]

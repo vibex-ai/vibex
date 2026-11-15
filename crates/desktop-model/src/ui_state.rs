@@ -1842,27 +1842,13 @@ const fn default_auto_update_enabled() -> bool {
 pub struct MessageReactionsUiState {
     #[serde(default = "default_message_reactions_enabled")]
     pub enabled: bool,
-    /// When this installation first showed message reactions.
-    ///
-    /// Messages written before the feature existed must not gain a reaction
-    /// retroactively. The desktop sets this once, on the first load of a state
-    /// file that predates it, and keeps it across restarts.
-    #[serde(default)]
-    pub since_ms: Option<i64>,
 }
 
 impl Default for MessageReactionsUiState {
     fn default() -> Self {
         Self {
             enabled: default_message_reactions_enabled(),
-            since_ms: None,
         }
-    }
-}
-
-impl MessageReactionsUiState {
-    fn normalize(&mut self) {
-        self.since_ms = self.since_ms.filter(|since_ms| *since_ms > 0);
     }
 }
 
@@ -2020,7 +2006,6 @@ impl DesktopUiStateV1 {
             .ok_or(UiStateError::Validation("source app version is empty"))?;
         self.computer.normalize();
         self.arena.normalize();
-        self.message_reactions.normalize();
         self.appearance.window_scale_percent = self.appearance.window_scale_percent.clamp(75, 200);
         self.appearance.interface_font.normalize(12);
         self.appearance.code_font.normalize(10);
@@ -2976,18 +2961,16 @@ mod tests {
         let state: MessageReactionsUiState =
             serde_json::from_str("{}").expect("an older state has no reaction section");
         assert!(state.enabled);
-        assert!(state.since_ms.is_none());
 
         let state: MessageReactionsUiState =
             serde_json::from_str(r#"{"enabled":false}"#).expect("an explicit off survives");
         assert!(!state.enabled);
 
-        let mut state = MessageReactionsUiState {
-            enabled: true,
-            since_ms: Some(0),
-        };
-        state.normalize();
-        assert!(state.since_ms.is_none(), "zero is not a feature epoch");
+        // The retired feature-epoch field must not make an older file fail.
+        let state: MessageReactionsUiState =
+            serde_json::from_str(r#"{"enabled":true,"sinceMs":123}"#)
+                .expect("an older epoch is ignored");
+        assert!(state.enabled);
     }
 
     #[test]
