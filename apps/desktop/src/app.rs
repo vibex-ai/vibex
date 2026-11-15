@@ -7528,8 +7528,8 @@ struct UserMessageTurnState {
     latest: bool,
     /// The turn has settled.
     complete: bool,
-    /// The agent took the message: the session is working, the turn has output,
-    /// or the turn has settled.
+    /// The agent has rendered an event for the turn: a thought, a tool call, a
+    /// permission card, or the answer.
     started: bool,
     /// The agent is working on the turn right now, as opposed to having
     /// responded and then stopped.
@@ -66042,10 +66042,10 @@ impl VibexWorkbench {
             .when(!is_first, |this| this.pt_5())
             .pb_5();
 
-        // The receipt waits for evidence that the agent took the message, not
-        // merely that the client sent it. Only the conversation's last turn can
-        // be the one a running session is working on; an older turn proves it
-        // started from its own output or its settled state.
+        // The receipt waits for an event the agent actually rendered — a
+        // thought, a tool call, a permission card, or the answer — not merely
+        // for the send. The running session only decides whether that receipt
+        // still describes work in progress or a reply that has settled.
         let session_working = is_last
             && self
                 .timeline
@@ -66058,13 +66058,10 @@ impl VibexWorkbench {
                         AgentSessionState::Running | AgentSessionState::NeedsInput
                     )
                 });
-        let turn_started = user_message_turn_started(
-            turn.failed,
-            turn.complete,
-            !turn.process_rows.is_empty(),
-            turn.conclusion_row.is_some(),
-            session_working,
-        );
+        let has_visible_event = !turn.process_rows.is_empty()
+            || turn.conclusion_row.is_some()
+            || turn.live_status.is_some();
+        let turn_has_event = user_message_reaction_has_event(turn.failed, has_visible_event);
 
         if let Some(user_row) = turn.user_row.as_ref() {
             let user_message = self.render_user_message_row(
@@ -66073,7 +66070,7 @@ impl VibexWorkbench {
                 UserMessageTurnState {
                     latest: is_last,
                     complete: turn.complete,
-                    started: turn_started,
+                    started: turn_has_event,
                     working: !turn.complete && session_working,
                 },
                 window,
@@ -103624,35 +103621,27 @@ fn user_message_reaction_visible(turn_started: bool, editing: bool) -> bool {
 ///
 /// The preference can switch every receipt off, and the stored epoch keeps
 /// messages written before the feature from gaining one retroactively. Inside
-/// that window the receipt still waits for its turn to start and yields to the
-/// inline editor.
+/// that window the receipt still waits for the agent's first rendered event and
+/// yields to the inline editor.
 fn user_message_reaction_allowed(
     enabled: bool,
     since_ms: Option<i64>,
     message_timestamp_ms: i64,
-    turn_started: bool,
+    turn_has_event: bool,
     editing: bool,
 ) -> bool {
     enabled
         && since_ms.is_some_and(|since_ms| message_timestamp_ms >= since_ms)
-        && user_message_reaction_visible(turn_started, editing)
+        && user_message_reaction_visible(turn_has_event, editing)
 }
 
-/// Whether a turn has started the work its receipt acknowledges.
+/// Whether the agent has put an event on screen for the turn.
 ///
-/// A dispatched turn is not yet a started one: the runtime may still be idle,
-/// and the receipt would then claim work that has not begun. A running (or
-/// waiting-for-input) session, the turn's first output, or a settled turn all
-/// prove the agent took the message. A failed turn proves nothing, so it wears
-/// no receipt.
-fn user_message_turn_started(
-    failed: bool,
-    complete: bool,
-    has_process_output: bool,
-    has_conclusion: bool,
-    session_working: bool,
-) -> bool {
-    !failed && (complete || has_process_output || has_conclusion || session_working)
+/// A dispatched turn is not enough, and neither is a running session: the
+/// receipt follows something the agent actually rendered — a thought, a tool
+/// call, a permission card, or the answer. A failed turn earns none.
+fn user_message_reaction_has_event(failed: bool, has_visible_event: bool) -> bool {
+    !failed && has_visible_event
 }
 
 /// The bubble's lower-edge reaction region, holding every mark the row earned.
@@ -124396,23 +124385,18 @@ mod tests {
     }
 
     #[test]
-    fn user_message_reaction_appears_only_after_the_turn_starts() {
-        // Sending is not starting: a dispatched turn with an idle runtime and
-        // no output has nothing to acknowledge yet.
-        assert!(!user_message_turn_started(
-            false, false, false, false, false
-        ));
-        // A running runtime, the first output, or a settled turn all prove the
-        // agent took the message.
-        assert!(user_message_turn_started(false, false, false, false, true));
-        assert!(user_message_turn_started(false, false, true, false, false));
-        assert!(user_message_turn_started(false, false, false, true, false));
-        assert!(user_message_turn_started(false, true, false, false, false));
+    fn user_message_reaction_waits_for_a_rendered_event() {
+        // A dispatched turn, even while the runtime is running, has nothing on
+        // screen yet: the receipt should not pre-empt the agent.
+        assert!(!user_message_reaction_has_event(false, false));
+        // The first rendered event (a thought, tool call, permission card, or
+        // answer) earns the receipt.
+        assert!(user_message_reaction_has_event(false, true));
         // A failed turn never wears a receipt.
-        assert!(!user_message_turn_started(true, true, true, true, true));
+        assert!(!user_message_reaction_has_event(true, true));
 
-        // A started turn keeps its receipt even after later messages arrive;
-        // an unstarted turn and edit mode do not show one.
+        // A rendered turn keeps its receipt even after later messages arrive;
+        // an unrendered turn and edit mode do not show one.
         assert!(user_message_reaction_visible(true, false));
         assert!(!user_message_reaction_visible(false, false));
         assert!(!user_message_reaction_visible(true, true));
@@ -124477,7 +124461,7 @@ mod tests {
     }
 
     #[test]
-    fn user_message_reaction_rides_the_turn_not_the_send() {
+    fn user_message_reaction_follows_the_rendered_event() {
         let source = include_str!("app.rs");
         let row = source
             .split_once("    fn render_user_message_row(")
@@ -124493,18 +124477,22 @@ mod tests {
         assert!(!row.contains("rand::"));
 
         let starter = source
-            .split_once("        let turn_started = user_message_turn_started(")
+            .split_once("        let has_visible_event =")
             .and_then(|(_, tail)| tail.split_once("\n        if let Some(user_row)"))
             .map(|(body, _)| body)
-            .expect("turn start gate should remain inspectable");
+            .expect("rendered-event gate should remain inspectable");
         assert!(starter.contains("turn.failed"));
-        assert!(starter.contains("turn.complete"));
         assert!(starter.contains("turn.process_rows"));
         assert!(starter.contains("turn.conclusion_row"));
-        assert!(starter.contains("session_working"));
+        assert!(starter.contains("turn.live_status"));
+        assert!(starter.contains("has_visible_event"));
+        assert!(
+            !starter.contains("session_working"),
+            "visibility waits for a rendered event, not for the session state"
+        );
         assert!(
             source.contains("AgentSessionState::Running | AgentSessionState::NeedsInput"),
-            "a running or input-waiting agent counts as started"
+            "the receipt's label still uses the running state"
         );
 
         let reactions = source
