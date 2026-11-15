@@ -14972,6 +14972,13 @@ impl VibexWorkbench {
             eprintln!("vibex-fonts: {error}");
         }
         self.ui_state = state;
+        // The reaction feature begins at this build's first load. Stamp that
+        // boundary once so messages written before it never gain a receipt
+        // retroactively; later loads keep the original stamp.
+        if self.ui_state.message_reactions.since_ms.is_none() {
+            self.ui_state.message_reactions.since_ms = Some(unix_timestamp_ms());
+            self.queue_ui_state();
+        }
         // The window is only known once the saved state is in memory, and the
         // overview load that applies it can already have finished — a remote
         // authority boots before this file is read. Re-arm the launch pass so
@@ -71101,9 +71108,17 @@ impl VibexWorkbench {
         };
         // The receipt is chosen from what the reader wrote, not from the row
         // or turn id, so replacing the optimistic item cannot change it
-        // mid-work. It appears once the turn has started and stays after the
-        // turn settles; `complete` only changes what the label says.
-        let reaction = user_message_reaction_visible(turn.started, editing).then(|| {
+        // mid-work. It belongs to messages written after the feature was
+        // introduced, waits for the turn to start, and stays after the turn
+        // settles; `complete` only changes what the label says.
+        let reaction = user_message_reaction_allowed(
+            self.ui_state.message_reactions.enabled,
+            self.ui_state.message_reactions.since_ms,
+            row.timestamp_ms,
+            turn.started,
+            editing,
+        )
+        .then(|| {
             (
                 user_message_reaction(&user_message_reaction_seed(&row.body, &attachments)),
                 turn.working,
@@ -88638,6 +88653,16 @@ fn settings_search_candidates(strings: &'static Strings) -> Vec<SettingsSearchCa
         ),
         settings_search_candidate(
             SettingsSection::General,
+            locale::text("Message reactions", "消息 Reaction", "訊息 Reaction"),
+            locale::text(
+                "Show a friendly emoji on your message while the Agent works, and keep it after the reply.",
+                "Agent 处理消息时在气泡上显示一个友好的表情，并在回复后保留。",
+                "Agent 處理訊息時在氣泡上顯示一個友好的表情，並在回覆後保留。",
+            ),
+            &["reaction", "emoji", "表情", "回应", "回應"],
+        ),
+        settings_search_candidate(
+            SettingsSection::General,
             locale::text("System notifications", "系统通知", "系統通知"),
             locale::text(
                 "Show desktop notifications for Agent activity.",
@@ -92876,6 +92901,23 @@ impl FoundationSettings {
         cx.notify();
     }
 
+    /// Turn the emoji receipt on or off for every conversation.
+    ///
+    /// Turning it on again keeps the original feature epoch, so messages from
+    /// before the feature stay without a receipt; only messages sent after it
+    /// can show one.
+    fn set_message_reactions_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        let _ = self.workbench.update(cx, |this, cx| {
+            this.ui_state.message_reactions.enabled = enabled;
+            if enabled && this.ui_state.message_reactions.since_ms.is_none() {
+                this.ui_state.message_reactions.since_ms = Some(unix_timestamp_ms());
+            }
+            this.queue_ui_state();
+            cx.notify();
+        });
+        cx.notify();
+    }
+
     fn set_notifications_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
         let _ = self.workbench.update(cx, |this, cx| {
             this.ui_state.desktop_behavior.notifications_enabled = enabled;
@@ -93569,6 +93611,10 @@ impl FoundationSettings {
             Some(strings.system_default),
             cx,
         );
+        let message_reactions_enabled = self
+            .workbench
+            .read_with(cx, |this, _| this.ui_state.message_reactions.enabled)
+            .unwrap_or(true);
         // Closing the window either leaves the Agent running in the system
         // tray or ends the application, so the row offers both outcomes by name
         // instead of asking the reader to interpret a switch's polarity.
@@ -93692,6 +93738,13 @@ impl FoundationSettings {
             .small()
             .checked(desktop_behavior.launch_at_login)
             .on_click(cx.listener(|this, enabled, _, cx| this.set_launch_at_login(*enabled, cx)));
+        let message_reactions =
+            Switch::new("message-reactions-enabled")
+                .small()
+                .checked(message_reactions_enabled)
+                .on_click(cx.listener(|this, enabled, _, cx| {
+                    this.set_message_reactions_enabled(*enabled, cx)
+                }));
         let notifications = Switch::new("notifications-enabled")
             .small()
             .checked(desktop_behavior.notifications_enabled)
@@ -93748,6 +93801,17 @@ impl FoundationSettings {
                                 "登入系統時啟動 Vibex。",
                             ),
                             launch_at_login,
+                            stacked,
+                            cx,
+                        ),
+                        setting_row(
+                            locale::text("Message reactions", "消息 Reaction", "訊息 Reaction"),
+                            locale::text(
+                                "Show a friendly emoji on your message while the Agent works, and keep it after the reply.",
+                                "Agent 处理消息时在气泡上显示一个友好的表情，并在回复后保留。",
+                                "Agent 處理訊息時在氣泡上顯示一個友好的表情，並在回覆後保留。",
+                            ),
+                            message_reactions,
                             stacked,
                             cx,
                         ),
@@ -103556,6 +103620,24 @@ fn user_message_reaction_visible(turn_started: bool, editing: bool) -> bool {
     !editing && turn_started
 }
 
+/// Whether a user message may wear its receipt at all.
+///
+/// The preference can switch every receipt off, and the stored epoch keeps
+/// messages written before the feature from gaining one retroactively. Inside
+/// that window the receipt still waits for its turn to start and yields to the
+/// inline editor.
+fn user_message_reaction_allowed(
+    enabled: bool,
+    since_ms: Option<i64>,
+    message_timestamp_ms: i64,
+    turn_started: bool,
+    editing: bool,
+) -> bool {
+    enabled
+        && since_ms.is_some_and(|since_ms| message_timestamp_ms >= since_ms)
+        && user_message_reaction_visible(turn_started, editing)
+}
+
 /// Whether a turn has started the work its receipt acknowledges.
 ///
 /// A dispatched turn is not yet a started one: the runtime may still be idle,
@@ -103586,9 +103668,14 @@ fn render_user_message_edge_reactions(
     reaction: Option<(&'static str, bool)>,
     cx: &App,
 ) -> Option<BubbleReactions> {
-    let mut reactions = BubbleReactions::new();
-    let mut has_mark = false;
     let has_action = is_goal_message || delivery != UserMessageDelivery::Prompt;
+    let mut reactions = BubbleReactions::new();
+    // A receipt that stands alone is the common case. Trim the library's
+    // decorative inset a little so it reads as a quiet mark, not a badge.
+    if reaction.is_some() && !has_action {
+        reactions = reactions.px(px(4.0)).py(px(1.0));
+    }
+    let mut has_mark = false;
     if let Some((emoji, working)) = reaction {
         let label = if working {
             locale::text(
@@ -103612,8 +103699,8 @@ fn render_user_message_edge_reactions(
                 .items_center()
                 // A reaction that shares the pill with an action loses the
                 // library's decorative padding, so it pays for its own inset.
-                .when(has_action, |this| this.px(px(6.0)))
-                .text_base()
+                .when(has_action, |this| this.px(px(4.0)))
+                .text_sm()
                 .aria_label(label)
                 .child(emoji),
         );
@@ -124346,6 +124433,50 @@ mod tests {
     }
 
     #[test]
+    fn user_message_reaction_respects_the_setting_and_feature_epoch() {
+        let since = Some(1_000);
+        // A message written at or after the feature boundary may wear one.
+        assert!(user_message_reaction_allowed(
+            true, since, 1_000, true, false
+        ));
+        assert!(user_message_reaction_allowed(
+            true, since, 1_001, true, false
+        ));
+        // Messages from before the feature never gain one retroactively.
+        assert!(!user_message_reaction_allowed(
+            true, since, 999, true, false
+        ));
+        // The preference turns every receipt off.
+        assert!(!user_message_reaction_allowed(
+            false, since, 1_001, true, false
+        ));
+        // A state that has not stamped the boundary has no receipts yet.
+        assert!(!user_message_reaction_allowed(
+            true, None, 1_001, true, false
+        ));
+        // The turn still has to start, and editing still wins.
+        assert!(!user_message_reaction_allowed(
+            true, since, 1_001, false, false
+        ));
+        assert!(!user_message_reaction_allowed(
+            true, since, 1_001, true, true
+        ));
+    }
+
+    #[test]
+    fn message_reactions_are_on_by_default_and_the_setting_is_wired() {
+        let state = DesktopUiStateV1::default();
+        assert!(state.message_reactions.enabled);
+        assert!(state.message_reactions.since_ms.is_none());
+
+        let source = include_str!("app.rs");
+        assert!(source.contains("message-reactions-enabled"));
+        assert!(source.contains("set_message_reactions_enabled"));
+        assert!(source.contains("ui_state.message_reactions.enabled"));
+        assert!(source.contains("message_reactions.since_ms"));
+    }
+
+    #[test]
     fn user_message_reaction_rides_the_turn_not_the_send() {
         let source = include_str!("app.rs");
         let row = source
@@ -124356,7 +124487,7 @@ mod tests {
 
         assert!(row.contains("turn.started"));
         assert!(row.contains("turn.working"));
-        assert!(row.contains("user_message_reaction_visible("));
+        assert!(row.contains("user_message_reaction_allowed("));
         assert!(row.contains("user_message_reaction_seed("));
         assert!(row.contains("user_message_reaction("));
         assert!(!row.contains("rand::"));
@@ -124386,6 +124517,11 @@ mod tests {
         assert!(reactions.contains("BubbleReactions::new()"));
         // The receipt is a child of the pill, not an action button.
         assert!(reactions.contains(".child(emoji)"));
+        // The receipt is a quiet mark: one type step down and a tighter inset
+        // than the first version, which read as a badge.
+        assert!(reactions.contains(".text_sm()"));
+        assert!(!reactions.contains(".text_base()"));
+        assert!(reactions.contains("px(px(4.0))"));
         assert!(reactions.contains("AI is working on this message"));
         assert!(reactions.contains("AI responded to this message"));
     }

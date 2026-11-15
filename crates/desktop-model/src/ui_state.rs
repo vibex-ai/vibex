@@ -1833,6 +1833,43 @@ const fn default_auto_update_enabled() -> bool {
     true
 }
 
+/// User-message reaction preferences.
+///
+/// The receipt is decoration, not a durable part of the transcript, so the
+/// switch can turn every reaction off without touching a session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessageReactionsUiState {
+    #[serde(default = "default_message_reactions_enabled")]
+    pub enabled: bool,
+    /// When this installation first showed message reactions.
+    ///
+    /// Messages written before the feature existed must not gain a reaction
+    /// retroactively. The desktop sets this once, on the first load of a state
+    /// file that predates it, and keeps it across restarts.
+    #[serde(default)]
+    pub since_ms: Option<i64>,
+}
+
+impl Default for MessageReactionsUiState {
+    fn default() -> Self {
+        Self {
+            enabled: default_message_reactions_enabled(),
+            since_ms: None,
+        }
+    }
+}
+
+impl MessageReactionsUiState {
+    fn normalize(&mut self) {
+        self.since_ms = self.since_ms.filter(|since_ms| *since_ms > 0);
+    }
+}
+
+const fn default_message_reactions_enabled() -> bool {
+    true
+}
+
 /// Developer-only diagnostics preferences.
 ///
 /// Kept apart from [`DesktopBehaviorUiState`], which holds user-facing product
@@ -1914,6 +1951,8 @@ pub struct DesktopUiStateV1 {
     #[serde(default)]
     pub desktop_behavior: DesktopBehaviorUiState,
     #[serde(default)]
+    pub message_reactions: MessageReactionsUiState,
+    #[serde(default)]
     pub developer: DeveloperUiState,
     #[serde(default)]
     pub keyboard: KeyboardUiState,
@@ -1954,6 +1993,7 @@ impl Default for DesktopUiStateV1 {
             right_rail: RightRailUiState::default(),
             session: SessionUiState::default(),
             desktop_behavior: DesktopBehaviorUiState::default(),
+            message_reactions: MessageReactionsUiState::default(),
             developer: DeveloperUiState::default(),
             keyboard: KeyboardUiState::default(),
             composer: ComposerUiState::default(),
@@ -1980,6 +2020,7 @@ impl DesktopUiStateV1 {
             .ok_or(UiStateError::Validation("source app version is empty"))?;
         self.computer.normalize();
         self.arena.normalize();
+        self.message_reactions.normalize();
         self.appearance.window_scale_percent = self.appearance.window_scale_percent.clamp(75, 200);
         self.appearance.interface_font.normalize(12);
         self.appearance.code_font.normalize(10);
@@ -2929,6 +2970,25 @@ mod tests {
     use super::*;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn message_reactions_default_on_and_decode_from_an_older_state() {
+        let state: MessageReactionsUiState =
+            serde_json::from_str("{}").expect("an older state has no reaction section");
+        assert!(state.enabled);
+        assert!(state.since_ms.is_none());
+
+        let state: MessageReactionsUiState =
+            serde_json::from_str(r#"{"enabled":false}"#).expect("an explicit off survives");
+        assert!(!state.enabled);
+
+        let mut state = MessageReactionsUiState {
+            enabled: true,
+            since_ms: Some(0),
+        };
+        state.normalize();
+        assert!(state.since_ms.is_none(), "zero is not a feature epoch");
+    }
 
     #[test]
     fn runtime_model_favorites_are_scoped_to_the_agent_source_and_model() {
