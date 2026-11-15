@@ -227,12 +227,10 @@ impl SidebarOrganizationState {
                     return false;
                 };
                 match &placement.item {
-                    SidebarOrganizationItem::Folder(folder_id) => {
-                        self.folders.get(folder_id).is_some_and(|folder| {
-                            folder.project_id == parent.project_id
-                                && folder.workspace_id == parent.workspace_id
-                        })
-                    }
+                    SidebarOrganizationItem::Folder(folder_id) => self
+                        .folders
+                        .get(folder_id)
+                        .is_some_and(|folder| folder.project_id == parent.project_id),
                     SidebarOrganizationItem::Project(_) => parent.project_id.is_none(),
                     SidebarOrganizationItem::Session(session_id) => session_projects
                         .get(session_id)
@@ -1935,7 +1933,9 @@ impl SidebarOrganizationState {
                     .is_some_and(|parent_scope| match &placement.item {
                         SidebarOrganizationItem::Folder(folder_id) => {
                             folder_id != parent_id
-                                && folder_scopes.get(folder_id) == Some(parent_scope)
+                                && folder_scopes
+                                    .get(folder_id)
+                                    .is_some_and(|scope| scope.0 == parent_scope.0)
                         }
                         SidebarOrganizationItem::Project(_) => {
                             parent_scope.0.is_none() && parent_scope.1.is_none()
@@ -2250,6 +2250,110 @@ mod tests {
             Some("workspace-a".into()),
             Some("parent".into()),
         ));
+    }
+
+    #[test]
+    fn folder_moves_can_cross_workspace_scopes() {
+        let mut state = SidebarOrganizationState::default();
+        assert!(state.create_folder_with_workspace(
+            "worktree-a",
+            "Worktree A",
+            Some("project-a".into()),
+            Some("workspace-a".into()),
+            None,
+        ));
+        assert!(state.create_folder_with_workspace(
+            "host-a",
+            "Host A",
+            Some("project-a".into()),
+            Some("workspace-a".into()),
+            None,
+        ));
+        assert!(state.create_folder_with_workspace(
+            "worktree-b",
+            "Worktree B",
+            Some("project-a".into()),
+            Some("workspace-b".into()),
+            None,
+        ));
+        assert!(state.create_folder_with_workspace(
+            "child-b",
+            "Child B",
+            Some("project-a".into()),
+            Some("workspace-b".into()),
+            Some("worktree-b".into()),
+        ));
+        assert!(state.create_folder(
+            "project-folder",
+            "Project Folder",
+            Some("project-a".into()),
+            None,
+        ));
+        let sessions = BTreeMap::new();
+        let moving = SidebarOrganizationItem::Folder("worktree-a".into());
+
+        // Compact mode keeps every project folder in one tree, so a folder may
+        // be filed under a folder from another Worktree.
+        assert!(state.can_move_into(&moving, "worktree-b", &sessions));
+        assert!(state.move_into(&moving, "worktree-b", &sessions));
+        assert_eq!(state.parent_of(&moving).as_deref(), Some("worktree-b"));
+
+        // A project-level folder can be filed under a Worktree folder too.
+        let project_folder = SidebarOrganizationItem::Folder("project-folder".into());
+        assert!(state.can_move_relative(
+            &project_folder,
+            &SidebarOrganizationItem::Folder("child-b".into()),
+            &sessions,
+        ));
+        assert!(state.move_relative(
+            &project_folder,
+            &SidebarOrganizationItem::Folder("child-b".into()),
+            false,
+            &sessions,
+        ));
+        assert_eq!(
+            state.parent_of(&project_folder).as_deref(),
+            Some("worktree-b")
+        );
+
+        // The next reconcile must not detach a cross-scope nesting; detailed
+        // mode flattens it for display instead of rewriting the arrangement.
+        state.reconcile(&["project-a".into()], &[]);
+        assert_eq!(state.parent_of(&moving).as_deref(), Some("worktree-b"));
+        assert_eq!(
+            state.parent_of(&project_folder).as_deref(),
+            Some("worktree-b")
+        );
+
+        // Moving back inside one Worktree still works.
+        assert!(state.can_move_into(&moving, "host-a", &sessions));
+        assert!(state.move_into(&moving, "host-a", &sessions));
+        assert_eq!(state.parent_of(&moving).as_deref(), Some("host-a"));
+    }
+
+    #[test]
+    fn a_folder_move_inside_one_workspace_survives_reconcile() {
+        let mut state = SidebarOrganizationState::default();
+        assert!(state.create_folder_with_workspace(
+            "parent",
+            "Parent",
+            Some("project-a".into()),
+            Some("workspace-a".into()),
+            None,
+        ));
+        assert!(state.create_folder_with_workspace(
+            "child",
+            "Child",
+            Some("project-a".into()),
+            Some("workspace-a".into()),
+            None,
+        ));
+        let child = SidebarOrganizationItem::Folder("child".into());
+        assert!(state.move_into(&child, "parent", &BTreeMap::new()));
+
+        state.reconcile(&["project-a".into()], &[]);
+
+        assert_eq!(state.parent_of(&child).as_deref(), Some("parent"));
     }
 
     #[test]

@@ -1886,7 +1886,16 @@ pub fn sidebar_project_items_for_workspace_with_sort(
             .iter()
             .map(|id| SidebarOrganizationItem::Group(id.clone())),
     );
-    let ordered = organization.ordered_children(parent_folder_id, &available);
+    let ordered = if parent_folder_id.is_none() {
+        // Compact mode offers every folder in the project, so this reproduces
+        // the stored tree. Detailed mode offers one Worktree at a time: a
+        // folder filed under a parent this projection cannot show is lifted to
+        // its own root instead of disappearing. The arrangement stays intact
+        // for compact mode and is flattened only for this projection.
+        ordered_scope_root_children(organization, &available)
+    } else {
+        organization.ordered_children(parent_folder_id, &available)
+    };
     // A field sort is a view over the same tree: sessions keep the slots their
     // placements gave them, but the sessions filling those slots follow the
     // reader's order. Rebuilding the placements instead would turn a glance at
@@ -1903,6 +1912,56 @@ pub fn sidebar_project_items_for_workspace_with_sort(
         _ => false,
     });
     pinned.into_iter().chain(rest).collect()
+}
+
+/// Orders a projection's root rows, lifting items whose folder parent is not
+/// part of this projection.
+///
+/// Compact mode puts every project folder in the same tree, so this is the
+/// ordinary root order. Detailed mode projects one Worktree at a time: a
+/// cross-Worktree parent is not in `available`, and leaving the child under it
+/// would hide both the folder and its sessions from every column. Such an item
+/// renders at its own root, while compact mode still shows the stored nesting.
+fn ordered_scope_root_children(
+    organization: &SidebarOrganizationState,
+    available: &[SidebarOrganizationItem],
+) -> Vec<SidebarOrganizationItem> {
+    let available_set = available.iter().cloned().collect::<BTreeSet<_>>();
+    let scoped_folder_ids = available
+        .iter()
+        .filter_map(|item| match item {
+            SidebarOrganizationItem::Folder(id) => Some(id.clone()),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    let mut seen = BTreeSet::new();
+    let mut ordered = organization
+        .placements
+        .iter()
+        .filter(|placement| {
+            available_set.contains(&placement.item)
+                && placement
+                    .parent_folder_id
+                    .as_deref()
+                    .is_none_or(|parent| !scoped_folder_ids.contains(parent))
+        })
+        .filter_map(|placement| {
+            seen.insert(placement.item.clone())
+                .then_some(placement.item.clone())
+        })
+        .collect::<Vec<_>>();
+    let placed = organization
+        .placements
+        .iter()
+        .map(|placement| placement.item.clone())
+        .collect::<BTreeSet<_>>();
+    ordered.extend(
+        available
+            .iter()
+            .filter(|item| !placed.contains(*item) && seen.insert((*item).clone()))
+            .cloned(),
+    );
+    ordered
 }
 
 /// Fills the session slots of `items` with `session_order`.
@@ -2387,6 +2446,122 @@ mod tests {
         assert!(compact.contains(&SidebarOrganizationItem::Folder("folder-a".into())));
         assert!(compact.contains(&SidebarOrganizationItem::Folder("folder-b".into())));
         assert!(compact.contains(&SidebarOrganizationItem::Folder("folder-legacy".into())));
+    }
+
+    #[test]
+    fn cross_worktree_folder_nesting_flattens_only_in_the_detailed_projection() {
+        let mut view = SidebarOrganizationView::default();
+        assert!(view.organization.create_folder_with_workspace(
+            "folder-a",
+            "A",
+            Some("project-1".into()),
+            Some("workspace-a".into()),
+            None,
+        ));
+        assert!(view.organization.create_folder_with_workspace(
+            "folder-b",
+            "B",
+            Some("project-1".into()),
+            Some("workspace-b".into()),
+            None,
+        ));
+        let folder_a = SidebarOrganizationItem::Folder("folder-a".into());
+        let folder_b = SidebarOrganizationItem::Folder("folder-b".into());
+        assert!(
+            view.organization
+                .move_into(&folder_a, "folder-b", &BTreeMap::new())
+        );
+        let session_projects = BTreeMap::from([("session-a".to_string(), "project-1".to_string())]);
+        assert!(view.organization.place_into_folder(
+            &SidebarOrganizationItem::Session("session-a".into()),
+            "folder-a",
+            &session_projects,
+        ));
+
+        let compact_root = sidebar_project_items(
+            &view.organization,
+            "project-1",
+            &["session-a".to_string()],
+            &BTreeSet::new(),
+            None,
+        );
+        assert!(compact_root.contains(&folder_b));
+        assert!(!compact_root.contains(&folder_a));
+        let compact_inside_b = sidebar_project_items(
+            &view.organization,
+            "project-1",
+            &["session-a".to_string()],
+            &BTreeSet::new(),
+            Some("folder-b"),
+        );
+        assert_eq!(compact_inside_b.as_slice(), std::slice::from_ref(&folder_a));
+        assert_eq!(
+            sidebar_project_items(
+                &view.organization,
+                "project-1",
+                &["session-a".to_string()],
+                &BTreeSet::new(),
+                Some("folder-a"),
+            ),
+            [SidebarOrganizationItem::Session("session-a".into())]
+        );
+
+        // Workspace B's detailed column cannot show the folder owned by
+        // workspace A, and must not lose it from workspace A's column either.
+        let workspace_b_root = sidebar_project_items_for_workspace(
+            &view.organization,
+            "project-1",
+            Some("workspace-b"),
+            false,
+            false,
+            &["session-b".to_string()],
+            &[],
+            &BTreeSet::new(),
+            None,
+        );
+        assert!(workspace_b_root.contains(&folder_b));
+        assert!(!workspace_b_root.contains(&folder_a));
+        assert!(
+            !sidebar_project_items_for_workspace(
+                &view.organization,
+                "project-1",
+                Some("workspace-b"),
+                false,
+                false,
+                &["session-b".to_string()],
+                &[],
+                &BTreeSet::new(),
+                Some("folder-b"),
+            )
+            .contains(&folder_a)
+        );
+
+        let workspace_a_root = sidebar_project_items_for_workspace(
+            &view.organization,
+            "project-1",
+            Some("workspace-a"),
+            false,
+            false,
+            &["session-a".to_string()],
+            &[],
+            &BTreeSet::new(),
+            None,
+        );
+        assert_eq!(workspace_a_root.as_slice(), std::slice::from_ref(&folder_a));
+        assert_eq!(
+            sidebar_project_items_for_workspace(
+                &view.organization,
+                "project-1",
+                Some("workspace-a"),
+                false,
+                false,
+                &["session-a".to_string()],
+                &[],
+                &BTreeSet::new(),
+                Some("folder-a"),
+            ),
+            [SidebarOrganizationItem::Session("session-a".into())]
+        );
     }
 
     /// A client can set a folder's archive window, and the window is the
