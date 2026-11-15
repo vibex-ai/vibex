@@ -4671,8 +4671,13 @@ impl AgentManager {
         // input only: the user timeline item above was written from
         // `request.text`, so the transcript, the auto title and search all keep
         // exactly what the user wrote.
-        let prompt_context =
-            compose_prompt_context(team_context.as_deref(), request.prompt_context.as_deref());
+        let reaction_context = (request.provenance == vibex_core::MessageProvenance::HumanInput)
+            .then_some(VIBEX_USE_REACTION_PROMPT);
+        let prompt_context = compose_prompt_context(
+            reaction_context,
+            team_context.as_deref(),
+            request.prompt_context.as_deref(),
+        );
         let provider_turn_text = match prompt_context.as_deref() {
             Some(context) if !context.trim().is_empty() => {
                 format!("{context}\n\n{provider_turn_text}")
@@ -8100,16 +8105,33 @@ fn team_awareness_prompt(session_id: &VibexSessionId, tasks: &[AgentDelegation])
     Some(bounded_text(&text, MAX_TEAM_AWARENESS_CHARS))
 }
 
-/// Puts the team block ahead of the context the caller already composed.
-fn compose_prompt_context(team: Option<&str>, requested: Option<&str>) -> Option<String> {
-    let team = team.filter(|value| !value.trim().is_empty());
-    let requested = requested.filter(|value| !value.trim().is_empty());
-    match (team, requested) {
-        (Some(team), Some(requested)) => Some(format!("{team}\n\n{requested}")),
-        (Some(team), None) => Some(team.to_string()),
-        (None, Some(requested)) => Some(requested.to_string()),
-        (None, None) => None,
+/// The reaction nudge that opens every human turn.
+///
+/// The tool is optional, and a decoration loses to the answer unless the model
+/// is told it is welcome. The wording deliberately covers more than greetings:
+/// a terse bug report or an instruction is exactly when a receipt makes the
+/// exchange feel responsive. The model still decides; a distracting reaction
+/// is worse than none.
+const VIBEX_USE_REACTION_PROMPT: &str = "Runtime instruction: a short emoji reaction is welcome on most turns. \
+When one would naturally acknowledge what the user said — a question, a report, an instruction, an image, \
+a correction, or a remark — call vibex_react once for their current message. Do not limit reactions to \
+greetings, confirmations, or thanks, and never let a reaction replace your answer. Use your judgment; \
+skip a reaction that would be distracting or tonally wrong.";
+
+/// Puts the reaction nudge and team block ahead of the context the caller
+/// already composed.
+fn compose_prompt_context(
+    reaction: Option<&str>,
+    team: Option<&str>,
+    requested: Option<&str>,
+) -> Option<String> {
+    let mut parts = Vec::new();
+    for value in [reaction, team, requested].into_iter().flatten() {
+        if !value.trim().is_empty() {
+            parts.push(value);
+        }
     }
+    (!parts.is_empty()).then(|| parts.join("\n\n"))
 }
 
 /// Builds the credential-free runtime summary shown for one task.
@@ -8692,20 +8714,27 @@ mod tests {
     }
 
     #[test]
-    fn team_awareness_sits_ahead_of_the_callers_own_context() {
+    fn reaction_guidance_sits_ahead_of_team_and_caller_context() {
+        let composed = compose_prompt_context(
+            Some(VIBEX_USE_REACTION_PROMPT),
+            Some("team"),
+            Some("requested"),
+        )
+        .unwrap();
+        assert!(composed.starts_with("Runtime instruction:"));
+        assert!(composed.contains("vibex_react"));
+        assert!(composed.contains("Do not limit reactions to"));
+        assert!(composed.ends_with("team\n\nrequested"));
+
         assert_eq!(
-            compose_prompt_context(Some("team"), Some("requested")),
-            Some("team\n\nrequested".to_string())
-        );
-        assert_eq!(
-            compose_prompt_context(Some("  "), Some("requested")),
+            compose_prompt_context(None, Some("  "), Some("requested")),
             Some("requested".to_string())
         );
         assert_eq!(
-            compose_prompt_context(Some("team"), None),
+            compose_prompt_context(None, Some("team"), None),
             Some("team".to_string())
         );
-        assert_eq!(compose_prompt_context(None, None), None);
+        assert_eq!(compose_prompt_context(None, None, None), None);
     }
 
     struct TestProvider {

@@ -1141,9 +1141,11 @@ fn tool_description(tool: VibexUseTool) -> &'static str {
             "Dissolve a group the caller created. Sessions remain and tasks keep running."
         }
         VibexUseTool::React => {
-            "Attach an emoji reaction to a user message in this session. Call it only when a \
-             reaction genuinely fits the exchange; omit it otherwise. Any emoji is accepted. \
-             The reaction defaults to the newest user message; sequence names an earlier one."
+            "Attach an emoji reaction to a user message in this session. A reaction is welcome on \
+             most turns, not only for greetings or thanks: use one when a short emoji naturally \
+             acknowledges what the user said. Any emoji is accepted. Defaults to the newest user \
+             message; sequence names an earlier one. Use your judgment and skip a reaction that \
+             would be distracting."
         }
     }
 }
