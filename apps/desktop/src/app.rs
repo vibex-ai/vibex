@@ -7517,6 +7517,25 @@ const AGENT_ANSWER_ACTION_ORDER: [AgentAnswerAction; 4] = [
     AgentAnswerAction::Timestamp,
 ];
 
+/// The turn facts a user message row reads.
+///
+/// The receipt, the edit affordance, and the context menu all answer from the
+/// same facts; threading them one by one made the renderer take more arguments
+/// than its meaning.
+#[derive(Clone, Copy, Debug, Default)]
+struct UserMessageTurnState {
+    /// The conversation's latest turn; only its message wears a receipt.
+    latest: bool,
+    /// The turn has settled.
+    complete: bool,
+    /// The agent took the message: the session is working, the turn has output,
+    /// or the turn has settled.
+    started: bool,
+    /// The agent is working on the turn right now, as opposed to having
+    /// responded and then stopped.
+    working: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UserMessageEditActionState {
     Hidden,
@@ -66016,12 +66035,37 @@ impl VibexWorkbench {
             .when(!is_first, |this| this.pt_5())
             .pb_5();
 
+        // The receipt waits for evidence that the agent took the message, not
+        // merely that the client sent it.
+        let session_working = self
+            .timeline
+            .session_id
+            .as_ref()
+            .and_then(|session_id| self.registered_session(session_id.as_str()))
+            .is_some_and(|session| {
+                matches!(
+                    session.state,
+                    AgentSessionState::Running | AgentSessionState::NeedsInput
+                )
+            });
+        let turn_started = user_message_turn_started(
+            turn.failed,
+            turn.complete,
+            !turn.process_rows.is_empty(),
+            turn.conclusion_row.is_some(),
+            session_working,
+        );
+
         if let Some(user_row) = turn.user_row.as_ref() {
             let user_message = self.render_user_message_row(
                 user_row,
                 Some(&turn.id),
-                is_last,
-                turn.complete,
+                UserMessageTurnState {
+                    latest: is_last,
+                    complete: turn.complete,
+                    started: turn_started,
+                    working: !turn.complete && session_working,
+                },
                 window,
                 cx,
             );
@@ -67678,7 +67722,7 @@ impl VibexWorkbench {
         let mut answer_metadata = answer_metadata;
         let element = match row.kind {
             TimelineRowKind::UserMessage => {
-                self.render_user_message_row(row, None, false, false, window, cx)
+                self.render_user_message_row(row, None, UserMessageTurnState::default(), window, cx)
             }
             TimelineRowKind::AgentMessage => self.render_agent_message_row(
                 row,
@@ -71007,8 +71051,7 @@ impl VibexWorkbench {
         &mut self,
         row: &TimelineRow,
         turn_id: Option<&str>,
-        latest_user_message: bool,
-        turn_complete: bool,
+        turn: UserMessageTurnState,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -71053,6 +71096,17 @@ impl VibexWorkbench {
         } else {
             self.render_user_message_attachment_strip(&row.id, &row.body, &attachments, cx)
         };
+        // The receipt is chosen from what the reader wrote, not from the row
+        // or turn id, so replacing the optimistic item cannot change it
+        // mid-work. It appears once the turn has started and stays after the
+        // turn settles; `complete` only changes what the label says.
+        let reaction =
+            user_message_reaction_visible(turn.latest, turn.started, editing).then(|| {
+                (
+                    user_message_reaction(&user_message_reaction_seed(&row.body, &attachments)),
+                    turn.working,
+                )
+            });
         let inline_content = if editing {
             self.render_inline_user_message_editor(&row.id, cx)
         } else {
@@ -71072,30 +71126,10 @@ impl VibexWorkbench {
         // neither mark.
         let goal_message = parse_slash_command_invocation(&row.body)
             .is_some_and(|(name, _)| name.eq_ignore_ascii_case("goal"));
-        // While this client is waiting on the turn, its latest user message
-        // wears a friendly receipt. The receipt is an expression of work in
-        // progress, not a mark that survives into history: a settled turn
-        // removes it, and an edited message swaps it for its editor.
-        let working_reaction = (!editing
-            && latest_user_message
-            && !turn_complete
-            && self.runtime_status == RuntimeStatus::Ready
-            && self
-                .timeline
-                .session_id
-                .as_ref()
-                .is_some_and(|session_id| self.session_turn_pending(session_id)))
-        .then(|| user_message_working_reaction(turn_id.unwrap_or(row.id.as_str())));
         let edge_reactions = if editing {
             None
         } else {
-            render_user_message_edge_reactions(
-                &row.id,
-                delivery,
-                goal_message,
-                working_reaction,
-                cx,
-            )
+            render_user_message_edge_reactions(&row.id, delivery, goal_message, reaction, cx)
         };
         let hover_group: SharedString = format!("timeline-user-{}", row.id).into();
         let edit_text = row.body.clone();
@@ -71105,8 +71139,8 @@ impl VibexWorkbench {
         let edit_user_sequence = row.first_sequence;
         let edit_source_end_sequence = self.timeline.authoritative_end_sequence;
         let edit_action_state = user_message_edit_action_state(
-            latest_user_message,
-            turn_complete,
+            turn.latest,
+            turn.complete,
             self.timeline.needs_authoritative_refetch,
             self.selected_agent_session_state(),
             self.agent_action_pending
@@ -71124,8 +71158,8 @@ impl VibexWorkbench {
             first_sequence: row.first_sequence,
             last_sequence: row.last_sequence,
             authoritative_end_sequence: edit_source_end_sequence.unwrap_or(row.last_sequence),
-            latest_user_message,
-            turn_complete,
+            latest_user_message: turn.latest,
+            turn_complete: turn.complete,
             edit_action_state,
             row_is_live_view: self.timeline.session_id.as_ref() == self.view_session_id.as_ref(),
             child_session: self
@@ -103473,47 +103507,107 @@ fn render_user_message_goal_button(row_id: &str, cx: &App) -> Button {
         .tooltip(label)
 }
 
-/// The friendly reactions a user message wears while the agent works.
+/// The friendly receipt a user message wears once its turn has started.
 ///
-/// Deliberately small and non-committal: a reaction here means "received and
-/// working", not "finished" or "this is great". The array is the selection
-/// wheel; a stable hash picks one.
-const USER_MESSAGE_WORKING_REACTIONS: [&str; 7] = ["👀", "🤔", "👍", "💪", "❤️", "🫶", "🚀"];
+/// Deliberately small and non-committal: the emoji says the message was
+/// received, not that the work is finished or that its content is being
+/// judged. The array is the selection wheel; a stable hash picks one.
+const USER_MESSAGE_REACTIONS: [&str; 7] = ["👀", "🤔", "👍", "💪", "❤️", "🫶", "🚀"];
 
-/// Pick the reaction a user message wears while its turn is being worked.
+/// Pick the receipt a user message wears.
 ///
-/// Hash the message's turn rather than sampling a random source: the same turn
-/// in a second pane, or after a restart, must not change expression mid-work,
-/// and a render must never advance the pick.
-fn user_message_working_reaction(seed: &str) -> &'static str {
+/// Hash the message rather than sampling a random source: the same message in a
+/// second pane, after an authoritative refresh, or after a restart must not
+/// change expression under the reader, and a render must never advance the pick.
+fn user_message_reaction(seed: &str) -> &'static str {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in seed.as_bytes() {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
-    USER_MESSAGE_WORKING_REACTIONS[(hash % USER_MESSAGE_WORKING_REACTIONS.len() as u64) as usize]
+    USER_MESSAGE_REACTIONS[(hash % USER_MESSAGE_REACTIONS.len() as u64) as usize]
+}
+
+/// The stable identity a receipt is chosen from.
+///
+/// A row's id, and the turn id built from it, change when an optimistic send is
+/// replaced by the authoritative item. Seeding from them made the emoji turn
+/// into a different one mid-work. The text and the attachment labels are the
+/// parts of the message the reader wrote, so they survive that replacement.
+fn user_message_reaction_seed(text: &str, attachments: &[MessageAttachment]) -> String {
+    let mut seed = String::with_capacity(text.len() + attachments.len() * 16);
+    seed.push_str(text);
+    for attachment in attachments {
+        seed.push('\u{1f}');
+        seed.push_str(attachment.display_label());
+    }
+    seed
+}
+
+/// Whether a user message has a receipt yet.
+///
+/// A receipt is not a read receipt for the send: it appears only once the turn
+/// has started, and it stays once the turn settles. Editing the message swaps
+/// it for the editor, and only the conversation's latest turn wears one.
+fn user_message_reaction_visible(
+    latest_user_message: bool,
+    turn_started: bool,
+    editing: bool,
+) -> bool {
+    !editing && latest_user_message && turn_started
+}
+
+/// Whether a turn has started the work its receipt acknowledges.
+///
+/// A dispatched turn is not yet a started one: the runtime may still be idle,
+/// and the receipt would then claim work that has not begun. A running (or
+/// waiting-for-input) session, the turn's first output, or a settled turn all
+/// prove the agent took the message. A failed turn proves nothing, so it wears
+/// no receipt.
+fn user_message_turn_started(
+    failed: bool,
+    complete: bool,
+    has_process_output: bool,
+    has_conclusion: bool,
+    session_working: bool,
+) -> bool {
+    !failed && (complete || has_process_output || has_conclusion || session_working)
 }
 
 /// The bubble's lower-edge reaction region, holding every mark the row earned.
 ///
-/// The working receipt leads; the goal badge and delivery accent keep the
-/// trailing corner. All share one pill so the row does not grow a second
-/// floating surface.
+/// The receipt leads; the goal badge and delivery accent keep the trailing
+/// corner. All share one pill so the row does not grow a second floating
+/// surface. The bool on the reaction distinguishes work in progress from a
+/// settled turn, which changes only the accessible description.
 fn render_user_message_edge_reactions(
     row_id: &str,
     delivery: UserMessageDelivery,
     is_goal_message: bool,
-    working_reaction: Option<&'static str>,
+    reaction: Option<(&'static str, bool)>,
     cx: &App,
 ) -> Option<BubbleReactions> {
     let mut reactions = BubbleReactions::new();
     let mut has_mark = false;
     let has_action = is_goal_message || delivery != UserMessageDelivery::Prompt;
-    if let Some(emoji) = working_reaction {
+    if let Some((emoji, working)) = reaction {
+        let label = if working {
+            locale::text(
+                "AI is working on this message",
+                "AI 正在处理这条消息",
+                "AI 正在處理這則訊息",
+            )
+        } else {
+            locale::text(
+                "AI responded to this message",
+                "AI 已回应这条消息",
+                "AI 已回應這則訊息",
+            )
+        };
         reactions = reactions.child(
             div()
                 .id(SharedString::from(format!(
-                    "user-message-working-reaction:{row_id}"
+                    "user-message-reaction:{row_id}"
                 )))
                 .flex()
                 .items_center()
@@ -103521,11 +103615,7 @@ fn render_user_message_edge_reactions(
                 // library's decorative padding, so it pays for its own inset.
                 .when(has_action, |this| this.px(px(6.0)))
                 .text_base()
-                .aria_label(locale::text(
-                    "AI is working on this message",
-                    "AI 正在处理这条消息",
-                    "AI 正在處理這則訊息",
-                ))
+                .aria_label(label)
                 .child(emoji),
         );
         has_mark = true;
@@ -124196,31 +124286,68 @@ mod tests {
     }
 
     #[test]
-    fn user_message_working_reaction_is_stable_and_covers_the_wheel() {
+    fn user_message_reaction_is_stable_and_covers_the_wheel() {
         assert_eq!(
-            USER_MESSAGE_WORKING_REACTIONS,
+            USER_MESSAGE_REACTIONS,
             ["👀", "🤔", "👍", "💪", "❤️", "🫶", "🚀"]
         );
 
         let mut seen = BTreeSet::new();
         for index in 0..256 {
-            let seed = format!("turn-{index}");
-            let reaction = user_message_working_reaction(&seed);
-            // The same message in another pane, or after a restart, keeps the
-            // expression it already showed.
-            assert_eq!(reaction, user_message_working_reaction(&seed));
-            assert!(USER_MESSAGE_WORKING_REACTIONS.contains(&reaction));
+            let seed = format!("message-{index}");
+            let reaction = user_message_reaction(&seed);
+            // The same message in another pane, after an authoritative
+            // refresh, or after a restart keeps the expression it showed.
+            assert_eq!(reaction, user_message_reaction(&seed));
+            assert!(USER_MESSAGE_REACTIONS.contains(&reaction));
             seen.insert(reaction);
         }
         assert_eq!(
             seen.len(),
-            USER_MESSAGE_WORKING_REACTIONS.len(),
+            USER_MESSAGE_REACTIONS.len(),
             "every friendly reaction should be reachable"
         );
     }
 
     #[test]
-    fn user_message_working_reaction_only_rides_a_live_turn() {
+    fn user_message_reaction_appears_only_after_the_turn_starts() {
+        // Sending is not starting: a dispatched turn with an idle runtime and
+        // no output has nothing to acknowledge yet.
+        assert!(!user_message_turn_started(
+            false, false, false, false, false
+        ));
+        // A running runtime, the first output, or a settled turn all prove the
+        // agent took the message.
+        assert!(user_message_turn_started(false, false, false, false, true));
+        assert!(user_message_turn_started(false, false, true, false, false));
+        assert!(user_message_turn_started(false, false, false, true, false));
+        assert!(user_message_turn_started(false, true, false, false, false));
+        // A failed turn never wears a receipt.
+        assert!(!user_message_turn_started(true, true, true, true, true));
+
+        // Only the latest turn's message shows it, and never while editing.
+        assert!(user_message_reaction_visible(true, true, false));
+        assert!(!user_message_reaction_visible(false, true, false));
+        assert!(!user_message_reaction_visible(true, false, false));
+        assert!(!user_message_reaction_visible(true, true, true));
+    }
+
+    #[test]
+    fn user_message_reaction_survives_the_optimistic_row() {
+        let image = message_attachment("paste", Some(0));
+        let seed = user_message_reaction_seed("look", std::slice::from_ref(&image));
+
+        // The seed is what the reader wrote, not the row or turn id that
+        // changes when the optimistic item is replaced by the authoritative one.
+        assert_eq!(seed, "look\u{1f}paste");
+        assert_eq!(user_message_reaction(&seed), user_message_reaction(&seed));
+
+        let edited = user_message_reaction_seed("look again", std::slice::from_ref(&image));
+        assert_ne!(seed, edited);
+    }
+
+    #[test]
+    fn user_message_reaction_rides_the_turn_not_the_send() {
         let source = include_str!("app.rs");
         let row = source
             .split_once("    fn render_user_message_row(")
@@ -124228,12 +124355,27 @@ mod tests {
             .map(|(body, _)| body)
             .expect("user message row should remain inspectable");
 
-        assert!(row.contains("latest_user_message"));
-        assert!(row.contains("!turn_complete"));
-        assert!(row.contains("RuntimeStatus::Ready"));
-        assert!(row.contains("session_turn_pending"));
-        assert!(row.contains("user_message_working_reaction("));
+        assert!(row.contains("turn.started"));
+        assert!(row.contains("turn.working"));
+        assert!(row.contains("user_message_reaction_visible("));
+        assert!(row.contains("user_message_reaction_seed("));
+        assert!(row.contains("user_message_reaction("));
         assert!(!row.contains("rand::"));
+
+        let starter = source
+            .split_once("        let turn_started = user_message_turn_started(")
+            .and_then(|(_, tail)| tail.split_once("\n        if let Some(user_row)"))
+            .map(|(body, _)| body)
+            .expect("turn start gate should remain inspectable");
+        assert!(starter.contains("turn.failed"));
+        assert!(starter.contains("turn.complete"));
+        assert!(starter.contains("turn.process_rows"));
+        assert!(starter.contains("turn.conclusion_row"));
+        assert!(starter.contains("session_working"));
+        assert!(
+            source.contains("AgentSessionState::Running | AgentSessionState::NeedsInput"),
+            "a running or input-waiting agent counts as started"
+        );
 
         let reactions = source
             .split_once("fn render_user_message_edge_reactions(")
@@ -124241,11 +124383,12 @@ mod tests {
             .map(|(body, _)| body)
             .expect("edge reaction region should remain inspectable");
 
-        assert!(reactions.contains("working_reaction"));
+        assert!(reactions.contains("reaction"));
         assert!(reactions.contains("BubbleReactions::new()"));
         // The receipt is a child of the pill, not an action button.
         assert!(reactions.contains(".child(emoji)"));
         assert!(reactions.contains("AI is working on this message"));
+        assert!(reactions.contains("AI responded to this message"));
     }
 
     #[test]
