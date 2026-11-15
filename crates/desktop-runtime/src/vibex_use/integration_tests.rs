@@ -340,6 +340,23 @@ async fn react_attaches_an_emoji_notice_to_the_latest_user_message() {
 }
 
 #[tokio::test]
+async fn react_is_refused_when_the_shell_hides_reactions() {
+    let fixture = Fixture::new();
+    let parent = fixture.session("Parent");
+    let actor = fixture.actor(&parent);
+    fixture.service.manager.set_message_reactions_enabled(false);
+    let error = fixture
+        .call_result(&actor, VibexUseTool::React, json!({"emoji": "❤️"}))
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{error:?}").contains("disabled"),
+        "expected the disabled guard, got {error:?}"
+    );
+    fixture.service.manager.set_message_reactions_enabled(true);
+}
+
+#[tokio::test]
 async fn reused_worker_keeps_each_round_result_and_acceptance_releases_its_controller() {
     let fixture = Fixture::new();
     let parent = fixture.session("Parent");

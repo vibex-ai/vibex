@@ -13765,6 +13765,9 @@ impl VibexWorkbench {
                                     200,
                                 ));
                                 this.apply_loaded_ui_state(state, cx);
+                                runtime.agent().manager().set_message_reactions_enabled(
+                                    this.ui_state.message_reactions.enabled,
+                                );
                                 crate::system_tray::update_locale(this.resolved_locale(), cx);
                             } else {
                                 this.ui_writer = None;
@@ -92858,6 +92861,12 @@ impl FoundationSettings {
     fn set_message_reactions_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
         let _ = self.workbench.update(cx, |this, cx| {
             this.ui_state.message_reactions.enabled = enabled;
+            if let Some(runtime) = this.runtime.as_ref() {
+                runtime
+                    .agent()
+                    .manager()
+                    .set_message_reactions_enabled(enabled);
+            }
             this.queue_ui_state();
             cx.notify();
         });
@@ -124263,6 +124272,7 @@ mod tests {
         assert!(source.contains("message-reactions-enabled"));
         assert!(source.contains("set_message_reactions_enabled"));
         assert!(source.contains("ui_state.message_reactions.enabled"));
+        assert!(source.contains("agent().manager().set_message_reactions_enabled"));
     }
 
     #[test]

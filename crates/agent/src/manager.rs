@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 
 use tokio::sync::{Mutex as AsyncMutex, broadcast, mpsc};
@@ -219,6 +220,12 @@ pub struct AgentManager {
     /// resources are assembled, and that is where a per-Agent "off" has to be
     /// honoured. Absent entries take [`AgentBuiltinTool::default_enabled`].
     agent_tool_preferences: StdMutex<vibex_core::AgentToolPreferences>,
+    /// Whether the shell wants Agent reactions.
+    ///
+    /// The catalogue and the per-turn nudge both read this one flag, so turning
+    /// reactions off in the shell also stops asking the model for them. It is
+    /// runtime-wide because the prompt is composed before a client is chosen.
+    message_reactions_enabled: AtomicBool,
     delegation_lifecycle_locks: StdMutex<HashMap<String, Weak<AsyncMutex<()>>>>,
     execution_observers: StdMutex<HashSet<VibexExecutionId>>,
     execution_progress: Arc<tokio::sync::Notify>,
@@ -681,6 +688,7 @@ impl AgentManager {
             computer_mcp_tool: StdMutex::new(None),
             timeline_compaction_sweep: StdMutex::new(TimelineCompactionSweep::default()),
             agent_tool_preferences: StdMutex::new(vibex_core::AgentToolPreferences::default()),
+            message_reactions_enabled: AtomicBool::new(true),
             delegation_lifecycle_locks: StdMutex::new(HashMap::new()),
             execution_observers: StdMutex::new(HashSet::new()),
             execution_progress: Arc::new(tokio::sync::Notify::new()),
@@ -851,6 +859,20 @@ impl AgentManager {
 
     pub fn vibex_use_host(&self) -> Option<Arc<dyn VibexUseToolHost>> {
         self.vibex_use_host.get().and_then(Weak::upgrade)
+    }
+
+    /// Tell the runtime whether the shell shows Agent reactions.
+    ///
+    /// Both the `vibex_react` catalogue entry and the per-turn reaction nudge
+    /// read this flag, so turning the preference off stops asking the model for
+    /// a reaction the reader would never see.
+    pub fn set_message_reactions_enabled(&self, enabled: bool) {
+        self.message_reactions_enabled
+            .store(enabled, Ordering::Relaxed);
+    }
+
+    pub fn message_reactions_enabled(&self) -> bool {
+        self.message_reactions_enabled.load(Ordering::Relaxed)
     }
 
     /// Authority every reference the broker hands out belongs to.
@@ -4671,8 +4693,9 @@ impl AgentManager {
         // input only: the user timeline item above was written from
         // `request.text`, so the transcript, the auto title and search all keep
         // exactly what the user wrote.
-        let reaction_context = (request.provenance == vibex_core::MessageProvenance::HumanInput)
-            .then_some(VIBEX_USE_REACTION_PROMPT);
+        let reaction_context = (request.provenance == vibex_core::MessageProvenance::HumanInput
+            && self.message_reactions_enabled())
+        .then_some(VIBEX_USE_REACTION_PROMPT);
         let prompt_context = compose_prompt_context(
             reaction_context,
             team_context.as_deref(),
@@ -8735,6 +8758,15 @@ mod tests {
             Some("team".to_string())
         );
         assert_eq!(compose_prompt_context(None, None, None), None);
+    }
+
+    #[test]
+    fn message_reactions_are_on_by_default_and_switch_off() {
+        let directory = tempfile::tempdir().unwrap();
+        let manager = AgentManager::new(directory.path().join("reactions.db")).unwrap();
+        assert!(manager.message_reactions_enabled());
+        manager.set_message_reactions_enabled(false);
+        assert!(!manager.message_reactions_enabled());
     }
 
     struct TestProvider {

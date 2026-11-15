@@ -821,6 +821,10 @@ pub struct VibexUseCapabilitySnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delegation_blocked_by: Option<String>,
     pub can_read_any_session: bool,
+    /// Whether the shell wants Agent reactions. When false the runtime neither
+    /// advertises `vibex_react` nor nudges the model toward it.
+    #[serde(default = "default_reactions_available")]
+    pub reactions_available: bool,
     pub presentation: VibexUsePresentationCapability,
     /// Tools this caller may actually use. A tool that cannot succeed is not
     /// advertised as available.
@@ -1010,6 +1014,11 @@ pub struct VibexUseToolDefinition {
     pub input_schema: Value,
 }
 
+/// Reactions are on for a shell that predates the preference.
+const fn default_reactions_available() -> bool {
+    true
+}
+
 /// Builds the whole catalogue. Tools whose capability is missing are omitted
 /// instead of being advertised and then failing.
 pub fn vibex_use_tool_definitions(
@@ -1018,6 +1027,9 @@ pub fn vibex_use_tool_definitions(
     VibexUseTool::ALL
         .into_iter()
         .filter(|tool| {
+            if matches!(tool, VibexUseTool::React) {
+                return capability.reactions_available;
+            }
             if tool.is_presentation() {
                 // `list_groups` is still meaningful without a shell because it
                 // reports the capability itself.
@@ -3024,6 +3036,7 @@ mod tests {
             can_delegate: true,
             delegation_blocked_by: None,
             can_read_any_session: false,
+            reactions_available: true,
             presentation: VibexUsePresentationCapability::default(),
             available_tools: Vec::new(),
         };
@@ -3034,6 +3047,14 @@ mod tests {
         assert!(names.contains(&"vibex_react"));
         assert!(!names.contains(&"vibex_create_group"));
         assert!(!names.contains(&"vibex_present_group"));
+
+        let mut reactions_off = capability.clone();
+        reactions_off.reactions_available = false;
+        let names: Vec<String> = vibex_use_tool_definitions(&reactions_off)
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+        assert!(!names.contains(&"vibex_react".to_string()));
 
         let mut budget_exhausted = capability.clone();
         budget_exhausted.can_delegate = false;

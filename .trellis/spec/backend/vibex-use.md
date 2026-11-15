@@ -33,9 +33,10 @@ availability.
 
 `vibex_react` is optional for the Agent: it accepts any short emoji and appends a hidden system notice whose provider
 correlation names the target user-message item. Shells draw the emoji on that bubble; a client that does not know the
-convention still reads the notice as harmless text. It is advertised with every delivery channel; reaction display is the
-shell's choice. Every human turn also opens with a short runtime guideline that makes a reaction welcome without
-prescribing greetings, confirmations, or thanks; delegated and system prompts do not carry it.
+convention still reads the notice as harmless text. The shell's reaction preference gates the whole feature: while it is
+on, `vibex_react` is advertised and every human turn opens with a short guideline that makes a reaction welcome without
+prescribing greetings, confirmations, or thanks. Turning it off removes the catalogue entry, suppresses the guideline,
+and rejects calls on a cached tool list. Delegated and system prompts never carry the guideline.
 
 Human clients use [`AgentBackend`](../../../crates/vibex-backend/src/agent.rs): `team_snapshot(TeamSnapshotRequest)`,
 `session_tree(SessionTreeRequest)`, `delegate_session(MutationRequest<HumanDelegationRequest>)`,

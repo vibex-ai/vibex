@@ -504,6 +504,7 @@ impl VibexUseService {
                 None
             },
             can_read_any_session: false,
+            reactions_available: self.manager.message_reactions_enabled(),
             presentation,
             available_tools: Vec::new(),
         };
@@ -2659,6 +2660,12 @@ impl VibexUseService {
         actor: &VibexUseActor,
         arguments: &serde_json::Value,
     ) -> VibexResult<serde_json::Value> {
+        if !self.manager.message_reactions_enabled() {
+            return Err(VibexError::validation(
+                use_codes::REQUEST_INVALID,
+                "message reactions are disabled",
+            ));
+        }
         let emoji = arguments
             .get("emoji")
             .and_then(serde_json::Value::as_str)
