@@ -3605,13 +3605,14 @@ fn the_group_row_opens_its_context_menu(cx: &mut TestAppContext) {
     );
     // A menu that opened but never painted would still set the target above.
     // Driving one of its items by keyboard proves a live popup, not just the
-    // deferred builder. "Auto continue" writes the opposite of the effective
-    // default the menu read when it was built.
+    // deferred builder. The title row is not a choice, so one step reaches
+    // "Auto continue", which writes the opposite of the effective default the
+    // menu read when it was built.
     let project_default = workbench.read_with(cx, |workbench, _| {
         workbench.project_auto_continue_enabled_for("project_team")
     });
     cx.simulate_mouse_move(point(px(0.0), px(0.0)), None, Default::default());
-    cx.simulate_keystrokes("down down enter");
+    cx.simulate_keystrokes("down enter");
     draw(cx);
     assert_eq!(
         workbench.read_with(cx, |workbench, _| workbench

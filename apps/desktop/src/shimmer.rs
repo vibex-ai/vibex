@@ -17,9 +17,9 @@ use std::time::Duration;
 
 use gpui::{
     Animation, AnimationExt as _, App, Bounds, ContentMask, Element, ElementId, GlobalElementId,
-    Hsla, InspectorElementId, IntoElement, LayoutId, LineLayout, ParentElement as _, Pixels, Point,
-    RenderOnce, SharedString, StyleRefinement, Styled, StyledText, TextAlign, Window, WrapBoundary,
-    div, point, px, size,
+    Hsla, InspectorElementId, InteractiveElement as _, IntoElement, LayoutId, LineLayout,
+    ParentElement as _, Pixels, Point, RenderOnce, SharedString, StyleRefinement, Styled,
+    StyledText, TextAlign, Window, WrapBoundary, div, point, px, size,
 };
 use gpui_component::{ActiveTheme as _, Colorize as _, StyledExt as _};
 
@@ -165,6 +165,7 @@ pub struct ShimmerText {
     style: StyleRefinement,
     shimmer_style: ShimmerStyle,
     id: Option<ElementId>,
+    debug_selector: Option<SharedString>,
 }
 
 impl ShimmerText {
@@ -175,6 +176,7 @@ impl ShimmerText {
             style: StyleRefinement::default(),
             shimmer_style: ShimmerStyle::default(),
             id: None,
+            debug_selector: None,
         }
     }
 
@@ -219,6 +221,16 @@ impl ShimmerText {
         self.shimmer_style = self.shimmer_style.once(once);
         self
     }
+
+    /// Name the label for a test that asks whether the sweep is mounted.
+    ///
+    /// The container is the same element either way; only the debug selector
+    /// changes, so a test can observe the animated state without a pixel
+    /// comparison.
+    pub fn debug_selector(mut self, selector: impl Into<SharedString>) -> Self {
+        self.debug_selector = Some(selector.into());
+        self
+    }
 }
 
 impl Styled for ShimmerText {
@@ -237,6 +249,13 @@ impl RenderOnce for ShimmerText {
                 .child(StyledText::new(self.text))
                 .into_any_element();
         }
+
+        // The selector marks the animated state only: a label that renders
+        // static under reduced motion must not look mounted to a test.
+        let container = match self.debug_selector {
+            Some(selector) => container.debug_selector(move || selector.to_string()),
+            None => container,
+        };
 
         let tokens = cx.theme().semantic_tokens();
         let reverse = self.shimmer_style.reverse;

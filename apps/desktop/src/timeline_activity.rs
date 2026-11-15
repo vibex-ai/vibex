@@ -364,6 +364,7 @@ fn activity_text(id: &'static str, text: &str, running: bool) -> AnyElement {
     if running && live_labels_animate() {
         ShimmerText::new(text.to_string())
             .id(id)
+            .debug_selector(format!("activity-shimmer:{id}"))
             .duration(TIMELINE_SHIMMER_SWEEP)
             .spread(TIMELINE_SHIMMER_SPREAD)
             .into_any_element()

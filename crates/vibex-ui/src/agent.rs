@@ -4042,6 +4042,7 @@ mod tests {
                 responder_device_id: None,
                 provider_resolution_id: None,
                 note: None,
+                responder: None,
                 resolved_at_ms: 2,
             },
         };

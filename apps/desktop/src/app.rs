@@ -103843,7 +103843,6 @@ mod tests {
     /// edges dark. A caret resting against the chip is still editing it, so a
     /// chip drawn from that rule looked inert while the controls below were
     /// pointed at it.
-    #[test]
     /// A chip always resolves to some entry of its Agent, never to nothing.
     ///
     /// Three shapes reach the lookup: the row's own reference, a tuned reference
@@ -104054,7 +104053,8 @@ mod tests {
 
         // A real draft after picking a chip: the insertion appends one space, so
         // the caret rests one byte past the token.
-        let single = composer_content_with_mentions("@Codex fix it", &[codex_mention.clone()]);
+        let single =
+            composer_content_with_mentions("@Codex fix it", std::slice::from_ref(&codex_mention));
         let chip = single.tokens()[0].range();
         assert_eq!(
             delegation_edit_subject(single.tokens(), chip.end).and_then(|m| m.agent_id),
@@ -131383,9 +131383,11 @@ mod tests {
             })
             .map(|(body, _)| body)
             .expect("the folder setter should remain inspectable");
-        // A stale or foreign folder is refused rather than written.
+        // A stale or foreign folder is refused rather than written. The guard
+        // is formatted over several lines, so compare it without whitespace.
         assert!(setter.contains(".folder(folder_id)"));
-        assert!(setter.contains("folder.project_id == self.new_session_workspace.project_id"));
+        let guard = setter.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(guard.contains("folder.project_id == self .new_session_workspace .project_id"));
 
         // The page draws the control from the choices, so an empty list hides
         // it, and the control writes through the same setter the folder row
