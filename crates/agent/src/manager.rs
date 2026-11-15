@@ -473,6 +473,12 @@ struct AgentTurnRequest {
     /// Who the authority says authored this message. It is recorded on the user
     /// timeline item, so a delegated instruction never reads as the user's own.
     provenance: vibex_core::MessageProvenance,
+    /// Whether this turn executes a provider slash command.
+    ///
+    /// The provider reads the command from the start of the prompt, so the
+    /// runtime's reaction guideline must not open the text: a paragraph before
+    /// `/review` would stop it being the command the person picked.
+    provider_command: bool,
 }
 
 impl From<SendAgentMessageRequest> for AgentTurnRequest {
@@ -488,6 +494,7 @@ impl From<SendAgentMessageRequest> for AgentTurnRequest {
             delivery: request.delivery,
             prompt_context: request.prompt_context,
             provenance: request.provenance,
+            provider_command: false,
         }
     }
 }
@@ -3790,6 +3797,7 @@ impl AgentManager {
                     policy_id: "continue_turn".to_string(),
                     trigger_event_id: String::new(),
                 },
+                provider_command: false,
             },
             // The continuation prompt is an internal retry instruction. It
             // must stay out of the transcript and must not update the session
@@ -4379,6 +4387,9 @@ impl AgentManager {
             prompt_context: None,
             // A slash command is still the person typing it.
             provenance: vibex_core::MessageProvenance::HumanInput,
+            // The provider reads the command from the start of the prompt, so
+            // the reaction guideline must not open it.
+            provider_command: true,
         };
         let command_request = request.clone();
         let items = self
@@ -4464,6 +4475,7 @@ impl AgentManager {
                     delivery: UserMessageDelivery::Prompt,
                     prompt_context: None,
                     provenance: vibex_core::MessageProvenance::HumanInput,
+                    provider_command: false,
                 },
                 AgentTurnDisplayPolicy::USER_AUTHORED,
                 ContextBridgeTurnBehavior::ConsumePending,
@@ -4694,6 +4706,7 @@ impl AgentManager {
         // `request.text`, so the transcript, the auto title and search all keep
         // exactly what the user wrote.
         let reaction_context = (request.provenance == vibex_core::MessageProvenance::HumanInput
+            && !request.provider_command
             && self.message_reactions_enabled())
         .then_some(VIBEX_USE_REACTION_PROMPT);
         let prompt_context = compose_prompt_context(
@@ -9708,6 +9721,7 @@ mod tests {
                     delivery: UserMessageDelivery::Prompt,
                     prompt_context: None,
                     provenance: vibex_core::MessageProvenance::HumanInput,
+                    provider_command: false,
                 },
                 AgentTurnDisplayPolicy::USER_AUTHORED,
                 ContextBridgeTurnBehavior::ConsumePending,
@@ -10009,6 +10023,7 @@ mod tests {
                     delivery: UserMessageDelivery::Prompt,
                     prompt_context: None,
                     provenance: vibex_core::MessageProvenance::HumanInput,
+                    provider_command: false,
                 },
                 AgentTurnDisplayPolicy::USER_AUTHORED,
                 ContextBridgeTurnBehavior::ConsumePending,
@@ -10048,6 +10063,7 @@ mod tests {
                     delivery: UserMessageDelivery::Prompt,
                     prompt_context: None,
                     provenance: vibex_core::MessageProvenance::HumanInput,
+                    provider_command: false,
                 },
                 AgentTurnDisplayPolicy::USER_AUTHORED,
                 ContextBridgeTurnBehavior::ConsumePending,
@@ -10187,6 +10203,7 @@ mod tests {
                     delivery: UserMessageDelivery::Prompt,
                     prompt_context: None,
                     provenance: vibex_core::MessageProvenance::HumanInput,
+                    provider_command: false,
                 },
                 AgentTurnDisplayPolicy::USER_AUTHORED,
                 ContextBridgeTurnBehavior::ConsumePending,
@@ -10709,6 +10726,7 @@ mod tests {
                         delivery: UserMessageDelivery::Prompt,
                         prompt_context: None,
                         provenance: vibex_core::MessageProvenance::HumanInput,
+                        provider_command: false,
                     },
                     AgentTurnDisplayPolicy::USER_AUTHORED,
                     ContextBridgeTurnBehavior::ConsumePending,
@@ -10948,6 +10966,7 @@ mod tests {
                         delivery: UserMessageDelivery::Prompt,
                         prompt_context: None,
                         provenance: vibex_core::MessageProvenance::HumanInput,
+                        provider_command: false,
                     },
                     AgentTurnDisplayPolicy::USER_AUTHORED,
                     ContextBridgeTurnBehavior::ConsumePending,
