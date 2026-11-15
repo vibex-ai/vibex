@@ -53,6 +53,10 @@ use gpui_component::{
     Theme, ThemeStyled as _, VirtualListScrollHandle, WindowExt as _,
     accordion::Accordion,
     animation::EffectTransition as Transition,
+    attachment::{
+        Attachment, AttachmentActions, AttachmentContent, AttachmentDescription, AttachmentMedia,
+        AttachmentTitle,
+    },
     avatar::Avatar,
     bubble::{Bubble, BubbleContent, BubbleReactions},
     button::{Button, ButtonCustomVariant, ButtonVariants as _},
@@ -207,7 +211,7 @@ use vibex_ui::{
 
 use crate::markdown::{
     MarkdownLinkKind, MarkdownPresentation, RangeHighlight, RenderedText, TextView, TextViewState,
-    escape_markdown_literal, is_file_url, is_windows_drive_path, local_file_path,
+    data_url_image, escape_markdown_literal, is_file_url, is_windows_drive_path, local_file_path,
     markdown_link_kind, plain_text as markdown_plain_text, resolve_workspace_path,
     resources as markdown_resources, text_view_style, utf8_prefix,
 };
@@ -1136,6 +1140,22 @@ const USER_MESSAGE_PILL_HORIZONTAL_INSET_PX: f32 = 30.0;
 /// Narrower timelines than this stay uncapped: the pill is unusable there
 /// anyway, and a cap would only wrap its text one character per line.
 const USER_MESSAGE_BODY_MIN_MAX_WIDTH_PX: f32 = 80.0;
+/// The square a message's picture occupies in the strip above its bubble.
+///
+/// A thumbnail is a raster boundary, so it stays a physical size while the
+/// text around it follows the interface zoom.
+const USER_MESSAGE_ATTACHMENT_TILE_PX: f32 = 64.0;
+/// The file card keeps the library's medium `Attachment` chip height.
+const USER_MESSAGE_ATTACHMENT_FILE_HEIGHT_PX: f32 = 56.0;
+/// The library's medium `Attachment` chip width (`14.5rem` at the default base).
+const USER_MESSAGE_ATTACHMENT_FILE_WIDTH_PX: f32 = 232.0;
+/// Gap inside an attachment row, between its rows, and before the bubble.
+const USER_MESSAGE_ATTACHMENT_GAP_PX: f32 = 8.0;
+/// The bubble column already contributes its own gap; this tops it up to the
+/// full attachment gap so the strip does not sit tighter than its own rows.
+const USER_MESSAGE_ATTACHMENT_BUBBLE_GAP_PX: f32 = USER_MESSAGE_ATTACHMENT_GAP_PX / 2.0;
+/// How many decoded `data:` pictures a message strip keeps on hand.
+const USER_MESSAGE_THUMBNAIL_CACHE_LIMIT: usize = 32;
 const AGENT_TURN_DURATION_TICK_INTERVAL: Duration = Duration::from_secs(1);
 const AGENT_TIMELINE_LAYOUT_WIDTH_EPSILON_PX: f32 = 1.0;
 /// Advance width the timeline's body text averages. The first-layout estimator
@@ -5955,6 +5975,16 @@ pub struct SessionView {
     composer_plan_expanded: Option<ComposerPlanIdentity>,
     dismissed_composer_plans: BTreeSet<ComposerPlanIdentity>,
     attachment_image_preview: Option<AttachmentImagePreviewState>,
+    /// Decoded `data:` pictures used as message attachment thumbnails.
+    ///
+    /// A message's picture can arrive as a multi-megabyte base64 URI, and the
+    /// strip above its bubble is drawn whenever the row is on screen. Decoding
+    /// that URI every frame would spend the frame's budget on one thumbnail, so
+    /// the decoded bytes stay here. The key fingerprints the URI cheaply; the
+    /// value keeps a failed decode too, so a broken picture is retried only when
+    /// the message that carried it changes. Bounded, and never notifies: it is a
+    /// decode memo, not interface state.
+    user_message_thumbnail_cache: BTreeMap<u64, Option<Arc<gpui::Image>>>,
     /// Working-image textures whose replacement frame has been presented, kept
     /// here when the preview closes so the atlas entry can still be released.
     preview_texture_graveyard: Vec<Arc<RenderImage>>,
@@ -6100,6 +6130,7 @@ impl SessionView {
             composer_plan_expanded: None,
             dismissed_composer_plans: BTreeSet::new(),
             attachment_image_preview: None,
+            user_message_thumbnail_cache: BTreeMap::new(),
             preview_texture_graveyard: Vec::new(),
             composer_queue_editing_id: None,
             composer_queue_edit_attachments: Vec::new(),
@@ -37040,6 +37071,24 @@ impl VibexWorkbench {
                 cx.notify();
             });
         }));
+    }
+
+    /// Activate one attachment of a message, from its thumbnail or file card.
+    ///
+    /// The body's inline label dispatches the same two actions, so every
+    /// surface that represents an attachment opens the same thing.
+    fn open_user_message_attachment(
+        &mut self,
+        action: UserMessageAttachmentAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match action {
+            UserMessageAttachmentAction::PreviewImage(attachment) => {
+                self.open_message_attachment_preview(attachment, window, cx)
+            }
+            UserMessageAttachmentAction::OpenFile(path) => self.open_code_file(path, window, cx),
+        }
     }
 
     /// Open a picture a message carries, wherever its bytes live.
@@ -70034,6 +70083,60 @@ impl VibexWorkbench {
         estimated_chars_per_line(self.estimated_timeline_content_width())
     }
 
+    /// The first-layout height of a user message's attachment strip.
+    ///
+    /// Pictures and files occupy separate rows, both wrapping inside the same
+    /// 78% column as the bubble. Visible rows report their real height after
+    /// layout; this only keeps the virtual list from starting the row a whole
+    /// thumbnail short.
+    fn estimated_user_message_attachment_strip_height(&self, row: &TimelineRow) -> f32 {
+        let attachments = self
+            .timeline_row_latest_item(row)
+            .and_then(|item| match &item.payload {
+                vibex_core::TimelinePayload::UserMessage(message) => Some(&message.attachments),
+                _ => None,
+            });
+        let Some(attachments) = attachments else {
+            return 0.0;
+        };
+        let (images, files) =
+            attachments
+                .iter()
+                .fold((0usize, 0usize), |(images, files), attachment| {
+                    if message_attachment_is_image(attachment) {
+                        (images + 1, files)
+                    } else {
+                        (images, files + 1)
+                    }
+                });
+        if images == 0 && files == 0 {
+            return 0.0;
+        }
+        let column_width =
+            self.estimated_timeline_content_width() * USER_MESSAGE_COLUMN_WIDTH_RATIO;
+        let mut height = 0.0;
+        if images > 0 {
+            let image_rows =
+                user_message_attachment_rows(images, USER_MESSAGE_ATTACHMENT_TILE_PX, column_width);
+            height += image_rows as f32 * USER_MESSAGE_ATTACHMENT_TILE_PX
+                + (image_rows.saturating_sub(1) as f32) * USER_MESSAGE_ATTACHMENT_GAP_PX;
+        }
+        if files > 0 {
+            if height > 0.0 {
+                height += USER_MESSAGE_ATTACHMENT_GAP_PX;
+            }
+            let file_rows = user_message_attachment_rows(
+                files,
+                USER_MESSAGE_ATTACHMENT_FILE_WIDTH_PX,
+                column_width,
+            );
+            height += file_rows as f32 * USER_MESSAGE_ATTACHMENT_FILE_HEIGHT_PX
+                + (file_rows.saturating_sub(1) as f32) * USER_MESSAGE_ATTACHMENT_GAP_PX;
+        }
+        // The strip's own bottom inset plus the column gap.
+        height + USER_MESSAGE_ATTACHMENT_GAP_PX
+    }
+
     // Height estimation provides the first virtual-list layout. Visible turns
     // report their intrinsic height after layout so rich Markdown spacing does
     // not depend on this approximation.
@@ -70061,7 +70164,7 @@ impl VibexWorkbench {
                 {
                     base_height + 40.0
                 } else {
-                    base_height
+                    base_height + self.estimated_user_message_attachment_strip_height(row)
                 }
             }
             TimelineRowKind::AgentMessage => {
@@ -70945,6 +71048,11 @@ impl VibexWorkbench {
             .as_ref()
             .is_some_and(|edit| edit.matches(&row.id, self.selected_session_id.as_ref()));
         let search_highlight = self.session_search_highlight_for_rows(std::slice::from_ref(row));
+        let attachment_strip = if editing {
+            None
+        } else {
+            self.render_user_message_attachment_strip(&row.id, &row.body, &attachments, cx)
+        };
         let inline_content = if editing {
             self.render_inline_user_message_editor(&row.id, cx)
         } else {
@@ -70964,10 +71072,30 @@ impl VibexWorkbench {
         // neither mark.
         let goal_message = parse_slash_command_invocation(&row.body)
             .is_some_and(|(name, _)| name.eq_ignore_ascii_case("goal"));
+        // While this client is waiting on the turn, its latest user message
+        // wears a friendly receipt. The receipt is an expression of work in
+        // progress, not a mark that survives into history: a settled turn
+        // removes it, and an edited message swaps it for its editor.
+        let working_reaction = (!editing
+            && latest_user_message
+            && !turn_complete
+            && self.runtime_status == RuntimeStatus::Ready
+            && self
+                .timeline
+                .session_id
+                .as_ref()
+                .is_some_and(|session_id| self.session_turn_pending(session_id)))
+        .then(|| user_message_working_reaction(turn_id.unwrap_or(row.id.as_str())));
         let edge_reactions = if editing {
             None
         } else {
-            render_user_message_edge_reactions(&row.id, delivery, goal_message, cx)
+            render_user_message_edge_reactions(
+                &row.id,
+                delivery,
+                goal_message,
+                working_reaction,
+                cx,
+            )
         };
         let hover_group: SharedString = format!("timeline-user-{}", row.id).into();
         let edit_text = row.body.clone();
@@ -71015,6 +71143,7 @@ impl VibexWorkbench {
             .w(relative(USER_MESSAGE_COLUMN_WIDTH_RATIO))
             .items_end()
             .gap_1()
+            .when_some(attachment_strip, |this, strip| this.child(strip))
             .child(render_user_message_bubble(
                 inline_content,
                 edge_reactions,
@@ -71137,6 +71266,8 @@ impl VibexWorkbench {
             user_message_clipboard_item_with_mentions(&row.body, &attachments, &mentions);
         let timestamp = self.timeline_row_timestamp(row);
         let search_highlight = self.session_search_highlight_for_rows(std::slice::from_ref(row));
+        let attachment_strip =
+            self.render_user_message_attachment_strip(&row.id, &row.body, &attachments, cx);
         let inline_content = self.render_user_message_inline_content(
             &row.id,
             row.body.clone(),
@@ -71176,6 +71307,7 @@ impl VibexWorkbench {
             .w(relative(USER_MESSAGE_COLUMN_WIDTH_RATIO))
             .items_end()
             .gap_1()
+            .when_some(attachment_strip, |this, strip| this.child(strip))
             .child(render_user_message_bubble(
                 inline_content,
                 None,
@@ -71206,6 +71338,130 @@ impl VibexWorkbench {
                     .into_any_element(),
             )
             .into_any_element()
+    }
+
+    /// The pictures and files a user message carries, drawn above its bubble.
+    ///
+    /// Pictures keep one row above the files so a 64px square never wraps
+    /// beside a long file card. Both rows end on the bubble's trailing edge,
+    /// and an attachment the client cannot resolve is left out rather than
+    /// drawn as a control that does nothing.
+    fn render_user_message_attachment_strip(
+        &mut self,
+        row_id: &str,
+        text: &str,
+        attachments: &[MessageAttachment],
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        if attachments.is_empty() {
+            return None;
+        }
+        let workspace_root = self
+            .view_session()
+            .map(|session| session.workspace_root.clone());
+        let locale = self.resolved_locale();
+        let entity = cx.weak_entity();
+        let mut image_tiles = Vec::new();
+        let mut file_cards = Vec::new();
+        for (index, attachment) in user_message_attachments_in_display_order(text, attachments)
+            .into_iter()
+            .enumerate()
+        {
+            let Some(action) =
+                user_message_attachment_action(&attachment, workspace_root.as_deref())
+            else {
+                continue;
+            };
+            if message_attachment_is_image(&attachment) {
+                let Some(source) = self.user_message_attachment_thumbnail(&attachment) else {
+                    continue;
+                };
+                image_tiles.push(render_user_message_image_tile(
+                    row_id,
+                    index,
+                    &attachment,
+                    source,
+                    action,
+                    entity.clone(),
+                    cx,
+                ));
+            } else {
+                file_cards.push(render_user_message_file_card(
+                    row_id,
+                    index,
+                    &attachment,
+                    action,
+                    entity.clone(),
+                    locale,
+                    cx,
+                ));
+            }
+        }
+        if image_tiles.is_empty() && file_cards.is_empty() {
+            return None;
+        }
+        let image_row = (!image_tiles.is_empty()).then(|| {
+            h_flex()
+                .w_full()
+                .min_w_0()
+                .flex_wrap()
+                .justify_end()
+                .gap(px(USER_MESSAGE_ATTACHMENT_GAP_PX))
+                .children(image_tiles)
+                .into_any_element()
+        });
+        let file_row = (!file_cards.is_empty()).then(|| {
+            h_flex()
+                .w_full()
+                .min_w_0()
+                .flex_wrap()
+                .justify_end()
+                .gap(px(USER_MESSAGE_ATTACHMENT_GAP_PX))
+                .children(file_cards)
+                .into_any_element()
+        });
+        Some(
+            v_flex()
+                .w_full()
+                .items_end()
+                .gap(px(USER_MESSAGE_ATTACHMENT_GAP_PX))
+                .when_some(image_row, |this, row| this.child(row))
+                .when_some(file_row, |this, row| this.child(row))
+                .mb(px(USER_MESSAGE_ATTACHMENT_BUBBLE_GAP_PX))
+                .into_any_element(),
+        )
+    }
+
+    /// Resolve one message picture to something `img()` can paint.
+    ///
+    /// Local files go straight to the asset system; inline `data:` bytes are
+    /// decoded once and remembered for the frame budget. `None` means there is
+    /// no thumbnail to draw, so the strip leaves that attachment to its inline
+    /// label instead of showing a hole.
+    fn user_message_attachment_thumbnail(
+        &mut self,
+        attachment: &MessageAttachment,
+    ) -> Option<UserMessageThumbnailSource> {
+        let uri = attachment.uri.as_deref()?.trim();
+        if let Some(path) = attachment_local_path(uri) {
+            return Some(UserMessageThumbnailSource::Path(PathBuf::from(path)));
+        }
+        if !uri.to_ascii_lowercase().starts_with("data:image/") {
+            return None;
+        }
+        let key = user_message_data_uri_key(uri);
+        if let Some(cached) = self.user_message_thumbnail_cache.get(&key) {
+            return cached.clone().map(UserMessageThumbnailSource::Decoded);
+        }
+        let decoded = data_url_image(uri);
+        if self.user_message_thumbnail_cache.len() >= USER_MESSAGE_THUMBNAIL_CACHE_LIMIT
+            && let Some(oldest) = self.user_message_thumbnail_cache.keys().next().copied()
+        {
+            self.user_message_thumbnail_cache.remove(&oldest);
+        }
+        self.user_message_thumbnail_cache
+            .insert(key, decoded.clone());
+        decoded.map(UserMessageThumbnailSource::Decoded)
     }
 
     /// The definite width this view's user message bodies may wrap at.
@@ -102870,25 +103126,7 @@ fn user_message_inline_document(
                 if label.is_empty() {
                     continue;
                 }
-                let composer_attachment = composer_attachment_from_message(
-                    attachment,
-                    format!("message-attachment:{segment_index}"),
-                );
-                let action = if composer_attachment.is_image() {
-                    // The message's attachment itself travels with the action:
-                    // a picture written by another client is a `data:` URL with
-                    // no path to resolve yet, and the preview writes it down
-                    // when the reader asks for it.
-                    Some(UserMessageAttachmentAction::PreviewImage(
-                        attachment.clone(),
-                    ))
-                } else {
-                    composer_attachment.path.as_deref().and_then(|path| {
-                        agent_file_operation_preview_path(path, workspace_root)
-                            .map(UserMessageAttachmentAction::OpenFile)
-                    })
-                };
-                if let Some(action) = action {
+                if let Some(action) = user_message_attachment_action(attachment, workspace_root) {
                     let key = format!("vibex-attachment:{segment_index}");
                     attachment_actions.insert(key.clone(), action);
                     source.push('[');
@@ -102917,6 +103155,265 @@ fn user_message_inline_document(
     }
 
     (source, Arc::new(attachment_actions))
+}
+
+/// Where a message's picture can be read for its thumbnail.
+enum UserMessageThumbnailSource {
+    /// A file the client can read directly; GPUI loads and caches it.
+    Path(PathBuf),
+    /// A `data:` URI decoded in this process, kept in the view's bounded
+    /// thumbnail memo so a redraw does not base64-decode the payload again.
+    Decoded(Arc<gpui::Image>),
+}
+
+/// What activating one of a message's attachments does.
+///
+/// The strip above the bubble and the inline label in its text resolve through
+/// this one function, so a picture and its thumbnail cannot open different
+/// things.
+fn user_message_attachment_action(
+    attachment: &MessageAttachment,
+    workspace_root: Option<&str>,
+) -> Option<UserMessageAttachmentAction> {
+    let composer_attachment = composer_attachment_from_message(attachment, String::new());
+    if composer_attachment.is_image() {
+        // The message's attachment itself travels with the action: a picture
+        // written by another client is a `data:` URL with no path to resolve
+        // yet, and the preview writes it down when the reader asks for it.
+        return Some(UserMessageAttachmentAction::PreviewImage(
+            attachment.clone(),
+        ));
+    }
+    let path = composer_attachment.path.as_deref()?;
+    // A file under the session's workspace travels as a workspace-relative
+    // path, which is what the code preview's tab identity expects. A file the
+    // reader attached from elsewhere (a packaged plugin beside the project, a
+    // download, a sibling checkout) must still get a card: the preview accepts
+    // absolute external paths unchanged, so falling back to one keeps the card
+    // and its click promise instead of silently dropping the attachment.
+    let destination = agent_file_operation_preview_path(path, workspace_root).or_else(|| {
+        let path = path.trim();
+        (Path::new(path).is_absolute() || is_windows_drive_path(path)).then(|| path.to_string())
+    })?;
+    Some(UserMessageAttachmentAction::OpenFile(destination))
+}
+
+/// The attachments a message carries, in the order its body mentions them.
+///
+/// A message with text around its pictures is read in that order; attachments
+/// the sending client wrote without an inline offset follow it, exactly as
+/// [`user_message_inline_document`] lays them out.
+fn user_message_attachments_in_display_order(
+    text: &str,
+    attachments: &[MessageAttachment],
+) -> Vec<MessageAttachment> {
+    user_message_inline_segments(text, attachments)
+        .into_iter()
+        .filter_map(|segment| match segment {
+            UserMessageInlineSegment::Attachment(attachment) => Some(attachment),
+            UserMessageInlineSegment::Text(_) => None,
+        })
+        .collect()
+}
+
+/// The short type word a file card's second line carries (`PDF`, `DOCX`, …).
+fn user_message_attachment_type_label(
+    attachment: &MessageAttachment,
+    locale: locale::ResolvedLocale,
+) -> SharedString {
+    let extension = attachment
+        .display_label()
+        .rsplit_once('.')
+        .map(|(_, extension)| extension.trim())
+        .filter(|extension| {
+            !extension.is_empty()
+                && extension.len() <= 8
+                && extension
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric())
+        })
+        .map(str::to_ascii_uppercase);
+    if let Some(extension) = extension {
+        return extension.into();
+    }
+    if let Some(subtype) = attachment
+        .mime_type
+        .as_deref()
+        .and_then(|mime_type| mime_type.split_once('/'))
+        .map(|(_, subtype)| subtype.trim())
+        .filter(|subtype| {
+            !subtype.is_empty()
+                && subtype.len() <= 8
+                && subtype
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric())
+        })
+    {
+        return subtype.to_ascii_uppercase().into();
+    }
+    locale::text_for(locale, "File", "文件", "檔案").into()
+}
+
+/// A cheap fingerprint for a `data:` URI used as a thumbnail cache key.
+///
+/// The payload can be megabytes, so hashing all of it every frame would trade
+/// one expensive decode for another. Length plus both ends changes whenever a
+/// picture changes in practice, and costs the same regardless of size.
+fn user_message_data_uri_key(uri: &str) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let bytes = uri.as_bytes();
+    bytes.len().hash(&mut hasher);
+    bytes[..bytes.len().min(256)].hash(&mut hasher);
+    bytes[bytes.len().saturating_sub(256)..].hash(&mut hasher);
+    hasher.finish()
+}
+
+/// How many rows `count` attachments of one kind need in a column.
+///
+/// The strip's rows wrap at the lane width, so the first-layout estimate has to
+/// count them the same way before the row is measured. A lane never reports
+/// zero rows for a non-empty count, even in a degenerate pane.
+fn user_message_attachment_rows(count: usize, item_width: f32, column_width: f32) -> usize {
+    if count == 0 {
+        return 0;
+    }
+    let per_row = (((column_width + USER_MESSAGE_ATTACHMENT_GAP_PX)
+        / (item_width + USER_MESSAGE_ATTACHMENT_GAP_PX))
+        .floor() as usize)
+        .max(1);
+    count.div_ceil(per_row)
+}
+
+/// One picture in the strip above a user message.
+///
+/// The library's `Attachment` would draw the square, but its click layer is a
+/// pointer-only overlay with no focus or keyboard activation. A picture is the
+/// whole control here, so it is a `Button` whose child is the image; focus,
+/// Enter/Space, hover, the tooltip and the accessible name all come from the
+/// component.
+fn render_user_message_image_tile(
+    row_id: &str,
+    index: usize,
+    attachment: &MessageAttachment,
+    source: UserMessageThumbnailSource,
+    action: UserMessageAttachmentAction,
+    entity: WeakEntity<VibexWorkbench>,
+    cx: &App,
+) -> Button {
+    let label: SharedString = attachment.display_label().to_string().into();
+    let action_label: SharedString = format!(
+        "{}: {label}",
+        locale::text("Preview image", "预览图片", "預覽圖片")
+    )
+    .into();
+    let fallback_color = cx.theme().muted_foreground;
+    let image = match source {
+        UserMessageThumbnailSource::Path(path) => img(path),
+        UserMessageThumbnailSource::Decoded(image) => img(image),
+    };
+    Button::new(SharedString::from(format!(
+        "user-message-attachment:{row_id}:{index}"
+    )))
+    .ghost()
+    .compact()
+    .p(px(2.0))
+    .size(px(USER_MESSAGE_ATTACHMENT_TILE_PX))
+    .rounded(cx.theme().radius_lg)
+    .overflow_hidden()
+    .bg(cx.theme().muted)
+    .tooltip(action_label.clone())
+    .accessibility_label(action_label)
+    .on_click(move |_, window, cx| {
+        let action = action.clone();
+        let _ = entity.update(cx, |this, cx| {
+            this.open_user_message_attachment(action, window, cx);
+        });
+    })
+    .child(
+        image
+            .size_full()
+            .rounded(cx.theme().radius)
+            .object_fit(ObjectFit::Cover)
+            .with_fallback(move || {
+                div()
+                    .size_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        Icon::new(IconName::File)
+                            .size(px(20.0))
+                            .text_color(fallback_color),
+                    )
+                    .into_any_element()
+            }),
+    )
+}
+
+/// One file in the strip under a user message's pictures.
+///
+/// This is the library's `Attachment` card: media, title, description and an
+/// actions slot. The visible `Open` button in that slot is the keyboard path;
+/// the card's own click layer is the pointer shortcut, so an accessible user
+/// never depends on the part that cannot take focus.
+fn render_user_message_file_card(
+    row_id: &str,
+    index: usize,
+    attachment: &MessageAttachment,
+    action: UserMessageAttachmentAction,
+    entity: WeakEntity<VibexWorkbench>,
+    locale: locale::ResolvedLocale,
+    cx: &App,
+) -> Attachment {
+    let label: SharedString = attachment.display_label().to_string().into();
+    let type_label = user_message_attachment_type_label(attachment, locale);
+    let open_label: SharedString = locale::text_for(locale, "Open", "打开", "開啟").into();
+    let action_label: SharedString = format!(
+        "{}: {label}",
+        locale::text_for(locale, "Open attachment", "打开附件", "開啟附件")
+    )
+    .into();
+    let card_id = SharedString::from(format!("user-message-attachment:{row_id}:{index}"));
+    let click_entity = entity.clone();
+    let click_action = action.clone();
+    Attachment::new()
+        .id(card_id.clone())
+        .tooltip(label.clone())
+        .media(
+            AttachmentMedia::new().child(
+                Icon::new(IconName::File)
+                    .size(px(20.0))
+                    .text_color(cx.theme().muted_foreground),
+            ),
+        )
+        .content(
+            AttachmentContent::new()
+                .title(AttachmentTitle::new(label))
+                .description(AttachmentDescription::new(type_label)),
+        )
+        .actions(
+            AttachmentActions::new().child(
+                Button::new(SharedString::from(format!("{card_id}:open")))
+                    .small()
+                    .ghost()
+                    .compact()
+                    .label(open_label)
+                    .tooltip(action_label.clone())
+                    .accessibility_label(action_label)
+                    .on_click(move |_, window, cx| {
+                        let action = action.clone();
+                        let _ = entity.update(cx, |this, cx| {
+                            this.open_user_message_attachment(action, window, cx);
+                        });
+                    }),
+            ),
+        )
+        .on_click(move |_, window, cx| {
+            let action = click_action.clone();
+            let _ = click_entity.update(cx, |this, cx| {
+                this.open_user_message_attachment(action, window, cx);
+            });
+        })
 }
 
 fn render_user_message_delivery_button(
@@ -102976,18 +103473,63 @@ fn render_user_message_goal_button(row_id: &str, cx: &App) -> Button {
         .tooltip(label)
 }
 
+/// The friendly reactions a user message wears while the agent works.
+///
+/// Deliberately small and non-committal: a reaction here means "received and
+/// working", not "finished" or "this is great". The array is the selection
+/// wheel; a stable hash picks one.
+const USER_MESSAGE_WORKING_REACTIONS: [&str; 7] = ["👀", "🤔", "👍", "💪", "❤️", "🫶", "🚀"];
+
+/// Pick the reaction a user message wears while its turn is being worked.
+///
+/// Hash the message's turn rather than sampling a random source: the same turn
+/// in a second pane, or after a restart, must not change expression mid-work,
+/// and a render must never advance the pick.
+fn user_message_working_reaction(seed: &str) -> &'static str {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in seed.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    USER_MESSAGE_WORKING_REACTIONS[(hash % USER_MESSAGE_WORKING_REACTIONS.len() as u64) as usize]
+}
+
 /// The bubble's lower-edge reaction region, holding every mark the row earned.
 ///
-/// Both marks share one pill: the goal badge sits inboard of the delivery
-/// accent so the delivery hue keeps the corner it has always held.
+/// The working receipt leads; the goal badge and delivery accent keep the
+/// trailing corner. All share one pill so the row does not grow a second
+/// floating surface.
 fn render_user_message_edge_reactions(
     row_id: &str,
     delivery: UserMessageDelivery,
     is_goal_message: bool,
+    working_reaction: Option<&'static str>,
     cx: &App,
 ) -> Option<BubbleReactions> {
     let mut reactions = BubbleReactions::new();
     let mut has_mark = false;
+    let has_action = is_goal_message || delivery != UserMessageDelivery::Prompt;
+    if let Some(emoji) = working_reaction {
+        reactions = reactions.child(
+            div()
+                .id(SharedString::from(format!(
+                    "user-message-working-reaction:{row_id}"
+                )))
+                .flex()
+                .items_center()
+                // A reaction that shares the pill with an action loses the
+                // library's decorative padding, so it pays for its own inset.
+                .when(has_action, |this| this.px(px(6.0)))
+                .text_base()
+                .aria_label(locale::text(
+                    "AI is working on this message",
+                    "AI 正在处理这条消息",
+                    "AI 正在處理這則訊息",
+                ))
+                .child(emoji),
+        );
+        has_mark = true;
+    }
     if is_goal_message {
         reactions = reactions.action(render_user_message_goal_button(row_id, cx));
         has_mark = true;
@@ -123521,6 +124063,192 @@ mod tests {
     }
 
     #[test]
+    fn user_message_attachment_strip_stacks_pictures_above_files() {
+        let source = include_str!("app.rs");
+        let strip = source
+            .split_once("    fn render_user_message_attachment_strip(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// Resolve one message picture"))
+            .map(|(body, _)| body)
+            .expect("attachment strip should remain inspectable");
+
+        assert!(strip.contains("user_message_attachments_in_display_order"));
+        assert!(strip.contains("image_tiles"));
+        assert!(strip.contains("file_cards"));
+        assert!(strip.contains(".flex_wrap()"));
+        assert!(strip.contains(".justify_end()"));
+
+        // Pictures are one row, files are the row beneath them, and the strip
+        // hands both to the bubble from the same trailing edge.
+        let image_row = strip
+            .find(".when_some(image_row")
+            .expect("the picture row should be drawn first");
+        let file_row = strip
+            .find(".when_some(file_row")
+            .expect("the file row should follow the picture row");
+        assert!(image_row < file_row);
+    }
+
+    #[test]
+    fn user_message_attachment_rows_wrap_into_lanes() {
+        // A 500px column holds seven 64px pictures plus their gaps.
+        assert_eq!(user_message_attachment_rows(7, 64.0, 500.0), 1);
+        assert_eq!(user_message_attachment_rows(8, 64.0, 500.0), 2);
+        // Two 232px file cards fit; the third starts a second lane.
+        assert_eq!(user_message_attachment_rows(2, 232.0, 500.0), 1);
+        assert_eq!(user_message_attachment_rows(3, 232.0, 500.0), 2);
+        assert_eq!(user_message_attachment_rows(0, 232.0, 500.0), 0);
+    }
+
+    #[test]
+    fn user_message_attachment_type_label_prefers_extension_then_mime() {
+        let pdf = MessageAttachment {
+            label: "sales-dashboard.pdf".into(),
+            mime_type: Some("application/pdf".into()),
+            uri: None,
+            inline_text_offset: None,
+        };
+        assert_eq!(
+            user_message_attachment_type_label(&pdf, locale::ResolvedLocale::En).as_ref(),
+            "PDF"
+        );
+
+        let zipped = MessageAttachment {
+            label: "download".into(),
+            mime_type: Some("application/zip".into()),
+            uri: None,
+            inline_text_offset: None,
+        };
+        assert_eq!(
+            user_message_attachment_type_label(&zipped, locale::ResolvedLocale::En).as_ref(),
+            "ZIP"
+        );
+
+        let bare = MessageAttachment {
+            label: "untitled".into(),
+            mime_type: None,
+            uri: None,
+            inline_text_offset: None,
+        };
+        assert_eq!(
+            user_message_attachment_type_label(&bare, locale::ResolvedLocale::En).as_ref(),
+            "File"
+        );
+    }
+
+    #[test]
+    fn user_message_attachment_action_matches_the_inline_link() {
+        let image = MessageAttachment {
+            label: "shot.png".into(),
+            mime_type: Some("image/png".into()),
+            uri: Some("data:image/png;base64,AA".into()),
+            inline_text_offset: Some(0),
+        };
+        assert!(matches!(
+            user_message_attachment_action(&image, Some("/work/vibex")),
+            Some(UserMessageAttachmentAction::PreviewImage(_))
+        ));
+
+        let file = MessageAttachment {
+            label: "README.md".into(),
+            mime_type: Some("text/markdown".into()),
+            uri: Some("file:///work/vibex/README.md".into()),
+            inline_text_offset: Some(0),
+        };
+        assert_eq!(
+            user_message_attachment_action(&file, Some("/work/vibex")),
+            Some(UserMessageAttachmentAction::OpenFile("README.md".into()))
+        );
+
+        // A plugin package beside the project is outside the workspace. Its
+        // card still has to appear, so the action keeps the absolute path the
+        // preview accepts for an external file.
+        let outside = MessageAttachment {
+            label: "dev.vibex.todo-1.1.0.vplug".into(),
+            mime_type: None,
+            uri: Some("file:///work/vibex-plugin/packages/dev.vibex.todo-1.1.0.vplug".into()),
+            inline_text_offset: Some(0),
+        };
+        assert_eq!(
+            user_message_attachment_action(&outside, Some("/work/vibex")),
+            Some(UserMessageAttachmentAction::OpenFile(
+                "/work/vibex-plugin/packages/dev.vibex.todo-1.1.0.vplug".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn user_message_file_card_uses_the_library_attachment_parts() {
+        let source = include_str!("app.rs");
+        let card = source
+            .split_once("fn render_user_message_file_card(")
+            .and_then(|(_, tail)| tail.split_once("\nfn render_user_message_delivery_button("))
+            .map(|(body, _)| body)
+            .expect("file card helper should remain inspectable");
+
+        assert!(card.contains("Attachment::new()"));
+        assert!(card.contains("AttachmentMedia::new()"));
+        assert!(card.contains("AttachmentContent::new()"));
+        assert!(card.contains("AttachmentTitle::new("));
+        assert!(card.contains("AttachmentDescription::new("));
+        assert!(card.contains("AttachmentActions::new()"));
+        assert!(card.contains("Button::new("));
+        assert!(card.contains(".accessibility_label("));
+    }
+
+    #[test]
+    fn user_message_working_reaction_is_stable_and_covers_the_wheel() {
+        assert_eq!(
+            USER_MESSAGE_WORKING_REACTIONS,
+            ["👀", "🤔", "👍", "💪", "❤️", "🫶", "🚀"]
+        );
+
+        let mut seen = BTreeSet::new();
+        for index in 0..256 {
+            let seed = format!("turn-{index}");
+            let reaction = user_message_working_reaction(&seed);
+            // The same message in another pane, or after a restart, keeps the
+            // expression it already showed.
+            assert_eq!(reaction, user_message_working_reaction(&seed));
+            assert!(USER_MESSAGE_WORKING_REACTIONS.contains(&reaction));
+            seen.insert(reaction);
+        }
+        assert_eq!(
+            seen.len(),
+            USER_MESSAGE_WORKING_REACTIONS.len(),
+            "every friendly reaction should be reachable"
+        );
+    }
+
+    #[test]
+    fn user_message_working_reaction_only_rides_a_live_turn() {
+        let source = include_str!("app.rs");
+        let row = source
+            .split_once("    fn render_user_message_row(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_agent_message_row("))
+            .map(|(body, _)| body)
+            .expect("user message row should remain inspectable");
+
+        assert!(row.contains("latest_user_message"));
+        assert!(row.contains("!turn_complete"));
+        assert!(row.contains("RuntimeStatus::Ready"));
+        assert!(row.contains("session_turn_pending"));
+        assert!(row.contains("user_message_working_reaction("));
+        assert!(!row.contains("rand::"));
+
+        let reactions = source
+            .split_once("fn render_user_message_edge_reactions(")
+            .and_then(|(_, tail)| tail.split_once("\n/// The strip an edge-anchored reaction"))
+            .map(|(body, _)| body)
+            .expect("edge reaction region should remain inspectable");
+
+        assert!(reactions.contains("working_reaction"));
+        assert!(reactions.contains("BubbleReactions::new()"));
+        // The receipt is a child of the pill, not an action button.
+        assert!(reactions.contains(".child(emoji)"));
+        assert!(reactions.contains("AI is working on this message"));
+    }
+
+    #[test]
     fn inline_composer_file_attachments_use_the_multi_tab_open_path() {
         let source = include_str!("app.rs");
         let renderer = source
@@ -131634,6 +132362,7 @@ mod tests {
                 "delivery-probe",
                 self.delivery.get(),
                 false,
+                None,
                 cx,
             )
             .map(|reactions| {
@@ -131708,6 +132437,7 @@ mod tests {
                 "goal-badge-probe",
                 UserMessageDelivery::Prompt,
                 self.is_goal_message.get(),
+                None,
                 cx,
             )
             .map(|reactions| {
