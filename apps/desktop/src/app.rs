@@ -66036,18 +66036,21 @@ impl VibexWorkbench {
             .pb_5();
 
         // The receipt waits for evidence that the agent took the message, not
-        // merely that the client sent it.
-        let session_working = self
-            .timeline
-            .session_id
-            .as_ref()
-            .and_then(|session_id| self.registered_session(session_id.as_str()))
-            .is_some_and(|session| {
-                matches!(
-                    session.state,
-                    AgentSessionState::Running | AgentSessionState::NeedsInput
-                )
-            });
+        // merely that the client sent it. Only the conversation's last turn can
+        // be the one a running session is working on; an older turn proves it
+        // started from its own output or its settled state.
+        let session_working = is_last
+            && self
+                .timeline
+                .session_id
+                .as_ref()
+                .and_then(|session_id| self.registered_session(session_id.as_str()))
+                .is_some_and(|session| {
+                    matches!(
+                        session.state,
+                        AgentSessionState::Running | AgentSessionState::NeedsInput
+                    )
+                });
         let turn_started = user_message_turn_started(
             turn.failed,
             turn.complete,
@@ -71100,13 +71103,12 @@ impl VibexWorkbench {
         // or turn id, so replacing the optimistic item cannot change it
         // mid-work. It appears once the turn has started and stays after the
         // turn settles; `complete` only changes what the label says.
-        let reaction =
-            user_message_reaction_visible(turn.latest, turn.started, editing).then(|| {
-                (
-                    user_message_reaction(&user_message_reaction_seed(&row.body, &attachments)),
-                    turn.working,
-                )
-            });
+        let reaction = user_message_reaction_visible(turn.started, editing).then(|| {
+            (
+                user_message_reaction(&user_message_reaction_seed(&row.body, &attachments)),
+                turn.working,
+            )
+        });
         let inline_content = if editing {
             self.render_inline_user_message_editor(&row.id, cx)
         } else {
@@ -103544,17 +103546,14 @@ fn user_message_reaction_seed(text: &str, attachments: &[MessageAttachment]) -> 
     seed
 }
 
-/// Whether a user message has a receipt yet.
+/// Whether a user message has a receipt.
 ///
 /// A receipt is not a read receipt for the send: it appears only once the turn
-/// has started, and it stays once the turn settles. Editing the message swaps
-/// it for the editor, and only the conversation's latest turn wears one.
-fn user_message_reaction_visible(
-    latest_user_message: bool,
-    turn_started: bool,
-    editing: bool,
-) -> bool {
-    !editing && latest_user_message && turn_started
+/// has started, and it stays once the turn settles. A later message must not
+/// take it away from the message whose turn it acknowledges; editing that
+/// message swaps it for the editor.
+fn user_message_reaction_visible(turn_started: bool, editing: bool) -> bool {
+    !editing && turn_started
 }
 
 /// Whether a turn has started the work its receipt acknowledges.
@@ -124325,11 +124324,11 @@ mod tests {
         // A failed turn never wears a receipt.
         assert!(!user_message_turn_started(true, true, true, true, true));
 
-        // Only the latest turn's message shows it, and never while editing.
-        assert!(user_message_reaction_visible(true, true, false));
-        assert!(!user_message_reaction_visible(false, true, false));
-        assert!(!user_message_reaction_visible(true, false, false));
-        assert!(!user_message_reaction_visible(true, true, true));
+        // A started turn keeps its receipt even after later messages arrive;
+        // an unstarted turn and edit mode do not show one.
+        assert!(user_message_reaction_visible(true, false));
+        assert!(!user_message_reaction_visible(false, false));
+        assert!(!user_message_reaction_visible(true, true));
     }
 
     #[test]
