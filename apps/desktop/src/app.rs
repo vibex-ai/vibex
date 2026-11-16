@@ -1407,7 +1407,10 @@ const SETTINGS_DIALOG_RADIUS: f32 = 12.0;
 const SETTINGS_DIALOG_CONTENT_RADIUS: f32 = SETTINGS_DIALOG_RADIUS - 1.0;
 /// Leading and trailing inset of every settings page. The appearance preview
 /// cards measure their row from the same value, so they line up with the panel.
-const SETTINGS_PAGE_PADDING_X: f32 = 70.0;
+///
+/// A settings surface with its own page body — the IM channels master–detail —
+/// reads this too, so its title shares the settings alignment spine.
+pub(crate) const SETTINGS_PAGE_PADDING_X: f32 = 70.0;
 
 /// A route's failover prompt, with the seconds it has left.
 ///
@@ -101950,7 +101953,10 @@ fn resolve_release_channel(
 /// Both the appearance preview cards, which flex to a third of it, and the
 /// stacked-or-inline decision for setting rows measure against this: what a row
 /// can hold depends on the page it is drawn on, not on the window around it.
-fn settings_page_width(viewport_width: f32) -> f32 {
+///
+/// A settings surface with its own page body (the IM channel master–detail)
+/// reads it too, so it stacks at the same page widths the row-based pages do.
+pub(crate) fn settings_page_width(viewport_width: f32) -> f32 {
     let dialog_width = (viewport_width - 32.0).clamp(1.0, SETTINGS_DIALOG_MAX_WIDTH);
     let navigation_width = if viewport_width >= SETTINGS_VERTICAL_TABS_MIN_WIDTH {
         SETTINGS_NAVIGATION_WIDTH

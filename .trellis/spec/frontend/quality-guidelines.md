@@ -584,6 +584,78 @@ composited over an already-dim surface**.
   must be composited over its surface before it is measured.
 
 
+## Convention: Panel Results Are Hints, Never In-Panel Strips
+
+A result is not a piece of the panel's layout. A success, failure, or progress
+message that an action produced — create, save, delete, test, generate a code,
+apply a filter — must be handed to the window's top hint layer. The panel must
+not paint a fixed, non-dismissible strip above its own controls.
+
+**Why.** A strip sits between the reader and the controls it describes, pushes
+the form down after the click that caused it, and cannot be dismissed; it also
+competes with the primary task for the panel's one focal point. The hint layer
+already paints above every dialog backdrop (`hint_layer::push` is deferred at
+`HINT_LAYER_PRIORITY`, between the dialog band and the popup band), so a result
+raised from a settings dialog stays legible over that dialog without becoming
+part of it. The same rule already governs mobile as
+[Mobile Notices Are Toasts](#convention-mobile-notices-are-toasts); this is its
+desktop form.
+
+**How.**
+
+- The page keeps a `pending_hint: Option<PendingHint>` and nothing paints from a
+  "current notice" field, so a message cannot outlive the action it described.
+- A completion queues the hint (`hint(tone, message)`); `render` takes it and
+  calls `window.defer(cx, ...)` before pushing, so the layer is mutated between
+  frames, not during render.
+- The push sets `Theme::global_mut(cx).notification.placement = Anchor::TopCenter`
+  and calls `hint_layer::push(window, hint_notification(tone, message)
+  .id::<SomeHintFamily>(), cx)`. One private zero-sized type per page gives the
+  page its own replace-by-id family.
+- Error hints may stay until dismissed (`autohide(false)`); success and info
+  hints autohide. A hint whose action produced something the reader must copy —
+  a pairing code, a URL — carries it as `Hint::copy_text` instead of relying on
+  selection inside the panel.
+- The one exception is field-scoped validation that belongs to the control the
+  reader is filling in, and it must be dismissible with the surface that owns
+  it. Generic action results are never an in-panel strip.
+
+**Example** — `apps/desktop/src/im_channels.rs` is the reference:
+
+```rust
+fn hint(&mut self, tone: NotificationType, message: impl Into<SharedString>) {
+    self.pending_hint = Some(PendingHint { tone, message: message.into(), copy_text: None });
+}
+
+fn present_hint(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    let Some(pending) = self.pending_hint.take() else { return };
+    window.defer(cx, move |window, cx| {
+        Theme::global_mut(cx).notification.placement = Anchor::TopCenter;
+        hint_layer::push(
+            window,
+            hint_notification(pending.tone, pending.message)
+                .id::<ImChannelHint>()
+                .autohide(!matches!(pending.tone, NotificationType::Error)),
+            cx,
+        );
+    });
+}
+```
+
+**Wrong vs Correct**
+
+```text
+Wrong: self.notice = Some("Channel deleted.");  ->  a green strip pinned at the
+       top of the panel, pushing the form down, with no way to dismiss it.
+Correct: self.hint(NotificationType::Success, "Channel deleted.");  ->  a
+         top-centered hint card above the dialog, replaced by the next result.
+```
+
+**Related**: `apps/desktop/src/hint_layer.rs` (the layer), and the mobile
+counterpart below. Review any new panel for a `.when_some(self.error…, …)` or
+`.when_some(self.notice…, …)` strip before shipping it.
+
+
 ## Convention: Mobile Notices Are Toasts
 
 A phone shows one narrow column of content, so a notice never takes a line in a

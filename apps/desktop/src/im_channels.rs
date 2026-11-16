@@ -1,51 +1,78 @@
 //! IM channel settings page.
 //!
-//! The page owns its async state instead of mirroring it on the workbench: a
-//! channel create, test, or pairing-code request is a network round trip, and
-//! rebuilding the whole settings tree while it runs would lose focus in the
-//! form. The workbench only supplies the backend facade.
+//! The page is a master–detail surface: the channels a runtime knows sit in a
+//! list lane, the selected channel fills the work area, and adding a channel is
+//! a step in that work area rather than a second form stacked on the page. The
+//! page owns its async state instead of mirroring it on the workbench: a create,
+//! test, or pairing-code request is a network round trip, and rebuilding the
+//! settings tree while it runs would lose focus in the form.
+//!
+//! Results never become a strip pinned inside the page. The workbench's hint
+//! layer already carries action feedback above every dialog, so this page hands
+//! it a light hint like the rest of settings; see
+//! `.trellis/spec/frontend/quality-guidelines.md`.
 
 use gpui::{
-    AnyElement, App, Context, Entity, IntoElement, ParentElement as _, Render, Styled as _,
-    WeakEntity, Window, div, prelude::*, px,
+    Anchor, AnyElement, App, Context, Entity, Hsla, IntoElement, ParentElement as _, Render,
+    SharedString, Styled as _, WeakEntity, Window, div, prelude::*, px,
 };
 use gpui_component::{
-    ActiveTheme as _, Disableable as _, Sizable as _, StyledExt as _,
+    ActiveTheme as _, Disableable as _, Selectable as _, Sizable as _, StyledExt as _, Theme,
+    WindowExt as _,
     button::{Button, ButtonVariants as _},
+    dialog::{DialogAction, DialogClose, DialogFooter},
     h_flex,
     input::{Input, InputState},
+    notification::NotificationType,
     switch::Switch,
     v_flex,
 };
 use vibex_backend::BackendError;
 use vibex_core::{
     AgentSession, ImBindingSummary, ImChannelConfig, ImChannelDraft, ImChannelId, ImChannelKind,
-    ImChannelSummary, ImLarkConfig, ImLarkRegion, ImLarkTransport, ImPairingCodeInfo,
-    ImPairingRequest, ImPrincipalId, ImPrincipalSummary, ImSessionDefaults, ImTelegramConfig,
+    ImChannelSummary, ImPairingCodeInfo, ImPairingRequest, ImPrincipalId, ImPrincipalSummary,
+    ImSessionDefaults, ImTelegramConfig,
 };
 
-use crate::app::VibexWorkbench;
+use crate::app::{SETTINGS_PAGE_PADDING_X, VibexWorkbench, settings_page_width};
+use crate::hint_layer::{self, hint_notification};
 use crate::locale;
+use crate::theme;
+
+/// One hint family for this page: a newer IM result replaces the older card.
+struct ImChannelHint;
+
+/// The channel list lane. Wide enough for the names a bot carries, visibly
+/// narrower than the work area.
+const CHANNEL_LANE_WIDTH: f32 = 224.0;
+/// The page width below which the lane and the work area stack instead of
+/// sitting side by side, so the detail never gets a column too narrow to read.
+const CHANNEL_LANE_MIN_PAGE_WIDTH: f32 = 560.0;
+/// How many recent sessions the default-session picker offers.
+const DEFAULT_SESSION_CHOICES: usize = 5;
+
+/// A result waiting for the window's hint layer.
+struct PendingHint {
+    tone: NotificationType,
+    message: SharedString,
+    copy_text: Option<SharedString>,
+}
 
 pub struct ImChannelsView {
     workbench: WeakEntity<VibexWorkbench>,
     name_input: Entity<InputState>,
     token_input: Entity<InputState>,
     chat_input: Entity<InputState>,
-    lark_app_id_input: Entity<InputState>,
-    lark_app_secret_input: Entity<InputState>,
-    lark_chat_input: Entity<InputState>,
     telegram_topic_mode: bool,
-    /// Which Lark deployment the app was created in.
-    lark_region: ImLarkRegion,
     channels: Vec<ImChannelSummary>,
     selected: Option<ImChannelId>,
+    /// The add-channel step is showing in the work area.
+    adding: bool,
     principals: Vec<ImPrincipalSummary>,
     bindings: Vec<ImBindingSummary>,
     default_sessions: Vec<AgentSession>,
     pairing: Option<ImPairingCodeInfo>,
-    notice: Option<String>,
-    error: Option<String>,
+    pending_hint: Option<PendingHint>,
     loading: bool,
     loaded: bool,
     busy: bool,
@@ -62,30 +89,20 @@ impl ImChannelsView {
         let token_input = cx.new(|cx| InputState::new(window, cx).placeholder("123456:ABC-DEF..."));
         let chat_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("-1001234567890 or @channel"));
-        let lark_app_id_input =
-            cx.new(|cx| InputState::new(window, cx).placeholder("cli_xxxxxxxxx"));
-        let lark_app_secret_input =
-            cx.new(|cx| InputState::new(window, cx).placeholder("Lark app secret"));
-        let lark_chat_input =
-            cx.new(|cx| InputState::new(window, cx).placeholder("oc_xxxxxxxxx (optional)"));
         Self {
             workbench,
             name_input,
             token_input,
             chat_input,
-            lark_app_id_input,
-            lark_app_secret_input,
-            lark_chat_input,
             telegram_topic_mode: false,
-            lark_region: ImLarkRegion::Feishu,
             channels: Vec::new(),
             selected: None,
+            adding: false,
             principals: Vec::new(),
             bindings: Vec::new(),
             default_sessions: Vec::new(),
             pairing: None,
-            notice: None,
-            error: None,
+            pending_hint: None,
             loading: false,
             loaded: false,
             busy: false,
@@ -104,16 +121,62 @@ impl ImChannelsView {
         self.reload(cx);
     }
 
+    /// Queues a result for the window's top hint layer.
+    fn hint(&mut self, tone: NotificationType, message: impl Into<SharedString>) {
+        self.pending_hint = Some(PendingHint {
+            tone,
+            message: message.into(),
+            copy_text: None,
+        });
+    }
+
+    fn hint_with_copy(
+        &mut self,
+        tone: NotificationType,
+        message: impl Into<SharedString>,
+        copy_text: impl Into<SharedString>,
+    ) {
+        self.pending_hint = Some(PendingHint {
+            tone,
+            message: message.into(),
+            copy_text: Some(copy_text.into()),
+        });
+    }
+
+    /// Hands the queued result to the hint layer on the next frame.
+    ///
+    /// The push is deferred so it never mutates a plugin entity while the page
+    /// is being rendered, and it lands above the settings dialog's backdrop
+    /// like every other settings result.
+    fn present_hint(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(pending) = self.pending_hint.take() else {
+            return;
+        };
+        window.defer(cx, move |window, cx| {
+            Theme::global_mut(cx).notification.placement = Anchor::TopCenter;
+            let hint = hint_notification(pending.tone, pending.message)
+                .id::<ImChannelHint>()
+                .autohide(!matches!(pending.tone, NotificationType::Error));
+            let hint = match pending.copy_text {
+                Some(copy_text) => hint.copy_text(copy_text),
+                None => hint,
+            };
+            hint_layer::push(window, hint, cx);
+        });
+    }
+
     fn reload(&mut self, cx: &mut Context<Self>) {
         if self.loading {
             return;
         }
         self.loading = true;
-        self.error = None;
         let Some(backend) = self.backend(cx) else {
             self.loading = false;
             self.loaded = true;
-            self.error = Some("The runtime has no active backend.".to_string());
+            self.hint(
+                NotificationType::Error,
+                "The runtime has no active backend.".to_string(),
+            );
             cx.notify();
             return;
         };
@@ -142,10 +205,9 @@ impl ImChannelsView {
                             if this.selected.is_some() {
                                 this.reload_selected(cx);
                             }
-                            this.error = None;
                         }
-                        Ok(Err(error)) => this.error = Some(error),
-                        Err(error) => this.error = Some(error.to_string()),
+                        Ok(Err(error)) => this.hint(NotificationType::Error, error),
+                        Err(error) => this.hint(NotificationType::Error, error.to_string()),
                     }
                     cx.notify();
                 });
@@ -200,116 +262,24 @@ impl ImChannelsView {
                 let bindings = bindings.await;
                 let sessions = sessions.await;
                 let _ = weak.update(cx, |this, cx| {
+                    let mut failures = Vec::new();
                     match principals {
                         Ok(Ok(principals)) => this.principals = principals,
-                        Ok(Err(error)) => this.error = Some(error),
-                        Err(error) => this.error = Some(error.to_string()),
+                        Ok(Err(error)) => failures.push(error),
+                        Err(error) => failures.push(error.to_string()),
                     }
                     match bindings {
                         Ok(Ok(bindings)) => this.bindings = bindings,
-                        Ok(Err(error)) => this.error = Some(error),
-                        Err(error) => this.error = Some(error.to_string()),
+                        Ok(Err(error)) => failures.push(error),
+                        Err(error) => failures.push(error.to_string()),
                     }
                     match sessions {
                         Ok(Ok(sessions)) => this.default_sessions = sessions,
-                        Ok(Err(error)) => this.error = Some(error),
-                        Err(error) => this.error = Some(error.to_string()),
+                        Ok(Err(error)) => failures.push(error),
+                        Err(error) => failures.push(error.to_string()),
                     }
-                    cx.notify();
-                });
-            },
-        ));
-    }
-
-    fn create_lark_channel(&mut self, cx: &mut Context<Self>) {
-        if self.busy {
-            return;
-        }
-        let app_id = self.lark_app_id_input.read(cx).value().to_string();
-        let app_secret = self.lark_app_secret_input.read(cx).value().to_string();
-        let chat_id = self.lark_chat_input.read(cx).value().to_string();
-        let region = self.lark_region;
-        if app_id.trim().is_empty() || app_secret.trim().is_empty() {
-            self.error = Some("Lark app id and app secret are required.".to_string());
-            cx.notify();
-            return;
-        }
-        let Some(backend) = self.backend(cx) else {
-            self.error = Some("The runtime has no active backend.".to_string());
-            cx.notify();
-            return;
-        };
-        self.busy = true;
-        self.error = None;
-        self.notice = None;
-        // Enabling the channel connects the adapter, and the adapter spawns its
-        // long connection onto the Tokio runtime. The work has to be started
-        // there; polling it on the UI executor panics with "there is no reactor
-        // running".
-        let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            let display_name = if chat_id.trim().is_empty() {
-                "Lark bot".to_string()
-            } else {
-                chat_id.trim().to_string()
-            };
-            let draft = ImChannelDraft {
-                display_name,
-                config: ImChannelConfig::Lark(ImLarkConfig {
-                    app_id: app_id.trim().to_string(),
-                    chat_id: (!chat_id.trim().is_empty()).then(|| chat_id.trim().to_string()),
-                    transport: ImLarkTransport::LongConnection,
-                    region,
-                }),
-                default_session: None,
-                event_filter: Vec::new(),
-                locale: None,
-            };
-            async {
-                let channel = backend
-                    .management()
-                    .create_im_channel(vibex_backend::MutationRequest::new(draft))
-                    .await
-                    .map_err(backend_error)?;
-                backend
-                    .management()
-                    .set_im_channel_app_secret(vibex_backend::MutationRequest::new(
-                        vibex_backend::ImChannelAppSecretUpdateRequest {
-                            channel_id: channel.channel_id.clone(),
-                            app_secret: app_secret.trim().to_string(),
-                        },
-                    ))
-                    .await
-                    .map_err(backend_error)?;
-                backend
-                    .management()
-                    .set_im_channel_enabled(vibex_backend::MutationRequest::new(
-                        vibex_backend::ImChannelEnabledRequest {
-                            channel_id: channel.channel_id,
-                            enabled: true,
-                        },
-                    ))
-                    .await
-                    .map(|_| ())
-                    .map_err(backend_error)
-            }
-            .await
-        });
-        self.task = Some(cx.spawn(
-            async move |weak: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
-                let result = match runner.await {
-                    Ok(result) => result,
-                    Err(error) => Err(error.to_string()),
-                };
-                let _ = weak.update(cx, |this, cx| {
-                    this.busy = false;
-                    match result {
-                        Ok(()) => {
-                            this.notice = Some("Lark channel created. Generate a pairing code, then send /pair <code> in a direct message.".to_string());
-                            this.loaded = false;
-                            this.loading = false;
-                            this.reload(cx);
-                        }
-                        Err(error) => this.error = Some(error),
+                    if let Some(message) = failures.into_iter().next() {
+                        this.hint(NotificationType::Error, message);
                     }
                     cx.notify();
                 });
@@ -326,18 +296,27 @@ impl ImChannelsView {
         let chat_id = self.chat_input.read(cx).value().to_string();
         let topic_mode = self.telegram_topic_mode;
         if name.trim().is_empty() || token.trim().is_empty() || chat_id.trim().is_empty() {
-            self.error = Some("Name, bot token, and chat id are required.".to_string());
+            self.hint(
+                NotificationType::Error,
+                locale::text(
+                    "A name, a bot token, and a chat id are required.",
+                    "需要填写名称、Bot token 和聊天 ID。",
+                    "需要填寫名稱、Bot token 和聊天 ID。",
+                )
+                .to_string(),
+            );
             cx.notify();
             return;
         }
         let Some(backend) = self.backend(cx) else {
-            self.error = Some("The runtime has no active backend.".to_string());
+            self.hint(
+                NotificationType::Error,
+                "The runtime has no active backend.".to_string(),
+            );
             cx.notify();
             return;
         };
         self.busy = true;
-        self.error = None;
-        self.notice = None;
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
             let draft = ImChannelDraft {
                 display_name: name.trim().to_string(),
@@ -350,40 +329,33 @@ impl ImChannelsView {
                 event_filter: Vec::new(),
                 locale: None,
             };
-            let created = backend
+            let channel = backend
                 .management()
                 .create_im_channel(vibex_backend::MutationRequest::new(draft))
                 .await
-                .map_err(backend_error);
-            match created {
-                Ok(channel) => {
-                    let token_result = backend
-                        .management()
-                        .set_im_channel_bot_token(vibex_backend::MutationRequest::new(
-                            vibex_backend::ImChannelSecretUpdateRequest {
-                                channel_id: channel.channel_id.clone(),
-                                bot_token: token.trim().to_string(),
-                            },
-                        ))
-                        .await
-                        .map_err(backend_error);
-                    match token_result {
-                        Ok(()) => backend
-                            .management()
-                            .set_im_channel_enabled(vibex_backend::MutationRequest::new(
-                                vibex_backend::ImChannelEnabledRequest {
-                                    channel_id: channel.channel_id,
-                                    enabled: true,
-                                },
-                            ))
-                            .await
-                            .map(|_| ())
-                            .map_err(backend_error),
-                        Err(error) => Err(error),
-                    }
-                }
-                Err(error) => Err(error),
-            }
+                .map_err(backend_error)?;
+            let channel_id = channel.channel_id.clone();
+            backend
+                .management()
+                .set_im_channel_bot_token(vibex_backend::MutationRequest::new(
+                    vibex_backend::ImChannelSecretUpdateRequest {
+                        channel_id: channel_id.clone(),
+                        bot_token: token.trim().to_string(),
+                    },
+                ))
+                .await
+                .map_err(backend_error)?;
+            backend
+                .management()
+                .set_im_channel_enabled(vibex_backend::MutationRequest::new(
+                    vibex_backend::ImChannelEnabledRequest {
+                        channel_id: channel_id.clone(),
+                        enabled: true,
+                    },
+                ))
+                .await
+                .map_err(backend_error)?;
+            Ok::<ImChannelId, String>(channel_id)
         });
         self.task = Some(cx.spawn(async move |weak: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
             let result = match runner.await {
@@ -393,13 +365,24 @@ impl ImChannelsView {
             let _ = weak.update(cx, |this, cx| {
                 this.busy = false;
                 match result {
-                    Ok(()) => {
-                        this.notice = Some("Telegram channel created. Generate a pairing code, then send /pair <code> in a direct message.".to_string());
+                    Ok(channel_id) => {
+                        this.adding = false;
+                        this.selected = Some(channel_id);
+                        this.pairing = None;
+                        this.hint(
+                            NotificationType::Success,
+                            locale::text(
+                                "Telegram channel added. Generate a pairing code, then send /pair <code> in a direct message.",
+                                "Telegram 频道已添加。生成配对码，然后在私聊中发送 /pair <配对码>。",
+                                "Telegram 頻道已新增。產生配對碼，然後在私聊中傳送 /pair <配對碼>。",
+                            )
+                            .to_string(),
+                        );
                         this.loaded = false;
                         this.loading = false;
                         this.reload(cx);
                     }
-                    Err(error) => this.error = Some(error),
+                    Err(error) => this.hint(NotificationType::Error, error),
                 }
                 cx.notify();
             });
@@ -437,7 +420,7 @@ impl ImChannelsView {
                             this.loading = false;
                             this.reload(cx);
                         }
-                        Err(error) => this.error = Some(error),
+                        Err(error) => this.hint(NotificationType::Error, error),
                     }
                     cx.notify();
                 });
@@ -469,12 +452,72 @@ impl ImChannelsView {
                             this.loading = false;
                             this.reload(cx);
                         }
-                        Err(error) => this.error = Some(error),
+                        Err(error) => this.hint(NotificationType::Error, error),
                     }
                     cx.notify();
                 });
             },
         ));
+    }
+
+    /// Confirms before deleting, because the channel's secret goes with it.
+    fn confirm_delete(
+        &mut self,
+        channel_id: ImChannelId,
+        display_name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let entity = cx.weak_entity();
+        let is_dark = cx.theme().is_dark();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let entity = entity.clone();
+            let channel_id = channel_id.clone();
+            let display_name = display_name.clone();
+            dialog
+                .title(locale::text(
+                    "Delete this channel?",
+                    "删除这个频道？",
+                    "刪除這個頻道？",
+                ))
+                .child(
+                    v_flex()
+                        .gap_3()
+                        .child(div().text_sm().whitespace_normal().child(locale::text(
+                            "The bot token or app secret stored for this channel is erased, and its chats stop reaching the runtime.",
+                            "该频道保存的 Bot token 或 App secret 会被删除，它的聊天将无法再连到运行时。",
+                            "該頻道儲存的 Bot token 或 App secret 會被刪除，它的聊天將無法再連到執行階段。",
+                        )))
+                        .child(
+                            div()
+                                .px_2()
+                                .py_1()
+                                .rounded(px(6.0))
+                                .bg(theme::module_surface(is_dark))
+                                .text_sm()
+                                .font_semibold()
+                                .child(display_name),
+                        ),
+                )
+                .footer(
+                    DialogFooter::new()
+                        .child(DialogClose::new().child(
+                            Button::new("im-channel-delete-cancel")
+                                .outline()
+                                .label(locale::text("Cancel", "取消", "取消")),
+                        ))
+                        .child(DialogAction::new().child(
+                            Button::new("im-channel-delete-confirm")
+                                .danger()
+                                .label(locale::text("Delete", "删除", "刪除")),
+                        )),
+                )
+                .on_ok(move |_, _, cx| {
+                    let _ =
+                        entity.update(cx, |this, cx| this.delete_channel(channel_id.clone(), cx));
+                    true
+                })
+        });
     }
 
     fn test_channel(&mut self, channel_id: ImChannelId, cx: &mut Context<Self>) {
@@ -499,17 +542,19 @@ impl ImChannelsView {
                     this.busy = false;
                     match result {
                         Ok(report) => {
-                            this.notice = Some(format!(
-                                "Connected to {}{}.",
-                                report.bot_name.unwrap_or_else(|| "Telegram".to_string()),
-                                report
-                                    .chat_title
-                                    .map(|title| format!(" in {title}"))
-                                    .unwrap_or_default()
-                            ));
-                            this.error = None;
+                            this.hint(
+                                NotificationType::Success,
+                                format!(
+                                    "Connected to {}{}.",
+                                    report.bot_name.unwrap_or_else(|| "Telegram".to_string()),
+                                    report
+                                        .chat_title
+                                        .map(|title| format!(" in {title}"))
+                                        .unwrap_or_default()
+                                ),
+                            );
                         }
-                        Err(error) => this.error = Some(error),
+                        Err(error) => this.hint(NotificationType::Error, error),
                     }
                     cx.notify();
                 });
@@ -562,15 +607,11 @@ impl ImChannelsView {
                     this.busy = false;
                     match result {
                         Ok(()) => {
-                            this.notice = Some(format!(
-                                "Default session set from “{}” for /new.",
-                                session.title
-                            ));
                             this.loaded = false;
                             this.loading = false;
                             this.reload(cx);
                         }
-                        Err(error) => this.error = Some(error),
+                        Err(error) => this.hint(NotificationType::Error, error),
                     }
                     cx.notify();
                 });
@@ -598,12 +639,11 @@ impl ImChannelsView {
                 let _ = weak.update(cx, |this, cx| {
                     match result {
                         Ok(()) => {
-                            this.notice = Some("Default session cleared.".to_string());
                             this.loaded = false;
                             this.loading = false;
                             this.reload(cx);
                         }
-                        Err(error) => this.error = Some(error),
+                        Err(error) => this.hint(NotificationType::Error, error),
                     }
                     cx.notify();
                 });
@@ -631,18 +671,19 @@ impl ImChannelsView {
                 this.busy = false;
                 match result {
                     Ok(pairing) => {
-                        this.notice = Some(
+                        this.hint_with_copy(
+                            NotificationType::Success,
                             locale::text(
                                 "Pairing code created. Send /pair <code> in a direct message within 10 minutes.",
                                 "配对码已生成。请在 10 分钟内私聊发送 /pair <配对码>。",
                                 "配對碼已產生。請在 10 分鐘內私聊傳送 /pair <配對碼>。",
                             )
                             .to_string(),
+                            pairing.code.clone(),
                         );
                         this.pairing = Some(pairing);
-                        this.error = None;
                     }
-                    Err(error) => this.error = Some(error),
+                    Err(error) => this.hint(NotificationType::Error, error),
                 }
                 cx.notify();
             });
@@ -663,7 +704,7 @@ impl ImChannelsView {
                 let _ = weak.update(cx, |this, cx| {
                     match result {
                         Ok(()) => this.reload_selected(cx),
-                        Err(error) => this.error = Some(error),
+                        Err(error) => this.hint(NotificationType::Error, error),
                     }
                     cx.notify();
                 });
@@ -710,7 +751,7 @@ impl ImChannelsView {
                             this.loading = false;
                             this.reload(cx);
                         }
-                        Err(error) => this.error = Some(error),
+                        Err(error) => this.hint(NotificationType::Error, error),
                     }
                     cx.notify();
                 });
@@ -740,12 +781,11 @@ impl ImChannelsView {
                 let _ = weak.update(cx, |this, cx| {
                     match result {
                         Ok(()) => {
-                            this.notice = Some("Channel language updated.".to_string());
                             this.loaded = false;
                             this.loading = false;
                             this.reload(cx);
                         }
-                        Err(error) => this.error = Some(error),
+                        Err(error) => this.hint(NotificationType::Error, error),
                     }
                     cx.notify();
                 });
@@ -767,12 +807,11 @@ impl ImChannelsView {
                 let _ = weak.update(cx, |this, cx| {
                     match result {
                         Ok(()) => {
-                            this.notice = Some("Binding removed.".to_string());
                             this.loaded = false;
                             this.loading = false;
                             this.reload(cx);
                         }
-                        Err(error) => this.error = Some(error),
+                        Err(error) => this.hint(NotificationType::Error, error),
                     }
                     cx.notify();
                 });
@@ -782,8 +821,20 @@ impl ImChannelsView {
 
     fn select_channel(&mut self, channel_id: ImChannelId, cx: &mut Context<Self>) {
         self.selected = Some(channel_id);
+        self.adding = false;
         self.pairing = None;
         self.reload_selected(cx);
+        cx.notify();
+    }
+
+    fn begin_add(&mut self, cx: &mut Context<Self>) {
+        self.adding = true;
+        self.pairing = None;
+        cx.notify();
+    }
+
+    fn cancel_add(&mut self, cx: &mut Context<Self>) {
+        self.adding = false;
         cx.notify();
     }
 
@@ -802,6 +853,7 @@ impl ImChannelsView {
             _ => cx.theme().muted_foreground,
         };
         div()
+            .flex_none()
             .size(px(8.0))
             .rounded_full()
             .bg(color)
@@ -823,41 +875,368 @@ impl ImChannelsView {
     }
 }
 
+/// A rounded plate whose rows are separated by an inset hairline.
+fn panel(rows: Vec<AnyElement>, is_dark: bool, border: Hsla) -> AnyElement {
+    let mut separated = Vec::with_capacity(rows.len().saturating_mul(2));
+    for (index, row) in rows.into_iter().enumerate() {
+        if index > 0 {
+            separated.push(
+                div()
+                    .flex_none()
+                    .h(px(1.0))
+                    .bg(border.opacity(0.5))
+                    .into_any_element(),
+            );
+        }
+        separated.push(row);
+    }
+    v_flex()
+        .w_full()
+        .min_w_0()
+        .rounded(px(10.0))
+        .bg(theme::module_surface(is_dark))
+        .px_4()
+        .py_1()
+        .children(separated)
+        .into_any_element()
+}
+
+/// A labeled section: the subject, optional help, and its body.
+fn section(
+    title: &'static str,
+    description: Option<String>,
+    body: AnyElement,
+    cx: &App,
+) -> AnyElement {
+    let muted = cx.theme().muted_foreground;
+    v_flex()
+        .w_full()
+        .min_w_0()
+        .gap_3()
+        .child(
+            v_flex()
+                .gap_1()
+                .child(div().text_sm().font_semibold().child(title))
+                .when_some(description, |this, description| {
+                    this.child(
+                        div()
+                            .text_xs()
+                            .whitespace_normal()
+                            .text_color(muted)
+                            .child(description),
+                    )
+                }),
+        )
+        .child(body)
+        .into_any_element()
+}
+
+/// A row's identity: what it is, and one line of supporting description.
+fn row_text(title: impl IntoElement, description: Option<String>, cx: &App) -> AnyElement {
+    let foreground = cx.theme().foreground;
+    let muted = cx.theme().muted_foreground;
+    v_flex()
+        .flex_1()
+        .min_w_0()
+        .gap_1()
+        .child(
+            div()
+                .text_sm()
+                .text_color(foreground)
+                .whitespace_normal()
+                .child(title),
+        )
+        .when_some(description, |this, description| {
+            this.child(
+                div()
+                    .text_xs()
+                    .text_color(muted)
+                    .whitespace_normal()
+                    .child(description),
+            )
+        })
+        .into_any_element()
+}
+
 impl Render for ImChannelsView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if !self.loaded && !self.loading {
             self.reload(cx);
         }
+        self.present_hint(window, cx);
+
         let foreground = cx.theme().foreground;
         let muted = cx.theme().muted_foreground;
-        let border = cx.theme().border;
-        let surface = cx.theme().secondary;
+        let page_width = settings_page_width(f32::from(window.viewport_size().width));
+        let wide = page_width >= CHANNEL_LANE_MIN_PAGE_WIDTH;
 
-        let add_form = v_flex()
-            .gap_2()
-            .p_3()
-            .rounded(px(8.0))
-            .border_1()
-            .border_color(border)
-            .bg(surface)
+        let header = h_flex()
+            .w_full()
+            .min_w_0()
+            .justify_between()
+            .flex_wrap()
+            .items_start()
+            .gap_4()
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_lg()
+                            .font_semibold()
+                            .text_color(foreground)
+                            .child(locale::text("IM channels", "IM 频道", "IM 頻道")),
+                    )
+                    .child(div().text_xs().whitespace_normal().text_color(muted).child(
+                        locale::text(
+                            "Chat with Vibex and approve tool calls from Telegram.",
+                            "通过 Telegram 与 Vibex 对话并批准工具调用。",
+                            "透過 Telegram 與 Vibex 對話並批准工具呼叫。",
+                        ),
+                    )),
+            )
+            .child(
+                h_flex()
+                    .flex_none()
+                    .gap_2()
+                    .child(
+                        Button::new("im-channels-refresh")
+                            .small()
+                            .ghost()
+                            .label(locale::text("Refresh", "刷新", "重新整理"))
+                            .disabled(self.loading)
+                            .on_click(cx.listener(|this, _, _, cx| this.reload(cx))),
+                    )
+                    // With no channels the empty state owns the add action, so
+                    // the header does not offer a second, identical one.
+                    .when(!self.channels.is_empty(), |this| {
+                        this.child(
+                            Button::new("im-channels-add")
+                                .small()
+                                .label(locale::text(
+                                    "Add Telegram bot",
+                                    "添加 Telegram 机器人",
+                                    "新增 Telegram 機器人",
+                                ))
+                                .disabled(self.busy || self.adding)
+                                .on_click(cx.listener(|this, _, _, cx| this.begin_add(cx))),
+                        )
+                    }),
+            );
+
+        // With no channels there is nothing to list, so the work area is the
+        // whole page: the add step, or the empty state that opens it.
+        let body = if self.channels.is_empty() {
+            if self.adding {
+                self.render_add_form(cx)
+            } else {
+                empty_state(
+                    locale::text("No channels yet", "还没有频道", "還沒有頻道"),
+                    locale::text(
+                        "Add a Telegram bot to reach this runtime from chat.",
+                        "添加一个 Telegram 机器人，即可在聊天里使用这个运行时。",
+                        "新增一個 Telegram 機器人，即可在聊天裡使用這個執行階段。",
+                    ),
+                    Button::new("im-channels-add-empty")
+                        .small()
+                        .label(locale::text(
+                            "Add Telegram bot",
+                            "添加 Telegram 机器人",
+                            "新增 Telegram 機器人",
+                        ))
+                        .on_click(cx.listener(|this, _, _, cx| this.begin_add(cx))),
+                    cx,
+                )
+            }
+        } else if wide {
+            h_flex()
+                .w_full()
+                .min_w_0()
+                .items_start()
+                .gap_6()
+                .child(self.render_channel_list(true, cx))
+                .child(self.render_work_area(cx))
+                .into_any_element()
+        } else {
+            v_flex()
+                .w_full()
+                .min_w_0()
+                .gap_6()
+                .child(self.render_channel_list(false, cx))
+                .child(self.render_work_area(cx))
+                .into_any_element()
+        };
+
+        v_flex()
+            .id("im-channels-page")
+            .w_full()
+            .min_w_0()
+            .gap_6()
+            .px(px(SETTINGS_PAGE_PADDING_X))
+            .py_8()
+            .text_color(foreground)
+            .child(header)
+            .child(body)
             .child(
                 div()
-                    .text_sm()
+                    .text_xs()
+                    .whitespace_normal()
+                    .text_color(muted)
+                    .child(locale::text(
+                        "Approvals use the buttons on the card, or the printed short code. Images and documents up to 10 MB are accepted; long answers are split across messages.",
+                        "审批可通过卡片按钮或卡片上的短码完成。接受不超过 10 MB 的图片和文档；超长回答会自动分段发送。",
+                        "審批可透過卡片按鈕或卡片上的短碼完成。接受不超過 10 MB 的圖片和文件；超長回覆會自動分段傳送。",
+                    )),
+            )
+    }
+}
+
+impl ImChannelsView {
+    /// The list lane: one selectable row per channel. Side by side with the
+    /// work area when the page is wide enough, a stacked block when it is not.
+    fn render_channel_list(&self, wide: bool, cx: &mut Context<Self>) -> AnyElement {
+        let foreground = cx.theme().foreground;
+        let muted = cx.theme().muted_foreground;
+        let surface = cx.theme().secondary;
+
+        let mut list = v_flex().w_full().min_w_0().gap_1();
+        for channel in &self.channels {
+            let channel_id = channel.channel_id.clone();
+            let selected = self.selected.as_ref() == Some(&channel.channel_id);
+            let meta = format!(
+                "{} · {}",
+                self.channel_kind_label(channel.kind),
+                self.status_label(channel)
+            );
+            list = list.child(
+                Button::new(SharedString::from(format!(
+                    "im-channel-select-{}",
+                    channel.channel_id.as_str()
+                )))
+                .small()
+                .ghost()
+                .w_full()
+                .h(px(32.0))
+                .justify_start()
+                .px_2()
+                .rounded(px(6.0))
+                .selected(selected)
+                .when(selected, |this| this.bg(surface))
+                .child(self.status_dot(channel, cx))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_sm()
+                        .text_color(if selected { foreground } else { muted })
+                        .truncate()
+                        .child(channel.display_name.clone()),
+                )
+                .child(div().flex_none().text_xs().text_color(muted).child(meta))
+                .on_click(
+                    cx.listener(move |this, _, _, cx| this.select_channel(channel_id.clone(), cx)),
+                ),
+            );
+        }
+
+        v_flex()
+            .when(wide, |this| this.w(px(CHANNEL_LANE_WIDTH)).flex_none())
+            .when(!wide, |this| this.w_full())
+            .min_w_0()
+            .gap_2()
+            .child(
+                div()
+                    .text_xs()
                     .font_semibold()
-                    .text_color(foreground)
-                    .child(locale::text("Add Telegram channel", "添加 Telegram 频道", "新增 Telegram 頻道")),
+                    .text_color(muted)
+                    .child(locale::text("Channels", "频道", "頻道")),
             )
+            .child(list)
+            .into_any_element()
+    }
+
+    /// The work area: the add step, the selected channel, or a resting state.
+    fn render_work_area(&self, cx: &mut Context<Self>) -> AnyElement {
+        if self.adding {
+            return self.render_add_form(cx);
+        }
+        let Some(channel) = self
+            .selected
+            .as_ref()
+            .and_then(|channel_id| {
+                self.channels
+                    .iter()
+                    .find(|channel| &channel.channel_id == channel_id)
+            })
+            .cloned()
+        else {
+            return v_flex()
+                .flex_1()
+                .min_w_0()
+                .items_center()
+                .justify_center()
+                .py_8()
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(locale::text(
+                            "Select a channel to manage it.",
+                            "选择一个频道进行管理。",
+                            "選擇一個頻道進行管理。",
+                        )),
+                )
+                .into_any_element();
+        };
+        self.render_channel_detail(&channel, cx)
+    }
+
+    /// The add-channel step: one short form, committed with its own button.
+    fn render_add_form(&self, cx: &mut Context<Self>) -> AnyElement {
+        let foreground = cx.theme().foreground;
+        let muted = cx.theme().muted_foreground;
+        let is_dark = cx.theme().is_dark();
+        let border = cx.theme().border;
+
+        let field = |label: &'static str, input: AnyElement, cx: &App| {
+            let muted = cx.theme().muted_foreground;
+            v_flex()
+                .w_full()
+                .min_w_0()
+                .gap_1()
+                .child(div().text_xs().text_color(muted).child(label))
+                .child(input)
+                .into_any_element()
+        };
+
+        let form = v_flex()
+            .w_full()
+            .min_w_0()
+            .gap_3()
+            .child(field(
+                locale::text("Name", "名称", "名稱"),
+                Input::new(&self.name_input).small().w_full().into_any_element(),
+                cx,
+            ))
+            .child(field(
+                locale::text("Bot token", "Bot token", "Bot token"),
+                Input::new(&self.token_input).small().w_full().into_any_element(),
+                cx,
+            ))
+            .child(field(
+                locale::text("Chat id", "聊天 ID", "聊天 ID"),
+                Input::new(&self.chat_input).small().w_full().into_any_element(),
+                cx,
+            ))
             .child(
                 h_flex()
-                    .gap_2()
-                    .child(Input::new(&self.name_input).small().w_full())
-                    .child(Input::new(&self.chat_input).small().w_full()),
-            )
-            .child(Input::new(&self.token_input).small().w_full())
-            .child(
-                h_flex()
-                    .gap_2()
+                    .w_full()
+                    .min_w_0()
+                    .gap_3()
                     .items_center()
+                    .py_2()
                     .child(
                         Switch::new("im-telegram-topic-mode")
                             .small()
@@ -868,703 +1247,733 @@ impl Render for ImChannelsView {
                             })),
                     )
                     .child(
-                        div()
-                            .text_xs()
-                            .text_color(muted)
-                            .child(locale::text(
-                                "Forum topic mode: create one topic per /new session. The bot must be a forum admin.",
-                                "话题模式：每个 /new 会话创建一个话题。机器人必须是论坛管理员。",
-                                "話題模式：每個 /new 工作階段建立一個話題。機器人必須是論壇管理員。",
-                            )),
-                    ),
-            )
-            .child(
-                h_flex()
-                    .justify_between()
-                    .items_center()
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(muted)
-                            .child(locale::text(
-                                "The bot token is stored in the OS keychain (or the runtime's host secret file).",
-                                "Bot token 存在操作系统钥匙串（或运行时的主机密钥文件）中。",
-                                "Bot token 存在作業系統鑰匙圈（或執行時的主機密鑰檔案）中。",
-                            )),
-                    )
-                    .child(
-                        Button::new("im-channel-create")
-                            .small()
-                            .primary()
-                            .label(if self.busy { "Working…" } else { "Add channel" })
-                            .disabled(self.busy)
-                            .on_click(cx.listener(|this, _, _, cx| this.create_channel(cx))),
-                    ),
-            );
-
-        let add_lark_form = v_flex()
-            .gap_2()
-            .p_3()
-            .rounded(px(8.0))
-            .border_1()
-            .border_color(border)
-            .bg(surface)
-            .child(
-                div()
-                    .text_sm()
-                    .font_semibold()
-                    .text_color(foreground)
-                    .child(locale::text("Add Lark / Feishu channel", "添加 Lark / 飞书频道", "新增 Lark / 飛書頻道")),
-            )
-            .child(
-                h_flex()
-                    .gap_2()
-                    .items_center()
-                    .child(Input::new(&self.lark_app_id_input).small().w_full())
-                    .child(Input::new(&self.lark_chat_input).small().w_full()),
-            )
-            .child(Input::new(&self.lark_app_secret_input).small().w_full())
-            .child(
-                h_flex()
-                    .gap_2()
-                    .items_center()
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(muted)
-                            .child(locale::text(
-                                "Deployment (the app must exist there)",
-                                "部署区域（应用必须在该区域注册）",
-                                "部署區域（應用必須在該區域註冊）",
-                            )),
-                    )
-                    .child(
-                        Button::new("im-lark-region-feishu")
-                            .small()
-                            .outline()
-                            .label(locale::text("飞书 中国", "飞书 中国", "飛書 中國"))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.lark_region = ImLarkRegion::Feishu;
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        Button::new("im-lark-region-lark")
-                            .small()
-                            .outline()
-                            .label(locale::text("Lark 国际", "Lark 国际", "Lark 國際"))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.lark_region = ImLarkRegion::Lark;
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(muted)
-                            .child(match self.lark_region {
-                                ImLarkRegion::Feishu => {
-                                    locale::text("open.feishu.cn", "open.feishu.cn", "open.feishu.cn")
-                                }
-                                ImLarkRegion::Lark => locale::text(
-                                    "open.larksuite.com",
-                                    "open.larksuite.com",
-                                    "open.larksuite.com",
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .gap_1()
+                            .child(div().text_sm().text_color(foreground).child(locale::text(
+                                "Forum topic mode",
+                                "话题模式",
+                                "話題模式",
+                            )))
+                            .child(div().text_xs().text_color(muted).whitespace_normal().child(
+                                locale::text(
+                                    "Create one topic per /new session. The bot must be a forum admin.",
+                                    "每个 /new 会话创建一个话题。机器人必须是论坛管理员。",
+                                    "每個 /new 工作階段建立一個話題。機器人必須是論壇管理員。",
                                 ),
-                            }),
-                    ),
-            )
-            .child(
-                h_flex()
-                    .justify_between()
-                    .items_center()
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(muted)
-                            .child(locale::text(
-                                "The app secret is stored in the OS keychain (or the runtime's host secret file). Subscribe the app to card.action.trigger so approval cards can be answered with a button.",
-                                "App secret 存在操作系统钥匙串（或运行时的主机密钥文件）中。请为应用订阅 card.action.trigger，这样审批卡片就能用按钮回答。",
-                                "App secret 存在作業系統鑰匙圈（或執行時的主機密鑰檔案）中。請為應用訂閱 card.action.trigger，這樣審批卡片就能用按鈕回答。",
                             )),
-                    )
-                    .child(
-                        Button::new("im-lark-create")
-                            .small()
-                            .primary()
-                            .label(if self.busy { "Working…" } else { "Add Lark channel" })
-                            .disabled(self.busy)
-                            .on_click(cx.listener(|this, _, _, cx| this.create_lark_channel(cx))),
                     ),
             );
+        let requirements = panel(
+            vec![
+                h_flex()
+                    .w_full()
+                    .min_w_0()
+                    .gap_3()
+                    .py_3()
+                    .child(row_text(
+                        locale::text("Where the token lives", "Token 存放位置", "Token 存放位置"),
+                        Some(
+                            locale::text(
+                                "The bot token is stored in the OS keychain, or the runtime's host secret file on a headless deployment.",
+                                "Bot token 存在操作系统钥匙串；无界面部署则存在运行时的主机密钥文件。",
+                                "Bot token 存在作業系統鑰匙圈；無介面部署則存在執行時的主機密鑰檔案。",
+                            )
+                            .to_string(),
+                        ),
+                        cx,
+                    ))
+                    .into_any_element(),
+            ],
+            is_dark,
+            border,
+        );
 
-        let list = if self.channels.is_empty() {
-            div()
-                .text_sm()
-                .text_color(muted)
-                .child(if self.loading {
-                    "Loading channels…"
-                } else {
-                    "No IM channels yet. Add a Telegram bot or Lark app above."
-                })
-                .into_any_element()
-        } else {
-            v_flex()
-                .gap_1()
-                .children(self.channels.iter().map(|channel| {
-                    let channel_id = channel.channel_id.clone();
-                    let selected = self.selected.as_ref() == Some(&channel.channel_id);
-                    h_flex()
-                        .gap_2()
-                        .items_center()
-                        .p_2()
-                        .rounded(px(6.0))
-                        .when(selected, |this| this.bg(surface))
-                        .child(self.status_dot(channel, cx))
-                        .child(
-                            v_flex()
-                                .flex_1()
-                                .child(
-                                    div()
-                                        .text_sm()
-                                        .text_color(foreground)
-                                        .child(channel.display_name.clone()),
-                                )
-                                .child(div().text_xs().text_color(muted).child(format!(
-                                    "{} · {} · {}",
-                                    self.channel_kind_label(channel.kind),
-                                    self.status_label(channel),
-                                    if channel.configured {
-                                        "secret configured"
-                                    } else {
-                                        "secret missing"
-                                    }
-                                ))),
-                        )
-                        .child(
-                            Switch::new(format!(
-                                "im-channel-enabled-{}",
-                                channel.channel_id.as_str()
+        v_flex()
+            .flex_1()
+            .min_w_0()
+            .gap_6()
+            .child(
+                h_flex()
+                    .w_full()
+                    .min_w_0()
+                    .justify_between()
+                    .flex_wrap()
+                    .items_start()
+                    .gap_4()
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .gap_1()
+                            .child(div().text_base().font_semibold().text_color(foreground).child(
+                                locale::text("Add a Telegram bot", "添加 Telegram 机器人", "新增 Telegram 機器人"),
                             ))
-                            .small()
-                            .checked(channel.enabled)
-                            .on_click(cx.listener({
-                                let channel_id = channel_id.clone();
-                                move |this, enabled, _, cx| {
-                                    this.toggle_channel(channel_id.clone(), *enabled, cx);
-                                }
-                            })),
-                        )
-                        .child(
-                            Button::new(format!(
-                                "im-channel-select-{}",
-                                channel.channel_id.as_str()
-                            ))
-                            .small()
-                            .ghost()
-                            .label(locale::text("Open", "打开", "開啟"))
-                            .on_click(cx.listener({
-                                let channel_id = channel_id.clone();
-                                move |this, _, _, cx| this.select_channel(channel_id.clone(), cx)
-                            })),
-                        )
-                        .into_any_element()
-                }))
-                .into_any_element()
-        };
-
-        let selected_panel = if let Some(channel_id) = self.selected.clone() {
-            let channel = self
-                .channels
-                .iter()
-                .find(|channel| channel.channel_id == channel_id)
-                .cloned();
-            let mut panel = v_flex()
-                .gap_2()
-                .p_3()
-                .rounded(px(8.0))
-                .border_1()
-                .border_color(border);
-            if let Some(channel) = channel {
-                panel = panel
+                            .child(div().text_xs().text_color(muted).whitespace_normal().child(
+                                locale::text(
+                                    "Create the bot with @BotFather, then paste its token and the chat it should serve.",
+                                    "先用 @BotFather 创建机器人，再填入它的 token 和要服务的聊天。",
+                                    "先用 @BotFather 建立機器人，再填入它的 token 和要服務的聊天。",
+                                ),
+                            )),
+                    )
                     .child(
                         h_flex()
-                            .justify_between()
+                            .flex_none()
+                            .gap_2()
+                            .child(
+                                Button::new("im-channel-add-cancel")
+                                    .small()
+                                    .ghost()
+                                    .label(locale::text("Cancel", "取消", "取消"))
+                                    .disabled(self.busy)
+                                    .on_click(cx.listener(|this, _, _, cx| this.cancel_add(cx))),
+                            )
+                            .child(
+                                Button::new("im-channel-create")
+                                    .small()
+                                    .primary()
+                                    .loading(self.busy)
+                                    .label(locale::text("Add bot", "添加机器人", "新增機器人"))
+                                    .disabled(self.busy)
+                                    .on_click(cx.listener(|this, _, _, cx| this.create_channel(cx))),
+                            ),
+                    ),
+            )
+            .child(form)
+            .child(requirements)
+            .into_any_element()
+    }
+
+    /// The selected channel, grouped into the subjects an operator works with.
+    fn render_channel_detail(
+        &self,
+        channel: &ImChannelSummary,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let foreground = cx.theme().foreground;
+        let muted = cx.theme().muted_foreground;
+        let border = cx.theme().border;
+        let is_dark = cx.theme().is_dark();
+        let channel_id = channel.channel_id.clone();
+
+        let header = h_flex()
+            .w_full()
+            .min_w_0()
+            .justify_between()
+            .flex_wrap()
+            .items_start()
+            .gap_4()
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .gap_1()
+                    .child(
+                        h_flex()
+                            .min_w_0()
+                            .gap_2()
                             .items_center()
+                            .child(self.status_dot(channel, cx))
                             .child(
                                 div()
-                                    .text_sm()
+                                    .text_base()
                                     .font_semibold()
                                     .text_color(foreground)
+                                    .truncate()
                                     .child(channel.display_name.clone()),
                             )
                             .child(
-                                h_flex()
-                                    .gap_2()
-                                    .child(
-                                        Button::new("im-channel-test")
-                                            .small()
-                                            .outline()
-                                            .label(locale::text("Test connection", "测试连接", "測試連線"))
-                                            .disabled(self.busy)
-                                            .on_click(cx.listener({
-                                                let channel_id = channel_id.clone();
-                                                move |this, _, _, cx| this.test_channel(channel_id.clone(), cx)
-                                            })),
-                                    )
-                                    .child(
-                                        Button::new("im-channel-delete")
-                                            .small()
-                                            .ghost()
-                                            .label(locale::text("Delete", "删除", "刪除"))
-                                            .disabled(self.busy)
-                                            .on_click(cx.listener({
-                                                let channel_id = channel_id.clone();
-                                                move |this, _, _, cx| this.delete_channel(channel_id.clone(), cx)
-                                            })),
-                                    ),
-                            ),
-                    )
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .items_center()
-                            .child(
-                                Button::new("im-channel-pair")
-                                    .small()
-                                    .primary()
-                                    .label(locale::text("Generate pairing code", "生成配对码", "產生配對碼"))
-                                    .disabled(self.busy)
-                                    .on_click(cx.listener({
-                                        let channel_id = channel_id.clone();
-                                        move |this, _, _, cx| this.create_pairing_code(channel_id.clone(), cx)
-                                    })),
-                            )
-                            .when_some(self.pairing.as_ref(), |this, pairing| {
-                                this.child(
-                                    div()
-                                        .text_sm()
-                                        .font_semibold()
-                                        .text_color(foreground)
-                                        .child(pairing.code.clone()),
-                                )
-                            }),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(muted)
-                            .child(locale::text(
-                        "Send /pair <code> to the bot in a direct message. The code expires in 10 minutes.",
-                        "在私聊中向机器人发送 /pair <配对码>。配对码 10 分钟后过期。",
-                        "在私聊中向機器人傳送 /pair <配對碼>。配對碼 10 分鐘後過期。",
-                    )),
-                    )
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(foreground)
-                            .child(format!(
-                                "{} ({})",
-                                locale::text("Paired identities", "已配对身份", "已配對身分"),
-                                self.principals.len()
-                            )),
-                    );
-                if self.principals.is_empty() {
-                    panel = panel.child(div().text_xs().text_color(muted).child(locale::text(
-                        "No identities have paired with this channel yet.",
-                        "还没有身份配对这个频道。",
-                        "還沒有身分配對這個頻道。",
-                    )));
-                } else {
-                    for principal in &self.principals {
-                        let principal_id = principal.principal_id.clone();
-                        panel = panel.child(
-                            h_flex()
-                                .gap_2()
-                                .items_center()
-                                .child(
-                                    v_flex()
-                                        .flex_1()
-                                        .child(
-                                            div()
-                                                .text_xs()
-                                                .text_color(foreground)
-                                                .child(principal.display_name.clone()),
-                                        )
-                                        .child(
-                                            div()
-                                                .text_xs()
-                                                .text_color(muted)
-                                                .child(format!("{:?}", principal.status)),
-                                        ),
-                                )
-                                .child(
-                                    Button::new(format!(
-                                        "im-principal-revoke-{}",
-                                        principal.principal_id.as_str()
-                                    ))
-                                    .small()
-                                    .ghost()
-                                    .label(locale::text("Revoke", "撤销", "撤銷"))
-                                    .on_click(cx.listener(
-                                        move |this, _, _, cx| {
-                                            this.revoke_principal(principal_id.clone(), cx)
-                                        },
-                                    )),
-                                ),
-                        );
-                    }
-                }
-                panel = panel.child(div().text_sm().text_color(foreground).child(format!(
-                    "{} ({})",
-                    locale::text("Session bindings", "会话绑定", "工作階段綁定"),
-                    self.bindings.len()
-                )));
-                if self.bindings.is_empty() {
-                    panel = panel.child(div().text_xs().text_color(muted).child(locale::text(
-                        "No chat is bound to a session yet. Use /use in the chat, or /new.",
-                        "还没有聊天绑定到会话。可在聊天里用 /use，或用 /new。",
-                        "還沒有聊天綁定到工作階段。可在聊天裡用 /use，或用 /new。",
-                    )));
-                } else {
-                    for binding in &self.bindings {
-                        let binding_id = binding.binding_id.clone();
-                        let title = binding
-                            .title
-                            .clone()
-                            .filter(|title| !title.trim().is_empty())
-                            .unwrap_or_else(|| {
-                                format!(
-                                    "session {}",
-                                    &binding.session_id.as_str()
-                                        [..8.min(binding.session_id.as_str().len())]
-                                )
-                            });
-                        panel = panel.child(
-                            h_flex()
-                                .gap_2()
-                                .items_center()
-                                .child(
-                                    v_flex()
-                                        .flex_1()
-                                        .child(div().text_xs().text_color(foreground).child(title))
-                                        .child(div().text_xs().text_color(muted).child({
-                                            let thread = if binding.thread_key.is_empty() {
-                                                String::new()
-                                            } else {
-                                                format!(" · thread {}", binding.thread_key)
-                                            };
-                                            format!(
-                                                "chat {} · {:?}{thread}",
-                                                binding.external_chat_id, binding.status
-                                            )
-                                        })),
-                                )
-                                .child(
-                                    Button::new(format!(
-                                        "im-binding-revoke-{}",
-                                        binding.binding_id.as_str()
-                                    ))
-                                    .small()
-                                    .ghost()
-                                    .label(locale::text("Unbind", "解绑", "解除綁定"))
-                                    .on_click(cx.listener(
-                                        move |this, _, _, cx| {
-                                            this.revoke_binding(binding_id.clone(), cx)
-                                        },
-                                    )),
-                                ),
-                        );
-                    }
-                }
-                panel = panel.child(
-                    h_flex()
-                        .justify_between()
-                        .items_center()
-                        .child(
-                            v_flex()
-                                .child(
-                                    div()
-                                        .text_sm()
-                                        .text_color(foreground)
-                                        .child(locale::text("Default session for /new", "/new 的默认会话", "/new 的預設工作階段")),
-                                )
-                                .child(div().text_xs().text_color(muted).child(
-                                    if channel.default_session.is_some() {
-                                        "Configured. /new can start without a bound session."
-                                    } else {
-                                        locale::text(
-                                        "Pick a recent session to reuse its workspace and Agent.",
-                                        "选一个最近的会话，复用它当时的工作区和 Agent。",
-                                        "選一個最近的工作階段，重複使用它當時的工作區和 Agent。",
-                                    )
-                                    },
-                                )),
-                        )
-                        .when(channel.default_session.is_some(), |this| {
-                            this.child(
-                                Button::new("im-default-clear")
-                                    .small()
-                                    .ghost()
-                                    .label(locale::text("Clear", "清除", "清除"))
-                                    .on_click(cx.listener({
-                                        let channel_id = channel_id.clone();
-                                        move |this, _, _, cx| {
-                                            this.clear_default_session(channel_id.clone(), cx)
-                                        }
-                                    })),
-                            )
-                        }),
-                );
-                for session in self.default_sessions.iter().take(5) {
-                    let session = session.clone();
-                    let short = session
-                        .id
-                        .as_str()
-                        .rsplit('_')
-                        .next()
-                        .unwrap_or_default()
-                        .chars()
-                        .take(8)
-                        .collect::<String>();
-                    panel = panel.child(
-                        h_flex()
-                            .gap_2()
-                            .items_center()
-                            .child(
                                 div()
-                                    .flex_1()
+                                    .flex_none()
                                     .text_xs()
                                     .text_color(muted)
-                                    .child(format!("#{short} · {}", session.title)),
-                            )
-                            .child(
-                                Button::new(format!("im-default-use-{}", session.id.as_str()))
-                                    .small()
-                                    .outline()
-                                    .label(locale::text("Use as default", "设为默认", "設為預設"))
-                                    .disabled(self.busy)
-                                    .on_click(cx.listener({
-                                        let channel_id = channel_id.clone();
-                                        move |this, _, _, cx| {
-                                            this.set_default_session(
-                                                channel_id.clone(),
-                                                session.clone(),
-                                                cx,
-                                            )
-                                        }
-                                    })),
+                                    .child(self.status_label(channel)),
                             ),
-                    );
-                }
-
-                // Events this channel forwards. The list is the full known set,
-                // with the channel's current selection checked.
-                panel = panel.child(
-                    v_flex()
-                        .gap_1()
-                        .child(
-                            div()
-                                .text_sm()
-                                .text_color(foreground)
-                                .child(locale::text("Events sent to this chat", "发送到这个聊天的活动", "傳送到這個聊天的活動")),
-                        )
-                        .child(div().text_xs().text_color(muted).child(
-                            "Approvals and errors are the default set. Turning one off stops it for every binding on this channel.",
-                        )),
-                );
-                for event_id in vibex_core::IM_EVENT_FILTER_IDS {
-                    let enabled = channel.event_filter.iter().any(|id| id == event_id);
-                    let channel_for_toggle = channel.clone();
-                    panel = panel.child(
+                    )
+                    .child(div().text_xs().text_color(muted).child(format!(
+                        "{} · {}",
+                        self.channel_kind_label(channel.kind),
+                        if channel.configured {
+                            locale::text("Secret configured", "密钥已配置", "密鑰已設定")
+                        } else {
+                            locale::text("Secret missing", "缺少密钥", "缺少密鑰")
+                        }
+                    ))),
+            )
+            .child(
+                h_flex()
+                    .flex_none()
+                    .gap_3()
+                    .items_center()
+                    .child(
                         h_flex()
                             .gap_2()
                             .items_center()
                             .child(
                                 div()
-                                    .flex_1()
                                     .text_xs()
-                                    .text_color(foreground)
-                                    .child(*event_id),
+                                    .text_color(muted)
+                                    .child(locale::text("Enabled", "启用", "啟用")),
                             )
                             .child(
                                 Switch::new(format!(
-                                    "im-event-{}-{}",
-                                    channel_id.as_str(),
-                                    event_id
+                                    "im-channel-enabled-{}",
+                                    channel.channel_id.as_str()
                                 ))
                                 .small()
-                                .checked(enabled)
-                                .on_click(cx.listener(
-                                    move |this, checked, _, cx| {
-                                        this.toggle_event_filter(
-                                            channel_for_toggle.clone(),
-                                            event_id,
-                                            *checked,
-                                            cx,
-                                        )
-                                    },
-                                )),
-                            ),
-                    );
-                }
-
-                // Language for this channel's replies.
-                panel = panel.child(
-                    h_flex()
-                        .justify_between()
-                        .items_center()
-                        .child(
-                            v_flex()
-                                .child(div().text_sm().text_color(foreground).child(locale::text(
-                                    "Reply language",
-                                    "回复语言",
-                                    "回覆語言",
-                                )))
-                                .child(div().text_xs().text_color(muted).child(format!(
-                                    "{} (host default when unset)",
-                                    channel
-                                        .locale
-                                        .clone()
-                                        .unwrap_or_else(|| "Not set".to_string())
-                                ))),
-                        )
-                        .child(
-                            h_flex()
-                                .gap_1()
-                                .child(
-                                    Button::new(format!("im-locale-en-{}", channel_id.as_str()))
-                                        .small()
-                                        .ghost()
-                                        .label("English")
-                                        .on_click(cx.listener({
-                                            let channel_id = channel_id.clone();
-                                            move |this, _, _, cx| {
-                                                this.set_channel_locale(
-                                                    channel_id.clone(),
-                                                    Some("en".to_string()),
-                                                    cx,
-                                                )
-                                            }
-                                        })),
-                                )
-                                .child(
-                                    Button::new(format!("im-locale-zh-{}", channel_id.as_str()))
-                                        .small()
-                                        .ghost()
-                                        .label("中文")
-                                        .on_click(cx.listener({
-                                            let channel_id = channel_id.clone();
-                                            move |this, _, _, cx| {
-                                                this.set_channel_locale(
-                                                    channel_id.clone(),
-                                                    Some("zh-CN".to_string()),
-                                                    cx,
-                                                )
-                                            }
-                                        })),
-                                )
-                                .child(
-                                    Button::new(format!("im-locale-auto-{}", channel_id.as_str()))
-                                        .small()
-                                        .ghost()
-                                        .label(locale::text("Host", "跟随系统", "跟隨系統"))
-                                        .on_click(cx.listener({
-                                            let channel_id = channel_id.clone();
-                                            move |this, _, _, cx| {
-                                                this.set_channel_locale(
-                                                    channel_id.clone(),
-                                                    None,
-                                                    cx,
-                                                )
-                                            }
-                                        })),
-                                ),
-                        ),
-                );
-            }
-            panel.into_any_element()
-        } else {
-            div().into_any_element()
-        };
-
-        v_flex()
-            .id("im-channels-page")
-            .gap_4()
-            .p_4()
-            .child(
-                h_flex()
-                    .justify_between()
-                    .items_center()
-                    .child(
-                        v_flex()
-                            .child(
-                                div()
-                                    .text_lg()
-                                    .font_semibold()
-                                    .text_color(foreground)
-                                    .child(locale::text("IM channels", "IM 频道", "IM 頻道")),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(muted)
-                                    .child(locale::text(
-                                "Chat with Vibex and approve tool calls from Telegram.",
-                                "通过 IM 与 Vibex 对话并批准工具调用。",
-                                "透過 IM 與 Vibex 對話並批准工具呼叫。",
-                            )),
+                                .checked(channel.enabled)
+                                .disabled(self.busy)
+                                .on_click(cx.listener({
+                                    let channel_id = channel_id.clone();
+                                    move |this, enabled, _, cx| {
+                                        this.toggle_channel(channel_id.clone(), *enabled, cx);
+                                    }
+                                })),
                             ),
                     )
                     .child(
-                        Button::new("im-channels-refresh")
+                        Button::new("im-channel-test")
+                            .small()
+                            .outline()
+                            .label(locale::text("Test", "测试", "測試"))
+                            .disabled(self.busy)
+                            .on_click(cx.listener({
+                                let channel_id = channel_id.clone();
+                                move |this, _, _, cx| this.test_channel(channel_id.clone(), cx)
+                            })),
+                    )
+                    .child(
+                        Button::new("im-channel-delete")
                             .small()
                             .ghost()
-                            .label(locale::text("Refresh", "刷新", "重新整理"))
-                            .disabled(self.loading)
-                            .on_click(cx.listener(|this, _, _, cx| this.reload(cx))),
+                            .text_color(cx.theme().danger)
+                            .label(locale::text("Delete", "删除", "刪除"))
+                            .disabled(self.busy)
+                            .on_click(cx.listener({
+                                let channel_id = channel_id.clone();
+                                let display_name = channel.display_name.clone();
+                                move |this, _, window, cx| {
+                                    this.confirm_delete(
+                                        channel_id.clone(),
+                                        display_name.clone(),
+                                        window,
+                                        cx,
+                                    )
+                                }
+                            })),
                     ),
-            )
-            .when_some(self.error.clone(), |this, error| {
-                this.child(
-                    div()
-                        .p_2()
-                        .rounded(px(6.0))
-                        .bg(cx.theme().danger.opacity(0.12))
-                        .text_xs()
-                        .text_color(cx.theme().danger)
-                        .child(error),
+            );
+
+        // One row for pairing: the code replaces the subject once it exists,
+        // so the row does not grow a second line for the same fact.
+        let pairing_title: AnyElement = match self
+            .pairing
+            .as_ref()
+            .filter(|pairing| pairing.channel_id == channel_id)
+        {
+            Some(pairing) => div()
+                .text_base()
+                .font_semibold()
+                .child(SharedString::from(pairing.code.clone()))
+                .into_any_element(),
+            None => div()
+                .text_sm()
+                .child(locale::text("Pairing code", "配对码", "配對碼"))
+                .into_any_element(),
+        };
+        let pairing_rows = vec![
+            h_flex()
+                .w_full()
+                .min_w_0()
+                .gap_3()
+                .py_3()
+                .items_center()
+                .child(row_text(
+                    pairing_title,
+                    Some(
+                        locale::text(
+                            "Send /pair <code> to the bot in a direct message. The code expires in 10 minutes.",
+                            "在私聊中向机器人发送 /pair <配对码>。配对码 10 分钟后过期。",
+                            "在私聊中向機器人傳送 /pair <配對碼>。配對碼 10 分鐘後過期。",
+                        )
+                        .to_string(),
+                    ),
+                    cx,
+                ))
+                .child(
+                    Button::new("im-channel-pair")
+                        .small()
+                        .outline()
+                        .label(locale::text("Generate code", "生成配对码", "產生配對碼"))
+                        .disabled(self.busy)
+                        .on_click(cx.listener({
+                            let channel_id = channel_id.clone();
+                            move |this, _, _, cx| this.create_pairing_code(channel_id.clone(), cx)
+                        })),
                 )
-            })
-            .when_some(self.notice.clone(), |this, notice| {
-                this.child(
-                    div()
-                        .p_2()
-                        .rounded(px(6.0))
-                        .bg(cx.theme().success.opacity(0.12))
-                        .text_xs()
-                        .text_color(cx.theme().success)
-                        .child(notice),
+                .into_any_element(),
+        ];
+
+        let mut identity_rows = Vec::new();
+        if self.principals.is_empty() {
+            identity_rows.push(
+                h_flex()
+                    .w_full()
+                    .min_w_0()
+                    .py_3()
+                    .child(div().text_xs().text_color(muted).child(locale::text(
+                        "No identity has paired with this channel yet.",
+                        "还没有身份配对这个频道。",
+                        "還沒有身分配對這個頻道。",
+                    )))
+                    .into_any_element(),
+            );
+        } else {
+            for principal in &self.principals {
+                let principal_id = principal.principal_id.clone();
+                identity_rows.push(
+                    h_flex()
+                        .w_full()
+                        .min_w_0()
+                        .gap_3()
+                        .py_3()
+                        .items_center()
+                        .child(row_text(
+                            principal.display_name.clone(),
+                            Some(format!("{:?}", principal.status)),
+                            cx,
+                        ))
+                        .child(
+                            Button::new(SharedString::from(format!(
+                                "im-principal-revoke-{}",
+                                principal.principal_id.as_str()
+                            )))
+                            .small()
+                            .ghost()
+                            .label(locale::text("Revoke", "撤销", "撤銷"))
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    this.revoke_principal(principal_id.clone(), cx)
+                                },
+                            )),
+                        )
+                        .into_any_element(),
+                );
+            }
+        }
+
+        let mut binding_rows = Vec::new();
+        if self.bindings.is_empty() {
+            binding_rows.push(
+                h_flex()
+                    .w_full()
+                    .min_w_0()
+                    .py_3()
+                    .child(div().text_xs().text_color(muted).child(locale::text(
+                        "No chat is bound to a session yet. Use /use in the chat, or /new.",
+                        "还没有聊天绑定到会话。可在聊天里用 /use，或用 /new。",
+                        "還沒有聊天綁定到工作階段。可在聊天裡用 /use，或用 /new。",
+                    )))
+                    .into_any_element(),
+            );
+        } else {
+            for binding in &self.bindings {
+                let binding_id = binding.binding_id.clone();
+                let title = binding
+                    .title
+                    .clone()
+                    .filter(|title| !title.trim().is_empty())
+                    .unwrap_or_else(|| {
+                        format!(
+                            "session {}",
+                            &binding.session_id.as_str()
+                                [..8.min(binding.session_id.as_str().len())]
+                        )
+                    });
+                let thread = if binding.thread_key.is_empty() {
+                    String::new()
+                } else {
+                    format!(" · thread {}", binding.thread_key)
+                };
+                binding_rows.push(
+                    h_flex()
+                        .w_full()
+                        .min_w_0()
+                        .gap_3()
+                        .py_3()
+                        .items_center()
+                        .child(row_text(
+                            title,
+                            Some(format!(
+                                "chat {} · {:?}{thread}",
+                                binding.external_chat_id, binding.status
+                            )),
+                            cx,
+                        ))
+                        .child(
+                            Button::new(SharedString::from(format!(
+                                "im-binding-revoke-{}",
+                                binding.binding_id.as_str()
+                            )))
+                            .small()
+                            .ghost()
+                            .label(locale::text("Unbind", "解绑", "解除綁定"))
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| this.revoke_binding(binding_id.clone(), cx),
+                            )),
+                        )
+                        .into_any_element(),
+                );
+            }
+        }
+
+        let mut default_rows = vec![
+            h_flex()
+                .w_full()
+                .min_w_0()
+                .gap_3()
+                .py_3()
+                .items_center()
+                .child(row_text(
+                    locale::text(
+                        "Default session for /new",
+                        "/new 的默认会话",
+                        "/new 的預設工作階段",
+                    ),
+                    Some(if channel.default_session.is_some() {
+                        locale::text(
+                            "Configured. /new can start without a bound session.",
+                            "已配置。/new 无需绑定会话即可开始。",
+                            "已設定。/new 無需綁定工作階段即可開始。",
+                        )
+                        .to_string()
+                    } else {
+                        locale::text(
+                            "Pick a recent session to reuse its workspace and Agent.",
+                            "选一个最近的会话，复用它当时的工作区和 Agent。",
+                            "選一個最近的工作階段，重複使用它當時的工作區和 Agent。",
+                        )
+                        .to_string()
+                    }),
+                    cx,
+                ))
+                .when(channel.default_session.is_some(), |this| {
+                    this.child(
+                        Button::new("im-default-clear")
+                            .small()
+                            .ghost()
+                            .label(locale::text("Clear", "清除", "清除"))
+                            .disabled(self.busy)
+                            .on_click(cx.listener({
+                                let channel_id = channel_id.clone();
+                                move |this, _, _, cx| {
+                                    this.clear_default_session(channel_id.clone(), cx)
+                                }
+                            })),
+                    )
+                })
+                .into_any_element(),
+        ];
+        for session in self.default_sessions.iter().take(DEFAULT_SESSION_CHOICES) {
+            let session = session.clone();
+            let short = session
+                .id
+                .as_str()
+                .rsplit('_')
+                .next()
+                .unwrap_or_default()
+                .chars()
+                .take(8)
+                .collect::<String>();
+            default_rows.push(
+                h_flex()
+                    .w_full()
+                    .min_w_0()
+                    .gap_3()
+                    .py_3()
+                    .items_center()
+                    .child(row_text(format!("#{short} · {}", session.title), None, cx))
+                    .child(
+                        Button::new(SharedString::from(format!(
+                            "im-default-use-{}",
+                            session.id.as_str()
+                        )))
+                        .small()
+                        .outline()
+                        .label(locale::text("Use as default", "设为默认", "設為預設"))
+                        .disabled(self.busy)
+                        .on_click(cx.listener({
+                            let channel_id = channel_id.clone();
+                            move |this, _, _, cx| {
+                                this.set_default_session(channel_id.clone(), session.clone(), cx)
+                            }
+                        })),
+                    )
+                    .into_any_element(),
+            );
+        }
+
+        let mut event_rows = Vec::new();
+        for event_id in vibex_core::IM_EVENT_FILTER_IDS {
+            let enabled = channel.event_filter.iter().any(|id| id == event_id);
+            let channel_for_toggle = channel.clone();
+            event_rows.push(
+                h_flex()
+                    .w_full()
+                    .min_w_0()
+                    .gap_3()
+                    .py_2()
+                    .items_center()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_xs()
+                            .text_color(foreground)
+                            .child(*event_id),
+                    )
+                    .child(
+                        Switch::new(SharedString::from(format!(
+                            "im-event-{}-{}",
+                            channel_id.as_str(),
+                            event_id
+                        )))
+                        .small()
+                        .checked(enabled)
+                        .disabled(self.busy)
+                        .on_click(cx.listener(
+                            move |this, checked, _, cx| {
+                                this.toggle_event_filter(
+                                    channel_for_toggle.clone(),
+                                    event_id,
+                                    *checked,
+                                    cx,
+                                )
+                            },
+                        )),
+                    )
+                    .into_any_element(),
+            );
+        }
+
+        let locale_choice = |id: String,
+                             label: &'static str,
+                             value: Option<&'static str>,
+                             current: Option<&str>,
+                             channel_id: ImChannelId,
+                             cx: &mut Context<Self>| {
+            let selected = current == value;
+            Button::new(SharedString::from(id))
+                .small()
+                .ghost()
+                .selected(selected)
+                .when(selected, |this| this.bg(cx.theme().secondary))
+                .label(label)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.set_channel_locale(channel_id.clone(), value.map(str::to_string), cx)
+                }))
+                .into_any_element()
+        };
+        let language_row = panel(
+            vec![
+                h_flex()
+                    .w_full()
+                    .min_w_0()
+                    .gap_3()
+                    .py_3()
+                    .items_center()
+                    .child(row_text(
+                        locale::text("Reply language", "回复语言", "回覆語言"),
+                        Some(
+                            locale::text(
+                                "How the bot speaks in this chat; the host language is the default.",
+                                "机器人在这个聊天里使用的语言；默认跟随系统。",
+                                "機器人在這個聊天裡使用的語言；預設跟隨系統。",
+                            )
+                            .to_string(),
+                        ),
+                        cx,
+                    ))
+                    .child(
+                        h_flex()
+                            .flex_none()
+                            .gap_1()
+                            .child(locale_choice(
+                                format!("im-locale-en-{}", channel_id.as_str()),
+                                "English",
+                                Some("en"),
+                                channel.locale.as_deref(),
+                                channel_id.clone(),
+                                cx,
+                            ))
+                            .child(locale_choice(
+                                format!("im-locale-zh-{}", channel_id.as_str()),
+                                "中文",
+                                Some("zh-CN"),
+                                channel.locale.as_deref(),
+                                channel_id.clone(),
+                                cx,
+                            ))
+                            .child(locale_choice(
+                                format!("im-locale-auto-{}", channel_id.as_str()),
+                                locale::text("Host", "跟随系统", "跟隨系統"),
+                                None,
+                                channel.locale.as_deref(),
+                                channel_id.clone(),
+                                cx,
+                            )),
+                    )
+                    .into_any_element(),
+            ],
+            is_dark,
+            border,
+        );
+
+        v_flex()
+            .flex_1()
+            .min_w_0()
+            .gap_6()
+            .child(header)
+            .child(section(
+                locale::text("Pairing", "配对", "配對"),
+                Some(locale::text(
+                    "A pairing code is how a chat proves it belongs to this channel.",
+                    "配对码用于让一个聊天证明自己属于这个频道。",
+                    "配對碼用於讓一個聊天證明自己屬於這個頻道。",
                 )
-            })
-            .child(add_form)
-            .child(add_lark_form)
-            .child(list)
-            .child(selected_panel)
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(muted)
-                    .child(locale::text(
-                        "Telegram and Lark are supported. Approvals use the buttons on the card, or the printed short code. Images and documents up to 10 MB are accepted; long answers are split across messages.",
-                        "支持 Telegram 和 Lark。审批可通过卡片按钮或卡片上的短码完成。接受不超过 10 MB 的图片和文档；超长回答会自动分段发送。",
-                        "支援 Telegram 和 Lark。審批可透過卡片按鈕或卡片上的短碼完成。接受不超過 10 MB 的圖片和文件；超長回覆會自動分段傳送。",
-                    )),
-            )
+                .to_string()),
+                panel(pairing_rows, is_dark, border),
+                cx,
+            ))
+            .child(section(
+                locale::text("Paired identities", "已配对身份", "已配對身分"),
+                Some(format!(
+                    "{} ({})",
+                    locale::text(
+                        "Who may talk to this channel",
+                        "可以与该频道对话的身份",
+                        "可以與該頻道對話的身分",
+                    ),
+                    self.principals.len()
+                )),
+                panel(identity_rows, is_dark, border),
+                cx,
+            ))
+            .child(section(
+                locale::text("Session bindings", "会话绑定", "工作階段綁定"),
+                Some(format!(
+                    "{} ({})",
+                    locale::text(
+                        "Chats currently driving a session",
+                        "当前正在驱动会话的聊天",
+                        "目前正在驅動工作階段的聊天",
+                    ),
+                    self.bindings.len()
+                )),
+                panel(binding_rows, is_dark, border),
+                cx,
+            ))
+            .child(section(
+                locale::text("New sessions", "新会话", "新工作階段"),
+                Some(
+                    locale::text(
+                        "/new reuses the workspace and Agent of the session chosen here.",
+                        "/new 会复用这里所选会话的工作区和 Agent。",
+                        "/new 會重複使用這裡所選工作階段的工作區和 Agent。",
+                    )
+                    .to_string(),
+                ),
+                panel(default_rows, is_dark, border),
+                cx,
+            ))
+            .child(section(
+                locale::text("Events sent to this chat", "发送到这个聊天的活动", "傳送到這個聊天的活動"),
+                Some(
+                    locale::text(
+                        "Approvals and errors are the default set. Turning one off stops it for every binding on this channel.",
+                        "审批和错误默认开启。关闭一项会同时影响该频道下的所有绑定。",
+                        "審批和錯誤預設開啟。關閉一項會同時影響該頻道下的所有綁定。",
+                    )
+                    .to_string(),
+                ),
+                panel(event_rows, is_dark, border),
+                cx,
+            ))
+            .child(section(
+                locale::text("Language", "语言", "語言"),
+                None,
+                language_row,
+                cx,
+            ))
+            .into_any_element()
     }
+}
+
+/// A first-run or empty-collection surface: what is missing and the next step.
+fn empty_state(
+    title: &'static str,
+    description: &'static str,
+    action: Button,
+    cx: &App,
+) -> AnyElement {
+    let border = cx.theme().border;
+    let muted = cx.theme().muted_foreground;
+    v_flex()
+        .w_full()
+        .min_w_0()
+        .items_center()
+        .justify_center()
+        .gap_3()
+        .px_6()
+        .py_8()
+        .rounded(px(10.0))
+        .border_1()
+        .border_color(border)
+        .child(div().text_sm().font_semibold().child(title))
+        .child(
+            div()
+                .max_w(px(420.0))
+                .text_xs()
+                .whitespace_normal()
+                .text_color(muted)
+                .child(description),
+        )
+        .child(action)
+        .into_any_element()
 }
 
 fn backend_error(error: BackendError) -> String {
     format!("{}: {}", error.code, error.message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The page is a source-level contract in two places that a render test
+    /// would need the whole workbench to reach.
+    #[test]
+    fn the_page_offers_telegram_only_and_reports_through_the_hint_layer() {
+        let source = include_str!("im_channels.rs");
+        // Only the Telegram entry exists; the Lark app form is gone. The
+        // needles are split because the test's own text is part of `source`.
+        assert!(source.contains("Add Telegram bot"));
+        assert!(!source.contains(concat!("create_lark", "_channel")));
+        assert!(!source.contains(concat!("im-lark", "-create")));
+        assert!(!source.contains(concat!("Add Lark ", "channel")));
+        // Results ride the window's top hint layer, never a strip in the page.
+        assert!(source.contains("hint_layer::push"));
+        assert!(!source.contains(concat!(".when_some(self.", "notice")));
+        assert!(!source.contains(concat!(".when_some(self.", "error")));
+    }
+
+    /// The page body follows the settings page measure, so the master–detail
+    /// stacks at the same widths the row-based pages do.
+    #[test]
+    fn the_work_area_stacks_on_a_narrow_page() {
+        assert!(CHANNEL_LANE_MIN_PAGE_WIDTH < crate::app::settings_page_width(1280.0));
+        assert!(crate::app::settings_page_width(640.0) < CHANNEL_LANE_MIN_PAGE_WIDTH);
+    }
 }
