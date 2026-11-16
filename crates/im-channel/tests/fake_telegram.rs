@@ -22,17 +22,16 @@ use vibex_core::{
     AgentId, AgentMessageDeltaPayload, AgentMessagePayload, AgentMessagePhase,
     AgentNotificationIntent, AgentSession, AgentSessionRuntimeSelectionState, AgentSessionSafety,
     AgentSessionState, CreateAgentSessionRequest, FetchTimelineRequest, ImBindingSummary,
-    ImChannelConfig, ImChannelDraft, ImPairingRequest, ImPrincipalRole, ImPrincipalStatus,
-    ImRuntimeAgentChoice, ImRuntimeChoice, ImRuntimeOptions, ImRuntimeProviderChoice,
-    PermissionActionDetail, PermissionRequest, PermissionRequestStatus, PermissionResolution,
-    PermissionResponseKind, PermissionResponseOption, ProjectId, ProviderProfileId,
-    ResolveElicitationRequest, ResolvePermissionRequest, RuntimeAuthSource, RuntimeModelSelection,
-    SendAgentMessageRequest, SessionRuntimeSelection, SessionRuntimeSelectionStatus,
-    SetDesiredAgentSessionRuntimeRequest, SystemNoticeLevel, SystemNoticePayload, TimelineItem,
-    TimelineItemId, TimelineLiveEvent, TimelinePage, TimelinePayload, TimelinePayloadDepth,
-    TimelineRedactionState, TimelineSource, UserMessagePayload,
-    VIBEX_USE_REACTION_CORRELATION_PREFIX, VibexResult, VibexSessionId, WorkspaceId, WorkspaceMode,
-    unix_timestamp_ms,
+    ImChannelConfig, ImChannelDraft, ImPairingRequest, ImPrincipalStatus, ImRuntimeAgentChoice,
+    ImRuntimeChoice, ImRuntimeOptions, ImRuntimeProviderChoice, PermissionActionDetail,
+    PermissionRequest, PermissionRequestStatus, PermissionResolution, PermissionResponseKind,
+    PermissionResponseOption, ProjectId, ProviderProfileId, ResolveElicitationRequest,
+    ResolvePermissionRequest, RuntimeAuthSource, RuntimeModelSelection, SendAgentMessageRequest,
+    SessionRuntimeSelection, SessionRuntimeSelectionStatus, SetDesiredAgentSessionRuntimeRequest,
+    SystemNoticeLevel, SystemNoticePayload, TimelineItem, TimelineItemId, TimelineLiveEvent,
+    TimelinePage, TimelinePayload, TimelinePayloadDepth, TimelineRedactionState, TimelineSource,
+    UserMessagePayload, VIBEX_USE_REACTION_CORRELATION_PREFIX, VibexResult, VibexSessionId,
+    WorkspaceId, WorkspaceMode, unix_timestamp_ms,
 };
 use vibex_im_channel::{ImAgentPort, ImChannelService, ImChannelServiceConfig};
 
@@ -680,7 +679,6 @@ async fn telegram_pairing_commands_and_approval_round_trip() {
             default_session: None,
             event_filter: Vec::new(),
             locale: Some("en".to_string()),
-            stream_mode: vibex_core::ImStreamMode::Auto,
         })
         .await
         .expect("create channel");
@@ -697,7 +695,6 @@ async fn telegram_pairing_commands_and_approval_round_trip() {
     let pairing = service
         .create_pairing_code(ImPairingRequest {
             channel_id: channel.channel_id.clone(),
-            role: ImPrincipalRole::Operator,
             ttl_ms: Some(60_000),
             scope: vibex_core::ImPairingScope::Direct,
             target_chat_id: None,
@@ -728,7 +725,6 @@ async fn telegram_pairing_commands_and_approval_round_trip() {
     let group_code = service
         .create_pairing_code(ImPairingRequest {
             channel_id: channel.channel_id.clone(),
-            role: ImPrincipalRole::Operator,
             ttl_ms: Some(60_000),
             scope: vibex_core::ImPairingScope::Direct,
             target_chat_id: None,
@@ -1338,11 +1334,14 @@ async fn telegram_pairing_commands_and_approval_round_trip() {
         "the final edit is rendered, not raw Markdown"
     );
     assert!(
-        !fake
-            .sent_texts()
+        fake.sent_texts()
             .iter()
             .any(|text| text.contains("streamed")),
-        "the final answer is edited into the live message, not sent again"
+        "a text block is streamed into a message of its own"
+    );
+    assert!(
+        !fake.sent_texts().iter().any(|text| text.contains("answer")),
+        "the final answer finishes that message instead of being sent again"
     );
 
     service.stop().await;

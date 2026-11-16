@@ -15,8 +15,8 @@ use vibex_core::{
     ImBindingSummary, ImChannelConfig, ImChannelConfigEnvelope, ImChannelDraft, ImChannelId,
     ImChannelState, ImChannelStatus, ImChannelSummary, ImChannelTestReport, ImLarkTransport,
     ImMessageId, ImPairingCodeInfo, ImPairingId, ImPairingRequest, ImPairingScope, ImPrincipalId,
-    ImPrincipalRole, ImPrincipalStatus, ImPrincipalSummary, ImSessionDefaults, MessageProvenance,
-    PermissionRequest, PermissionRequestStatus, PermissionResolution, PermissionResponseKind,
+    ImPrincipalStatus, ImPrincipalSummary, ImSessionDefaults, MessageProvenance, PermissionRequest,
+    PermissionRequestStatus, PermissionResolution, PermissionResponseKind,
     PermissionResponseOption, ResolvePermissionRequest, SendAgentMessageRequest, TimelineLiveEvent,
     TimelinePayload, VibexError, VibexResult, VibexSessionId, unix_timestamp_ms,
 };
@@ -288,7 +288,6 @@ impl ImChannelService {
             schema_version: 1,
             config: draft.config,
             default_session: draft.default_session,
-            stream_mode: draft.stream_mode,
         };
         let event_filter_json = if draft.event_filter.is_empty() {
             None
@@ -473,42 +472,6 @@ impl ImChannelService {
         self.summary_for(&conn, &updated, status)
     }
 
-    /// Changes how much of a running turn this channel shows.
-    ///
-    /// The value is read at the start of each turn, so a live turn keeps the
-    /// setting it began with and a running connection needs no reload.
-    pub async fn set_stream_mode(
-        &self,
-        channel_id: &ImChannelId,
-        stream_mode: vibex_core::ImStreamMode,
-    ) -> VibexResult<ImChannelSummary> {
-        let conn = self.open()?;
-        let record = ImChannelRepository::get(&conn, channel_id)?.ok_or_else(|| {
-            VibexError::validation("im_channel_not_found", "IM channel was not found")
-        })?;
-        let mut envelope: ImChannelConfigEnvelope = serde_json::from_str(&record.config_json)
-            .map_err(|_| {
-                VibexError::validation(
-                    "im_channel_config_invalid",
-                    "IM channel configuration is not valid",
-                )
-            })?;
-        envelope.stream_mode = stream_mode;
-        let updated = ImChannelRecord {
-            config_json: serde_json::to_string(&envelope).map_err(|_| {
-                VibexError::validation(
-                    "im_channel_config_invalid",
-                    "IM channel configuration could not be encoded",
-                )
-            })?,
-            updated_at_ms: unix_timestamp_ms(),
-            ..record
-        };
-        ImChannelRepository::update(&conn, &updated)?;
-        let status = self.status_for(&updated.channel_id, updated.enabled).await;
-        self.summary_for(&conn, &updated, status)
-    }
-
     /// Replaces the set of events this channel forwards.
     ///
     /// The filter is stored as JSON so a future event id can be added without a
@@ -522,6 +485,13 @@ impl ImChannelService {
         let record = ImChannelRepository::get(&conn, channel_id)?.ok_or_else(|| {
             VibexError::validation("im_channel_not_found", "IM channel was not found")
         })?;
+        // `tool_progress` became part of the live progress line, which always
+        // labels what a turn is doing. A settings page that still sends the id
+        // drops it here instead of failing to save.
+        let filter: Vec<String> = filter
+            .into_iter()
+            .filter(|id| id != "tool_progress")
+            .collect();
         let known: Vec<&str> = filter
             .iter()
             .filter(|id| vibex_core::IM_EVENT_FILTER_IDS.contains(&id.as_str()))
@@ -579,44 +549,6 @@ impl ImChannelService {
         ImChannelRepository::update(&conn, &updated)?;
         let status = self.status_for(&updated.channel_id, updated.enabled).await;
         self.summary_for(&conn, &updated, status)
-    }
-
-    /// Changes what a paired identity is allowed to do.
-    ///
-    /// The role is read on every inbound message, so the next message honours
-    /// the change without reconnecting.
-    pub async fn set_principal_role(
-        &self,
-        principal_id: &ImPrincipalId,
-        role: ImPrincipalRole,
-    ) -> VibexResult<ImPrincipalSummary> {
-        let conn = self.open()?;
-        let principal = ImPrincipalRepository::get(&conn, principal_id)?.ok_or_else(|| {
-            VibexError::validation("im_principal_not_found", "IM principal was not found")
-        })?;
-        if principal.status != ImPrincipalStatus::Active {
-            return Err(VibexError::validation(
-                "im_principal_revoked",
-                "a revoked identity cannot change role",
-            ));
-        }
-        let updated = ImPrincipalRecord {
-            role,
-            updated_at_ms: unix_timestamp_ms(),
-            ..principal
-        };
-        ImPrincipalRepository::upsert_active(&conn, &updated)?;
-        self.audit(
-            &conn,
-            &updated.channel_id,
-            Some(principal_id),
-            "principal_role_changed",
-            Some("principal"),
-            Some(principal_id.as_str()),
-            "allowed",
-            Some(&format!("role={}", role.as_str())),
-        )?;
-        Ok(principal_summary(updated))
     }
 
     pub async fn test_channel(&self, channel_id: &ImChannelId) -> VibexResult<ImChannelTestReport> {
@@ -712,7 +644,6 @@ impl ImChannelService {
             pairing_id: ImPairingId::new(),
             channel_id: request.channel_id.clone(),
             code_hash,
-            role: request.role,
             scope: request.scope.as_str().to_string(),
             target_chat_id: (request.scope == vibex_core::ImPairingScope::Group)
                 .then(|| request.target_chat_id.clone())
@@ -732,12 +663,11 @@ impl ImChannelService {
             Some("pairing"),
             Some(record.pairing_id.as_str()),
             "allowed",
-            Some(&format!("role={}", request.role.as_str())),
+            None,
         )?;
         Ok(ImPairingCodeInfo {
             channel_id: request.channel_id,
             code,
-            role: request.role,
             expires_at_ms: record.expires_at_ms,
         })
     }
@@ -826,10 +756,6 @@ impl ImChannelService {
         let default_session = envelope
             .as_ref()
             .and_then(|envelope| envelope.default_session.clone());
-        let stream_mode = envelope
-            .as_ref()
-            .map(|envelope| envelope.stream_mode)
-            .unwrap_or_default();
         let event_filter = record
             .event_filter_json
             .as_deref()
@@ -850,7 +776,6 @@ impl ImChannelService {
             default_session,
             event_filter,
             locale: record.locale.clone(),
-            stream_mode,
             status,
             created_at_ms: record.created_at_ms,
             updated_at_ms: record.updated_at_ms,
@@ -1335,7 +1260,6 @@ impl ImChannelService {
                 channel_id: event.channel_id.clone(),
                 external_user_id: event.external_user_id.clone(),
                 display_name: event.sender_display_name.clone(),
-                role: pairing.role,
                 status: ImPrincipalStatus::Active,
                 paired_at_ms: Some(now),
                 last_seen_at_ms: Some(now),
@@ -1356,25 +1280,20 @@ impl ImChannelService {
                 Some("pairing"),
                 Some(pairing.pairing_id.as_str()),
                 "allowed",
-                Some(&format!("role={}", pairing.role.as_str())),
+                None,
             )?;
             tx.commit().map_err(|_| {
                 VibexError::storage("im_pairing_commit_failed", "pairing transaction failed")
             })?;
         }
         drop(conn);
-        let role = role_label(pairing.role, self.locale(event));
         self.reply(
             event,
             runtime,
-            &format!(
-                "{} {role}\n{}",
-                self.locale(event).text("Paired as", "已配对为", "已配對為"),
-                self.locale(event).text(
-                    "Send /help to see what you can do.",
-                    "发送 /help 查看可以做什么。",
-                    "傳送 /help 查看可以做什麼。",
-                )
+            self.locale(event).text(
+                "Paired. Send /help to see what you can do.",
+                "已配对。发送 /help 查看可以做什么。",
+                "已配對。傳送 /help 查看可以做什麼。",
             ),
         )
         .await?;
@@ -1506,19 +1425,6 @@ impl ImChannelService {
             .strip_prefix(ELICITATION_ACTION_PREFIX)
             .map(str::to_string)
         {
-            if !principal.role.can_approve() {
-                self.reply(
-                    event,
-                    runtime,
-                    self.locale(event).text(
-                        "You do not have permission to approve.",
-                        "你没有审批权限。",
-                        "你沒有審批權限。",
-                    ),
-                )
-                .await?;
-                return Ok(());
-            }
             let payload: ElicitationActionPayload = serde_json::from_str(&action.payload_json)
                 .map_err(|_| {
                     VibexError::validation(
@@ -1584,19 +1490,6 @@ impl ImChannelService {
         }
         // Whatever is left is an approval: the only remaining kind, and the
         // only one an Approver may answer.
-        if !principal.role.can_approve() {
-            self.reply(
-                event,
-                runtime,
-                self.locale(event).text(
-                    "You do not have permission to approve.",
-                    "你没有审批权限。",
-                    "你沒有審批權限。",
-                ),
-            )
-            .await?;
-            return Ok(());
-        }
         let payload: ApprovalActionPayload =
             serde_json::from_str(&action.payload_json).map_err(|_| {
                 VibexError::validation(
@@ -1689,16 +1582,10 @@ impl ImChannelService {
                 self.send_help(event, runtime, full).await?;
             }
             "/whoami" => {
-                let role = role_label(principal.role, locale);
                 self.reply_card(
                     event,
                     runtime,
-                    &render::identity(
-                        locale,
-                        &principal.display_name,
-                        role,
-                        event.channel_id.as_str(),
-                    ),
+                    &render::identity(locale, &principal.display_name, event.channel_id.as_str()),
                 )
                 .await?;
             }
@@ -1770,18 +1657,7 @@ impl ImChannelService {
                     .await?
             }
             "/say" => {
-                if !principal.role.can_prompt() {
-                    self.reply(
-                        event,
-                        runtime,
-                        self.locale(event).text(
-                            "Your role cannot send prompts.",
-                            "你的角色不能发送内容。",
-                            "你的角色不能傳送內容。",
-                        ),
-                    )
-                    .await?;
-                } else if args.is_empty() {
+                if args.is_empty() {
                     self.reply(
                         event,
                         runtime,
@@ -1823,7 +1699,7 @@ impl ImChannelService {
         &self,
         event: &ImInboundEvent,
         runtime: &ChannelRuntime,
-        principal: &ImPrincipalRecord,
+        _principal: &ImPrincipalRecord,
     ) -> VibexResult<()> {
         let conn = self.open()?;
         let locale = self.locale(event);
@@ -1843,7 +1719,6 @@ impl ImChannelService {
         let session = self.inner.agent.get_session(&binding.session_id).await?;
         let pending =
             ImApprovalCardRepository::list_pending_for_binding(&conn, &binding.binding_id)?;
-        let role = role_label(principal.role, locale);
         let options = self
             .inner
             .agent
@@ -1851,37 +1726,35 @@ impl ImChannelService {
             .await
             .ok();
         let mut buttons = Vec::new();
-        if principal.role.can_prompt() {
-            for (kind, label) in [
-                (
-                    commands::ACTION_STATUS_STOP,
-                    locale.text("Stop", "停止", "停止"),
-                ),
-                (
-                    commands::ACTION_MENU_SESSIONS,
-                    locale.text("Sessions", "会话", "工作階段"),
-                ),
-                (
-                    commands::ACTION_MENU_MODEL,
-                    locale.text("Model", "模型", "模型"),
-                ),
-                (
-                    commands::ACTION_MENU_PROVIDER,
-                    locale.text("Provider", "供应商", "供應商"),
-                ),
-                (
-                    commands::ACTION_MENU_EFFORT,
-                    locale.text("Effort", "思考", "思考"),
-                ),
-            ] {
-                let minted = self.mint_action(&conn, &binding, kind, "{}")?;
-                buttons.push(ImButton {
-                    action_id: minted.action_id,
-                    label: label.to_string(),
-                });
-            }
+        for (kind, label) in [
+            (
+                commands::ACTION_STATUS_STOP,
+                locale.text("Stop", "停止", "停止"),
+            ),
+            (
+                commands::ACTION_MENU_SESSIONS,
+                locale.text("Sessions", "会话", "工作階段"),
+            ),
+            (
+                commands::ACTION_MENU_MODEL,
+                locale.text("Model", "模型", "模型"),
+            ),
+            (
+                commands::ACTION_MENU_PROVIDER,
+                locale.text("Provider", "供应商", "供應商"),
+            ),
+            (
+                commands::ACTION_MENU_EFFORT,
+                locale.text("Effort", "思考", "思考"),
+            ),
+        ] {
+            let minted = self.mint_action(&conn, &binding, kind, "{}")?;
+            buttons.push(ImButton {
+                action_id: minted.action_id,
+                label: label.to_string(),
+            });
         }
-        let text = render::status_card(locale, &session, role, options.as_ref(), pending.len());
+        let text = render::status_card(locale, &session, options.as_ref(), pending.len());
         self.reply_buttons(event, runtime, &text, buttons).await?;
         Ok(())
     }
@@ -1893,19 +1766,6 @@ impl ImChannelService {
         principal: &ImPrincipalRecord,
         args: &str,
     ) -> VibexResult<()> {
-        if !principal.role.can_approve() {
-            self.reply(
-                event,
-                runtime,
-                self.locale(event).text(
-                    "Your role cannot bind sessions.",
-                    "你的角色不能绑定会话。",
-                    "你的角色不能綁定工作階段。",
-                ),
-            )
-            .await?;
-            return Ok(());
-        }
         if args.is_empty() {
             self.reply(
                 event,
@@ -1974,19 +1834,6 @@ impl ImChannelService {
         principal: &ImPrincipalRecord,
         prompt: &str,
     ) -> VibexResult<()> {
-        if !principal.role.can_prompt() {
-            self.reply(
-                event,
-                runtime,
-                self.locale(event).text(
-                    "Your role cannot start sessions.",
-                    "你的角色不能新建会话。",
-                    "你的角色不能建立工作階段。",
-                ),
-            )
-            .await?;
-            return Ok(());
-        }
         if prompt.trim().is_empty() {
             self.reply(
                 event,
@@ -2088,7 +1935,7 @@ impl ImChannelService {
         }
         let binding = self.make_binding(&reply_event, principal, &session, None);
         ImBindingRepository::upsert(&conn, &binding)?;
-        self.start_live_turn(&binding, Some(reply_event.chat_type));
+        self.start_live_turn(&binding);
         self.send_prompt(&reply_event, &session.id, prompt).await?;
         self.reply(
             &reply_event,
@@ -2107,21 +1954,8 @@ impl ImChannelService {
         self: &Arc<Self>,
         event: &ImInboundEvent,
         runtime: &ChannelRuntime,
-        principal: &ImPrincipalRecord,
+        _principal: &ImPrincipalRecord,
     ) -> VibexResult<()> {
-        if !principal.role.can_prompt() {
-            self.reply(
-                event,
-                runtime,
-                self.locale(event).text(
-                    "Your role cannot stop sessions.",
-                    "你的角色不能停止会话。",
-                    "你的角色不能停止工作階段。",
-                ),
-            )
-            .await?;
-            return Ok(());
-        }
         let conn = self.open()?;
         let Some(binding) = self.binding_for(&conn, event)? else {
             self.reply(
@@ -2137,22 +1971,8 @@ impl ImChannelService {
             return Ok(());
         };
         self.inner.agent.interrupt(&binding.session_id).await?;
-        // The live message already says the turn ended; only a chat that never
-        // saw one needs the notice.
-        if self.live_mode_for_binding(&binding).edits_a_message() {
-            self.stop_live_turn(&binding).await;
-        } else {
-            self.reply(
-                event,
-                runtime,
-                self.locale(event).text(
-                    "Stopped the current turn.",
-                    "已停止当前回合。",
-                    "已停止目前回合。",
-                ),
-            )
-            .await?;
-        }
+        // The live turn already says the turn ended.
+        self.stop_live_turn(&binding).await;
         Ok(())
     }
 
@@ -2164,19 +1984,6 @@ impl ImChannelService {
         code: &str,
         choice: ApprovalChoice,
     ) -> VibexResult<()> {
-        if !principal.role.can_approve() {
-            self.reply(
-                event,
-                runtime,
-                self.locale(event).text(
-                    "Your role cannot approve.",
-                    "你的角色不能审批。",
-                    "你的角色不能審批。",
-                ),
-            )
-            .await?;
-            return Ok(());
-        }
         let conn = self.open()?;
         let Some(binding) = self.binding_for(&conn, event)? else {
             self.reply(
@@ -2320,21 +2127,8 @@ impl ImChannelService {
         &self,
         event: &ImInboundEvent,
         runtime: &ChannelRuntime,
-        principal: &ImPrincipalRecord,
+        _principal: &ImPrincipalRecord,
     ) -> VibexResult<()> {
-        if !principal.role.can_admin() {
-            self.reply(
-                event,
-                runtime,
-                self.locale(event).text(
-                    "Only an admin can unbind this chat.",
-                    "只有管理员可以解除绑定。",
-                    "只有管理員可以解除綁定。",
-                ),
-            )
-            .await?;
-            return Ok(());
-        }
         let conn = self.open()?;
         let Some(binding) = self.binding_for(&conn, event)? else {
             self.reply(
@@ -2372,22 +2166,9 @@ impl ImChannelService {
         self: &Arc<Self>,
         event: &ImInboundEvent,
         runtime: &ChannelRuntime,
-        principal: &ImPrincipalRecord,
+        _principal: &ImPrincipalRecord,
         text: &str,
     ) -> VibexResult<()> {
-        if !principal.role.can_prompt() {
-            self.reply(
-                event,
-                runtime,
-                self.locale(event).text(
-                    "Your role cannot send prompts.",
-                    "你的角色不能发送内容。",
-                    "你的角色不能傳送內容。",
-                ),
-            )
-            .await?;
-            return Ok(());
-        }
         let conn = self.open()?;
         let Some(binding) = self.binding_for(&conn, event)? else {
             self.reply(
@@ -2401,24 +2182,11 @@ impl ImChannelService {
         if text.trim().is_empty() && event.attachments.is_empty() {
             return Ok(());
         }
-        // The live message is the acknowledgement; a second "Sent." line would
+        // The live turn is the acknowledgement; a second "Sent." line would
         // only push it up the chat.
-        let live = self.live_mode_for_binding(&binding).edits_a_message();
-        self.start_live_turn(&binding, Some(event.chat_type));
+        self.start_live_turn(&binding);
         self.send_prompt_with_attachments(event, &binding.session_id, text, &event.attachments)
             .await?;
-        if !live {
-            self.reply(
-                event,
-                runtime,
-                self.locale(event).text(
-                    "Sent. I will report back here.",
-                    "已发送，我会在这里回复。",
-                    "已傳送，我會在這裡回覆。",
-                ),
-            )
-            .await?;
-        }
         Ok(())
     }
 
@@ -2900,23 +2668,6 @@ fn topic_title(prompt: &str) -> String {
         .collect()
 }
 
-fn role_label(role: ImPrincipalRole, locale: ImLocale) -> &'static str {
-    match (role, locale) {
-        (ImPrincipalRole::Observer, ImLocale::ZhCn) => "只读",
-        (ImPrincipalRole::Observer, ImLocale::ZhTw) => "唯讀",
-        (ImPrincipalRole::Observer, _) => "observer",
-        (ImPrincipalRole::Approver, ImLocale::ZhCn) => "审批",
-        (ImPrincipalRole::Approver, ImLocale::ZhTw) => "審批",
-        (ImPrincipalRole::Approver, _) => "approver",
-        (ImPrincipalRole::Operator, ImLocale::ZhCn) => "操作",
-        (ImPrincipalRole::Operator, ImLocale::ZhTw) => "操作",
-        (ImPrincipalRole::Operator, _) => "operator",
-        (ImPrincipalRole::Admin, ImLocale::ZhCn) => "管理员",
-        (ImPrincipalRole::Admin, ImLocale::ZhTw) => "管理員",
-        (ImPrincipalRole::Admin, _) => "admin",
-    }
-}
-
 fn generate_pairing_code() -> String {
     let entropy = Uuid::new_v4().simple().to_string();
     let mut chars = entropy.bytes().filter_map(|byte| {
@@ -2998,7 +2749,6 @@ fn principal_summary(record: ImPrincipalRecord) -> ImPrincipalSummary {
         channel_id: record.channel_id,
         external_user_id: record.external_user_id,
         display_name: record.display_name,
-        role: record.role,
         status: record.status,
         paired_at_ms: record.paired_at_ms,
         last_seen_at_ms: record.last_seen_at_ms,
@@ -3182,7 +2932,6 @@ mod tests {
             default_session: None,
             event_filter: Vec::new(),
             locale: None,
-            stream_mode: vibex_core::ImStreamMode::Auto,
         }
     }
 
@@ -3208,7 +2957,6 @@ mod tests {
         let pairing = service
             .create_pairing_code(ImPairingRequest {
                 channel_id: channel.channel_id.clone(),
-                role: ImPrincipalRole::Approver,
                 ttl_ms: Some(60_000),
                 scope: ImPairingScope::Direct,
                 target_chat_id: None,
@@ -3216,7 +2964,6 @@ mod tests {
             .await
             .expect("pairing code");
         assert!(pairing.code.starts_with("VBX-"));
-        assert_eq!(pairing.role, ImPrincipalRole::Approver);
     }
 
     #[tokio::test]
@@ -3317,7 +3064,6 @@ mod tests {
             default_session: None,
             event_filter: Vec::new(),
             locale: None,
-            stream_mode: vibex_core::ImStreamMode::Auto,
         };
         assert_eq!(draft.config.kind(), vibex_core::ImChannelKind::Lark);
     }

@@ -21,8 +21,7 @@ use vibex_backend::BackendError;
 use vibex_core::{
     AgentSession, ImBindingSummary, ImChannelConfig, ImChannelDraft, ImChannelId, ImChannelKind,
     ImChannelSummary, ImLarkConfig, ImLarkRegion, ImLarkTransport, ImPairingCodeInfo,
-    ImPairingRequest, ImPrincipalId, ImPrincipalRole, ImPrincipalSummary, ImSessionDefaults,
-    ImStreamMode, ImTelegramConfig,
+    ImPairingRequest, ImPrincipalId, ImPrincipalSummary, ImSessionDefaults, ImTelegramConfig,
 };
 
 use crate::app::VibexWorkbench;
@@ -37,8 +36,6 @@ pub struct ImChannelsView {
     lark_app_secret_input: Entity<InputState>,
     lark_chat_input: Entity<InputState>,
     telegram_topic_mode: bool,
-    /// The role a newly minted pairing code grants.
-    pairing_role: ImPrincipalRole,
     /// Which Lark deployment the app was created in.
     lark_region: ImLarkRegion,
     channels: Vec<ImChannelSummary>,
@@ -80,7 +77,6 @@ impl ImChannelsView {
             lark_app_secret_input,
             lark_chat_input,
             telegram_topic_mode: false,
-            pairing_role: ImPrincipalRole::Operator,
             lark_region: ImLarkRegion::Feishu,
             channels: Vec::new(),
             selected: None,
@@ -267,7 +263,6 @@ impl ImChannelsView {
                 default_session: None,
                 event_filter: Vec::new(),
                 locale: None,
-                stream_mode: ImStreamMode::Auto,
             };
             async {
                 let channel = backend
@@ -354,7 +349,6 @@ impl ImChannelsView {
                 default_session: None,
                 event_filter: Vec::new(),
                 locale: None,
-                stream_mode: ImStreamMode::Auto,
             };
             let created = backend
                 .management()
@@ -622,13 +616,11 @@ impl ImChannelsView {
             return;
         };
         self.busy = true;
-        let role = self.pairing_role;
         self.task = Some(cx.spawn(async move |weak: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
             let result = backend
                 .management()
                 .create_im_pairing_code(vibex_backend::MutationRequest::new(ImPairingRequest {
                     channel_id,
-                    role,
                     ttl_ms: Some(600_000),
                     scope: vibex_core::ImPairingScope::Direct,
                     target_chat_id: None,
@@ -761,41 +753,6 @@ impl ImChannelsView {
         ));
     }
 
-    fn set_principal_role(
-        &mut self,
-        principal_id: ImPrincipalId,
-        role: ImPrincipalRole,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(backend) = self.backend(cx) else {
-            return;
-        };
-        self.task = Some(cx.spawn(
-            async move |weak: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
-                let result = backend
-                    .management()
-                    .set_im_principal_role(vibex_backend::MutationRequest::new(
-                        vibex_backend::ImPrincipalRoleUpdate { principal_id, role },
-                    ))
-                    .await
-                    .map(|_| ())
-                    .map_err(backend_error);
-                let _ = weak.update(cx, |this, cx| {
-                    match result {
-                        Ok(()) => {
-                            this.notice = Some("Role updated.".to_string());
-                            this.loaded = false;
-                            this.loading = false;
-                            this.reload(cx);
-                        }
-                        Err(error) => this.error = Some(error),
-                    }
-                    cx.notify();
-                });
-            },
-        ));
-    }
-
     fn revoke_binding(&mut self, binding_id: vibex_core::ImBindingId, cx: &mut Context<Self>) {
         let Some(backend) = self.backend(cx) else {
             return;
@@ -811,86 +768,6 @@ impl ImChannelsView {
                     match result {
                         Ok(()) => {
                             this.notice = Some("Binding removed.".to_string());
-                            this.loaded = false;
-                            this.loading = false;
-                            this.reload(cx);
-                        }
-                        Err(error) => this.error = Some(error),
-                    }
-                    cx.notify();
-                });
-            },
-        ));
-    }
-
-    fn role_label(role: ImPrincipalRole) -> &'static str {
-        match role {
-            ImPrincipalRole::Observer => locale::text("Observer", "只读", "唯讀"),
-            ImPrincipalRole::Approver => locale::text("Approver", "审批", "審批"),
-            ImPrincipalRole::Operator => locale::text("Operator", "操作员", "操作員"),
-            ImPrincipalRole::Admin => locale::text("Admin", "管理员", "管理員"),
-        }
-    }
-
-    fn next_role(role: ImPrincipalRole) -> ImPrincipalRole {
-        match role {
-            ImPrincipalRole::Observer => ImPrincipalRole::Approver,
-            ImPrincipalRole::Approver => ImPrincipalRole::Operator,
-            ImPrincipalRole::Operator => ImPrincipalRole::Admin,
-            ImPrincipalRole::Admin => ImPrincipalRole::Observer,
-        }
-    }
-
-    fn stream_mode_label(mode: ImStreamMode) -> &'static str {
-        match mode {
-            ImStreamMode::Auto => locale::text("Auto", "自动", "自動"),
-            ImStreamMode::Off => locale::text("Off", "关闭", "關閉"),
-            ImStreamMode::Typing => locale::text("Typing", "输入中", "輸入中"),
-            ImStreamMode::Progress => locale::text("Progress", "进度", "進度"),
-            ImStreamMode::Live => locale::text("Live", "逐字", "逐字"),
-        }
-    }
-
-    fn next_stream_mode(mode: ImStreamMode) -> ImStreamMode {
-        match mode {
-            ImStreamMode::Auto => ImStreamMode::Off,
-            ImStreamMode::Off => ImStreamMode::Typing,
-            ImStreamMode::Typing => ImStreamMode::Progress,
-            ImStreamMode::Progress => ImStreamMode::Live,
-            ImStreamMode::Live => ImStreamMode::Auto,
-        }
-    }
-
-    fn set_stream_mode(
-        &mut self,
-        channel_id: ImChannelId,
-        mode: ImStreamMode,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(backend) = self.backend(cx) else {
-            return;
-        };
-        self.busy = true;
-        self.error = None;
-        self.task = Some(cx.spawn(
-            async move |weak: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
-                let result = backend
-                    .management()
-                    .set_im_channel_stream_mode(vibex_backend::MutationRequest::new(
-                        vibex_backend::ImChannelStreamModeUpdate {
-                            channel_id,
-                            stream_mode: mode,
-                        },
-                    ))
-                    .await
-                    .map(|_| ())
-                    .map_err(backend_error);
-                let _ = weak.update(cx, |this, cx| {
-                    this.busy = false;
-                    match result {
-                        Ok(()) => {
-                            this.notice =
-                                Some(format!("Streaming: {}.", Self::stream_mode_label(mode)));
                             this.loaded = false;
                             this.loading = false;
                             this.reload(cx);
@@ -1253,34 +1130,6 @@ impl Render for ImChannelsView {
                             .gap_2()
                             .items_center()
                             .child(
-                                Button::new("im-stream-mode")
-                                    .small()
-                                    .outline()
-                                    .label(format!(
-                                        "{}: {}",
-                                        locale::text("Streaming", "流式", "串流"),
-                                        Self::stream_mode_label(channel.stream_mode)
-                                    ))
-                                    .disabled(self.busy)
-                                    .on_click(cx.listener({
-                                        let channel_id = channel_id.clone();
-                                        let mode = Self::next_stream_mode(channel.stream_mode);
-                                        move |this, _, _, cx| {
-                                            this.set_stream_mode(channel_id.clone(), mode, cx)
-                                        }
-                                    })),
-                            )
-                            .child(
-                                Button::new("im-pairing-role")
-                                    .small()
-                                    .outline()
-                                    .label(format!("Role: {}", Self::role_label(self.pairing_role)))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.pairing_role = Self::next_role(this.pairing_role);
-                                        cx.notify();
-                                    })),
-                            )
-                            .child(
                                 Button::new("im-channel-pair")
                                     .small()
                                     .primary()
@@ -1343,26 +1192,12 @@ impl Render for ImChannelsView {
                                                 .text_color(foreground)
                                                 .child(principal.display_name.clone()),
                                         )
-                                        .child(div().text_xs().text_color(muted).child(format!(
-                                            "{:?} · {:?}",
-                                            principal.role, principal.status
-                                        ))),
-                                )
-                                .child(
-                                    Button::new(format!(
-                                        "im-principal-role-{}",
-                                        principal.principal_id.as_str()
-                                    ))
-                                    .small()
-                                    .outline()
-                                    .label(Self::role_label(principal.role))
-                                    .on_click(cx.listener({
-                                        let principal_id = principal_id.clone();
-                                        let next = Self::next_role(principal.role);
-                                        move |this, _, _, cx| {
-                                            this.set_principal_role(principal_id.clone(), next, cx)
-                                        }
-                                    })),
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(muted)
+                                                .child(format!("{:?}", principal.status)),
+                                        ),
                                 )
                                 .child(
                                     Button::new(format!(

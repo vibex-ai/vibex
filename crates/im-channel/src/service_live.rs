@@ -1,8 +1,9 @@
-//! Live turn delivery: the progress line and the growing answer.
+//! Live turn delivery: one progress line and the answer as it grows.
 //!
-//! A chat used to see only the final answer. The runtime already streams
-//! `AgentMessageDelta` events, so a turn can be shown as it happens: one
-//! message that a single worker owns and edits until the turn ends.
+//! A chat sees each assistant text block as its own message, edited while that
+//! block streams, and one progress message that is edited as tools and thinking
+//! change. A turn that writes, calls a tool, and writes again therefore leaves
+//! several readable messages behind instead of one message that keeps mutating.
 //!
 //! The worker is the only writer. The event loop never blocks on an edit; it
 //! records what the turn produced and makes sure a worker is running. That
@@ -11,97 +12,29 @@
 //! the worker redraws from the latest state, so a burst of deltas costs one
 //! edit instead of one edit each.
 
-use vibex_core::{AgentMessageDeltaPayload, AgentMessagePhase, ImChannelKind, ImStreamMode};
+use vibex_core::{AgentMessageDeltaPayload, AgentMessagePhase};
 
 use super::*;
 use crate::error::ImResult;
-use crate::types::ImActivity;
+use crate::types::ImTarget;
 
-/// How long a live answer waits between edits.
+/// How long a streaming text message waits between edits.
 ///
 /// A person does not read faster than this, and every edit is a provider call
 /// that competes with approvals and final answers for the same quota.
-const LIVE_EDIT_GAP_MS: i64 = 1_500;
-/// How long a progress line waits between edits. Groups get the thriftier
-/// setting because Telegram counts an edit against the group's message rate.
-const PROGRESS_EDIT_GAP_MS: i64 = 4_000;
+const TEXT_EDIT_GAP_MS: i64 = 1_500;
+/// How long a progress line waits between edits. It changes less often than an
+/// answer grows, so it can afford to be thriftier.
+const PROGRESS_EDIT_GAP_MS: i64 = 2_500;
 /// How often a progress line's clock is redrawn.
 const PROGRESS_CLOCK_BUCKET_MS: i64 = 5_000;
 /// How often the worker wakes to reconsider the message.
 const LIVE_POLL_MS: u64 = 400;
-/// How often the `typing` action is refreshed; Telegram clears it after ~5s.
-const TYPING_TICK_MS: i64 = 4_000;
-/// The longest a live message trails an answer that outgrew it.
-const LIVE_TAIL_CHARS: usize = 2_800;
+/// The most edits one turn will make, so a runaway stream stops spending the
+/// provider's quota on itself.
+const MAX_TURN_EDITS: u32 = 200;
 /// How long a finalizer waits for the worker to deliver before giving up.
 const LIVE_FINISH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
-
-/// What a chat actually asked to see, after `Auto` is resolved.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum ResolvedStream {
-    Off,
-    Typing,
-    Progress,
-    Live,
-}
-
-impl ResolvedStream {
-    fn edit_gap_ms(self) -> i64 {
-        match self {
-            Self::Progress => PROGRESS_EDIT_GAP_MS,
-            _ => LIVE_EDIT_GAP_MS,
-        }
-    }
-
-    pub(super) fn edits_a_message(self) -> bool {
-        matches!(self, Self::Progress | Self::Live)
-    }
-}
-
-/// Resolves the channel's appetite for live updates against this chat.
-///
-/// `Auto` streams a direct message and keeps a group to a progress line. The
-/// chat type is not always known: a timeline event names a binding, not an
-/// inbound message, so a negative Telegram chat id or a thread key is read as a
-/// group. Guessing "group" is the conservative direction, because it is the
-/// answer that sends less.
-pub(super) fn resolve_stream(
-    mode: ImStreamMode,
-    chat_type: Option<ImChatType>,
-    group_hint: bool,
-) -> ResolvedStream {
-    match mode {
-        ImStreamMode::Off => ResolvedStream::Off,
-        ImStreamMode::Typing => ResolvedStream::Typing,
-        ImStreamMode::Progress => ResolvedStream::Progress,
-        ImStreamMode::Live => ResolvedStream::Live,
-        ImStreamMode::Auto => {
-            let group = match chat_type {
-                Some(ImChatType::Direct) => false,
-                Some(ImChatType::Group | ImChatType::Thread) => true,
-                None => group_hint,
-            };
-            if group {
-                ResolvedStream::Progress
-            } else {
-                ResolvedStream::Live
-            }
-        }
-    }
-}
-
-/// Whether a chat looks like a group when the inbound message is gone.
-///
-/// A timeline event names a binding, not the message that created it. Telegram
-/// ids carry the answer (groups are negative, forum topics have a thread key);
-/// Lark's are opaque, so a binding without an inbound message takes the quieter
-/// setting rather than editing a busy group's timeline.
-fn group_hint(kind: ImChannelKind, external_chat_id: &str, thread_key: &str) -> bool {
-    match kind {
-        ImChannelKind::Telegram => external_chat_id.starts_with('-') || !thread_key.is_empty(),
-        ImChannelKind::Lark => true,
-    }
-}
 
 /// How a turn ended, from the live delivery's point of view.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -111,126 +44,204 @@ pub(super) enum LiveOutcome {
     Stopped,
 }
 
+/// One assistant text block, streamed into its own chat message.
+#[derive(Debug, Clone, Default)]
+struct TextRun {
+    /// The provider message this block arrived under, when it has one. A new
+    /// correlation starts a new chat message even without an activity between.
+    correlation: Option<String>,
+    /// The provider's phase, when it reports one. A phase change is a boundary.
+    phase: Option<AgentMessagePhase>,
+    text: String,
+    message_id: Option<String>,
+    shown: String,
+    last_edit_ms: i64,
+    /// A block that has ended: it is drawn but never appended to again.
+    sealed: bool,
+}
+
+/// The turn's single activity message.
+#[derive(Debug, Clone, Default)]
+struct ProgressRun {
+    message_id: Option<String>,
+    shown: String,
+    label: Option<String>,
+    last_edit_ms: i64,
+}
+
+/// One redraw the worker owes the chat.
+enum LiveDraw {
+    Text {
+        index: usize,
+        message_id: Option<String>,
+        text: String,
+    },
+    Progress {
+        message_id: Option<String>,
+        text: String,
+    },
+}
+
 pub(super) struct LiveTurn {
-    pub(super) mode: ResolvedStream,
     locale: ImLocale,
     started_ms: i64,
-    /// The answer text the deltas accumulated.
-    text: String,
-    /// The latest commentary or tool label, when the channel forwards those.
-    progress: Option<String>,
-    /// The text the provider last confirmed for the live message.
-    shown: String,
-    message_id: Option<String>,
-    last_edit_ms: i64,
+    /// Every text block of the turn, in order; the last one is still growing.
+    runs: Vec<TextRun>,
+    progress: Option<ProgressRun>,
     finished: bool,
     outcome: Option<LiveOutcome>,
     watermark: i64,
     worker_running: bool,
-    /// Whether the turn produced a message of its own.
-    sent_any: bool,
     edits: u32,
 }
 
 impl LiveTurn {
-    fn new(mode: ResolvedStream, locale: ImLocale, now_ms: i64) -> Self {
+    fn new(locale: ImLocale, now_ms: i64) -> Self {
         Self {
-            mode,
             locale,
             started_ms: now_ms,
-            text: String::new(),
+            runs: Vec::new(),
             progress: None,
-            shown: String::new(),
-            message_id: None,
-            last_edit_ms: 0,
             finished: false,
             outcome: None,
             watermark: 0,
             worker_running: false,
-            sent_any: false,
             edits: 0,
         }
     }
 
     /// Clears a finished turn so the next one starts from nothing.
     fn reset(&mut self, now_ms: i64) {
-        let mode = self.mode;
         let locale = self.locale;
-        *self = Self::new(mode, locale, now_ms);
+        *self = Self::new(locale, now_ms);
     }
 
-    /// What the live message should say right now, if anything.
-    fn display(&self, now_ms: i64) -> Option<String> {
-        let progress = || {
-            let elapsed = now_ms.saturating_sub(self.started_ms).max(0);
-            let bucket = elapsed / PROGRESS_CLOCK_BUCKET_MS * PROGRESS_CLOCK_BUCKET_MS / 1000;
-            render::working(self.locale, self.progress.as_deref(), bucket)
-        };
-        match self.mode {
-            ResolvedStream::Off | ResolvedStream::Typing => None,
-            ResolvedStream::Progress => Some(progress()),
-            ResolvedStream::Live => {
-                if self.text.trim().is_empty() {
-                    Some(progress())
-                } else {
-                    Some(render::live_answer(
-                        &self.text,
-                        LIVE_TAIL_CHARS,
-                        self.locale,
-                    ))
-                }
-            }
+    /// Ends the block that is streaming, so the next delta opens a new message.
+    fn seal_current(&mut self) {
+        if let Some(run) = self.runs.last_mut() {
+            run.sealed = true;
         }
+    }
+
+    /// Records one delta, starting a new chat message at a block boundary.
+    fn append_delta(&mut self, delta: &AgentMessageDeltaPayload, correlation: Option<&str>) {
+        if delta.text_delta.is_empty() {
+            return;
+        }
+        let boundary = match self.runs.last() {
+            None => true,
+            Some(run) => {
+                run.sealed
+                    || (correlation.is_some()
+                        && run.correlation.is_some()
+                        && run.correlation.as_deref() != correlation)
+                    || (delta.phase.is_some() && run.phase.is_some() && run.phase != delta.phase)
+            }
+        };
+        if boundary {
+            self.runs.push(TextRun {
+                correlation: correlation.map(str::to_string),
+                phase: delta.phase,
+                ..TextRun::default()
+            });
+        }
+        if let Some(run) = self.runs.last_mut() {
+            if run.correlation.is_none() {
+                run.correlation = correlation.map(str::to_string);
+            }
+            if run.phase.is_none() {
+                run.phase = delta.phase;
+            }
+            run.text.push_str(&delta.text_delta);
+        }
+    }
+
+    fn note_activity(&mut self, label: Option<String>) {
+        self.seal_current();
+        let progress = self.progress.get_or_insert_with(ProgressRun::default);
+        if label.is_some() {
+            progress.label = label;
+        }
+    }
+
+    /// Shows the progress line from the start of the turn, before the first
+    /// tool or thought names what the turn is doing.
+    fn begin_activity(&mut self) {
+        self.progress.get_or_insert_with(ProgressRun::default);
+    }
+
+    /// The progress line's text right now, if the turn has shown activity.
+    fn display_progress(&self, now_ms: i64) -> Option<String> {
+        let progress = self.progress.as_ref()?;
+        let elapsed = now_ms.saturating_sub(self.started_ms).max(0);
+        let bucket = elapsed / PROGRESS_CLOCK_BUCKET_MS * PROGRESS_CLOCK_BUCKET_MS / 1000;
+        Some(render::working(
+            self.locale,
+            progress.label.as_deref(),
+            bucket,
+        ))
     }
 }
 
+/// The next redraw the worker owes, if any.
+fn pending_draw(state: &Arc<Mutex<LiveTurn>>, now_ms: i64, ignore_gap: bool) -> Option<LiveDraw> {
+    let turn = state.lock().expect("live turn lock");
+    if !ignore_gap && turn.edits >= MAX_TURN_EDITS {
+        return None;
+    }
+    for (index, run) in turn.runs.iter().enumerate() {
+        if run.text.trim().is_empty() {
+            continue;
+        }
+        let text = render::live_text(&run.text);
+        if text == run.shown {
+            continue;
+        }
+        if !ignore_gap && now_ms.saturating_sub(run.last_edit_ms) < TEXT_EDIT_GAP_MS {
+            continue;
+        }
+        return Some(LiveDraw::Text {
+            index,
+            message_id: run.message_id.clone(),
+            text,
+        });
+    }
+    let progress = turn.progress.as_ref()?;
+    let text = turn.display_progress(now_ms)?;
+    if text == progress.shown {
+        return None;
+    }
+    if !ignore_gap && now_ms.saturating_sub(progress.last_edit_ms) < PROGRESS_EDIT_GAP_MS {
+        return None;
+    }
+    Some(LiveDraw::Progress {
+        message_id: progress.message_id.clone(),
+        text,
+    })
+}
+
 impl ImChannelService {
-    /// The stream mode and platform stored for a channel.
-    fn channel_stream_settings(&self, channel_id: &ImChannelId) -> (ImStreamMode, ImChannelKind) {
-        let Some(conn) = self.open().ok() else {
-            return (ImStreamMode::Auto, ImChannelKind::Telegram);
-        };
-        ImChannelRepository::get(&conn, channel_id)
-            .ok()
-            .flatten()
-            .map(|record| {
-                let mode = serde_json::from_str::<ImChannelConfigEnvelope>(&record.config_json)
-                    .ok()
-                    .map(|envelope| envelope.stream_mode)
-                    .unwrap_or_default();
-                (mode, record.kind)
-            })
-            .unwrap_or((ImStreamMode::Auto, ImChannelKind::Telegram))
-    }
-
-    /// The stream mode a binding's chat has asked for.
-    pub(super) fn live_mode_for_binding(&self, binding: &ImBindingRecord) -> ResolvedStream {
-        let (mode, kind) = self.channel_stream_settings(&binding.channel_id);
-        resolve_stream(
-            mode,
-            None,
-            group_hint(kind, &binding.external_chat_id, &binding.thread_key),
-        )
-    }
-
     /// The live turn for a binding, created on first use.
     fn live_slot(&self, binding: &ImBindingRecord) -> Arc<Mutex<LiveTurn>> {
         let mut turns = self.inner.live_turns.lock().expect("live turn registry");
         turns
             .entry(binding.binding_id.clone())
             .or_insert_with(|| {
-                let mode = self.live_mode_for_binding(binding);
                 let locale = self.locale_for_channel(&binding.channel_id);
-                Arc::new(Mutex::new(LiveTurn::new(mode, locale, unix_timestamp_ms())))
+                Arc::new(Mutex::new(LiveTurn::new(locale, unix_timestamp_ms())))
             })
             .clone()
     }
 
     /// Records a streamed delta and makes sure a worker is drawing it.
+    ///
+    /// `correlation` is the provider's message id: a change means a new text
+    /// block, which becomes a new chat message.
     pub(super) fn note_live_delta(
         self: &Arc<Self>,
         binding: &ImBindingRecord,
         payload: &AgentMessageDeltaPayload,
+        correlation: Option<&str>,
     ) {
         let state = self.live_slot(binding);
         {
@@ -238,84 +249,51 @@ impl ImChannelService {
             if turn.finished {
                 turn.reset(unix_timestamp_ms());
             }
-            if !turn.mode.edits_a_message() {
-                return;
-            }
-            match payload.phase {
-                Some(AgentMessagePhase::Commentary) => {
-                    let label = payload.text_delta.trim();
-                    if !label.is_empty() {
-                        turn.progress = Some(render::truncate(label, 120));
-                    }
-                }
-                _ => turn.text.push_str(&payload.text_delta),
-            }
+            turn.append_delta(payload, correlation);
         }
         self.ensure_live_worker(binding, &state);
     }
 
-    /// Records a tool label for the progress line.
-    ///
-    /// Tool names ride the channel's event filter: a chat that turned tool
-    /// progress off asked not to see them, and the progress line is not the
-    /// place to overrule that.
-    pub(super) fn note_live_progress(self: &Arc<Self>, binding: &ImBindingRecord, label: &str) {
-        let allowed = self
-            .open()
-            .ok()
-            .and_then(|conn| {
-                ImChannelRepository::get(&conn, &binding.channel_id)
-                    .ok()
-                    .flatten()
-            })
-            .is_some_and(|record| event_allowed(&record, "tool_progress"));
-        if !allowed || label.trim().is_empty() {
-            return;
-        }
+    /// Records a tool call as the turn's current activity.
+    pub(super) fn note_live_tool(
+        self: &Arc<Self>,
+        binding: &ImBindingRecord,
+        tool_name: &str,
+        summary: &str,
+    ) {
+        let locale = self.locale_for_channel(&binding.channel_id);
+        let label = render::activity(locale, tool_name, summary);
+        self.note_live_activity(binding, Some(label));
+    }
+
+    /// Records model reasoning as the turn's current activity.
+    pub(super) fn note_live_thinking(self: &Arc<Self>, binding: &ImBindingRecord) {
+        let locale = self.locale_for_channel(&binding.channel_id);
+        let label = render::thinking(locale).to_string();
+        self.note_live_activity(binding, Some(label));
+    }
+
+    fn note_live_activity(self: &Arc<Self>, binding: &ImBindingRecord, label: Option<String>) {
         let state = self.live_slot(binding);
         {
             let mut turn = state.lock().expect("live turn lock");
             if turn.finished {
                 turn.reset(unix_timestamp_ms());
             }
-            if !turn.mode.edits_a_message() {
-                return;
-            }
-            turn.progress = Some(render::truncate(label.trim(), 120));
+            turn.note_activity(label);
         }
         self.ensure_live_worker(binding, &state);
     }
 
     /// Starts (or keeps) a live turn for a binding that is now running.
-    ///
-    /// The ticker cases need this even before any delta arrives: a `typing`
-    /// action and a progress line both have something to say about a turn that
-    /// has not produced text yet.
-    pub(super) fn start_live_turn(
-        self: &Arc<Self>,
-        binding: &ImBindingRecord,
-        chat_type: Option<ImChatType>,
-    ) {
-        let mode = {
-            let (stored, kind) = self.channel_stream_settings(&binding.channel_id);
-            resolve_stream(
-                stored,
-                chat_type,
-                group_hint(kind, &binding.external_chat_id, &binding.thread_key),
-            )
-        };
-        if mode == ResolvedStream::Off {
-            return;
-        }
+    pub(super) fn start_live_turn(self: &Arc<Self>, binding: &ImBindingRecord) {
         let state = self.live_slot(binding);
         {
             let mut turn = state.lock().expect("live turn lock");
             if turn.finished {
                 turn.reset(unix_timestamp_ms());
             }
-            // A binding that changed its stream setting picks the new mode up
-            // on the next turn rather than mid-answer.
-            turn.mode = mode;
+            turn.begin_activity();
         }
         self.ensure_live_worker(binding, &state);
     }
@@ -344,9 +322,6 @@ impl ImChannelService {
     }
 
     /// Records how a turn ended. Returns whether the live path owns the reply.
-    ///
-    /// A channel in `Typing` mode only ever sent chat actions, so the answer
-    /// still goes out through the ordinary path and the caller is told so.
     pub(super) async fn finish_live_turn(
         self: &Arc<Self>,
         binding: &ImBindingRecord,
@@ -360,17 +335,11 @@ impl ImChannelService {
         let Some(state) = state else {
             return false;
         };
-        let mode = {
+        {
             let mut turn = state.lock().expect("live turn lock");
             turn.finished = true;
             turn.outcome = Some(outcome);
             turn.watermark = watermark;
-            turn.mode
-        };
-        if mode == ResolvedStream::Typing {
-            self.await_live_worker(&state).await;
-            self.forget_live_turn(&binding.binding_id);
-            return false;
         }
         self.ensure_live_worker(binding, &state);
         self.await_live_worker(&state).await;
@@ -437,101 +406,33 @@ impl ImChannelService {
         binding: &ImBindingRecord,
         state: &Arc<Mutex<LiveTurn>>,
     ) {
-        let mut last_typing_ms = 0_i64;
         loop {
             if *self.inner.shutdown.borrow() {
                 break;
             }
             let now = unix_timestamp_ms();
-            let snapshot = {
+            let (finished, outcome, watermark, locale) = {
                 let turn = state.lock().expect("live turn lock");
                 (
-                    turn.mode,
                     turn.finished,
                     turn.outcome.clone(),
-                    turn.display(now),
-                    turn.message_id.clone(),
-                    turn.shown.clone(),
-                    turn.last_edit_ms,
                     turn.watermark,
                     turn.locale,
-                    turn.edits,
                 )
             };
-            let (
-                mode,
-                finished,
-                outcome,
-                display,
-                message_id,
-                shown,
-                last_edit_ms,
-                watermark,
-                locale,
-                edits,
-            ) = snapshot;
-
             if finished {
-                // Only a mode that edits a message owns the final content.
-                // `Typing` never showed one, so its outcome is left to the
-                // ordinary send path or the answer would go out twice.
-                if let Some(outcome) = outcome
-                    && mode.edits_a_message()
-                {
+                // Everything the turn produced still has to reach the chat
+                // before the outcome replaces or follows it.
+                self.flush_live_turn(binding, state).await;
+                if let Some(outcome) = outcome {
                     self.deliver_live_outcome(binding, state, &outcome, watermark, locale)
                         .await;
                 }
                 break;
             }
-
-            if mode == ResolvedStream::Typing {
-                // The tick count bounds a turn that never finishes on its own:
-                // a chat action every few seconds is a hint, not a heartbeat
-                // worth keeping for an hour.
-                if now.saturating_sub(last_typing_ms) >= TYPING_TICK_MS && edits < 120 {
-                    if let Some(outbox) = self.live_outbox(&binding.channel_id).await {
-                        let _ = outbox
-                            .activity(Self::live_target(binding), ImActivity::Typing)
-                            .await;
-                    }
-                    last_typing_ms = now;
-                    if let Ok(mut turn) = state.lock() {
-                        turn.sent_any = true;
-                        turn.edits = turn.edits.saturating_add(1);
-                    }
-                }
-            } else if let Some(text) = display {
-                let gap = mode.edit_gap_ms();
-                if text != shown && now.saturating_sub(last_edit_ms) >= gap && edits < 120 {
-                    let result = self
-                        .draw_live_message(binding, message_id.as_deref(), &text)
-                        .await;
-                    let mut turn = state.lock().expect("live turn lock");
-                    turn.edits = turn.edits.saturating_add(1);
-                    match result {
-                        Ok(settled) => {
-                            turn.shown = text;
-                            turn.last_edit_ms = unix_timestamp_ms();
-                            if let Some(settled) = settled {
-                                turn.message_id = Some(settled);
-                            }
-                            turn.sent_any = true;
-                        }
-                        Err(error) => {
-                            // Back off on a refusal instead of hammering it.
-                            // The final answer still goes out; only the
-                            // progress line is lost.
-                            turn.last_edit_ms = unix_timestamp_ms() + 3_000;
-                            tracing::debug!(
-                                target: "vibex_im",
-                                error_code = %error.code(),
-                                "IM live edit failed"
-                            );
-                        }
-                    }
-                }
+            if let Some(draw) = pending_draw(state, now, false) {
+                self.draw_live(binding, state, draw).await;
             }
-
             tokio::time::sleep(std::time::Duration::from_millis(LIVE_POLL_MS)).await;
         }
         if let Ok(mut turn) = state.lock() {
@@ -539,16 +440,101 @@ impl ImChannelService {
         }
     }
 
+    /// Draws everything still outstanding, ignoring the coalescing gaps.
+    async fn flush_live_turn(
+        self: &Arc<Self>,
+        binding: &ImBindingRecord,
+        state: &Arc<Mutex<LiveTurn>>,
+    ) {
+        for _ in 0..8 {
+            let Some(draw) = pending_draw(state, unix_timestamp_ms(), true) else {
+                break;
+            };
+            self.draw_live(binding, state, draw).await;
+        }
+    }
+
+    async fn draw_live(
+        self: &Arc<Self>,
+        binding: &ImBindingRecord,
+        state: &Arc<Mutex<LiveTurn>>,
+        draw: LiveDraw,
+    ) {
+        let Some(outbox) = self.live_outbox(&binding.channel_id).await else {
+            return;
+        };
+        match draw {
+            LiveDraw::Text {
+                index,
+                message_id,
+                text,
+            } => {
+                let result = self
+                    .draw_live_message(binding, &outbox, message_id.as_deref(), &text)
+                    .await;
+                let mut turn = state.lock().expect("live turn lock");
+                turn.edits = turn.edits.saturating_add(1);
+                let Some(run) = turn.runs.get_mut(index) else {
+                    return;
+                };
+                match result {
+                    Ok(settled) => {
+                        run.shown = text;
+                        run.last_edit_ms = unix_timestamp_ms();
+                        if settled.is_some() {
+                            run.message_id = settled;
+                        }
+                    }
+                    Err(error) => {
+                        // Back off on a refusal instead of hammering it. The
+                        // final answer still goes out; only the live text is lost.
+                        run.last_edit_ms = unix_timestamp_ms() + 3_000;
+                        tracing::debug!(
+                            target: "vibex_im",
+                            error_code = %error.code(),
+                            "IM live text edit failed"
+                        );
+                    }
+                }
+            }
+            LiveDraw::Progress { message_id, text } => {
+                let result = self
+                    .draw_live_message(binding, &outbox, message_id.as_deref(), &text)
+                    .await;
+                let mut turn = state.lock().expect("live turn lock");
+                turn.edits = turn.edits.saturating_add(1);
+                let Some(progress) = turn.progress.as_mut() else {
+                    return;
+                };
+                match result {
+                    Ok(settled) => {
+                        progress.shown = text;
+                        progress.last_edit_ms = unix_timestamp_ms();
+                        if settled.is_some() {
+                            progress.message_id = settled;
+                        }
+                    }
+                    Err(error) => {
+                        progress.last_edit_ms = unix_timestamp_ms() + 3_000;
+                        tracing::debug!(
+                            target: "vibex_im",
+                            error_code = %error.code(),
+                            "IM progress edit failed"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     /// Sends or edits the one live message. Returns its id when it was created.
     async fn draw_live_message(
         &self,
         binding: &ImBindingRecord,
+        outbox: &Outbox,
         message_id: Option<&str>,
         text: &str,
     ) -> ImResult<Option<String>> {
-        let Some(outbox) = self.live_outbox(&binding.channel_id).await else {
-            return Ok(None);
-        };
         let target = Self::live_target(binding);
         match message_id {
             Some(message_id) => {
@@ -590,9 +576,14 @@ impl ImChannelService {
         watermark: i64,
         locale: ImLocale,
     ) {
-        let (message_id, partial, sent_any) = {
+        let (runs, progress_id) = {
             let turn = state.lock().expect("live turn lock");
-            (turn.message_id.clone(), turn.text.clone(), turn.sent_any)
+            (
+                turn.runs.clone(),
+                turn.progress
+                    .as_ref()
+                    .and_then(|progress| progress.message_id.clone()),
+            )
         };
         let Some(outbox) = self.live_outbox(&binding.channel_id).await else {
             return;
@@ -601,7 +592,16 @@ impl ImChannelService {
 
         let delivered = match outcome {
             LiveOutcome::Answer(answer) => {
-                let parts = render::final_answer_parts(answer, locale);
+                // Blocks already closed are in the chat; the final text repeats
+                // them, so only its own tail is news.
+                let closed: String = runs
+                    .iter()
+                    .take(runs.len().saturating_sub(1))
+                    .map(|run| run.text.as_str())
+                    .collect();
+                let remainder = answer.strip_prefix(closed.as_str()).unwrap_or(answer);
+                let parts = render::final_answer_parts(remainder, locale);
+                let mut message_id = runs.last().and_then(|run| run.message_id.clone());
                 let mut ok = true;
                 for (index, part) in parts.iter().enumerate() {
                     let result = if index == 0
@@ -634,53 +634,57 @@ impl ImChannelService {
                         ok = false;
                         break;
                     }
+                    message_id = None;
                 }
                 ok
             }
             LiveOutcome::Failure(text) => {
-                let body = if partial.trim().is_empty() {
-                    text.clone()
-                } else {
-                    format!(
-                        "{}\n\n{}",
-                        render::truncate(&partial, LIVE_TAIL_CHARS),
-                        text
-                    )
-                };
                 self.draw_final_line(
                     binding,
                     &outbox,
                     &target,
-                    message_id.as_deref(),
-                    &body,
+                    progress_id.as_deref(),
+                    text,
                     false,
                 )
                 .await
             }
             LiveOutcome::Stopped => {
                 let label = render::stopped(locale);
-                let body = if partial.trim().is_empty() {
-                    label.to_string()
-                } else {
-                    format!("{}\n\n{label}", render::truncate(&partial, LIVE_TAIL_CHARS))
-                };
-                // An interrupted turn with no message of its own says nothing:
-                // a chat does not need a notice for a turn it never saw.
-                if message_id.is_none() && !sent_any {
+                let any_shown = runs.iter().any(|run| run.message_id.is_some());
+                if progress_id.is_none() && !any_shown {
+                    // A chat does not need a notice for a turn it never saw.
                     true
                 } else {
                     self.draw_final_line(
                         binding,
                         &outbox,
                         &target,
-                        message_id.as_deref(),
-                        &body,
+                        progress_id.as_deref(),
+                        label,
                         false,
                     )
                     .await
                 }
             }
         };
+
+        // The activity line outlives the work it described; settle it once the
+        // answer has landed rather than leaving a timer running forever.
+        if matches!(outcome, LiveOutcome::Answer(_))
+            && let Some(progress_id) = progress_id.as_deref()
+        {
+            let label = render::finished(locale);
+            let _ = outbox
+                .edit(
+                    target,
+                    progress_id.to_string(),
+                    label.to_string(),
+                    true,
+                    OutboundPriority::Normal,
+                )
+                .await;
+        }
 
         if delivered
             && watermark > 0
@@ -737,68 +741,58 @@ impl ImChannelService {
 mod tests {
     use super::*;
 
-    #[test]
-    fn auto_streams_a_direct_message_and_settles_a_group() {
-        assert_eq!(
-            resolve_stream(ImStreamMode::Auto, Some(ImChatType::Direct), true),
-            ResolvedStream::Live
-        );
-        assert_eq!(
-            resolve_stream(ImStreamMode::Auto, Some(ImChatType::Group), false),
-            ResolvedStream::Progress
-        );
+    fn delta(text: &str, phase: Option<AgentMessagePhase>) -> AgentMessageDeltaPayload {
+        AgentMessageDeltaPayload {
+            text_delta: text.to_string(),
+            chunk_index: 0,
+            phase,
+        }
     }
 
     #[test]
-    fn auto_reads_an_unknown_chat_from_its_transport_shape() {
-        // A timeline event names the binding, not the inbound message.
-        assert_eq!(
-            resolve_stream(
-                ImStreamMode::Auto,
-                None,
-                group_hint(vibex_core::ImChannelKind::Telegram, "-100123", "")
-            ),
-            ResolvedStream::Progress
-        );
-        assert_eq!(
-            resolve_stream(
-                ImStreamMode::Auto,
-                None,
-                group_hint(vibex_core::ImChannelKind::Telegram, "42", "")
-            ),
-            ResolvedStream::Live
-        );
-        assert_eq!(
-            resolve_stream(
-                ImStreamMode::Auto,
-                None,
-                group_hint(vibex_core::ImChannelKind::Lark, "oc_chat", "")
-            ),
-            ResolvedStream::Progress
-        );
+    fn a_new_provider_message_starts_a_new_chat_message() {
+        let mut turn = LiveTurn::new(ImLocale::En, 0);
+        turn.append_delta(&delta("first", None), Some("m1"));
+        turn.append_delta(&delta(" second", None), Some("m1"));
+        turn.append_delta(&delta("other", None), Some("m2"));
+        assert_eq!(turn.runs.len(), 2);
+        assert_eq!(turn.runs[0].text, "first second");
+        assert_eq!(turn.runs[1].text, "other");
     }
 
     #[test]
-    fn an_explicit_mode_wins_over_the_chat_shape() {
-        assert_eq!(
-            resolve_stream(ImStreamMode::Off, Some(ImChatType::Direct), false),
-            ResolvedStream::Off
+    fn a_phase_change_starts_a_new_chat_message() {
+        let mut turn = LiveTurn::new(ImLocale::En, 0);
+        turn.append_delta(
+            &delta("thinking aloud", Some(AgentMessagePhase::Commentary)),
+            None,
         );
-        assert_eq!(
-            resolve_stream(ImStreamMode::Live, Some(ImChatType::Group), true),
-            ResolvedStream::Live
+        turn.append_delta(
+            &delta("the answer", Some(AgentMessagePhase::FinalAnswer)),
+            None,
         );
+        assert_eq!(turn.runs.len(), 2);
+        assert_eq!(turn.runs[0].text, "thinking aloud");
+        assert_eq!(turn.runs[1].text, "the answer");
     }
 
     #[test]
-    fn a_live_display_keeps_the_tail_of_a_long_answer() {
-        let mut turn = LiveTurn::new(ResolvedStream::Live, ImLocale::En, 0);
-        turn.text = "x".repeat(10_000);
-        let display = turn.display(1_000).expect("display");
-        assert!(display.chars().count() < 10_000);
-        assert!(
-            display.starts_with('…') || display.ends_with('▍'),
-            "{display}"
-        );
+    fn an_activity_seals_the_block_so_later_text_is_a_new_message() {
+        let mut turn = LiveTurn::new(ImLocale::En, 0);
+        turn.append_delta(&delta("before the tool", None), None);
+        turn.note_activity(Some("Running a command".to_string()));
+        turn.append_delta(&delta("after the tool", None), None);
+        assert_eq!(turn.runs.len(), 2);
+        assert_eq!(turn.runs[0].text, "before the tool");
+        assert_eq!(turn.runs[1].text, "after the tool");
+        assert!(turn.progress.is_some());
+    }
+
+    #[test]
+    fn the_live_text_is_bounded_and_carries_no_cursor() {
+        let text = "x".repeat(10_000);
+        let shown = render::live_text(&text);
+        assert!(shown.chars().count() <= 3_800);
+        assert!(!shown.contains('▍'));
     }
 }

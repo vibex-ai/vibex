@@ -8,7 +8,7 @@
 use rusqlite::{Connection, OptionalExtension, params};
 use vibex_core::{
     ImActionId, ImBindingId, ImBindingStatus, ImChannelId, ImChannelKind, ImPairingId,
-    ImPrincipalId, ImPrincipalRole, ImPrincipalStatus, VibexError, VibexResult, VibexSessionId,
+    ImPrincipalId, ImPrincipalStatus, VibexError, VibexResult, VibexSessionId,
 };
 
 use super::parse_id_sql;
@@ -43,7 +43,6 @@ pub struct ImPrincipalRecord {
     pub channel_id: ImChannelId,
     pub external_user_id: String,
     pub display_name: String,
-    pub role: ImPrincipalRole,
     pub status: ImPrincipalStatus,
     pub paired_at_ms: Option<i64>,
     pub last_seen_at_ms: Option<i64>,
@@ -57,7 +56,6 @@ pub struct ImPairingRecord {
     pub pairing_id: ImPairingId,
     pub channel_id: ImChannelId,
     pub code_hash: String,
-    pub role: ImPrincipalRole,
     pub scope: String,
     pub target_chat_id: Option<String>,
     pub created_by_principal_id: Option<ImPrincipalId>,
@@ -323,7 +321,7 @@ impl ImPrincipalRepository {
         principal_id: &ImPrincipalId,
     ) -> VibexResult<Option<ImPrincipalRecord>> {
         conn.query_row(
-            "SELECT principal_id, channel_id, external_user_id, display_name, role, status,
+            "SELECT principal_id, channel_id, external_user_id, display_name, status,
                     paired_at_ms, last_seen_at_ms, revoked_at_ms, created_at_ms, updated_at_ms
              FROM im_principals WHERE principal_id = ?1",
             params![principal_id.as_str()],
@@ -339,7 +337,7 @@ impl ImPrincipalRepository {
         external_user_id: &str,
     ) -> VibexResult<Option<ImPrincipalRecord>> {
         conn.query_row(
-            "SELECT principal_id, channel_id, external_user_id, display_name, role, status,
+            "SELECT principal_id, channel_id, external_user_id, display_name, status,
                     paired_at_ms, last_seen_at_ms, revoked_at_ms, created_at_ms, updated_at_ms
              FROM im_principals WHERE channel_id = ?1 AND external_user_id = ?2",
             params![channel_id.as_str(), external_user_id],
@@ -350,14 +348,16 @@ impl ImPrincipalRepository {
     }
 
     pub fn upsert_active(conn: &Connection, record: &ImPrincipalRecord) -> VibexResult<()> {
+        // `role` is a legacy column kept so older databases migrate without a
+        // rewrite. Every paired identity is an admin now, so it is written as a
+        // constant and never read back.
         conn.execute(
             "INSERT INTO im_principals (
                 principal_id, channel_id, external_user_id, display_name, role, status,
                 paired_at_ms, last_seen_at_ms, revoked_at_ms, created_at_ms, updated_at_ms
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+             ) VALUES (?1, ?2, ?3, ?4, 'admin', ?5, ?6, ?7, ?8, ?9, ?10)
              ON CONFLICT(channel_id, external_user_id) DO UPDATE SET
                 display_name = excluded.display_name,
-                role = excluded.role,
                 status = 'active',
                 paired_at_ms = excluded.paired_at_ms,
                 last_seen_at_ms = excluded.last_seen_at_ms,
@@ -368,7 +368,6 @@ impl ImPrincipalRepository {
                 record.channel_id.as_str(),
                 record.external_user_id,
                 record.display_name,
-                record.role.as_str(),
                 record.status.as_str(),
                 record.paired_at_ms,
                 record.last_seen_at_ms,
@@ -387,7 +386,7 @@ impl ImPrincipalRepository {
     ) -> VibexResult<Vec<ImPrincipalRecord>> {
         let mut statement = conn
             .prepare(
-                "SELECT principal_id, channel_id, external_user_id, display_name, role, status,
+                "SELECT principal_id, channel_id, external_user_id, display_name, status,
                         paired_at_ms, last_seen_at_ms, revoked_at_ms, created_at_ms, updated_at_ms
                  FROM im_principals WHERE channel_id = ?1 ORDER BY created_at_ms ASC",
             )
@@ -425,17 +424,18 @@ pub struct ImPairingRepository;
 
 impl ImPairingRepository {
     pub fn insert(conn: &Connection, record: &ImPairingRecord) -> VibexResult<()> {
+        // `role` is legacy: every paired identity is an admin now, so a code
+        // records the constant and nothing reads it back.
         conn.execute(
             "INSERT INTO im_pairing_codes (
                 pairing_id, channel_id, code_hash, role, scope, target_chat_id,
                 created_by_principal_id, expires_at_ms, claimed_principal_id, created_at_ms,
                 claimed_at_ms
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+             ) VALUES (?1, ?2, ?3, 'admin', ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 record.pairing_id.as_str(),
                 record.channel_id.as_str(),
                 record.code_hash,
-                record.role.as_str(),
                 record.scope,
                 record.target_chat_id,
                 record
@@ -486,7 +486,7 @@ impl ImPairingRepository {
             return Ok(None);
         }
         conn.query_row(
-            "SELECT pairing_id, channel_id, code_hash, role, scope, target_chat_id,
+            "SELECT pairing_id, channel_id, code_hash, scope, target_chat_id,
                     created_by_principal_id, expires_at_ms, claimed_principal_id, created_at_ms,
                     claimed_at_ms
              FROM im_pairing_codes WHERE code_hash = ?1",
@@ -1027,38 +1027,34 @@ fn map_secret(row: &rusqlite::Row<'_>) -> rusqlite::Result<ImChannelSecretRecord
 }
 
 fn map_principal(row: &rusqlite::Row<'_>) -> rusqlite::Result<ImPrincipalRecord> {
-    let role: String = row.get(4)?;
-    let status: String = row.get(5)?;
+    let status: String = row.get(4)?;
     Ok(ImPrincipalRecord {
         principal_id: parse_id_sql(row.get(0)?, ImPrincipalId::parse)?,
         channel_id: parse_id_sql(row.get(1)?, ImChannelId::parse)?,
         external_user_id: row.get(2)?,
         display_name: row.get(3)?,
-        role: ImPrincipalRole::parse(&role).ok_or_else(|| invalid_text(4, "role", &role))?,
         status: ImPrincipalStatus::parse(&status)
-            .ok_or_else(|| invalid_text(5, "status", &status))?,
-        paired_at_ms: row.get(6)?,
-        last_seen_at_ms: row.get(7)?,
-        revoked_at_ms: row.get(8)?,
-        created_at_ms: row.get(9)?,
-        updated_at_ms: row.get(10)?,
+            .ok_or_else(|| invalid_text(4, "status", &status))?,
+        paired_at_ms: row.get(5)?,
+        last_seen_at_ms: row.get(6)?,
+        revoked_at_ms: row.get(7)?,
+        created_at_ms: row.get(8)?,
+        updated_at_ms: row.get(9)?,
     })
 }
 
 fn map_pairing(row: &rusqlite::Row<'_>) -> rusqlite::Result<ImPairingRecord> {
-    let role: String = row.get(3)?;
     Ok(ImPairingRecord {
         pairing_id: parse_id_sql(row.get(0)?, ImPairingId::parse)?,
         channel_id: parse_id_sql(row.get(1)?, ImChannelId::parse)?,
         code_hash: row.get(2)?,
-        role: ImPrincipalRole::parse(&role).ok_or_else(|| invalid_text(3, "role", &role))?,
-        scope: row.get(4)?,
-        target_chat_id: row.get(5)?,
-        created_by_principal_id: parse_optional_id(row, 6, ImPrincipalId::parse)?,
-        expires_at_ms: row.get(7)?,
-        claimed_principal_id: parse_optional_id(row, 8, ImPrincipalId::parse)?,
-        created_at_ms: row.get(9)?,
-        claimed_at_ms: row.get(10)?,
+        scope: row.get(3)?,
+        target_chat_id: row.get(4)?,
+        created_by_principal_id: parse_optional_id(row, 5, ImPrincipalId::parse)?,
+        expires_at_ms: row.get(6)?,
+        claimed_principal_id: parse_optional_id(row, 7, ImPrincipalId::parse)?,
+        created_at_ms: row.get(8)?,
+        claimed_at_ms: row.get(9)?,
     })
 }
 
@@ -1492,7 +1488,6 @@ mod tests {
             pairing_id: pairing_id.clone(),
             channel_id,
             code_hash: "hash".to_string(),
-            role: ImPrincipalRole::Approver,
             scope: "dm".to_string(),
             target_chat_id: None,
             created_by_principal_id: None,

@@ -100,10 +100,10 @@ use crate::{
     BrowserSessionOpenRequest, BrowserTabOpenRequest, BrowserTabSelection, BrowserViewportRequest,
     DeviceBackend, FileBackend, GitBackend, ImChannelAppSecretUpdateRequest,
     ImChannelDefaultSessionUpdate, ImChannelEnabledRequest, ImChannelEventFilterUpdate,
-    ImChannelLocaleUpdate, ImChannelSecretUpdateRequest, ImChannelStreamModeUpdate,
-    ImPrincipalRoleUpdate, ManagementBackend, ManagementProfileSelectionRequest, MutationRequest,
-    RelayConnectionState, RelayStatusSummary, SidebarBackend, TerminalBackend, TerminalFrame,
-    TerminalFrameBatch, TerminalFrameSubscription, WorkspaceBackend, WorkspaceSummary,
+    ImChannelLocaleUpdate, ImChannelSecretUpdateRequest, ManagementBackend,
+    ManagementProfileSelectionRequest, MutationRequest, RelayConnectionState, RelayStatusSummary,
+    SidebarBackend, TerminalBackend, TerminalFrame, TerminalFrameBatch, TerminalFrameSubscription,
+    WorkspaceBackend, WorkspaceSummary,
 };
 use vibex_desktop_model::{SidebarMutationOutcome, SidebarOrganizationView, UiStateStore};
 
@@ -5379,40 +5379,6 @@ impl ManagementBackend for NativeBackend {
                 .management()
                 .im_channels()
                 .set_channel_locale(&request.payload.channel_id, request.payload.locale)
-                .await
-                .map_err(Into::into)
-        })
-    }
-
-    fn set_im_channel_stream_mode(
-        &self,
-        request: MutationRequest<ImChannelStreamModeUpdate>,
-    ) -> BackendFuture<'_, ImChannelSummary> {
-        let runtime = self.runtime.clone();
-        Box::pin(async move {
-            request.validate()?;
-            runtime.ensure_accepting_actions()?;
-            runtime
-                .management()
-                .im_channels()
-                .set_stream_mode(&request.payload.channel_id, request.payload.stream_mode)
-                .await
-                .map_err(Into::into)
-        })
-    }
-
-    fn set_im_principal_role(
-        &self,
-        request: MutationRequest<ImPrincipalRoleUpdate>,
-    ) -> BackendFuture<'_, ImPrincipalSummary> {
-        let runtime = self.runtime.clone();
-        Box::pin(async move {
-            request.validate()?;
-            runtime.ensure_accepting_actions()?;
-            runtime
-                .management()
-                .im_channels()
-                .set_principal_role(&request.payload.principal_id, request.payload.role)
                 .await
                 .map_err(Into::into)
         })

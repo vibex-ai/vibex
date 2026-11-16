@@ -204,19 +204,6 @@ impl ImChannelService {
         principal: &ImPrincipalRecord,
     ) -> VibexResult<()> {
         let locale = self.locale(event);
-        if !principal.role.can_prompt() {
-            self.reply(
-                event,
-                runtime,
-                locale.text(
-                    "Your role cannot bind sessions.",
-                    "你的角色不能绑定会话。",
-                    "你的角色不能綁定工作階段。",
-                ),
-            )
-            .await?;
-            return Ok(());
-        }
         let mut sessions = self.inner.agent.list_sessions(false).await?;
         sessions.retain(|session| session.deleted_at_ms.is_none());
         sessions.sort_by_key(|session| std::cmp::Reverse(session.last_message_at_ms));
@@ -267,23 +254,10 @@ impl ImChannelService {
         &self,
         event: &ImInboundEvent,
         runtime: &ChannelRuntime,
-        principal: &ImPrincipalRecord,
+        _principal: &ImPrincipalRecord,
         field: RuntimeField,
     ) -> VibexResult<()> {
         let locale = self.locale(event);
-        if !principal.role.can_prompt() {
-            self.reply(
-                event,
-                runtime,
-                locale.text(
-                    "Your role cannot change the runtime.",
-                    "你的角色不能修改运行参数。",
-                    "你的角色不能修改執行參數。",
-                ),
-            )
-            .await?;
-            return Ok(());
-        }
         let conn = self.open()?;
         let Some(binding) = self.binding_for(&conn, event)? else {
             self.reply(
@@ -339,22 +313,9 @@ impl ImChannelService {
         &self,
         event: &ImInboundEvent,
         runtime: &ChannelRuntime,
-        principal: &ImPrincipalRecord,
+        _principal: &ImPrincipalRecord,
     ) -> VibexResult<()> {
         let locale = self.locale(event);
-        if !principal.role.can_prompt() {
-            self.reply(
-                event,
-                runtime,
-                locale.text(
-                    "Your role cannot change the runtime.",
-                    "你的角色不能修改运行参数。",
-                    "你的角色不能修改執行參數。",
-                ),
-            )
-            .await?;
-            return Ok(());
-        }
         let conn = self.open()?;
         let Some(binding) = self.binding_for(&conn, event)? else {
             self.reply(
@@ -417,22 +378,9 @@ impl ImChannelService {
         &self,
         event: &ImInboundEvent,
         runtime: &ChannelRuntime,
-        principal: &ImPrincipalRecord,
+        _principal: &ImPrincipalRecord,
     ) -> VibexResult<()> {
         let locale = self.locale(event);
-        if !principal.role.can_prompt() {
-            self.reply(
-                event,
-                runtime,
-                locale.text(
-                    "Your role cannot change the runtime.",
-                    "你的角色不能修改运行参数。",
-                    "你的角色不能修改執行參數。",
-                ),
-            )
-            .await?;
-            return Ok(());
-        }
         let conn = self.open()?;
         let Some(binding) = self.binding_for(&conn, event)? else {
             self.reply(
@@ -565,19 +513,6 @@ impl ImChannelService {
             .strip_prefix(ACTION_MENU_PREFIX)
             .and_then(RuntimeField::parse)
         {
-            if !principal.role.can_prompt() {
-                self.reply(
-                    event,
-                    runtime,
-                    locale.text(
-                        "Your role cannot change the runtime.",
-                        "你的角色不能修改运行参数。",
-                        "你的角色不能修改執行參數。",
-                    ),
-                )
-                .await?;
-                return Ok(true);
-            }
             if !self.consume_action(action, principal)? {
                 self.reply(event, runtime, already).await?;
                 return Ok(true);
@@ -595,19 +530,6 @@ impl ImChannelService {
             return Ok(true);
         }
         if kind == ACTION_STATUS_STOP {
-            if !principal.role.can_prompt() {
-                self.reply(
-                    event,
-                    runtime,
-                    locale.text(
-                        "Your role cannot stop sessions.",
-                        "你的角色不能停止会话。",
-                        "你的角色不能停止工作階段。",
-                    ),
-                )
-                .await?;
-                return Ok(true);
-            }
             if !self.consume_action(action, principal)? {
                 self.reply(event, runtime, already).await?;
                 return Ok(true);
@@ -623,19 +545,6 @@ impl ImChannelService {
             return Ok(true);
         }
         if kind == ACTION_SESSION_USE {
-            if !principal.role.can_prompt() {
-                self.reply(
-                    event,
-                    runtime,
-                    locale.text(
-                        "Your role cannot bind sessions.",
-                        "你的角色不能绑定会话。",
-                        "你的角色不能綁定工作階段。",
-                    ),
-                )
-                .await?;
-                return Ok(true);
-            }
             if !self.consume_action(action, principal)? {
                 self.reply(event, runtime, already).await?;
                 return Ok(true);
@@ -664,19 +573,6 @@ impl ImChannelService {
             .strip_prefix(ACTION_RUNTIME_PREFIX)
             .and_then(RuntimeField::parse)
         {
-            if !principal.role.can_prompt() {
-                self.reply(
-                    event,
-                    runtime,
-                    locale.text(
-                        "Your role cannot change the runtime.",
-                        "你的角色不能修改运行参数。",
-                        "你的角色不能修改執行參數。",
-                    ),
-                )
-                .await?;
-                return Ok(true);
-            }
             if !self.consume_action(action, principal)? {
                 self.reply(event, runtime, already).await?;
                 return Ok(true);
@@ -860,19 +756,6 @@ impl ImChannelService {
             };
         }
         let locale = self.locale(event);
-        if !principal.role.can_prompt() {
-            self.reply(
-                event,
-                runtime,
-                locale.text(
-                    "Your role cannot change the runtime.",
-                    "你的角色不能修改运行参数。",
-                    "你的角色不能修改執行參數。",
-                ),
-            )
-            .await?;
-            return Ok(());
-        }
         let conn = self.open()?;
         let Some(binding) = self.binding_for(&conn, event)? else {
             self.reply(

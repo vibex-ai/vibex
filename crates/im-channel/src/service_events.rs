@@ -217,11 +217,19 @@ impl ImChannelService {
             match &event.item.payload {
                 TimelinePayload::AgentMessageDelta(delta) => {
                     // Deltas are not a filtered event: a channel that shows no
-                    // tool progress still shows its answer growing.
-                    self.note_live_delta(&binding, delta);
+                    // tool progress still shows its answer growing. The
+                    // provider's message id is what separates two text blocks.
+                    self.note_live_delta(
+                        &binding,
+                        delta,
+                        event.item.provider_correlation_id.as_deref(),
+                    );
+                }
+                TimelinePayload::Reasoning(_) => {
+                    self.note_live_thinking(&binding);
                 }
                 TimelinePayload::ToolCall(tool) => {
-                    self.note_live_progress(&binding, &tool.tool_name);
+                    self.note_live_tool(&binding, &tool.tool_name, &tool.summary);
                 }
                 TimelinePayload::AgentMessage(message) if message.is_final => {
                     if !message.text.trim().is_empty() {
@@ -319,7 +327,7 @@ impl ImChannelService {
             // does and settles when the session stops being busy, which is what
             // makes an interrupted turn leave something readable behind.
             if running {
-                self.start_live_turn(&binding, None);
+                self.start_live_turn(&binding);
             } else {
                 self.stop_live_turn(&binding).await;
             }

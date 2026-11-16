@@ -12,7 +12,7 @@
 
 use std::sync::Arc;
 
-use vibex_core::{ImChannelId, ImPairingRequest, ImPrincipalRole};
+use vibex_core::{ImChannelId, ImPairingRequest};
 use vibex_desktop_runtime::DesktopRuntimeConfig;
 use vibex_im_channel::{AdministrativeAgent, ImChannelService, ImChannelServiceConfig};
 
@@ -24,7 +24,6 @@ pub enum ImCommand {
     },
     Pair {
         channel: String,
-        role: ImPrincipalRole,
         ttl_ms: Option<u32>,
         scope: vibex_core::ImPairingScope,
         group_chat: Option<String>,
@@ -46,10 +45,6 @@ pub enum ImCommand {
         channel: String,
         enabled: bool,
     },
-    StreamMode {
-        channel: String,
-        mode: Option<vibex_core::ImStreamMode>,
-    },
 }
 
 impl ImCommand {
@@ -57,7 +52,7 @@ impl ImCommand {
     pub fn parse(args: &[String]) -> Result<Self, String> {
         let Some(action) = args.first().map(String::as_str) else {
             return Err(
-                "usage: vibex-server im <list|pair|revoke|bindings|unbind|test|enable|disable|stream-mode>"
+                "usage: vibex-server im <list|pair|revoke|bindings|unbind|test|enable|disable>"
                     .to_string(),
             );
         };
@@ -74,17 +69,6 @@ impl ImCommand {
             }),
             "pair" => {
                 let channel = flag("--channel").ok_or("pair needs --channel <id|name>")?;
-                let role = match flag("--role").as_deref() {
-                    None | Some("operator") => ImPrincipalRole::Operator,
-                    Some("observer") => ImPrincipalRole::Observer,
-                    Some("approver") => ImPrincipalRole::Approver,
-                    Some("admin") => ImPrincipalRole::Admin,
-                    Some(other) => {
-                        return Err(format!(
-                            "unknown role {other}; use observer, approver, operator, or admin"
-                        ));
-                    }
-                };
                 let ttl_ms = flag("--ttl-minutes")
                     .map(|value| {
                         value
@@ -101,7 +85,6 @@ impl ImCommand {
                 };
                 Ok(Self::Pair {
                     channel,
-                    role,
                     ttl_ms,
                     scope,
                     group_chat,
@@ -128,16 +111,6 @@ impl ImCommand {
                 channel: flag("--channel").ok_or("disable needs --channel <id|name>")?,
                 enabled: false,
             }),
-            "stream-mode" | "stream_mode" => {
-                let channel = flag("--channel").ok_or("stream-mode needs --channel <id|name>")?;
-                let mode = match flag("--mode").as_deref() {
-                    None => None,
-                    Some(value) => Some(vibex_core::ImStreamMode::parse(value).ok_or(format!(
-                        "unknown stream mode {value}; use auto, off, typing, progress, or live"
-                    ))?),
-                };
-                Ok(Self::StreamMode { channel, mode })
-            }
             other => Err(format!("unknown im command {other}")),
         }
     }
@@ -194,7 +167,6 @@ pub async fn run(config: &DesktopRuntimeConfig, command: ImCommand) -> Result<()
         }
         ImCommand::Pair {
             channel,
-            role,
             ttl_ms,
             scope,
             group_chat,
@@ -203,7 +175,6 @@ pub async fn run(config: &DesktopRuntimeConfig, command: ImCommand) -> Result<()
             let pairing = service
                 .create_pairing_code(ImPairingRequest {
                     channel_id,
-                    role,
                     ttl_ms,
                     scope,
                     target_chat_id: group_chat,
@@ -211,7 +182,6 @@ pub async fn run(config: &DesktopRuntimeConfig, command: ImCommand) -> Result<()
                 .await
                 .map_err(|error| error.message)?;
             println!("pairing_code={}", pairing.code);
-            println!("role={}", pairing.role.as_str());
             println!("expires_at_ms={}", pairing.expires_at_ms);
             println!("warning=one-time code; it is not stored in plaintext");
             Ok(())
@@ -292,36 +262,6 @@ pub async fn run(config: &DesktopRuntimeConfig, command: ImCommand) -> Result<()
             }
             Ok(())
         }
-        ImCommand::StreamMode { channel, mode } => {
-            let channel_id = resolve_channel(&service, &channel).await?;
-            let Some(mode) = mode else {
-                let channels = service
-                    .list_channels()
-                    .await
-                    .map_err(|error| error.message)?;
-                if let Some(summary) = channels
-                    .into_iter()
-                    .find(|summary| summary.channel_id == channel_id)
-                {
-                    println!(
-                        "{} stream_mode={}",
-                        summary.display_name,
-                        summary.stream_mode.as_str()
-                    );
-                }
-                return Ok(());
-            };
-            let summary = service
-                .set_stream_mode(&channel_id, mode)
-                .await
-                .map_err(|error| error.message)?;
-            println!(
-                "{} stream_mode={}",
-                summary.display_name,
-                summary.stream_mode.as_str()
-            );
-            Ok(())
-        }
         ImCommand::Enable { channel, enabled } => {
             let channel_id = resolve_channel(&service, &channel).await?;
             // Enabling from the CLI opens the transport in this process, which
@@ -385,8 +325,7 @@ fn configure_secret_store(config: &DesktopRuntimeConfig) {
 /// The `im` help block, printed by the top-level help.
 pub fn print_help() {
     println!("  im list [--json]                     list configured channels");
-    println!("  im pair --channel <id|name> [--role observer|approver|operator|admin]");
-    println!("          [--ttl-minutes N] [--chat GROUP_ID]");
+    println!("  im pair --channel <id|name> [--ttl-minutes N] [--chat GROUP_ID]");
     println!("                                       mint a one-time pairing code; --chat");
     println!("                                       binds a code to one group");
     println!("  im revoke --channel <id|name> --principal <id|external-id>");
@@ -394,9 +333,6 @@ pub fn print_help() {
     println!("  im unbind --binding <id>             drop one binding");
     println!("  im test --channel <id|name>          read-only provider probe");
     println!("  im enable|disable --channel <id|name>");
-    println!("  im stream-mode --channel <id|name> [--mode auto|off|typing|progress|live]");
-    println!("                                       show or set how much of a running");
-    println!("                                       turn the chat sees");
 }
 
 #[cfg(test)]
@@ -416,38 +352,27 @@ mod tests {
     }
 
     #[test]
-    fn pair_defaults_to_operator_and_reads_a_role() {
+    fn pair_defaults_and_reads_a_ttl() {
         let command =
             ImCommand::parse(&args(&["pair", "--channel", "imchannel_ab"])).expect("parse");
         match command {
             ImCommand::Pair {
                 channel,
-                role,
                 ttl_ms,
                 scope,
                 group_chat,
             } => {
                 assert_eq!(channel, "imchannel_ab");
-                assert_eq!(role, ImPrincipalRole::Operator);
                 assert!(ttl_ms.is_none());
                 assert_eq!(scope, vibex_core::ImPairingScope::Direct);
                 assert!(group_chat.is_none());
             }
             _ => panic!("expected pair"),
         }
-        let command = ImCommand::parse(&args(&[
-            "pair",
-            "--channel",
-            "bot",
-            "--role",
-            "admin",
-            "--ttl-minutes",
-            "2",
-        ]))
-        .expect("parse");
+        let command = ImCommand::parse(&args(&["pair", "--channel", "bot", "--ttl-minutes", "2"]))
+            .expect("parse");
         match command {
-            ImCommand::Pair { role, ttl_ms, .. } => {
-                assert_eq!(role, ImPrincipalRole::Admin);
+            ImCommand::Pair { ttl_ms, .. } => {
                 assert_eq!(ttl_ms, Some(120_000));
             }
             _ => panic!("expected pair"),
@@ -470,44 +395,11 @@ mod tests {
     }
 
     #[test]
-    fn stream_mode_accepts_a_known_mode_and_refuses_an_unknown_one() {
-        let command = ImCommand::parse(&args(&[
-            "stream-mode",
-            "--channel",
-            "bot",
-            "--mode",
-            "progress",
-        ]))
-        .expect("parse");
-        match command {
-            ImCommand::StreamMode { mode, .. } => {
-                assert_eq!(mode, Some(vibex_core::ImStreamMode::Progress));
-            }
-            _ => panic!("expected stream mode"),
-        }
-        let bare = ImCommand::parse(&args(&["stream-mode", "--channel", "bot"])).expect("parse");
-        match bare {
-            ImCommand::StreamMode { mode, .. } => assert!(mode.is_none()),
-            _ => panic!("expected stream mode"),
-        }
-        let error = ImCommand::parse(&args(&[
-            "stream-mode",
-            "--channel",
-            "bot",
-            "--mode",
-            "loud",
-        ]))
-        .expect_err("unknown mode");
-        assert!(error.contains("unknown stream mode"), "{error}");
-    }
-
-    #[test]
     fn a_missing_channel_is_reported_with_its_flag() {
         let error = ImCommand::parse(&args(&["test"])).expect_err("missing channel");
         assert!(error.contains("--channel"), "{error}");
-        let error = ImCommand::parse(&args(&["pair", "--channel", "x", "--role", "root"]))
-            .expect_err("bad role");
-        assert!(error.contains("observer"), "{error}");
+        let error = ImCommand::parse(&args(&["pair"])).expect_err("missing channel");
+        assert!(error.contains("--channel"), "{error}");
     }
 
     #[test]

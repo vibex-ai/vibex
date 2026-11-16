@@ -26,7 +26,7 @@ use vibex_core::{ImChannelState, ImChannelStatus, unix_timestamp_ms};
 
 use crate::adapter::ImAdapter;
 use crate::error::{ImError, ImResult};
-use crate::types::{ImActivity, ImButton, ImSentMessage, ImTarget};
+use crate::types::{ImButton, ImSentMessage, ImTarget};
 
 /// How hard the outbox tries before it reports a failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,8 +117,6 @@ enum OutboundCall {
         text: String,
         markdown: bool,
     },
-    /// A chat action: no message id, nothing to retry.
-    Activity { activity: ImActivity },
 }
 
 struct OutboxJob {
@@ -217,22 +215,6 @@ impl Outbox {
         Ok(())
     }
 
-    /// Shows a chat action. It is best-effort: a failed typing hint is not
-    /// worth a retry, and it must never delay a real message.
-    pub(crate) async fn activity(&self, target: ImTarget, activity: ImActivity) -> ImResult<()> {
-        let (reply, wait) = oneshot::channel();
-        self.enqueue(OutboxJob {
-            chat_id: target.chat_id.clone(),
-            target,
-            call: OutboundCall::Activity { activity },
-            priority: OutboundPriority::BestEffort,
-            reply,
-        })
-        .await?;
-        wait.await.map_err(|_| ImError::Internal)??;
-        Ok(())
-    }
-
     async fn enqueue(&self, job: OutboxJob) -> ImResult<()> {
         if let Ok(mut status) = self.status.lock() {
             status.pending_outbox = status.pending_outbox.saturating_add(1);
@@ -279,12 +261,6 @@ async fn deliver(
                     message_id: message_id.clone(),
                 })
             }
-            OutboundCall::Activity { activity } => adapter
-                .send_activity(&job.target, *activity)
-                .await
-                .map(|()| ImSentMessage {
-                    message_id: String::new(),
-                }),
         };
         match result {
             Ok(sent) => return Ok(sent),

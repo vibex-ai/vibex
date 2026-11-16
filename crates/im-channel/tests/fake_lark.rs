@@ -585,7 +585,6 @@ async fn lark_long_connection_round_trip() {
             default_session: None,
             event_filter: Vec::new(),
             locale: Some("en".to_string()),
-            stream_mode: vibex_core::ImStreamMode::Auto,
         })
         .await
         .expect("create channel");

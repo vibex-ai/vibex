@@ -21,7 +21,7 @@ show you.
 | Forum topics | one topic per `/new` | threads |
 | Transport | long poll | long connection |
 | Rich text | Markdown rendered as HTML | plain text |
-| Live turn | progress line or streamed answer | progress line or streamed answer |
+| Live turn | progress line and streamed answer | progress line and streamed answer |
 | Command menu | `/` picker via `setMyCommands` | `/` picker via the command list |
 
 Enterprise WeChat and personal WeChat are not implemented and are not offered in
@@ -30,21 +30,18 @@ settings or on the command line.
 ## How a turn appears
 
 A reply used to arrive only when the turn ended. It now appears while the turn
-runs, at the level the channel asks for — **Settings → IM channels → Streaming**
-(or `vibex-server im stream-mode`):
+runs, in every chat and at every level:
 
-| Mode | What the chat sees |
-| --- | --- |
-| `auto` | a direct message streams the answer; a group gets a progress line |
-| `off` | only the final answer |
-| `typing` | a `typing` chat action while the turn runs, then the answer |
-| `progress` | one message edited into `⏳ Working · 12s · Bash` |
-| `live` | one message edited as the answer grows, finalized in place |
+- Each assistant text block is its own message, edited as that block streams. A
+  turn that writes, calls a tool, and writes again therefore leaves several
+  readable messages behind rather than one message that keeps changing.
+- While tools run and the model reasons, one progress message is edited in
+  place: `⏳ Thinking · 12s`, `⏳ Running a command · 30s`. The line names the
+  kind of work, never its input or output. When the turn finishes it settles on
+  `✅ Done`.
 
-The answer is one message the channel owns and edits: the final text replaces
-the last edit instead of arriving as a second message. An answer too long for
-one chat message is still split into `(1/3)`, `(2/3)`, …; until those parts
-land, a live message shows only the tail of what has streamed so far.
+An answer too long for one chat message is split into `(1/3)`, `(2/3)`, …; the
+first part replaces the streamed message and the rest arrive as new messages.
 
 Edits are coalesced, so a burst of deltas costs one edit, and they wait behind a
 provider rate limit rather than queueing ahead of approvals and final answers.
@@ -120,7 +117,7 @@ A channel refuses everyone until an identity is paired.
 1. In **Settings → IM channels**, open the channel and press **Generate pairing
    code**. The code looks like `VBX-ABC12-DEF34` and expires in 10 minutes.
 2. Send `/pair VBX-ABC12-DEF34` to the bot in a direct message.
-3. The bot replies with your role.
+3. The bot confirms the pairing.
 
 A code is bound to the kind of chat it was minted for. A code generated in the
 app is a direct-message code, and sending it in a group is refused; a group code
@@ -134,7 +131,7 @@ otherwise pair everyone who saw it. Mint one from the command line, naming the
 chat:
 
 ```bash
-vibex-server im pair --channel "Team bot" --chat -1001234567890 --role operator
+vibex-server im pair --channel "Team bot" --chat -1001234567890
 ```
 
 Then send `/pair <code>` in that group. The claimed identity is the person who
@@ -143,17 +140,12 @@ sent it; other members still have to be paired individually.
 An unpaired group is otherwise ignored: the bot does not answer non-command
 messages there, so it stays quiet in a busy room.
 
-### Roles
+### Who may do what
 
-| Role | Can prompt | Can approve | Can unbind |
-| --- | --- | --- | --- |
-| Observer | no | no | no |
-| Approver | no | yes | no |
-| Operator | yes | yes | no |
-| Admin | yes | yes | yes |
-
-The desktop generates operator codes. `vibex-server im pair --role` mints any of
-the four.
+Pairing grants full control: anyone paired can prompt the Agent, approve or deny
+what it asks, and unbind the chat with `/unbind`. A channel that needs read-only
+watchers should use a separate bot rather than a smaller role, because every
+paired identity on a channel is trusted the same way.
 
 ## Commands
 
@@ -161,7 +153,7 @@ the four.
 | --- | --- |
 | `/pair <code>` | pair this chat |
 | `/help` | the short list; `/help commands` lists everything |
-| `/whoami` | your identity and role |
+| `/whoami` | your identity |
 | `/status` | bound session, runtime, state, pending approvals |
 | `/sessions` | recent sessions, one button each |
 | `/use <n or id>` | bind this chat to a session |
@@ -198,8 +190,7 @@ or provider clears the reasoning effort, because the new one advertises its own.
 Every picker shows what the current selection advertises, the choice applies to
 the next turn, and the card carries the selection revisions it was read at, so a
 card left open while someone else changed the runtime is refused instead of
-overwriting the newer choice. An Operator or Admin may change these; an Approver
-may not.
+overwriting the newer choice.
 
 ### `/new` and defaults
 
@@ -254,7 +245,7 @@ vibex-server im list
 vibex-server im list --json
 
 # Mint a code for someone else to claim.
-vibex-server im pair --channel "Team bot" --role operator --ttl-minutes 10
+vibex-server im pair --channel "Team bot" --ttl-minutes 10
 
 vibex-server im bindings --channel "Team bot"
 vibex-server im unbind --binding <binding-id>
@@ -264,8 +255,6 @@ vibex-server im enable --channel "Team bot"
 vibex-server im disable --channel "Team bot"
 
 vibex-server im revoke --channel "Team bot" --principal <id-or-external-id>
-
-vibex-server im stream-mode --channel "Team bot" --mode live
 ```
 
 `--channel` accepts the channel id or its display name. `revoke` accepts either
@@ -273,9 +262,7 @@ the Vibex principal id or the external id the chat shows.
 
 `im enable` writes the enabled flag; the connection itself belongs to the
 process that owns the home directory, so a running daemon picks the change up on
-its next start. `im stream-mode` with no `--mode` prints what the channel is set
-to; the value is read when a turn starts, so a change lands on the next turn
-without a reconnect.
+its next start.
 
 ## Where state lives
 

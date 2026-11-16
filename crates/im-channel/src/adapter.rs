@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use vibex_core::{ImChannelKind, ImChannelTestReport};
 
 use crate::error::ImResult;
-use crate::types::{ImActivity, ImButton, ImCommandSpec, ImSentMessage, ImTarget, ImThreadTarget};
+use crate::types::{ImButton, ImCommandSpec, ImSentMessage, ImTarget, ImThreadTarget};
 
 /// The platform-neutral operations the channel service needs from a transport.
 ///
@@ -56,12 +56,6 @@ pub trait ImAdapter: Send + Sync + 'static {
     ) -> ImResult<()> {
         let plain = crate::markdown::to_plain_text(markdown);
         self.edit_text(target, message_id, &plain, buttons).await
-    }
-
-    /// Shows a chat action while a turn runs. A transport that has none does
-    /// nothing, which is why the default is not an error.
-    async fn send_activity(&self, _target: &ImTarget, _activity: ImActivity) -> ImResult<()> {
-        Ok(())
     }
 
     /// Publishes the slash-command menu, when the transport has one.

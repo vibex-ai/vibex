@@ -27,6 +27,6 @@ pub use markdown::to_telegram_html;
 pub use service::{ImChannelService, ImChannelServiceConfig};
 pub use telegram::TelegramAdapter;
 pub use types::{
-    ImActivity, ImButton, ImCallback, ImChatType, ImCommandSpec, ImInboundEvent, ImSentMessage,
-    ImTarget, ImThreadTarget,
+    ImButton, ImCallback, ImChatType, ImCommandSpec, ImInboundEvent, ImSentMessage, ImTarget,
+    ImThreadTarget,
 };

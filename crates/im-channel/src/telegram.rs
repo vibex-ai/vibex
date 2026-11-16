@@ -13,8 +13,8 @@ use vibex_core::{
 use crate::adapter::ImAdapter;
 use crate::error::{ImError, ImResult};
 use crate::types::{
-    ImActivity, ImAttachment, ImButton, ImCallback, ImChatType, ImCommandSpec, ImInboundEvent,
-    ImSentMessage, ImTarget, ImThreadTarget,
+    ImAttachment, ImButton, ImCallback, ImChatType, ImCommandSpec, ImInboundEvent, ImSentMessage,
+    ImTarget, ImThreadTarget,
 };
 
 const TELEGRAM_API_BASE: &str = "https://api.telegram.org";
@@ -506,22 +506,6 @@ impl TelegramAdapter {
         body
     }
 
-    /// Shows a chat action, which is the cheapest way to say "still working".
-    pub async fn send_activity(&self, target: &ImTarget, activity: ImActivity) -> ImResult<()> {
-        let action = match activity {
-            ImActivity::Typing => "typing",
-        };
-        let mut body = json!({
-            "chat_id": target.chat_id,
-            "action": action,
-        });
-        if !target.thread_key.is_empty() {
-            body["message_thread_id"] = json!(target.thread_key);
-        }
-        self.call("sendChatAction", body).await?;
-        Ok(())
-    }
-
     /// Sets the bot's reaction on a message.
     ///
     /// Telegram accepts a fixed emoji vocabulary for reactions and answers
@@ -884,10 +868,6 @@ impl ImAdapter for TelegramAdapter {
         buttons: &[ImButton],
     ) -> ImResult<()> {
         TelegramAdapter::edit_markdown(self, target, message_id, markdown, buttons).await
-    }
-
-    async fn send_activity(&self, target: &ImTarget, activity: ImActivity) -> ImResult<()> {
-        TelegramAdapter::send_activity(self, target, activity).await
     }
 
     async fn register_commands(&self, commands: &[ImCommandSpec]) -> ImResult<()> {

@@ -167,51 +167,6 @@ impl ImSessionDefaults {
     }
 }
 
-/// How much of a running turn a chat sees.
-///
-/// The runtime already streams answer deltas; this is the chat's appetite for
-/// them. Telegram edits are rate limited and a group is noisy, so the default
-/// is not one setting for every chat: [`Self::Auto`] streams a direct message
-/// and keeps a group to a single progress line.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ImStreamMode {
-    /// Direct messages stream the answer; groups show a progress line.
-    #[default]
-    Auto,
-    /// Only the final answer is sent.
-    Off,
-    /// A `typing` chat action while the turn runs; the answer arrives once.
-    Typing,
-    /// One message edited into a progress line, replaced by the answer.
-    Progress,
-    /// One message edited as the answer grows, finalized in place.
-    Live,
-}
-
-impl ImStreamMode {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Auto => "auto",
-            Self::Off => "off",
-            Self::Typing => "typing",
-            Self::Progress => "progress",
-            Self::Live => "live",
-        }
-    }
-
-    pub fn parse(value: &str) -> Option<Self> {
-        match value {
-            "auto" => Some(Self::Auto),
-            "off" => Some(Self::Off),
-            "typing" => Some(Self::Typing),
-            "progress" => Some(Self::Progress),
-            "live" => Some(Self::Live),
-            _ => None,
-        }
-    }
-}
-
 /// The full persisted envelope behind `im_channels.config_json`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -220,8 +175,6 @@ pub struct ImChannelConfigEnvelope {
     pub config: ImChannelConfig,
     #[serde(default)]
     pub default_session: Option<ImSessionDefaults>,
-    #[serde(default)]
-    pub stream_mode: ImStreamMode,
 }
 
 impl ImChannelConfigEnvelope {
@@ -230,7 +183,6 @@ impl ImChannelConfigEnvelope {
             schema_version: 1,
             config,
             default_session: None,
-            stream_mode: ImStreamMode::Auto,
         }
     }
 }
@@ -247,14 +199,12 @@ pub struct ImChannelDraft {
     pub event_filter: Vec<String>,
     #[serde(default)]
     pub locale: Option<String>,
-    #[serde(default)]
-    pub stream_mode: ImStreamMode,
 }
 
 /// The event ids an IM channel may forward. `None`/empty means the default set.
 ///
-/// `tool_progress` is on by default now that it only labels the single live
-/// progress line rather than sending a message per tool call.
+/// Tool progress is no longer one of them: the live progress line always
+/// labels what a turn is doing, so there is nothing left for the id to gate.
 pub const DEFAULT_IM_EVENT_FILTER: &[&str] = &[
     "turn_complete",
     "turn_failed",
@@ -264,7 +214,6 @@ pub const DEFAULT_IM_EVENT_FILTER: &[&str] = &[
     "elicitation_resolution",
     "error",
     "needs_input",
-    "tool_progress",
 ];
 
 /// The id the UI uses for an event in its filter checklist.
@@ -278,50 +227,7 @@ pub const IM_EVENT_FILTER_IDS: &[&str] = &[
     "error",
     "needs_input",
     "user_prompt_sent",
-    "tool_progress",
 ];
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ImPrincipalRole {
-    Observer,
-    Approver,
-    Operator,
-    Admin,
-}
-
-impl ImPrincipalRole {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Observer => "observer",
-            Self::Approver => "approver",
-            Self::Operator => "operator",
-            Self::Admin => "admin",
-        }
-    }
-
-    pub fn parse(value: &str) -> Option<Self> {
-        match value {
-            "observer" => Some(Self::Observer),
-            "approver" => Some(Self::Approver),
-            "operator" => Some(Self::Operator),
-            "admin" => Some(Self::Admin),
-            _ => None,
-        }
-    }
-
-    pub const fn can_approve(self) -> bool {
-        matches!(self, Self::Approver | Self::Operator | Self::Admin)
-    }
-
-    pub const fn can_prompt(self) -> bool {
-        matches!(self, Self::Operator | Self::Admin)
-    }
-
-    pub const fn can_admin(self) -> bool {
-        matches!(self, Self::Admin)
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -357,7 +263,6 @@ pub struct ImPrincipalSummary {
     pub channel_id: ImChannelId,
     pub external_user_id: String,
     pub display_name: String,
-    pub role: ImPrincipalRole,
     pub status: ImPrincipalStatus,
     pub paired_at_ms: Option<i64>,
     pub last_seen_at_ms: Option<i64>,
@@ -468,8 +373,6 @@ pub struct ImChannelSummary {
     pub default_session: Option<ImSessionDefaults>,
     pub event_filter: Vec<String>,
     pub locale: Option<String>,
-    #[serde(default)]
-    pub stream_mode: ImStreamMode,
     pub status: ImChannelStatus,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
@@ -517,7 +420,6 @@ impl ImPairingScope {
 #[serde(rename_all = "camelCase")]
 pub struct ImPairingRequest {
     pub channel_id: ImChannelId,
-    pub role: ImPrincipalRole,
     pub ttl_ms: Option<u32>,
     #[serde(default)]
     pub scope: ImPairingScope,
@@ -531,7 +433,6 @@ pub struct ImPairingRequest {
 pub struct ImPairingCodeInfo {
     pub channel_id: ImChannelId,
     pub code: String,
-    pub role: ImPrincipalRole,
     pub expires_at_ms: i64,
 }
 

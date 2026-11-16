@@ -239,17 +239,153 @@ pub fn working(locale: ImLocale, label: Option<&str>, seconds: i64) -> String {
     format!("⏳ {subject} · {seconds}s")
 }
 
-/// The live answer, bounded to its tail and marked as still growing.
-pub fn live_answer(text: &str, tail_chars: usize, _locale: ImLocale) -> String {
+/// One text block as it streams, bounded to what a single chat message holds.
+///
+/// No trailing cursor: a growing message is already visible as it changes, and
+/// a marker that lingers after an edit would be wrong on the next turn.
+pub fn live_text(text: &str) -> String {
     let trimmed = text.trim_start();
-    let length = trimmed.chars().count();
-    let body = if length > tail_chars {
-        let skip = length - tail_chars;
-        format!("…{}", trimmed.chars().skip(skip).collect::<String>())
+    if trimmed.chars().count() <= MAX_MESSAGE_CHARS {
+        return trimmed.to_string();
+    }
+    trimmed.chars().take(MAX_MESSAGE_CHARS).collect()
+}
+
+/// The activity a tool call is doing, as a short phrase rather than a tool id.
+///
+/// Only the kind is shown, never the tool's input or output, so a chat learns
+/// what is happening without leaking what it operates on. Some providers report
+/// an anonymous `other` call and put the verb in the title; the title is used
+/// only to classify, never to display.
+pub fn activity(locale: ImLocale, tool_name: &str, summary: &str) -> String {
+    let name = tool_name.trim().to_ascii_lowercase();
+    let detail = summary.trim().to_ascii_lowercase();
+    let anonymous = name.is_empty() || name == "other" || name == "tool";
+    let kind = if anonymous && looks_like_thinking(&detail) {
+        ActivityKind::Thinking
     } else {
-        trimmed.to_string()
+        activity_kind(&name)
     };
-    format!("{body}▍")
+    let text = match kind {
+        ActivityKind::Thinking => locale.text("Thinking", "思考中", "思考中"),
+        ActivityKind::Command => locale.text("Running a command", "运行命令", "執行命令"),
+        ActivityKind::Read => locale.text("Reading a file", "读取文件", "讀取檔案"),
+        ActivityKind::Edit => locale.text("Editing a file", "编辑文件", "編輯檔案"),
+        ActivityKind::Search => locale.text("Searching files", "搜索文件", "搜尋檔案"),
+        ActivityKind::Web => locale.text("Searching the web", "联网搜索", "聯網搜尋"),
+        ActivityKind::Plan => locale.text("Updating the plan", "整理计划", "整理計畫"),
+        ActivityKind::Delegate => locale.text("Delegating to an agent", "委派子代理", "委派子代理"),
+        ActivityKind::Ask => locale.text("Asking you a question", "向你提问", "向你提問"),
+        ActivityKind::Image => locale.text("Generating an image", "生成图片", "生成圖片"),
+        ActivityKind::Computer => locale.text("Using the computer", "操作电脑", "操作電腦"),
+        ActivityKind::Working => locale.text("Working", "处理中", "處理中"),
+    };
+    text.to_string()
+}
+
+fn looks_like_thinking(detail: &str) -> bool {
+    detail.contains("think")
+        || detail.contains("reason")
+        || detail.contains("思考")
+        || detail.contains("推理")
+}
+
+/// The label for model reasoning.
+pub fn thinking(locale: ImLocale) -> &'static str {
+    locale.text("Thinking", "思考中", "思考中")
+}
+
+/// The label an activity line settles on when the turn finished.
+pub fn finished(locale: ImLocale) -> &'static str {
+    match locale {
+        ImLocale::En => "✅ Done",
+        ImLocale::ZhCn => "✅ 完成",
+        ImLocale::ZhTw => "✅ 完成",
+    }
+}
+
+enum ActivityKind {
+    Thinking,
+    Command,
+    Read,
+    Edit,
+    Search,
+    Web,
+    Plan,
+    Delegate,
+    Ask,
+    Image,
+    Computer,
+    Working,
+}
+
+/// The bucket a tool name falls into. Providers prefix their own names
+/// (`claude_`, `codex_`, `mcp_`), so the match is on substrings.
+fn activity_kind(name: &str) -> ActivityKind {
+    if name.contains("think") || name.contains("reason") || name.contains("thought") {
+        return ActivityKind::Thinking;
+    }
+    if name.contains("web")
+        || name.contains("fetch")
+        || name.contains("browse")
+        || name.contains("http")
+        || name.contains("url")
+    {
+        return ActivityKind::Web;
+    }
+    if name.contains("terminal")
+        || name.contains("bash")
+        || name.contains("shell")
+        || name.contains("command")
+        || name.contains("execute")
+        || name.contains("exec")
+        || name.contains("command_execution")
+    {
+        return ActivityKind::Command;
+    }
+    if name.contains("write")
+        || name.contains("edit")
+        || name.contains("patch")
+        || name.contains("replace")
+        || name.contains("apply")
+        || name.contains("create_file")
+    {
+        return ActivityKind::Edit;
+    }
+    if name.contains("read") || name.contains("view") || name.contains("open_file") {
+        return ActivityKind::Read;
+    }
+    if name.contains("search")
+        || name.contains("grep")
+        || name.contains("glob")
+        || name.contains("find")
+    {
+        return ActivityKind::Search;
+    }
+    if name.contains("todo") || name.contains("plan") {
+        return ActivityKind::Plan;
+    }
+    if name.contains("task")
+        || name.contains("agent")
+        || name.contains("delegate")
+        || name.contains("collab")
+    {
+        return ActivityKind::Delegate;
+    }
+    if name.contains("ask")
+        || name.contains("question")
+        || name.contains("interview")
+        || name.contains("elicit")
+    {
+        return ActivityKind::Ask;
+    }
+    if name.contains("image") || name.contains("screenshot") || name.contains("photo") {
+        return ActivityKind::Image;
+    }
+    if name.contains("computer") || name.contains("click") || name.contains("keyboard") {
+        return ActivityKind::Computer;
+    }
+    ActivityKind::Working
 }
 
 /// The marker an interrupted turn leaves behind.
@@ -501,9 +637,9 @@ pub fn runtime_applied(field: &str, value: &str, selection: &str) -> String {
 }
 
 /// Who is speaking, and in which channel.
-pub fn identity(locale: ImLocale, name: &str, role: &str, channel_id: &str) -> String {
+pub fn identity(locale: ImLocale, name: &str, channel_id: &str) -> String {
     format!(
-        "**{}** · {role}\n{} `{}`",
+        "**{}**\n{} `{}`",
         escape_markdown(name),
         locale.text("Channel", "频道", "頻道"),
         short_channel_id(channel_id)
@@ -518,14 +654,11 @@ pub fn identity(locale: ImLocale, name: &str, role: &str, channel_id: &str) -> S
 pub fn status_rows(
     locale: ImLocale,
     state: &str,
-    role: &str,
     runtime: Option<&vibex_core::ImRuntimeOptions>,
     pending: usize,
 ) -> Vec<(&'static str, String)> {
-    let mut rows: Vec<(&'static str, String)> = vec![
-        (locale.text("State", "状态", "狀態"), state.to_string()),
-        (locale.text("Role", "角色", "角色"), role.to_string()),
-    ];
+    let mut rows: Vec<(&'static str, String)> =
+        vec![(locale.text("State", "状态", "狀態"), state.to_string())];
     if let Some(runtime) = runtime {
         rows.push(("Agent", runtime.agent_label.clone()));
         rows.push((
@@ -552,7 +685,6 @@ pub fn status_rows(
 pub fn status_card(
     locale: ImLocale,
     session: &AgentSession,
-    role: &str,
     runtime: Option<&vibex_core::ImRuntimeOptions>,
     pending: usize,
 ) -> String {
@@ -561,7 +693,7 @@ pub fn status_card(
     } else {
         session.title.trim().to_string()
     };
-    let rows = status_rows(locale, state_label(session, locale), role, runtime, pending);
+    let rows = status_rows(locale, state_label(session, locale), runtime, pending);
     format!(
         "**#{} · {}**\n{}",
         short_session_id(session),
@@ -696,13 +828,7 @@ mod tests {
 
     #[test]
     fn a_status_card_shows_only_the_tuning_that_was_chosen() {
-        let defaults = status_rows(
-            ImLocale::En,
-            "idle",
-            "operator",
-            Some(&options_with(None, None)),
-            0,
-        );
+        let defaults = status_rows(ImLocale::En, "idle", Some(&options_with(None, None)), 0);
         assert!(
             !defaults
                 .iter()
@@ -712,13 +838,12 @@ mod tests {
         let tuned = status_rows(
             ImLocale::En,
             "idle",
-            "operator",
             Some(&options_with(Some("max"), Some("read-only"))),
             0,
         );
         assert!(tuned.contains(&("Effort", "max".to_string())));
         assert!(tuned.contains(&("Mode", "read-only".to_string())));
-        let waiting = status_rows(ImLocale::ZhCn, "空闲", "操作", None, 2);
+        let waiting = status_rows(ImLocale::ZhCn, "空闲", None, 2);
         assert!(waiting.contains(&("待审批", "2".to_string())));
     }
 
@@ -744,10 +869,22 @@ mod tests {
         let card = identity(
             ImLocale::ZhCn,
             "p",
-            "操作",
             "imchannel_817f9b1fdb164ee5a60474330e802b85",
         );
-        assert_eq!(card, "**p** · 操作\n频道 `imchannel_817f9b1f`");
+        assert_eq!(card, "**p**\n频道 `imchannel_817f9b1f`");
+    }
+
+    #[test]
+    fn an_anonymous_other_call_reads_as_thinking_when_its_title_says_so() {
+        assert_eq!(
+            activity(ImLocale::ZhCn, "other", "Thinking about the file"),
+            "思考中"
+        );
+        assert_eq!(activity(ImLocale::En, "other", "list the tree"), "Working");
+        assert_eq!(
+            activity(ImLocale::En, "claude_bash", "run the tests"),
+            "Running a command"
+        );
     }
 
     #[test]
