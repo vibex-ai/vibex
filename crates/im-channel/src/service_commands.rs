@@ -173,7 +173,7 @@ impl ImChannelService {
     ) -> VibexResult<()> {
         let locale = self.locale(event);
         if full {
-            return self.reply(event, runtime, &render::help(locale, "/")).await;
+            return self.reply(event, runtime, &render::help(locale)).await;
         }
         let conn = self.open()?;
         let Some(binding) = self.binding_for(&conn, event)? else {
@@ -182,18 +182,15 @@ impl ImChannelService {
                 .await;
         };
         let button = self.mint_action(&conn, &binding, ACTION_MENU_HELP, "{}")?;
-        let label = match locale {
-            ImLocale::En => "All commands",
-            ImLocale::ZhCn => "全部命令",
-            ImLocale::ZhTw => "全部指令",
-        };
         self.reply_buttons(
             event,
             runtime,
             &render::help_short(locale),
             vec![ImButton {
                 action_id: button.action_id,
-                label: format!("{label} ({})", button.label),
+                label: locale
+                    .text("All commands", "全部命令", "全部指令")
+                    .to_string(),
             }],
         )
         .await
@@ -206,9 +203,18 @@ impl ImChannelService {
         runtime: &ChannelRuntime,
         principal: &ImPrincipalRecord,
     ) -> VibexResult<()> {
+        let locale = self.locale(event);
         if !principal.role.can_prompt() {
-            self.reply(event, runtime, "Your role cannot bind sessions.")
-                .await?;
+            self.reply(
+                event,
+                runtime,
+                locale.text(
+                    "Your role cannot bind sessions.",
+                    "你的角色不能绑定会话。",
+                    "你的角色不能綁定工作階段。",
+                ),
+            )
+            .await?;
             return Ok(());
         }
         let mut sessions = self.inner.agent.list_sessions(false).await?;
@@ -222,25 +228,28 @@ impl ImChannelService {
                 sessions.iter().map(|session| session.id.clone()).collect(),
             );
         }
+        let list = render::session_list(&sessions, locale);
         let conn = self.open()?;
-        let locale = self.locale(event);
         // Listing is not binding: a chat that has not chosen a session yet can
         // still see what is there, it just has no card to mint buttons under.
         let Some(binding) = self.binding_for(&conn, event)? else {
-            self.reply(event, runtime, &render::session_list(&sessions, locale))
-                .await?;
+            let text = format!("{list}\n{}", render::session_use_hint(locale));
+            self.reply(event, runtime, &text).await?;
             return Ok(());
         };
-        let mut text = render::session_list(&sessions, locale);
+        if sessions.is_empty() {
+            self.reply(event, runtime, &list).await?;
+            return Ok(());
+        }
         let mut buttons = Vec::new();
-        for session in sessions.iter().take(SESSION_PICK_LIMIT) {
+        for session in sessions.iter() {
             let payload = serde_json::to_string(&ValuePayload {
                 value: session.id.as_str().to_string(),
             })
             .map_err(|_| im_payload_error())?;
             let minted = self.mint_action(&conn, &binding, ACTION_SESSION_USE, &payload)?;
             let title = if session.title.trim().is_empty() {
-                "Untitled".to_string()
+                locale.text("Untitled", "未命名", "未命名").to_string()
             } else {
                 render::truncate(session.title.trim(), 28)
             };
@@ -249,21 +258,7 @@ impl ImChannelService {
                 label: title,
             });
         }
-        // The list already ends with "Use /use <n>"; the buttons replace it.
-        if !buttons.is_empty() {
-            text = text.replace(
-                match locale {
-                    ImLocale::En => "Use /use <n> to bind one.",
-                    ImLocale::ZhCn => "用 /use <序号> 绑定一个。",
-                    ImLocale::ZhTw => "用 /use <序號> 綁定一個。",
-                },
-                match locale {
-                    ImLocale::En => "Tap a session to bind it.",
-                    ImLocale::ZhCn => "点一个会话即可绑定。",
-                    ImLocale::ZhTw => "點一個工作階段即可綁定。",
-                },
-            );
-        }
+        let text = format!("{list}\n{}", render::session_tap_hint(locale));
         self.reply_buttons(event, runtime, &text, buttons).await
     }
 
@@ -275,32 +270,49 @@ impl ImChannelService {
         principal: &ImPrincipalRecord,
         field: RuntimeField,
     ) -> VibexResult<()> {
+        let locale = self.locale(event);
         if !principal.role.can_prompt() {
-            self.reply(event, runtime, "Your role cannot change the runtime.")
-                .await?;
+            self.reply(
+                event,
+                runtime,
+                locale.text(
+                    "Your role cannot change the runtime.",
+                    "你的角色不能修改运行参数。",
+                    "你的角色不能修改執行參數。",
+                ),
+            )
+            .await?;
             return Ok(());
         }
         let conn = self.open()?;
         let Some(binding) = self.binding_for(&conn, event)? else {
-            self.reply(event, runtime, "No session is bound.").await?;
+            self.reply(
+                event,
+                runtime,
+                locale.text(
+                    "No session is bound.",
+                    "还没有绑定会话。",
+                    "還沒有綁定工作階段。",
+                ),
+            )
+            .await?;
             return Ok(());
         };
-        let locale = self.locale(event);
         let options = self
             .inner
             .agent
             .runtime_options(&binding.session_id)
             .await?;
-        let (choices, text) = self.runtime_card_body(&options, field, locale);
+        let (choices, current) = self.runtime_card_body(&options, field, locale);
         if choices.is_empty() {
             self.reply(
                 event,
                 runtime,
-                match locale {
-                    ImLocale::En => "This selection has nothing to choose from.",
-                    ImLocale::ZhCn => "当前选择没有可选项。",
-                    ImLocale::ZhTw => "目前選擇沒有可選項。",
-                },
+                locale.text(
+                    "Nothing to choose from here.",
+                    "这里没有可选项。",
+                    "這裡沒有可選項。",
+                ),
             )
             .await?;
             return Ok(());
@@ -318,6 +330,7 @@ impl ImChannelService {
                 label: format!("{marker}{}", render::truncate(&choice.label, 40)),
             });
         }
+        let text = render::picker(locale, field.label(locale), &current);
         self.reply_buttons(event, runtime, &text, buttons).await
     }
 
@@ -328,38 +341,58 @@ impl ImChannelService {
         runtime: &ChannelRuntime,
         principal: &ImPrincipalRecord,
     ) -> VibexResult<()> {
+        let locale = self.locale(event);
         if !principal.role.can_prompt() {
-            self.reply(event, runtime, "Your role cannot change the runtime.")
-                .await?;
+            self.reply(
+                event,
+                runtime,
+                locale.text(
+                    "Your role cannot change the runtime.",
+                    "你的角色不能修改运行参数。",
+                    "你的角色不能修改執行參數。",
+                ),
+            )
+            .await?;
             return Ok(());
         }
         let conn = self.open()?;
         let Some(binding) = self.binding_for(&conn, event)? else {
-            self.reply(event, runtime, "No session is bound.").await?;
+            self.reply(
+                event,
+                runtime,
+                locale.text(
+                    "No session is bound.",
+                    "还没有绑定会话。",
+                    "還沒有綁定工作階段。",
+                ),
+            )
+            .await?;
             return Ok(());
         };
-        let locale = self.locale(event);
         let options = self
             .inner
             .agent
             .runtime_options(&binding.session_id)
             .await?;
         if options.agents.is_empty() {
-            self.reply(event, runtime, "No other Agent is available.")
-                .await?;
+            self.reply(
+                event,
+                runtime,
+                locale.text(
+                    "No other Agent is available.",
+                    "没有其他可用的 Agent。",
+                    "沒有其他可用的 Agent。",
+                ),
+            )
+            .await?;
             return Ok(());
         }
-        let mut text = format!(
-            "{}\n{}",
-            RuntimeField::Agent.label(locale),
-            render::runtime_current(locale, &options)
-        );
-        text.push('\n');
-        text.push_str(match locale {
-            ImLocale::En => "Tap an Agent to switch. It applies to the next turn.",
-            ImLocale::ZhCn => "点选 Agent 切换，下一轮生效。",
-            ImLocale::ZhTw => "點選 Agent 切換，下一輪生效。",
-        });
+        let current = options
+            .agents
+            .iter()
+            .find(|choice| choice.current)
+            .map(|choice| choice.agent_label.clone())
+            .unwrap_or_else(|| options.agent_label.clone());
         let mut buttons = Vec::new();
         for choice in options.agents.iter().take(MAX_CHOICES) {
             let payload = serde_json::to_string(&AgentChoicePayload {
@@ -375,6 +408,7 @@ impl ImChannelService {
                 label: agent_button_label(choice),
             });
         }
+        let text = render::picker(locale, RuntimeField::Agent.label(locale), &current);
         self.reply_buttons(event, runtime, &text, buttons).await
     }
 
@@ -385,17 +419,34 @@ impl ImChannelService {
         runtime: &ChannelRuntime,
         principal: &ImPrincipalRecord,
     ) -> VibexResult<()> {
+        let locale = self.locale(event);
         if !principal.role.can_prompt() {
-            self.reply(event, runtime, "Your role cannot change the runtime.")
-                .await?;
+            self.reply(
+                event,
+                runtime,
+                locale.text(
+                    "Your role cannot change the runtime.",
+                    "你的角色不能修改运行参数。",
+                    "你的角色不能修改執行參數。",
+                ),
+            )
+            .await?;
             return Ok(());
         }
         let conn = self.open()?;
         let Some(binding) = self.binding_for(&conn, event)? else {
-            self.reply(event, runtime, "No session is bound.").await?;
+            self.reply(
+                event,
+                runtime,
+                locale.text(
+                    "No session is bound.",
+                    "还没有绑定会话。",
+                    "還沒有綁定工作階段。",
+                ),
+            )
+            .await?;
             return Ok(());
         };
-        let locale = self.locale(event);
         let options = self
             .inner
             .agent
@@ -405,25 +456,21 @@ impl ImChannelService {
             self.reply(
                 event,
                 runtime,
-                match locale {
-                    ImLocale::En => "This Agent has one source to run under.",
-                    ImLocale::ZhCn => "该 Agent 只有一个可用的供应商。",
-                    ImLocale::ZhTw => "該 Agent 只有一個可用的供應商。",
-                },
+                locale.text(
+                    "This Agent has one source to run under.",
+                    "该 Agent 只有一个可用的供应商。",
+                    "該 Agent 只有一個可用的供應商。",
+                ),
             )
             .await?;
             return Ok(());
         }
-        let mut text = format!(
-            "{}\n{}\n",
-            RuntimeField::Provider.label(locale),
-            render::runtime_current(locale, &options)
-        );
-        text.push_str(match locale {
-            ImLocale::En => "Tap a provider. It applies to the next turn; pick a model after.",
-            ImLocale::ZhCn => "点选供应商，下一轮生效；之后可用 /model 选择模型。",
-            ImLocale::ZhTw => "點選供應商，下一輪生效；之後可用 /model 選擇模型。",
-        });
+        let current = options
+            .providers
+            .iter()
+            .find(|choice| choice.current)
+            .map(|choice| choice.label.clone())
+            .unwrap_or_else(|| options.agent_label.clone());
         let mut buttons = Vec::new();
         for choice in options.providers.iter().take(MAX_CHOICES) {
             let payload = serde_json::to_string(&ProviderChoicePayload {
@@ -443,6 +490,7 @@ impl ImChannelService {
                 label: format!("{marker}{}", render::truncate(&choice.label, 40)),
             });
         }
+        let text = render::picker(locale, RuntimeField::Provider.label(locale), &current);
         self.reply_buttons(event, runtime, &text, buttons).await
     }
 
@@ -459,18 +507,25 @@ impl ImChannelService {
             RuntimeField::Mode => options.modes.clone(),
             RuntimeField::Agent | RuntimeField::Provider => Vec::new(),
         };
-        let mut text = format!(
-            "{}\n{}",
-            field.label(locale),
-            render::runtime_current(locale, options)
-        );
-        text.push('\n');
-        text.push_str(match locale {
-            ImLocale::En => "Tap a value. It applies to the next turn.",
-            ImLocale::ZhCn => "点选后下一轮生效。",
-            ImLocale::ZhTw => "點選後下一輪生效。",
-        });
-        (choices, text)
+        let default = locale.text("default", "默认", "預設");
+        let current = choices
+            .iter()
+            .find(|choice| choice.current)
+            .map(|choice| choice.label.clone())
+            .unwrap_or_else(|| match field {
+                RuntimeField::Model => options.model_label.clone(),
+                RuntimeField::Effort => options
+                    .effort_label
+                    .clone()
+                    .unwrap_or_else(|| default.to_string()),
+                RuntimeField::Mode => options
+                    .mode_label
+                    .clone()
+                    .unwrap_or_else(|| default.to_string()),
+                RuntimeField::Agent => options.agent_label.clone(),
+                RuntimeField::Provider => options.agent_label.clone(),
+            });
+        (choices, current)
     }
 
     /// Handles a command button. Returns whether the action was one.
@@ -482,21 +537,24 @@ impl ImChannelService {
         binding: &ImBindingRecord,
         action: &ImActionRecord,
     ) -> VibexResult<bool> {
+        let locale = self.locale(event);
+        let already = locale.text(
+            "This action was already handled.",
+            "这个操作已经处理过了。",
+            "這個操作已經處理過了。",
+        );
         let kind = action.kind.as_str();
         if kind == ACTION_MENU_HELP {
             if !self.consume_action(action, principal)? {
-                self.reply(event, runtime, "This action was already handled.")
-                    .await?;
+                self.reply(event, runtime, already).await?;
                 return Ok(true);
             }
-            self.reply(event, runtime, &render::help(self.locale(event), "/"))
-                .await?;
+            self.reply(event, runtime, &render::help(locale)).await?;
             return Ok(true);
         }
         if kind == ACTION_MENU_SESSIONS {
             if !self.consume_action(action, principal)? {
-                self.reply(event, runtime, "This action was already handled.")
-                    .await?;
+                self.reply(event, runtime, already).await?;
                 return Ok(true);
             }
             self.send_sessions_card(event, runtime, principal).await?;
@@ -507,13 +565,20 @@ impl ImChannelService {
             .and_then(RuntimeField::parse)
         {
             if !principal.role.can_prompt() {
-                self.reply(event, runtime, "Your role cannot change the runtime.")
-                    .await?;
+                self.reply(
+                    event,
+                    runtime,
+                    locale.text(
+                        "Your role cannot change the runtime.",
+                        "你的角色不能修改运行参数。",
+                        "你的角色不能修改執行參數。",
+                    ),
+                )
+                .await?;
                 return Ok(true);
             }
             if !self.consume_action(action, principal)? {
-                self.reply(event, runtime, "This action was already handled.")
-                    .await?;
+                self.reply(event, runtime, already).await?;
                 return Ok(true);
             }
             match field {
@@ -530,30 +595,48 @@ impl ImChannelService {
         }
         if kind == ACTION_STATUS_STOP {
             if !principal.role.can_prompt() {
-                self.reply(event, runtime, "Your role cannot stop sessions.")
-                    .await?;
+                self.reply(
+                    event,
+                    runtime,
+                    locale.text(
+                        "Your role cannot stop sessions.",
+                        "你的角色不能停止会话。",
+                        "你的角色不能停止工作階段。",
+                    ),
+                )
+                .await?;
                 return Ok(true);
             }
             if !self.consume_action(action, principal)? {
-                self.reply(event, runtime, "This action was already handled.")
-                    .await?;
+                self.reply(event, runtime, already).await?;
                 return Ok(true);
             }
             self.inner.agent.interrupt(&binding.session_id).await?;
             self.stop_live_turn(binding).await;
-            self.reply(event, runtime, "Stopped the current turn.")
-                .await?;
+            self.reply(
+                event,
+                runtime,
+                locale.text("Stopped.", "已停止。", "已停止。"),
+            )
+            .await?;
             return Ok(true);
         }
         if kind == ACTION_SESSION_USE {
             if !principal.role.can_prompt() {
-                self.reply(event, runtime, "Your role cannot bind sessions.")
-                    .await?;
+                self.reply(
+                    event,
+                    runtime,
+                    locale.text(
+                        "Your role cannot bind sessions.",
+                        "你的角色不能绑定会话。",
+                        "你的角色不能綁定工作階段。",
+                    ),
+                )
+                .await?;
                 return Ok(true);
             }
             if !self.consume_action(action, principal)? {
-                self.reply(event, runtime, "This action was already handled.")
-                    .await?;
+                self.reply(event, runtime, already).await?;
                 return Ok(true);
             }
             let payload: ValuePayload =
@@ -567,9 +650,10 @@ impl ImChannelService {
                 event,
                 runtime,
                 &format!(
-                    "Bound to #{} · {}",
+                    "{} #{} · {}",
+                    locale.text("Bound to", "已绑定", "已綁定"),
                     render::short_session_id(&session),
-                    session.title
+                    render::truncate(session.title.trim(), 48)
                 ),
             )
             .await?;
@@ -580,45 +664,45 @@ impl ImChannelService {
             .and_then(RuntimeField::parse)
         {
             if !principal.role.can_prompt() {
-                self.reply(event, runtime, "Your role cannot change the runtime.")
-                    .await?;
+                self.reply(
+                    event,
+                    runtime,
+                    locale.text(
+                        "Your role cannot change the runtime.",
+                        "你的角色不能修改运行参数。",
+                        "你的角色不能修改執行參數。",
+                    ),
+                )
+                .await?;
                 return Ok(true);
             }
             if !self.consume_action(action, principal)? {
-                self.reply(event, runtime, "This action was already handled.")
-                    .await?;
+                self.reply(event, runtime, already).await?;
                 return Ok(true);
             }
-            let locale = self.locale(event);
             match self
                 .apply_runtime_choice(binding, field, &action.payload_json)
                 .await
             {
-                Ok(summary) => {
-                    self.reply(
-                        event,
-                        runtime,
-                        &format!("{}: {summary}", field.label(locale)),
-                    )
-                    .await?;
+                Ok((value, selection)) => {
+                    let text = render::runtime_applied(field.label(locale), &value, &selection);
+                    self.reply(event, runtime, &text).await?;
                 }
                 Err(error) => {
+                    let command = field.action_kind().trim_start_matches("runtime:");
                     let text = match locale {
-                        ImLocale::En => format!(
-                            "Could not apply that: {}. Send /{} again.",
-                            error.message,
-                            field.action_kind().trim_start_matches("runtime:")
-                        ),
-                        ImLocale::ZhCn => format!(
-                            "未能应用：{}。请重新发送 /{}。",
-                            error.message,
-                            field.action_kind().trim_start_matches("runtime:")
-                        ),
-                        ImLocale::ZhTw => format!(
-                            "未能套用：{}。請重新傳送 /{}。",
-                            error.message,
-                            field.action_kind().trim_start_matches("runtime:")
-                        ),
+                        ImLocale::En => {
+                            format!(
+                                "Could not apply that: {}. Send /{command} again.",
+                                error.message
+                            )
+                        }
+                        ImLocale::ZhCn => {
+                            format!("未能应用：{}。请重新发送 /{command}。", error.message)
+                        }
+                        ImLocale::ZhTw => {
+                            format!("未能套用：{}。請重新傳送 /{command}。", error.message)
+                        }
                     };
                     self.reply(event, runtime, &text).await?;
                 }
@@ -643,54 +727,103 @@ impl ImChannelService {
     }
 
     /// Reads the options again and applies the choice against their revisions.
+    /// Reads the options again and applies the choice against their revisions.
+    ///
+    /// Returns the chosen value's own label and the selection it produced, so a
+    /// confirmation can name what changed and show what it changed to.
     async fn apply_runtime_choice(
         &self,
         binding: &ImBindingRecord,
         field: RuntimeField,
         payload_json: &str,
-    ) -> VibexResult<String> {
+    ) -> VibexResult<(String, String)> {
+        let locale = self.locale_for_channel(&binding.channel_id);
+        let default = locale.text("default", "默认", "預設").to_string();
         let options = self
             .inner
             .agent
             .runtime_options(&binding.session_id)
             .await?;
         let mut desired = options.current.clone();
-        match field {
+        let value = match field {
             RuntimeField::Model => {
                 let payload: ValuePayload =
                     serde_json::from_str(payload_json).map_err(|_| im_payload_error())?;
+                let value = options
+                    .models
+                    .iter()
+                    .find(|choice| choice.id == payload.value)
+                    .map(|choice| choice.label.clone())
+                    .unwrap_or_else(|| payload.value.clone());
                 desired.model = RuntimeModelSelection::explicit(payload.value);
                 // A different model advertises different efforts.
                 desired.reasoning_effort = None;
+                value
             }
             RuntimeField::Effort => {
                 let payload: ValuePayload =
                     serde_json::from_str(payload_json).map_err(|_| im_payload_error())?;
+                let value = if payload.value.is_empty() {
+                    default
+                } else {
+                    options
+                        .efforts
+                        .iter()
+                        .find(|choice| choice.id == payload.value)
+                        .map(|choice| choice.label.clone())
+                        .unwrap_or_else(|| payload.value.clone())
+                };
                 desired.reasoning_effort = (!payload.value.is_empty()).then_some(payload.value);
+                value
             }
             RuntimeField::Mode => {
                 let payload: ValuePayload =
                     serde_json::from_str(payload_json).map_err(|_| im_payload_error())?;
+                let value = if payload.value.is_empty() {
+                    default
+                } else {
+                    options
+                        .modes
+                        .iter()
+                        .find(|choice| choice.id == payload.value)
+                        .map(|choice| choice.label.clone())
+                        .unwrap_or_else(|| payload.value.clone())
+                };
                 desired.mode_id = (!payload.value.is_empty()).then_some(payload.value);
+                value
             }
             RuntimeField::Agent => {
                 let payload: AgentChoicePayload =
                     serde_json::from_str(payload_json).map_err(|_| im_payload_error())?;
+                let value = options
+                    .agents
+                    .iter()
+                    .find(|choice| choice.agent_id.as_str() == payload.agent_id)
+                    .map(|choice| choice.agent_label.clone())
+                    .unwrap_or_else(|| payload.agent_id.clone());
                 desired.agent_id = AgentId::parse(&payload.agent_id)?;
                 desired.auth_source = payload.auth_source;
                 desired.model = payload.model;
                 desired.reasoning_effort = None;
                 desired.mode_id = None;
+                value
             }
             RuntimeField::Provider => {
                 let payload: ProviderChoicePayload =
                     serde_json::from_str(payload_json).map_err(|_| im_payload_error())?;
+                let value = options
+                    .providers
+                    .iter()
+                    .find(|choice| choice.auth_source == payload.auth_source)
+                    .map(|choice| choice.label.clone())
+                    .unwrap_or_else(|| locale.text("Provider", "供应商", "供應商").to_string());
                 desired.auth_source = payload.auth_source;
                 desired.model = payload.model;
                 // A different source advertises different efforts.
                 desired.reasoning_effort = None;
+                value
             }
-        }
+        };
         let state = self
             .inner
             .agent
@@ -703,10 +836,7 @@ impl ImChannelService {
                 interaction: RuntimeSelectionInteraction::Seamless,
             })
             .await?;
-        Ok(render::runtime_selection_summary(
-            self.locale_for_channel(&binding.channel_id),
-            &state.desired,
-        ))
+        Ok((value, render::selection_line(locale, &state.desired)))
     }
 
     /// `/model`, `/effort`, `/mode`, `/agent`, with an optional direct value.
@@ -728,23 +858,37 @@ impl ImChannelService {
                 }
             };
         }
+        let locale = self.locale(event);
         if !principal.role.can_prompt() {
-            self.reply(event, runtime, "Your role cannot change the runtime.")
-                .await?;
+            self.reply(
+                event,
+                runtime,
+                locale.text(
+                    "Your role cannot change the runtime.",
+                    "你的角色不能修改运行参数。",
+                    "你的角色不能修改執行參數。",
+                ),
+            )
+            .await?;
             return Ok(());
         }
         let conn = self.open()?;
         let Some(binding) = self.binding_for(&conn, event)? else {
-            self.reply(event, runtime, "No session is bound.").await?;
+            self.reply(
+                event,
+                runtime,
+                locale.text(
+                    "No session is bound.",
+                    "还没有绑定会话。",
+                    "還沒有綁定工作階段。",
+                ),
+            )
+            .await?;
             return Ok(());
         };
-        let locale = self.locale(event);
-        // The text form takes the value itself: an id for a model, the literal
-        // effort or mode, and `id` for an Agent (which can only be chosen from
-        // the card, because a switch needs its source and model too).
-        // Switching Agent or provider needs the source and model that come
-        // with the choice, so the text form opens the card rather than
-        // guessing from a bare id.
+        // Switching Agent or provider needs the source and model that come with
+        // the choice, so the text form opens the card rather than guessing from
+        // a bare id.
         match field {
             RuntimeField::Agent => {
                 self.send_agent_card(event, runtime, principal).await?;
@@ -761,21 +905,27 @@ impl ImChannelService {
         })
         .map_err(|_| im_payload_error())?;
         match self.apply_runtime_choice(&binding, field, &payload).await {
-            Ok(summary) => {
-                self.reply(
-                    event,
-                    runtime,
-                    &format!("{}: {summary}", field.label(locale)),
-                )
-                .await?;
+            Ok((value, selection)) => {
+                let text = render::runtime_applied(field.label(locale), &value, &selection);
+                self.reply(event, runtime, &text).await?;
             }
             Err(error) => {
-                self.reply(
-                    event,
-                    runtime,
-                    &format!("Could not apply that: {}", error.message),
-                )
-                .await?;
+                let command = field.action_kind().trim_start_matches("runtime:");
+                let text = match locale {
+                    ImLocale::En => {
+                        format!(
+                            "Could not apply that: {}. Send /{command} again.",
+                            error.message
+                        )
+                    }
+                    ImLocale::ZhCn => {
+                        format!("未能应用：{}。请重新发送 /{command}。", error.message)
+                    }
+                    ImLocale::ZhTw => {
+                        format!("未能套用：{}。請重新傳送 /{command}。", error.message)
+                    }
+                };
+                self.reply(event, runtime, &text).await?;
             }
         }
         Ok(())

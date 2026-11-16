@@ -34,14 +34,17 @@ impl ImChannelService {
                 resolution,
             })
             .await?;
-        let status = match option.response {
+        // The row keeps a stable word so a locale change never rewrites history;
+        // only the chat text is translated.
+        let stored = match option.response {
             PermissionResponseKind::Approve => "approved",
             PermissionResponseKind::Deny => "denied",
-            PermissionResponseKind::AlwaysAllowForSession => "approved for this session",
+            PermissionResponseKind::AlwaysAllowForSession => "always_allowed",
         };
+        let status = render::approval_result(self.locale(event), option.response);
         let conn = self.open()?;
         if let Some(card_id) = card_id.filter(|id| !id.is_empty()) {
-            ImApprovalCardRepository::set_status(&conn, card_id, status, unix_timestamp_ms())?;
+            ImApprovalCardRepository::set_status(&conn, card_id, stored, unix_timestamp_ms())?;
             ImActionRepository::invalidate_for_card(&conn, card_id, unix_timestamp_ms())?;
         }
         let cards = ImApprovalCardRepository::list_for_request(
@@ -53,7 +56,7 @@ impl ImChannelService {
             ImApprovalCardRepository::set_status(
                 &conn,
                 &card.card_id,
-                status,
+                stored,
                 unix_timestamp_ms(),
             )?;
             ImActionRepository::invalidate_for_card(&conn, &card.card_id, unix_timestamp_ms())?;
@@ -66,7 +69,7 @@ impl ImChannelService {
                             thread_key: binding.thread_key.clone(),
                         },
                         message_id.to_string(),
-                        format!("{status}: {}\n{}", request.title, principal.display_name),
+                        format!("{status} · {}", request.title),
                         false,
                         OutboundPriority::Normal,
                     )
@@ -74,7 +77,7 @@ impl ImChannelService {
             }
         }
         let _ = event;
-        Ok(format!("{status}: {}", request.title))
+        Ok(format!("{status} · {}", request.title))
     }
 
     pub(super) async fn send_approval_card(
@@ -228,16 +231,16 @@ impl ImChannelService {
     ) -> VibexResult<()> {
         let conn = self.open()?;
         let cards = ImApprovalCardRepository::list_for_request(&conn, session_id, request_id)?;
-        let status = match response {
+        let stored = match response {
             PermissionResponseKind::Approve => "approved",
             PermissionResponseKind::Deny => "denied",
-            PermissionResponseKind::AlwaysAllowForSession => "approved for this session",
+            PermissionResponseKind::AlwaysAllowForSession => "always_allowed",
         };
         for card in cards {
             ImApprovalCardRepository::set_status(
                 &conn,
                 &card.card_id,
-                status,
+                stored,
                 unix_timestamp_ms(),
             )?;
             ImActionRepository::invalidate_for_card(&conn, &card.card_id, unix_timestamp_ms())?;
@@ -261,7 +264,13 @@ impl ImChannelService {
                             thread_key: binding.thread_key.clone(),
                         },
                         message_id.to_string(),
-                        format!("{status}: approval request {}", request_id),
+                        format!(
+                            "{} · {request_id}",
+                            render::approval_result(
+                                self.locale_for_channel(&binding.channel_id),
+                                response
+                            )
+                        ),
                         false,
                         OutboundPriority::Normal,
                     )
@@ -379,12 +388,25 @@ impl ImChannelService {
         request: &vibex_core::ElicitationRequest,
         value: &str,
     ) -> VibexResult<String> {
+        let locale = self.locale(event);
         let Some(form) = crate::elicitation::SimpleForm::of(request) else {
-            return Ok("This question can only be answered in Vibex.".to_string());
+            return Ok(locale
+                .text(
+                    "This question can only be answered in Vibex.",
+                    "这个问题只能在 Vibex 里回答。",
+                    "這個問題只能在 Vibex 裡回答。",
+                )
+                .to_string());
         };
         let Some(resolution) = crate::elicitation::resolution_for_choice(request, &form, value)
         else {
-            return Ok("That answer is no longer available.".to_string());
+            return Ok(locale
+                .text(
+                    "That answer is no longer available.",
+                    "这个回答已失效。",
+                    "這個回答已失效。",
+                )
+                .to_string());
         };
         self.inner
             .agent

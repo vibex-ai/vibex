@@ -1073,7 +1073,7 @@ impl ImChannelService {
         else {
             return;
         };
-        let text = format!("Vibex error ({}): {}", error.code, error.message);
+        let text = render::error_message(&error.code, &error.message, self.locale(event));
         let _ = self.reply(event, &runtime, &text).await;
     }
 
@@ -1163,8 +1163,16 @@ impl ImChannelService {
                     .await;
             }
             let Some(action_id) = action_id else {
-                self.reply(&event, &runtime, "This action is no longer available.")
-                    .await?;
+                self.reply(
+                    &event,
+                    &runtime,
+                    self.locale(&event).text(
+                        "This action is no longer available.",
+                        "这个操作已失效。",
+                        "這個操作已失效。",
+                    ),
+                )
+                .await?;
                 return Ok(());
             };
             return self.handle_callback(&event, &runtime, &action_id).await;
@@ -1192,7 +1200,7 @@ impl ImChannelService {
             self.reply(
                 &event,
                 &runtime,
-                "This bot is not paired with you yet. Ask the owner for a pairing code, then send /pair <code>.",
+                self.locale(&event).text("This bot is not paired with you yet. Ask the owner for a pairing code, then send /pair <code>.", "这个机器人还没有和你配对。向管理员要一个配对码，然后发送 /pair <配对码>。", "這個機器人還沒有和你配對。向管理員要一個配對碼，然後傳送 /pair <配對碼>。"),
             )
             .await?;
             return Ok(());
@@ -1201,7 +1209,11 @@ impl ImChannelService {
             self.reply(
                 &event,
                 &runtime,
-                "Your IM identity has been revoked. Ask the owner to pair you again.",
+                self.locale(&event).text(
+                    "Your IM identity has been revoked. Ask the owner to pair you again.",
+                    "你的身份已被解除。请联系管理员重新配对。",
+                    "你的身分已被解除。請聯絡管理員重新配對。",
+                ),
             )
             .await?;
             return Ok(());
@@ -1252,7 +1264,11 @@ impl ImChannelService {
             self.reply(
                 event,
                 runtime,
-                "Send /pair <code> with the code from Vibex settings.",
+                self.locale(event).text(
+                    "Send /pair <code> with the code from Vibex settings.",
+                    "把 Vibex 设置里的配对码用 /pair <配对码> 发过来。",
+                    "把 Vibex 設定裡的配對碼用 /pair <配對碼> 傳過來。",
+                ),
             )
             .await?;
             return Ok(());
@@ -1262,8 +1278,16 @@ impl ImChannelService {
         let mut conn = self.open()?;
         let Some(pairing) = ImPairingRepository::claim(&conn, &code_hash, now)? else {
             drop(conn);
-            self.reply(event, runtime, "That pairing code is invalid or expired.")
-                .await?;
+            self.reply(
+                event,
+                runtime,
+                self.locale(event).text(
+                    "That pairing code is invalid or expired.",
+                    "配对码无效或已过期。",
+                    "配對碼無效或已過期。",
+                ),
+            )
+            .await?;
             return Ok(());
         };
         // A code is bound to the kind of chat it was minted for. A direct code
@@ -1281,7 +1305,11 @@ impl ImChannelService {
             self.reply(
                 event,
                 runtime,
-                "That pairing code cannot be used in this chat.",
+                self.locale(event).text(
+                    "That pairing code cannot be used in this chat.",
+                    "这个配对码不能在这个聊天里使用。",
+                    "這個配對碼不能在這個聊天裡使用。",
+                ),
             )
             .await?;
             return Ok(());
@@ -1339,7 +1367,15 @@ impl ImChannelService {
         self.reply(
             event,
             runtime,
-            &format!("Paired as {role}. Send /help to see what you can do."),
+            &format!(
+                "{} {role}\n{}",
+                self.locale(event).text("Paired as", "已配对为", "已配對為"),
+                self.locale(event).text(
+                    "Send /help to see what you can do.",
+                    "发送 /help 查看可以做什么。",
+                    "傳送 /help 查看可以做什麼。",
+                )
+            ),
         )
         .await?;
         Ok(())
@@ -1358,45 +1394,109 @@ impl ImChannelService {
             &event.external_user_id,
         )?
         else {
-            self.reply(event, runtime, "Pair this chat before approving.")
-                .await?;
+            self.reply(
+                event,
+                runtime,
+                self.locale(event).text(
+                    "Pair this chat before approving.",
+                    "请先配对这个聊天。",
+                    "請先配對這個聊天。",
+                ),
+            )
+            .await?;
             return Ok(());
         };
         if principal.status != ImPrincipalStatus::Active {
-            self.reply(event, runtime, "You do not have permission to act here.")
-                .await?;
+            self.reply(
+                event,
+                runtime,
+                self.locale(event).text(
+                    "You do not have permission to act here.",
+                    "你没有权限在这里操作。",
+                    "你沒有權限在這裡操作。",
+                ),
+            )
+            .await?;
             return Ok(());
         }
         let Some(action) = ImActionRepository::get(&conn, action_id)? else {
-            self.reply(event, runtime, "This action is no longer available.")
-                .await?;
+            self.reply(
+                event,
+                runtime,
+                self.locale(event).text(
+                    "This action is no longer available.",
+                    "这个操作已失效。",
+                    "這個操作已失效。",
+                ),
+            )
+            .await?;
             return Ok(());
         };
         if action.consumed_at_ms.is_some() {
-            self.reply(event, runtime, "This action was already handled.")
-                .await?;
+            self.reply(
+                event,
+                runtime,
+                self.locale(event).text(
+                    "This action was already handled.",
+                    "这个操作已经处理过了。",
+                    "這個操作已經處理過了。",
+                ),
+            )
+            .await?;
             return Ok(());
         }
         if action.expires_at_ms <= unix_timestamp_ms() {
-            self.reply(event, runtime, "This action has expired.")
-                .await?;
+            self.reply(
+                event,
+                runtime,
+                self.locale(event).text(
+                    "This action has expired.",
+                    "这个操作已过期。",
+                    "這個操作已過期。",
+                ),
+            )
+            .await?;
             return Ok(());
         }
         if action.channel_id != event.channel_id {
-            self.reply(event, runtime, "This action belongs to another channel.")
-                .await?;
+            self.reply(
+                event,
+                runtime,
+                self.locale(event).text(
+                    "This action belongs to another channel.",
+                    "这个操作属于另一个频道。",
+                    "這個操作屬於另一個頻道。",
+                ),
+            )
+            .await?;
             return Ok(());
         }
         let Some(binding) = ImBindingRepository::get(&conn, &action.binding_id)? else {
-            self.reply(event, runtime, "This conversation is no longer bound.")
-                .await?;
+            self.reply(
+                event,
+                runtime,
+                self.locale(event).text(
+                    "This conversation is no longer bound.",
+                    "这个会话已解除绑定。",
+                    "這個工作階段已解除綁定。",
+                ),
+            )
+            .await?;
             return Ok(());
         };
         if binding.external_chat_id != event.external_chat_id
             || binding.thread_key != event.thread_key
         {
-            self.reply(event, runtime, "This action belongs to another chat.")
-                .await?;
+            self.reply(
+                event,
+                runtime,
+                self.locale(event).text(
+                    "This action belongs to another chat.",
+                    "这个操作属于另一个聊天。",
+                    "這個操作屬於另一個聊天。",
+                ),
+            )
+            .await?;
             return Ok(());
         }
         // An elicitation button answers a question, not a permission request;
@@ -1407,8 +1507,16 @@ impl ImChannelService {
             .map(str::to_string)
         {
             if !principal.role.can_approve() {
-                self.reply(event, runtime, "You do not have permission to approve.")
-                    .await?;
+                self.reply(
+                    event,
+                    runtime,
+                    self.locale(event).text(
+                        "You do not have permission to approve.",
+                        "你没有审批权限。",
+                        "你沒有審批權限。",
+                    ),
+                )
+                .await?;
                 return Ok(());
             }
             let payload: ElicitationActionPayload = serde_json::from_str(&action.payload_json)
@@ -1425,7 +1533,11 @@ impl ImChannelService {
                 self.reply(
                     event,
                     runtime,
-                    "That question was already answered or withdrawn.",
+                    self.locale(event).text(
+                        "That question was already answered or withdrawn.",
+                        "那个问题已被回答或撤回。",
+                        "那個問題已被回答或撤回。",
+                    ),
                 )
                 .await?;
                 return Ok(());
@@ -1436,8 +1548,16 @@ impl ImChannelService {
                 &principal.principal_id,
                 unix_timestamp_ms(),
             )? {
-                self.reply(event, runtime, "That answer was already recorded.")
-                    .await?;
+                self.reply(
+                    event,
+                    runtime,
+                    self.locale(event).text(
+                        "That answer was already recorded.",
+                        "这个回答已经记录过了。",
+                        "這個回答已經記錄過了。",
+                    ),
+                )
+                .await?;
                 return Ok(());
             }
             let status = self
@@ -1465,8 +1585,16 @@ impl ImChannelService {
         // Whatever is left is an approval: the only remaining kind, and the
         // only one an Approver may answer.
         if !principal.role.can_approve() {
-            self.reply(event, runtime, "You do not have permission to approve.")
-                .await?;
+            self.reply(
+                event,
+                runtime,
+                self.locale(event).text(
+                    "You do not have permission to approve.",
+                    "你没有审批权限。",
+                    "你沒有審批權限。",
+                ),
+            )
+            .await?;
             return Ok(());
         }
         let payload: ApprovalActionPayload =
@@ -1483,7 +1611,11 @@ impl ImChannelService {
             self.reply(
                 event,
                 runtime,
-                "That approval request is no longer pending.",
+                self.locale(event).text(
+                    "That approval request is no longer pending.",
+                    "那个审批请求已不再等待处理。",
+                    "那個審批請求已不再等待處理。",
+                ),
             )
             .await?;
             return Ok(());
@@ -1497,7 +1629,11 @@ impl ImChannelService {
             self.reply(
                 event,
                 runtime,
-                "That approval option is no longer available.",
+                self.locale(event).text(
+                    "That approval option is no longer available.",
+                    "那个审批选项已失效。",
+                    "那個審批選項已失效。",
+                ),
             )
             .await?;
             return Ok(());
@@ -1508,8 +1644,16 @@ impl ImChannelService {
             &principal.principal_id,
             unix_timestamp_ms(),
         )? {
-            self.reply(event, runtime, "This action was already handled.")
-                .await?;
+            self.reply(
+                event,
+                runtime,
+                self.locale(event).text(
+                    "This action was already handled.",
+                    "这个操作已经处理过了。",
+                    "這個操作已經處理過了。",
+                ),
+            )
+            .await?;
             return Ok(());
         }
         let status = self
@@ -1549,9 +1693,11 @@ impl ImChannelService {
                 self.reply(
                     event,
                     runtime,
-                    &format!(
-                        "Vibex IM identity\nUser: {}\nRole: {role}\nChannel: {}",
-                        principal.display_name, event.channel_id
+                    &render::identity(
+                        locale,
+                        &principal.display_name,
+                        role,
+                        event.channel_id.as_str(),
                     ),
                 )
                 .await?;
@@ -1625,10 +1771,27 @@ impl ImChannelService {
             }
             "/say" => {
                 if !principal.role.can_prompt() {
-                    self.reply(event, runtime, "Your role cannot send prompts.")
-                        .await?;
+                    self.reply(
+                        event,
+                        runtime,
+                        self.locale(event).text(
+                            "Your role cannot send prompts.",
+                            "你的角色不能发送内容。",
+                            "你的角色不能傳送內容。",
+                        ),
+                    )
+                    .await?;
                 } else if args.is_empty() {
-                    self.reply(event, runtime, "Usage: /say <text>").await?;
+                    self.reply(
+                        event,
+                        runtime,
+                        self.locale(event).text(
+                            "Usage: /say <text>",
+                            "用法：/say <内容>",
+                            "用法：/say <內容>",
+                        ),
+                    )
+                    .await?;
                 } else {
                     self.handle_plain_text(event, runtime, principal, args)
                         .await?;
@@ -1639,7 +1802,16 @@ impl ImChannelService {
                 self.reply(
                     event,
                     runtime,
-                    &format!("Unknown command {command}. Send /help for the command list."),
+                    &format!(
+                        "{} {command}\n{}",
+                        self.locale(event)
+                            .text("Unknown command", "未知命令", "未知指令"),
+                        self.locale(event).text(
+                            "Send /help for the command list.",
+                            "发送 /help 查看命令列表。",
+                            "傳送 /help 查看指令列表。",
+                        )
+                    ),
                 )
                 .await?;
             }
@@ -1654,11 +1826,16 @@ impl ImChannelService {
         principal: &ImPrincipalRecord,
     ) -> VibexResult<()> {
         let conn = self.open()?;
+        let locale = self.locale(event);
         let Some(binding) = self.binding_for(&conn, event)? else {
             self.reply(
                 event,
                 runtime,
-                "No session is bound. Use /sessions or /new.",
+                locale.text(
+                    "No session is bound. Use /sessions or /new.",
+                    "还没有绑定会话。用 /sessions 或 /new。",
+                    "還沒有綁定工作階段。用 /sessions 或 /new。",
+                ),
             )
             .await?;
             return Ok(());
@@ -1666,54 +1843,35 @@ impl ImChannelService {
         let session = self.inner.agent.get_session(&binding.session_id).await?;
         let pending =
             ImApprovalCardRepository::list_pending_for_binding(&conn, &binding.binding_id)?;
-        let locale = self.locale(event);
         let role = role_label(principal.role, locale);
-        let runtime_line = match self.inner.agent.runtime_options(&binding.session_id).await {
-            Ok(options) => render::runtime_current(locale, &options),
-            Err(_) => session.agent_id.as_str().to_string(),
-        };
+        let options = self
+            .inner
+            .agent
+            .runtime_options(&binding.session_id)
+            .await
+            .ok();
         let mut buttons = Vec::new();
         if principal.role.can_prompt() {
             for (kind, label) in [
                 (
                     commands::ACTION_STATUS_STOP,
-                    match locale {
-                        ImLocale::En => "Stop",
-                        ImLocale::ZhCn => "停止",
-                        ImLocale::ZhTw => "停止",
-                    },
+                    locale.text("Stop", "停止", "停止"),
                 ),
                 (
                     commands::ACTION_MENU_SESSIONS,
-                    match locale {
-                        ImLocale::En => "Sessions",
-                        ImLocale::ZhCn => "会话",
-                        ImLocale::ZhTw => "工作階段",
-                    },
+                    locale.text("Sessions", "会话", "工作階段"),
                 ),
                 (
                     commands::ACTION_MENU_MODEL,
-                    match locale {
-                        ImLocale::En => "Model",
-                        ImLocale::ZhCn => "模型",
-                        ImLocale::ZhTw => "模型",
-                    },
+                    locale.text("Model", "模型", "模型"),
                 ),
                 (
                     commands::ACTION_MENU_PROVIDER,
-                    match locale {
-                        ImLocale::En => "Provider",
-                        ImLocale::ZhCn => "供应商",
-                        ImLocale::ZhTw => "供應商",
-                    },
+                    locale.text("Provider", "供应商", "供應商"),
                 ),
                 (
                     commands::ACTION_MENU_EFFORT,
-                    match locale {
-                        ImLocale::En => "Effort",
-                        ImLocale::ZhCn => "思考",
-                        ImLocale::ZhTw => "思考",
-                    },
+                    locale.text("Effort", "思考", "思考"),
                 ),
             ] {
                 let minted = self.mint_action(&conn, &binding, kind, "{}")?;
@@ -1723,13 +1881,7 @@ impl ImChannelService {
                 });
             }
         }
-        let text = format!(
-            "Vibex session\n#{} · {}\nState: {}\n{runtime_line}\nApprovals pending: {}\nRole: {role}",
-            render::short_session_id(&session),
-            session.title,
-            render::state_label(&session, locale),
-            pending.len(),
-        );
+        let text = render::status_card(locale, &session, role, options.as_ref(), pending.len());
         self.reply_buttons(event, runtime, &text, buttons).await?;
         Ok(())
     }
@@ -1742,13 +1894,29 @@ impl ImChannelService {
         args: &str,
     ) -> VibexResult<()> {
         if !principal.role.can_approve() {
-            self.reply(event, runtime, "Your role cannot bind sessions.")
-                .await?;
+            self.reply(
+                event,
+                runtime,
+                self.locale(event).text(
+                    "Your role cannot bind sessions.",
+                    "你的角色不能绑定会话。",
+                    "你的角色不能綁定工作階段。",
+                ),
+            )
+            .await?;
             return Ok(());
         }
         if args.is_empty() {
-            self.reply(event, runtime, "Usage: /use <n|session-id>")
-                .await?;
+            self.reply(
+                event,
+                runtime,
+                self.locale(event).text(
+                    "Usage: /use <n|session-id>",
+                    "用法：/use <序号|会话 ID>",
+                    "用法：/use <序號|工作階段 ID>",
+                ),
+            )
+            .await?;
             return Ok(());
         }
         let session_id = if let Ok(index) = args.parse::<usize>() {
@@ -1769,8 +1937,16 @@ impl ImChannelService {
                 .map(|session| session.id)
         };
         let Some(session_id) = session_id else {
-            self.reply(event, runtime, "Session not found. Send /sessions first.")
-                .await?;
+            self.reply(
+                event,
+                runtime,
+                self.locale(event).text(
+                    "Session not found. Send /sessions first.",
+                    "找不到会话。先发送 /sessions。",
+                    "找不到工作階段。先傳送 /sessions。",
+                ),
+            )
+            .await?;
             return Ok(());
         };
         let session = self.inner.agent.get_session(&session_id).await?;
@@ -1781,9 +1957,10 @@ impl ImChannelService {
             event,
             runtime,
             &format!(
-                "Bound to #{} · {}",
+                "{} #{} · {}",
+                self.locale(event).text("Bound to", "已绑定", "已綁定"),
                 render::short_session_id(&session),
-                session.title
+                render::truncate(session.title.trim(), 48)
             ),
         )
         .await?;
@@ -1798,12 +1975,29 @@ impl ImChannelService {
         prompt: &str,
     ) -> VibexResult<()> {
         if !principal.role.can_prompt() {
-            self.reply(event, runtime, "Your role cannot start sessions.")
-                .await?;
+            self.reply(
+                event,
+                runtime,
+                self.locale(event).text(
+                    "Your role cannot start sessions.",
+                    "你的角色不能新建会话。",
+                    "你的角色不能建立工作階段。",
+                ),
+            )
+            .await?;
             return Ok(());
         }
         if prompt.trim().is_empty() {
-            self.reply(event, runtime, "Usage: /new <prompt>").await?;
+            self.reply(
+                event,
+                runtime,
+                self.locale(event).text(
+                    "Usage: /new <prompt>",
+                    "用法：/new <内容>",
+                    "用法：/new <內容>",
+                ),
+            )
+            .await?;
             return Ok(());
         }
         let conn = self.open()?;
@@ -1848,7 +2042,7 @@ impl ImChannelService {
             self.reply(
                     event,
                     runtime,
-                    "This channel has no default workspace and Agent. Bind a session with /use first, or configure defaults in Vibex settings.",
+                    self.locale(event).text("This channel has no default workspace and Agent. Bind a session with /use first, or configure defaults in Vibex settings.", "这个频道没有默认工作区和 Agent。先用 /use 绑定一个会话，或在 Vibex 设置里配置默认值。", "這個頻道沒有預設工作區和 Agent。先用 /use 綁定一個工作階段，或在 Vibex 設定裡設定預設值。"),
                 )
                 .await?;
             return Ok(());
@@ -1878,7 +2072,14 @@ impl ImChannelService {
                     self.reply(
                         event,
                         runtime,
-                        &format!("Could not create a Telegram topic: {error}"),
+                        &format!(
+                            "{} {error}",
+                            self.locale(event).text(
+                                "Could not create a Telegram topic:",
+                                "无法创建 Telegram 话题：",
+                                "無法建立 Telegram 話題："
+                            )
+                        ),
                     )
                     .await?;
                     return Ok(());
@@ -1909,13 +2110,30 @@ impl ImChannelService {
         principal: &ImPrincipalRecord,
     ) -> VibexResult<()> {
         if !principal.role.can_prompt() {
-            self.reply(event, runtime, "Your role cannot stop sessions.")
-                .await?;
+            self.reply(
+                event,
+                runtime,
+                self.locale(event).text(
+                    "Your role cannot stop sessions.",
+                    "你的角色不能停止会话。",
+                    "你的角色不能停止工作階段。",
+                ),
+            )
+            .await?;
             return Ok(());
         }
         let conn = self.open()?;
         let Some(binding) = self.binding_for(&conn, event)? else {
-            self.reply(event, runtime, "No session is bound.").await?;
+            self.reply(
+                event,
+                runtime,
+                self.locale(event).text(
+                    "No session is bound.",
+                    "还没有绑定会话。",
+                    "還沒有綁定工作階段。",
+                ),
+            )
+            .await?;
             return Ok(());
         };
         self.inner.agent.interrupt(&binding.session_id).await?;
@@ -1924,8 +2142,16 @@ impl ImChannelService {
         if self.live_mode_for_binding(&binding).edits_a_message() {
             self.stop_live_turn(&binding).await;
         } else {
-            self.reply(event, runtime, "Stopped the current turn.")
-                .await?;
+            self.reply(
+                event,
+                runtime,
+                self.locale(event).text(
+                    "Stopped the current turn.",
+                    "已停止当前回合。",
+                    "已停止目前回合。",
+                ),
+            )
+            .await?;
         }
         Ok(())
     }
@@ -1939,21 +2165,46 @@ impl ImChannelService {
         choice: ApprovalChoice,
     ) -> VibexResult<()> {
         if !principal.role.can_approve() {
-            self.reply(event, runtime, "Your role cannot approve.")
-                .await?;
+            self.reply(
+                event,
+                runtime,
+                self.locale(event).text(
+                    "Your role cannot approve.",
+                    "你的角色不能审批。",
+                    "你的角色不能審批。",
+                ),
+            )
+            .await?;
             return Ok(());
         }
         let conn = self.open()?;
         let Some(binding) = self.binding_for(&conn, event)? else {
-            self.reply(event, runtime, "No session is bound.").await?;
+            self.reply(
+                event,
+                runtime,
+                self.locale(event).text(
+                    "No session is bound.",
+                    "还没有绑定会话。",
+                    "還沒有綁定工作階段。",
+                ),
+            )
+            .await?;
             return Ok(());
         };
         let (request, action_card) = if code.trim().is_empty() {
             let cards =
                 ImApprovalCardRepository::list_pending_for_binding(&conn, &binding.binding_id)?;
             let Some(card) = cards.first() else {
-                self.reply(event, runtime, "There is no pending approval.")
-                    .await?;
+                self.reply(
+                    event,
+                    runtime,
+                    self.locale(event).text(
+                        "There is no pending approval.",
+                        "没有待处理的审批。",
+                        "沒有待處理的審批。",
+                    ),
+                )
+                .await?;
                 return Ok(());
             };
             let Some(request) = self
@@ -1963,7 +2214,11 @@ impl ImChannelService {
                 self.reply(
                     event,
                     runtime,
-                    "That approval request is no longer pending.",
+                    self.locale(event).text(
+                        "That approval request is no longer pending.",
+                        "那个审批请求已不再等待处理。",
+                        "那個審批請求已不再等待處理。",
+                    ),
                 )
                 .await?;
                 return Ok(());
@@ -1977,8 +2232,16 @@ impl ImChannelService {
                 unix_timestamp_ms(),
             )?
             else {
-                self.reply(event, runtime, "That approval code is invalid or expired.")
-                    .await?;
+                self.reply(
+                    event,
+                    runtime,
+                    self.locale(event).text(
+                        "That approval code is invalid or expired.",
+                        "审批短码无效或已过期。",
+                        "審批短碼無效或已過期。",
+                    ),
+                )
+                .await?;
                 return Ok(());
             };
             let payload: ApprovalActionPayload = serde_json::from_str(&action.payload_json)
@@ -1994,8 +2257,16 @@ impl ImChannelService {
                 &principal.principal_id,
                 unix_timestamp_ms(),
             )? {
-                self.reply(event, runtime, "That approval was already handled.")
-                    .await?;
+                self.reply(
+                    event,
+                    runtime,
+                    self.locale(event).text(
+                        "That approval was already handled.",
+                        "这个审批已经处理过了。",
+                        "這個審批已經處理過了。",
+                    ),
+                )
+                .await?;
                 return Ok(());
             }
             let Some(request) = self
@@ -2005,7 +2276,11 @@ impl ImChannelService {
                 self.reply(
                     event,
                     runtime,
-                    "That approval request is no longer pending.",
+                    self.locale(event).text(
+                        "That approval request is no longer pending.",
+                        "那个审批请求已不再等待处理。",
+                        "那個審批請求已不再等待處理。",
+                    ),
                 )
                 .await?;
                 return Ok(());
@@ -2013,8 +2288,16 @@ impl ImChannelService {
             (request, Some(action.card_id.unwrap_or_default()))
         };
         let Some(option) = choose_option(&request, choice) else {
-            self.reply(event, runtime, "That approval option is not available.")
-                .await?;
+            self.reply(
+                event,
+                runtime,
+                self.locale(event).text(
+                    "That approval option is not available.",
+                    "那个审批选项不可用。",
+                    "那個審批選項不可用。",
+                ),
+            )
+            .await?;
             return Ok(());
         };
         let status = self
@@ -2040,14 +2323,30 @@ impl ImChannelService {
         principal: &ImPrincipalRecord,
     ) -> VibexResult<()> {
         if !principal.role.can_admin() {
-            self.reply(event, runtime, "Only an admin can unbind this chat.")
-                .await?;
+            self.reply(
+                event,
+                runtime,
+                self.locale(event).text(
+                    "Only an admin can unbind this chat.",
+                    "只有管理员可以解除绑定。",
+                    "只有管理員可以解除綁定。",
+                ),
+            )
+            .await?;
             return Ok(());
         }
         let conn = self.open()?;
         let Some(binding) = self.binding_for(&conn, event)? else {
-            self.reply(event, runtime, "This chat is not bound.")
-                .await?;
+            self.reply(
+                event,
+                runtime,
+                self.locale(event).text(
+                    "This chat is not bound.",
+                    "这个聊天没有绑定。",
+                    "這個聊天沒有綁定。",
+                ),
+            )
+            .await?;
             return Ok(());
         };
         ImBindingRepository::set_status(
@@ -2056,8 +2355,16 @@ impl ImChannelService {
             ImBindingStatus::Revoked,
             unix_timestamp_ms(),
         )?;
-        self.reply(event, runtime, "This chat is no longer bound to a session.")
-            .await?;
+        self.reply(
+            event,
+            runtime,
+            self.locale(event).text(
+                "This chat is no longer bound to a session.",
+                "这个聊天已不再绑定会话。",
+                "這個聊天已不再綁定工作階段。",
+            ),
+        )
+        .await?;
         Ok(())
     }
 
@@ -2069,8 +2376,16 @@ impl ImChannelService {
         text: &str,
     ) -> VibexResult<()> {
         if !principal.role.can_prompt() {
-            self.reply(event, runtime, "Your role cannot send prompts.")
-                .await?;
+            self.reply(
+                event,
+                runtime,
+                self.locale(event).text(
+                    "Your role cannot send prompts.",
+                    "你的角色不能发送内容。",
+                    "你的角色不能傳送內容。",
+                ),
+            )
+            .await?;
             return Ok(());
         }
         let conn = self.open()?;
@@ -2093,8 +2408,16 @@ impl ImChannelService {
         self.send_prompt_with_attachments(event, &binding.session_id, text, &event.attachments)
             .await?;
         if !live {
-            self.reply(event, runtime, "Sent. I will report back here.")
-                .await?;
+            self.reply(
+                event,
+                runtime,
+                self.locale(event).text(
+                    "Sent. I will report back here.",
+                    "已发送，我会在这里回复。",
+                    "已傳送，我會在這裡回覆。",
+                ),
+            )
+            .await?;
         }
         Ok(())
     }

@@ -268,7 +268,11 @@ impl ImChannelService {
                     .await?;
                 }
                 TimelinePayload::Error(error) => {
-                    let text = render::error_message(&error.code, &error.message);
+                    let text = render::error_message(
+                        &error.code,
+                        &error.message,
+                        self.locale_for_channel(&binding.channel_id),
+                    );
                     let live = self
                         .finish_live_turn(
                             &binding,

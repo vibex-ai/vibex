@@ -760,7 +760,7 @@ async fn lark_long_connection_round_trip() {
             fake.edited.lock().expect("edited").iter().any(|body| {
                 body.get("content")
                     .and_then(Value::as_str)
-                    .is_some_and(|content| content.contains("approved"))
+                    .is_some_and(|content| content.contains("Approved"))
             })
         },
         "approval card edit",

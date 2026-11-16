@@ -760,7 +760,7 @@ async fn telegram_pairing_commands_and_approval_round_trip() {
         || async {
             fake.sent_texts()
                 .iter()
-                .any(|text| text.contains("Recent sessions"))
+                .any(|text| text.contains("Sessions"))
         },
         "session list",
     )
@@ -912,7 +912,7 @@ async fn telegram_pairing_commands_and_approval_round_trip() {
             fake.edited.lock().expect("edited").iter().any(|body| {
                 body.get("text")
                     .and_then(Value::as_str)
-                    .is_some_and(|text| text.contains("approved"))
+                    .is_some_and(|text| text.contains("Approved"))
             })
         },
         "approval card edit",
@@ -1143,12 +1143,10 @@ async fn telegram_pairing_commands_and_approval_round_trip() {
     // `/status` offers pickers. A picker button carries no value at all, so
     // pressing it has to open the card instead of failing to parse a payload.
     fake.push(message_update(60, "/status"));
+    // The picker buttons are the status card's own shape; waiting on the
+    // session title would match the `/sessions` list sent earlier.
     wait_for(
-        || async {
-            fake.sent_texts()
-                .iter()
-                .any(|text| text.contains("Approvals pending"))
-        },
+        || async { fake.button_action("Model").is_some() },
         "status card",
     )
     .await;
