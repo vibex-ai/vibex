@@ -38803,6 +38803,12 @@ impl VibexWorkbench {
             let destination = local_file_path(url);
             if let Some(target) = agent_file_operation_preview_path(&destination, workspace_root) {
                 self.open_code_file(target, window, cx);
+            } else if let Some(local) = agent_file_operation_platform_path(&destination)
+                && local.is_absolute()
+            {
+                // A local file outside the session workspace still opens: the
+                // preview accepts an absolute external path.
+                self.open_code_file(local.to_string_lossy().into_owned(), window, cx);
             }
             return;
         }
@@ -103053,17 +103059,26 @@ fn session_markdown_text_view(
     )
 }
 
-fn agent_file_operation_preview_path(path: &str, workspace_root: Option<&str>) -> Option<String> {
+/// The platform path a local file destination names.
+///
+/// A `file:` URL is decoded, an absolute path is taken as-is, and a relative
+/// path is returned unchanged. `None` when the destination names no local file
+/// at all (a non-file URL scheme).
+fn agent_file_operation_platform_path(path: &str) -> Option<std::path::PathBuf> {
     let path = path.trim();
     if path.is_empty() {
         return None;
     }
-    let path = match url::Url::parse(path) {
-        Ok(url) if url.scheme() == "file" => url.to_file_path().ok()?,
-        Ok(_) if std::path::Path::new(path).is_absolute() => std::path::PathBuf::from(path),
-        Ok(_) => return None,
-        Err(_) => std::path::PathBuf::from(path),
-    };
+    match url::Url::parse(path) {
+        Ok(url) if url.scheme() == "file" => url.to_file_path().ok(),
+        Ok(_) if std::path::Path::new(path).is_absolute() => Some(std::path::PathBuf::from(path)),
+        Ok(_) => None,
+        Err(_) => Some(std::path::PathBuf::from(path)),
+    }
+}
+
+fn agent_file_operation_preview_path(path: &str, workspace_root: Option<&str>) -> Option<String> {
+    let path = agent_file_operation_platform_path(path)?;
     let path = if path.is_absolute() {
         // The root may itself have been written from a POSIX shell with a
         // leading `/` before the drive; normalizing both sides keeps the
@@ -133690,6 +133705,30 @@ mod tests {
         );
         assert_eq!(
             agent_file_operation_preview_path("https://example.com/file.rs", Some("/work/vibex")),
+            None
+        );
+    }
+
+    #[test]
+    fn agent_file_operation_platform_paths_name_the_local_file() {
+        // A local file outside the workspace still yields an absolute platform
+        // path, which is what a Markdown link uses to open it.
+        assert_eq!(
+            agent_file_operation_platform_path("/work/other/private.txt"),
+            Some(std::path::PathBuf::from("/work/other/private.txt"))
+        );
+        assert_eq!(
+            agent_file_operation_platform_path("file:///work/other/private.txt"),
+            Some(std::path::PathBuf::from("/work/other/private.txt"))
+        );
+        // A relative destination stays relative; the workspace resolver owns it.
+        assert_eq!(
+            agent_file_operation_platform_path("crates/core/src/timeline.rs"),
+            Some(std::path::PathBuf::from("crates/core/src/timeline.rs"))
+        );
+        // A non-file scheme names no local file.
+        assert_eq!(
+            agent_file_operation_platform_path("https://example.com/file.rs"),
             None
         );
     }
