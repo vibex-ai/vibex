@@ -8,7 +8,7 @@ pub enum ImError {
     Transport,
     #[error("rate limited, retry after {retry_after_ms}ms")]
     RateLimited { retry_after_ms: u64 },
-    #[error("provider rejected: {code}")]
+    #[error("provider rejected: {code}: {message}")]
     ProviderRejected { code: String, message: String },
     #[error("unsupported by this channel")]
     Unsupported,
@@ -31,3 +31,22 @@ impl ImError {
 }
 
 pub type ImResult<T> = Result<T, ImError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provider_rejection_keeps_the_message_it_was_given() {
+        let error = ImError::ProviderRejected {
+            code: "21001".to_string(),
+            message: "Access denied due to platform policy".to_string(),
+        };
+
+        assert_eq!(
+            error.to_string(),
+            "provider rejected: 21001: Access denied due to platform policy"
+        );
+        assert_eq!(error.code(), "im_provider_rejected");
+    }
+}
