@@ -34689,12 +34689,12 @@ impl VibexWorkbench {
         }) {
             return None;
         }
-        let Some(runtime) = self.runtime.clone() else {
+        if self.runtime.is_none() {
             // Remote-client mode: command discovery is an authority-local
             // capability, so manual slash expansion stays disabled and typed
             // text is submitted verbatim.
             return self.take_composer_message_remote(window, cx);
-        };
+        }
         let session_id = self.view_session_id.clone()?;
         let Some(selection) = self.view_runtime_selection() else {
             self.agent_error = Some("Runtime selection is not ready".into());
@@ -34719,25 +34719,11 @@ impl VibexWorkbench {
             }
         };
         self.sync_composer_command_entry(ComposerTarget::Session, cx);
-        let allow_manual_provider_slash = runtime
-            .agent()
-            .manager()
-            .command_discovery_capabilities(&AgentCommandDiscoverRequest {
-                agent_id: Some(selection.agent_id.clone()),
-                provider_profile_id: selection.provider_profile_id().cloned(),
-                session_id: Some(session_id.clone()),
-                workspace_id: None,
-                trigger: Some(AgentCommandTrigger::Slash),
-                query: None,
-                limit: Some(1),
-            })
-            .map(|capabilities| capabilities.slash_commands)
-            .unwrap_or(false);
-        let command_invocation = resolve_composer_command_invocation(
-            &text,
-            self.composer_command_entry.as_ref(),
-            allow_manual_provider_slash,
-        );
+        // Only a command picked from the Composer menu executes on send; a
+        // leading `/` typed into the draft is prose and reaches the Agent as
+        // the message the reader wrote. See `resolve_composer_command_invocation`.
+        let command_invocation =
+            resolve_composer_command_invocation(&text, self.composer_command_entry.as_ref());
         self.composer_queue_serial = self.composer_queue_serial.saturating_add(1).max(1);
         let mentions = composer_input.read(cx).tokens().to_vec();
         let message = ComposerQueueMessage {
@@ -42443,35 +42429,11 @@ impl VibexWorkbench {
         let mentions = composer_mentions(self.new_session_input.read(cx).tokens());
         let (text, attachments) = self.new_session_draft_payload(cx);
         self.sync_composer_command_entry(ComposerTarget::NewSession, cx);
-        // Manual slash expansion reads the authority's discovery capability.
-        // A paired runtime resolves explicit command selections through the
-        // facade below; an unmatched typed `/…` stays verbatim, matching the
-        // remote composer path.
-        let allow_manual_provider_slash = self
-            .runtime
-            .as_ref()
-            .map(|runtime| {
-                runtime
-                    .agent()
-                    .manager()
-                    .command_discovery_capabilities(&AgentCommandDiscoverRequest {
-                        agent_id: Some(selection.agent_id.clone()),
-                        provider_profile_id: selection.provider_profile_id().cloned(),
-                        session_id: None,
-                        workspace_id: None,
-                        trigger: Some(AgentCommandTrigger::Slash),
-                        query: None,
-                        limit: Some(1),
-                    })
-                    .map(|capabilities| capabilities.slash_commands)
-                    .unwrap_or(false)
-            })
-            .unwrap_or(false);
-        let command_invocation = resolve_composer_command_invocation(
-            &text,
-            self.new_session_command_entry.as_ref(),
-            allow_manual_provider_slash,
-        );
+        // Only a command picked from the Composer menu executes on send. A
+        // typed `/…` that no selection armed stays the reader's own prose and
+        // is sent as an ordinary first message.
+        let command_invocation =
+            resolve_composer_command_invocation(&text, self.new_session_command_entry.as_ref());
         let title = session_title_from_first_message(&text, &attachments);
         let has_initial_message =
             scheduled_at_ms.is_none() && (!text.trim().is_empty() || !attachments.is_empty());
@@ -84345,34 +84307,32 @@ fn command_entry_matches_draft(text: &str, entry: Option<&AgentCommandEntry>) ->
         .is_none_or(|entry_name| entry_name == command_name)
 }
 
+/// The command a draft executes on send, or `None` when the draft is prose.
+///
+/// Only a command the reader picked from the Composer menu executes. Typing
+/// `/name` by hand is not enough: text that merely begins with a slash — a
+/// pasted shell line, a sentence about `/status` — must reach the Agent as the
+/// message the person wrote instead of being sent to the provider as a slash
+/// command it never advertised. `entry` is set by the menu's own selection and
+/// cleared whenever the draft stops matching it, so the reader's intent is the
+/// key, not the leading character.
 fn resolve_composer_command_invocation(
     text: &str,
     entry: Option<&AgentCommandEntry>,
-    allow_manual_provider_slash: bool,
 ) -> Option<ComposerCommandInvocation> {
+    let entry = entry?;
     let (command_name, arguments) = parse_slash_command_invocation(text)?;
-    if let Some(entry) = entry {
-        if !command_entry_matches_draft(text, Some(entry)) {
-            return None;
-        }
-        return Some(ComposerCommandInvocation {
-            command_id: Some(entry.id.clone()),
-            trigger: entry.trigger,
-            source_kind: entry.source_kind,
-            command_text: text.trim().to_string(),
-            command_name: Some(command_name),
-            arguments,
-            prompt_id: entry.prompt_id.clone(),
-        });
+    if !command_entry_matches_draft(text, Some(entry)) {
+        return None;
     }
-    allow_manual_provider_slash.then(|| ComposerCommandInvocation {
-        command_id: None,
-        trigger: AgentCommandTrigger::Slash,
-        source_kind: AgentCommandSourceKind::Provider,
+    Some(ComposerCommandInvocation {
+        command_id: Some(entry.id.clone()),
+        trigger: entry.trigger,
+        source_kind: entry.source_kind,
         command_text: text.trim().to_string(),
         command_name: Some(command_name),
         arguments,
-        prompt_id: None,
+        prompt_id: entry.prompt_id.clone(),
     })
 }
 
@@ -110279,7 +110239,7 @@ mod tests {
             Some("review"),
         );
         let invocation =
-            resolve_composer_command_invocation("/review staged", Some(&prompt), false).unwrap();
+            resolve_composer_command_invocation("/review staged", Some(&prompt)).unwrap();
         assert_eq!(invocation.command_id.as_deref(), Some("command:test"));
         assert_eq!(invocation.source_kind, AgentCommandSourceKind::Prompt);
         assert_eq!(invocation.arguments.as_deref(), Some("staged"));
@@ -110291,16 +110251,16 @@ mod tests {
             AgentCommandTrigger::Mention,
             None,
         );
-        assert!(resolve_composer_command_invocation("/review", Some(&reference), true).is_none());
+        assert!(resolve_composer_command_invocation("/review", Some(&reference)).is_none());
     }
 
+    /// Prose that merely begins with `/` is never executed as a provider slash
+    /// command: without a menu selection the draft reaches the Agent as a
+    /// message, so an unrecognized `/name` cannot fail a send.
     #[test]
-    fn manual_slash_execution_requires_provider_capability() {
-        assert!(resolve_composer_command_invocation("/review", None, false).is_none());
-        let invocation = resolve_composer_command_invocation("/review", None, true).unwrap();
-        assert_eq!(invocation.command_id, None);
-        assert_eq!(invocation.source_kind, AgentCommandSourceKind::Provider);
-        assert_eq!(invocation.command_name.as_deref(), Some("review"));
+    fn typed_slash_text_stays_prose_without_a_menu_selection() {
+        assert!(resolve_composer_command_invocation("/status 下方是什么", None).is_none());
+        assert!(resolve_composer_command_invocation("/review", None).is_none());
     }
 
     fn new_session_runtime_option(agent: &str, label: &str) -> SessionRuntimeOption {
