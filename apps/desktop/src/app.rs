@@ -97364,17 +97364,30 @@ impl FoundationSettings {
                 .map(|row| Self::connection_row(row, stacked, settings.clone(), cx))
                 .collect()
         };
-        let leading = h_flex()
-            .w_full()
-            .items_center()
-            .justify_end()
-            .gap_2()
-            .flex_wrap()
-            .child(bootstrap_button)
-            .child(wsl_button)
-            .child(add_button)
-            .child(pairing_button)
-            .into_any_element();
+        // The empty state already carries the three add flows, so the strip
+        // above the panel would repeat them. Bootstrap is the one action that
+        // belongs to the page itself, and it keeps the right edge whether or
+        // not there are rows to show.
+        let leading = if rows.is_empty() {
+            h_flex()
+                .w_full()
+                .items_center()
+                .justify_end()
+                .child(bootstrap_button)
+                .into_any_element()
+        } else {
+            h_flex()
+                .w_full()
+                .items_center()
+                .justify_end()
+                .gap_2()
+                .flex_wrap()
+                .child(bootstrap_button)
+                .child(wsl_button)
+                .child(add_button)
+                .child(pairing_button)
+                .into_any_element()
+        };
         // A failure that outlives its dialog is a light hint, not a strip on the
         // page: Settings is itself a dialog, so a notice painted here competes
         // with the controls under it and cannot be closed. The workbench's hint
@@ -127116,6 +127129,46 @@ mod tests {
         assert!(page.contains("open_connections_add_dialog"));
         assert!(page.contains("open_connections_bootstrap_dialog"));
         assert!(page.contains("open_connections_wsl_dialog"));
+        // Bootstrap is the page's own action and keeps the right edge even
+        // with no rows; the empty state owns the three add flows, so the strip
+        // above the panel must not repeat them there.
+        assert!(page.contains("let leading = if rows.is_empty()"));
+        let leading = page
+            .split_once("let leading = if rows.is_empty()")
+            .and_then(|(_, tail)| tail.split_once("// A failure that outlives its dialog"))
+            .map(|(body, _)| body)
+            .expect("the leading strip should remain inspectable");
+        let (empty_leading, populated_leading) = leading
+            .split_once("} else {")
+            .expect("the leading strip should branch on the empty list");
+        assert!(
+            empty_leading.contains("justify_end()") && empty_leading.contains("bootstrap_button"),
+            "the empty state keeps Bootstrap at the right edge"
+        );
+        for duplicate in [
+            "pairing_button",
+            "add_button",
+            "wsl_button",
+            "connections-add\"",
+            "connections-add-wsl",
+            "connections-pair\"",
+        ] {
+            assert!(
+                !empty_leading.contains(duplicate),
+                "{duplicate} is already in the empty state and must not be repeated"
+            );
+        }
+        for kept in [
+            "bootstrap_button",
+            "wsl_button",
+            "add_button",
+            "pairing_button",
+        ] {
+            assert!(
+                populated_leading.contains(kept),
+                "a populated list keeps {kept} in the strip"
+            );
+        }
 
         let row = source
             .split_once("    fn connection_row(")
