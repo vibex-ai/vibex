@@ -14,6 +14,7 @@ const VIBEX_SECRET_SERVICE: &str = "dev.vibex.provider-secrets";
 #[cfg(all(not(test), feature = "os-keychain"))]
 const VIBEX_IM_SECRET_SERVICE: &str = "dev.vibex.im-secrets";
 
+#[cfg(not(test))]
 const IM_HOST_SECRET_FILE: &str = "im-secrets.json";
 
 /// Host-side secret file used when no usable OS keychain exists.
@@ -689,16 +690,23 @@ fn im_keyring_entry(lookup_key: &str) -> VibexResult<keyring::Entry> {
     })
 }
 
+/// The IM host-file backend, reached only from the `not(test)` branches of
+/// [`resolve_im_secret`], [`store_im_secret`], and [`delete_im_secret`]: the
+/// tests answer from the in-memory store instead, so without this gate the
+/// cluster reads as dead code in a test build.
+#[cfg(not(test))]
 fn im_host_secret_path(root: &Path) -> PathBuf {
     root.join(IM_HOST_SECRET_FILE)
 }
 
+#[cfg(not(test))]
 fn store_im_host_file_secret(root: &Path, lookup_key: &str, secret: &str) -> VibexResult<()> {
     let mut secrets = read_im_host_secret_file(root)?;
     secrets.insert(lookup_key.to_string(), secret.to_string());
     write_im_host_secret_file(root, &secrets)
 }
 
+#[cfg(not(test))]
 fn load_im_host_file_secret(root: &Path, lookup_key: &str) -> VibexResult<Option<String>> {
     Ok(read_im_host_secret_file(root)?
         .get(lookup_key)
@@ -706,6 +714,7 @@ fn load_im_host_file_secret(root: &Path, lookup_key: &str) -> VibexResult<Option
         .filter(|secret| !secret.is_empty()))
 }
 
+#[cfg(not(test))]
 fn delete_im_host_file_secret(root: &Path, lookup_key: &str) -> VibexResult<()> {
     let mut secrets = read_im_host_secret_file(root)?;
     if secrets.remove(lookup_key).is_none() {
@@ -714,6 +723,7 @@ fn delete_im_host_file_secret(root: &Path, lookup_key: &str) -> VibexResult<()> 
     write_im_host_secret_file(root, &secrets)
 }
 
+#[cfg(not(test))]
 fn read_im_host_secret_file(root: &Path) -> VibexResult<BTreeMap<String, String>> {
     let path = im_host_secret_path(root);
     let bytes = match std::fs::read(&path) {
@@ -735,6 +745,7 @@ fn read_im_host_secret_file(root: &Path) -> VibexResult<BTreeMap<String, String>
     })
 }
 
+#[cfg(not(test))]
 fn write_im_host_secret_file(root: &Path, secrets: &BTreeMap<String, String>) -> VibexResult<()> {
     std::fs::create_dir_all(root)
         .map_err(|error| im_host_secret_file_error("create", root, &error))?;
@@ -769,6 +780,7 @@ fn write_im_host_secret_file(root: &Path, secrets: &BTreeMap<String, String>) ->
     Ok(())
 }
 
+#[cfg(not(test))]
 fn im_host_secret_file_error(
     action: &'static str,
     path: &Path,
