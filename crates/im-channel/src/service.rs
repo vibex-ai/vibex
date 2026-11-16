@@ -1570,7 +1570,7 @@ impl ImChannelService {
                     &payload.value,
                 )
                 .await?;
-            self.reply_with(event, runtime, &status, OutboundPriority::BestEffort)
+            self.reply_card_with(event, runtime, &status, OutboundPriority::BestEffort)
                 .await?;
             return Ok(());
         }
@@ -1667,7 +1667,7 @@ impl ImChannelService {
                 action.card_id.as_deref(),
             )
             .await?;
-        self.reply_with(event, runtime, &status, OutboundPriority::BestEffort)
+        self.reply_card_with(event, runtime, &status, OutboundPriority::BestEffort)
             .await?;
         Ok(())
     }
@@ -1690,7 +1690,7 @@ impl ImChannelService {
             }
             "/whoami" => {
                 let role = role_label(principal.role, locale);
-                self.reply(
+                self.reply_card(
                     event,
                     runtime,
                     &render::identity(
@@ -2311,7 +2311,7 @@ impl ImChannelService {
                 action_card.as_deref(),
             )
             .await?;
-        self.reply_with(event, runtime, &status, OutboundPriority::BestEffort)
+        self.reply_card_with(event, runtime, &status, OutboundPriority::BestEffort)
             .await?;
         Ok(())
     }
@@ -2685,6 +2685,47 @@ impl ImChannelService {
         text: &str,
         priority: OutboundPriority,
     ) -> VibexResult<()> {
+        self.reply_rendered(event, runtime, text, false, priority)
+            .await
+    }
+
+    /// Sends one of the channel's own cards.
+    ///
+    /// A card is authored Markdown — bold labels, a table, a code span — so a
+    /// transport that renders it gets the markup. Text that is not the
+    /// channel's own (an error, a provider message) goes through [`Self::reply`]
+    /// instead, where stray punctuation cannot restyle anything.
+    async fn reply_card(
+        &self,
+        event: &ImInboundEvent,
+        runtime: &ChannelRuntime,
+        text: &str,
+    ) -> VibexResult<()> {
+        self.reply_card_with(event, runtime, text, OutboundPriority::Normal)
+            .await
+    }
+
+    async fn reply_card_with(
+        &self,
+        event: &ImInboundEvent,
+        runtime: &ChannelRuntime,
+        text: &str,
+        priority: OutboundPriority,
+    ) -> VibexResult<()> {
+        // A card is Markdown for every transport: the adapter decides whether
+        // that becomes HTML or the same text with its markup stripped.
+        self.reply_rendered(event, runtime, text, true, priority)
+            .await
+    }
+
+    async fn reply_rendered(
+        &self,
+        event: &ImInboundEvent,
+        runtime: &ChannelRuntime,
+        text: &str,
+        markdown: bool,
+        priority: OutboundPriority,
+    ) -> VibexResult<()> {
         let target = ImTarget {
             chat_id: event.external_chat_id.clone(),
             thread_key: event.thread_key.clone(),
@@ -2692,7 +2733,7 @@ impl ImChannelService {
         let message_id = self.record_outbound_reply(event, text);
         let result = runtime
             .outbox
-            .send(target, text.to_string(), Vec::new(), false, priority)
+            .send(target, text.to_string(), Vec::new(), markdown, priority)
             .await;
         self.finish_outbound(&message_id, &result);
         result.map_err(im_error_to_vibex)?;

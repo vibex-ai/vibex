@@ -1259,6 +1259,19 @@ async fn telegram_pairing_commands_and_approval_round_trip() {
         Some("👍")
     );
 
+    // The status card is authored Markdown, so Telegram gets HTML: a card that
+    // leaked its `**` would mean the rendering path was bypassed.
+    assert!(
+        fake.sent_texts()
+            .iter()
+            .any(|text| text.contains("<b>") && text.contains("<pre>")),
+        "the status card arrives rendered"
+    );
+    assert!(
+        !fake.sent_texts().iter().any(|text| text.contains("**")),
+        "no card leaks raw Markdown"
+    );
+
     // A streamed turn: the live message the turn already owns is edited as
     // deltas arrive, and the final answer lands in that same message rendered
     // as HTML instead of being sent again.

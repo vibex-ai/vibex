@@ -87,6 +87,46 @@ pub fn to_telegram_html(markdown: &str) -> String {
     out.trim_end_matches('\n').to_string()
 }
 
+/// Renders Markdown as the plain text a transport without rich text can show.
+///
+/// It is the same conversion the HTML path uses, with the tags dropped: a chat
+/// that cannot render bold should read `会话` rather than `**会话**`. Code and
+/// table blocks keep their lines, which is what makes a status table readable.
+pub fn to_plain_text(markdown: &str) -> String {
+    let html = to_telegram_html(markdown);
+    let mut out = String::with_capacity(html.len());
+    let mut in_tag = false;
+    let mut characters = html.chars().peekable();
+    while let Some(character) = characters.next() {
+        match character {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            '&' => {
+                let rest: String = characters.clone().take(4).collect();
+                let replacement = if rest.starts_with("amp;") {
+                    characters.nth(3);
+                    Some('&')
+                } else if rest.starts_with("lt;") {
+                    characters.nth(2);
+                    Some('<')
+                } else if rest.starts_with("gt;") {
+                    characters.nth(2);
+                    Some('>')
+                } else {
+                    None
+                };
+                match replacement {
+                    Some(character) => out.push(character),
+                    None => out.push('&'),
+                }
+            }
+            _ if !in_tag => out.push(character),
+            _ => {}
+        }
+    }
+    out
+}
+
 /// Escapes the three characters that would otherwise start an HTML entity.
 pub fn escape_html(text: &str) -> String {
     let mut escaped = String::with_capacity(text.len());
@@ -175,6 +215,14 @@ fn render_inline(input: &str, depth: usize) -> String {
     let mut index = 0;
     while index < bytes.len() {
         let rest = &input[index..];
+        // A backslash takes the next character literally, which is how a value
+        // the channel did not write (a title, a model name) is kept from being
+        // read as markup.
+        if let Some(character) = rest.strip_prefix('\\').and_then(|rest| rest.chars().next()) {
+            out.push(character);
+            index += 1 + character.len_utf8();
+            continue;
+        }
         if rest.starts_with('`')
             && let Some(rendered) = code_span(rest)
         {
@@ -406,6 +454,20 @@ mod tests {
     fn an_unclosed_fence_does_not_swallow_the_formatting_after_it() {
         let html = to_telegram_html("```\nstill code");
         assert!(html.starts_with("<pre>"), "{html}");
+    }
+
+    #[test]
+    fn plain_text_drops_the_markup_and_keeps_the_text() {
+        assert_eq!(to_plain_text("**bold** and *italic*"), "bold and italic");
+        assert_eq!(to_plain_text("a < b & c"), "a < b & c");
+        let table = to_plain_text("```\n会话  #22d494a1\n状态  空闲\n```");
+        assert_eq!(table, "会话  #22d494a1\n状态  空闲");
+    }
+
+    #[test]
+    fn a_backslash_keeps_the_next_character_literal() {
+        assert_eq!(to_telegram_html("a \\*literal\\* star"), "a *literal* star");
+        assert_eq!(to_telegram_html("\\`not code\\`"), "`not code`");
     }
 
     #[test]

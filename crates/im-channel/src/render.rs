@@ -2,6 +2,50 @@ use vibex_core::{AgentSession, PermissionRequest};
 
 use crate::i18n::ImLocale;
 
+/// Keeps a value the channel did not write from being read as markup.
+///
+/// A session title or a model id can contain `*`, `_` or a backtick; without
+/// this, authoring a card in Markdown would let that text restyle the card.
+pub fn escape_markdown(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for character in text.chars() {
+        if matches!(character, '\\' | '*' | '_' | '`' | '~' | '[') {
+            escaped.push('\\');
+        }
+        escaped.push(character);
+    }
+    escaped
+}
+
+/// A rough screen width: a CJK character or an emoji is about two cells.
+pub fn display_width(text: &str) -> usize {
+    text.chars()
+        .map(|character| if character as u32 >= 0x1100 { 2 } else { 1 })
+        .sum()
+}
+
+/// An aligned two-column block, shown in the transport's monospace frame.
+///
+/// Telegram has no table markup, so a table is a code fence whose key column is
+/// padded by display width. Values are escaped: a table cell is data, never
+/// markup.
+pub fn table(rows: &[(&str, String)]) -> String {
+    let width = rows
+        .iter()
+        .map(|(key, _)| display_width(key))
+        .max()
+        .unwrap_or(0);
+    let mut text = String::from("```");
+    for (key, value) in rows {
+        text.push('\n');
+        text.push_str(key);
+        text.push_str(&" ".repeat(width.saturating_sub(display_width(key)) + 2));
+        text.push_str(&escape_markdown(value));
+    }
+    text.push_str("\n```");
+    text
+}
+
 /// The most characters one chat message carries.
 ///
 /// Telegram's hard limit is 4096 UTF-16 code units; 3800 leaves room for the
@@ -91,23 +135,23 @@ pub fn error_message(code: &str, message: &str, locale: ImLocale) -> String {
 /// The one-line answer to `/help`, with the full list behind a button.
 pub fn help_short(locale: ImLocale) -> String {
     match locale {
-        ImLocale::En => "Vibex\n\
-             /status session · /sessions switch\n\
-             /new <text> start a session\n\
-             /model /provider /effort /mode /agent tune it\n\
-             Type / for every command"
+        ImLocale::En => "**Vibex**\n\n\
+             **Session**  /status  /sessions  /new\n\
+             **Runtime**  /agent  /provider  /model  /effort  /mode\n\
+             **Approval**  /approve  /always  /deny\n\
+             **Other**  /stop  /whoami  /help commands"
             .to_string(),
-        ImLocale::ZhCn => "Vibex\n\
-             /status 会话 · /sessions 切换\n\
-             /new <内容> 新建会话\n\
-             /model /provider /effort /mode /agent 调整\n\
-             输入 / 查看全部命令"
+        ImLocale::ZhCn => "**Vibex**\n\n\
+             **会话**  /status  /sessions  /new\n\
+             **运行参数**  /agent  /provider  /model  /effort  /mode\n\
+             **审批**  /approve  /always  /deny\n\
+             **其他**  /stop  /whoami  /help commands"
             .to_string(),
-        ImLocale::ZhTw => "Vibex\n\
-             /status 工作階段 · /sessions 切換\n\
-             /new <內容> 建立工作階段\n\
-             /model /provider /effort /mode /agent 調整\n\
-             輸入 / 查看全部指令"
+        ImLocale::ZhTw => "**Vibex**\n\n\
+             **工作階段**  /status  /sessions  /new\n\
+             **執行參數**  /agent  /provider  /model  /effort  /mode\n\
+             **審批**  /approve  /always  /deny\n\
+             **其他**  /stop  /whoami  /help commands"
             .to_string(),
     }
 }
@@ -287,7 +331,7 @@ pub fn session_list(sessions: &[AgentSession], locale: ImLocale) -> String {
         let title = if session.title.trim().is_empty() {
             locale.text("Untitled", "未命名", "未命名").to_string()
         } else {
-            truncate(session.title.trim(), 48)
+            escape_markdown(&truncate(session.title.trim(), 48))
         };
         text.push_str(&format!(
             "\n{}. {} · {title} · {}",
@@ -432,31 +476,12 @@ fn mode_label(locale: ImLocale) -> &'static str {
     }
 }
 
-/// The selection in force, one line, for a picker card or `/status`.
-pub fn runtime_summary(options: &vibex_core::ImRuntimeOptions) -> String {
-    format!("{} · {}", options.agent_label, options.model_label)
-}
-
-/// The tuning that differs from a model default, or nothing when it does not.
-///
-/// A card that always prints `effort default · mode default` buries the one
-/// value the reader came to change, so only real choices are shown.
-pub fn runtime_tuning(locale: ImLocale, options: &vibex_core::ImRuntimeOptions) -> Option<String> {
-    let mut parts = Vec::new();
-    if let Some(effort) = options.effort_label.as_deref() {
-        parts.push(format!("{} {effort}", effort_label(locale)));
-    }
-    if let Some(mode) = options.mode_label.as_deref() {
-        parts.push(format!("{} {mode}", mode_label(locale)));
-    }
-    (!parts.is_empty()).then(|| parts.join(" · "))
-}
-
 /// A picker card: what is being chosen, what it is now, and what happens next.
 pub fn picker(locale: ImLocale, title: &str, current: &str) -> String {
     format!(
-        "{title}\n{} {current}\n{}",
+        "**{title}**\n{} **{}**\n_{}_",
         locale.text("Now", "当前", "目前"),
+        escape_markdown(current),
         locale.text(
             "Tap a value; it applies to the next turn.",
             "点选后下一轮生效。",
@@ -467,16 +492,60 @@ pub fn picker(locale: ImLocale, title: &str, current: &str) -> String {
 
 /// Confirms one setting and shows the selection it left behind.
 pub fn runtime_applied(field: &str, value: &str, selection: &str) -> String {
-    format!("✅ {field} · {value}\n{}", truncate(selection, 200))
+    format!(
+        "✅ **{}** → **{}**\n{}",
+        escape_markdown(field),
+        escape_markdown(value),
+        escape_markdown(selection)
+    )
 }
 
 /// Who is speaking, and in which channel.
 pub fn identity(locale: ImLocale, name: &str, role: &str, channel_id: &str) -> String {
     format!(
-        "{name} · {role}\n{} {}",
+        "**{}** · {role}\n{} `{}`",
+        escape_markdown(name),
         locale.text("Channel", "频道", "頻道"),
         short_channel_id(channel_id)
     )
+}
+
+/// The rows a status card shows, in order.
+///
+/// Only the tuning that differs from a model default earns a row: a card that
+/// always prints `Effort default · Mode default` buries the one line the reader
+/// came for. A pending approval earns a row only when something is waiting.
+pub fn status_rows(
+    locale: ImLocale,
+    state: &str,
+    role: &str,
+    runtime: Option<&vibex_core::ImRuntimeOptions>,
+    pending: usize,
+) -> Vec<(&'static str, String)> {
+    let mut rows: Vec<(&'static str, String)> = vec![
+        (locale.text("State", "状态", "狀態"), state.to_string()),
+        (locale.text("Role", "角色", "角色"), role.to_string()),
+    ];
+    if let Some(runtime) = runtime {
+        rows.push(("Agent", runtime.agent_label.clone()));
+        rows.push((
+            locale.text("Model", "模型", "模型"),
+            runtime.model_label.clone(),
+        ));
+        if let Some(effort) = runtime.effort_label.as_deref() {
+            rows.push((locale.text("Effort", "思考", "思考"), effort.to_string()));
+        }
+        if let Some(mode) = runtime.mode_label.as_deref() {
+            rows.push((locale.text("Mode", "模式", "模式"), mode.to_string()));
+        }
+    }
+    if pending > 0 {
+        rows.push((
+            locale.text("Pending", "待审批", "待審批"),
+            pending.to_string(),
+        ));
+    }
+    rows
 }
 
 /// The session card: what it is, what it runs, and anything waiting on a human.
@@ -490,25 +559,15 @@ pub fn status_card(
     let title = if session.title.trim().is_empty() {
         locale.text("Untitled", "未命名", "未命名").to_string()
     } else {
-        truncate(session.title.trim(), 64)
+        session.title.trim().to_string()
     };
-    let mut lines = vec![
-        format!("#{} · {title}", short_session_id(session)),
-        format!("{} · {role}", state_label(session, locale)),
-    ];
-    if let Some(runtime) = runtime {
-        lines.push(runtime_summary(runtime));
-        if let Some(tuning) = runtime_tuning(locale, runtime) {
-            lines.push(tuning);
-        }
-    }
-    if pending > 0 {
-        lines.push(format!(
-            "{} {pending}",
-            locale.text("Pending", "待审批", "待審批")
-        ));
-    }
-    lines.join("\n")
+    let rows = status_rows(locale, state_label(session, locale), role, runtime, pending);
+    format!(
+        "**#{} · {}**\n{}",
+        short_session_id(session),
+        escape_markdown(&truncate(&title, 64)),
+        table(&rows)
+    )
 }
 
 /// The word a resolved approval is reported with.
@@ -541,6 +600,11 @@ pub fn short_channel_id(channel_id: &str) -> String {
 }
 
 /// A one-line summary of a selection that has just been applied.
+/// The selection in force, one line, for a confirmation.
+///
+/// Only what was chosen is spelled out: a default effort and mode are left off,
+/// because a line that always prints them buries the value the reader came to
+/// change.
 pub fn selection_line(locale: ImLocale, selection: &vibex_core::SessionRuntimeSelection) -> String {
     let mut parts = vec![
         selection.agent_id.as_str().to_string(),
@@ -632,25 +696,47 @@ mod tests {
 
     #[test]
     fn a_status_card_shows_only_the_tuning_that_was_chosen() {
-        assert_eq!(
-            runtime_tuning(ImLocale::En, &options_with(None, None)),
-            None,
-            "a default effort and mode are not worth a line"
+        let defaults = status_rows(
+            ImLocale::En,
+            "idle",
+            "operator",
+            Some(&options_with(None, None)),
+            0,
         );
-        assert_eq!(
-            runtime_tuning(ImLocale::En, &options_with(Some("max"), None)).as_deref(),
-            Some("effort max")
+        assert!(
+            !defaults
+                .iter()
+                .any(|(key, _)| *key == "Effort" || *key == "Mode"),
+            "a default effort and mode are not worth a row: {defaults:?}"
         );
-        assert_eq!(
-            runtime_tuning(ImLocale::En, &options_with(Some("max"), Some("read-only"))).as_deref(),
-            Some("effort max · mode read-only")
+        let tuned = status_rows(
+            ImLocale::En,
+            "idle",
+            "operator",
+            Some(&options_with(Some("max"), Some("read-only"))),
+            0,
         );
+        assert!(tuned.contains(&("Effort", "max".to_string())));
+        assert!(tuned.contains(&("Mode", "read-only".to_string())));
+        let waiting = status_rows(ImLocale::ZhCn, "空闲", "操作", None, 2);
+        assert!(waiting.contains(&("待审批", "2".to_string())));
+    }
+
+    #[test]
+    fn a_table_pads_its_key_column_and_escapes_its_values() {
+        let rendered = table(&[("状态", "空闲".to_string()), ("Agent", "*x*".to_string())]);
+        assert!(rendered.starts_with("```\n"), "{rendered}");
+        assert!(rendered.contains("状态   空闲"), "{rendered}");
+        assert!(rendered.contains("Agent  \\*x\\*"), "{rendered}");
     }
 
     #[test]
     fn a_picker_names_the_field_and_its_current_value() {
         let card = picker(ImLocale::ZhCn, "模型", "loomy/DeepSeek");
-        assert_eq!(card, "模型\n当前 loomy/DeepSeek\n点选后下一轮生效。");
+        assert_eq!(
+            card,
+            "**模型**\n当前 **loomy/DeepSeek**\n_点选后下一轮生效。_"
+        );
     }
 
     #[test]
@@ -661,7 +747,7 @@ mod tests {
             "操作",
             "imchannel_817f9b1fdb164ee5a60474330e802b85",
         );
-        assert_eq!(card, "p · 操作\n频道 imchannel_817f9b1f");
+        assert_eq!(card, "**p** · 操作\n频道 `imchannel_817f9b1f`");
     }
 
     #[test]

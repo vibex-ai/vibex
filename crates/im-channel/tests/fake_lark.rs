@@ -101,24 +101,33 @@ impl FakeLark {
     }
 
     /// The value a card button sends back when pressed.
-    fn first_card_action(&self) -> Option<String> {
-        self.sent.lock().expect("sent").iter().find_map(|body| {
-            let content = body.get("content").and_then(Value::as_str)?;
-            let content: Value = serde_json::from_str(content).ok()?;
-            content
-                .get("elements")?
-                .as_array()?
-                .iter()
-                .find_map(|element| {
-                    element
-                        .get("actions")?
-                        .as_array()?
-                        .first()?
-                        .pointer("/value/vibex_action")
-                        .and_then(Value::as_str)
-                        .map(str::to_string)
-                })
-        })
+    /// The action of the newest interactive card, which is the one just sent.
+    ///
+    /// Finding the first card instead would pick up any earlier card with a
+    /// button — a command card, say — rather than the approval just posted.
+    fn latest_card_action(&self) -> Option<String> {
+        self.sent
+            .lock()
+            .expect("sent")
+            .iter()
+            .rev()
+            .find_map(|body| {
+                let content = body.get("content").and_then(Value::as_str)?;
+                let content: Value = serde_json::from_str(content).ok()?;
+                content
+                    .get("elements")?
+                    .as_array()?
+                    .iter()
+                    .find_map(|element| {
+                        element
+                            .get("actions")?
+                            .as_array()?
+                            .first()?
+                            .pointer("/value/vibex_action")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    })
+            })
     }
 }
 
@@ -624,6 +633,23 @@ async fn lark_long_connection_round_trip() {
         Some("hello vibex")
     );
 
+    // A card authored in Markdown is flattened for a transport that cannot
+    // render it, instead of being shown with its markup.
+    fake.push(message_event("evt-help", "om_help", "p2p", "/help"));
+    wait_for(
+        || async {
+            fake.sent_texts()
+                .iter()
+                .any(|text| text.contains("Vibex") && !text.contains("**"))
+        },
+        "flattened help card",
+    )
+    .await;
+    assert!(
+        !fake.sent_texts().iter().any(|text| text.contains("**")),
+        "no card reaches a plain-text transport with its markup intact"
+    );
+
     // An image message is one prompt carrying one downloaded file.
     fake.push(json!({
         "header": { "event_type": "im.message.receive_v1", "event_id": "evt-image" },
@@ -721,7 +747,7 @@ async fn lark_long_connection_round_trip() {
         "approval card",
     )
     .await;
-    let approved_by_button = fake.first_card_action().expect("card action");
+    let approved_by_button = fake.latest_card_action().expect("card action");
     assert!(
         fake.sent
             .lock()

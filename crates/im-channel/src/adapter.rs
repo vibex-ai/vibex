@@ -33,16 +33,17 @@ pub trait ImAdapter: Send + Sync + 'static {
 
     /// Sends Markdown, letting the transport render it.
     ///
-    /// The default treats it as plain text: a transport without rich text
-    /// support says so by sending the Markdown verbatim rather than by dropping
-    /// the answer.
+    /// A transport without rich text gets the same text with the markup
+    /// stripped: showing `**bold**` to a reader who cannot see bold is worse
+    /// than showing `bold`.
     async fn send_markdown(
         &self,
         target: &ImTarget,
         markdown: &str,
         buttons: &[ImButton],
     ) -> ImResult<ImSentMessage> {
-        self.send_text(target, markdown, buttons).await
+        let plain = crate::markdown::to_plain_text(markdown);
+        self.send_text(target, &plain, buttons).await
     }
 
     /// Replaces a message with rendered Markdown.
@@ -53,7 +54,8 @@ pub trait ImAdapter: Send + Sync + 'static {
         markdown: &str,
         buttons: &[ImButton],
     ) -> ImResult<()> {
-        self.edit_text(target, message_id, markdown, buttons).await
+        let plain = crate::markdown::to_plain_text(markdown);
+        self.edit_text(target, message_id, &plain, buttons).await
     }
 
     /// Shows a chat action while a turn runs. A transport that has none does

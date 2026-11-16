@@ -156,7 +156,7 @@ impl ImChannelService {
                 target,
                 text.to_string(),
                 buttons,
-                false,
+                true,
                 OutboundPriority::Normal,
             )
             .await;
@@ -173,12 +173,12 @@ impl ImChannelService {
     ) -> VibexResult<()> {
         let locale = self.locale(event);
         if full {
-            return self.reply(event, runtime, &render::help(locale)).await;
+            return self.reply_card(event, runtime, &render::help(locale)).await;
         }
         let conn = self.open()?;
         let Some(binding) = self.binding_for(&conn, event)? else {
             return self
-                .reply(event, runtime, &render::help_short(locale))
+                .reply_card(event, runtime, &render::help_short(locale))
                 .await;
         };
         let button = self.mint_action(&conn, &binding, ACTION_MENU_HELP, "{}")?;
@@ -234,11 +234,11 @@ impl ImChannelService {
         // still see what is there, it just has no card to mint buttons under.
         let Some(binding) = self.binding_for(&conn, event)? else {
             let text = format!("{list}\n{}", render::session_use_hint(locale));
-            self.reply(event, runtime, &text).await?;
+            self.reply_card(event, runtime, &text).await?;
             return Ok(());
         };
         if sessions.is_empty() {
-            self.reply(event, runtime, &list).await?;
+            self.reply_card(event, runtime, &list).await?;
             return Ok(());
         }
         let mut buttons = Vec::new();
@@ -549,7 +549,8 @@ impl ImChannelService {
                 self.reply(event, runtime, already).await?;
                 return Ok(true);
             }
-            self.reply(event, runtime, &render::help(locale)).await?;
+            self.reply_card(event, runtime, &render::help(locale))
+                .await?;
             return Ok(true);
         }
         if kind == ACTION_MENU_SESSIONS {
@@ -686,7 +687,7 @@ impl ImChannelService {
             {
                 Ok((value, selection)) => {
                     let text = render::runtime_applied(field.label(locale), &value, &selection);
-                    self.reply(event, runtime, &text).await?;
+                    self.reply_card(event, runtime, &text).await?;
                 }
                 Err(error) => {
                     let command = field.action_kind().trim_start_matches("runtime:");
