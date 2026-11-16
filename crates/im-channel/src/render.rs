@@ -121,6 +121,7 @@ pub fn command_specs(locale: ImLocale) -> Vec<crate::types::ImCommandSpec> {
             ("use", "Bind a session by number or id"),
             ("new", "Start a session and send the first prompt"),
             ("model", "Choose the model"),
+            ("provider", "Choose the provider"),
             ("effort", "Choose the reasoning effort"),
             ("mode", "Choose the Agent mode"),
             ("agent", "Switch the Agent"),
@@ -140,6 +141,7 @@ pub fn command_specs(locale: ImLocale) -> Vec<crate::types::ImCommandSpec> {
             ("use", "按序号或 ID 绑定会话"),
             ("new", "新建会话并发送第一条内容"),
             ("model", "选择模型"),
+            ("provider", "选择供应商"),
             ("effort", "选择思考强度"),
             ("mode", "选择 Agent 模式"),
             ("agent", "切换 Agent"),
@@ -159,6 +161,7 @@ pub fn command_specs(locale: ImLocale) -> Vec<crate::types::ImCommandSpec> {
             ("use", "按序號或 ID 綁定工作階段"),
             ("new", "建立工作階段並傳送第一則內容"),
             ("model", "選擇模型"),
+            ("provider", "選擇供應商"),
             ("effort", "選擇思考強度"),
             ("mode", "選擇 Agent 模式"),
             ("agent", "切換 Agent"),
@@ -223,6 +226,7 @@ pub fn help(locale: ImLocale, prefix: &str) -> String {
              /sessions    recent sessions\n\
              /use <n|id>  bind a session\n\
              /model [id]  choose the model\n\
+             /provider [id] choose the provider\n\
              /effort [v]  choose the reasoning effort\n\
              /mode [id]   choose the Agent mode\n\
              /agent       switch the Agent\n\
@@ -243,6 +247,7 @@ pub fn help(locale: ImLocale, prefix: &str) -> String {
              /sessions    最近会话\n\
              /use <序号|ID> 绑定会话\n\
              /model [ID]  选择模型\n\
+             /provider [ID] 选择供应商\n\
              /effort [值] 选择思考强度\n\
              /mode [ID]   选择 Agent 模式\n\
              /agent       切换 Agent\n\
@@ -263,6 +268,7 @@ pub fn help(locale: ImLocale, prefix: &str) -> String {
              /sessions    最近工作階段\n\
              /use <序號|ID> 綁定工作階段\n\
              /model [ID]  選擇模型\n\
+             /provider [ID] 選擇供應商\n\
              /effort [值] 選擇思考強度\n\
              /mode [ID]   選擇 Agent 模式\n\
              /agent       切換 Agent\n\

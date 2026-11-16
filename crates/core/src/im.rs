@@ -565,22 +565,31 @@ pub struct ImRuntimeChoice {
     pub current: bool,
 }
 
-/// One pickable Agent, already paired with the source and model it would use.
+/// One pickable Agent.
 ///
-/// Switching Agent is not a matter of one id: the source the credentials live
-/// under and a model that Agent advertises are part of the same decision, so
-/// the choices are whole selections rather than a bare list of Agent ids.
+/// The source and model that come with it are a starting point, not part of
+/// what the button asks: `/agent` switches Agent, and `/provider` and `/model`
+/// adjust the rest.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ImRuntimeAgentChoice {
     pub agent_id: AgentId,
     pub auth_source: RuntimeAuthSource,
     pub model: RuntimeModelSelection,
-    /// The Agent's own name, without the source.
+    /// The Agent's own name.
     pub agent_label: String,
-    /// The credential source, which is what tells two entries of the same
-    /// Agent apart.
-    pub source_label: String,
+    #[serde(default)]
+    pub current: bool,
+}
+
+/// One credential source the current Agent can run under.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImRuntimeProviderChoice {
+    pub auth_source: RuntimeAuthSource,
+    /// The model this source would start from.
+    pub model: RuntimeModelSelection,
+    pub label: String,
     #[serde(default)]
     pub current: bool,
 }
@@ -601,6 +610,8 @@ pub struct ImRuntimeOptions {
     pub mode_label: Option<String>,
     #[serde(default)]
     pub agents: Vec<ImRuntimeAgentChoice>,
+    #[serde(default)]
+    pub providers: Vec<ImRuntimeProviderChoice>,
     #[serde(default)]
     pub models: Vec<ImRuntimeChoice>,
     #[serde(default)]

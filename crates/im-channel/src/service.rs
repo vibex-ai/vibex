@@ -1572,6 +1572,16 @@ impl ImChannelService {
                 )
                 .await?
             }
+            "/provider" => {
+                self.handle_runtime_command(
+                    event,
+                    runtime,
+                    principal,
+                    commands::RuntimeField::Provider,
+                    args,
+                )
+                .await?
+            }
             "/mode" => {
                 self.handle_runtime_command(
                     event,
@@ -1681,6 +1691,14 @@ impl ImChannelService {
                         ImLocale::En => "Model",
                         ImLocale::ZhCn => "模型",
                         ImLocale::ZhTw => "模型",
+                    },
+                ),
+                (
+                    commands::ACTION_MENU_PROVIDER,
+                    match locale {
+                        ImLocale::En => "Provider",
+                        ImLocale::ZhCn => "供应商",
+                        ImLocale::ZhTw => "供應商",
                     },
                 ),
                 (

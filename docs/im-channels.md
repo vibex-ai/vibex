@@ -152,10 +152,11 @@ the four.
 | `/status` | bound session, runtime, state, pending approvals |
 | `/sessions` | recent sessions, one button each |
 | `/use <n or id>` | bind this chat to a session |
+| `/agent` | switch Agent |
+| `/provider [id]` | pick the credential source for this Agent |
 | `/model [id]` | pick the model |
 | `/effort [value]` | pick the reasoning effort |
 | `/mode [id]` | pick the Agent mode |
-| `/agent` | switch Agent |
 | `/new <text>` | start a session and send the first prompt |
 | `/stop` | interrupt the running turn |
 | `/approve [code]` | approve the pending request |
@@ -175,12 +176,17 @@ off, any text in the group reaches the Agent.
 
 ### Changing the session
 
-`/model`, `/effort`, `/mode` and `/agent` change the runtime selection of the
-session this chat is bound to. The picker shows what the current Agent
-advertises; choosing applies to the next turn, and the card carries the
-selection revisions it was read at, so a card left open while someone else
-changed the runtime is refused instead of overwriting the newer choice. An
-Operator or Admin may change these; an Approver may not.
+Each command owns one part of the runtime selection of the session this chat is
+bound to: `/agent` switches Agent (starting from a source and model that Agent
+advertises), `/provider` changes the credential source without changing the
+Agent, and `/model`, `/effort` and `/mode` narrow it from there. Switching Agent
+or provider clears the reasoning effort, because the new one advertises its own.
+
+Every picker shows what the current selection advertises, the choice applies to
+the next turn, and the card carries the selection revisions it was read at, so a
+card left open while someone else changed the runtime is refused instead of
+overwriting the newer choice. An Operator or Admin may change these; an Approver
+may not.
 
 ### `/new` and defaults
 

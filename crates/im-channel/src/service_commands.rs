@@ -29,6 +29,7 @@ pub(super) const ACTION_MENU_SESSIONS: &str = "menu:sessions";
 /// Opens a picker. Unlike `runtime:*` these carry no value, so a card button
 /// that only asks "which model?" can never be mistaken for a choice.
 pub(super) const ACTION_MENU_MODEL: &str = "menu:model";
+pub(super) const ACTION_MENU_PROVIDER: &str = "menu:provider";
 pub(super) const ACTION_MENU_EFFORT: &str = "menu:effort";
 pub(super) const ACTION_MENU_PREFIX: &str = "menu:";
 pub(super) const ACTION_STATUS_STOP: &str = "status:stop";
@@ -36,6 +37,7 @@ pub(super) const ACTION_STATUS_STOP: &str = "status:stop";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum RuntimeField {
     Model,
+    Provider,
     Effort,
     Mode,
     Agent,
@@ -45,6 +47,7 @@ impl RuntimeField {
     pub(super) fn parse(value: &str) -> Option<Self> {
         match value {
             "model" => Some(Self::Model),
+            "provider" => Some(Self::Provider),
             "effort" => Some(Self::Effort),
             "mode" => Some(Self::Mode),
             "agent" => Some(Self::Agent),
@@ -55,6 +58,7 @@ impl RuntimeField {
     fn action_kind(self) -> &'static str {
         match self {
             Self::Model => "runtime:model",
+            Self::Provider => "runtime:provider",
             Self::Effort => "runtime:effort",
             Self::Mode => "runtime:mode",
             Self::Agent => "runtime:agent",
@@ -66,6 +70,9 @@ impl RuntimeField {
             (Self::Model, ImLocale::ZhCn) => "模型",
             (Self::Model, ImLocale::ZhTw) => "模型",
             (Self::Model, _) => "Model",
+            (Self::Provider, ImLocale::ZhCn) => "供应商",
+            (Self::Provider, ImLocale::ZhTw) => "供應商",
+            (Self::Provider, _) => "Provider",
             (Self::Effort, ImLocale::ZhCn) => "思考强度",
             (Self::Effort, ImLocale::ZhTw) => "思考強度",
             (Self::Effort, _) => "Reasoning effort",
@@ -87,6 +94,12 @@ pub(super) struct ValuePayload {
 #[derive(Debug, Serialize, Deserialize)]
 pub(super) struct AgentChoicePayload {
     pub agent_id: String,
+    pub auth_source: RuntimeAuthSource,
+    pub model: RuntimeModelSelection,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub(super) struct ProviderChoicePayload {
     pub auth_source: RuntimeAuthSource,
     pub model: RuntimeModelSelection,
 }
@@ -357,15 +370,77 @@ impl ImChannelService {
             .map_err(|_| im_payload_error())?;
             let minted =
                 self.mint_action(&conn, &binding, RuntimeField::Agent.action_kind(), &payload)?;
-            let repeats = options
-                .agents
-                .iter()
-                .filter(|other| other.agent_label == choice.agent_label)
-                .count()
-                > 1;
             buttons.push(ImButton {
                 action_id: minted.action_id,
-                label: agent_button_label(choice, repeats),
+                label: agent_button_label(choice),
+            });
+        }
+        self.reply_buttons(event, runtime, &text, buttons).await
+    }
+
+    /// The credential-source picker for the current Agent.
+    async fn send_provider_card(
+        &self,
+        event: &ImInboundEvent,
+        runtime: &ChannelRuntime,
+        principal: &ImPrincipalRecord,
+    ) -> VibexResult<()> {
+        if !principal.role.can_prompt() {
+            self.reply(event, runtime, "Your role cannot change the runtime.")
+                .await?;
+            return Ok(());
+        }
+        let conn = self.open()?;
+        let Some(binding) = self.binding_for(&conn, event)? else {
+            self.reply(event, runtime, "No session is bound.").await?;
+            return Ok(());
+        };
+        let locale = self.locale(event);
+        let options = self
+            .inner
+            .agent
+            .runtime_options(&binding.session_id)
+            .await?;
+        if options.providers.is_empty() {
+            self.reply(
+                event,
+                runtime,
+                match locale {
+                    ImLocale::En => "This Agent has one source to run under.",
+                    ImLocale::ZhCn => "该 Agent 只有一个可用的供应商。",
+                    ImLocale::ZhTw => "該 Agent 只有一個可用的供應商。",
+                },
+            )
+            .await?;
+            return Ok(());
+        }
+        let mut text = format!(
+            "{}\n{}\n",
+            RuntimeField::Provider.label(locale),
+            render::runtime_current(locale, &options)
+        );
+        text.push_str(match locale {
+            ImLocale::En => "Tap a provider. It applies to the next turn; pick a model after.",
+            ImLocale::ZhCn => "点选供应商，下一轮生效；之后可用 /model 选择模型。",
+            ImLocale::ZhTw => "點選供應商，下一輪生效；之後可用 /model 選擇模型。",
+        });
+        let mut buttons = Vec::new();
+        for choice in options.providers.iter().take(MAX_CHOICES) {
+            let payload = serde_json::to_string(&ProviderChoicePayload {
+                auth_source: choice.auth_source.clone(),
+                model: choice.model.clone(),
+            })
+            .map_err(|_| im_payload_error())?;
+            let minted = self.mint_action(
+                &conn,
+                &binding,
+                RuntimeField::Provider.action_kind(),
+                &payload,
+            )?;
+            let marker = if choice.current { "✓ " } else { "" };
+            buttons.push(ImButton {
+                action_id: minted.action_id,
+                label: format!("{marker}{}", render::truncate(&choice.label, 40)),
             });
         }
         self.reply_buttons(event, runtime, &text, buttons).await
@@ -382,7 +457,7 @@ impl ImChannelService {
             RuntimeField::Model => options.models.clone(),
             RuntimeField::Effort => options.efforts.clone(),
             RuntimeField::Mode => options.modes.clone(),
-            RuntimeField::Agent => Vec::new(),
+            RuntimeField::Agent | RuntimeField::Provider => Vec::new(),
         };
         let mut text = format!(
             "{}\n{}",
@@ -443,6 +518,9 @@ impl ImChannelService {
             }
             match field {
                 RuntimeField::Agent => self.send_agent_card(event, runtime, principal).await?,
+                RuntimeField::Provider => {
+                    self.send_provider_card(event, runtime, principal).await?
+                }
                 _ => {
                     self.send_runtime_card(event, runtime, principal, field)
                         .await?
@@ -604,6 +682,14 @@ impl ImChannelService {
                 desired.reasoning_effort = None;
                 desired.mode_id = None;
             }
+            RuntimeField::Provider => {
+                let payload: ProviderChoicePayload =
+                    serde_json::from_str(payload_json).map_err(|_| im_payload_error())?;
+                desired.auth_source = payload.auth_source;
+                desired.model = payload.model;
+                // A different source advertises different efforts.
+                desired.reasoning_effort = None;
+            }
         }
         let state = self
             .inner
@@ -635,6 +721,7 @@ impl ImChannelService {
         if args.trim().is_empty() {
             return match field {
                 RuntimeField::Agent => self.send_agent_card(event, runtime, principal).await,
+                RuntimeField::Provider => self.send_provider_card(event, runtime, principal).await,
                 _ => {
                     self.send_runtime_card(event, runtime, principal, field)
                         .await
@@ -655,9 +742,19 @@ impl ImChannelService {
         // The text form takes the value itself: an id for a model, the literal
         // effort or mode, and `id` for an Agent (which can only be chosen from
         // the card, because a switch needs its source and model too).
-        if field == RuntimeField::Agent {
-            self.send_agent_card(event, runtime, principal).await?;
-            return Ok(());
+        // Switching Agent or provider needs the source and model that come
+        // with the choice, so the text form opens the card rather than
+        // guessing from a bare id.
+        match field {
+            RuntimeField::Agent => {
+                self.send_agent_card(event, runtime, principal).await?;
+                return Ok(());
+            }
+            RuntimeField::Provider => {
+                self.send_provider_card(event, runtime, principal).await?;
+                return Ok(());
+            }
+            _ => {}
         }
         let payload = serde_json::to_string(&ValuePayload {
             value: args.trim().to_string(),
@@ -687,52 +784,17 @@ impl ImChannelService {
 
 /// A picker button's text.
 ///
-/// Telegram buttons carry no image, so the Agent's mark stands in for a logo
-/// and the label stays short enough not to be elided: the Agent's own name,
-/// or the source when the same Agent appears more than once.
-fn agent_button_label(choice: &vibex_core::ImRuntimeAgentChoice, repeats: bool) -> String {
-    let name = if repeats {
-        &choice.source_label
-    } else {
-        &choice.agent_label
-    };
-    let marker = if choice.current { "✓ " } else { "" };
-    let name = if name.trim().is_empty() {
+/// A button cannot show an image, and a stand-in glyph reads as noise, so the
+/// Agent's own name is the label; the keyboard keeps it from being elided by
+/// giving a long label a row to itself.
+fn agent_button_label(choice: &vibex_core::ImRuntimeAgentChoice) -> String {
+    let name = if choice.agent_label.trim().is_empty() {
         choice.agent_id.as_str()
     } else {
-        name.trim()
+        choice.agent_label.trim()
     };
-    format!(
-        "{marker}{} {}",
-        agent_mark(choice.agent_id.as_str()),
-        render::truncate(name, 24)
-    )
-}
-
-/// A text stand-in for an Agent's brand, since a button cannot show one.
-fn agent_mark(agent_id: &str) -> &'static str {
-    let id = agent_id.to_ascii_lowercase();
-    if id.contains("claude") {
-        "🟠"
-    } else if id.contains("codex") {
-        "⬛"
-    } else if id.contains("gemini") {
-        "♊"
-    } else if id.contains("cline") {
-        "🔷"
-    } else if id.contains("deepseek") {
-        "🐋"
-    } else if id.contains("cursor") {
-        "🖱"
-    } else if id.contains("qwen") {
-        "🟣"
-    } else if id.contains("kimi") {
-        "🌙"
-    } else if id.contains("amp") {
-        "⚡"
-    } else {
-        "🤖"
-    }
+    let marker = if choice.current { "✓ " } else { "" };
+    format!("{marker}{}", render::truncate(name, 32))
 }
 
 fn im_payload_error() -> VibexError {
@@ -749,7 +811,6 @@ mod tests {
     fn choice(
         agent_id: &str,
         agent_label: &str,
-        source_label: &str,
         current: bool,
     ) -> vibex_core::ImRuntimeAgentChoice {
         vibex_core::ImRuntimeAgentChoice {
@@ -757,34 +818,21 @@ mod tests {
             auth_source: RuntimeAuthSource::provider_profile(vibex_core::ProviderProfileId::new()),
             model: RuntimeModelSelection::explicit("model"),
             agent_label: agent_label.to_string(),
-            source_label: source_label.to_string(),
             current,
         }
     }
 
     #[test]
     fn an_agent_button_names_the_agent_and_marks_the_current_one() {
-        let pick = choice("claude", "Claude Code", "Anthropic", false);
-        assert_eq!(agent_button_label(&pick, false), "🟠 Claude Code");
-        let current = choice("claude", "Claude Code", "Anthropic", true);
-        assert_eq!(agent_button_label(&current, false), "✓ 🟠 Claude Code");
-    }
-
-    #[test]
-    fn a_repeated_agent_falls_back_to_its_source_so_the_buttons_differ() {
-        let first = choice("claude", "Claude Code", "Anthropic", false);
-        let second = choice("claude", "Claude Code", "Local Proxy", false);
-        assert_ne!(
-            agent_button_label(&first, true),
-            agent_button_label(&second, true)
-        );
-        assert_eq!(agent_button_label(&first, true), "🟠 Anthropic");
-        assert_eq!(agent_button_label(&second, true), "🟠 Local Proxy");
+        let pick = choice("claude", "Claude Code", false);
+        assert_eq!(agent_button_label(&pick), "Claude Code");
+        let current = choice("claude", "Claude Code", true);
+        assert_eq!(agent_button_label(&current), "✓ Claude Code");
     }
 
     #[test]
     fn a_long_agent_name_is_elided_by_the_label_not_by_the_client() {
-        let long = choice("something", &"x".repeat(80), "source", false);
-        assert!(agent_button_label(&long, false).chars().count() < 40);
+        let long = choice("something", &"x".repeat(80), false);
+        assert!(agent_button_label(&long).chars().count() < 40);
     }
 }

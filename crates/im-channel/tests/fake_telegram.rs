@@ -23,14 +23,14 @@ use vibex_core::{
     AgentNotificationIntent, AgentSession, AgentSessionRuntimeSelectionState, AgentSessionSafety,
     AgentSessionState, CreateAgentSessionRequest, FetchTimelineRequest, ImBindingSummary,
     ImChannelConfig, ImChannelDraft, ImPairingRequest, ImPrincipalRole, ImPrincipalStatus,
-    ImRuntimeAgentChoice, ImRuntimeChoice, ImRuntimeOptions, PermissionActionDetail,
-    PermissionRequest, PermissionRequestStatus, PermissionResolution, PermissionResponseKind,
-    PermissionResponseOption, ProjectId, ProviderProfileId, ResolveElicitationRequest,
-    ResolvePermissionRequest, SendAgentMessageRequest, SessionRuntimeSelection,
-    SessionRuntimeSelectionStatus, SetDesiredAgentSessionRuntimeRequest, TimelineItem,
-    TimelineItemId, TimelineLiveEvent, TimelinePage, TimelinePayload, TimelinePayloadDepth,
-    TimelineRedactionState, TimelineSource, VibexResult, VibexSessionId, WorkspaceId,
-    WorkspaceMode, unix_timestamp_ms,
+    ImRuntimeAgentChoice, ImRuntimeChoice, ImRuntimeOptions, ImRuntimeProviderChoice,
+    PermissionActionDetail, PermissionRequest, PermissionRequestStatus, PermissionResolution,
+    PermissionResponseKind, PermissionResponseOption, ProjectId, ProviderProfileId,
+    ResolveElicitationRequest, ResolvePermissionRequest, RuntimeAuthSource, RuntimeModelSelection,
+    SendAgentMessageRequest, SessionRuntimeSelection, SessionRuntimeSelectionStatus,
+    SetDesiredAgentSessionRuntimeRequest, TimelineItem, TimelineItemId, TimelineLiveEvent,
+    TimelinePage, TimelinePayload, TimelinePayloadDepth, TimelineRedactionState, TimelineSource,
+    VibexResult, VibexSessionId, WorkspaceId, WorkspaceMode, unix_timestamp_ms,
 };
 use vibex_im_channel::{ImAgentPort, ImChannelService, ImChannelServiceConfig};
 
@@ -396,7 +396,6 @@ impl ImAgentPort for MockAgent {
                     auth_source: self.selection.auth_source.clone(),
                     model: self.selection.model.clone(),
                     agent_label: "Claude Code".to_string(),
-                    source_label: "Anthropic".to_string(),
                     current: true,
                 },
                 ImRuntimeAgentChoice {
@@ -404,7 +403,22 @@ impl ImAgentPort for MockAgent {
                     auth_source: self.selection.auth_source.clone(),
                     model: self.selection.model.clone(),
                     agent_label: "Codex".to_string(),
-                    source_label: "OpenAI".to_string(),
+                    current: false,
+                },
+            ],
+            providers: vec![
+                ImRuntimeProviderChoice {
+                    auth_source: self.selection.auth_source.clone(),
+                    model: self.selection.model.clone(),
+                    label: "Anthropic".to_string(),
+                    current: true,
+                },
+                ImRuntimeProviderChoice {
+                    auth_source: RuntimeAuthSource::provider_profile(
+                        ProviderProfileId::parse("provider_test_proxy").expect("profile id"),
+                    ),
+                    model: RuntimeModelSelection::explicit("other-model"),
+                    label: "Local Proxy".to_string(),
                     current: false,
                 },
             ],
@@ -1115,6 +1129,31 @@ async fn telegram_pairing_commands_and_approval_round_trip() {
         "model applied",
     )
     .await;
+
+    // `/provider` is its own switch: it changes where the Agent runs without
+    // changing which Agent it is, and it is the command that owns the source.
+    fake.push(message_update(63, "/provider"));
+    wait_for(
+        || async { fake.button_action("Local Proxy").is_some() },
+        "provider card",
+    )
+    .await;
+    let proxy = fake
+        .button_action("Local Proxy")
+        .expect("the provider card offers the other source");
+    fake.push(callback_update(64, &proxy));
+    wait_for(
+        || async { agent.applied_selections.lock().expect("applied").len() >= 2 },
+        "provider applied",
+    )
+    .await;
+    assert!(
+        !fake
+            .sent_texts()
+            .iter()
+            .any(|text| text.contains("Could not apply that")),
+        "the provider switch is accepted"
+    );
 
     // A streamed turn: the live message the turn already owns is edited as
     // deltas arrive, and the final answer lands in that same message rendered

@@ -9,7 +9,7 @@ use vibex_agent::{AgentManager, RuntimeSelectionService};
 use vibex_core::{
     AgentNotificationIntent, AgentSession, AgentSessionRuntimeSelectionState,
     CreateAgentSessionRequest, FetchTimelineRequest, ImRuntimeAgentChoice, ImRuntimeChoice,
-    ImRuntimeOptions, ResolveElicitationRequest, ResolvePermissionRequest,
+    ImRuntimeOptions, ImRuntimeProviderChoice, ResolveElicitationRequest, ResolvePermissionRequest,
     RuntimeOptionAvailability, SendAgentMessageRequest, SetDesiredAgentSessionRuntimeRequest,
     TimelineItem, TimelineLiveEvent, TimelinePage, VibexResult, VibexSessionId,
 };
@@ -180,12 +180,15 @@ impl ImAgentPort for AgentManagerImPort {
             }
         }
 
+        // One entry per Agent. Which source and model it starts from is a
+        // starting point the chat can then change with `/provider` and
+        // `/model`, not a second thing the Agent button is asking.
         let mut agents: Vec<ImRuntimeAgentChoice> = Vec::new();
         for option in selectable.clone() {
-            if agents.iter().any(|choice| {
-                choice.agent_id == option.selection.agent_id
-                    && choice.auth_source == option.selection.auth_source
-            }) {
+            if agents
+                .iter()
+                .any(|choice| choice.agent_id == option.selection.agent_id)
+            {
                 continue;
             }
             agents.push(ImRuntimeAgentChoice {
@@ -193,9 +196,28 @@ impl ImAgentPort for AgentManagerImPort {
                 auth_source: option.selection.auth_source.clone(),
                 model: option.selection.model.clone(),
                 agent_label: option.agent_label.clone(),
-                source_label: option.auth_source_label.clone(),
-                current: option.selection.agent_id == current.agent_id
-                    && option.selection.auth_source == current.auth_source,
+                current: option.selection.agent_id == current.agent_id,
+            });
+        }
+
+        // The sources the current Agent can run under, each starting from a
+        // model that source advertises.
+        let mut providers: Vec<ImRuntimeProviderChoice> = Vec::new();
+        for option in selectable
+            .clone()
+            .filter(|option| option.selection.agent_id == current.agent_id)
+        {
+            if providers
+                .iter()
+                .any(|choice| choice.auth_source == option.selection.auth_source)
+            {
+                continue;
+            }
+            providers.push(ImRuntimeProviderChoice {
+                auth_source: option.selection.auth_source.clone(),
+                model: option.selection.model.clone(),
+                label: option.auth_source_label.clone(),
+                current: option.selection.auth_source == current.auth_source,
             });
         }
 
@@ -226,6 +248,7 @@ impl ImAgentPort for AgentManagerImPort {
             mode_label: current.mode_id.clone(),
             current,
             agents,
+            providers,
             models,
             efforts,
             modes,

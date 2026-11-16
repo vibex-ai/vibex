@@ -438,10 +438,7 @@ impl TelegramAdapter {
             body["message_thread_id"] = json!(target.thread_key);
         }
         if !buttons.is_empty() {
-            // One row for an approval card, narrower rows for a picker: eight
-            // buttons in a single row leaves every label elided to `Cla...`,
-            // and a button cannot show an icon to tell them apart.
-            let width = if buttons.len() > 3 { 2 } else { buttons.len() };
+            let width = button_row_width(buttons);
             let rows: Vec<Vec<Value>> = buttons
                 .chunks(width)
                 .map(|row| {
@@ -833,6 +830,38 @@ impl ImAdapter for TelegramAdapter {
     }
 }
 
+/// How many picker buttons share a row.
+///
+/// Eight buttons in one row leaves every label elided to `Cla...`, and a
+/// button cannot show an icon to tell them apart. The row is sized from the
+/// widest label instead, so a long one gets a row to itself. An approval card
+/// is two or three short labels and keeps the single row it always had.
+fn button_row_width(buttons: &[ImButton]) -> usize {
+    if buttons.len() <= 3 {
+        return buttons.len().max(1);
+    }
+    let widest = buttons
+        .iter()
+        .map(|button| button_display_width(&button.label))
+        .max()
+        .unwrap_or(0);
+    if widest <= 8 {
+        3
+    } else if widest <= 24 {
+        2
+    } else {
+        1
+    }
+}
+
+/// A rough screen width: a CJK character or an emoji is about twice a Latin
+/// one, which is what decides how many buttons fit beside each other.
+fn button_display_width(text: &str) -> usize {
+    text.chars()
+        .map(|character| if character as u32 >= 0x1100 { 2 } else { 1 })
+        .sum()
+}
+
 fn truncate_title(title: &str) -> String {
     title.chars().take(128).collect()
 }
@@ -852,6 +881,31 @@ mod tests {
             Arc::new(Mutex::new(ImChannelStatus::default())),
         )
         .expect("adapter")
+    }
+
+    fn button(label: &str) -> ImButton {
+        ImButton {
+            action_id: ImActionId::new(),
+            label: label.to_string(),
+        }
+    }
+
+    #[test]
+    fn a_short_picker_spreads_and_a_long_label_gets_its_own_row() {
+        let short: Vec<ImButton> = (0..6).map(|_| button("Codex")).collect();
+        assert_eq!(button_row_width(&short), 3);
+        let names: Vec<ImButton> = (0..6).map(|_| button("Claude Code")).collect();
+        assert_eq!(button_row_width(&names), 2);
+        let long: Vec<ImButton> = (0..6)
+            .map(|_| button("loomy/DeepSeek-V4.1-Flash"))
+            .collect();
+        assert_eq!(button_row_width(&long), 1);
+    }
+
+    #[test]
+    fn an_approval_card_keeps_one_row() {
+        let card = vec![button("Approve"), button("Always allow"), button("Deny")];
+        assert_eq!(button_row_width(&card), 3);
     }
 
     #[tokio::test]
