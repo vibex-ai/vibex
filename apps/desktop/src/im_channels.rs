@@ -7,6 +7,12 @@
 //! test, or pairing-code request is a network round trip, and rebuilding the
 //! settings tree while it runs would lose focus in the form.
 //!
+//! Side by side, the lane and the work area are two scroll regions with the
+//! page title above them: a long channel list moves under the lane's own
+//! heading without taking the selected channel's configuration away, and a long
+//! configuration scrolls without hiding the list. The page fills the settings
+//! viewport in that layout so the outer page does not move either.
+//!
 //! Results never become a strip pinned inside the page. The workbench's hint
 //! layer already carries action feedback above every dialog, so this page hands
 //! it a light hint like the rest of settings; see
@@ -14,16 +20,17 @@
 
 use gpui::{
     Anchor, AnyElement, App, Context, Entity, Hsla, IntoElement, ParentElement as _, Render,
-    SharedString, Styled as _, WeakEntity, Window, div, prelude::*, px,
+    ScrollHandle, SharedString, Styled as _, WeakEntity, Window, div, point, prelude::*, px,
 };
 use gpui_component::{
-    ActiveTheme as _, Disableable as _, Selectable as _, Sizable as _, StyledExt as _, Theme,
+    ActiveTheme as _, Disableable as _, Icon, Selectable as _, Sizable as _, StyledExt as _, Theme,
     WindowExt as _,
     button::{Button, ButtonVariants as _},
     dialog::{DialogAction, DialogClose, DialogFooter},
     h_flex,
     input::{Input, InputState},
     notification::NotificationType,
+    scroll::ScrollbarAxis,
     switch::Switch,
     v_flex,
 };
@@ -35,6 +42,7 @@ use vibex_core::{
 };
 
 use crate::app::{SETTINGS_PAGE_PADDING_X, VibexWorkbench, settings_page_width};
+use crate::gpui_ext::{PinnedScrollbar as _, ScrollGutter as _};
 use crate::hint_layer::{self, hint_notification};
 use crate::locale;
 use crate::theme;
@@ -48,6 +56,17 @@ const CHANNEL_LANE_WIDTH: f32 = 224.0;
 /// The page width below which the lane and the work area stack instead of
 /// sitting side by side, so the detail never gets a column too narrow to read.
 const CHANNEL_LANE_MIN_PAGE_WIDTH: f32 = 560.0;
+/// Where the two-column page starts, measured from the dialog's leading edge.
+///
+/// The other settings pages align their title on the wider page inset, but this
+/// page's first column *is* the master lane: pulling it toward the edge gives
+/// the work area beside it the width its forms and panels need.
+const CHANNEL_PAGE_LEADING_INSET: f32 = 36.0;
+/// The gutter between the lane and the work area.
+const CHANNEL_COLUMN_GAP: f32 = 24.0;
+/// The glyph an empty page shows above its copy, the same chat mark the
+/// settings navigation uses for this section.
+const CHANNEL_EMPTY_ICON: &str = "icons/vibex/chat-circle.svg";
 /// How many recent sessions the default-session picker offers.
 const DEFAULT_SESSION_CHOICES: usize = 5;
 
@@ -73,6 +92,10 @@ pub struct ImChannelsView {
     default_sessions: Vec<AgentSession>,
     pairing: Option<ImPairingCodeInfo>,
     pending_hint: Option<PendingHint>,
+    /// The lane and the work area scroll on their own, so a long channel list
+    /// never takes the selected channel's configuration away from the reader.
+    lane_scroll: ScrollHandle,
+    detail_scroll: ScrollHandle,
     loading: bool,
     loaded: bool,
     busy: bool,
@@ -103,11 +126,22 @@ impl ImChannelsView {
             default_sessions: Vec::new(),
             pairing: None,
             pending_hint: None,
+            lane_scroll: ScrollHandle::new(),
+            detail_scroll: ScrollHandle::new(),
             loading: false,
             loaded: false,
             busy: false,
             task: None,
         }
+    }
+
+    /// Returns the work area to the top when it starts showing another subject.
+    ///
+    /// The detail is one scroll region reused by every channel, so without this
+    /// a reader who scrolled to the last section of one channel would land at
+    /// the same offset on the next one, where that section may not exist.
+    fn reset_detail_scroll(&self) {
+        self.detail_scroll.set_offset(point(px(0.0), px(0.0)));
     }
 
     fn backend(&self, cx: &App) -> Option<vibex_backend::BackendFacade> {
@@ -369,6 +403,7 @@ impl ImChannelsView {
                         this.adding = false;
                         this.selected = Some(channel_id);
                         this.pairing = None;
+                        this.reset_detail_scroll();
                         this.hint(
                             NotificationType::Success,
                             locale::text(
@@ -823,6 +858,7 @@ impl ImChannelsView {
         self.selected = Some(channel_id);
         self.adding = false;
         self.pairing = None;
+        self.reset_detail_scroll();
         self.reload_selected(cx);
         cx.notify();
     }
@@ -830,11 +866,13 @@ impl ImChannelsView {
     fn begin_add(&mut self, cx: &mut Context<Self>) {
         self.adding = true;
         self.pairing = None;
+        self.reset_detail_scroll();
         cx.notify();
     }
 
     fn cancel_add(&mut self, cx: &mut Context<Self>) {
         self.adding = false;
+        self.reset_detail_scroll();
         cx.notify();
     }
 
@@ -968,11 +1006,22 @@ impl Render for ImChannelsView {
         let foreground = cx.theme().foreground;
         let muted = cx.theme().muted_foreground;
         let page_width = settings_page_width(f32::from(window.viewport_size().width));
+        // The lane and the work area only split once the page is wide enough
+        // to give both a readable column; below that they stack and the page
+        // itself scrolls.
         let wide = page_width >= CHANNEL_LANE_MIN_PAGE_WIDTH;
+        let has_channels = !self.channels.is_empty();
+        // Side by side, the page owns a definite height: the title band stays
+        // put and the lane and the work area each scroll what does not fit.
+        // The settings viewport above must not scroll as well, or a wheel over
+        // a column would move the page's title out from under the reader.
+        let split = has_channels && wide;
 
         let header = h_flex()
             .w_full()
             .min_w_0()
+            .flex_none()
+            .debug_selector(|| "im-channels-header".to_string())
             .justify_between()
             .flex_wrap()
             .items_start()
@@ -1026,9 +1075,7 @@ impl Render for ImChannelsView {
                     }),
             );
 
-        // With no channels there is nothing to list, so the work area is the
-        // whole page: the add step, or the empty state that opens it.
-        let body = if self.channels.is_empty() {
+        let body = if !has_channels {
             if self.adding {
                 self.render_add_form(cx)
             } else {
@@ -1054,33 +1101,50 @@ impl Render for ImChannelsView {
             h_flex()
                 .w_full()
                 .min_w_0()
-                .items_start()
-                .gap_6()
-                .child(self.render_channel_list(true, cx))
-                .child(self.render_work_area(cx))
+                .flex_1()
+                .min_h_0()
+                // `h_flex` centers its children on the cross axis; the columns
+                // have to share the band's whole height instead, or neither
+                // scroll region gets a definite viewport.
+                .items_stretch()
+                .gap(px(CHANNEL_COLUMN_GAP))
+                .child(self.render_channel_lane(true, cx))
+                .child(self.render_work_area_scroll(cx))
                 .into_any_element()
         } else {
             v_flex()
                 .w_full()
                 .min_w_0()
                 .gap_6()
-                .child(self.render_channel_list(false, cx))
+                .child(self.render_channel_lane(false, cx))
                 .child(self.render_work_area(cx))
                 .into_any_element()
         };
 
         v_flex()
             .id("im-channels-page")
+            .debug_selector(|| "im-channels-page".to_string())
             .w_full()
             .min_w_0()
             .gap_6()
-            .px(px(SETTINGS_PAGE_PADDING_X))
+            // The two-column page pulls its leading column toward the dialog
+            // edge: the lane is the first thing the page shows, and the work
+            // area beside it needs the width. The page's own title shares the
+            // lane's edge, and every other settings page keeps the wider inset.
+            .pl(px(if split {
+                CHANNEL_PAGE_LEADING_INSET
+            } else {
+                SETTINGS_PAGE_PADDING_X
+            }))
+            .pr(px(SETTINGS_PAGE_PADDING_X))
             .py_8()
             .text_color(foreground)
+            .when(split, |this| this.h_full().min_h_0())
             .child(header)
             .child(body)
             .child(
                 div()
+                    .flex_none()
                     .text_xs()
                     .whitespace_normal()
                     .text_color(muted)
@@ -1094,14 +1158,18 @@ impl Render for ImChannelsView {
 }
 
 impl ImChannelsView {
-    /// The list lane: one selectable row per channel. Side by side with the
-    /// work area when the page is wide enough, a stacked block when it is not.
-    fn render_channel_list(&self, wide: bool, cx: &mut Context<Self>) -> AnyElement {
+    /// The list lane: one selectable row per channel.
+    ///
+    /// Side by side with the work area, the lane keeps its "Channels" heading
+    /// in place and scrolls only the rows under it, so the page's title and
+    /// the lane's own subject stay visible while the reader moves through a
+    /// long list. Stacked, the lane grows with its rows and the page scrolls.
+    fn render_channel_lane(&self, wide: bool, cx: &mut Context<Self>) -> AnyElement {
         let foreground = cx.theme().foreground;
         let muted = cx.theme().muted_foreground;
         let surface = cx.theme().secondary;
 
-        let mut list = v_flex().w_full().min_w_0().gap_1();
+        let mut rows = v_flex().w_full().min_w_0().gap_1();
         for channel in &self.channels {
             let channel_id = channel.channel_id.clone();
             let selected = self.selected.as_ref() == Some(&channel.channel_id);
@@ -1110,7 +1178,7 @@ impl ImChannelsView {
                 self.channel_kind_label(channel.kind),
                 self.status_label(channel)
             );
-            list = list.child(
+            rows = rows.child(
                 Button::new(SharedString::from(format!(
                     "im-channel-select-{}",
                     channel.channel_id.as_str()
@@ -1141,19 +1209,64 @@ impl ImChannelsView {
             );
         }
 
+        let heading = div()
+            .flex_none()
+            .text_xs()
+            .font_semibold()
+            .text_color(muted)
+            .child(locale::text("Channels", "频道", "頻道"));
+
+        let lane = if wide {
+            v_flex()
+                .w(px(CHANNEL_LANE_WIDTH))
+                .flex_none()
+                .min_h_0()
+                .gap_2()
+                .child(heading)
+                .child(
+                    v_flex()
+                        .id("im-channel-lane-scroll")
+                        .debug_selector(|| "im-channel-lane-scroll".to_string())
+                        .w_full()
+                        .flex_1()
+                        .min_h_0()
+                        .track_scroll(&self.lane_scroll)
+                        .overflow_y_scroll()
+                        // The rows end flush with the lane's trailing edge, so
+                        // the bar needs a lane of its own to keep the status
+                        // text out from under the thumb.
+                        .scroll_gutter()
+                        .child(rows)
+                        .pinned_scrollbar(&self.lane_scroll, ScrollbarAxis::Vertical),
+                )
+        } else {
+            v_flex()
+                .w_full()
+                .min_w_0()
+                .gap_2()
+                .child(heading)
+                .child(rows)
+        };
+        lane.into_any_element()
+    }
+
+    /// The work area inside its own scroll region.
+    ///
+    /// The lane and the work area are separate scroll regions on purpose: a
+    /// long channel list must never take the selected channel's configuration
+    /// away, and a long configuration must never hide the list of channels.
+    fn render_work_area_scroll(&self, cx: &mut Context<Self>) -> AnyElement {
         v_flex()
-            .when(wide, |this| this.w(px(CHANNEL_LANE_WIDTH)).flex_none())
-            .when(!wide, |this| this.w_full())
+            .id("im-channel-work-area-scroll")
+            .debug_selector(|| "im-channel-work-area-scroll".to_string())
+            .flex_1()
             .min_w_0()
-            .gap_2()
-            .child(
-                div()
-                    .text_xs()
-                    .font_semibold()
-                    .text_color(muted)
-                    .child(locale::text("Channels", "频道", "頻道")),
-            )
-            .child(list)
+            .min_h_0()
+            .track_scroll(&self.detail_scroll)
+            .overflow_y_scroll()
+            .scroll_gutter()
+            .child(self.render_work_area(cx))
+            .pinned_scrollbar(&self.detail_scroll, ScrollbarAxis::Vertical)
             .into_any_element()
     }
 
@@ -1173,7 +1286,7 @@ impl ImChannelsView {
             .cloned()
         else {
             return v_flex()
-                .flex_1()
+                .w_full()
                 .min_w_0()
                 .items_center()
                 .justify_center()
@@ -1291,7 +1404,7 @@ impl ImChannelsView {
         );
 
         v_flex()
-            .flex_1()
+            .w_full()
             .min_w_0()
             .gap_6()
             .child(
@@ -1832,7 +1945,7 @@ impl ImChannelsView {
         );
 
         v_flex()
-            .flex_1()
+            .w_full()
             .min_w_0()
             .gap_6()
             .child(header)
@@ -1912,13 +2025,18 @@ impl ImChannelsView {
 }
 
 /// A first-run or empty-collection surface: what is missing and the next step.
+///
+/// The resting surface is the same plate a settings group paints — the module
+/// fill, rounded, without an outline — which is how the remote-instance page
+/// shows its own empty state. An outlined card inside the settings page read as
+/// a second dialog rather than as the page's own surface.
 fn empty_state(
     title: &'static str,
     description: &'static str,
     action: Button,
     cx: &App,
 ) -> AnyElement {
-    let border = cx.theme().border;
+    let is_dark = cx.theme().is_dark();
     let muted = cx.theme().muted_foreground;
     v_flex()
         .w_full()
@@ -1929,12 +2047,18 @@ fn empty_state(
         .px_6()
         .py_8()
         .rounded(px(10.0))
-        .border_1()
-        .border_color(border)
+        .bg(theme::module_surface(is_dark))
+        .child(
+            Icon::default()
+                .path(CHANNEL_EMPTY_ICON)
+                .size(px(28.0))
+                .text_color(muted),
+        )
         .child(div().text_sm().font_semibold().child(title))
         .child(
             div()
                 .max_w(px(420.0))
+                .text_center()
                 .text_xs()
                 .whitespace_normal()
                 .text_color(muted)
@@ -1950,7 +2074,11 @@ fn backend_error(error: BackendError) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
     use super::*;
+    use gpui::{ScrollDelta, ScrollEvent, TestAppContext};
 
     /// The page is a source-level contract in two places that a render test
     /// would need the whole workbench to reach.
@@ -1975,5 +2103,203 @@ mod tests {
     fn the_work_area_stacks_on_a_narrow_page() {
         assert!(CHANNEL_LANE_MIN_PAGE_WIDTH < crate::app::settings_page_width(1280.0));
         assert!(crate::app::settings_page_width(640.0) < CHANNEL_LANE_MIN_PAGE_WIDTH);
+    }
+
+    /// Side by side, the two columns move on their own.
+    ///
+    /// The page fills the settings viewport with a fixed title band above two
+    /// independent scroll regions: one channel's configuration can be read
+    /// while the list of channels stays in place, and a long list never takes
+    /// the work area with it. Each region tracks its own handle and pins its
+    /// own bar, so neither bar can drift with the rows.
+    #[gpui::test]
+    fn the_two_columns_scroll_independently(cx: &mut TestAppContext) {
+        struct LaneProbe {
+            view: Entity<ImChannelsView>,
+            // The page fills this viewport, so it never has anything of its
+            // own to scroll; tracked to prove that.
+            viewport_scroll: ScrollHandle,
+        }
+
+        impl Render for LaneProbe {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                // The same nesting the settings dialog gives a page: a
+                // definite-height viewport whose child fills it. The page's own
+                // `h_full` is what turns the two columns into bounded scroll
+                // regions instead of content-sized blocks.
+                div()
+                    .id("im-channels-test-viewport")
+                    .debug_selector(|| "im-channels-test-viewport".to_string())
+                    .size_full()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.viewport_scroll)
+                    .child(self.view.clone())
+            }
+        }
+
+        cx.update(gpui_component::init);
+        cx.update(gpui_tokio::init);
+        cx.update(crate::hint_layer::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        // The page only reads the workbench for its backend, and this layout
+        // test never asks it for one: an invalid handle keeps the real
+        // workbench — and its runtime lock — out of the test entirely.
+        // `Root` is the kit's own root: the page pushes its results onto the
+        // window's hint layer, which only exists under it.
+        let probe_slot: Rc<RefCell<Option<Entity<LaneProbe>>>> = Rc::new(RefCell::new(None));
+        let slot = probe_slot.clone();
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            let view = cx.new(|cx| ImChannelsView::new(WeakEntity::new_invalid(), window, cx));
+            let probe = cx.new(|_| LaneProbe {
+                view,
+                viewport_scroll: ScrollHandle::new(),
+            });
+            *slot.borrow_mut() = Some(probe.clone());
+            gpui_component::Root::new(probe, window, cx)
+        });
+        let probe = probe_slot
+            .borrow()
+            .clone()
+            .expect("the rooted window built its page");
+        cx.run_until_parked();
+        // A page with no channels keeps the resting empty state, which has
+        // nothing to scroll; the split layout is the state a runtime with
+        // channels reaches.
+        let channels = (0..24)
+            .map(|index| ImChannelSummary {
+                channel_id: ImChannelId::new(),
+                display_name: format!("Channel {index}"),
+                kind: ImChannelKind::Telegram,
+                enabled: true,
+                configured: true,
+                default_session: None,
+                event_filter: Vec::new(),
+                locale: None,
+                status: Default::default(),
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            })
+            .collect::<Vec<_>>();
+        probe.update(cx, |probe, cx| {
+            probe.view.update(cx, |view, cx| {
+                view.channels = channels;
+                view.selected = view
+                    .channels
+                    .first()
+                    .map(|channel| channel.channel_id.clone());
+                cx.notify();
+            });
+            cx.notify();
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        let (lane_scroll, detail_scroll, viewport_scroll) = probe.read_with(cx, |probe, cx| {
+            probe.view.read_with(cx, |view, _| {
+                (
+                    view.lane_scroll.clone(),
+                    view.detail_scroll.clone(),
+                    probe.viewport_scroll.clone(),
+                )
+            })
+        });
+        let lane_area = cx
+            .debug_bounds("im-channel-lane-scroll")
+            .expect("the lane should own a scroll viewport");
+        let detail_area = cx
+            .debug_bounds("im-channel-work-area-scroll")
+            .expect("the work area should own a scroll viewport");
+        assert!(
+            lane_area.size.height > px(120.0),
+            "the lane needs a real viewport to scroll in, got {:?}",
+            lane_area.size
+        );
+        assert!(
+            detail_area.size.height > px(120.0),
+            "the work area needs a real viewport to scroll in, got {:?}",
+            detail_area.size
+        );
+        let page_area = cx
+            .debug_bounds("im-channels-page")
+            .expect("the page should be laid out");
+        let viewport_area = cx
+            .debug_bounds("im-channels-test-viewport")
+            .expect("the probe viewport should be laid out");
+        // The page fills the viewport rather than growing with its content:
+        // that is the definite height the two column viewports divide between
+        // them, and the reason the outer page has nothing left to scroll.
+        assert_eq!(
+            page_area.size.height, viewport_area.size.height,
+            "the page should fill the settings viewport"
+        );
+        // The page's first column sits at its own tighter inset and the work
+        // area starts one gap after it: the lane is pulled toward the dialog
+        // edge instead of the wider page inset the row-based pages use.
+        assert_eq!(
+            lane_area.left() - page_area.left(),
+            px(CHANNEL_PAGE_LEADING_INSET),
+            "the lane should start at the page's tighter inset"
+        );
+        assert_eq!(
+            detail_area.left() - lane_area.right(),
+            px(CHANNEL_COLUMN_GAP),
+            "the work area should follow the lane after one gutter"
+        );
+
+        let header_area = cx
+            .debug_bounds("im-channels-header")
+            .expect("the page title should be laid out");
+        cx.simulate_event(ScrollEvent {
+            position: lane_area.center(),
+            delta: ScrollDelta::Pixels(point(px(0.0), px(-80.0))),
+            modifiers: Default::default(),
+            touch_phase: gpui::TouchPhase::Moved,
+            ..Default::default()
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        assert!(
+            lane_scroll.offset().y < px(0.0),
+            "the lane should follow the wheel over its rows: offset {:?}",
+            lane_scroll.offset()
+        );
+        assert_eq!(
+            detail_scroll.offset().y,
+            px(0.0),
+            "moving the lane must leave the work area where it was"
+        );
+        assert_eq!(
+            cx.debug_bounds("im-channels-header"),
+            Some(header_area),
+            "the page title stays put while a column scrolls"
+        );
+
+        cx.simulate_event(ScrollEvent {
+            position: point(detail_area.center().x, detail_area.top() + px(40.0)),
+            delta: ScrollDelta::Pixels(point(px(0.0), px(-80.0))),
+            modifiers: Default::default(),
+            touch_phase: gpui::TouchPhase::Moved,
+            ..Default::default()
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        assert!(
+            detail_scroll.offset().y < px(0.0),
+            "the work area should follow the wheel over its own content: offset {:?}",
+            detail_scroll.offset()
+        );
+        // Neither column's wheel moved the page itself: the title is fixed and
+        // the two regions are the only things that travel.
+        assert_eq!(
+            viewport_scroll.offset().y,
+            px(0.0),
+            "the settings viewport must not scroll the page as well"
+        );
     }
 }
