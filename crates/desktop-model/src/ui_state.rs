@@ -1856,7 +1856,8 @@ const fn default_message_reactions_enabled() -> bool {
     true
 }
 
-/// Developer-only diagnostics preferences.
+/// Developer-only preferences: the diagnostics HUD, and the switches that keep
+/// unfinished surfaces out of the product until they are ready.
 ///
 /// Kept apart from [`DesktopBehaviorUiState`], which holds user-facing product
 /// behavior, so the Developer settings section can grow without widening that
@@ -1871,6 +1872,13 @@ pub struct DeveloperUiState {
     /// restore.
     #[serde(default)]
     pub show_fps_monitor: bool,
+    /// Whether the IM channel surface is exposed at all.
+    ///
+    /// The chat bridges are still a beta, so the settings entry stays hidden
+    /// until this is on. Temporary: it goes away when the feature ships and the
+    /// entry becomes unconditional again.
+    #[serde(default)]
+    pub im_channels_beta: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -3554,6 +3562,17 @@ mod tests {
         let legacy: DesktopUiStateV1 = serde_json::from_value(legacy).unwrap();
         assert!(!legacy.developer.show_fps_monitor);
 
+        // A state file written before the IM channel beta switch existed has no
+        // `imChannelsBeta`, so the entry it gates stays hidden rather than
+        // appearing for everyone on the upgrade.
+        let mut before_beta = serde_json::to_value(DesktopUiStateV1::default()).unwrap();
+        before_beta["developer"]
+            .as_object_mut()
+            .unwrap()
+            .remove("imChannelsBeta");
+        let before_beta: DesktopUiStateV1 = serde_json::from_value(before_beta).unwrap();
+        assert!(!before_beta.developer.im_channels_beta);
+
         // The HUD's placement used to be persisted as `fpsMonitorPlacement`,
         // and the SSH remote runtime used to be gated by a stored
         // `sshRemoteRuntime`. The workbench places the HUD itself now, and the
@@ -3570,9 +3589,11 @@ mod tests {
 
         let mut state = DesktopUiStateV1::default();
         state.developer.show_fps_monitor = true;
+        state.developer.im_channels_beta = true;
         state.normalize().unwrap();
         let serialized = serde_json::to_value(&state.developer).unwrap();
         assert_eq!(serialized["showFpsMonitor"], serde_json::json!(true));
+        assert_eq!(serialized["imChannelsBeta"], serde_json::json!(true));
         assert!(
             serialized.get("fpsMonitorPlacement").is_none(),
             "the HUD opens in the middle of the window, so no placement is stored"
@@ -3584,6 +3605,7 @@ mod tests {
         let round_trip: DesktopUiStateV1 =
             serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
         assert!(round_trip.developer.show_fps_monitor);
+        assert!(round_trip.developer.im_channels_beta);
     }
 
     #[test]

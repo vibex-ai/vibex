@@ -26,6 +26,8 @@ pub struct DiagnosticBundle {
     pub providers: DiagnosticProviderSection,
     pub scheduled_tasks: DiagnosticScheduledTaskSection,
     pub workbench: DiagnosticWorkbenchSection,
+    #[serde(default)]
+    pub im_channels: DiagnosticImChannelSection,
     pub runtime: DiagnosticRuntimeSection,
     pub smokes: DiagnosticSmokeSection,
     pub errors: DiagnosticErrorSection,
@@ -251,6 +253,30 @@ pub struct DiagnosticScheduledTaskAuditRecord {
 #[serde(rename_all = "camelCase")]
 pub struct DiagnosticWorkbenchSection {
     pub counts: Vec<DiagnosticCount>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagnosticImChannelSection {
+    /// One row per configured channel, without secrets or chat contents.
+    pub channels: Vec<DiagnosticImChannelRecord>,
+}
+
+/// What a bundle says about one IM channel.
+///
+/// Deliberately narrow: the kind, whether it is enabled and configured, its
+/// connection state, and counters. No chat id, no session id, no message text —
+/// a bundle is shared with support, and a chat id identifies a person.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagnosticImChannelRecord {
+    pub channel_id: String,
+    pub kind: String,
+    pub enabled: bool,
+    pub configured: bool,
+    pub state: String,
+    pub consecutive_failures: u32,
+    pub last_error_code: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

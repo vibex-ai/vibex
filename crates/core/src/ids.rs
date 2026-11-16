@@ -138,6 +138,13 @@ vibex_id!(NativeStateHomeId, "statehome");
 vibex_id!(MessageSubmissionId, "submission");
 vibex_id!(AgentDelegationId, "delegation");
 vibex_id!(UsageExecutionId, "usage_execution");
+vibex_id!(ImChannelId, "imchannel");
+vibex_id!(ImPrincipalId, "imprincipal");
+vibex_id!(ImBindingId, "imbinding");
+vibex_id!(ImActionId, "imaction");
+vibex_id!(ImMessageId, "immessage");
+vibex_id!(ImPairingId, "impairing");
+
 // Vibex-use product identities. A delegated task keeps its historical
 // `delegation_*` id; only the execution, operation and group namespaces are new.
 vibex_id!(VibexExecutionId, "execution");

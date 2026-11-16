@@ -11520,6 +11520,12 @@ fn subscribe_composer_input(
 /// Only genuinely application-scoped state (the session list, the sidebar, the
 /// runtime handles, tasks) stays on `VibexWorkbench` itself.
 impl VibexWorkbench {
+    /// The active backend facade, for the settings surfaces that own their own
+    /// async state instead of mirroring it on the workbench.
+    pub(crate) fn backend_facade(&self) -> Option<BackendFacade> {
+        self.backend.clone()
+    }
+
     /// Fetches one page of history above what the view already holds.
     ///
     /// The desktop used to read whole histories, so it had no older-history
@@ -78515,10 +78521,13 @@ impl VibexWorkbench {
         // Settings entries are only meaningful once something has been asked
         // for; there is no "recent settings" to fall back to.
         if !query_empty {
-            let settings = settings_search_candidates_for_query(query, strings)
-                .into_iter()
-                .map(CommandPaletteEntry::Setting)
-                .collect::<Vec<_>>();
+            let settings = settings_candidates_without_disabled_betas(
+                settings_search_candidates_for_query(query, strings),
+                self.ui_state.developer.im_channels_beta,
+            )
+            .into_iter()
+            .map(CommandPaletteEntry::Setting)
+            .collect::<Vec<_>>();
             if !settings.is_empty() {
                 sections.push(CommandPaletteSection {
                     heading: strings.command_palette_settings.into(),
@@ -87944,6 +87953,7 @@ enum SettingsSection {
     Appearance,
     Workbench,
     Connections,
+    Channels,
     Session,
     Archived,
     Terminal,
@@ -88415,6 +88425,23 @@ fn settings_section_for_query(query: &str) -> Option<SettingsSection> {
         "主機",
     ]) {
         Some(SettingsSection::Connections)
+    } else if matches(&[
+        "im channel",
+        "im channels",
+        "im 频道",
+        "telegram",
+        "lark",
+        "feishu",
+        "bot",
+        "channel",
+        "频道",
+        "頻道",
+        "机器人",
+        "機器人",
+        "飞书",
+        "飛書",
+    ]) {
+        Some(SettingsSection::Channels)
     } else if matches(&[
         "archived", "archive", "restore", "归档", "封存", "復原", "复原",
     ]) {
@@ -89192,6 +89219,31 @@ fn settings_search_candidates(strings: &'static Strings) -> Vec<SettingsSearchCa
             ],
         ),
         settings_search_candidate(
+            SettingsSection::Channels,
+            locale::text("IM channels", "IM 频道", "IM 頻道"),
+            locale::text(
+                "Chat with Vibex and approve tool calls from Telegram.",
+                "通过 Telegram 和 Vibex 对话并批准工具调用。",
+                "透過 Telegram 和 Vibex 對話並批准工具呼叫。",
+            ),
+            &[
+                "im channel",
+                "im channels",
+                "im 频道",
+                "telegram",
+                "lark",
+                "feishu",
+                "bot",
+                "channel",
+                "频道",
+                "頻道",
+                "机器人",
+                "機器人",
+                "飞书",
+                "飛書",
+            ],
+        ),
+        settings_search_candidate(
             SettingsSection::Terminal,
             locale::text("Default shell", "默认 Shell", "預設 Shell"),
             locale::text(
@@ -89639,6 +89691,7 @@ fn settings_section_label(section: SettingsSection) -> &'static str {
         SettingsSection::Connections => {
             locale::text("Remote instances", "远程实例", "遠端執行個體")
         }
+        SettingsSection::Channels => locale::text("IM channels", "IM 频道", "IM 頻道"),
         SettingsSection::Session => locale::text("Session", "会话", "會話"),
         SettingsSection::Archived => locale::text("Archived sessions", "已归档会话", "已封存會話"),
         SettingsSection::Terminal => locale::text("Terminal", "终端", "終端機"),
@@ -89672,6 +89725,24 @@ fn settings_search_candidates_for_query(
                 })
         })
         .take(SETTINGS_SEARCH_RESULT_LIMIT)
+        .collect()
+}
+
+/// Drops the settings entries whose feature is still behind a beta switch.
+///
+/// The settings search and the command palette draw from one candidate list, so
+/// the gate is applied to that list here rather than at each surface that
+/// renders one: a switched-off beta must not be reachable by typing its name.
+fn settings_candidates_without_disabled_betas(
+    candidates: Vec<SettingsSearchCandidate>,
+    im_channels_beta: bool,
+) -> Vec<SettingsSearchCandidate> {
+    if im_channels_beta {
+        return candidates;
+    }
+    candidates
+        .into_iter()
+        .filter(|candidate| candidate.section != SettingsSection::Channels)
         .collect()
 }
 
@@ -90659,6 +90730,7 @@ struct FoundationSettings {
     bootstrap_command: Option<crate::ssh_connection::bootstrap::BootstrapCommand>,
     bootstrap_error: Option<String>,
     active_section: SettingsSection,
+    im_channels_view: Entity<crate::im_channels::ImChannelsView>,
     /// Release notes selected for the About page, kept across frames so the
     /// Markdown source is not re-selected and re-compared on every render.
     about_notes: Option<AboutReleaseNotes>,
@@ -91112,6 +91184,8 @@ impl FoundationSettings {
                 },
             )
             .detach();
+            let im_channels_view =
+                cx.new(|cx| crate::im_channels::ImChannelsView::new(workbench.clone(), window, cx));
             Self {
                 workbench,
                 home_dir,
@@ -91189,6 +91263,7 @@ impl FoundationSettings {
                 bootstrap_command: None,
                 bootstrap_error: None,
                 active_section: SettingsSection::General,
+                im_channels_view,
                 about_notes: None,
                 about_notes_scroll: ScrollHandle::new(),
             }
@@ -91220,6 +91295,10 @@ impl FoundationSettings {
         if section == SettingsSection::Connections {
             self.reload_connections_profiles();
             self.resume_unprovisioned_connections(cx);
+        }
+        if section == SettingsSection::Channels {
+            self.im_channels_view
+                .update(cx, |view, cx| view.reload_public(cx));
         }
     }
 
@@ -92038,8 +92117,12 @@ impl FoundationSettings {
         strings: &'static Strings,
         cx: &mut Context<Self>,
     ) {
+        let im_channels_beta = self.developer(cx).im_channels_beta;
         let query = self.search.read(cx).value().trim().to_lowercase();
-        let candidates = settings_search_candidates_for_query(&query, strings);
+        let candidates = settings_candidates_without_disabled_betas(
+            settings_search_candidates_for_query(&query, strings),
+            im_channels_beta,
+        );
         let Some(candidate) = candidates
             .get(index.min(candidates.len().saturating_sub(1)))
             .copied()
@@ -92048,8 +92131,11 @@ impl FoundationSettings {
             self.search_scroll.scroll_to_item(0);
             // The keyword fallback can name a section outside the candidate
             // list, so it is resolved here rather than in activation, which
-            // also runs while the workbench is leased.
-            if let Some(section) = settings_section_for_query(&query) {
+            // also runs while the workbench is leased. It answers to the same
+            // beta gate as the list: a hidden entry stays out of reach.
+            if let Some(section) = settings_section_for_query(&query)
+                .filter(|section| *section != SettingsSection::Channels || im_channels_beta)
+            {
                 self.activate_settings_section(section, cx);
             } else {
                 self.settings_render_context
@@ -92098,7 +92184,10 @@ impl FoundationSettings {
             .borrow_mut()
             .replace(candidate.title.to_string());
         let query = self.search.read(cx).value().to_string();
-        let candidates = settings_search_candidates_for_query(&query, locale::current_strings());
+        let candidates = settings_candidates_without_disabled_betas(
+            settings_search_candidates_for_query(&query, locale::current_strings()),
+            self.developer(cx).im_channels_beta,
+        );
         self.search_scroll
             .scroll_to_item(settings_search_result_scroll_index(&candidates, index));
         self.search.update(cx, |input, cx| input.focus(window, cx));
@@ -92112,7 +92201,10 @@ impl FoundationSettings {
         cx: &mut Context<Self>,
     ) {
         let query = self.search.read(cx).value().to_string();
-        let candidates = settings_search_candidates_for_query(&query, locale::current_strings());
+        let candidates = settings_candidates_without_disabled_betas(
+            settings_search_candidates_for_query(&query, locale::current_strings()),
+            self.developer(cx).im_channels_beta,
+        );
         if candidates.is_empty() {
             return;
         }
@@ -92146,7 +92238,10 @@ impl FoundationSettings {
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let query = self.search.read(cx).value().trim().to_string();
-        let candidates = settings_search_candidates_for_query(&query, strings);
+        let candidates = settings_candidates_without_disabled_betas(
+            settings_search_candidates_for_query(&query, strings),
+            self.developer(cx).im_channels_beta,
+        );
         if candidates.is_empty() {
             return None;
         }
@@ -92935,6 +93030,21 @@ impl FoundationSettings {
         cx.notify();
     }
 
+    /// Opens or closes the IM channel beta.
+    ///
+    /// Only the stored flag changes here. Anything that had the IM page open
+    /// while this lands — a settings undo putting the old snapshot back, a
+    /// state file edited by hand — is handled where the page is rendered, so
+    /// the switch does not have to know which surface is on screen.
+    fn set_im_channels_beta(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        let _ = self.workbench.update(cx, |this, cx| {
+            this.ui_state.developer.im_channels_beta = enabled;
+            this.queue_ui_state();
+            cx.notify();
+        });
+        cx.notify();
+    }
+
     fn set_queue_send_mode(&mut self, mode: ComposerQueueSendMode, cx: &mut Context<Self>) {
         let _ = self.workbench.update(cx, |this, cx| {
             this.ui_state.composer.queue_send_mode = mode;
@@ -93302,6 +93412,10 @@ impl FoundationSettings {
         let muted_foreground = theme::semantic_color("muted-foreground", is_dark);
         let border = theme::semantic_color("border", is_dark);
         let sidebar_accent = theme::semantic_color("sidebar-accent", is_dark);
+        // The IM channel surface is a beta: its entry only exists once the
+        // Developer page's switch is on, and the search lists answer to the
+        // same flag.
+        let im_channels_visible = self.developer(cx).im_channels_beta;
         // Groups own their members, so a section can only change groups by
         // moving between these lists. Ordering by a `split_off` index instead
         // let a section drift into a group whose label did not describe it.
@@ -93319,6 +93433,7 @@ impl FoundationSettings {
                 &[
                     (SettingsSection::Workbench, IconName::LayoutDashboard),
                     (SettingsSection::Connections, IconName::Network),
+                    (SettingsSection::Channels, IconName::Bot),
                     (SettingsSection::Session, IconName::Bot),
                     (SettingsSection::Archived, IconName::Inbox),
                     (SettingsSection::Terminal, IconName::SquareTerminal),
@@ -93340,6 +93455,9 @@ impl FoundationSettings {
             .map(|(label, entries)| {
                 let buttons = entries
                     .iter()
+                    .filter(|(section, _)| {
+                        *section != SettingsSection::Channels || im_channels_visible
+                    })
                     .map(|(section, icon)| {
                         let section = *section;
                         let label = settings_section_label(section);
@@ -100489,6 +100607,17 @@ impl FoundationSettings {
             .on_click(cx.listener(|this, enabled, window, cx| {
                 this.set_show_fps_monitor(*enabled, window, cx)
             }));
+        // The IM channel surface is still a beta, so it has its own switch
+        // rather than shipping in the navigation for everyone.
+        let im_channels_switch = Switch::new("developer-im-channels-beta")
+            .small()
+            .checked(developer.im_channels_beta)
+            .tooltip(locale::text(
+                "IM channels (beta)",
+                "IM 频道（Beta）",
+                "IM 頻道（Beta）",
+            ))
+            .on_click(cx.listener(|this, enabled, _, cx| this.set_im_channels_beta(*enabled, cx)));
         settings_page(
             locale::text("Developer", "开发者", "開發者"),
             locale::text(
@@ -100496,17 +100625,33 @@ impl FoundationSettings {
                 "用于诊断和分析工作台自身的性能。",
                 "用於診斷與分析工作台自身的效能。",
             ),
-            vec![SettingsGroup::unlabeled(vec![setting_row(
-                locale::text("FPS monitor", "帧率监视器", "幀率監視器"),
-                locale::text(
-                    "Overlay realtime frame rate, frame time and resource usage on the workbench. The HUD opens in the middle of the window and can be dragged from there; while it is on, one sample a second is recorded to the diagnostics folder.",
-                    "在工作台上叠加实时帧率、帧耗时与资源占用，开启时显示在窗口正中，可拖动调整位置；开启期间每秒记录一次采样到诊断数据。",
-                    "在工作台上疊加即時幀率、幀耗時與資源佔用，開啟時顯示在視窗正中，可拖動調整位置；開啟期間每秒記錄一次取樣到診斷資料。",
+            vec![
+                SettingsGroup::unlabeled(vec![setting_row(
+                    locale::text("FPS monitor", "帧率监视器", "幀率監視器"),
+                    locale::text(
+                        "Overlay realtime frame rate, frame time and resource usage on the workbench. The HUD opens in the middle of the window and can be dragged from there; while it is on, one sample a second is recorded to the diagnostics folder.",
+                        "在工作台上叠加实时帧率、帧耗时与资源占用，开启时显示在窗口正中，可拖动调整位置；开启期间每秒记录一次采样到诊断数据。",
+                        "在工作台上疊加即時幀率、幀耗時與資源佔用，開啟時顯示在視窗正中，可拖動調整位置；開啟期間每秒記錄一次取樣到診斷資料。",
+                    ),
+                    fps_monitor_switch,
+                    stacked,
+                    cx,
+                )]),
+                SettingsGroup::new(
+                    locale::text("Beta features", "Beta 功能", "Beta 功能"),
+                    vec![setting_row(
+                        locale::text("IM channels (beta)", "IM 频道（Beta）", "IM 頻道（Beta）"),
+                        locale::text(
+                            "Shows the IM channels entry in settings, where the Telegram and Lark bridges are configured. The bridges are unfinished, so the entry stays hidden until this is on.",
+                            "在设置中显示 IM 频道入口，用于配置 Telegram 与飞书/Lark 桥接。该功能尚未完成，开启后才会出现入口。",
+                            "在設定中顯示 IM 頻道入口，用於設定 Telegram 與 Lark 橋接。此功能尚未完成，開啟後才會出現入口。",
+                        ),
+                        im_channels_switch,
+                        stacked,
+                        cx,
+                    )],
                 ),
-                fps_monitor_switch,
-                stacked,
-                cx,
-            )])],
+            ],
             cx,
         )
     }
@@ -100535,6 +100680,15 @@ impl Render for FoundationSettings {
             .borrow_mut()
             .take();
         let navigation = self.render_navigation(vertical_tabs, strings, cx);
+        // The IM channel section is a beta behind the Developer page's switch,
+        // so its entry is gone from the navigation while the switch is off. A
+        // frame that still has it active — an undone settings change restoring
+        // the old snapshot, a state file edited by hand — falls back to General
+        // rather than rendering a page the navigation no longer lists.
+        if self.active_section == SettingsSection::Channels && !self.developer(cx).im_channels_beta
+        {
+            self.active_section = SettingsSection::General;
+        }
         let page = match self.active_section {
             SettingsSection::General => self.render_general_page(
                 &desktop_behavior,
@@ -100552,6 +100706,7 @@ impl Render for FoundationSettings {
             SettingsSection::Archived => self.render_archived_page(stacked_rows, cx),
             SettingsSection::Workbench => self.render_workbench_page(&workbench, stacked_rows, cx),
             SettingsSection::Connections => self.render_connections_page(stacked_rows, cx),
+            SettingsSection::Channels => self.im_channels_view.clone().into_any_element(),
             SettingsSection::Terminal => self.render_terminal_page(&terminal, stacked_rows, cx),
             SettingsSection::Browser => self.render_browser_page(stacked_rows, cx),
             SettingsSection::Computer => self.render_computer_page(stacked_rows, cx),
@@ -103837,12 +103992,6 @@ mod tests {
         );
     }
 
-    /// The chip lights up exactly when the controls edit it.
-    ///
-    /// The input's own highlight is a strict range overlap, which leaves both
-    /// edges dark. A caret resting against the chip is still editing it, so a
-    /// chip drawn from that rule looked inert while the controls below were
-    /// pointed at it.
     /// A chip always resolves to some entry of its Agent, never to nothing.
     ///
     /// Three shapes reach the lookup: the row's own reference, a tuned reference
@@ -127531,6 +127680,83 @@ mod tests {
             settings_section_for_query("fps"),
             Some(SettingsSection::Developer)
         );
+    }
+
+    /// The IM channel surface is a beta, so its navigation entry, its search
+    /// rows and its palette row only exist once the Developer page's switch is
+    /// on. Temporary: the gate comes out when the feature ships.
+    #[test]
+    fn developer_page_gates_the_im_channels_beta_entry() {
+        let source = include_str!("app.rs");
+        let developer_page = source
+            .split_once("    fn render_developer_page(")
+            .and_then(|(_, tail)| tail.split_once("\n}\n\nimpl Render for FoundationSettings"))
+            .map(|(body, _)| body)
+            .expect("developer settings page should remain inspectable");
+        assert!(developer_page.contains("Switch::new(\"developer-im-channels-beta\")"));
+        assert!(developer_page.contains("developer.im_channels_beta"));
+        assert!(developer_page.contains("set_im_channels_beta"));
+        assert!(
+            developer_page
+                .contains("locale::text(\"Beta features\", \"Beta 功能\", \"Beta 功能\")")
+        );
+
+        let switch = source
+            .split_once("    fn set_im_channels_beta(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn set_queue_send_mode("))
+            .map(|(body, _)| body)
+            .expect("the beta switch should remain inspectable");
+        assert!(switch.contains("this.ui_state.developer.im_channels_beta = enabled"));
+        assert!(switch.contains("this.queue_ui_state()"));
+
+        // The navigation drops the entry rather than disabling it, and the
+        // search rows answer to the same flag: a hidden surface cannot be
+        // reached by typing its name.
+        let navigation = source
+            .split_once("    fn render_navigation(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_general_page("))
+            .map(|(body, _)| body)
+            .expect("settings navigation should remain inspectable");
+        assert!(navigation.contains("self.developer(cx).im_channels_beta"));
+        assert!(
+            navigation.contains("*section != SettingsSection::Channels || im_channels_visible")
+        );
+
+        let gate = source
+            .split_once("fn settings_candidates_without_disabled_betas(")
+            .and_then(|(_, tail)| tail.split_once("\n}\n"))
+            .map(|(body, _)| body)
+            .expect("the beta candidate gate should remain inspectable");
+        assert!(gate.contains("candidate.section != SettingsSection::Channels"));
+
+        for function in [
+            "    fn preview_settings_search_selection(",
+            "    fn select_settings_search_candidate(",
+            "    fn move_settings_search_selection(",
+            "    fn render_search_results(",
+        ] {
+            assert!(
+                source
+                    .split_once(function)
+                    .and_then(|(_, tail)| tail.split_once("\n    }\n"))
+                    .map(|(body, _)| body)
+                    .is_some_and(|body| body.contains("settings_candidates_without_disabled_betas")),
+                "{function} should gate its candidates through the beta filter"
+            );
+        }
+
+        // A page left open when the switch went off — an undone settings
+        // change, a state file edited by hand — falls back to General instead
+        // of rendering a section the navigation no longer lists.
+        let render = source
+            .split_once("impl Render for FoundationSettings {")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n        let page = match self.active_section {")
+            })
+            .map(|(body, _)| body)
+            .expect("the settings renderer should remain inspectable");
+        assert!(render.contains("self.active_section == SettingsSection::Channels"));
+        assert!(render.contains("self.active_section = SettingsSection::General;"));
     }
 
     #[test]

@@ -1,0 +1,889 @@
+//! End-to-end test of the Telegram channel against a fake Bot API.
+//!
+//! The fake server exercises the same HTTP contract as Telegram: long polling,
+//! `sendMessage` buttons, callback acknowledgements, and `editMessageText` on a
+//! resolved approval. No real bot token or network access is involved.
+
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use async_trait::async_trait;
+use axum::{
+    Json, Router,
+    extract::{Path, State},
+    response::IntoResponse,
+    routing::{get, post},
+};
+use serde_json::{Value, json};
+use tokio::sync::{Notify, broadcast};
+use vibex_core::{
+    AgentId, AgentNotificationIntent, AgentSession, AgentSessionRuntimeSelectionState,
+    AgentSessionSafety, AgentSessionState, CreateAgentSessionRequest, FetchTimelineRequest,
+    ImBindingSummary, ImChannelConfig, ImChannelDraft, ImPairingRequest, ImPrincipalRole,
+    ImPrincipalStatus, PermissionActionDetail, PermissionRequest, PermissionRequestStatus,
+    PermissionResolution, PermissionResponseKind, PermissionResponseOption, ProjectId,
+    ProviderProfileId, ResolveElicitationRequest, ResolvePermissionRequest,
+    SendAgentMessageRequest, SessionRuntimeSelection, SessionRuntimeSelectionStatus, TimelineItem,
+    TimelineItemId, TimelineLiveEvent, TimelinePage, TimelinePayload, TimelinePayloadDepth,
+    TimelineRedactionState, TimelineSource, VibexResult, VibexSessionId, WorkspaceId,
+    WorkspaceMode, unix_timestamp_ms,
+};
+use vibex_im_channel::{ImAgentPort, ImChannelService, ImChannelServiceConfig};
+
+struct FakeTelegram {
+    updates: Mutex<VecDeque<Value>>,
+    sent: Mutex<Vec<Value>>,
+    edited: Mutex<Vec<Value>>,
+    callbacks: Mutex<Vec<Value>>,
+    topics: Mutex<Vec<Value>>,
+    topic_edits: Mutex<Vec<Value>>,
+    notify: Notify,
+    next_message_id: AtomicI64,
+}
+
+impl FakeTelegram {
+    fn new() -> Self {
+        Self {
+            updates: Mutex::new(VecDeque::new()),
+            sent: Mutex::new(Vec::new()),
+            edited: Mutex::new(Vec::new()),
+            callbacks: Mutex::new(Vec::new()),
+            topics: Mutex::new(Vec::new()),
+            topic_edits: Mutex::new(Vec::new()),
+            notify: Notify::new(),
+            next_message_id: AtomicI64::new(1),
+        }
+    }
+
+    fn push(&self, update: Value) {
+        self.updates.lock().expect("updates").push_back(update);
+        self.notify.notify_waiters();
+    }
+
+    fn sent_texts(&self) -> Vec<String> {
+        self.sent
+            .lock()
+            .expect("sent")
+            .iter()
+            .filter_map(|body| body.get("text").and_then(Value::as_str).map(str::to_string))
+            .collect()
+    }
+
+    fn callback_data(&self) -> Option<String> {
+        self.sent.lock().expect("sent").iter().find_map(|body| {
+            body.pointer("/reply_markup/inline_keyboard/0/0/callback_data")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+    }
+}
+
+/// The bytes `getFile` points at.
+async fn fake_file(
+    Path((_token, _path)): Path<(String, String)>,
+    State(_state): State<Arc<FakeTelegram>>,
+) -> impl IntoResponse {
+    vec![0xff, 0xd8, 0xff, 0xe0, 0x00]
+}
+
+async fn fake_telegram(
+    State(state): State<Arc<FakeTelegram>>,
+    Path((_token, method)): Path<(String, String)>,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    let result = match method.as_str() {
+        "getMe" => json!({ "username": "fake_vibex_bot", "first_name": "Fake" }),
+        "getChat" => json!({ "id": 42, "type": "private", "title": "Fake DM" }),
+        "getFile" => json!({ "file_path": "documents/file_1.jpg", "file_size": 5 }),
+        "getUpdates" => {
+            if state.updates.lock().expect("updates").is_empty() {
+                let _ =
+                    tokio::time::timeout(Duration::from_millis(250), state.notify.notified()).await;
+            }
+            let updates: Vec<Value> = state.updates.lock().expect("updates").drain(..).collect();
+            json!(updates)
+        }
+        "sendMessage" => {
+            state.sent.lock().expect("sent").push(body);
+            let id = state.next_message_id.fetch_add(1, Ordering::Relaxed);
+            json!({ "message_id": id })
+        }
+        "editMessageText" => {
+            state.edited.lock().expect("edited").push(body);
+            Value::Bool(true)
+        }
+        "answerCallbackQuery" => {
+            state.callbacks.lock().expect("callbacks").push(body);
+            Value::Bool(true)
+        }
+        "createForumTopic" => {
+            state.topics.lock().expect("topics").push(body);
+            json!({ "message_thread_id": 777 })
+        }
+        "editForumTopic" => {
+            state.topic_edits.lock().expect("topic_edits").push(body);
+            Value::Bool(true)
+        }
+        other => {
+            return Json(json!({
+                "ok": false,
+                "error_code": 404,
+                "description": format!("unhandled method {other}"),
+            }));
+        }
+    };
+    Json(json!({ "ok": true, "result": result }))
+}
+
+struct MockAgent {
+    timeline: broadcast::Sender<TimelineLiveEvent>,
+    sessions: broadcast::Sender<AgentSession>,
+    notifications: broadcast::Sender<AgentNotificationIntent>,
+    session: AgentSession,
+    selection: SessionRuntimeSelection,
+    pending: Mutex<Option<PermissionRequest>>,
+    pending_elicitation: Mutex<Option<vibex_core::ElicitationRequest>>,
+    prompts: Mutex<Vec<String>>,
+    attachments: Mutex<Vec<Vec<vibex_core::MessageAttachment>>>,
+    resolutions: Mutex<Vec<PermissionResolution>>,
+    elicitations: Mutex<Vec<vibex_core::ElicitationResolution>>,
+}
+
+impl MockAgent {
+    fn new() -> Self {
+        let (timeline, _) = broadcast::channel(32);
+        let (sessions, _) = broadcast::channel(32);
+        let (notifications, _) = broadcast::channel(32);
+        let now = unix_timestamp_ms();
+        let session = AgentSession {
+            id: VibexSessionId::new(),
+            title: "Fake session".to_string(),
+            project_id: ProjectId::new(),
+            workspace_id: WorkspaceId::new(),
+            workspace_root: "/tmp/fake-im-workspace".to_string(),
+            workspace_mode: WorkspaceMode::CurrentCheckout,
+            agent_id: AgentId::parse("claude").expect("agent id"),
+            state: AgentSessionState::Idle,
+            safety: AgentSessionSafety::workspace_write_ask_on_risk(),
+            created_at_ms: now,
+            updated_at_ms: now,
+            last_message_at_ms: now,
+            archived_at_ms: None,
+            deleted_at_ms: None,
+            tools: Default::default(),
+            transport: Default::default(),
+            terminal: None,
+        };
+        let selection = SessionRuntimeSelection::provider(
+            session.agent_id.clone(),
+            ProviderProfileId::new(),
+            "fake-model",
+        );
+        Self {
+            timeline,
+            sessions,
+            notifications,
+            session,
+            selection,
+            pending: Mutex::new(None),
+            pending_elicitation: Mutex::new(None),
+            prompts: Mutex::new(Vec::new()),
+            attachments: Mutex::new(Vec::new()),
+            resolutions: Mutex::new(Vec::new()),
+            elicitations: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn item(&self, sequence: i64, payload: TimelinePayload) -> TimelineItem {
+        TimelineItem {
+            id: TimelineItemId::new(),
+            session_id: self.session.id.clone(),
+            sequence,
+            timestamp_ms: unix_timestamp_ms(),
+            source: TimelineSource::Agent,
+            kind: payload.kind(),
+            correlation_id: None,
+            provider_correlation_id: None,
+            redaction_state: TimelineRedactionState::None,
+            execution_attribution: None,
+            payload_depth: TimelinePayloadDepth::Detail,
+            payload,
+        }
+    }
+}
+
+#[async_trait]
+impl ImAgentPort for MockAgent {
+    fn subscribe_timeline(&self) -> broadcast::Receiver<TimelineLiveEvent> {
+        self.timeline.subscribe()
+    }
+
+    fn subscribe_session_updates(&self) -> broadcast::Receiver<AgentSession> {
+        self.sessions.subscribe()
+    }
+
+    fn subscribe_notifications(&self) -> broadcast::Receiver<AgentNotificationIntent> {
+        self.notifications.subscribe()
+    }
+
+    async fn get_session(&self, _session_id: &VibexSessionId) -> VibexResult<AgentSession> {
+        Ok(self.session.clone())
+    }
+
+    async fn list_sessions(&self, _include_archived: bool) -> VibexResult<Vec<AgentSession>> {
+        Ok(vec![self.session.clone()])
+    }
+
+    async fn fetch_timeline(&self, _request: FetchTimelineRequest) -> VibexResult<TimelinePage> {
+        let mut items = self
+            .pending
+            .lock()
+            .expect("pending")
+            .clone()
+            .map(|request| vec![self.item(7, TimelinePayload::PermissionRequest(request))])
+            .unwrap_or_default();
+        if let Some(request) = self
+            .pending_elicitation
+            .lock()
+            .expect("pending elicitation")
+            .clone()
+        {
+            items.push(self.item(9, TimelinePayload::ElicitationRequest(request)));
+        }
+        Ok(TimelinePage {
+            session_id: self.session.id.clone(),
+            items,
+            start_sequence: Some(7),
+            end_sequence: Some(7),
+            has_older: false,
+            has_newer: false,
+            starts_at_turn_start: true,
+            leading_turn_start: None,
+            omitted: None,
+        })
+    }
+
+    async fn runtime_selection(
+        &self,
+        _session_id: &VibexSessionId,
+    ) -> VibexResult<AgentSessionRuntimeSelectionState> {
+        Ok(AgentSessionRuntimeSelectionState {
+            desired: self.selection.clone(),
+            effective: self.selection.clone(),
+            status: SessionRuntimeSelectionStatus::Ready,
+            session_revision: 1,
+            selection_revision: 1,
+            current_binding_id: None,
+            activation_generation: 1,
+            pending_switch_id: None,
+            actionable_error: None,
+        })
+    }
+
+    async fn create_session(
+        &self,
+        _request: CreateAgentSessionRequest,
+    ) -> VibexResult<AgentSession> {
+        Err(vibex_core::VibexError::process(
+            "fake_create_session",
+            "not used by this test",
+        ))
+    }
+
+    async fn send_message(
+        &self,
+        request: SendAgentMessageRequest,
+    ) -> VibexResult<Vec<TimelineItem>> {
+        self.prompts.lock().expect("prompts").push(request.text);
+        self.attachments
+            .lock()
+            .expect("attachments")
+            .push(request.attachments);
+        Ok(Vec::new())
+    }
+
+    async fn interrupt(&self, _session_id: &VibexSessionId) -> VibexResult<()> {
+        Ok(())
+    }
+
+    async fn resolve_permission(
+        &self,
+        request: ResolvePermissionRequest,
+    ) -> VibexResult<TimelineItem> {
+        self.resolutions
+            .lock()
+            .expect("resolutions")
+            .push(request.resolution.clone());
+        Ok(self.item(8, TimelinePayload::PermissionResolution(request.resolution)))
+    }
+
+    async fn resolve_elicitation(
+        &self,
+        request: ResolveElicitationRequest,
+    ) -> VibexResult<TimelineItem> {
+        self.elicitations
+            .lock()
+            .expect("elicitations")
+            .push(request.resolution.clone());
+        Ok(self.item(
+            9,
+            TimelinePayload::ElicitationResolution(request.resolution),
+        ))
+    }
+}
+
+fn message_update(update_id: i64, text: &str) -> Value {
+    json!({
+        "update_id": update_id,
+        "message": {
+            "message_id": update_id,
+            "date": 1,
+            "text": text,
+            "chat": { "id": 42, "type": "private" },
+            "from": { "id": 42, "is_bot": false, "first_name": "Tester" }
+        }
+    })
+}
+
+async fn wait_for<F, Fut>(mut condition: F, label: &str)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    for _ in 0..120 {
+        if condition().await {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("timed out waiting for {label}");
+}
+
+fn seed_session(conn: &rusqlite::Connection, agent: &MockAgent) {
+    let now = unix_timestamp_ms();
+    conn.execute(
+        "INSERT INTO projects (project_id, name, root_path, created_at_ms, updated_at_ms)
+         VALUES (?1, ?2, ?3, ?4, ?4)",
+        rusqlite::params![
+            agent.session.project_id.as_str(),
+            "Fake project",
+            agent.session.workspace_root,
+            now
+        ],
+    )
+    .expect("project");
+    conn.execute(
+        "INSERT INTO workspaces (workspace_id, project_id, root_path, mode, created_at_ms, updated_at_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+        rusqlite::params![
+            agent.session.workspace_id.as_str(),
+            agent.session.project_id.as_str(),
+            agent.session.workspace_root,
+            "current_checkout",
+            now
+        ],
+    )
+    .expect("workspace");
+    conn.execute(
+        "INSERT INTO agent_sessions (
+            session_id, title, project_id, workspace_id, workspace_root, workspace_mode,
+            state, permission_mode, ask_on_risk, bypass_all_permissions,
+            created_at_ms, updated_at_ms
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11)",
+        rusqlite::params![
+            agent.session.id.as_str(),
+            agent.session.title,
+            agent.session.project_id.as_str(),
+            agent.session.workspace_id.as_str(),
+            agent.session.workspace_root,
+            "current_checkout",
+            "idle",
+            "workspace_write",
+            1,
+            0,
+            now
+        ],
+    )
+    .expect("session");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn telegram_pairing_commands_and_approval_round_trip() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let home = dir.path().to_path_buf();
+    let db_path = home.join("vibex.db");
+    vibex_config_switch::secrets::configure_provider_secret_store(
+        vibex_config_switch::secrets::ProviderSecretStoreConfig::host_file(&home),
+    );
+    let mut conn = vibex_db::open_database(&db_path).expect("db");
+    vibex_db::apply_migrations(&mut conn).expect("migrate");
+
+    let agent = Arc::new(MockAgent::new());
+    seed_session(&conn, &agent);
+    drop(conn);
+
+    let fake = Arc::new(FakeTelegram::new());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let address = listener.local_addr().expect("addr");
+    let router = Router::new()
+        .route("/file/bot{token}/{*path}", get(fake_file))
+        .route("/bot{token}/{method}", post(fake_telegram))
+        .with_state(Arc::clone(&fake));
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router).await.expect("fake server");
+    });
+
+    let agent_port: Arc<dyn ImAgentPort> = agent.clone();
+    let service = Arc::new(
+        ImChannelService::new(ImChannelServiceConfig {
+            db_path: db_path.clone(),
+            home_dir: home,
+            agent: agent_port,
+            telegram_api_base: Some(format!("http://{address}")),
+            lark_api_base: None,
+            locale: Some("en".to_string()),
+        })
+        .expect("service"),
+    );
+    service.start().await.expect("start");
+    let channel = service
+        .create_channel(ImChannelDraft {
+            display_name: "Fake bot".to_string(),
+            config: ImChannelConfig::Telegram(vibex_core::ImTelegramConfig {
+                chat_id: "42".to_string(),
+                topic_mode: false,
+                require_mention_in_groups: false,
+            }),
+            default_session: None,
+            event_filter: Vec::new(),
+            locale: Some("en".to_string()),
+        })
+        .await
+        .expect("create channel");
+    service
+        .set_bot_token(&channel.channel_id, "123:fake-token")
+        .await
+        .expect("token");
+    service
+        .set_channel_enabled(&channel.channel_id, true)
+        .await
+        .expect("enable");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let pairing = service
+        .create_pairing_code(ImPairingRequest {
+            channel_id: channel.channel_id.clone(),
+            role: ImPrincipalRole::Operator,
+            ttl_ms: Some(60_000),
+            scope: vibex_core::ImPairingScope::Direct,
+            target_chat_id: None,
+        })
+        .await
+        .expect("pairing");
+    fake.push(message_update(1, "/start"));
+    fake.push(message_update(2, &format!("/pair {}", pairing.code)));
+    wait_for(
+        || async {
+            service
+                .list_principals(&channel.channel_id)
+                .await
+                .map(|principals| {
+                    principals
+                        .iter()
+                        .any(|principal| principal.status == ImPrincipalStatus::Active)
+                })
+                .unwrap_or(false)
+        },
+        "pairing",
+    )
+    .await;
+
+    // A code minted for a direct message is refused in a group, so a code
+    // pasted into a group cannot pair everyone with it. The bot still sees the
+    // message because the fake has no privacy mode.
+    let group_code = service
+        .create_pairing_code(ImPairingRequest {
+            channel_id: channel.channel_id.clone(),
+            role: ImPrincipalRole::Operator,
+            ttl_ms: Some(60_000),
+            scope: vibex_core::ImPairingScope::Direct,
+            target_chat_id: None,
+        })
+        .await
+        .expect("group code");
+    fake.push(json!({
+        "update_id": 41,
+        "message": {
+            "message_id": 41,
+            "date": 1,
+            "text": format!("/pair {}", group_code.code),
+            "chat": { "id": -1001234, "type": "supergroup" },
+            "from": { "id": 42, "is_bot": false, "first_name": "Tester" }
+        }
+    }));
+    wait_for(
+        || async {
+            fake.sent_texts()
+                .iter()
+                .any(|text| text.contains("cannot be used in this chat"))
+        },
+        "group pairing rejection",
+    )
+    .await;
+
+    fake.push(message_update(3, "/sessions"));
+    wait_for(
+        || async {
+            fake.sent_texts()
+                .iter()
+                .any(|text| text.contains("Recent sessions"))
+        },
+        "session list",
+    )
+    .await;
+
+    fake.push(message_update(4, "/use 1"));
+    wait_for(
+        || async {
+            fake.sent_texts()
+                .iter()
+                .any(|text| text.contains("Bound to"))
+        },
+        "binding",
+    )
+    .await;
+
+    fake.push(message_update(5, "hello fake"));
+    wait_for(
+        || async { !agent.prompts.lock().expect("prompts").is_empty() },
+        "prompt",
+    )
+    .await;
+
+    // A photo with a caption is one prompt carrying one file.
+    fake.push(json!({
+        "update_id": 51,
+        "message": {
+            "message_id": 51,
+            "date": 1,
+            "caption": "look at this",
+            "photo": [
+                { "file_id": "small", "file_size": 1, "width": 90, "height": 90 },
+                { "file_id": "large", "file_size": 5, "width": 1280, "height": 1280 }
+            ],
+            "chat": { "id": 42, "type": "private" },
+            "from": { "id": 42, "is_bot": false, "first_name": "Tester" }
+        }
+    }));
+    wait_for(
+        || async { agent.attachments.lock().expect("attachments").len() >= 2 },
+        "attachment prompt",
+    )
+    .await;
+    let sent = agent
+        .attachments
+        .lock()
+        .expect("attachments")
+        .last()
+        .cloned()
+        .expect("attachment prompt");
+    assert_eq!(sent.len(), 1, "one photo is one attachment");
+    assert_eq!(sent[0].label, "photo-1.jpg");
+    assert_eq!(sent[0].mime_type.as_deref(), Some("image/jpeg"));
+    assert!(
+        sent[0]
+            .uri
+            .as_deref()
+            .is_some_and(|uri| uri.starts_with("data:image/jpeg;base64,")),
+        "attachment bytes travel as a data URL"
+    );
+    assert_eq!(
+        agent
+            .prompts
+            .lock()
+            .expect("prompts")
+            .last()
+            .map(String::as_str),
+        Some("look at this")
+    );
+
+    let request = PermissionRequest {
+        id: vibex_core::RequestId::new(),
+        session_id: agent.session.id.clone(),
+        project_id: Some(agent.session.project_id.clone()),
+        workspace_id: Some(agent.session.workspace_id.clone()),
+        provider_request_id: Some("fake-request".to_string()),
+        risk_category: vibex_core::PermissionRiskCategory::Command,
+        title: "Run fake tests".to_string(),
+        details: vec![PermissionActionDetail {
+            label: "Command".to_string(),
+            value: "cargo test".to_string(),
+        }],
+        allowed_responses: vec![
+            PermissionResponseKind::Approve,
+            PermissionResponseKind::Deny,
+        ],
+        response_options: vec![
+            PermissionResponseOption {
+                option_id: "allow".to_string(),
+                label: "Allow".to_string(),
+                response: PermissionResponseKind::Approve,
+            },
+            PermissionResponseOption {
+                option_id: "deny".to_string(),
+                label: "Deny".to_string(),
+                response: PermissionResponseKind::Deny,
+            },
+        ],
+        status: PermissionRequestStatus::Pending,
+        requested_at_ms: unix_timestamp_ms(),
+        expires_at_ms: Some(unix_timestamp_ms() + 60_000),
+    };
+    *agent.pending.lock().expect("pending") = Some(request.clone());
+    agent
+        .timeline
+        .send(TimelineLiveEvent {
+            session_id: agent.session.id.clone(),
+            sequence: 7,
+            item: agent.item(7, TimelinePayload::PermissionRequest(request)),
+        })
+        .expect("timeline event");
+    wait_for(|| async { fake.callback_data().is_some() }, "approval card").await;
+    let action_id = fake.callback_data().expect("callback data");
+    fake.push(json!({
+        "update_id": 6,
+        "callback_query": {
+            "id": "callback-1",
+            "from": { "id": 42, "is_bot": false, "first_name": "Tester" },
+            "data": action_id,
+            "message": {
+                "message_id": 1,
+                "chat": { "id": 42, "type": "private" }
+            }
+        }
+    }));
+    wait_for(
+        || async { !agent.resolutions.lock().expect("resolutions").is_empty() },
+        "approval resolution",
+    )
+    .await;
+    assert!(
+        fake.callbacks
+            .lock()
+            .expect("callbacks")
+            .iter()
+            .any(|body| body.get("callback_query_id").and_then(Value::as_str) == Some("callback-1")),
+        "callback was acknowledged"
+    );
+    wait_for(
+        || async {
+            fake.edited.lock().expect("edited").iter().any(|body| {
+                body.get("text")
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| text.contains("approved"))
+            })
+        },
+        "approval card edit",
+    )
+    .await;
+
+    // The card and the desktop can answer at the same moment. Replaying the
+    // same button must not resolve twice, and the second press must be told the
+    // action is gone rather than silently ignored.
+    fake.push(json!({
+        "update_id": 7,
+        "callback_query": {
+            "id": "callback-2",
+            "from": { "id": 42, "is_bot": false, "first_name": "Tester" },
+            "data": action_id,
+            "message": {
+                "message_id": 1,
+                "chat": { "id": 42, "type": "private" }
+            }
+        }
+    }));
+    wait_for(
+        || async {
+            fake.sent_texts()
+                .iter()
+                .any(|text| text.contains("already handled"))
+        },
+        "duplicate press rejection",
+    )
+    .await;
+    assert_eq!(
+        agent.resolutions.lock().expect("resolutions").len(),
+        1,
+        "a replayed button resolves nothing"
+    );
+
+    let bindings: Vec<ImBindingSummary> = service
+        .list_bindings(&channel.channel_id)
+        .await
+        .expect("bindings");
+    assert_eq!(bindings.len(), 1);
+    assert_eq!(agent.prompts.lock().expect("prompts").len(), 2);
+    assert_eq!(agent.resolutions.lock().expect("resolutions").len(), 1);
+
+    // A one-field question is answered with a button, not with a trip to Vibex.
+    let elicitation = vibex_core::ElicitationRequest {
+        id: vibex_core::RequestId::new(),
+        session_id: agent.session.id.clone(),
+        provider_request_id: Some("elicitation-1".to_string()),
+        tool_call_id: None,
+        message: "Continue with the plan?".to_string(),
+        title: Some("Confirm".to_string()),
+        description: None,
+        fields: vec![vibex_core::ElicitationField {
+            id: "confirm".to_string(),
+            title: "Confirm".to_string(),
+            description: None,
+            required: true,
+            kind: vibex_core::ElicitationFieldKind::Boolean { default: None },
+        }],
+        status: vibex_core::ElicitationRequestStatus::Pending,
+        requested_at_ms: unix_timestamp_ms(),
+    };
+    *agent.pending_elicitation.lock().expect("elicitation") = Some(elicitation.clone());
+    agent
+        .timeline
+        .send(TimelineLiveEvent {
+            session_id: agent.session.id.clone(),
+            sequence: 9,
+            item: agent.item(9, TimelinePayload::ElicitationRequest(elicitation.clone())),
+        })
+        .expect("timeline");
+    wait_for(
+        || async {
+            fake.sent.lock().expect("sent").iter().any(|body| {
+                body.get("text")
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| text.contains("Continue with the plan?"))
+            })
+        },
+        "elicitation card",
+    )
+    .await;
+    let question = fake
+        .sent
+        .lock()
+        .expect("sent")
+        .iter()
+        .find(|body| {
+            body.get("text")
+                .and_then(Value::as_str)
+                .is_some_and(|text| text.contains("Continue with the plan?"))
+        })
+        .cloned()
+        .expect("question");
+    assert_eq!(
+        question
+            .pointer("/reply_markup/inline_keyboard/0/0/text")
+            .and_then(Value::as_str),
+        Some("Yes")
+    );
+    let yes_action = question
+        .pointer("/reply_markup/inline_keyboard/0/0/callback_data")
+        .and_then(Value::as_str)
+        .expect("yes action")
+        .to_string();
+    fake.push(json!({
+        "update_id": 9,
+        "callback_query": {
+            "id": "callback-3",
+            "from": { "id": 42, "is_bot": false, "first_name": "Tester" },
+            "data": yes_action,
+            "message": {
+                "message_id": 1,
+                "chat": { "id": 42, "type": "private" }
+            }
+        }
+    }));
+    wait_for(
+        || async { !agent.elicitations.lock().expect("elicitations").is_empty() },
+        "elicitation resolution",
+    )
+    .await;
+    let answered = agent
+        .elicitations
+        .lock()
+        .expect("elicitations")
+        .first()
+        .cloned()
+        .expect("resolution");
+    assert_eq!(
+        answered.action,
+        vibex_core::ElicitationResolutionAction::Accept
+    );
+    assert_eq!(
+        answered.answers.get("confirm"),
+        Some(&vibex_core::ElicitationAnswerValue::Boolean(true))
+    );
+    // The question was one field, so it never had to send the fallback notice.
+    assert!(
+        !fake
+            .sent_texts()
+            .iter()
+            .any(|text| text.contains("open Vibex"))
+    );
+
+    // Every send leaves a row, and the row reaches a terminal state. The ack
+    // for the last answer is still in flight when the resolution lands, so the
+    // drain is waited for rather than asserted immediately.
+    let conn = rusqlite::Connection::open(&db_path).expect("db");
+    let queued_rows = || -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM im_messages
+             WHERE direction = 'outbound' AND status = 'queued'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("queued rows")
+    };
+    for _ in 0..100 {
+        if queued_rows() == 0 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert_eq!(
+        queued_rows(),
+        0,
+        "nothing is left queued after the sends return"
+    );
+    let outbound: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM im_messages WHERE direction = 'outbound'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("outbound rows");
+    assert!(outbound > 0, "a delivered message is recorded");
+    let with_external_id: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM im_messages
+             WHERE direction = 'outbound' AND external_message_id IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )
+        .expect("external ids");
+    assert!(with_external_id > 0, "the provider id is kept");
+    // The log stores a preview and a digest, never the whole answer.
+    let preview_too_long: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM im_messages
+             WHERE direction = 'outbound' AND LENGTH(content_preview) > 256",
+            [],
+            |row| row.get(0),
+        )
+        .expect("preview bounds");
+    assert_eq!(preview_too_long, 0);
+    drop(conn);
+
+    service.stop().await;
+    server.abort();
+}

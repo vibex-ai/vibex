@@ -15,6 +15,7 @@ pub mod directory_picker;
 pub mod file_watch;
 pub mod gpui_ext;
 pub mod hint_layer;
+pub mod im_channels;
 pub mod image_editor;
 pub mod local_history_import;
 pub mod local_preview;

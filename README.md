@@ -410,7 +410,7 @@ The main ownership boundaries are:
 - `crates/vibex-remote-client` owns pairing, reconnect, synchronization, and Direct, Tailnet, and Relay route selection.
 - `apps/desktop` owns the native workbench and `DesktopRuntime`; `apps/mobile` and `apps/tui` compose the shared projections into their own surfaces.
 
-Read the [UI architecture boundary](docs/architecture/ui-boundary.md), [platform support matrix](docs/platform/support-matrix.md), [Remote Protocol v2](docs/remote/protocol-v2.md), and [SSH Remote Runtime](docs/remote/ssh-runtime.md) for the detailed contracts.
+Read the [UI architecture boundary](docs/architecture/ui-boundary.md), [platform support matrix](docs/platform/support-matrix.md), [Remote Protocol v2](docs/remote/protocol-v2.md), [SSH Remote Runtime](docs/remote/ssh-runtime.md), and [IM chat channels](docs/im-channels.md) for the detailed contracts.
 
 ---
 
