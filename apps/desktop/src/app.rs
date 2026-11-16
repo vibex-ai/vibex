@@ -1411,6 +1411,19 @@ const SETTINGS_DIALOG_CONTENT_RADIUS: f32 = SETTINGS_DIALOG_RADIUS - 1.0;
 /// A settings surface with its own page body — the IM channels master–detail —
 /// reads this too, so its title shares the settings alignment spine.
 pub(crate) const SETTINGS_PAGE_PADDING_X: f32 = 70.0;
+/// Inset of the close button the dialog paints in its top-right corner.
+const SETTINGS_CLOSE_INSET: f32 = 8.0;
+/// Edge of that close button: a small ghost button is 24px square.
+const SETTINGS_CLOSE_SIZE: f32 = 24.0;
+/// Gap between the corner actions.
+const SETTINGS_CORNER_ACTION_GAP: f32 = 4.0;
+/// Right inset of the undo action: one gap to the left of the close button.
+const SETTINGS_UNDO_ACTION_RIGHT: f32 =
+    SETTINGS_CLOSE_INSET + SETTINGS_CLOSE_SIZE + SETTINGS_CORNER_ACTION_GAP;
+/// Room the narrow settings top row leaves free for the corner actions, so the
+/// search field never runs underneath them.
+const SETTINGS_CORNER_ACTIONS_WIDTH: f32 =
+    SETTINGS_UNDO_ACTION_RIGHT + SETTINGS_CLOSE_SIZE + SETTINGS_CORNER_ACTION_GAP;
 
 /// A route's failover prompt, with the seconds it has left.
 ///
@@ -93685,6 +93698,10 @@ impl FoundationSettings {
             return v_flex()
                 .w_full()
                 .gap_2()
+                // The dialog's top-right corner holds the close button and,
+                // while there are changes to undo, the undo action. Reserve
+                // that strip so the search field cannot run underneath them.
+                .pr(px(SETTINGS_CORNER_ACTIONS_WIDTH))
                 .child(search)
                 .when_some(search_results, |this, results| this.child(results))
                 .when(!has_search_results, |this| {
@@ -100819,7 +100836,7 @@ impl FoundationSettings {
                     cx,
                 )]),
                 SettingsGroup::new(
-                    locale::text("Beta features", "Beta 功能", "Beta 功能"),
+                    locale::text("Experimental features", "实验功能", "實驗功能"),
                     vec![setting_row(
                         locale::text("IM channels (beta)", "IM 频道（Beta）", "IM 頻道（Beta）"),
                         locale::text(
@@ -100860,6 +100877,7 @@ impl Render for FoundationSettings {
             .target_anchor
             .borrow_mut()
             .take();
+        let has_changes = self.has_changes(cx);
         let navigation = self.render_navigation(vertical_tabs, strings, cx);
         // The IM channel section is a beta behind the Developer page's switch,
         // so its entry is gone from the navigation while the switch is off. A
@@ -100896,26 +100914,7 @@ impl Render for FoundationSettings {
             SettingsSection::Developer => self.render_developer_page(stacked_rows, cx),
             SettingsSection::About => self.render_about_page(stacked_rows, resolved_locale, cx),
         };
-        let has_changes = self.has_changes(cx);
         let undo_label = strings.undo_changes;
-        let page = div()
-            .relative()
-            .w_full()
-            .min_w_0()
-            .child(page)
-            .when(has_changes, |this| {
-                this.child(
-                    Button::new("undo-settings-changes")
-                        .small()
-                        .ghost()
-                        .icon(IconName::Undo2)
-                        .absolute()
-                        .top(px(20.0))
-                        .right(px(64.0))
-                        .tooltip(undo_label)
-                        .on_click(cx.listener(|this, _, window, cx| this.undo_changes(window, cx))),
-                )
-            });
         let target_anchor = self
             .settings_render_context
             .target_anchor
@@ -100973,6 +100972,22 @@ impl Render for FoundationSettings {
                     .overflow_y_scroll()
                     .child(page),
             )
+            // The undo action belongs to the dialog's top-right corner, beside
+            // the close button, and not to the page: pinned here it stays in
+            // reach while a long page scrolls.
+            .when(has_changes, |this| {
+                this.child(
+                    Button::new("undo-settings-changes")
+                        .small()
+                        .ghost()
+                        .icon(IconName::Undo2)
+                        .absolute()
+                        .top(px(SETTINGS_CLOSE_INSET))
+                        .right(px(SETTINGS_UNDO_ACTION_RIGHT))
+                        .tooltip(undo_label)
+                        .on_click(cx.listener(|this, _, window, cx| this.undo_changes(window, cx))),
+                )
+            })
     }
 }
 
@@ -128123,7 +128138,7 @@ mod tests {
         assert!(developer_page.contains("set_im_channels_beta"));
         assert!(
             developer_page
-                .contains("locale::text(\"Beta features\", \"Beta 功能\", \"Beta 功能\")")
+                .contains("locale::text(\"Experimental features\", \"实验功能\", \"實驗功能\")")
         );
 
         let switch = source
@@ -128565,8 +128580,17 @@ mod tests {
         assert!(settings.contains("has_changes"));
         assert!(settings.contains("undo-settings-changes"));
         assert!(settings.contains(".absolute()"));
-        assert!(settings.contains(".top(px(20.0))"));
-        assert!(settings.contains(".right(px(64.0))"));
+        assert!(settings.contains(".top(px(SETTINGS_CLOSE_INSET))"));
+        assert!(settings.contains(".right(px(SETTINGS_UNDO_ACTION_RIGHT))"));
+        // The action sits beside the dialog's close button, outside the page
+        // scroll viewport, so it stays in the corner while the page scrolls.
+        let page_scroll = settings
+            .find(".id(\"foundation-settings-page-scroll\")")
+            .expect("settings page should own a dedicated scroll viewport");
+        let undo = settings
+            .find("undo-settings-changes")
+            .expect("the undo action should stay available");
+        assert!(undo > page_scroll);
         assert!(!settings.contains("SettingsDialogTitle"));
 
         let open_settings = source
