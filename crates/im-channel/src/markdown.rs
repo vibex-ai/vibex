@@ -47,9 +47,10 @@ pub fn to_telegram_html(markdown: &str) -> String {
                 rows.push(lines[index]);
                 index += 1;
             }
-            out.push_str("<pre>");
-            out.push_str(&escape_html(&rows.join("\n")));
-            out.push_str("</pre>\n");
+            if let Some(rendered) = render_table(&rows) {
+                out.push_str(&rendered);
+                out.push('\n');
+            }
             continue;
         }
 
@@ -189,6 +190,94 @@ fn bullet_text(trimmed: &str) -> Option<&str> {
         }
     }
     None
+}
+
+/// A Markdown table as the monospace block a chat can actually show.
+///
+/// Telegram has no table markup, and passing the source lines through as a code
+/// block showed the pipes, the divider row and every `**` literally — a table
+/// that had to be read as Markdown source. The cells are parsed instead, each
+/// rendered to plain text, padded by display width, and emitted without the
+/// separators that were only ever syntax.
+fn render_table(lines: &[&str]) -> Option<String> {
+    let rows: Vec<Vec<String>> = lines
+        .iter()
+        .filter(|line| !is_table_divider(line))
+        .map(|line| table_cells(line))
+        .collect();
+    if rows.is_empty() {
+        return None;
+    }
+    let columns = rows.iter().map(Vec::len).max().unwrap_or(0);
+    if columns == 0 {
+        return None;
+    }
+    // A column wider than a phone screen would push the table off the edge.
+    // Cells are never cut — a wrong number is worse than a wrapped line — the
+    // padding is simply bounded.
+    const MAX_COLUMN_WIDTH: usize = 48;
+    let mut widths = vec![0_usize; columns];
+    for row in &rows {
+        for (index, cell) in row.iter().enumerate() {
+            widths[index] = widths[index].max(cell_width(cell)).min(MAX_COLUMN_WIDTH);
+        }
+    }
+    let mut out = String::from("<pre>");
+    for (row_index, row) in rows.iter().enumerate() {
+        if row_index > 0 {
+            out.push('\n');
+        }
+        if row_index == 1 {
+            // The rule the pipe syntax carried, drawn to the real widths.
+            for (index, width) in widths.iter().enumerate() {
+                if index > 0 {
+                    out.push_str("  ");
+                }
+                out.push_str(&"-".repeat(*width));
+            }
+            out.push('\n');
+        }
+        for (index, width) in widths.iter().enumerate() {
+            if index > 0 {
+                out.push_str("  ");
+            }
+            let cell = row.get(index).map(String::as_str).unwrap_or("");
+            out.push_str(&escape_html(cell));
+            out.push_str(&" ".repeat(width.saturating_sub(cell_width(cell))));
+        }
+        // Trailing padding would only widen the block.
+        while out.ends_with(' ') {
+            out.pop();
+        }
+    }
+    out.push_str("</pre>");
+    Some(out)
+}
+
+/// One row's cells, as plain text without their Markdown.
+fn table_cells(line: &str) -> Vec<String> {
+    let inner = line.trim().trim_matches('|');
+    inner
+        .split('|')
+        .map(|cell| to_plain_text(cell.trim()).trim().to_string())
+        .collect()
+}
+
+/// The `| --- | :-: |` row, which only says how the source was aligned.
+fn is_table_divider(line: &str) -> bool {
+    let inner = line.trim().trim_matches('|').trim();
+    !inner.is_empty()
+        && inner.contains('-')
+        && inner
+            .chars()
+            .all(|character| matches!(character, '-' | ':' | '|' | ' '))
+}
+
+/// A cell's width on screen: a CJK character or an emoji is about two cells.
+fn cell_width(text: &str) -> usize {
+    text.chars()
+        .map(|character| if character as u32 >= 0x1100 { 2 } else { 1 })
+        .sum()
 }
 
 fn is_table_start(lines: &[&str], index: usize) -> bool {
@@ -447,7 +536,46 @@ mod tests {
     fn a_table_becomes_a_pre_block() {
         let html = to_telegram_html("| a | b |\n| - | - |\n| 1 | 2 |");
         assert!(html.starts_with("<pre>"), "{html}");
-        assert!(html.contains("| 1 | 2 |"), "{html}");
+        assert!(html.ends_with("</pre>"), "{html}");
+        assert!(html.contains("a  b"), "{html}");
+        assert!(html.contains("1  2"), "{html}");
+    }
+
+    #[test]
+    fn a_table_is_aligned_cells_without_its_pipes_or_markup() {
+        let html = to_telegram_html("| 层 | 选型 |\n| --- | --- |\n| 语言 | **Rust** |");
+        assert!(html.starts_with("<pre>"), "{html}");
+        assert!(!html.contains('|'), "the pipes are syntax: {html}");
+        assert!(
+            !html.contains("**"),
+            "cell markup is rendered, not shown: {html}"
+        );
+        assert!(
+            !html.contains("| --- |"),
+            "the source divider is not shown: {html}"
+        );
+        // The first column is the same width on both rows, which is the whole
+        // point of the block: `层` is one character but occupies two cells.
+        assert_eq!(html, "<pre>层    选型\n----  ----\n语言  Rust</pre>");
+    }
+
+    #[test]
+    fn a_short_row_is_padded_to_the_columns_the_header_named() {
+        let html = to_telegram_html("| a | b | c |\n| - | - | - |\n| 1 |\n| 2 | 3 | 4 |");
+        let body = html.trim_start_matches("<pre>").trim_end_matches("</pre>");
+        let lines: Vec<&str> = body.lines().collect();
+        assert_eq!(lines.len(), 4, "a header, the rule, and two rows: {html}");
+        assert!(
+            lines[2].starts_with('1'),
+            "a short row still starts a column: {html}"
+        );
+        assert!(lines[3].contains("2  3  4"), "{html}");
+    }
+
+    #[test]
+    fn a_table_cell_keeps_its_text_when_it_holds_markup() {
+        let plain = to_plain_text("| a |\n| - |\n| `x < y` & more |");
+        assert!(plain.contains("x < y & more"), "{plain}");
     }
 
     #[test]
