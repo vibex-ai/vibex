@@ -19,6 +19,55 @@ use crate::types::{
 
 const TELEGRAM_API_BASE: &str = "https://api.telegram.org";
 
+/// The only emoji Telegram accepts as a reaction.
+///
+/// The vocabulary is the provider's, not a preference: anything outside it is a
+/// `400`, so the channel checks before it asks. `❤‍🔥` carries a zero-width
+/// joiner and is spelled out rather than composed.
+const TELEGRAM_REACTION_EMOJI: &[&str] = &[
+    "👍",
+    "👎",
+    "❤",
+    "🔥",
+    "🥰",
+    "👏",
+    "😁",
+    "🤔",
+    "🤯",
+    "😱",
+    "🤬",
+    "😢",
+    "🎉",
+    "🤩",
+    "🤮",
+    "💩",
+    "🙏",
+    "👌",
+    "🕊",
+    "🤡",
+    "🥱",
+    "🥴",
+    "😍",
+    "🐳",
+    "❤‍🔥",
+    "🌚",
+    "🌭",
+    "💯",
+    "🤣",
+    "⚡",
+    "🍌",
+    "🏆",
+    "💔",
+    "🤨",
+    "😐",
+    "🍓",
+    "🍾",
+    "😴",
+    "😄",
+    "😑",
+    "😇",
+];
+
 /// The largest file a chat message may bring in.
 ///
 /// The bot API itself refuses files over 20 MB, and a prompt carrying a large
@@ -473,6 +522,37 @@ impl TelegramAdapter {
         Ok(())
     }
 
+    /// Sets the bot's reaction on a message.
+    ///
+    /// Telegram accepts a fixed emoji vocabulary for reactions and answers
+    /// anything else with a 400; an emoji outside it is skipped instead. An
+    /// empty emoji clears the reaction, which is how the Agent withdrawing its
+    /// mark reaches the chat.
+    pub async fn set_reaction(
+        &self,
+        target: &ImTarget,
+        message_id: &str,
+        emoji: &str,
+    ) -> ImResult<()> {
+        let Ok(message_id) = message_id.parse::<i64>() else {
+            return Err(ImError::Unsupported);
+        };
+        let Some(reaction) = reaction_payload(emoji) else {
+            return Err(ImError::Unsupported);
+        };
+        self.call(
+            "setMessageReaction",
+            json!({
+                "chat_id": target.chat_id,
+                "message_id": message_id,
+                "reaction": reaction,
+            }),
+        )
+        .await?;
+        self.mark_outbound();
+        Ok(())
+    }
+
     /// Publishes the slash-command menu a client shows in its `/` picker.
     ///
     /// Telegram only accepts lowercase names of letters, digits and underscore,
@@ -736,6 +816,18 @@ fn is_entity_error(error: &ImError) -> bool {
     false
 }
 
+/// The `reaction` field for one emoji, or `None` when Telegram has no such
+/// reaction. An empty emoji clears the reaction.
+fn reaction_payload(emoji: &str) -> Option<Value> {
+    let emoji = emoji.trim();
+    if emoji.is_empty() {
+        return Some(json!([]));
+    }
+    TELEGRAM_REACTION_EMOJI
+        .contains(&emoji)
+        .then(|| json!([{ "type": "emoji", "emoji": emoji }]))
+}
+
 fn provider_error(value: &Value) -> ImError {
     let code = value
         .get("error_code")
@@ -800,6 +892,10 @@ impl ImAdapter for TelegramAdapter {
 
     async fn register_commands(&self, commands: &[ImCommandSpec]) -> ImResult<()> {
         TelegramAdapter::register_commands(self, commands).await
+    }
+
+    async fn set_reaction(&self, target: &ImTarget, message_id: &str, emoji: &str) -> ImResult<()> {
+        TelegramAdapter::set_reaction(self, target, message_id, emoji).await
     }
 
     async fn answer_callback(&self, callback_query_id: &str, text: Option<&str>) -> ImResult<()> {
@@ -906,6 +1002,16 @@ mod tests {
     fn an_approval_card_keeps_one_row() {
         let card = vec![button("Approve"), button("Always allow"), button("Deny")];
         assert_eq!(button_row_width(&card), 3);
+    }
+
+    #[test]
+    fn a_reaction_is_only_sent_for_an_emoji_telegram_accepts() {
+        assert_eq!(
+            reaction_payload("👍"),
+            Some(json!([{ "type": "emoji", "emoji": "👍" }]))
+        );
+        assert_eq!(reaction_payload("  "), Some(json!([])));
+        assert_eq!(reaction_payload("🦄"), None);
     }
 
     #[tokio::test]

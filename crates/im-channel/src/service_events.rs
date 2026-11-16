@@ -175,6 +175,28 @@ impl ImChannelService {
 
     async fn handle_timeline_event(self: &Arc<Self>, event: TimelineLiveEvent) -> VibexResult<()> {
         let conn = self.open()?;
+        // A user item names the prompt that produced it. This is the join a
+        // later Agent reaction needs, and it is not a filtered event: a channel
+        // that hides its own prompt echo still has to know where it went.
+        if let TimelinePayload::UserMessage(_) = &event.item.payload
+            && let Some(correlation) = event.item.correlation_id.as_ref()
+        {
+            self.bind_prompt_item(
+                &event.session_id,
+                event.item.id.as_str(),
+                correlation.as_str(),
+            );
+        }
+        // A reaction names the user item it decorates, and the target it finds
+        // already knows which chat message to react to. Handling it once, and
+        // not per binding, keeps a session bound in two chats from reacting in
+        // both.
+        if let TimelinePayload::SystemNotice(notice) = &event.item.payload
+            && let Some(correlation) = event.item.provider_correlation_id.as_deref()
+        {
+            self.mirror_reaction(&event.session_id, notice, correlation)
+                .await;
+        }
         let bindings = ImBindingRepository::list_active_for_session(&conn, &event.session_id)?;
         if bindings.is_empty() {
             return Ok(());
@@ -277,6 +299,7 @@ impl ImChannelService {
                     self.close_elicitation(resolution.request_id.as_str())
                         .await?;
                 }
+
                 _ => {}
             }
         }

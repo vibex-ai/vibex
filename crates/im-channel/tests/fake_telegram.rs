@@ -28,9 +28,11 @@ use vibex_core::{
     PermissionResponseKind, PermissionResponseOption, ProjectId, ProviderProfileId,
     ResolveElicitationRequest, ResolvePermissionRequest, RuntimeAuthSource, RuntimeModelSelection,
     SendAgentMessageRequest, SessionRuntimeSelection, SessionRuntimeSelectionStatus,
-    SetDesiredAgentSessionRuntimeRequest, TimelineItem, TimelineItemId, TimelineLiveEvent,
-    TimelinePage, TimelinePayload, TimelinePayloadDepth, TimelineRedactionState, TimelineSource,
-    VibexResult, VibexSessionId, WorkspaceId, WorkspaceMode, unix_timestamp_ms,
+    SetDesiredAgentSessionRuntimeRequest, SystemNoticeLevel, SystemNoticePayload, TimelineItem,
+    TimelineItemId, TimelineLiveEvent, TimelinePage, TimelinePayload, TimelinePayloadDepth,
+    TimelineRedactionState, TimelineSource, UserMessagePayload,
+    VIBEX_USE_REACTION_CORRELATION_PREFIX, VibexResult, VibexSessionId, WorkspaceId, WorkspaceMode,
+    unix_timestamp_ms,
 };
 use vibex_im_channel::{ImAgentPort, ImChannelService, ImChannelServiceConfig};
 
@@ -41,6 +43,7 @@ struct FakeTelegram {
     callbacks: Mutex<Vec<Value>>,
     topics: Mutex<Vec<Value>>,
     topic_edits: Mutex<Vec<Value>>,
+    reactions: Mutex<Vec<Value>>,
     notify: Notify,
     next_message_id: AtomicI64,
 }
@@ -54,6 +57,7 @@ impl FakeTelegram {
             callbacks: Mutex::new(Vec::new()),
             topics: Mutex::new(Vec::new()),
             topic_edits: Mutex::new(Vec::new()),
+            reactions: Mutex::new(Vec::new()),
             notify: Notify::new(),
             next_message_id: AtomicI64::new(1),
         }
@@ -144,6 +148,10 @@ async fn fake_telegram(
             Value::Bool(true)
         }
         "setMyCommands" | "sendChatAction" => Value::Bool(true),
+        "setMessageReaction" => {
+            state.reactions.lock().expect("reactions").push(body);
+            Value::Bool(true)
+        }
         "answerCallbackQuery" => {
             state.callbacks.lock().expect("callbacks").push(body);
             Value::Bool(true)
@@ -183,6 +191,9 @@ struct MockAgent {
     created_selections: Mutex<Vec<SessionRuntimeSelection>>,
     /// Every runtime selection the channel has applied.
     applied_selections: Mutex<Vec<SessionRuntimeSelection>>,
+    /// The newest user timeline item the mock published, with its text.
+    last_user_item: Mutex<Option<(String, String)>>,
+    next_sequence: AtomicI64,
     attachments: Mutex<Vec<Vec<vibex_core::MessageAttachment>>>,
     resolutions: Mutex<Vec<PermissionResolution>>,
     elicitations: Mutex<Vec<vibex_core::ElicitationResolution>>,
@@ -233,10 +244,26 @@ impl MockAgent {
             prompt_efforts: Mutex::new(Vec::new()),
             created_selections: Mutex::new(Vec::new()),
             applied_selections: Mutex::new(Vec::new()),
+            last_user_item: Mutex::new(None),
+            next_sequence: AtomicI64::new(100),
             attachments: Mutex::new(Vec::new()),
             resolutions: Mutex::new(Vec::new()),
             elicitations: Mutex::new(Vec::new()),
         }
+    }
+
+    /// A reaction notice naming the user item it decorates.
+    fn reaction_item(&self, sequence: i64, item_id: &str, emoji: &str) -> TimelineItem {
+        let mut item = self.item(
+            sequence,
+            TimelinePayload::SystemNotice(SystemNoticePayload {
+                level: SystemNoticeLevel::Info,
+                message: emoji.to_string(),
+            }),
+        );
+        item.provider_correlation_id =
+            Some(format!("{VIBEX_USE_REACTION_CORRELATION_PREFIX}{item_id}"));
+        item
     }
 
     fn item(&self, sequence: i64, payload: TimelinePayload) -> TimelineItem {
@@ -352,7 +379,38 @@ impl ImAgentPort for MockAgent {
             .lock()
             .expect("prompt efforts")
             .push(request.reasoning_effort);
-        self.prompts.lock().expect("prompts").push(request.text);
+        self.prompts
+            .lock()
+            .expect("prompts")
+            .push(request.text.clone());
+        // The real dispatcher appends the user item with the request's
+        // correlation and publishes it; a reaction later names that item.
+        let sequence = self.next_sequence.fetch_add(1, Ordering::SeqCst);
+        let payload = TimelinePayload::UserMessage(UserMessagePayload {
+            text: request.text.clone(),
+            ..Default::default()
+        });
+        let item = TimelineItem {
+            id: TimelineItemId::new(),
+            session_id: self.session.id.clone(),
+            sequence,
+            timestamp_ms: unix_timestamp_ms(),
+            source: TimelineSource::User,
+            kind: payload.kind(),
+            correlation_id: request.correlation_id.clone(),
+            provider_correlation_id: None,
+            redaction_state: TimelineRedactionState::None,
+            execution_attribution: None,
+            payload_depth: TimelinePayloadDepth::Detail,
+            payload,
+        };
+        *self.last_user_item.lock().expect("user item") =
+            Some((item.id.as_str().to_string(), request.text.clone()));
+        let _ = self.timeline.send(TimelineLiveEvent {
+            session_id: self.session.id.clone(),
+            sequence,
+            item,
+        });
         self.attachments
             .lock()
             .expect("attachments")
@@ -1153,6 +1211,54 @@ async fn telegram_pairing_commands_and_approval_round_trip() {
             .iter()
             .any(|text| text.contains("Could not apply that")),
         "the provider switch is accepted"
+    );
+
+    // An Agent reaction reaches the chat message it reacted to: the prompt
+    // carries a correlation, the dispatcher publishes the user item with it,
+    // and the reaction notice names that item.
+    fake.push(message_update(70, "react to me"));
+    wait_for(
+        || async {
+            agent
+                .last_user_item
+                .lock()
+                .expect("user item")
+                .as_ref()
+                .is_some_and(|(_, text)| text == "react to me")
+        },
+        "user item for the reaction",
+    )
+    .await;
+    let user_item = agent
+        .last_user_item
+        .lock()
+        .expect("user item")
+        .clone()
+        .expect("user item");
+    let _ = agent.timeline.send(TimelineLiveEvent {
+        session_id: agent.session.id.clone(),
+        sequence: 300,
+        item: agent.reaction_item(300, &user_item.0, "👍"),
+    });
+    wait_for(
+        || async { !fake.reactions.lock().expect("reactions").is_empty() },
+        "mirrored reaction",
+    )
+    .await;
+    let reaction = {
+        let reactions = fake.reactions.lock().expect("reactions");
+        reactions.last().cloned().expect("reaction")
+    };
+    assert_eq!(
+        reaction.get("message_id").and_then(Value::as_i64),
+        Some(70),
+        "the reaction lands on the message the reader sent"
+    );
+    assert_eq!(
+        reaction
+            .pointer("/reaction/0/emoji")
+            .and_then(Value::as_str),
+        Some("👍")
     );
 
     // A streamed turn: the live message the turn already owns is edited as

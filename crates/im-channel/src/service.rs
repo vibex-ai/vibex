@@ -73,6 +73,8 @@ mod commands;
 mod events;
 #[path = "service_live.rs"]
 mod live;
+#[path = "service_reactions.rs"]
+mod reactions;
 
 struct Inner {
     config: ImChannelServiceConfig,
@@ -89,6 +91,9 @@ struct Inner {
     inbound_limiter: InboundLimiter,
     /// One live turn per binding, keyed by binding id.
     live_turns: Mutex<HashMap<ImBindingId, Arc<Mutex<live::LiveTurn>>>>,
+    /// Chat messages recent prompts came from, so an Agent reaction can reach
+    /// the message it answered.
+    prompt_targets: Mutex<reactions::PromptTargets>,
 }
 
 struct ChannelRuntime {
@@ -137,6 +142,7 @@ impl ImChannelService {
                 session_choices: Mutex::new(HashMap::new()),
                 inbound_limiter: InboundLimiter::new(),
                 live_turns: Mutex::new(HashMap::new()),
+                prompt_targets: Mutex::new(reactions::PromptTargets::default()),
             }),
         })
     }
@@ -2122,6 +2128,26 @@ impl ImChannelService {
         // has to come from the same selection this prompt carries. Hard-coding
         // `None` failed every prompt once the session had a reasoning level.
         let reasoning_effort = runtime.desired.reasoning_effort.clone();
+        // The correlation this prompt carries is how the user timeline item is
+        // recognized later, which is what lets an Agent reaction find the
+        // message the reader actually sent.
+        let correlation_id = CorrelationId::new();
+        if let Some(external_message_id) = event
+            .external_message_id
+            .as_deref()
+            .filter(|id| !id.is_empty())
+        {
+            self.note_prompt_target(
+                &correlation_id,
+                reactions::PromptTarget {
+                    channel_id: event.channel_id.clone(),
+                    external_chat_id: event.external_chat_id.clone(),
+                    thread_key: event.thread_key.clone(),
+                    external_message_id: external_message_id.to_string(),
+                    created_at_ms: unix_timestamp_ms(),
+                },
+            );
+        }
         let key = sha256_hex(&format!(
             "{}:{}:{}",
             event.channel_id, event.provider_update_id, session_id
@@ -2149,7 +2175,7 @@ impl ImChannelService {
                 attachments,
                 mentions: Vec::new(),
                 reasoning_effort,
-                correlation_id: Some(CorrelationId::new()),
+                correlation_id: Some(correlation_id),
                 delivery: Default::default(),
                 prompt_context: None,
                 provenance: MessageProvenance::human_input(),

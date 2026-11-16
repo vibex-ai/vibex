@@ -67,6 +67,20 @@ pub trait ImAdapter: Send + Sync + 'static {
         Ok(())
     }
 
+    /// Sets an emoji reaction on a message the bot can see. An empty emoji
+    /// clears it.
+    ///
+    /// A transport without reactions, or one that refuses this emoji, says so
+    /// rather than pretending it worked.
+    async fn set_reaction(
+        &self,
+        _target: &ImTarget,
+        _message_id: &str,
+        _emoji: &str,
+    ) -> ImResult<()> {
+        Err(crate::error::ImError::Unsupported)
+    }
+
     async fn probe(&self) -> ImResult<ImChannelTestReport>;
 
     /// Whether an inbound group message is addressed to the bot.

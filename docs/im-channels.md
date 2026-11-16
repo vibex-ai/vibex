@@ -56,6 +56,19 @@ Markdown is rendered where the transport supports it: Telegram receives HTML
 Telegram refuses the markup, the same text is re-sent as plain text, so a stray
 `<` in a code sample costs the formatting and never the answer.
 
+### Reactions
+
+When the Agent reacts to a message — the desktop's message-reaction setting is
+what lets it — the same emoji is set on the chat message that sent the prompt.
+The channel knows which chat message a prompt came from because it remembers the
+correlation the submission carried and matches it to the user item the runtime
+publishes.
+
+The mirror is close to the provider's vocabulary, not the Agent's: Telegram only
+accepts its own list of reaction emoji, so a reaction outside it is skipped
+rather than sent and refused. A transport without reactions, such as Lark text
+messages, ignores them.
+
 ## Create the bot
 
 ### Telegram
@@ -326,8 +339,8 @@ last outbound, pending sends, and the last error with its retry time.
   option list, is answered with a button. Any other form — several fields, free
   text, numbers, multi-select — sends a notice and the answer happens in Vibex.
 - Reasoning is never forwarded, and tool names only label the one live progress
-  line. Final answers, errors, approvals, and notices are what a chat receives;
-  a channel that removes `tool_progress` from its event filter gets a progress
-  line without them.
+  line. Final answers, errors, approvals, notices, and the Agent's reaction are
+  what a chat receives; a channel that removes `tool_progress` from its event
+  filter gets a progress line without them.
 - Lark card buttons require the `card.action.trigger` event subscription; without
   it approvals fall back to `/approve <code>`.
