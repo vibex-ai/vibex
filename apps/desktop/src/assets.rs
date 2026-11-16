@@ -804,6 +804,18 @@ const VIBEX_ASSETS: &[(&str, &[u8])] = &[
             "/assets/icons/funnel.svg"
         )),
     ),
+    // The IM channel entry's chat bubble. It is Lucide's `message-circle` (ISC,
+    // the same set `gpui-kit-assets` bundles) because the component asset source
+    // embeds only a curated subset and this row needed one outside it. Replace
+    // the file with any other 24px outline glyph — Iconify's `ci:chat-circle`,
+    // say — to change the row without touching this table.
+    (
+        "icons/vibex/chat-circle.svg",
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/icons/chat-circle.svg"
+        )),
+    ),
 ];
 
 macro_rules! bundled_icon_asset {

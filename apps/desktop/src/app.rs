@@ -1388,6 +1388,12 @@ const SETTINGS_VERTICAL_TABS_MIN_WIDTH: f32 = 768.0;
 const SETTINGS_NAVIGATION_WIDTH: f32 = 256.0;
 const SETTINGS_NAVIGATION_ROW_HEIGHT: f32 = 34.0;
 const SETTINGS_NAVIGATION_SECTION_GAP: f32 = 4.0;
+/// The icon the IM channels settings row draws.
+///
+/// It is not in the component icon set's curated list, so it is addressed as an
+/// asset path: an unregistered path renders nothing at all, which is exactly
+/// how that row lost its glyph once.
+const IM_CHANNELS_SETTINGS_ICON: &str = "icons/vibex/chat-circle.svg";
 const SETTINGS_SEARCH_RESULT_LIMIT: usize = 32;
 const SETTINGS_SEARCH_RESULT_MAX_HEIGHT: f32 = 480.0;
 const SETTINGS_DIALOG_MAX_WIDTH: f32 = 1160.0;
@@ -93612,17 +93618,19 @@ impl FoundationSettings {
                         let label = settings_section_label(section);
                         let active = self.active_section == section;
                         // The channels entry is a chat, not the generic Bot
-                        // glyph the Agent entries use. `MessageCircle` is not
-                        // in this icon set's curated list, so the bundled
-                        // asset is addressed by path.
+                        // glyph the Agent entries use.
                         let icon = if section == SettingsSection::Channels {
-                            Icon::default().path("icons/message-circle.svg")
+                            Icon::default().path(IM_CHANNELS_SETTINGS_ICON)
                         } else {
                             Icon::new(icon.clone())
                         }
                         .size(px(16.0))
                         .mr(px(2.0))
-                        .text_color(if active { foreground } else { muted_foreground });
+                        .text_color(if active {
+                            foreground
+                        } else {
+                            muted_foreground
+                        });
                         Button::new(SharedString::from(format!("settings-{section:?}")))
                             .small()
                             .ghost()
@@ -127926,7 +127934,11 @@ mod tests {
         assert!(search_field.contains(".flex_none()"));
         assert!(search_field.contains(".h(px(40.0))"));
         assert!(navigation.contains("let label = settings_section_label(section)"));
-        assert!(navigation.contains("let icon = Icon::new(icon.clone())"));
+        // The channels row is the one entry that does not draw the glyph from
+        // the component icon set.
+        assert!(navigation.contains("let icon = if section == SettingsSection::Channels"));
+        assert!(navigation.contains("Icon::default().path(IM_CHANNELS_SETTINGS_ICON)"));
+        assert!(navigation.contains("Icon::new(icon.clone())"));
         assert!(navigation.contains(".mr(px(2.0))"));
         assert!(navigation.contains(".child(div().flex_1())"));
         assert!(navigation.contains(".w_full()"));
@@ -130049,6 +130061,23 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The IM channels row draws its icon by asset path, and an unregistered
+    /// path resolves to nothing without an error, so the registration is what
+    /// the row depends on.
+    #[test]
+    fn the_im_channels_settings_row_icon_is_bundled() {
+        use gpui::AssetSource as _;
+
+        let assets = crate::assets::VibexAssets;
+        assert!(
+            assets
+                .load(IM_CHANNELS_SETTINGS_ICON)
+                .expect("asset lookup should not fail")
+                .is_some(),
+            "{IM_CHANNELS_SETTINGS_ICON} is not in the asset bundle"
+        );
     }
 
     /// `Popover` toggles its panel from a mouse-down handler that also stops
