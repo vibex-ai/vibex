@@ -1833,6 +1833,29 @@ const fn default_auto_update_enabled() -> bool {
     true
 }
 
+/// User-message reaction preferences.
+///
+/// The receipt is decoration, not a durable part of the transcript, so the
+/// switch can turn every reaction off without touching a session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessageReactionsUiState {
+    #[serde(default = "default_message_reactions_enabled")]
+    pub enabled: bool,
+}
+
+impl Default for MessageReactionsUiState {
+    fn default() -> Self {
+        Self {
+            enabled: default_message_reactions_enabled(),
+        }
+    }
+}
+
+const fn default_message_reactions_enabled() -> bool {
+    true
+}
+
 /// Developer-only diagnostics preferences.
 ///
 /// Kept apart from [`DesktopBehaviorUiState`], which holds user-facing product
@@ -1914,6 +1937,8 @@ pub struct DesktopUiStateV1 {
     #[serde(default)]
     pub desktop_behavior: DesktopBehaviorUiState,
     #[serde(default)]
+    pub message_reactions: MessageReactionsUiState,
+    #[serde(default)]
     pub developer: DeveloperUiState,
     #[serde(default)]
     pub keyboard: KeyboardUiState,
@@ -1954,6 +1979,7 @@ impl Default for DesktopUiStateV1 {
             right_rail: RightRailUiState::default(),
             session: SessionUiState::default(),
             desktop_behavior: DesktopBehaviorUiState::default(),
+            message_reactions: MessageReactionsUiState::default(),
             developer: DeveloperUiState::default(),
             keyboard: KeyboardUiState::default(),
             composer: ComposerUiState::default(),
@@ -2929,6 +2955,23 @@ mod tests {
     use super::*;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn message_reactions_default_on_and_decode_from_an_older_state() {
+        let state: MessageReactionsUiState =
+            serde_json::from_str("{}").expect("an older state has no reaction section");
+        assert!(state.enabled);
+
+        let state: MessageReactionsUiState =
+            serde_json::from_str(r#"{"enabled":false}"#).expect("an explicit off survives");
+        assert!(!state.enabled);
+
+        // The retired feature-epoch field must not make an older file fail.
+        let state: MessageReactionsUiState =
+            serde_json::from_str(r#"{"enabled":true,"sinceMs":123}"#)
+                .expect("an older epoch is ignored");
+        assert!(state.enabled);
+    }
 
     #[test]
     fn runtime_model_favorites_are_scoped_to_the_agent_source_and_model() {

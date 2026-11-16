@@ -45240,7 +45240,7 @@ fn session_opened(cx: &mut Context<Self>) {
         assert!(
             open.find("let listed_workspace =").unwrap()
                 < open
-                    .find("controller.begin_session_load(")
+                    .find("controller.begin_session_load_after(")
                     .expect("the session load is issued while opening"),
             "the rail is retargeted before the read that could fail"
         );

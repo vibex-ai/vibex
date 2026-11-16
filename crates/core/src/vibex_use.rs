@@ -95,6 +95,16 @@ pub const VIBEX_USE_APPROVAL_UNTRUSTED_BEGIN: &str = "----- BEGIN UNTRUSTED APPR
 /// Closing delimiter around card content returned to a parent Agent.
 pub const VIBEX_USE_APPROVAL_UNTRUSTED_END: &str = "----- END UNTRUSTED APPROVAL CARD -----";
 
+/// Prefix of the provider correlation that ties a reaction notice to the user
+/// message it decorates.
+///
+/// A reaction is presentation, not a second message: the runtime appends it as
+/// a hidden system notice and the shell finds it by this prefix. The notice
+/// stays readable as plain text to a client that does not know about reactions.
+pub const VIBEX_USE_REACTION_CORRELATION_PREFIX: &str = "vibex-reaction:";
+/// A reaction is one short expression, not a place to hide a paragraph.
+pub const VIBEX_USE_REACTION_MAX_CHARS: usize = 64;
+
 /// Wraps card-derived text in explicit untrusted-content delimiters.
 ///
 /// The notice alone is a sentence; the fence is what makes where the card stops
@@ -811,6 +821,10 @@ pub struct VibexUseCapabilitySnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delegation_blocked_by: Option<String>,
     pub can_read_any_session: bool,
+    /// Whether the shell wants Agent reactions. When false the runtime neither
+    /// advertises `vibex_react` nor nudges the model toward it.
+    #[serde(default = "default_reactions_available")]
+    pub reactions_available: bool,
     pub presentation: VibexUsePresentationCapability,
     /// Tools this caller may actually use. A tool that cannot succeed is not
     /// advertised as available.
@@ -875,10 +889,11 @@ pub enum VibexUseTool {
     UpdateGroup,
     PresentGroup,
     DissolveGroup,
+    React,
 }
 
 impl VibexUseTool {
-    pub const ALL: [Self; 22] = [
+    pub const ALL: [Self; 23] = [
         Self::Discover,
         Self::ListSessions,
         Self::GetSession,
@@ -901,6 +916,7 @@ impl VibexUseTool {
         Self::UpdateGroup,
         Self::PresentGroup,
         Self::DissolveGroup,
+        Self::React,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -927,6 +943,7 @@ impl VibexUseTool {
             Self::UpdateGroup => "vibex_update_group",
             Self::PresentGroup => "vibex_present_group",
             Self::DissolveGroup => "vibex_dissolve_group",
+            Self::React => "vibex_react",
         }
     }
 
@@ -997,6 +1014,11 @@ pub struct VibexUseToolDefinition {
     pub input_schema: Value,
 }
 
+/// Reactions are on for a shell that predates the preference.
+const fn default_reactions_available() -> bool {
+    true
+}
+
 /// Builds the whole catalogue. Tools whose capability is missing are omitted
 /// instead of being advertised and then failing.
 pub fn vibex_use_tool_definitions(
@@ -1005,6 +1027,9 @@ pub fn vibex_use_tool_definitions(
     VibexUseTool::ALL
         .into_iter()
         .filter(|tool| {
+            if matches!(tool, VibexUseTool::React) {
+                return capability.reactions_available;
+            }
             if tool.is_presentation() {
                 // `list_groups` is still meaningful without a shell because it
                 // reports the capability itself.
@@ -1126,6 +1151,13 @@ fn tool_description(tool: VibexUseTool) -> &'static str {
         }
         VibexUseTool::DissolveGroup => {
             "Dissolve a group the caller created. Sessions remain and tasks keep running."
+        }
+        VibexUseTool::React => {
+            "Attach an emoji reaction to a user message in this session. A reaction is welcome on \
+             most turns, not only for greetings or thanks: use one when a short emoji naturally \
+             acknowledges what the user said. Any emoji is accepted. Defaults to the newest user \
+             message; sequence names an earlier one. Use your judgment and skip a reaction that \
+             would be distracting."
         }
     }
 }
@@ -1457,6 +1489,20 @@ fn tool_input_schema(tool: VibexUseTool) -> Value {
                 "expectedRevision": { "type": "integer" }
             },
             "required": ["idempotencyKey", "groupRef"]
+        }),
+        VibexUseTool::React => json!({
+            "type": "object",
+            "properties": {
+                "emoji": string(
+                    "The emoji reaction to attach to the user message. Any emoji is accepted; \
+                     the caller decides whether a reaction is appropriate."
+                ),
+                "sequence": {
+                    "type": "integer",
+                    "description": "Optional sequence of the user message to react to; defaults to the newest user message."
+                }
+            },
+            "required": ["emoji"]
         }),
     }
 }
@@ -2990,6 +3036,7 @@ mod tests {
             can_delegate: true,
             delegation_blocked_by: None,
             can_read_any_session: false,
+            reactions_available: true,
             presentation: VibexUsePresentationCapability::default(),
             available_tools: Vec::new(),
         };
@@ -2997,8 +3044,17 @@ mod tests {
         let names: Vec<&str> = tools.iter().map(|tool| tool.name.as_str()).collect();
         assert!(names.contains(&"vibex_delegate"));
         assert!(names.contains(&"vibex_list_groups"));
+        assert!(names.contains(&"vibex_react"));
         assert!(!names.contains(&"vibex_create_group"));
         assert!(!names.contains(&"vibex_present_group"));
+
+        let mut reactions_off = capability.clone();
+        reactions_off.reactions_available = false;
+        let names: Vec<String> = vibex_use_tool_definitions(&reactions_off)
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+        assert!(!names.contains(&"vibex_react".to_string()));
 
         let mut budget_exhausted = capability.clone();
         budget_exhausted.can_delegate = false;

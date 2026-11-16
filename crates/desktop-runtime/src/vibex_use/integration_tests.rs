@@ -291,6 +291,72 @@ impl Fixture {
 }
 
 #[tokio::test]
+async fn react_attaches_an_emoji_notice_to_the_latest_user_message() {
+    let fixture = Fixture::new();
+    let parent = fixture.session("Parent");
+    let actor = fixture.actor(&parent);
+    let mut conn = fixture.service.open().unwrap();
+    let user = TimelineRepository::append(
+        &mut conn,
+        &parent.id,
+        TimelineSource::User,
+        TimelinePayload::UserMessage(vibex_core::UserMessagePayload {
+            text: "hello".to_string(),
+            ..Default::default()
+        }),
+        None,
+        None,
+        TimelineRedactionState::None,
+    )
+    .unwrap();
+    drop(conn);
+
+    let response = fixture
+        .call(&actor, VibexUseTool::React, json!({"emoji": "❤️"}))
+        .await;
+    assert_eq!(response["emoji"], "❤️");
+    assert_eq!(response["messageId"], user.id.to_string());
+    assert_eq!(response["sequence"], user.sequence);
+
+    let conn = fixture.service.open().unwrap();
+    let (payload, correlation): (String, String) = conn
+        .query_row(
+            "SELECT payload_json, provider_correlation_id
+             FROM agent_timeline_items
+             WHERE session_id = ?1 AND kind = 'system_notice'
+             ORDER BY sequence DESC LIMIT 1",
+            rusqlite::params![parent.id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        correlation,
+        format!("{VIBEX_USE_REACTION_CORRELATION_PREFIX}{}", user.id)
+    );
+    match serde_json::from_str::<TimelinePayload>(&payload).unwrap() {
+        TimelinePayload::SystemNotice(notice) => assert_eq!(notice.message, "❤️"),
+        other => panic!("expected a reaction notice, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn react_is_refused_when_the_shell_hides_reactions() {
+    let fixture = Fixture::new();
+    let parent = fixture.session("Parent");
+    let actor = fixture.actor(&parent);
+    fixture.service.manager.set_message_reactions_enabled(false);
+    let error = fixture
+        .call_result(&actor, VibexUseTool::React, json!({"emoji": "❤️"}))
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{error:?}").contains("disabled"),
+        "expected the disabled guard, got {error:?}"
+    );
+    fixture.service.manager.set_message_reactions_enabled(true);
+}
+
+#[tokio::test]
 async fn reused_worker_keeps_each_round_result_and_acceptance_releases_its_controller() {
     let fixture = Fixture::new();
     let parent = fixture.session("Parent");

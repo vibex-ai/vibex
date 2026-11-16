@@ -21,7 +21,7 @@ fn response_delivered(&self, actor: &VibexUseActor, tool: VibexUseTool, response
     -> VibexResult<()>;
 ```
 
-`VibexUseTool::ALL` defines 20 tools. Keep schemas and service dispatch in sync; the live capability snapshot determines
+`VibexUseTool::ALL` defines 23 tools. Keep schemas and service dispatch in sync; the live capability snapshot determines
 availability.
 
 | Surface | Tools |
@@ -29,7 +29,15 @@ availability.
 | Discovery/reads | `vibex_discover`, `vibex_list_sessions`, `vibex_get_session`, `vibex_read_session`, `vibex_get_operation`, `vibex_get_tasks` |
 | Work | `vibex_create_session`, `vibex_delegate`, `vibex_send_message`, `vibex_finish_task`, `vibex_interrupt`, `vibex_cancel_task` |
 | Inbox | `vibex_wait`, `vibex_get_events`, `vibex_ack_events` |
-| Presentation | `vibex_list_groups`, `vibex_create_group`, `vibex_update_group`, `vibex_present_group`, `vibex_dissolve_group` |
+| Presentation | `vibex_list_groups`, `vibex_create_group`, `vibex_update_group`, `vibex_present_group`, `vibex_dissolve_group`, `vibex_react` |
+
+`vibex_react` is optional for the Agent: it accepts any short emoji and appends a hidden system notice whose provider
+correlation names the target user-message item. Shells draw the emoji on that bubble; a client that does not know the
+convention still reads the notice as harmless text. The shell's reaction preference (Session settings) gates creation,
+not rendering: while it is on, `vibex_react` is advertised and every human turn opens with a short guideline that makes
+a reaction welcome without prescribing greetings, confirmations, or thanks. Turning it off removes the catalogue
+entry, suppresses the guideline, and rejects calls on a cached tool list, while notices already recorded stay
+visible. Delegated and system prompts never carry the guideline.
 
 Human clients use [`AgentBackend`](../../../crates/vibex-backend/src/agent.rs): `team_snapshot(TeamSnapshotRequest)`,
 `session_tree(SessionTreeRequest)`, `delegate_session(MutationRequest<HumanDelegationRequest>)`,

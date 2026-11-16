@@ -975,3 +975,200 @@ fn an_older_page_keeps_the_row_the_reader_was_reading() {
         "the page moved the reader within the block"
     );
 }
+
+#[test]
+fn a_parked_offset_past_the_end_still_scrolls_up() {
+    // A prepend restores the reader's row against a longer transcript, and the
+    // content above it can then shrink — a re-measured block, a summary that
+    // replaced an expansion — so the parked offset can sit past the end. The
+    // clamp that follows must not turn the next upward gesture into a step that
+    // starts at the tail: the reader pressed "up" and the view did not move.
+    let long_answer = (0..40)
+        .map(|line| format!("answer line {line}\n\n"))
+        .collect::<String>();
+    let mut app = app(
+        vec![TimelinePayload::AgentMessage(AgentMessagePayload {
+            text: long_answer,
+            is_final: true,
+        })],
+        AgentSessionState::Idle,
+    );
+    let _ = draw(&mut app, 100, 30);
+    assert!(app.scroll.follow);
+
+    // Park past the bottom, which is what a restore against a transcript that
+    // then got shorter leaves behind.
+    app.scroll.follow = false;
+    app.scroll.offset = 100_000;
+    let _ = draw(&mut app, 100, 30);
+    let frame_offset = app.transcript.scroll_offset();
+
+    app.scroll_lines(-3);
+    let _ = draw(&mut app, 100, 30);
+    assert!(!app.scroll.follow, "an upward step must stop following");
+    assert!(
+        app.transcript.scroll_offset() < frame_offset,
+        "the viewport did not move up from {frame_offset}: it is at {}",
+        app.transcript.scroll_offset()
+    );
+}
+
+#[test]
+fn a_prepend_keeps_a_parked_anchor_inside_its_block() {
+    // The frame clamps an out-of-range offset for drawing, but the state keeps
+    // it. When an older page lands in that window, the anchor must not carry
+    // the excess into the restored position: a row past the block becomes an
+    // offset past the transcript, and an upward gesture has nothing to step
+    // from.
+    let long_answer = (0..40)
+        .map(|line| format!("answer line {line}\n\n"))
+        .collect::<String>();
+    let mut app = app(
+        vec![TimelinePayload::AgentMessage(AgentMessagePayload {
+            text: long_answer,
+            is_final: true,
+        })],
+        AgentSessionState::Idle,
+    );
+    let _ = draw(&mut app, 100, 30);
+    app.scroll.follow = false;
+    app.scroll.offset = 100_000;
+    let _ = draw(&mut app, 100, 30);
+
+    let session_id = app
+        .agent
+        .state
+        .timeline
+        .session_id
+        .clone()
+        .expect("the fixture has a session");
+    let mut items = app.agent.state.timeline.items.clone();
+    items.insert(
+        0,
+        TimelineItem {
+            id: TimelineItemId::new(),
+            session_id: session_id.clone(),
+            sequence: 0,
+            timestamp_ms: 0,
+            source: TimelineSource::User,
+            kind: TimelineItemKind::UserMessage,
+            correlation_id: None,
+            provider_correlation_id: None,
+            redaction_state: TimelineRedactionState::None,
+            execution_attribution: None,
+            payload_depth: TimelinePayloadDepth::Detail,
+            payload: TimelinePayload::UserMessage(UserMessagePayload {
+                text: "the question that began this turn".into(),
+                ..Default::default()
+            }),
+        },
+    );
+    app.agent
+        .state
+        .timeline
+        .replace_authoritative(session_id, items);
+    app.sync_transcript();
+
+    let total = app.transcript.total_height();
+    assert!(
+        app.scroll.offset < total,
+        "the anchor restored row {} past the {} rows of the transcript",
+        app.scroll.offset,
+        total
+    );
+}
+
+#[test]
+fn an_older_page_leaves_the_reader_able_to_keep_scrolling_up() {
+    // The reported regression: after the anchor change, an older page could
+    // land the reader at an offset the transcript cannot hold, and every later
+    // upward gesture was clamped back to the tail — history became unreachable.
+    let long_answer = (0..60)
+        .map(|line| format!("answer line {line}\n\n"))
+        .collect::<String>();
+    let mut app = app(
+        vec![TimelinePayload::AgentMessage(AgentMessagePayload {
+            text: long_answer,
+            is_final: true,
+        })],
+        AgentSessionState::Idle,
+    );
+    app.agent.state.timeline_has_older = true;
+    let _ = draw(&mut app, 100, 30);
+
+    // Park well inside the transcript, then pull the page above it.
+    for _ in 0..8 {
+        app.scroll_lines(-3);
+        let _ = draw(&mut app, 100, 30);
+    }
+    let session_id = app
+        .agent
+        .state
+        .timeline
+        .session_id
+        .clone()
+        .expect("the fixture has a session");
+    let before_sequence = app
+        .agent
+        .state
+        .timeline_oldest_sequence()
+        .expect("the fixture has an item");
+    let ticket = vibex_ui::AgentTimelineBeforeTicket {
+        generation: app.agent.state.generation,
+        session_id: session_id.clone(),
+        before_sequence,
+    };
+    let older = TimelineItem {
+        id: TimelineItemId::new(),
+        session_id: session_id.clone(),
+        sequence: 0,
+        timestamp_ms: 0,
+        source: TimelineSource::User,
+        kind: TimelineItemKind::UserMessage,
+        correlation_id: None,
+        provider_correlation_id: None,
+        redaction_state: TimelineRedactionState::None,
+        execution_attribution: None,
+        payload_depth: TimelinePayloadDepth::Detail,
+        payload: TimelinePayload::UserMessage(UserMessagePayload {
+            text: "the question that began this turn".into(),
+            ..Default::default()
+        }),
+    };
+    let page = TimelinePage {
+        session_id,
+        items: vec![older],
+        start_sequence: Some(0),
+        end_sequence: Some(0),
+        has_older: false,
+        has_newer: true,
+        starts_at_turn_start: true,
+        leading_turn_start: None,
+        omitted: None,
+    };
+    assert!(
+        app.agent
+            .apply_timeline_before(&ticket, Ok(page))
+            .expect("the page is valid")
+    );
+    app.sync_transcript();
+    let _ = draw(&mut app, 100, 30);
+    let after_page = app.transcript.scroll_offset();
+
+    // Keep walking up. Every gesture has to make progress, or the page the
+    // reader just loaded can never be reached.
+    let mut seen = vec![after_page];
+    for _ in 0..10 {
+        app.scroll_lines(-3);
+        let _ = draw(&mut app, 100, 30);
+        seen.push(app.transcript.scroll_offset());
+    }
+    assert!(
+        seen.windows(2).all(|pair| pair[0] >= pair[1]),
+        "scrolling up moved the viewport down: {seen:?}"
+    );
+    assert!(
+        seen.last().copied().unwrap() < seen.first().copied().unwrap(),
+        "scrolling up never made progress after the page landed: {seen:?}"
+    );
+}

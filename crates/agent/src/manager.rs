@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 
 use tokio::sync::{Mutex as AsyncMutex, broadcast, mpsc};
@@ -219,6 +220,12 @@ pub struct AgentManager {
     /// resources are assembled, and that is where a per-Agent "off" has to be
     /// honoured. Absent entries take [`AgentBuiltinTool::default_enabled`].
     agent_tool_preferences: StdMutex<vibex_core::AgentToolPreferences>,
+    /// Whether the shell wants Agent reactions.
+    ///
+    /// The catalogue and the per-turn nudge both read this one flag, so turning
+    /// reactions off in the shell also stops asking the model for them. It is
+    /// runtime-wide because the prompt is composed before a client is chosen.
+    message_reactions_enabled: AtomicBool,
     delegation_lifecycle_locks: StdMutex<HashMap<String, Weak<AsyncMutex<()>>>>,
     execution_observers: StdMutex<HashSet<VibexExecutionId>>,
     execution_progress: Arc<tokio::sync::Notify>,
@@ -466,6 +473,12 @@ struct AgentTurnRequest {
     /// Who the authority says authored this message. It is recorded on the user
     /// timeline item, so a delegated instruction never reads as the user's own.
     provenance: vibex_core::MessageProvenance,
+    /// Whether this turn executes a provider slash command.
+    ///
+    /// The provider reads the command from the start of the prompt, so the
+    /// runtime's reaction guideline must not open the text: a paragraph before
+    /// `/review` would stop it being the command the person picked.
+    provider_command: bool,
 }
 
 impl From<SendAgentMessageRequest> for AgentTurnRequest {
@@ -481,6 +494,7 @@ impl From<SendAgentMessageRequest> for AgentTurnRequest {
             delivery: request.delivery,
             prompt_context: request.prompt_context,
             provenance: request.provenance,
+            provider_command: false,
         }
     }
 }
@@ -681,6 +695,7 @@ impl AgentManager {
             computer_mcp_tool: StdMutex::new(None),
             timeline_compaction_sweep: StdMutex::new(TimelineCompactionSweep::default()),
             agent_tool_preferences: StdMutex::new(vibex_core::AgentToolPreferences::default()),
+            message_reactions_enabled: AtomicBool::new(true),
             delegation_lifecycle_locks: StdMutex::new(HashMap::new()),
             execution_observers: StdMutex::new(HashSet::new()),
             execution_progress: Arc::new(tokio::sync::Notify::new()),
@@ -851,6 +866,20 @@ impl AgentManager {
 
     pub fn vibex_use_host(&self) -> Option<Arc<dyn VibexUseToolHost>> {
         self.vibex_use_host.get().and_then(Weak::upgrade)
+    }
+
+    /// Tell the runtime whether the shell shows Agent reactions.
+    ///
+    /// Both the `vibex_react` catalogue entry and the per-turn reaction nudge
+    /// read this flag, so turning the preference off stops asking the model for
+    /// a reaction the reader would never see.
+    pub fn set_message_reactions_enabled(&self, enabled: bool) {
+        self.message_reactions_enabled
+            .store(enabled, Ordering::Relaxed);
+    }
+
+    pub fn message_reactions_enabled(&self) -> bool {
+        self.message_reactions_enabled.load(Ordering::Relaxed)
     }
 
     /// Authority every reference the broker hands out belongs to.
@@ -3768,6 +3797,7 @@ impl AgentManager {
                     policy_id: "continue_turn".to_string(),
                     trigger_event_id: String::new(),
                 },
+                provider_command: false,
             },
             // The continuation prompt is an internal retry instruction. It
             // must stay out of the transcript and must not update the session
@@ -4357,6 +4387,9 @@ impl AgentManager {
             prompt_context: None,
             // A slash command is still the person typing it.
             provenance: vibex_core::MessageProvenance::HumanInput,
+            // The provider reads the command from the start of the prompt, so
+            // the reaction guideline must not open it.
+            provider_command: true,
         };
         let command_request = request.clone();
         let items = self
@@ -4442,6 +4475,7 @@ impl AgentManager {
                     delivery: UserMessageDelivery::Prompt,
                     prompt_context: None,
                     provenance: vibex_core::MessageProvenance::HumanInput,
+                    provider_command: false,
                 },
                 AgentTurnDisplayPolicy::USER_AUTHORED,
                 ContextBridgeTurnBehavior::ConsumePending,
@@ -4671,8 +4705,15 @@ impl AgentManager {
         // input only: the user timeline item above was written from
         // `request.text`, so the transcript, the auto title and search all keep
         // exactly what the user wrote.
-        let prompt_context =
-            compose_prompt_context(team_context.as_deref(), request.prompt_context.as_deref());
+        let reaction_context = (request.provenance == vibex_core::MessageProvenance::HumanInput
+            && !request.provider_command
+            && self.message_reactions_enabled())
+        .then_some(VIBEX_USE_REACTION_PROMPT);
+        let prompt_context = compose_prompt_context(
+            reaction_context,
+            team_context.as_deref(),
+            request.prompt_context.as_deref(),
+        );
         let provider_turn_text = match prompt_context.as_deref() {
             Some(context) if !context.trim().is_empty() => {
                 format!("{context}\n\n{provider_turn_text}")
@@ -8100,16 +8141,33 @@ fn team_awareness_prompt(session_id: &VibexSessionId, tasks: &[AgentDelegation])
     Some(bounded_text(&text, MAX_TEAM_AWARENESS_CHARS))
 }
 
-/// Puts the team block ahead of the context the caller already composed.
-fn compose_prompt_context(team: Option<&str>, requested: Option<&str>) -> Option<String> {
-    let team = team.filter(|value| !value.trim().is_empty());
-    let requested = requested.filter(|value| !value.trim().is_empty());
-    match (team, requested) {
-        (Some(team), Some(requested)) => Some(format!("{team}\n\n{requested}")),
-        (Some(team), None) => Some(team.to_string()),
-        (None, Some(requested)) => Some(requested.to_string()),
-        (None, None) => None,
+/// The reaction nudge that opens every human turn.
+///
+/// The tool is optional, and a decoration loses to the answer unless the model
+/// is told it is welcome. The wording deliberately covers more than greetings:
+/// a terse bug report or an instruction is exactly when a receipt makes the
+/// exchange feel responsive. The model still decides; a distracting reaction
+/// is worse than none.
+const VIBEX_USE_REACTION_PROMPT: &str = "Runtime instruction: a short emoji reaction is welcome on most turns. \
+When one would naturally acknowledge what the user said — a question, a report, an instruction, an image, \
+a correction, or a remark — call vibex_react once for their current message. Do not limit reactions to \
+greetings, confirmations, or thanks, and never let a reaction replace your answer. Use your judgment; \
+skip a reaction that would be distracting or tonally wrong.";
+
+/// Puts the reaction nudge and team block ahead of the context the caller
+/// already composed.
+fn compose_prompt_context(
+    reaction: Option<&str>,
+    team: Option<&str>,
+    requested: Option<&str>,
+) -> Option<String> {
+    let mut parts = Vec::new();
+    for value in [reaction, team, requested].into_iter().flatten() {
+        if !value.trim().is_empty() {
+            parts.push(value);
+        }
     }
+    (!parts.is_empty()).then(|| parts.join("\n\n"))
 }
 
 /// Builds the credential-free runtime summary shown for one task.
@@ -8692,20 +8750,36 @@ mod tests {
     }
 
     #[test]
-    fn team_awareness_sits_ahead_of_the_callers_own_context() {
+    fn reaction_guidance_sits_ahead_of_team_and_caller_context() {
+        let composed = compose_prompt_context(
+            Some(VIBEX_USE_REACTION_PROMPT),
+            Some("team"),
+            Some("requested"),
+        )
+        .unwrap();
+        assert!(composed.starts_with("Runtime instruction:"));
+        assert!(composed.contains("vibex_react"));
+        assert!(composed.contains("Do not limit reactions to"));
+        assert!(composed.ends_with("team\n\nrequested"));
+
         assert_eq!(
-            compose_prompt_context(Some("team"), Some("requested")),
-            Some("team\n\nrequested".to_string())
-        );
-        assert_eq!(
-            compose_prompt_context(Some("  "), Some("requested")),
+            compose_prompt_context(None, Some("  "), Some("requested")),
             Some("requested".to_string())
         );
         assert_eq!(
-            compose_prompt_context(Some("team"), None),
+            compose_prompt_context(None, Some("team"), None),
             Some("team".to_string())
         );
-        assert_eq!(compose_prompt_context(None, None), None);
+        assert_eq!(compose_prompt_context(None, None, None), None);
+    }
+
+    #[test]
+    fn message_reactions_are_on_by_default_and_switch_off() {
+        let directory = tempfile::tempdir().unwrap();
+        let manager = AgentManager::new(directory.path().join("reactions.db")).unwrap();
+        assert!(manager.message_reactions_enabled());
+        manager.set_message_reactions_enabled(false);
+        assert!(!manager.message_reactions_enabled());
     }
 
     struct TestProvider {
@@ -9647,6 +9721,7 @@ mod tests {
                     delivery: UserMessageDelivery::Prompt,
                     prompt_context: None,
                     provenance: vibex_core::MessageProvenance::HumanInput,
+                    provider_command: false,
                 },
                 AgentTurnDisplayPolicy::USER_AUTHORED,
                 ContextBridgeTurnBehavior::ConsumePending,
@@ -9948,6 +10023,7 @@ mod tests {
                     delivery: UserMessageDelivery::Prompt,
                     prompt_context: None,
                     provenance: vibex_core::MessageProvenance::HumanInput,
+                    provider_command: false,
                 },
                 AgentTurnDisplayPolicy::USER_AUTHORED,
                 ContextBridgeTurnBehavior::ConsumePending,
@@ -9987,6 +10063,7 @@ mod tests {
                     delivery: UserMessageDelivery::Prompt,
                     prompt_context: None,
                     provenance: vibex_core::MessageProvenance::HumanInput,
+                    provider_command: false,
                 },
                 AgentTurnDisplayPolicy::USER_AUTHORED,
                 ContextBridgeTurnBehavior::ConsumePending,
@@ -10126,6 +10203,7 @@ mod tests {
                     delivery: UserMessageDelivery::Prompt,
                     prompt_context: None,
                     provenance: vibex_core::MessageProvenance::HumanInput,
+                    provider_command: false,
                 },
                 AgentTurnDisplayPolicy::USER_AUTHORED,
                 ContextBridgeTurnBehavior::ConsumePending,
@@ -10648,6 +10726,7 @@ mod tests {
                         delivery: UserMessageDelivery::Prompt,
                         prompt_context: None,
                         provenance: vibex_core::MessageProvenance::HumanInput,
+                        provider_command: false,
                     },
                     AgentTurnDisplayPolicy::USER_AUTHORED,
                     ContextBridgeTurnBehavior::ConsumePending,
@@ -10887,6 +10966,7 @@ mod tests {
                         delivery: UserMessageDelivery::Prompt,
                         prompt_context: None,
                         provenance: vibex_core::MessageProvenance::HumanInput,
+                        provider_command: false,
                     },
                     AgentTurnDisplayPolicy::USER_AUTHORED,
                     ContextBridgeTurnBehavior::ConsumePending,

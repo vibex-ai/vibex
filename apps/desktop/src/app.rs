@@ -53,6 +53,10 @@ use gpui_component::{
     Theme, ThemeStyled as _, VirtualListScrollHandle, WindowExt as _,
     accordion::Accordion,
     animation::EffectTransition as Transition,
+    attachment::{
+        Attachment, AttachmentActions, AttachmentContent, AttachmentDescription, AttachmentMedia,
+        AttachmentTitle,
+    },
     avatar::Avatar,
     bubble::{Bubble, BubbleContent, BubbleReactions},
     button::{Button, ButtonCustomVariant, ButtonVariants as _},
@@ -149,10 +153,10 @@ use vibex_core::{
     TerminalSession, TerminalStatus, TerminalSwitchShellRequest, TimelineItem, TimelineItemId,
     TimelineLiveEvent, TimelinePage, TimelinePayload, TimelineRedactionState, TimelineSource,
     TimelineTurnStart, UserMessageDelivery, UserMessagePayload, VIBEX_USE_MAX_MENTIONS,
-    VibexSessionId, VibexUseMention, VibexUsePresentationCapability, VibexUseUnavailableReason,
-    WorkspaceMode, WorkspaceRecord, agent_session_turn_requires_continuation,
-    latest_timeline_turn_ended_normally, managed_worktree_name_slug, normalize_agent_session_title,
-    unix_timestamp_ms,
+    VIBEX_USE_REACTION_CORRELATION_PREFIX, VibexSessionId, VibexUseMention,
+    VibexUsePresentationCapability, VibexUseUnavailableReason, WorkspaceMode, WorkspaceRecord,
+    agent_session_turn_requires_continuation, latest_timeline_turn_ended_normally,
+    managed_worktree_name_slug, normalize_agent_session_title, unix_timestamp_ms,
 };
 use vibex_desktop_model::{
     AgentOrderEntry, AgentOrdering, AgentPlanProjection, AgentSortStrategy, AppearanceUiState,
@@ -207,7 +211,7 @@ use vibex_ui::{
 
 use crate::markdown::{
     MarkdownLinkKind, MarkdownPresentation, RangeHighlight, RenderedText, TextView, TextViewState,
-    escape_markdown_literal, is_file_url, is_windows_drive_path, local_file_path,
+    data_url_image, escape_markdown_literal, is_file_url, is_windows_drive_path, local_file_path,
     markdown_link_kind, plain_text as markdown_plain_text, resolve_workspace_path,
     resources as markdown_resources, text_view_style, utf8_prefix,
 };
@@ -982,6 +986,16 @@ const AGENT_TIMELINE_WINDOW_BYTES: u32 = 1_048_576;
 /// Resuming from a view a long background run left far behind would make the
 /// wait grow with the session again, which a windowed open exists to avoid.
 const AGENT_TIMELINE_RESUME_MAX_ITEMS: usize = 2_000;
+/// How far a replaced window may reach back to keep a reader's place.
+///
+/// A reader who scrolled up holds rows below the newest window, and a
+/// replacement that drops the turn they are reading cannot restore their
+/// position: the anchor would resolve to a row the new window does not have.
+/// The read walks back down the history instead, and this is where it stops —
+/// past this much of what the reader already had, re-reading the page costs
+/// more than the jump it prevents, so the view lands on the oldest row it does
+/// hold rather than on the newest one.
+const AGENT_TIMELINE_ANCHOR_RECOVERY_MAX_ITEMS: usize = AGENT_TIMELINE_RESUME_MAX_ITEMS;
 /// How many older pages may be outstanding at once.
 ///
 /// Prefetch keeps the next page on the way while the reader is still moving
@@ -1126,6 +1140,22 @@ const USER_MESSAGE_PILL_HORIZONTAL_INSET_PX: f32 = 30.0;
 /// Narrower timelines than this stay uncapped: the pill is unusable there
 /// anyway, and a cap would only wrap its text one character per line.
 const USER_MESSAGE_BODY_MIN_MAX_WIDTH_PX: f32 = 80.0;
+/// The square a message's picture occupies in the strip above its bubble.
+///
+/// A thumbnail is a raster boundary, so it stays a physical size while the
+/// text around it follows the interface zoom.
+const USER_MESSAGE_ATTACHMENT_TILE_PX: f32 = 64.0;
+/// The file card keeps the library's medium `Attachment` chip height.
+const USER_MESSAGE_ATTACHMENT_FILE_HEIGHT_PX: f32 = 56.0;
+/// The library's medium `Attachment` chip width (`14.5rem` at the default base).
+const USER_MESSAGE_ATTACHMENT_FILE_WIDTH_PX: f32 = 232.0;
+/// Gap inside an attachment row, between its rows, and before the bubble.
+const USER_MESSAGE_ATTACHMENT_GAP_PX: f32 = 8.0;
+/// The bubble column already contributes its own gap; this tops it up to the
+/// full attachment gap so the strip does not sit tighter than its own rows.
+const USER_MESSAGE_ATTACHMENT_BUBBLE_GAP_PX: f32 = USER_MESSAGE_ATTACHMENT_GAP_PX / 2.0;
+/// How many decoded `data:` pictures a message strip keeps on hand.
+const USER_MESSAGE_THUMBNAIL_CACHE_LIMIT: usize = 32;
 const AGENT_TURN_DURATION_TICK_INTERVAL: Duration = Duration::from_secs(1);
 const AGENT_TIMELINE_LAYOUT_WIDTH_EPSILON_PX: f32 = 1.0;
 /// Advance width the timeline's body text averages. The first-layout estimator
@@ -2900,22 +2930,36 @@ async fn fetch_authoritative_timeline_via_backend(
 /// for this with `contiguous`, which takes the ordinary turn window: it pages
 /// the live turn row by row instead of handing it over in two bands, so it
 /// cannot leave a hole.
+///
+/// `cover_sequence` asks the read to hold on to a reader's place. A replacement
+/// that installs only the newest window drops the rows a scrolled-up reader is
+/// reading, and the preserved anchor then names a turn the new row table does
+/// not have — which is how a replacement used to end up clamped to the newest
+/// row. The window therefore reaches back down to that sequence through
+/// [`extend_timeline_window_back_to`], and `None` reads the newest page alone.
 async fn fetch_timeline_window_or_contiguous(
     runtime: Arc<DesktopRuntime>,
     session_id: VibexSessionId,
     contiguous: bool,
+    cover_sequence: Option<i64>,
 ) -> vibex_core::VibexResult<vibex_core::TimelinePage> {
-    runtime
+    let page = runtime
         .agent()
         .fetch_timeline(FetchTimelineRequest {
-            session_id,
+            session_id: session_id.clone(),
             after_sequence: None,
             before_sequence: None,
             limit: AGENT_TIMELINE_FETCH_PAGE_LIMIT,
             max_turns: (!contiguous).then_some(AGENT_TIMELINE_TURN_WINDOW),
             max_bytes: Some(AGENT_TIMELINE_WINDOW_BYTES),
         })
-        .await
+        .await?;
+    Ok(
+        extend_timeline_window_back_to(page, cover_sequence, |before_sequence| {
+            fetch_timeline_page_before(runtime.clone(), session_id.clone(), before_sequence, true)
+        })
+        .await,
+    )
 }
 
 /// Authority-agnostic twin of [`fetch_timeline_window_or_contiguous`].
@@ -2923,11 +2967,12 @@ async fn fetch_timeline_window_or_contiguous_via_backend(
     backend: BackendFacade,
     session_id: VibexSessionId,
     contiguous: bool,
+    cover_sequence: Option<i64>,
 ) -> vibex_core::VibexResult<vibex_core::TimelinePage> {
-    backend
+    let page = backend
         .agent()
         .fetch_timeline(FetchTimelineRequest {
-            session_id,
+            session_id: session_id.clone(),
             after_sequence: None,
             before_sequence: None,
             limit: AGENT_TIMELINE_FETCH_PAGE_LIMIT,
@@ -2935,7 +2980,96 @@ async fn fetch_timeline_window_or_contiguous_via_backend(
             max_bytes: Some(AGENT_TIMELINE_WINDOW_BYTES),
         })
         .await
-        .map_err(remote_error_into_vibex)
+        .map_err(remote_error_into_vibex)?;
+    Ok(
+        extend_timeline_window_back_to(page, cover_sequence, |before_sequence| {
+            fetch_timeline_page_before_via_backend(
+                backend.clone(),
+                session_id.clone(),
+                before_sequence,
+                true,
+            )
+        })
+        .await,
+    )
+}
+
+/// Reaches a replaced window back to the oldest sequence a reader still holds.
+///
+/// A replacement reads the newest page, which is not where a reader who has
+/// scrolled up is: their rows sit in pages below it, and the preserved anchor
+/// can only be restored onto a row the new window holds. Dropping the anchored
+/// turn therefore does not merely lose the pixel offset — it leaves an offset
+/// from a longer window behind, and the list clamps that to the newest row,
+/// which reads as the scroll being undone.
+///
+/// The read walks down one page at a time and stops at whichever comes first: a
+/// page that reaches `cover_sequence`, the end of the history, or the item
+/// budget in [`AGENT_TIMELINE_ANCHOR_RECOVERY_MAX_ITEMS`].
+///
+/// Best effort by design: a page that fails, or that answers a cursor it does
+/// not understand, leaves the window exactly as it arrived. Losing the reader's
+/// place is the bug this prevents; losing the refetch that repairs the stream
+/// as well would be worse.
+async fn extend_timeline_window_back_to<F, Fut>(
+    mut page: vibex_core::TimelinePage,
+    cover_sequence: Option<i64>,
+    mut fetch_before: F,
+) -> vibex_core::TimelinePage
+where
+    F: FnMut(i64) -> Fut,
+    Fut: std::future::Future<Output = vibex_core::VibexResult<vibex_core::TimelinePage>>,
+{
+    let Some(cover_sequence) = cover_sequence else {
+        return page;
+    };
+    while let Some(start_sequence) = page.start_sequence {
+        if start_sequence <= cover_sequence
+            || !page.has_older
+            || page.items.len() >= AGENT_TIMELINE_ANCHOR_RECOVERY_MAX_ITEMS
+        {
+            break;
+        }
+        let Ok(older) = fetch_before(start_sequence).await else {
+            break;
+        };
+        if !prepend_older_timeline_page(&mut page, older) {
+            break;
+        }
+    }
+    page
+}
+
+/// Puts a page below the window it was read for.
+///
+/// Returns whether the page really sat there: a page that belongs to another
+/// session, that is empty, or that runs into the rows already held describes
+/// some other cursor, and prepending it would duplicate or reorder the window
+/// instead of extending it.
+fn prepend_older_timeline_page(
+    page: &mut vibex_core::TimelinePage,
+    older: vibex_core::TimelinePage,
+) -> bool {
+    let Some(newer_start) = page.start_sequence else {
+        return false;
+    };
+    if older.session_id != page.session_id
+        || older.items.is_empty()
+        || older.items.iter().any(|item| item.sequence >= newer_start)
+    {
+        return false;
+    }
+    let mut items = older.items;
+    items.append(&mut page.items);
+    page.start_sequence = items.first().map(|item| item.sequence);
+    page.items = items;
+    // The page now opens where the older one did, so its leading end is what
+    // describes the merged window. `omitted` stays with the newest page: a hole
+    // it reported is in the middle of the span this read did not fill.
+    page.has_older = older.has_older;
+    page.starts_at_turn_start = older.starts_at_turn_start;
+    page.leading_turn_start = older.leading_turn_start;
+    true
 }
 
 /// Everything above `after_sequence`, for a refreshed cached window.
@@ -3042,10 +3176,17 @@ async fn fetch_timeline_tail_via_backend(
 }
 
 /// One page of history below `before_sequence`.
+///
+/// `contiguous` asks for a page that cannot skip stored rows. A page read to
+/// extend a replacement window has to be that one: it is prepended to rows the
+/// view is going to install, and a banded page's hole would make the merged
+/// window a projection of nothing. The ordinary older-history read keeps its
+/// turn window, which is what keeps each page opening on a turn boundary.
 async fn fetch_timeline_page_before(
     runtime: Arc<DesktopRuntime>,
     session_id: VibexSessionId,
     before_sequence: i64,
+    contiguous: bool,
 ) -> vibex_core::VibexResult<vibex_core::TimelinePage> {
     runtime
         .agent()
@@ -3054,7 +3195,7 @@ async fn fetch_timeline_page_before(
             after_sequence: None,
             before_sequence: Some(before_sequence),
             limit: AGENT_TIMELINE_FETCH_PAGE_LIMIT,
-            max_turns: Some(AGENT_TIMELINE_TURN_WINDOW),
+            max_turns: (!contiguous).then_some(AGENT_TIMELINE_TURN_WINDOW),
             max_bytes: Some(AGENT_TIMELINE_WINDOW_BYTES),
         })
         .await
@@ -3065,6 +3206,7 @@ async fn fetch_timeline_page_before_via_backend(
     backend: BackendFacade,
     session_id: VibexSessionId,
     before_sequence: i64,
+    contiguous: bool,
 ) -> vibex_core::VibexResult<vibex_core::TimelinePage> {
     backend
         .agent()
@@ -3073,7 +3215,7 @@ async fn fetch_timeline_page_before_via_backend(
             after_sequence: None,
             before_sequence: Some(before_sequence),
             limit: AGENT_TIMELINE_FETCH_PAGE_LIMIT,
-            max_turns: Some(AGENT_TIMELINE_TURN_WINDOW),
+            max_turns: (!contiguous).then_some(AGENT_TIMELINE_TURN_WINDOW),
             max_bytes: Some(AGENT_TIMELINE_WINDOW_BYTES),
         })
         .await
@@ -3092,6 +3234,13 @@ struct TimelineWindowRead {
     /// `omitted`. The recovery path after such a page is refused sets this:
     /// asking again with the ordinary window cannot produce another one.
     contiguous: bool,
+    /// The oldest sequence the replacement window must still hold.
+    ///
+    /// Only a reader who is not following the bottom has one: it is the turn
+    /// their preserved anchor names, so a window that reaches this sequence can
+    /// put them back exactly where they were. `None` reads the newest window
+    /// alone, which is every load that has nobody's place to keep.
+    cover_sequence: Option<i64>,
 }
 
 impl TimelineWindowRead {
@@ -3100,6 +3249,7 @@ impl TimelineWindowRead {
         Self {
             resume,
             contiguous: false,
+            cover_sequence: None,
         }
     }
 
@@ -3108,7 +3258,18 @@ impl TimelineWindowRead {
         Self {
             resume: None,
             contiguous: true,
+            cover_sequence: None,
         }
+    }
+
+    /// Asks a replacement to keep the turn the reader's anchor names.
+    ///
+    /// The window then reaches back far enough for [`Self::cover_sequence`] to
+    /// be installed, which is what lets the anchor resolve against it instead of
+    /// naming a turn the view no longer has.
+    fn covering(mut self, cover_sequence: Option<i64>) -> Self {
+        self.cover_sequence = cover_sequence;
+        self
     }
 }
 
@@ -5814,6 +5975,16 @@ pub struct SessionView {
     composer_plan_expanded: Option<ComposerPlanIdentity>,
     dismissed_composer_plans: BTreeSet<ComposerPlanIdentity>,
     attachment_image_preview: Option<AttachmentImagePreviewState>,
+    /// Decoded `data:` pictures used as message attachment thumbnails.
+    ///
+    /// A message's picture can arrive as a multi-megabyte base64 URI, and the
+    /// strip above its bubble is drawn whenever the row is on screen. Decoding
+    /// that URI every frame would spend the frame's budget on one thumbnail, so
+    /// the decoded bytes stay here. The key fingerprints the URI cheaply; the
+    /// value keeps a failed decode too, so a broken picture is retried only when
+    /// the message that carried it changes. Bounded, and never notifies: it is a
+    /// decode memo, not interface state.
+    user_message_thumbnail_cache: BTreeMap<u64, Option<Arc<gpui::Image>>>,
     /// Working-image textures whose replacement frame has been presented, kept
     /// here when the preview closes so the atlas entry can still be released.
     preview_texture_graveyard: Vec<Arc<RenderImage>>,
@@ -5959,6 +6130,7 @@ impl SessionView {
             composer_plan_expanded: None,
             dismissed_composer_plans: BTreeSet::new(),
             attachment_image_preview: None,
+            user_message_thumbnail_cache: BTreeMap::new(),
             preview_texture_graveyard: Vec::new(),
             composer_queue_editing_id: None,
             composer_queue_edit_attachments: Vec::new(),
@@ -7344,6 +7516,20 @@ const AGENT_ANSWER_ACTION_ORDER: [AgentAnswerAction; 4] = [
     AgentAnswerAction::Fork,
     AgentAnswerAction::Timestamp,
 ];
+
+/// The turn facts a user message row reads.
+///
+/// The edit affordance and the context menu answer from the same facts;
+/// threading them one by one made the renderer take more arguments than its
+/// meaning. A reaction is not one of these facts: it comes from the Agent's own
+/// notice and belongs to the message, not to the turn.
+#[derive(Clone, Copy, Debug, Default)]
+struct UserMessageTurnState {
+    /// The conversation's latest turn; only its message can be edited.
+    latest: bool,
+    /// The turn has settled.
+    complete: bool,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UserMessageEditActionState {
@@ -11366,7 +11552,8 @@ impl VibexWorkbench {
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
             match runtime {
                 Some(runtime) => {
-                    fetch_timeline_page_before(runtime, request_session_id, before_sequence).await
+                    fetch_timeline_page_before(runtime, request_session_id, before_sequence, false)
+                        .await
                 }
                 None => {
                     let Some(backend) = backend else {
@@ -11379,6 +11566,7 @@ impl VibexWorkbench {
                         backend,
                         request_session_id,
                         before_sequence,
+                        false,
                     )
                     .await
                 }
@@ -13583,6 +13771,9 @@ impl VibexWorkbench {
                                     200,
                                 ));
                                 this.apply_loaded_ui_state(state, cx);
+                                runtime.agent().manager().set_message_reactions_enabled(
+                                    this.ui_state.message_reactions.enabled,
+                                );
                                 crate::system_tray::update_locale(this.resolved_locale(), cx);
                             } else {
                                 this.ui_writer = None;
@@ -29598,13 +29789,23 @@ impl VibexWorkbench {
         let workspace_id = self
             .registered_session(session_id.as_str())
             .map(|session| session.workspace_id.clone());
+        // The read patches this view's tail, or re-opens the newest window when
+        // the tail grew past what patching is worth. Re-opening drops the rows
+        // the view was holding, so it is asked to keep the turn the borrowed
+        // view's anchor names — the same rule a refetch follows. A view that
+        // was following the bottom has no anchor and reads the window alone.
+        self.capture_timeline_scroll_anchor();
+        let cover_sequence = self
+            .timeline_follow
+            .anchor_span
+            .map(|span| span.first_sequence);
         if let Some(runtime) = runtime.clone() {
             self.load_agent_session_timeline(
                 runtime.clone(),
                 session_id.clone(),
                 workspace_id.clone(),
                 generation,
-                TimelineWindowRead::resuming(resume),
+                TimelineWindowRead::resuming(resume).covering(cover_sequence),
                 cx,
             );
             if let Some(backend) = self.backend.clone() {
@@ -29666,7 +29867,7 @@ impl VibexWorkbench {
             self.load_agent_session_timeline_remote(
                 session_id,
                 generation,
-                TimelineWindowRead::resuming(resume),
+                TimelineWindowRead::resuming(resume).covering(cover_sequence),
                 cx,
             );
         }
@@ -29698,7 +29899,11 @@ impl VibexWorkbench {
         let load_revision = self
             .registered_session(session_id.as_str())
             .map(|session| session.updated_at_ms);
-        let TimelineWindowRead { resume, contiguous } = window;
+        let TimelineWindowRead {
+            resume,
+            contiguous,
+            cover_sequence,
+        } = window;
         // A resumed load keeps the prefix the view already holds, so its leading
         // end — and whether that end sits inside a turn — is whatever the view
         // had. Only the window a read fetches can move it.
@@ -29732,6 +29937,7 @@ impl VibexWorkbench {
                                 backend,
                                 request_session_id.clone(),
                                 contiguous,
+                                cover_sequence,
                             )
                             .await?;
                             let starts_mid_turn = !page.starts_at_turn_start;
@@ -29751,6 +29957,7 @@ impl VibexWorkbench {
                         backend,
                         request_session_id.clone(),
                         contiguous,
+                        cover_sequence,
                     )
                     .await?;
                     let starts_mid_turn = !page.starts_at_turn_start;
@@ -29862,7 +30069,11 @@ impl VibexWorkbench {
         let load_revision = self
             .registered_session(session_id.as_str())
             .map(|session| session.updated_at_ms);
-        let TimelineWindowRead { resume, contiguous } = window;
+        let TimelineWindowRead {
+            resume,
+            contiguous,
+            cover_sequence,
+        } = window;
         // A resumed load keeps the prefix the view already holds, so its leading
         // end — and whether that end sits inside a turn — is whatever the view
         // had. Only the window a read fetches can move it.
@@ -29899,6 +30110,7 @@ impl VibexWorkbench {
                                 runtime,
                                 request_session_id.clone(),
                                 contiguous,
+                                cover_sequence,
                             )
                             .await?;
                             let starts_mid_turn = !page.starts_at_turn_start;
@@ -29918,6 +30130,7 @@ impl VibexWorkbench {
                         runtime,
                         request_session_id.clone(),
                         contiguous,
+                        cover_sequence,
                     )
                     .await?;
                     let starts_mid_turn = !page.starts_at_turn_start;
@@ -30207,6 +30420,18 @@ impl VibexWorkbench {
             self.timeline.mark_lagged();
             return;
         }
+        // A replacement opens the newest window, which is not where a reader who
+        // scrolled up is. Record their place now — before the read, because the
+        // install cannot describe a position the new window has already dropped
+        // — and ask the read to reach back far enough to keep the turn it names.
+        // Without this, a lagged refetch during a stream put the reader back at
+        // the bottom: the anchor resolved to nothing, the old offset survived,
+        // and the list clamped it to the newest row.
+        self.capture_timeline_scroll_anchor();
+        let cover_sequence = self
+            .timeline_follow
+            .anchor_span
+            .map(|span| span.first_sequence);
         let (runtime, session_id) = (self.runtime.clone(), self.selected_session_id.clone());
         let (Some(runtime), Some(session_id)) = (runtime, session_id) else {
             if let Some(session_id) = self.selected_session_id.clone() {
@@ -30218,7 +30443,7 @@ impl VibexWorkbench {
                 self.load_agent_session_timeline_remote(
                     session_id,
                     generation,
-                    TimelineWindowRead::contiguous(),
+                    TimelineWindowRead::contiguous().covering(cover_sequence),
                     cx,
                 );
             }
@@ -30233,7 +30458,7 @@ impl VibexWorkbench {
             session_id,
             workspace_id,
             self.session_generation,
-            TimelineWindowRead::contiguous(),
+            TimelineWindowRead::contiguous().covering(cover_sequence),
             cx,
         );
     }
@@ -32738,25 +32963,62 @@ impl VibexWorkbench {
 
     /// Put the captured anchor back under the viewport top against the current
     /// row table. Returns whether an anchor was applied.
+    ///
+    /// An anchor this table cannot resolve is not left to the list to settle:
+    /// see [`Self::settle_timeline_anchor_on_oldest_row`].
     fn apply_timeline_scroll_anchor(&mut self) -> bool {
         if self.timeline_follow.following_bottom {
             return false;
         }
-        let Some(row_index) = self.timeline_anchor_row_index() else {
-            return false;
+        let offset_in_row = self.timeline_follow.anchor_offset_px as f32;
+        let offset_y = self.timeline_anchor_row_index().and_then(|row_index| {
+            timeline_scroll_offset_for_anchor(
+                &self.timeline_row_heights(),
+                row_index,
+                offset_in_row,
+                self.timeline_list_padding_top_px,
+            )
+        });
+        if let Some(offset_y) = offset_y {
+            self.timeline_scroll
+                .set_offset(point(px(0.0), px(offset_y)));
+            return true;
+        }
+        // An anchor that resolved to nothing means the row table no longer holds
+        // the turn the reader was reading — a replacement installed a window
+        // that starts somewhere below it, and no offset in the old window means
+        // anything here. The offset that was left behind is the old window's,
+        // and it is beyond this one's range, so the list clamps it to the newest
+        // row: the reader is thrown forward to the live edge, which is exactly
+        // the "scroll went back by itself" report. Land on the oldest row the
+        // window does hold instead, and move the anchor there with it, so a
+        // later geometry change or history page does not re-apply the lost turn.
+        if self.timeline_follow.has_anchor() {
+            self.settle_timeline_anchor_on_oldest_row();
+        }
+        false
+    }
+
+    /// Holds the oldest row of the current window, abandoning an anchor the
+    /// installed window cannot honour.
+    ///
+    /// The alternative — keeping the old offset — is not a neutral choice: it
+    /// describes a window with more content above it than this one has, and the
+    /// virtual list resolves that by clamping to the newest row.
+    fn settle_timeline_anchor_on_oldest_row(&mut self) {
+        self.timeline_scroll.set_offset(point(px(0.0), px(0.0)));
+        let Some((turn_id, span)) = self
+            .conversation_turns_cache
+            .first()
+            .and_then(|turn| timeline_turn_anchor_span(turn).map(|span| (turn.id.clone(), span)))
+        else {
+            return;
         };
-        let row_heights = self.timeline_row_heights();
-        let Some(offset_y) = timeline_scroll_offset_for_anchor(
-            &row_heights,
-            row_index,
-            self.timeline_follow.anchor_offset_px as f32,
-            self.timeline_list_padding_top_px,
-        ) else {
-            return false;
-        };
-        self.timeline_scroll
-            .set_offset(point(px(0.0), px(offset_y)));
-        true
+        // The offset that maps to the top of the list is the top padding
+        // cancelled out, which is the anchor `offset 0` resolves from.
+        let offset_in_row = -(self.timeline_list_padding_top_px.round() as i32);
+        self.timeline_follow
+            .preserve_anchor_at(turn_id, span, offset_in_row);
     }
 
     fn handle_timeline_scroll_wheel(&mut self, event: &ScrollEvent, cx: &mut Context<Self>) {
@@ -36832,6 +37094,24 @@ impl VibexWorkbench {
                 cx.notify();
             });
         }));
+    }
+
+    /// Activate one attachment of a message, from its thumbnail or file card.
+    ///
+    /// The body's inline label dispatches the same two actions, so every
+    /// surface that represents an attachment opens the same thing.
+    fn open_user_message_attachment(
+        &mut self,
+        action: UserMessageAttachmentAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match action {
+            UserMessageAttachmentAction::PreviewImage(attachment) => {
+                self.open_message_attachment_preview(attachment, window, cx)
+            }
+            UserMessageAttachmentAction::OpenFile(path) => self.open_code_file(path, window, cx),
+        }
     }
 
     /// Open a picture a message carries, wherever its bytes live.
@@ -65759,12 +66039,17 @@ impl VibexWorkbench {
             .when(!is_first, |this| this.pt_5())
             .pb_5();
 
+        // Reactions are set explicitly by the Agent through vibex_react. The
+        // row reads them from the hidden timeline notices, not from the turn
+        // state, so the send and the answer timing no longer matter here.
         if let Some(user_row) = turn.user_row.as_ref() {
             let user_message = self.render_user_message_row(
                 user_row,
                 Some(&turn.id),
-                is_last,
-                turn.complete,
+                UserMessageTurnState {
+                    latest: is_last,
+                    complete: turn.complete,
+                },
                 window,
                 cx,
             );
@@ -67421,7 +67706,7 @@ impl VibexWorkbench {
         let mut answer_metadata = answer_metadata;
         let element = match row.kind {
             TimelineRowKind::UserMessage => {
-                self.render_user_message_row(row, None, false, false, window, cx)
+                self.render_user_message_row(row, None, UserMessageTurnState::default(), window, cx)
             }
             TimelineRowKind::AgentMessage => self.render_agent_message_row(
                 row,
@@ -69826,6 +70111,60 @@ impl VibexWorkbench {
         estimated_chars_per_line(self.estimated_timeline_content_width())
     }
 
+    /// The first-layout height of a user message's attachment strip.
+    ///
+    /// Pictures and files occupy separate rows, both wrapping inside the same
+    /// 78% column as the bubble. Visible rows report their real height after
+    /// layout; this only keeps the virtual list from starting the row a whole
+    /// thumbnail short.
+    fn estimated_user_message_attachment_strip_height(&self, row: &TimelineRow) -> f32 {
+        let attachments = self
+            .timeline_row_latest_item(row)
+            .and_then(|item| match &item.payload {
+                vibex_core::TimelinePayload::UserMessage(message) => Some(&message.attachments),
+                _ => None,
+            });
+        let Some(attachments) = attachments else {
+            return 0.0;
+        };
+        let (images, files) =
+            attachments
+                .iter()
+                .fold((0usize, 0usize), |(images, files), attachment| {
+                    if message_attachment_is_image(attachment) {
+                        (images + 1, files)
+                    } else {
+                        (images, files + 1)
+                    }
+                });
+        if images == 0 && files == 0 {
+            return 0.0;
+        }
+        let column_width =
+            self.estimated_timeline_content_width() * USER_MESSAGE_COLUMN_WIDTH_RATIO;
+        let mut height = 0.0;
+        if images > 0 {
+            let image_rows =
+                user_message_attachment_rows(images, USER_MESSAGE_ATTACHMENT_TILE_PX, column_width);
+            height += image_rows as f32 * USER_MESSAGE_ATTACHMENT_TILE_PX
+                + (image_rows.saturating_sub(1) as f32) * USER_MESSAGE_ATTACHMENT_GAP_PX;
+        }
+        if files > 0 {
+            if height > 0.0 {
+                height += USER_MESSAGE_ATTACHMENT_GAP_PX;
+            }
+            let file_rows = user_message_attachment_rows(
+                files,
+                USER_MESSAGE_ATTACHMENT_FILE_WIDTH_PX,
+                column_width,
+            );
+            height += file_rows as f32 * USER_MESSAGE_ATTACHMENT_FILE_HEIGHT_PX
+                + (file_rows.saturating_sub(1) as f32) * USER_MESSAGE_ATTACHMENT_GAP_PX;
+        }
+        // The strip's own bottom inset plus the column gap.
+        height + USER_MESSAGE_ATTACHMENT_GAP_PX
+    }
+
     // Height estimation provides the first virtual-list layout. Visible turns
     // report their intrinsic height after layout so rich Markdown spacing does
     // not depend on this approximation.
@@ -69853,7 +70192,7 @@ impl VibexWorkbench {
                 {
                     base_height + 40.0
                 } else {
-                    base_height
+                    base_height + self.estimated_user_message_attachment_strip_height(row)
                 }
             }
             TimelineRowKind::AgentMessage => {
@@ -70696,8 +71035,7 @@ impl VibexWorkbench {
         &mut self,
         row: &TimelineRow,
         turn_id: Option<&str>,
-        latest_user_message: bool,
-        turn_complete: bool,
+        turn: UserMessageTurnState,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -70737,6 +71075,18 @@ impl VibexWorkbench {
             .as_ref()
             .is_some_and(|edit| edit.matches(&row.id, self.selected_session_id.as_ref()));
         let search_highlight = self.session_search_highlight_for_rows(std::slice::from_ref(row));
+        let attachment_strip = if editing {
+            None
+        } else {
+            self.render_user_message_attachment_strip(&row.id, &row.body, &attachments, cx)
+        };
+        // The Agent sets a reaction explicitly through vibex_react. It is read
+        // from the hidden notice the tool wrote, so it appears only when the
+        // Agent decided to react and survives every later render. The feature
+        // switch stops new reactions; it must not hide the ones already here.
+        let reaction = (!editing)
+            .then(|| user_message_reaction_from_items(&row.item_ids, &self.timeline.items))
+            .flatten();
         let inline_content = if editing {
             self.render_inline_user_message_editor(&row.id, cx)
         } else {
@@ -70759,7 +71109,7 @@ impl VibexWorkbench {
         let edge_reactions = if editing {
             None
         } else {
-            render_user_message_edge_reactions(&row.id, delivery, goal_message, cx)
+            render_user_message_edge_reactions(&row.id, delivery, goal_message, reaction, cx)
         };
         let hover_group: SharedString = format!("timeline-user-{}", row.id).into();
         let edit_text = row.body.clone();
@@ -70769,8 +71119,8 @@ impl VibexWorkbench {
         let edit_user_sequence = row.first_sequence;
         let edit_source_end_sequence = self.timeline.authoritative_end_sequence;
         let edit_action_state = user_message_edit_action_state(
-            latest_user_message,
-            turn_complete,
+            turn.latest,
+            turn.complete,
             self.timeline.needs_authoritative_refetch,
             self.selected_agent_session_state(),
             self.agent_action_pending
@@ -70788,8 +71138,8 @@ impl VibexWorkbench {
             first_sequence: row.first_sequence,
             last_sequence: row.last_sequence,
             authoritative_end_sequence: edit_source_end_sequence.unwrap_or(row.last_sequence),
-            latest_user_message,
-            turn_complete,
+            latest_user_message: turn.latest,
+            turn_complete: turn.complete,
             edit_action_state,
             row_is_live_view: self.timeline.session_id.as_ref() == self.view_session_id.as_ref(),
             child_session: self
@@ -70807,6 +71157,7 @@ impl VibexWorkbench {
             .w(relative(USER_MESSAGE_COLUMN_WIDTH_RATIO))
             .items_end()
             .gap_1()
+            .when_some(attachment_strip, |this, strip| this.child(strip))
             .child(render_user_message_bubble(
                 inline_content,
                 edge_reactions,
@@ -70929,6 +71280,8 @@ impl VibexWorkbench {
             user_message_clipboard_item_with_mentions(&row.body, &attachments, &mentions);
         let timestamp = self.timeline_row_timestamp(row);
         let search_highlight = self.session_search_highlight_for_rows(std::slice::from_ref(row));
+        let attachment_strip =
+            self.render_user_message_attachment_strip(&row.id, &row.body, &attachments, cx);
         let inline_content = self.render_user_message_inline_content(
             &row.id,
             row.body.clone(),
@@ -70968,6 +71321,7 @@ impl VibexWorkbench {
             .w(relative(USER_MESSAGE_COLUMN_WIDTH_RATIO))
             .items_end()
             .gap_1()
+            .when_some(attachment_strip, |this, strip| this.child(strip))
             .child(render_user_message_bubble(
                 inline_content,
                 None,
@@ -70998,6 +71352,130 @@ impl VibexWorkbench {
                     .into_any_element(),
             )
             .into_any_element()
+    }
+
+    /// The pictures and files a user message carries, drawn above its bubble.
+    ///
+    /// Pictures keep one row above the files so a 64px square never wraps
+    /// beside a long file card. Both rows end on the bubble's trailing edge,
+    /// and an attachment the client cannot resolve is left out rather than
+    /// drawn as a control that does nothing.
+    fn render_user_message_attachment_strip(
+        &mut self,
+        row_id: &str,
+        text: &str,
+        attachments: &[MessageAttachment],
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        if attachments.is_empty() {
+            return None;
+        }
+        let workspace_root = self
+            .view_session()
+            .map(|session| session.workspace_root.clone());
+        let locale = self.resolved_locale();
+        let entity = cx.weak_entity();
+        let mut image_tiles = Vec::new();
+        let mut file_cards = Vec::new();
+        for (index, attachment) in user_message_attachments_in_display_order(text, attachments)
+            .into_iter()
+            .enumerate()
+        {
+            let Some(action) =
+                user_message_attachment_action(&attachment, workspace_root.as_deref())
+            else {
+                continue;
+            };
+            if message_attachment_is_image(&attachment) {
+                let Some(source) = self.user_message_attachment_thumbnail(&attachment) else {
+                    continue;
+                };
+                image_tiles.push(render_user_message_image_tile(
+                    row_id,
+                    index,
+                    &attachment,
+                    source,
+                    action,
+                    entity.clone(),
+                    cx,
+                ));
+            } else {
+                file_cards.push(render_user_message_file_card(
+                    row_id,
+                    index,
+                    &attachment,
+                    action,
+                    entity.clone(),
+                    locale,
+                    cx,
+                ));
+            }
+        }
+        if image_tiles.is_empty() && file_cards.is_empty() {
+            return None;
+        }
+        let image_row = (!image_tiles.is_empty()).then(|| {
+            h_flex()
+                .w_full()
+                .min_w_0()
+                .flex_wrap()
+                .justify_end()
+                .gap(px(USER_MESSAGE_ATTACHMENT_GAP_PX))
+                .children(image_tiles)
+                .into_any_element()
+        });
+        let file_row = (!file_cards.is_empty()).then(|| {
+            h_flex()
+                .w_full()
+                .min_w_0()
+                .flex_wrap()
+                .justify_end()
+                .gap(px(USER_MESSAGE_ATTACHMENT_GAP_PX))
+                .children(file_cards)
+                .into_any_element()
+        });
+        Some(
+            v_flex()
+                .w_full()
+                .items_end()
+                .gap(px(USER_MESSAGE_ATTACHMENT_GAP_PX))
+                .when_some(image_row, |this, row| this.child(row))
+                .when_some(file_row, |this, row| this.child(row))
+                .mb(px(USER_MESSAGE_ATTACHMENT_BUBBLE_GAP_PX))
+                .into_any_element(),
+        )
+    }
+
+    /// Resolve one message picture to something `img()` can paint.
+    ///
+    /// Local files go straight to the asset system; inline `data:` bytes are
+    /// decoded once and remembered for the frame budget. `None` means there is
+    /// no thumbnail to draw, so the strip leaves that attachment to its inline
+    /// label instead of showing a hole.
+    fn user_message_attachment_thumbnail(
+        &mut self,
+        attachment: &MessageAttachment,
+    ) -> Option<UserMessageThumbnailSource> {
+        let uri = attachment.uri.as_deref()?.trim();
+        if let Some(path) = attachment_local_path(uri) {
+            return Some(UserMessageThumbnailSource::Path(PathBuf::from(path)));
+        }
+        if !uri.to_ascii_lowercase().starts_with("data:image/") {
+            return None;
+        }
+        let key = user_message_data_uri_key(uri);
+        if let Some(cached) = self.user_message_thumbnail_cache.get(&key) {
+            return cached.clone().map(UserMessageThumbnailSource::Decoded);
+        }
+        let decoded = data_url_image(uri);
+        if self.user_message_thumbnail_cache.len() >= USER_MESSAGE_THUMBNAIL_CACHE_LIMIT
+            && let Some(oldest) = self.user_message_thumbnail_cache.keys().next().copied()
+        {
+            self.user_message_thumbnail_cache.remove(&oldest);
+        }
+        self.user_message_thumbnail_cache
+            .insert(key, decoded.clone());
+        decoded.map(UserMessageThumbnailSource::Decoded)
     }
 
     /// The definite width this view's user message bodies may wrap at.
@@ -88470,6 +88948,16 @@ fn settings_search_candidates(strings: &'static Strings) -> Vec<SettingsSearchCa
         ),
         settings_search_candidate(
             SettingsSection::Session,
+            locale::text("Message reactions", "消息 Reaction", "訊息 Reaction"),
+            locale::text(
+                "Let the Agent add emoji reactions to your messages. Turning this off stops new reactions; existing ones stay visible.",
+                "允许 Agent 给你的消息添加表情回应。关闭后不再产生新的 reaction，已有的 reaction 仍会显示。",
+                "允許 Agent 給你的訊息添加表情回應。關閉後不再產生新的 reaction，已有的 reaction 仍會顯示。",
+            ),
+            &["reaction", "emoji", "表情", "回应", "回應"],
+        ),
+        settings_search_candidate(
+            SettingsSection::Session,
             locale::text("Auto-continue", "自动继续", "自動繼續"),
             locale::text(
                 "Keep automatic continuation on for every project, including new sessions.",
@@ -92428,6 +92916,22 @@ impl FoundationSettings {
         cx.notify();
     }
 
+    /// Turn Agent emoji reactions on or off for every conversation.
+    fn set_message_reactions_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        let _ = self.workbench.update(cx, |this, cx| {
+            this.ui_state.message_reactions.enabled = enabled;
+            if let Some(runtime) = this.runtime.as_ref() {
+                runtime
+                    .agent()
+                    .manager()
+                    .set_message_reactions_enabled(enabled);
+            }
+            this.queue_ui_state();
+            cx.notify();
+        });
+        cx.notify();
+    }
+
     fn set_notifications_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
         let _ = self.workbench.update(cx, |this, cx| {
             this.ui_state.desktop_behavior.notifications_enabled = enabled;
@@ -93818,6 +94322,22 @@ impl FoundationSettings {
         strings: &'static Strings,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let message_reactions_enabled = self
+            .workbench
+            .read_with(cx, |this, _| this.ui_state.message_reactions.enabled)
+            .unwrap_or(true);
+        let message_reactions_switch =
+            Switch::new("message-reactions-enabled")
+                .small()
+                .checked(message_reactions_enabled)
+                .tooltip(locale::text(
+                    "Message reactions",
+                    "消息 Reaction",
+                    "訊息 Reaction",
+                ))
+                .on_click(cx.listener(|this, enabled, _, cx| {
+                    this.set_message_reactions_enabled(*enabled, cx)
+                }));
         let turn_preview_rail_switch =
             Switch::new("session-turn-preview-rail")
                 .small()
@@ -94072,6 +94592,20 @@ impl FoundationSettings {
                             cx,
                         ),
                     ],
+                ),
+                SettingsGroup::new(
+                    locale::text("Reactions", "Reaction", "Reaction"),
+                    vec![setting_row(
+                        locale::text("Message reactions", "消息 Reaction", "訊息 Reaction"),
+                        locale::text(
+                            "Let the Agent add emoji reactions to your messages. Turning this off stops new reactions; existing ones stay visible.",
+                            "允许 Agent 给你的消息添加表情回应。关闭后不再产生新的 reaction，已有的 reaction 仍会显示。",
+                            "允許 Agent 給你的訊息添加表情回應。關閉後不再產生新的 reaction，已有的 reaction 仍會顯示。",
+                        ),
+                        message_reactions_switch,
+                        stacked,
+                        cx,
+                    )],
                 ),
                 SettingsGroup::new(
                     locale::text("Composer", "输入与发送", "輸入與傳送"),
@@ -102716,25 +103250,7 @@ fn user_message_inline_document(
                 if label.is_empty() {
                     continue;
                 }
-                let composer_attachment = composer_attachment_from_message(
-                    attachment,
-                    format!("message-attachment:{segment_index}"),
-                );
-                let action = if composer_attachment.is_image() {
-                    // The message's attachment itself travels with the action:
-                    // a picture written by another client is a `data:` URL with
-                    // no path to resolve yet, and the preview writes it down
-                    // when the reader asks for it.
-                    Some(UserMessageAttachmentAction::PreviewImage(
-                        attachment.clone(),
-                    ))
-                } else {
-                    composer_attachment.path.as_deref().and_then(|path| {
-                        agent_file_operation_preview_path(path, workspace_root)
-                            .map(UserMessageAttachmentAction::OpenFile)
-                    })
-                };
-                if let Some(action) = action {
+                if let Some(action) = user_message_attachment_action(attachment, workspace_root) {
                     let key = format!("vibex-attachment:{segment_index}");
                     attachment_actions.insert(key.clone(), action);
                     source.push('[');
@@ -102763,6 +103279,265 @@ fn user_message_inline_document(
     }
 
     (source, Arc::new(attachment_actions))
+}
+
+/// Where a message's picture can be read for its thumbnail.
+enum UserMessageThumbnailSource {
+    /// A file the client can read directly; GPUI loads and caches it.
+    Path(PathBuf),
+    /// A `data:` URI decoded in this process, kept in the view's bounded
+    /// thumbnail memo so a redraw does not base64-decode the payload again.
+    Decoded(Arc<gpui::Image>),
+}
+
+/// What activating one of a message's attachments does.
+///
+/// The strip above the bubble and the inline label in its text resolve through
+/// this one function, so a picture and its thumbnail cannot open different
+/// things.
+fn user_message_attachment_action(
+    attachment: &MessageAttachment,
+    workspace_root: Option<&str>,
+) -> Option<UserMessageAttachmentAction> {
+    let composer_attachment = composer_attachment_from_message(attachment, String::new());
+    if composer_attachment.is_image() {
+        // The message's attachment itself travels with the action: a picture
+        // written by another client is a `data:` URL with no path to resolve
+        // yet, and the preview writes it down when the reader asks for it.
+        return Some(UserMessageAttachmentAction::PreviewImage(
+            attachment.clone(),
+        ));
+    }
+    let path = composer_attachment.path.as_deref()?;
+    // A file under the session's workspace travels as a workspace-relative
+    // path, which is what the code preview's tab identity expects. A file the
+    // reader attached from elsewhere (a packaged plugin beside the project, a
+    // download, a sibling checkout) must still get a card: the preview accepts
+    // absolute external paths unchanged, so falling back to one keeps the card
+    // and its click promise instead of silently dropping the attachment.
+    let destination = agent_file_operation_preview_path(path, workspace_root).or_else(|| {
+        let path = path.trim();
+        (Path::new(path).is_absolute() || is_windows_drive_path(path)).then(|| path.to_string())
+    })?;
+    Some(UserMessageAttachmentAction::OpenFile(destination))
+}
+
+/// The attachments a message carries, in the order its body mentions them.
+///
+/// A message with text around its pictures is read in that order; attachments
+/// the sending client wrote without an inline offset follow it, exactly as
+/// [`user_message_inline_document`] lays them out.
+fn user_message_attachments_in_display_order(
+    text: &str,
+    attachments: &[MessageAttachment],
+) -> Vec<MessageAttachment> {
+    user_message_inline_segments(text, attachments)
+        .into_iter()
+        .filter_map(|segment| match segment {
+            UserMessageInlineSegment::Attachment(attachment) => Some(attachment),
+            UserMessageInlineSegment::Text(_) => None,
+        })
+        .collect()
+}
+
+/// The short type word a file card's second line carries (`PDF`, `DOCX`, …).
+fn user_message_attachment_type_label(
+    attachment: &MessageAttachment,
+    locale: locale::ResolvedLocale,
+) -> SharedString {
+    let extension = attachment
+        .display_label()
+        .rsplit_once('.')
+        .map(|(_, extension)| extension.trim())
+        .filter(|extension| {
+            !extension.is_empty()
+                && extension.len() <= 8
+                && extension
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric())
+        })
+        .map(str::to_ascii_uppercase);
+    if let Some(extension) = extension {
+        return extension.into();
+    }
+    if let Some(subtype) = attachment
+        .mime_type
+        .as_deref()
+        .and_then(|mime_type| mime_type.split_once('/'))
+        .map(|(_, subtype)| subtype.trim())
+        .filter(|subtype| {
+            !subtype.is_empty()
+                && subtype.len() <= 8
+                && subtype
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric())
+        })
+    {
+        return subtype.to_ascii_uppercase().into();
+    }
+    locale::text_for(locale, "File", "文件", "檔案").into()
+}
+
+/// A cheap fingerprint for a `data:` URI used as a thumbnail cache key.
+///
+/// The payload can be megabytes, so hashing all of it every frame would trade
+/// one expensive decode for another. Length plus both ends changes whenever a
+/// picture changes in practice, and costs the same regardless of size.
+fn user_message_data_uri_key(uri: &str) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let bytes = uri.as_bytes();
+    bytes.len().hash(&mut hasher);
+    bytes[..bytes.len().min(256)].hash(&mut hasher);
+    bytes[bytes.len().saturating_sub(256)..].hash(&mut hasher);
+    hasher.finish()
+}
+
+/// How many rows `count` attachments of one kind need in a column.
+///
+/// The strip's rows wrap at the lane width, so the first-layout estimate has to
+/// count them the same way before the row is measured. A lane never reports
+/// zero rows for a non-empty count, even in a degenerate pane.
+fn user_message_attachment_rows(count: usize, item_width: f32, column_width: f32) -> usize {
+    if count == 0 {
+        return 0;
+    }
+    let per_row = (((column_width + USER_MESSAGE_ATTACHMENT_GAP_PX)
+        / (item_width + USER_MESSAGE_ATTACHMENT_GAP_PX))
+        .floor() as usize)
+        .max(1);
+    count.div_ceil(per_row)
+}
+
+/// One picture in the strip above a user message.
+///
+/// The library's `Attachment` would draw the square, but its click layer is a
+/// pointer-only overlay with no focus or keyboard activation. A picture is the
+/// whole control here, so it is a `Button` whose child is the image; focus,
+/// Enter/Space, hover, the tooltip and the accessible name all come from the
+/// component.
+fn render_user_message_image_tile(
+    row_id: &str,
+    index: usize,
+    attachment: &MessageAttachment,
+    source: UserMessageThumbnailSource,
+    action: UserMessageAttachmentAction,
+    entity: WeakEntity<VibexWorkbench>,
+    cx: &App,
+) -> Button {
+    let label: SharedString = attachment.display_label().to_string().into();
+    let action_label: SharedString = format!(
+        "{}: {label}",
+        locale::text("Preview image", "预览图片", "預覽圖片")
+    )
+    .into();
+    let fallback_color = cx.theme().muted_foreground;
+    let image = match source {
+        UserMessageThumbnailSource::Path(path) => img(path),
+        UserMessageThumbnailSource::Decoded(image) => img(image),
+    };
+    Button::new(SharedString::from(format!(
+        "user-message-attachment:{row_id}:{index}"
+    )))
+    .ghost()
+    .compact()
+    .p(px(2.0))
+    .size(px(USER_MESSAGE_ATTACHMENT_TILE_PX))
+    .rounded(cx.theme().radius_lg)
+    .overflow_hidden()
+    .bg(cx.theme().muted)
+    .tooltip(action_label.clone())
+    .accessibility_label(action_label)
+    .on_click(move |_, window, cx| {
+        let action = action.clone();
+        let _ = entity.update(cx, |this, cx| {
+            this.open_user_message_attachment(action, window, cx);
+        });
+    })
+    .child(
+        image
+            .size_full()
+            .rounded(cx.theme().radius)
+            .object_fit(ObjectFit::Cover)
+            .with_fallback(move || {
+                div()
+                    .size_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        Icon::new(IconName::File)
+                            .size(px(20.0))
+                            .text_color(fallback_color),
+                    )
+                    .into_any_element()
+            }),
+    )
+}
+
+/// One file in the strip under a user message's pictures.
+///
+/// This is the library's `Attachment` card: media, title, description and an
+/// actions slot. The visible `Open` button in that slot is the keyboard path;
+/// the card's own click layer is the pointer shortcut, so an accessible user
+/// never depends on the part that cannot take focus.
+fn render_user_message_file_card(
+    row_id: &str,
+    index: usize,
+    attachment: &MessageAttachment,
+    action: UserMessageAttachmentAction,
+    entity: WeakEntity<VibexWorkbench>,
+    locale: locale::ResolvedLocale,
+    cx: &App,
+) -> Attachment {
+    let label: SharedString = attachment.display_label().to_string().into();
+    let type_label = user_message_attachment_type_label(attachment, locale);
+    let open_label: SharedString = locale::text_for(locale, "Open", "打开", "開啟").into();
+    let action_label: SharedString = format!(
+        "{}: {label}",
+        locale::text_for(locale, "Open attachment", "打开附件", "開啟附件")
+    )
+    .into();
+    let card_id = SharedString::from(format!("user-message-attachment:{row_id}:{index}"));
+    let click_entity = entity.clone();
+    let click_action = action.clone();
+    Attachment::new()
+        .id(card_id.clone())
+        .tooltip(label.clone())
+        .media(
+            AttachmentMedia::new().child(
+                Icon::new(IconName::File)
+                    .size(px(20.0))
+                    .text_color(cx.theme().muted_foreground),
+            ),
+        )
+        .content(
+            AttachmentContent::new()
+                .title(AttachmentTitle::new(label))
+                .description(AttachmentDescription::new(type_label)),
+        )
+        .actions(
+            AttachmentActions::new().child(
+                Button::new(SharedString::from(format!("{card_id}:open")))
+                    .small()
+                    .ghost()
+                    .compact()
+                    .label(open_label)
+                    .tooltip(action_label.clone())
+                    .accessibility_label(action_label)
+                    .on_click(move |_, window, cx| {
+                        let action = action.clone();
+                        let _ = entity.update(cx, |this, cx| {
+                            this.open_user_message_attachment(action, window, cx);
+                        });
+                    }),
+            ),
+        )
+        .on_click(move |_, window, cx| {
+            let action = click_action.clone();
+            let _ = click_entity.update(cx, |this, cx| {
+                this.open_user_message_attachment(action, window, cx);
+            });
+        })
 }
 
 fn render_user_message_delivery_button(
@@ -102822,18 +103597,76 @@ fn render_user_message_goal_button(row_id: &str, cx: &App) -> Button {
         .tooltip(label)
 }
 
+/// The emoji the Agent attached to a user message.
+///
+/// The runtime records a reaction as a hidden system notice whose provider
+/// correlation names the target item; the conversation projection drops the
+/// notice from the rows, so this is the only place it is read. When the Agent
+/// changes its reaction, the newest notice for that item wins.
+fn user_message_reaction_from_items(
+    item_ids: &[String],
+    items: &[TimelineItem],
+) -> Option<SharedString> {
+    items
+        .iter()
+        .filter_map(|item| {
+            let TimelinePayload::SystemNotice(notice) = &item.payload else {
+                return None;
+            };
+            let target = item
+                .provider_correlation_id
+                .as_deref()?
+                .strip_prefix(VIBEX_USE_REACTION_CORRELATION_PREFIX)?;
+            item_ids
+                .iter()
+                .any(|item_id| item_id == target)
+                .then(|| (item.sequence, notice.message.clone()))
+        })
+        .max_by_key(|(sequence, _)| *sequence)
+        .map(|(_, emoji)| SharedString::from(emoji))
+}
+
 /// The bubble's lower-edge reaction region, holding every mark the row earned.
 ///
-/// Both marks share one pill: the goal badge sits inboard of the delivery
-/// accent so the delivery hue keeps the corner it has always held.
+/// The Agent's emoji leads; the goal badge and delivery accent keep the trailing
+/// corner. All share one pill so the row does not grow a second floating
+/// surface.
 fn render_user_message_edge_reactions(
     row_id: &str,
     delivery: UserMessageDelivery,
     is_goal_message: bool,
+    reaction: Option<SharedString>,
     cx: &App,
 ) -> Option<BubbleReactions> {
+    let has_action = is_goal_message || delivery != UserMessageDelivery::Prompt;
     let mut reactions = BubbleReactions::new();
+    // A reaction that stands alone is the common case. Trim the library's
+    // decorative inset a little so it reads as a quiet mark, not a badge.
+    if reaction.is_some() && !has_action {
+        reactions = reactions.px(px(4.0)).py(px(1.0));
+    }
     let mut has_mark = false;
+    if let Some(emoji) = reaction {
+        reactions = reactions.child(
+            div()
+                .id(SharedString::from(format!(
+                    "user-message-reaction:{row_id}"
+                )))
+                .flex()
+                .items_center()
+                // A reaction that shares the pill with an action loses the
+                // library's decorative padding, so it pays for its own inset.
+                .when(has_action, |this| this.px(px(4.0)))
+                .text_sm()
+                .aria_label(locale::text(
+                    "AI reacted to this message",
+                    "AI 回应了这条消息",
+                    "AI 回應了這則訊息",
+                ))
+                .child(emoji),
+        );
+        has_mark = true;
+    }
     if is_goal_message {
         reactions = reactions.action(render_user_message_goal_button(row_id, cx));
         has_mark = true;
@@ -111146,6 +111979,12 @@ mod tests {
             .expect("timeline anchor restore should remain inspectable");
         assert!(restore.contains("self.timeline_anchor_row_index()"));
         assert!(!restore.contains(".position(|turn| turn.id == turn_id)"));
+        // An anchor the installed window cannot resolve is not left for the
+        // virtual list to settle: that clamps the taller window's offset to the
+        // newest row, which is the jump this path exists to prevent.
+        assert!(restore.contains("self.timeline_follow.has_anchor()"));
+        assert!(restore.contains("self.settle_timeline_anchor_on_oldest_row()"));
+        assert!(restore.contains("self.timeline_scroll.set_offset(point(px(0.0), px(0.0)))"));
 
         let resolve = source
             .split_once("    fn timeline_anchor_row_index(")
@@ -111197,6 +112036,20 @@ mod tests {
             assert!(capture < replace);
             assert!(body.contains("this.timeline_scroll_anchor_pending = true;"));
         }
+
+        // The replacement a lagged refetch installs reads the newest window,
+        // which is not where a reader who scrolled up is. The read is asked for
+        // the turn their anchor names, so the anchor can resolve against the
+        // window that replaces theirs instead of being clamped to the newest
+        // row.
+        let refresh = source
+            .split_once("    fn refresh_selected_agent_timeline(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn load_agent_session_projection("))
+            .map(|(body, _)| body)
+            .expect("the timeline refresh should remain inspectable");
+        assert!(refresh.contains("self.capture_timeline_scroll_anchor();"));
+        assert!(refresh.contains("TimelineWindowRead::contiguous().covering(cover_sequence)"));
+        assert!(refresh.contains(".anchor_span"));
     }
 
     #[test]
@@ -123341,6 +124194,213 @@ mod tests {
     }
 
     #[test]
+    fn user_message_attachment_strip_stacks_pictures_above_files() {
+        let source = include_str!("app.rs");
+        let strip = source
+            .split_once("    fn render_user_message_attachment_strip(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// Resolve one message picture"))
+            .map(|(body, _)| body)
+            .expect("attachment strip should remain inspectable");
+
+        assert!(strip.contains("user_message_attachments_in_display_order"));
+        assert!(strip.contains("image_tiles"));
+        assert!(strip.contains("file_cards"));
+        assert!(strip.contains(".flex_wrap()"));
+        assert!(strip.contains(".justify_end()"));
+
+        // Pictures are one row, files are the row beneath them, and the strip
+        // hands both to the bubble from the same trailing edge.
+        let image_row = strip
+            .find(".when_some(image_row")
+            .expect("the picture row should be drawn first");
+        let file_row = strip
+            .find(".when_some(file_row")
+            .expect("the file row should follow the picture row");
+        assert!(image_row < file_row);
+    }
+
+    #[test]
+    fn user_message_attachment_rows_wrap_into_lanes() {
+        // A 500px column holds seven 64px pictures plus their gaps.
+        assert_eq!(user_message_attachment_rows(7, 64.0, 500.0), 1);
+        assert_eq!(user_message_attachment_rows(8, 64.0, 500.0), 2);
+        // Two 232px file cards fit; the third starts a second lane.
+        assert_eq!(user_message_attachment_rows(2, 232.0, 500.0), 1);
+        assert_eq!(user_message_attachment_rows(3, 232.0, 500.0), 2);
+        assert_eq!(user_message_attachment_rows(0, 232.0, 500.0), 0);
+    }
+
+    #[test]
+    fn user_message_attachment_type_label_prefers_extension_then_mime() {
+        let pdf = MessageAttachment {
+            label: "sales-dashboard.pdf".into(),
+            mime_type: Some("application/pdf".into()),
+            uri: None,
+            inline_text_offset: None,
+        };
+        assert_eq!(
+            user_message_attachment_type_label(&pdf, locale::ResolvedLocale::En).as_ref(),
+            "PDF"
+        );
+
+        let zipped = MessageAttachment {
+            label: "download".into(),
+            mime_type: Some("application/zip".into()),
+            uri: None,
+            inline_text_offset: None,
+        };
+        assert_eq!(
+            user_message_attachment_type_label(&zipped, locale::ResolvedLocale::En).as_ref(),
+            "ZIP"
+        );
+
+        let bare = MessageAttachment {
+            label: "untitled".into(),
+            mime_type: None,
+            uri: None,
+            inline_text_offset: None,
+        };
+        assert_eq!(
+            user_message_attachment_type_label(&bare, locale::ResolvedLocale::En).as_ref(),
+            "File"
+        );
+    }
+
+    #[test]
+    fn user_message_attachment_action_matches_the_inline_link() {
+        let image = MessageAttachment {
+            label: "shot.png".into(),
+            mime_type: Some("image/png".into()),
+            uri: Some("data:image/png;base64,AA".into()),
+            inline_text_offset: Some(0),
+        };
+        assert!(matches!(
+            user_message_attachment_action(&image, Some("/work/vibex")),
+            Some(UserMessageAttachmentAction::PreviewImage(_))
+        ));
+
+        let file = MessageAttachment {
+            label: "README.md".into(),
+            mime_type: Some("text/markdown".into()),
+            uri: Some("file:///work/vibex/README.md".into()),
+            inline_text_offset: Some(0),
+        };
+        assert_eq!(
+            user_message_attachment_action(&file, Some("/work/vibex")),
+            Some(UserMessageAttachmentAction::OpenFile("README.md".into()))
+        );
+
+        // A plugin package beside the project is outside the workspace. Its
+        // card still has to appear, so the action keeps the absolute path the
+        // preview accepts for an external file.
+        let outside = MessageAttachment {
+            label: "dev.vibex.todo-1.1.0.vplug".into(),
+            mime_type: None,
+            uri: Some("file:///work/vibex-plugin/packages/dev.vibex.todo-1.1.0.vplug".into()),
+            inline_text_offset: Some(0),
+        };
+        assert_eq!(
+            user_message_attachment_action(&outside, Some("/work/vibex")),
+            Some(UserMessageAttachmentAction::OpenFile(
+                "/work/vibex-plugin/packages/dev.vibex.todo-1.1.0.vplug".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn user_message_file_card_uses_the_library_attachment_parts() {
+        let source = include_str!("app.rs");
+        let card = source
+            .split_once("fn render_user_message_file_card(")
+            .and_then(|(_, tail)| tail.split_once("\nfn render_user_message_delivery_button("))
+            .map(|(body, _)| body)
+            .expect("file card helper should remain inspectable");
+
+        assert!(card.contains("Attachment::new()"));
+        assert!(card.contains("AttachmentMedia::new()"));
+        assert!(card.contains("AttachmentContent::new()"));
+        assert!(card.contains("AttachmentTitle::new("));
+        assert!(card.contains("AttachmentDescription::new("));
+        assert!(card.contains("AttachmentActions::new()"));
+        assert!(card.contains("Button::new("));
+        assert!(card.contains(".accessibility_label("));
+    }
+
+    #[test]
+    fn message_reactions_are_on_by_default_and_the_setting_is_wired() {
+        let state = DesktopUiStateV1::default();
+        assert!(state.message_reactions.enabled);
+
+        let source = include_str!("app.rs");
+        assert!(source.contains("set_message_reactions_enabled"));
+        assert!(source.contains("ui_state.message_reactions.enabled"));
+        assert!(source.contains("agent().manager().set_message_reactions_enabled"));
+
+        // The switch belongs to Session settings, not General.
+        let general = source
+            .split_once("    fn render_general_page(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_appearance_page("))
+            .map(|(body, _)| body)
+            .expect("general settings should remain inspectable");
+        assert!(!general.contains("message-reactions-enabled"));
+
+        let session = source
+            .split_once("    fn render_session_page(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_archived_page("))
+            .map(|(body, _)| body)
+            .expect("session settings should remain inspectable");
+        assert!(session.contains("message-reactions-enabled"));
+        assert!(session.contains("existing ones stay visible"));
+
+        // Turning the feature off stops new reactions but does not hide the
+        // ones already recorded on a message.
+        let row = source
+            .split_once("    fn render_user_message_row(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_agent_message_row("))
+            .map(|(body, _)| body)
+            .expect("user message row should remain inspectable");
+        assert!(!row.contains("message_reactions.enabled"));
+    }
+
+    #[test]
+    fn user_message_reaction_comes_from_the_agent_notice() {
+        let target = "item_user".to_string();
+        let item_ids = vec![target.clone()];
+        let notice = |sequence: i64, emoji: &str, target: &str| TimelineItem {
+            id: TimelineItemId::new(),
+            session_id: VibexSessionId::new(),
+            sequence,
+            timestamp_ms: 0,
+            source: TimelineSource::System,
+            kind: vibex_core::TimelineItemKind::SystemNotice,
+            correlation_id: None,
+            provider_correlation_id: Some(format!(
+                "{VIBEX_USE_REACTION_CORRELATION_PREFIX}{target}"
+            )),
+            redaction_state: vibex_core::TimelineRedactionState::None,
+            execution_attribution: None,
+            payload_depth: Default::default(),
+            payload: TimelinePayload::SystemNotice(vibex_core::SystemNoticePayload {
+                level: vibex_core::SystemNoticeLevel::Info,
+                message: emoji.to_string(),
+            }),
+        };
+
+        // No notice, no reaction.
+        assert!(user_message_reaction_from_items(&item_ids, &[]).is_none());
+        // A notice for another message does not decorate this one.
+        let other = notice(10, "🔥", "item_other");
+        assert!(user_message_reaction_from_items(&item_ids, &[other]).is_none());
+        // The newest notice for this message wins, so the Agent can change it.
+        let first = notice(11, "❤️", &target);
+        let second = notice(12, "🫶", &target);
+        assert_eq!(
+            user_message_reaction_from_items(&item_ids, &[first, second]).as_deref(),
+            Some("🫶")
+        );
+    }
+
+    #[test]
     fn inline_composer_file_attachments_use_the_multi_tab_open_path() {
         let source = include_str!("app.rs");
         let renderer = source
@@ -130377,9 +131437,11 @@ mod tests {
             })
             .map(|(body, _)| body)
             .expect("the folder setter should remain inspectable");
-        // A stale or foreign folder is refused rather than written.
+        // A stale or foreign folder is refused rather than written. The guard
+        // is formatted over several lines, so compare it without whitespace.
         assert!(setter.contains(".folder(folder_id)"));
-        assert!(setter.contains("folder.project_id == self.new_session_workspace.project_id"));
+        let guard = setter.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(guard.contains("folder.project_id == self .new_session_workspace .project_id"));
 
         // The page draws the control from the choices, so an empty list hides
         // it, and the control writes through the same setter the folder row
@@ -131454,6 +132516,7 @@ mod tests {
                 "delivery-probe",
                 self.delivery.get(),
                 false,
+                None,
                 cx,
             )
             .map(|reactions| {
@@ -131528,6 +132591,7 @@ mod tests {
                 "goal-badge-probe",
                 UserMessageDelivery::Prompt,
                 self.is_goal_message.get(),
+                None,
                 cx,
             )
             .map(|reactions| {

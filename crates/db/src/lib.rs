@@ -25292,6 +25292,7 @@ mod tests {
                 provider_resolution_id: None,
                 responder: None,
                 note: None,
+                responder: None,
                 resolved_at_ms: unix_timestamp_ms(),
             },
         )
@@ -25314,6 +25315,7 @@ mod tests {
                     provider_resolution_id: None,
                     responder: None,
                     note: None,
+                    responder: None,
                     resolved_at_ms: unix_timestamp_ms(),
                 },
             )
@@ -27501,6 +27503,7 @@ mod permission_lifecycle_tests {
             provider_resolution_id: None,
             responder: None,
             note: None,
+            responder: None,
             resolved_at_ms: 200,
         };
         PermissionRepository::resolve(&conn, &approved).unwrap();

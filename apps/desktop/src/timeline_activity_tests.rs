@@ -825,12 +825,15 @@ fn activity_shimmer_stops_when_settled_or_motion_is_reduced(cx: &mut TestAppCont
             view.running = running;
             cx.notify();
         });
-        let frames = cx.update(|window, cx| {
-            window.simulate_next_frame(cx);
+        cx.update(|window, cx| {
             let _ = window.draw(cx);
-            window.simulate_next_frame(cx)
         });
-        assert_eq!(frames > 0, running && !reduced);
+        // The sweep runs at 30 fps through a timer, so it registers no
+        // animation-frame callback of its own. What the row promises is that
+        // the animated label is mounted exactly while it is running and
+        // motion is allowed.
+        let shimmering = cx.debug_bounds("activity-shimmer:tool-target").is_some();
+        assert_eq!(shimmering, running && !reduced);
         let current = cx.debug_bounds("activity-text").unwrap().size.height;
         assert_eq!(
             *height.get_or_insert(current),

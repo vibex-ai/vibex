@@ -2704,7 +2704,19 @@ mod tests {
                 native_state_home_id: NativeStateHomeId::new(),
                 provider_resume_identity: None,
                 process_spawn_fingerprint: "mock-fingerprint".to_string(),
-                session_runtime_config_state: SessionRuntimeConfigState::default(),
+                // The mock executor stands in for the apply path, so its target
+                // binding carries the selection it was asked to apply — the
+                // same state a real `apply_session_config` leaves behind.
+                session_runtime_config_state: SessionRuntimeConfigState {
+                    preferred_model: intent.target_selection.model_id().map(str::to_string),
+                    effective_model: intent.target_selection.model_id().map(str::to_string),
+                    preferred_reasoning_effort: intent.target_selection.reasoning_effort.clone(),
+                    effective_reasoning_effort: intent.target_selection.reasoning_effort.clone(),
+                    preferred_mode: intent.target_selection.mode_id.clone(),
+                    effective_mode: intent.target_selection.mode_id.clone(),
+                    applied_activation_generation: Some(0),
+                    ..Default::default()
+                },
                 capability_snapshot: None,
                 restore_compatibility_key: None,
                 last_context_sequence: 0,
@@ -3056,7 +3068,18 @@ mod tests {
                 native_state_home_id: NativeStateHomeId::new(),
                 provider_resume_identity: None,
                 process_spawn_fingerprint: "source-fingerprint".to_string(),
-                session_runtime_config_state: SessionRuntimeConfigState::default(),
+                // The apply path confirms the selection on the binding it was
+                // applied to, so the fixture carries the same effort its
+                // selection names. A configuration that was never confirmed is
+                // deliberately not authoritative for reconciliation.
+                session_runtime_config_state: SessionRuntimeConfigState {
+                    preferred_model: Some("model-next".to_string()),
+                    effective_model: Some("model-next".to_string()),
+                    preferred_reasoning_effort: Some("high".to_string()),
+                    effective_reasoning_effort: Some("high".to_string()),
+                    applied_activation_generation: Some(0),
+                    ..Default::default()
+                },
                 capability_snapshot: None,
                 restore_compatibility_key: None,
                 last_context_sequence: 0,

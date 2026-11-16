@@ -16,6 +16,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use rusqlite::OptionalExtension as _;
 use tokio::sync::Notify;
 use vibex_agent::AgentManager;
 use vibex_agent::manager::DelegationStartOutcome;
@@ -30,21 +31,22 @@ use vibex_core::{
     PresentationActivationPolicy, PresentationOutcome, PresentationState, SendAgentMessageRequest,
     SessionGroupId, SessionGroupLayoutIntent, SessionGroupLayoutPreset, SessionGroupScope,
     SessionListPage, SessionReadAnchor, SessionReadCursor, SessionReadEntry, SessionReadPage,
-    SessionReadView, SessionRuntimeOption, SessionRuntimeSelection, SessionTreeNode, TaskListPage,
-    TimelineItem, TimelineItemKind, TimelinePayload, UserMessageDelivery,
+    SessionReadView, SessionRuntimeOption, SessionRuntimeSelection, SessionTreeNode,
+    SystemNoticeLevel, SystemNoticePayload, TaskListPage, TimelineItem, TimelineItemKind,
+    TimelinePayload, TimelineRedactionState, TimelineSource, UserMessageDelivery,
     VIBEX_USE_APPROVAL_READ_CHARS, VIBEX_USE_APPROVAL_UNTRUSTED_NOTICE,
     VIBEX_USE_DEFAULT_READ_CHARS, VIBEX_USE_DEFAULT_READ_ITEMS, VIBEX_USE_IDEMPOTENCY_KEY_CHARS,
     VIBEX_USE_MAX_BATCH_REFS, VIBEX_USE_MAX_CONTEXT_REFS, VIBEX_USE_MAX_GROUP_MEMBERS,
     VIBEX_USE_MAX_LIVE_PANES, VIBEX_USE_MAX_READ_CHARS, VIBEX_USE_MAX_READ_ITEMS,
-    VIBEX_USE_MAX_WAIT_MS, VIBEX_USE_SUMMARY_CHARS, VIBEX_USE_TITLE_CHARS, VibexError,
-    VibexExecutionId, VibexOperationId, VibexResult, VibexSessionId, VibexUseActor,
-    VibexUseCapabilitySnapshot, VibexUseDelivery, VibexUseGroupSummary, VibexUseMention,
-    VibexUseMentionKind, VibexUseOperation, VibexUseOperationResource, VibexUseOperationState,
-    VibexUsePresentationCapability, VibexUseRef, VibexUseResourceKind, VibexUseRuntimeOption,
-    VibexUseScope, VibexUseSessionSummary, VibexUseTool, VibexUseToolDefinition,
-    VibexUseToolFuture, VibexUseToolHost, VibexUseUnavailableReason, VibexUseWorkspaceOption,
-    WaitOutcome, WaitResponse, WorkspaceRecord, bounded_chars, unix_timestamp_ms,
-    vibex_use_codes as use_codes,
+    VIBEX_USE_MAX_WAIT_MS, VIBEX_USE_REACTION_CORRELATION_PREFIX, VIBEX_USE_REACTION_MAX_CHARS,
+    VIBEX_USE_SUMMARY_CHARS, VIBEX_USE_TITLE_CHARS, VibexError, VibexExecutionId, VibexOperationId,
+    VibexResult, VibexSessionId, VibexUseActor, VibexUseCapabilitySnapshot, VibexUseDelivery,
+    VibexUseGroupSummary, VibexUseMention, VibexUseMentionKind, VibexUseOperation,
+    VibexUseOperationResource, VibexUseOperationState, VibexUsePresentationCapability, VibexUseRef,
+    VibexUseResourceKind, VibexUseRuntimeOption, VibexUseScope, VibexUseSessionSummary,
+    VibexUseTool, VibexUseToolDefinition, VibexUseToolFuture, VibexUseToolHost,
+    VibexUseUnavailableReason, VibexUseWorkspaceOption, WaitOutcome, WaitResponse, WorkspaceRecord,
+    bounded_chars, unix_timestamp_ms, vibex_use_codes as use_codes,
 };
 use vibex_db::{
     AgentDelegationRepository, AgentSessionRuntimeRepository, DbConnection, ElicitationRepository,
@@ -502,6 +504,7 @@ impl VibexUseService {
                 None
             },
             can_read_any_session: false,
+            reactions_available: self.manager.message_reactions_enabled(),
             presentation,
             available_tools: Vec::new(),
         };
@@ -2642,6 +2645,97 @@ impl VibexUseService {
             "groupRef": group_ref.as_uri(),
             "dissolved": true,
             "message": "the group is gone; its sessions and tasks are unchanged",
+        }))
+    }
+
+    /// Attach an emoji reaction to a user message in the caller's session.
+    ///
+    /// A reaction is presentation, not another message: it is a hidden system
+    /// notice whose provider correlation names the target item. The shell finds
+    /// it there and draws it on the bubble; a client that does not know the
+    /// convention still reads the emoji as a harmless notice. Any emoji is
+    /// accepted — whether to react at all is the Agent's judgment.
+    fn react(
+        &self,
+        actor: &VibexUseActor,
+        arguments: &serde_json::Value,
+    ) -> VibexResult<serde_json::Value> {
+        if !self.manager.message_reactions_enabled() {
+            return Err(VibexError::validation(
+                use_codes::REQUEST_INVALID,
+                "message reactions are disabled",
+            ));
+        }
+        let emoji = arguments
+            .get("emoji")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|emoji| !emoji.is_empty())
+            .ok_or_else(|| {
+                VibexError::validation(use_codes::REQUEST_INVALID, "emoji is required")
+            })?;
+        if emoji.chars().count() > VIBEX_USE_REACTION_MAX_CHARS {
+            return Err(VibexError::validation(
+                use_codes::REQUEST_INVALID,
+                format!("emoji must be at most {VIBEX_USE_REACTION_MAX_CHARS} characters"),
+            ));
+        }
+        if emoji.chars().any(char::is_control) {
+            return Err(VibexError::validation(
+                use_codes::REQUEST_INVALID,
+                "emoji must not contain control characters",
+            ));
+        }
+        let mut conn = self.open()?;
+        let target_sequence = match optional_i64(arguments, "sequence") {
+            Some(sequence) => Some(sequence),
+            None => conn
+                .query_row(
+                    "SELECT sequence FROM agent_timeline_items
+                     WHERE session_id = ?1 AND kind = 'user_message'
+                     ORDER BY sequence DESC LIMIT 1",
+                    rusqlite::params![actor.session_id.as_str()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()
+                .map_err(|_| {
+                    VibexError::storage(
+                        "reaction_target_read_failed",
+                        "failed to find the user message to react to",
+                    )
+                })?,
+        };
+        let target = match target_sequence {
+            Some(sequence) => TimelineRepository::fetch_item(&conn, &actor.session_id, sequence)?,
+            None => None,
+        }
+        .filter(|item| item.kind == TimelineItemKind::UserMessage)
+        .ok_or_else(|| {
+            VibexError::validation(
+                use_codes::REQUEST_INVALID,
+                "the session has no user message to react to",
+            )
+        })?;
+        let correlation = format!("{VIBEX_USE_REACTION_CORRELATION_PREFIX}{}", target.id);
+        let notice = TimelineRepository::append(
+            &mut conn,
+            &actor.session_id,
+            TimelineSource::System,
+            TimelinePayload::SystemNotice(SystemNoticePayload {
+                level: SystemNoticeLevel::Info,
+                message: emoji.to_string(),
+            }),
+            None,
+            Some(&correlation),
+            TimelineRedactionState::None,
+        )?;
+        self.manager.publish_external_timeline_item(notice)?;
+        Ok(serde_json::json!({
+            "status": "reacted",
+            "sessionRef": VibexUseRef::session(&actor.session_id).as_uri(),
+            "messageId": target.id.to_string(),
+            "sequence": target.sequence,
+            "emoji": emoji,
         }))
     }
 
@@ -4804,6 +4898,7 @@ impl VibexUseToolHost for VibexUseService {
                 VibexUseTool::UpdateGroup => self.update_group(&actor, &arguments).await,
                 VibexUseTool::PresentGroup => self.present_group(&actor, &arguments).await,
                 VibexUseTool::DissolveGroup => self.dissolve_group(&actor, &arguments).await,
+                VibexUseTool::React => self.react(&actor, &arguments),
             };
             self.record_operation_response(&actor, tool, &arguments, &result)?;
             if matches!(

@@ -1833,6 +1833,270 @@ fn a_window_that_skipped_stored_rows_is_not_installed(cx: &mut TestAppContext) {
     );
 }
 
+/// A replacement window reaches back to the turn the reader is holding.
+///
+/// This is the refetch a lagged stream triggers while the reader is scrolled up.
+/// Their rows came from older pages, so the newest window the refetch reads no
+/// longer reaches them: the preserved anchor names a turn the replacement does
+/// not have, and the offset from the taller window is then beyond the
+/// replacement's range, which the list resolves by clamping to its newest row.
+/// The reader watches their scroll undo itself, which is the report this fixes.
+#[test]
+fn a_replacement_window_reaches_back_to_the_readers_turn() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    let session_id = VibexSessionId::parse("session_layout").unwrap();
+    let page = |start_sequence: i64, end_sequence: i64, has_older: bool| TimelinePage {
+        session_id: session_id.clone(),
+        items: (start_sequence..=end_sequence)
+            .map(|sequence| {
+                live_timeline_item(
+                    sequence,
+                    TimelinePayload::AgentMessage(vibex_core::AgentMessagePayload {
+                        text: format!("answer {sequence}"),
+                        is_final: true,
+                    }),
+                )
+            })
+            .collect(),
+        start_sequence: Some(start_sequence),
+        end_sequence: Some(end_sequence),
+        has_older,
+        has_newer: true,
+        starts_at_turn_start: true,
+        leading_turn_start: None,
+        omitted: None,
+    };
+
+    // The newest window opens above the reader. Each page below it is read from
+    // the oldest row the window holds, which is what keeps the merge adjacent.
+    let older_pages = std::cell::RefCell::new(vec![page(800, 899, true), page(700, 799, false)]);
+    let cursors = std::cell::RefCell::new(Vec::new());
+    let extended = runtime.block_on(extend_timeline_window_back_to(
+        page(900, 950, true),
+        Some(750),
+        |before_sequence| {
+            cursors.borrow_mut().push(before_sequence);
+            std::future::ready(Ok::<_, vibex_core::VibexError>(
+                older_pages.borrow_mut().remove(0),
+            ))
+        },
+    ));
+    assert_eq!(
+        cursors.into_inner(),
+        vec![900, 800],
+        "every page is addressed from the window's current oldest row"
+    );
+    assert_eq!(
+        extended.start_sequence,
+        Some(700),
+        "the window reaches the turn the anchor names"
+    );
+    assert_eq!(extended.items.len(), 251);
+    assert_eq!(
+        extended.items.first().map(|item| item.sequence),
+        Some(700),
+        "the pages are prepended in the order they were read"
+    );
+    assert_eq!(
+        extended.items.last().map(|item| item.sequence),
+        Some(950),
+        "the newest rows are untouched"
+    );
+    assert!(
+        !extended.has_older,
+        "the merged window takes the history below it from the oldest page"
+    );
+    assert!(
+        extended.has_newer,
+        "the newest page still answers for what sits above the window"
+    );
+
+    // Nobody is scrolled up, so there is no place to keep and no page to read.
+    let pages_read = std::cell::Cell::new(0);
+    let untouched = runtime.block_on(extend_timeline_window_back_to(
+        page(900, 950, true),
+        None,
+        |_| {
+            pages_read.set(pages_read.get() + 1);
+            std::future::ready(Ok::<_, vibex_core::VibexError>(page(800, 899, true)))
+        },
+    ));
+    assert_eq!((pages_read.get(), untouched.start_sequence), (0, Some(900)));
+
+    // A cursor the authority answers with rows the window already holds would
+    // duplicate them, so the merge refuses the page instead of looping on it.
+    let refused = runtime.block_on(extend_timeline_window_back_to(
+        page(900, 950, true),
+        Some(100),
+        |_| std::future::ready(Ok::<_, vibex_core::VibexError>(page(900, 950, true))),
+    ));
+    assert_eq!(refused.start_sequence, Some(900));
+    assert_eq!(refused.items.len(), 51);
+}
+
+/// A window that no longer holds the reader's turn lands on its oldest row.
+///
+/// Keeping the offset of the taller window is not a neutral fallback: it lies
+/// beyond the replacement's range, so the list clamps it to the newest row and
+/// the reader is thrown to the live edge. The oldest row is the nearest place
+/// that still exists, and the history above it is one page away.
+#[gpui::test]
+fn a_replacement_that_drops_the_readers_turn_lands_on_its_oldest_row(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    let session_id = VibexSessionId::parse("session_layout").unwrap();
+
+    fn turn(start_sequence: i64, question: &str, tools: usize, answer: &str) -> Vec<TimelineItem> {
+        let mut sequence = start_sequence;
+        let mut items = vec![live_timeline_item(
+            sequence,
+            TimelinePayload::UserMessage(UserMessagePayload {
+                text: question.into(),
+                ..Default::default()
+            }),
+        )];
+        for tool in 0..tools {
+            sequence += 1;
+            items.push(progress_tool(sequence, tool));
+        }
+        sequence += 1;
+        items.push(live_timeline_item(
+            sequence,
+            TimelinePayload::AgentMessage(vibex_core::AgentMessagePayload {
+                text: answer.into(),
+                is_final: true,
+            }),
+        ));
+        items
+    }
+
+    // Twenty turns: the reader scrolls deep into the tenth, and the window the
+    // replacement installs covers only the newest six — the shape a lagged
+    // refetch has when the reader is a long way up the conversation.
+    let mut turns: Vec<Vec<TimelineItem>> = Vec::new();
+    let mut sequence = 1;
+    for index in 0..20 {
+        let items = turn(
+            sequence,
+            &format!("Question {index}"),
+            2,
+            &format!("Answer {index}"),
+        );
+        sequence = items.last().map(|item| item.sequence).unwrap_or(sequence) + 1;
+        turns.push(items);
+    }
+    let newest: Vec<TimelineItem> = turns[14..].iter().flatten().cloned().collect();
+
+    let (workbench, cx) = live_tool_timeline(cx, true);
+    workbench.update(cx, |workbench, _| {
+        workbench
+            .timeline
+            .replace_authoritative(session_id.clone(), turns.iter().flatten().cloned());
+        workbench.rebuild_timeline_sizes();
+        workbench.timeline_follow.set_following_bottom(true);
+        workbench.request_timeline_scroll_to_latest();
+    });
+    let _ = draw_live_timeline_frames(&workbench, cx, 2);
+
+    let dropped_turn_id = workbench.read_with(cx, |workbench, _| {
+        workbench.conversation_turns_cache[9].id.clone()
+    });
+    let (stale_offset, anchored) = workbench.update(cx, |workbench, _| {
+        workbench.timeline_follow.set_following_bottom(false);
+        // Just inside the tenth turn, which the replacement window does not
+        // reach, and far past what that window's own content can show.
+        let above: Pixels = workbench
+            .timeline_row_sizes
+            .iter()
+            .take(9)
+            .map(|row| row.height)
+            .sum();
+        let stale_offset = -(above + px(20.0));
+        workbench
+            .timeline_scroll
+            .set_offset(point(px(0.0), stale_offset));
+        workbench.capture_timeline_scroll_anchor();
+        (
+            stale_offset,
+            workbench.timeline_follow.anchor_row_id.clone(),
+        )
+    });
+    assert_eq!(
+        anchored.as_deref(),
+        Some(dropped_turn_id.as_str()),
+        "the fixture has to put the reader inside the turn the window drops"
+    );
+
+    let installed = workbench.update(cx, |workbench, _| {
+        let updates = workbench.begin_timeline_load();
+        let prepared = runtime
+            .block_on(PreparedTimeline::prepare_with_older(
+                session_id.clone(),
+                newest,
+                true,
+                false,
+                None,
+                None,
+                None,
+                false,
+                ReasoningDisplayMode::Timeline,
+            ))
+            .expect("the newest window prepares");
+        let installed = workbench.install_prepared_timeline(prepared, &mut updates.borrow_mut());
+        // The loader raises this after a replacement; the anchor is applied on
+        // the next frame, against the row table the install just built.
+        workbench.timeline_scroll_anchor_pending = true;
+        installed
+    });
+    assert!(installed, "the replacement window is a valid projection");
+    let oldest_turn_id = workbench.read_with(cx, |workbench, _| {
+        workbench
+            .conversation_turns_cache
+            .first()
+            .map(|turn| turn.id.clone())
+    });
+    let _ = draw_live_timeline_frames(&workbench, cx, 2);
+
+    let (offset, max_offset, settled, content, viewport) =
+        workbench.read_with(cx, |workbench, _| {
+            (
+                workbench.timeline_scroll.offset().y,
+                workbench.timeline_scroll.max_offset().y,
+                workbench.timeline_follow.anchor_row_id.clone(),
+                workbench
+                    .timeline_row_sizes
+                    .iter()
+                    .map(|row| row.height)
+                    .sum::<Pixels>(),
+                workbench.timeline_scroll.bounds().size.height,
+            )
+        });
+    assert!(
+        max_offset > px(0.0),
+        "the replacement has to be scrollable for a clamp to be visible, got {max_offset:?} \
+         for {content:?} in a {viewport:?} viewport"
+    );
+    assert!(
+        stale_offset < -max_offset,
+        "the old offset has to be out of the replacement's range, got {stale_offset:?} \
+         against {}",
+        -max_offset
+    );
+    assert_eq!(
+        offset,
+        px(0.0),
+        "a dropped anchor lands on the oldest row instead of being clamped to the newest one"
+    );
+    assert_eq!(
+        settled, oldest_turn_id,
+        "the anchor moves with the landing, so a later frame does not re-apply the lost turn"
+    );
+}
+
 /// A prefetch that could not start a read keeps the whole budget.
 ///
 /// The slot is spent for a page that is really travelling; spending one for a

@@ -664,6 +664,29 @@ runtime switch or a turn on an Agent that was otherwise healthy.
   `thought_level` / `thinking_level` / `reasoning` categories now resolve to
   `reasoning_effort`, and a Boolean option stays generic because it cannot
   carry a level.
+- **The committed selection describes what the binding converged on, not what
+  was requested.** Dropping a field while applying the configuration is only
+  half of the contract: the durable selection has to settle with it. A switch
+  to a Profile whose Model publishes a narrower effort scale carried `max`
+  from the previous Profile, the apply loop dropped it, the binding converged
+  with `effectiveReasoningEffort = null`, and `RuntimeSwitchRepository::commit`
+  still recorded the requested `max` as the effective selection. `is_converged()`
+  treats `null == null` as converged, so the switch committed while the two
+  halves disagreed, and every later turn was refused with
+  `message_submission_runtime_binding_mismatch` — on an idle session with a
+  current binding. The commit transaction therefore reconciles the selection
+  against the target binding's config before writing it, and settles the
+  desired side with it, because turn admission also requires desired ==
+  effective. Settling is not a new user selection, so `selection_revision` does
+  not move.
+- **A durable row in the broken shape is repaired where it is read.**
+  `AgentSessionRuntimeRepository::settle_selections_with_effective_config`
+  runs during startup reconciliation and settles any committed session whose
+  selection names a field its current binding does not carry. Fixing only the
+  write path would leave every conversation already committed that way unable
+  to send a message forever. The Model is deliberately not reconciled this way:
+  a substituted Model is the Agent's answer and is recorded on both sides of
+  the configuration instead.
 - **A wire name must be an identifier, not a label.** Antigravity validates
   `mcpServers[].name` against `^[a-zA-Z0-9_-]+$` and refuses the whole
   `session/new` with `-32602 Invalid params` when a display name such as
