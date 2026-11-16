@@ -1945,6 +1945,11 @@ impl ImChannelService {
         files: &[crate::types::ImAttachment],
     ) -> VibexResult<()> {
         let runtime = self.inner.agent.runtime_selection(session_id).await?;
+        // The message submission coordinator rejects a request whose
+        // message-level effort disagrees with `desired_runtime`, so the value
+        // has to come from the same selection this prompt carries. Hard-coding
+        // `None` failed every prompt once the session had a reasoning level.
+        let reasoning_effort = runtime.desired.reasoning_effort.clone();
         let key = sha256_hex(&format!(
             "{}:{}:{}",
             event.channel_id, event.provider_update_id, session_id
@@ -1971,7 +1976,7 @@ impl ImChannelService {
                 text: text.to_string(),
                 attachments,
                 mentions: Vec::new(),
-                reasoning_effort: None,
+                reasoning_effort,
                 correlation_id: Some(CorrelationId::new()),
                 delivery: Default::default(),
                 prompt_context: None,

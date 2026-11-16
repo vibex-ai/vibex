@@ -146,6 +146,11 @@ struct MockAgent {
     pending: Mutex<Option<PermissionRequest>>,
     pending_elicitation: Mutex<Option<vibex_core::ElicitationRequest>>,
     prompts: Mutex<Vec<String>>,
+    /// The message-level effort of each accepted prompt. The real coordinator
+    /// rejects a request whose effort disagrees with its selection, so the
+    /// fake records the value the channel actually sent.
+    prompt_efforts: Mutex<Vec<Option<String>>>,
+    created_selections: Mutex<Vec<SessionRuntimeSelection>>,
     attachments: Mutex<Vec<Vec<vibex_core::MessageAttachment>>>,
     resolutions: Mutex<Vec<PermissionResolution>>,
     elicitations: Mutex<Vec<vibex_core::ElicitationResolution>>,
@@ -176,11 +181,14 @@ impl MockAgent {
             transport: Default::default(),
             terminal: None,
         };
-        let selection = SessionRuntimeSelection::provider(
-            session.agent_id.clone(),
-            ProviderProfileId::new(),
-            "fake-model",
-        );
+        let selection = SessionRuntimeSelection {
+            reasoning_effort: Some("high".to_string()),
+            ..SessionRuntimeSelection::provider(
+                session.agent_id.clone(),
+                ProviderProfileId::new(),
+                "fake-model",
+            )
+        };
         Self {
             timeline,
             sessions,
@@ -190,6 +198,8 @@ impl MockAgent {
             pending: Mutex::new(None),
             pending_elicitation: Mutex::new(None),
             prompts: Mutex::new(Vec::new()),
+            prompt_efforts: Mutex::new(Vec::new()),
+            created_selections: Mutex::new(Vec::new()),
             attachments: Mutex::new(Vec::new()),
             resolutions: Mutex::new(Vec::new()),
             elicitations: Mutex::new(Vec::new()),
@@ -284,18 +294,31 @@ impl ImAgentPort for MockAgent {
 
     async fn create_session(
         &self,
-        _request: CreateAgentSessionRequest,
+        request: CreateAgentSessionRequest,
     ) -> VibexResult<AgentSession> {
-        Err(vibex_core::VibexError::process(
-            "fake_create_session",
-            "not used by this test",
-        ))
+        self.created_selections
+            .lock()
+            .expect("created selections")
+            .push(request.runtime);
+        Ok(self.session.clone())
     }
 
     async fn send_message(
         &self,
         request: SendAgentMessageRequest,
     ) -> VibexResult<Vec<TimelineItem>> {
+        // Mirror the coordinator's contract check, so a channel that builds a
+        // request the runtime would refuse fails here instead of in production.
+        if request.reasoning_effort != request.desired_runtime.reasoning_effort {
+            return Err(vibex_core::VibexError::validation(
+                "message_submission_runtime_config_mismatch",
+                "message reasoning effort must match the desired runtime selection",
+            ));
+        }
+        self.prompt_efforts
+            .lock()
+            .expect("prompt efforts")
+            .push(request.reasoning_effort);
         self.prompts.lock().expect("prompts").push(request.text);
         self.attachments
             .lock()
@@ -610,6 +633,14 @@ async fn telegram_pairing_commands_and_approval_round_trip() {
             .map(String::as_str),
         Some("look at this")
     );
+    // Every prompt has to carry the bound session's reasoning level. The
+    // session's selection sets one, which is the case that used to be rejected
+    // as a config mismatch before the channel copied the value over.
+    assert_eq!(
+        agent.prompt_efforts.lock().expect("prompt efforts").last(),
+        Some(&Some("high".to_string())),
+        "a prompt carries the session's reasoning effort"
+    );
 
     let request = PermissionRequest {
         id: vibex_core::RequestId::new(),
@@ -728,6 +759,34 @@ async fn telegram_pairing_commands_and_approval_round_trip() {
     assert_eq!(bindings.len(), 1);
     assert_eq!(agent.prompts.lock().expect("prompts").len(), 2);
     assert_eq!(agent.resolutions.lock().expect("resolutions").len(), 1);
+
+    // `/new` takes the same prompt path as a bound session, so it has to
+    // survive the same reasoning-effort check.
+    fake.push(message_update(52, "/new start a fresh session"));
+    wait_for(
+        || async { agent.prompts.lock().expect("prompts").len() >= 3 },
+        "new session prompt",
+    )
+    .await;
+    assert_eq!(
+        agent
+            .prompts
+            .lock()
+            .expect("prompts")
+            .last()
+            .map(String::as_str),
+        Some("start a fresh session")
+    );
+    assert_eq!(
+        agent
+            .created_selections
+            .lock()
+            .expect("created selections")
+            .last()
+            .cloned(),
+        Some(agent.selection.clone()),
+        "/new reuses the selection it will then prompt with"
+    );
 
     // A one-field question is answered with a button, not with a trip to Vibex.
     let elicitation = vibex_core::ElicitationRequest {

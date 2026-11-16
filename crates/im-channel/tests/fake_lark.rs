@@ -259,11 +259,14 @@ impl MockAgent {
             transport: Default::default(),
             terminal: None,
         };
-        let selection = SessionRuntimeSelection::provider(
-            session.agent_id.clone(),
-            ProviderProfileId::new(),
-            "fake-model",
-        );
+        let selection = SessionRuntimeSelection {
+            reasoning_effort: Some("high".to_string()),
+            ..SessionRuntimeSelection::provider(
+                session.agent_id.clone(),
+                ProviderProfileId::new(),
+                "fake-model",
+            )
+        };
         Self {
             timeline,
             sessions,
@@ -366,6 +369,14 @@ impl ImAgentPort for MockAgent {
         &self,
         request: SendAgentMessageRequest,
     ) -> VibexResult<Vec<TimelineItem>> {
+        // Mirror the coordinator's contract check, so a channel that builds a
+        // request the runtime would refuse fails here instead of in production.
+        if request.reasoning_effort != request.desired_runtime.reasoning_effort {
+            return Err(vibex_core::VibexError::validation(
+                "message_submission_runtime_config_mismatch",
+                "message reasoning effort must match the desired runtime selection",
+            ));
+        }
         self.prompts.lock().expect("prompts").push(request.text);
         self.attachments
             .lock()
