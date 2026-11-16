@@ -30,8 +30,8 @@ use vibex_core::{
     HookDeleteRequest, HookInstallPreview, HookInstallPreviewRequest, HookUpdateRequest,
     ImBindingId, ImBindingSummary, ImChannelDraft, ImChannelId, ImChannelSummary,
     ImChannelTestReport, ImPairingCodeInfo, ImPairingRequest, ImPrincipalId, ImPrincipalRole,
-    ImPrincipalSummary, ImSessionDefaults, ManagementSnapshotPayload, MarketIcon, McpMarketIcon,
-    McpMarketInstallRequest, McpMarketInstallResult, McpMarketSearchRequest,
+    ImPrincipalSummary, ImSessionDefaults, ImStreamMode, ManagementSnapshotPayload, MarketIcon,
+    McpMarketIcon, McpMarketInstallRequest, McpMarketInstallResult, McpMarketSearchRequest,
     McpMarketSearchResponse, McpServer, McpServerAgentMatrix, McpServerAgentMatrixListRequest,
     McpServerCreateRequest, McpServerDeleteRequest, McpServerDiscoverRequest,
     McpServerDiscoveryResponse, McpServerImportRequest, McpServerImportResult,
@@ -143,6 +143,13 @@ pub struct ImChannelEventFilterUpdate {
 pub struct ImChannelLocaleUpdate {
     pub channel_id: ImChannelId,
     pub locale: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImChannelStreamModeUpdate {
+    pub channel_id: ImChannelId,
+    pub stream_mode: ImStreamMode,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1065,6 +1072,19 @@ pub trait ManagementBackend: BackendBound {
     fn set_im_channel_locale(
         &self,
         request: MutationRequest<ImChannelLocaleUpdate>,
+    ) -> BackendFuture<'_, ImChannelSummary> {
+        let _ = request;
+        Box::pin(async {
+            Err(BackendError::unsupported(
+                "im_channels_unavailable",
+                "IM channels are unavailable on this backend",
+            ))
+        })
+    }
+
+    fn set_im_channel_stream_mode(
+        &self,
+        request: MutationRequest<ImChannelStreamModeUpdate>,
     ) -> BackendFuture<'_, ImChannelSummary> {
         let _ = request;
         Box::pin(async {

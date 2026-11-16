@@ -173,7 +173,7 @@ impl ImChannelService {
         Ok(())
     }
 
-    async fn handle_timeline_event(&self, event: TimelineLiveEvent) -> VibexResult<()> {
+    async fn handle_timeline_event(self: &Arc<Self>, event: TimelineLiveEvent) -> VibexResult<()> {
         let conn = self.open()?;
         let bindings = ImBindingRepository::list_active_for_session(&conn, &event.session_id)?;
         if bindings.is_empty() {
@@ -193,16 +193,43 @@ impl ImChannelService {
                 continue;
             }
             match &event.item.payload {
+                TimelinePayload::AgentMessageDelta(delta) => {
+                    // Deltas are not a filtered event: a channel that shows no
+                    // tool progress still shows its answer growing.
+                    self.note_live_delta(&binding, delta);
+                }
+                TimelinePayload::ToolCall(tool) => {
+                    self.note_live_progress(&binding, &tool.tool_name);
+                }
                 TimelinePayload::AgentMessage(message) if message.is_final => {
                     if !message.text.trim().is_empty() {
-                        self.send_answer_to_binding(&binding, &message.text).await?;
+                        let live = self
+                            .finish_live_turn(
+                                &binding,
+                                super::live::LiveOutcome::Answer(message.text.clone()),
+                                event.sequence,
+                            )
+                            .await;
+                        if !live {
+                            self.send_answer_to_binding(&binding, &message.text).await?;
+                            ImBindingRepository::set_delivered_sequence(
+                                &conn,
+                                &binding.binding_id,
+                                event.sequence,
+                                unix_timestamp_ms(),
+                            )?;
+                        }
+                    } else {
+                        // An empty final still ends the turn; the live message
+                        // must not be left with a growing marker.
+                        let _ = self
+                            .finish_live_turn(
+                                &binding,
+                                super::live::LiveOutcome::Stopped,
+                                event.sequence,
+                            )
+                            .await;
                     }
-                    ImBindingRepository::set_delivered_sequence(
-                        &conn,
-                        &binding.binding_id,
-                        event.sequence,
-                        unix_timestamp_ms(),
-                    )?;
                 }
                 TimelinePayload::PermissionRequest(request)
                     if request.status == PermissionRequestStatus::Pending =>
@@ -220,7 +247,16 @@ impl ImChannelService {
                 }
                 TimelinePayload::Error(error) => {
                     let text = render::error_message(&error.code, &error.message);
-                    self.send_to_binding(&binding, &text).await?;
+                    let live = self
+                        .finish_live_turn(
+                            &binding,
+                            super::live::LiveOutcome::Failure(text.clone()),
+                            event.sequence,
+                        )
+                        .await;
+                    if !live {
+                        self.send_to_binding(&binding, &text).await?;
+                    }
                     ImBindingRepository::set_delivered_sequence(
                         &conn,
                         &binding.binding_id,
@@ -247,10 +283,19 @@ impl ImChannelService {
         Ok(())
     }
 
-    async fn handle_session_update(&self, session: AgentSession) -> VibexResult<()> {
+    async fn handle_session_update(self: &Arc<Self>, session: AgentSession) -> VibexResult<()> {
         let conn = self.open()?;
         let bindings = ImBindingRepository::list_active_for_session(&conn, &session.id)?;
+        let running = session.display_state() == AgentSessionState::Running;
         for binding in bindings {
+            // The live message follows the turn: it starts when the session
+            // does and settles when the session stops being busy, which is what
+            // makes an interrupted turn leave something readable behind.
+            if running {
+                self.start_live_turn(&binding, None);
+            } else {
+                self.stop_live_turn(&binding).await;
+            }
             if binding.title.as_deref() == Some(session.title.as_str()) {
                 continue;
             }

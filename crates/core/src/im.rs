@@ -167,6 +167,51 @@ impl ImSessionDefaults {
     }
 }
 
+/// How much of a running turn a chat sees.
+///
+/// The runtime already streams answer deltas; this is the chat's appetite for
+/// them. Telegram edits are rate limited and a group is noisy, so the default
+/// is not one setting for every chat: [`Self::Auto`] streams a direct message
+/// and keeps a group to a single progress line.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImStreamMode {
+    /// Direct messages stream the answer; groups show a progress line.
+    #[default]
+    Auto,
+    /// Only the final answer is sent.
+    Off,
+    /// A `typing` chat action while the turn runs; the answer arrives once.
+    Typing,
+    /// One message edited into a progress line, replaced by the answer.
+    Progress,
+    /// One message edited as the answer grows, finalized in place.
+    Live,
+}
+
+impl ImStreamMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Off => "off",
+            Self::Typing => "typing",
+            Self::Progress => "progress",
+            Self::Live => "live",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "auto" => Some(Self::Auto),
+            "off" => Some(Self::Off),
+            "typing" => Some(Self::Typing),
+            "progress" => Some(Self::Progress),
+            "live" => Some(Self::Live),
+            _ => None,
+        }
+    }
+}
+
 /// The full persisted envelope behind `im_channels.config_json`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -175,6 +220,8 @@ pub struct ImChannelConfigEnvelope {
     pub config: ImChannelConfig,
     #[serde(default)]
     pub default_session: Option<ImSessionDefaults>,
+    #[serde(default)]
+    pub stream_mode: ImStreamMode,
 }
 
 impl ImChannelConfigEnvelope {
@@ -183,6 +230,7 @@ impl ImChannelConfigEnvelope {
             schema_version: 1,
             config,
             default_session: None,
+            stream_mode: ImStreamMode::Auto,
         }
     }
 }
@@ -199,9 +247,14 @@ pub struct ImChannelDraft {
     pub event_filter: Vec<String>,
     #[serde(default)]
     pub locale: Option<String>,
+    #[serde(default)]
+    pub stream_mode: ImStreamMode,
 }
 
 /// The event ids an IM channel may forward. `None`/empty means the default set.
+///
+/// `tool_progress` is on by default now that it only labels the single live
+/// progress line rather than sending a message per tool call.
 pub const DEFAULT_IM_EVENT_FILTER: &[&str] = &[
     "turn_complete",
     "turn_failed",
@@ -211,6 +264,7 @@ pub const DEFAULT_IM_EVENT_FILTER: &[&str] = &[
     "elicitation_resolution",
     "error",
     "needs_input",
+    "tool_progress",
 ];
 
 /// The id the UI uses for an event in its filter checklist.
@@ -414,6 +468,8 @@ pub struct ImChannelSummary {
     pub default_session: Option<ImSessionDefaults>,
     pub event_filter: Vec<String>,
     pub locale: Option<String>,
+    #[serde(default)]
+    pub stream_mode: ImStreamMode,
     pub status: ImChannelStatus,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
@@ -497,4 +553,54 @@ impl ImSecretKind {
 
 fn default_true() -> bool {
     true
+}
+
+/// One pickable value in a chat-side runtime picker.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImRuntimeChoice {
+    pub id: String,
+    pub label: String,
+    #[serde(default)]
+    pub current: bool,
+}
+
+/// One pickable Agent, already paired with the source and model it would use.
+///
+/// Switching Agent is not a matter of one id: the source the credentials live
+/// under and a model that Agent advertises are part of the same decision, so
+/// the choices are whole selections rather than a bare list of Agent ids.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImRuntimeAgentChoice {
+    pub agent_id: AgentId,
+    pub auth_source: RuntimeAuthSource,
+    pub model: RuntimeModelSelection,
+    pub label: String,
+    #[serde(default)]
+    pub current: bool,
+}
+
+/// What a chat may change about a bound session, read from the runtime catalog.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImRuntimeOptions {
+    /// Revisions the mutation has to echo back, so a stale button loses.
+    pub session_revision: i64,
+    pub selection_revision: i64,
+    pub current: SessionRuntimeSelection,
+    pub agent_label: String,
+    pub model_label: String,
+    #[serde(default)]
+    pub effort_label: Option<String>,
+    #[serde(default)]
+    pub mode_label: Option<String>,
+    #[serde(default)]
+    pub agents: Vec<ImRuntimeAgentChoice>,
+    #[serde(default)]
+    pub models: Vec<ImRuntimeChoice>,
+    #[serde(default)]
+    pub efforts: Vec<ImRuntimeChoice>,
+    #[serde(default)]
+    pub modes: Vec<ImRuntimeChoice>,
 }

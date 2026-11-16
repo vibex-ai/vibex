@@ -46,6 +46,10 @@ pub enum ImCommand {
         channel: String,
         enabled: bool,
     },
+    StreamMode {
+        channel: String,
+        mode: Option<vibex_core::ImStreamMode>,
+    },
 }
 
 impl ImCommand {
@@ -53,7 +57,7 @@ impl ImCommand {
     pub fn parse(args: &[String]) -> Result<Self, String> {
         let Some(action) = args.first().map(String::as_str) else {
             return Err(
-                "usage: vibex-server im <list|pair|revoke|bindings|unbind|test|enable|disable>"
+                "usage: vibex-server im <list|pair|revoke|bindings|unbind|test|enable|disable|stream-mode>"
                     .to_string(),
             );
         };
@@ -124,6 +128,16 @@ impl ImCommand {
                 channel: flag("--channel").ok_or("disable needs --channel <id|name>")?,
                 enabled: false,
             }),
+            "stream-mode" | "stream_mode" => {
+                let channel = flag("--channel").ok_or("stream-mode needs --channel <id|name>")?;
+                let mode = match flag("--mode").as_deref() {
+                    None => None,
+                    Some(value) => Some(vibex_core::ImStreamMode::parse(value).ok_or(format!(
+                        "unknown stream mode {value}; use auto, off, typing, progress, or live"
+                    ))?),
+                };
+                Ok(Self::StreamMode { channel, mode })
+            }
             other => Err(format!("unknown im command {other}")),
         }
     }
@@ -278,6 +292,36 @@ pub async fn run(config: &DesktopRuntimeConfig, command: ImCommand) -> Result<()
             }
             Ok(())
         }
+        ImCommand::StreamMode { channel, mode } => {
+            let channel_id = resolve_channel(&service, &channel).await?;
+            let Some(mode) = mode else {
+                let channels = service
+                    .list_channels()
+                    .await
+                    .map_err(|error| error.message)?;
+                if let Some(summary) = channels
+                    .into_iter()
+                    .find(|summary| summary.channel_id == channel_id)
+                {
+                    println!(
+                        "{} stream_mode={}",
+                        summary.display_name,
+                        summary.stream_mode.as_str()
+                    );
+                }
+                return Ok(());
+            };
+            let summary = service
+                .set_stream_mode(&channel_id, mode)
+                .await
+                .map_err(|error| error.message)?;
+            println!(
+                "{} stream_mode={}",
+                summary.display_name,
+                summary.stream_mode.as_str()
+            );
+            Ok(())
+        }
         ImCommand::Enable { channel, enabled } => {
             let channel_id = resolve_channel(&service, &channel).await?;
             // Enabling from the CLI opens the transport in this process, which
@@ -350,6 +394,9 @@ pub fn print_help() {
     println!("  im unbind --binding <id>             drop one binding");
     println!("  im test --channel <id|name>          read-only provider probe");
     println!("  im enable|disable --channel <id|name>");
+    println!("  im stream-mode --channel <id|name> [--mode auto|off|typing|progress|live]");
+    println!("                                       show or set how much of a running");
+    println!("                                       turn the chat sees");
 }
 
 #[cfg(test)]
@@ -420,6 +467,38 @@ mod tests {
             }
             _ => panic!("expected pair"),
         }
+    }
+
+    #[test]
+    fn stream_mode_accepts_a_known_mode_and_refuses_an_unknown_one() {
+        let command = ImCommand::parse(&args(&[
+            "stream-mode",
+            "--channel",
+            "bot",
+            "--mode",
+            "progress",
+        ]))
+        .expect("parse");
+        match command {
+            ImCommand::StreamMode { mode, .. } => {
+                assert_eq!(mode, Some(vibex_core::ImStreamMode::Progress));
+            }
+            _ => panic!("expected stream mode"),
+        }
+        let bare = ImCommand::parse(&args(&["stream-mode", "--channel", "bot"])).expect("parse");
+        match bare {
+            ImCommand::StreamMode { mode, .. } => assert!(mode.is_none()),
+            _ => panic!("expected stream mode"),
+        }
+        let error = ImCommand::parse(&args(&[
+            "stream-mode",
+            "--channel",
+            "bot",
+            "--mode",
+            "loud",
+        ]))
+        .expect_err("unknown mode");
+        assert!(error.contains("unknown stream mode"), "{error}");
     }
 
     #[test]

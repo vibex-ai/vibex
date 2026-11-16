@@ -20,9 +20,41 @@ show you.
 | Images and documents in | yes, up to 10 MB | yes, up to 10 MB |
 | Forum topics | one topic per `/new` | threads |
 | Transport | long poll | long connection |
+| Rich text | Markdown rendered as HTML | plain text |
+| Live turn | progress line or streamed answer | progress line or streamed answer |
+| Command menu | `/` picker via `setMyCommands` | `/` picker via the command list |
 
 Enterprise WeChat and personal WeChat are not implemented and are not offered in
 settings or on the command line.
+
+## How a turn appears
+
+A reply used to arrive only when the turn ended. It now appears while the turn
+runs, at the level the channel asks for — **Settings → IM channels → Streaming**
+(or `vibex-server im stream-mode`):
+
+| Mode | What the chat sees |
+| --- | --- |
+| `auto` | a direct message streams the answer; a group gets a progress line |
+| `off` | only the final answer |
+| `typing` | a `typing` chat action while the turn runs, then the answer |
+| `progress` | one message edited into `⏳ Working · 12s · Bash` |
+| `live` | one message edited as the answer grows, finalized in place |
+
+The answer is one message the channel owns and edits: the final text replaces
+the last edit instead of arriving as a second message. An answer too long for
+one chat message is still split into `(1/3)`, `(2/3)`, …; until those parts
+land, a live message shows only the tail of what has streamed so far.
+
+Edits are coalesced, so a burst of deltas costs one edit, and they wait behind a
+provider rate limit rather than queueing ahead of approvals and final answers.
+An interrupted turn leaves `⏹ Stopped.` behind instead of a message that never
+finishes.
+
+Markdown is rendered where the transport supports it: Telegram receives HTML
+(`<b>`, `<code>`, `<pre>`, `<blockquote>`, links) generated from the answer. If
+Telegram refuses the markup, the same text is re-sent as plain text, so a stray
+`<` in a code sample costs the formatting and never the answer.
 
 ## Create the bot
 
@@ -115,11 +147,15 @@ the four.
 | Command | What it does |
 | --- | --- |
 | `/pair <code>` | pair this chat |
-| `/help` | list the commands |
+| `/help` | the short list; `/help commands` lists everything |
 | `/whoami` | your identity and role |
-| `/status` | bound session, state, pending approvals |
-| `/sessions` | the five most recent sessions |
+| `/status` | bound session, runtime, state, pending approvals |
+| `/sessions` | recent sessions, one button each |
 | `/use <n or id>` | bind this chat to a session |
+| `/model [id]` | pick the model |
+| `/effort [value]` | pick the reasoning effort |
+| `/mode [id]` | pick the Agent mode |
+| `/agent` | switch Agent |
 | `/new <text>` | start a session and send the first prompt |
 | `/stop` | interrupt the running turn |
 | `/approve [code]` | approve the pending request |
@@ -128,9 +164,23 @@ the four.
 | `/say <text>` | send text that starts with `/` |
 | `/unbind` | drop this chat's binding (admin) |
 
+Telegram publishes this table as the bot's command menu, so the `/` picker in a
+client offers the same names. Where a command takes a choice, the reply carries
+buttons and the text form still works; every button also prints a short code for
+clients that cannot show an inline keyboard.
+
 In a group, the bot answers commands and — on Telegram — messages that begin
 with its `@username`. The mention requirement is a per-channel setting; with it
 off, any text in the group reaches the Agent.
+
+### Changing the session
+
+`/model`, `/effort`, `/mode` and `/agent` change the runtime selection of the
+session this chat is bound to. The picker shows what the current Agent
+advertises; choosing applies to the next turn, and the card carries the
+selection revisions it was read at, so a card left open while someone else
+changed the runtime is refused instead of overwriting the newer choice. An
+Operator or Admin may change these; an Approver may not.
 
 ### `/new` and defaults
 
@@ -195,6 +245,8 @@ vibex-server im enable --channel "Team bot"
 vibex-server im disable --channel "Team bot"
 
 vibex-server im revoke --channel "Team bot" --principal <id-or-external-id>
+
+vibex-server im stream-mode --channel "Team bot" --mode live
 ```
 
 `--channel` accepts the channel id or its display name. `revoke` accepts either
@@ -202,7 +254,9 @@ the Vibex principal id or the external id the chat shows.
 
 `im enable` writes the enabled flag; the connection itself belongs to the
 process that owns the home directory, so a running daemon picks the change up on
-its next start.
+its next start. `im stream-mode` with no `--mode` prints what the channel is set
+to; the value is read when a turn starts, so a change lands on the next turn
+without a reconnect.
 
 ## Where state lives
 
@@ -265,7 +319,9 @@ last outbound, pending sends, and the last error with its retry time.
 - A question with exactly one boolean field, or one field restricted to a fixed
   option list, is answered with a button. Any other form — several fields, free
   text, numbers, multi-select — sends a notice and the answer happens in Vibex.
-- Reasoning and tool progress are never forwarded, only final answers, errors,
-  approvals, and notices.
+- Reasoning is never forwarded, and tool names only label the one live progress
+  line. Final answers, errors, approvals, and notices are what a chat receives;
+  a channel that removes `tool_progress` from its event filter gets a progress
+  line without them.
 - Lark card buttons require the `card.action.trigger` event subscription; without
   it approvals fall back to `/approve <code>`.

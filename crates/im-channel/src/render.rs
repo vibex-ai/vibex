@@ -84,6 +84,135 @@ pub fn error_message(code: &str, message: &str) -> String {
     format!("Vibex error ({}): {}", code, truncate(message, 1200))
 }
 
+/// The one-line answer to `/help`, with the full list behind a button.
+pub fn help_short(locale: ImLocale) -> String {
+    match locale {
+        ImLocale::En => "Vibex IM\n\
+             /status  this session\n\
+             /sessions  pick one\n\
+             /new <text>  start one\n\
+             /model, /effort  tune it\n\
+             Type / for the full menu."
+            .to_string(),
+        ImLocale::ZhCn => "Vibex IM\n\
+             /status  当前会话\n\
+             /sessions  选择会话\n\
+             /new <内容>  新建会话\n\
+             /model、/effort  调整参数\n\
+             输入 / 查看全部命令。"
+            .to_string(),
+        ImLocale::ZhTw => "Vibex IM\n\
+             /status  目前工作階段\n\
+             /sessions  選擇工作階段\n\
+             /new <內容>  建立工作階段\n\
+             /model、/effort  調整參數\n\
+             輸入 / 查看全部指令。"
+            .to_string(),
+    }
+}
+
+/// The command menu a client shows in its `/` picker.
+pub fn command_specs(locale: ImLocale) -> Vec<crate::types::ImCommandSpec> {
+    let entries: &[(&str, &str)] = match locale {
+        ImLocale::En => &[
+            ("pair", "Pair this chat with a code"),
+            ("status", "Session, Agent, model and pending approvals"),
+            ("sessions", "Pick a session to bind"),
+            ("use", "Bind a session by number or id"),
+            ("new", "Start a session and send the first prompt"),
+            ("model", "Choose the model"),
+            ("effort", "Choose the reasoning effort"),
+            ("mode", "Choose the Agent mode"),
+            ("agent", "Switch the Agent"),
+            ("stop", "Interrupt the running turn"),
+            ("approve", "Approve the pending request"),
+            ("always", "Allow for the rest of the session"),
+            ("deny", "Deny the pending request"),
+            ("say", "Send text that starts with a slash"),
+            ("whoami", "Show your role"),
+            ("unbind", "Drop this chat's binding"),
+            ("help", "Commands and shortcuts"),
+        ],
+        ImLocale::ZhCn => &[
+            ("pair", "用配对码配对这个聊天"),
+            ("status", "会话、Agent、模型与待审批"),
+            ("sessions", "选择要绑定的会话"),
+            ("use", "按序号或 ID 绑定会话"),
+            ("new", "新建会话并发送第一条内容"),
+            ("model", "选择模型"),
+            ("effort", "选择思考强度"),
+            ("mode", "选择 Agent 模式"),
+            ("agent", "切换 Agent"),
+            ("stop", "停止当前回合"),
+            ("approve", "批准待处理请求"),
+            ("always", "本会话内总是允许"),
+            ("deny", "拒绝待处理请求"),
+            ("say", "原样发送以斜杠开头的文本"),
+            ("whoami", "查看身份和角色"),
+            ("unbind", "解除当前聊天的绑定"),
+            ("help", "命令与快捷操作"),
+        ],
+        ImLocale::ZhTw => &[
+            ("pair", "用配對碼配對這個聊天"),
+            ("status", "工作階段、Agent、模型與待審批"),
+            ("sessions", "選擇要綁定的工作階段"),
+            ("use", "按序號或 ID 綁定工作階段"),
+            ("new", "建立工作階段並傳送第一則內容"),
+            ("model", "選擇模型"),
+            ("effort", "選擇思考強度"),
+            ("mode", "選擇 Agent 模式"),
+            ("agent", "切換 Agent"),
+            ("stop", "停止目前回合"),
+            ("approve", "批准待處理請求"),
+            ("always", "本工作階段內總是允許"),
+            ("deny", "拒絕待處理請求"),
+            ("say", "原樣傳送以斜線開頭的內容"),
+            ("whoami", "查看身分和角色"),
+            ("unbind", "解除目前聊天的綁定"),
+            ("help", "指令與快捷操作"),
+        ],
+    };
+    entries
+        .iter()
+        .map(|(command, description)| crate::types::ImCommandSpec::new(*command, *description))
+        .collect()
+}
+
+/// The live progress line.
+pub fn working(locale: ImLocale, label: Option<&str>, seconds: i64) -> String {
+    let verb = match locale {
+        ImLocale::En => "Working",
+        ImLocale::ZhCn => "处理中",
+        ImLocale::ZhTw => "處理中",
+    };
+    let subject = label
+        .filter(|label| !label.trim().is_empty())
+        .unwrap_or(verb);
+    format!("⏳ {subject} · {seconds}s")
+}
+
+/// The live answer, bounded to its tail and marked as still growing.
+pub fn live_answer(text: &str, tail_chars: usize, _locale: ImLocale) -> String {
+    let trimmed = text.trim_start();
+    let length = trimmed.chars().count();
+    let body = if length > tail_chars {
+        let skip = length - tail_chars;
+        format!("…{}", trimmed.chars().skip(skip).collect::<String>())
+    } else {
+        trimmed.to_string()
+    };
+    format!("{body}▍")
+}
+
+/// The marker an interrupted turn leaves behind.
+pub fn stopped(locale: ImLocale) -> &'static str {
+    match locale {
+        ImLocale::En => "⏹ Stopped.",
+        ImLocale::ZhCn => "⏹ 已停止。",
+        ImLocale::ZhTw => "⏹ 已停止。",
+    }
+}
+
 pub fn help(locale: ImLocale, prefix: &str) -> String {
     match locale {
         ImLocale::En => format!(
@@ -93,6 +222,10 @@ pub fn help(locale: ImLocale, prefix: &str) -> String {
              /status      current session status\n\
              /sessions    recent sessions\n\
              /use <n|id>  bind a session\n\
+             /model [id]  choose the model\n\
+             /effort [v]  choose the reasoning effort\n\
+             /mode [id]   choose the Agent mode\n\
+             /agent       switch the Agent\n\
              /new <text>  create a session and send\n\
              /stop        stop the running turn\n\
              /approve [code]\n\
@@ -109,6 +242,10 @@ pub fn help(locale: ImLocale, prefix: &str) -> String {
              /status      当前会话状态\n\
              /sessions    最近会话\n\
              /use <序号|ID> 绑定会话\n\
+             /model [ID]  选择模型\n\
+             /effort [值] 选择思考强度\n\
+             /mode [ID]   选择 Agent 模式\n\
+             /agent       切换 Agent\n\
              /new <内容>  新建会话并发送\n\
              /stop        停止当前回合\n\
              /approve [短码] 批准\n\
@@ -125,6 +262,10 @@ pub fn help(locale: ImLocale, prefix: &str) -> String {
              /status      目前工作階段狀態\n\
              /sessions    最近工作階段\n\
              /use <序號|ID> 綁定工作階段\n\
+             /model [ID]  選擇模型\n\
+             /effort [值] 選擇思考強度\n\
+             /mode [ID]   選擇 Agent 模式\n\
+             /agent       切換 Agent\n\
              /new <內容>  建立工作階段並傳送\n\
              /stop        停止目前回合\n\
              /approve [短碼] 批准\n\
@@ -310,6 +451,73 @@ fn risk_label(request: &PermissionRequest, locale: ImLocale) -> &'static str {
         (PermissionRiskCategory::CustomTool, ImLocale::ZhTw) => "自訂工具",
         (PermissionRiskCategory::CustomTool, _) => "custom tool",
     }
+}
+
+fn default_true_text(locale: ImLocale) -> &'static str {
+    match locale {
+        ImLocale::En => "default",
+        ImLocale::ZhCn => "默认",
+        ImLocale::ZhTw => "預設",
+    }
+}
+
+fn effort_label(locale: ImLocale) -> &'static str {
+    match locale {
+        ImLocale::En => "effort",
+        ImLocale::ZhCn => "思考",
+        ImLocale::ZhTw => "思考",
+    }
+}
+
+fn mode_label(locale: ImLocale) -> &'static str {
+    match locale {
+        ImLocale::En => "mode",
+        ImLocale::ZhCn => "模式",
+        ImLocale::ZhTw => "模式",
+    }
+}
+
+/// The selection in force, one line, for a picker card or `/status`.
+pub fn runtime_current(locale: ImLocale, options: &vibex_core::ImRuntimeOptions) -> String {
+    let effort = options
+        .effort_label
+        .clone()
+        .unwrap_or_else(|| default_true_text(locale).to_string());
+    let mode = options
+        .mode_label
+        .clone()
+        .unwrap_or_else(|| default_true_text(locale).to_string());
+    format!(
+        "{} · {} · {} {} · {} {}",
+        options.agent_label,
+        options.model_label,
+        effort_label(locale),
+        effort,
+        mode_label(locale),
+        mode
+    )
+}
+
+/// A one-line summary of a selection that has just been applied.
+pub fn runtime_selection_summary(
+    locale: ImLocale,
+    selection: &vibex_core::SessionRuntimeSelection,
+) -> String {
+    let mut parts = vec![
+        selection.agent_id.as_str().to_string(),
+        selection
+            .model
+            .model_id()
+            .unwrap_or_else(|| default_true_text(locale))
+            .to_string(),
+    ];
+    if let Some(effort) = selection.reasoning_effort.as_deref() {
+        parts.push(format!("{} {effort}", effort_label(locale)));
+    }
+    if let Some(mode) = selection.mode_id.as_deref() {
+        parts.push(format!("{} {mode}", mode_label(locale)));
+    }
+    parts.join(" · ")
 }
 
 #[cfg(test)]

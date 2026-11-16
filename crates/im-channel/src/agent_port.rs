@@ -2,9 +2,9 @@ use async_trait::async_trait;
 use tokio::sync::broadcast;
 use vibex_core::{
     AgentNotificationIntent, AgentSession, AgentSessionRuntimeSelectionState,
-    CreateAgentSessionRequest, FetchTimelineRequest, ResolveElicitationRequest,
-    ResolvePermissionRequest, SendAgentMessageRequest, TimelineItem, TimelineLiveEvent,
-    TimelinePage, VibexResult, VibexSessionId,
+    CreateAgentSessionRequest, FetchTimelineRequest, ImRuntimeOptions, ResolveElicitationRequest,
+    ResolvePermissionRequest, SendAgentMessageRequest, SetDesiredAgentSessionRuntimeRequest,
+    TimelineItem, TimelineLiveEvent, TimelinePage, VibexResult, VibexSessionId,
 };
 
 /// The narrow slice of the authoritative Agent runtime an IM channel needs.
@@ -31,6 +31,14 @@ pub trait ImAgentPort: Send + Sync + 'static {
         &self,
         request: SendAgentMessageRequest,
     ) -> VibexResult<Vec<TimelineItem>>;
+    /// Accepts a prompt without waiting for its turn to finish.
+    ///
+    /// The default keeps the blocking call, which is all a test needs. A host
+    /// that serves a chat overrides this so one long turn does not hold the
+    /// inbound queue and its reader can still press `/stop`.
+    async fn submit_message(&self, request: SendAgentMessageRequest) -> VibexResult<()> {
+        self.send_message(request).await.map(|_| ())
+    }
     async fn interrupt(&self, session_id: &VibexSessionId) -> VibexResult<()>;
     async fn resolve_permission(
         &self,
@@ -40,6 +48,29 @@ pub trait ImAgentPort: Send + Sync + 'static {
         &self,
         request: ResolveElicitationRequest,
     ) -> VibexResult<TimelineItem>;
+
+    /// Applies a new desired runtime selection.
+    ///
+    /// The revisions in the request are the ones the options were read at, so a
+    /// button pressed against a stale card loses to whoever changed the
+    /// selection first instead of overwriting it.
+    async fn set_desired_runtime(
+        &self,
+        _request: SetDesiredAgentSessionRuntimeRequest,
+    ) -> VibexResult<AgentSessionRuntimeSelectionState> {
+        Err(vibex_core::VibexError::capability(
+            "im_runtime_selection_unavailable",
+            "this channel host cannot change a session's runtime selection",
+        ))
+    }
+
+    /// The Agent, model, effort and mode choices a bound session offers.
+    async fn runtime_options(&self, _session_id: &VibexSessionId) -> VibexResult<ImRuntimeOptions> {
+        Err(vibex_core::VibexError::capability(
+            "im_runtime_options_unavailable",
+            "this channel host cannot list a session's runtime options",
+        ))
+    }
 }
 
 /// The Agent port for administrative commands that never run a turn.

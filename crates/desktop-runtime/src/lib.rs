@@ -3413,6 +3413,7 @@ impl DesktopRuntime {
                 agent: Arc::new(im_channel::AgentManagerImPort::new(
                     manager.clone(),
                     runtime_selection.clone(),
+                    runtime_catalog.clone(),
                 )),
                 telegram_api_base: None,
                 lark_api_base: None,

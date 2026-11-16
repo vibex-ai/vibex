@@ -10,7 +10,7 @@ use tokio::sync::{Mutex as AsyncMutex, RwLock, mpsc, watch};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 use vibex_core::{
-    AgentNotificationIntent, AgentNotificationKind, AgentSession, CorrelationId,
+    AgentNotificationIntent, AgentNotificationKind, AgentSession, AgentSessionState, CorrelationId,
     CreateAgentSessionRequest, FetchTimelineRequest, ImActionId, ImBindingId, ImBindingStatus,
     ImBindingSummary, ImChannelConfig, ImChannelConfigEnvelope, ImChannelDraft, ImChannelId,
     ImChannelState, ImChannelStatus, ImChannelSummary, ImChannelTestReport, ImLarkTransport,
@@ -48,7 +48,6 @@ const AUDIT_RETENTION_MS: i64 = 180 * 24 * 60 * 60 * 1000;
 /// How often the retention sweep runs while the service is up.
 const RETENTION_INTERVAL: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
 const PAIRING_CODE_ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-const DEFAULT_SESSION_LIST_LIMIT: usize = 5;
 
 #[derive(Clone)]
 pub struct ImChannelServiceConfig {
@@ -68,8 +67,12 @@ pub struct ImChannelService {
 
 #[path = "service_approvals.rs"]
 mod approvals;
+#[path = "service_commands.rs"]
+mod commands;
 #[path = "service_events.rs"]
 mod events;
+#[path = "service_live.rs"]
+mod live;
 
 struct Inner {
     config: ImChannelServiceConfig,
@@ -84,6 +87,8 @@ struct Inner {
     retention_task: AsyncMutex<Option<JoinHandle<()>>>,
     session_choices: Mutex<HashMap<ImPrincipalId, Vec<VibexSessionId>>>,
     inbound_limiter: InboundLimiter,
+    /// One live turn per binding, keyed by binding id.
+    live_turns: Mutex<HashMap<ImBindingId, Arc<Mutex<live::LiveTurn>>>>,
 }
 
 struct ChannelRuntime {
@@ -131,6 +136,7 @@ impl ImChannelService {
                 retention_task: AsyncMutex::new(None),
                 session_choices: Mutex::new(HashMap::new()),
                 inbound_limiter: InboundLimiter::new(),
+                live_turns: Mutex::new(HashMap::new()),
             }),
         })
     }
@@ -276,6 +282,7 @@ impl ImChannelService {
             schema_version: 1,
             config: draft.config,
             default_session: draft.default_session,
+            stream_mode: draft.stream_mode,
         };
         let event_filter_json = if draft.event_filter.is_empty() {
             None
@@ -456,6 +463,42 @@ impl ImChannelService {
         };
         ImChannelRepository::update(&conn, &updated)?;
         self.reload_channel(channel_id).await?;
+        let status = self.status_for(&updated.channel_id, updated.enabled).await;
+        self.summary_for(&conn, &updated, status)
+    }
+
+    /// Changes how much of a running turn this channel shows.
+    ///
+    /// The value is read at the start of each turn, so a live turn keeps the
+    /// setting it began with and a running connection needs no reload.
+    pub async fn set_stream_mode(
+        &self,
+        channel_id: &ImChannelId,
+        stream_mode: vibex_core::ImStreamMode,
+    ) -> VibexResult<ImChannelSummary> {
+        let conn = self.open()?;
+        let record = ImChannelRepository::get(&conn, channel_id)?.ok_or_else(|| {
+            VibexError::validation("im_channel_not_found", "IM channel was not found")
+        })?;
+        let mut envelope: ImChannelConfigEnvelope = serde_json::from_str(&record.config_json)
+            .map_err(|_| {
+                VibexError::validation(
+                    "im_channel_config_invalid",
+                    "IM channel configuration is not valid",
+                )
+            })?;
+        envelope.stream_mode = stream_mode;
+        let updated = ImChannelRecord {
+            config_json: serde_json::to_string(&envelope).map_err(|_| {
+                VibexError::validation(
+                    "im_channel_config_invalid",
+                    "IM channel configuration could not be encoded",
+                )
+            })?,
+            updated_at_ms: unix_timestamp_ms(),
+            ..record
+        };
+        ImChannelRepository::update(&conn, &updated)?;
         let status = self.status_for(&updated.channel_id, updated.enabled).await;
         self.summary_for(&conn, &updated, status)
     }
@@ -773,9 +816,14 @@ impl ImChannelService {
             matches!(secret.secret_kind.as_str(), "bot_token" | "app_secret")
                 && secret.setup_state == "configured"
         });
-        let default_session = serde_json::from_str::<ImChannelConfigEnvelope>(&record.config_json)
-            .ok()
-            .and_then(|envelope| envelope.default_session);
+        let envelope = serde_json::from_str::<ImChannelConfigEnvelope>(&record.config_json).ok();
+        let default_session = envelope
+            .as_ref()
+            .and_then(|envelope| envelope.default_session.clone());
+        let stream_mode = envelope
+            .as_ref()
+            .map(|envelope| envelope.stream_mode)
+            .unwrap_or_default();
         let event_filter = record
             .event_filter_json
             .as_deref()
@@ -796,6 +844,7 @@ impl ImChannelService {
             default_session,
             event_filter,
             locale: record.locale.clone(),
+            stream_mode,
             status,
             created_at_ms: record.created_at_ms,
             updated_at_ms: record.updated_at_ms,
@@ -910,6 +959,20 @@ impl ImChannelService {
             Arc::clone(&status),
             self.inner.shutdown.subscribe(),
         );
+        // The native `/` menu is a client feature, not a channel one; a failure
+        // to publish it costs the picker, not the commands.
+        let locale = self.locale_for_channel(&record.channel_id);
+        if let Err(error) = adapter
+            .register_commands(&render::command_specs(locale))
+            .await
+        {
+            tracing::warn!(
+                target: "vibex_im",
+                channel_id = %record.channel_id,
+                error_code = error.code(),
+                "IM command menu registration failed"
+            );
+        }
         // Aborting the channel has to stop the poller and the sender together,
         // so the stored handle owns the sender task and aborts the transport when
         // it ends. The shutdown signal already covers a clean stop.
@@ -1008,7 +1071,7 @@ impl ImChannelService {
         let _ = self.reply(event, &runtime, &text).await;
     }
 
-    async fn handle_inbound(&self, event: ImInboundEvent) -> VibexResult<()> {
+    async fn handle_inbound(self: &Arc<Self>, event: ImInboundEvent) -> VibexResult<()> {
         let conn = self.open()?;
         let Some(record) = ImChannelRepository::get(&conn, &event.channel_id)? else {
             return Ok(());
@@ -1277,7 +1340,7 @@ impl ImChannelService {
     }
 
     async fn handle_callback(
-        &self,
+        self: &Arc<Self>,
         event: &ImInboundEvent,
         runtime: &ChannelRuntime,
         action_id: &ImActionId,
@@ -1293,8 +1356,8 @@ impl ImChannelService {
                 .await?;
             return Ok(());
         };
-        if principal.status != ImPrincipalStatus::Active || !principal.role.can_approve() {
-            self.reply(event, runtime, "You do not have permission to approve.")
+        if principal.status != ImPrincipalStatus::Active {
+            self.reply(event, runtime, "You do not have permission to act here.")
                 .await?;
             return Ok(());
         }
@@ -1337,6 +1400,11 @@ impl ImChannelService {
             .strip_prefix(ELICITATION_ACTION_PREFIX)
             .map(str::to_string)
         {
+            if !principal.role.can_approve() {
+                self.reply(event, runtime, "You do not have permission to approve.")
+                    .await?;
+                return Ok(());
+            }
             let payload: ElicitationActionPayload = serde_json::from_str(&action.payload_json)
                 .map_err(|_| {
                     VibexError::validation(
@@ -1377,6 +1445,21 @@ impl ImChannelService {
                 )
                 .await?;
             self.reply_with(event, runtime, &status, OutboundPriority::BestEffort)
+                .await?;
+            return Ok(());
+        }
+        // Command cards share the action table with approvals; a non-approval
+        // kind is answered here and never reaches the approval payload.
+        if self
+            .handle_action(event, runtime, &principal, &binding, &action)
+            .await?
+        {
+            return Ok(());
+        }
+        // Whatever is left is an approval: the only remaining kind, and the
+        // only one an Approver may answer.
+        if !principal.role.can_approve() {
+            self.reply(event, runtime, "You do not have permission to approve.")
                 .await?;
             return Ok(());
         }
@@ -1440,7 +1523,7 @@ impl ImChannelService {
     }
 
     async fn handle_command(
-        &self,
+        self: &Arc<Self>,
         event: &ImInboundEvent,
         runtime: &ChannelRuntime,
         principal: &ImPrincipalRecord,
@@ -1452,8 +1535,8 @@ impl ImChannelService {
         let locale = self.locale(event);
         match command.as_str() {
             "/start" | "/help" => {
-                self.reply(event, runtime, &render::help(locale, "/"))
-                    .await?;
+                let full = args.trim().eq_ignore_ascii_case("commands");
+                self.send_help(event, runtime, full).await?;
             }
             "/whoami" => {
                 let role = role_label(principal.role, locale);
@@ -1468,7 +1551,47 @@ impl ImChannelService {
                 .await?;
             }
             "/status" => self.handle_status(event, runtime, principal).await?,
-            "/sessions" => self.handle_sessions(event, runtime, principal).await?,
+            "/sessions" => self.send_sessions_card(event, runtime, principal).await?,
+            "/model" => {
+                self.handle_runtime_command(
+                    event,
+                    runtime,
+                    principal,
+                    commands::RuntimeField::Model,
+                    args,
+                )
+                .await?
+            }
+            "/effort" => {
+                self.handle_runtime_command(
+                    event,
+                    runtime,
+                    principal,
+                    commands::RuntimeField::Effort,
+                    args,
+                )
+                .await?
+            }
+            "/mode" => {
+                self.handle_runtime_command(
+                    event,
+                    runtime,
+                    principal,
+                    commands::RuntimeField::Mode,
+                    args,
+                )
+                .await?
+            }
+            "/agent" => {
+                self.handle_runtime_command(
+                    event,
+                    runtime,
+                    principal,
+                    commands::RuntimeField::Agent,
+                    args,
+                )
+                .await?
+            }
             "/use" => self.handle_use(event, runtime, principal, args).await?,
             "/new" => self.handle_new(event, runtime, principal, args).await?,
             "/stop" => self.handle_stop(event, runtime, principal).await?,
@@ -1527,45 +1650,63 @@ impl ImChannelService {
         let session = self.inner.agent.get_session(&binding.session_id).await?;
         let pending =
             ImApprovalCardRepository::list_pending_for_binding(&conn, &binding.binding_id)?;
-        let role = role_label(principal.role, self.locale(event));
-        self.reply(
-            event,
-            runtime,
-            &format!(
-                "Vibex session\n#{} · {}\nState: {}\nAgent: {}\nApprovals pending: {}\nRole: {role}",
-                render::short_session_id(&session),
-                session.title,
-                render::state_label(&session, self.locale(event)),
-                session.agent_id,
-                pending.len(),
-            ),
-        )
-        .await?;
-        Ok(())
-    }
-
-    async fn handle_sessions(
-        &self,
-        event: &ImInboundEvent,
-        runtime: &ChannelRuntime,
-        principal: &ImPrincipalRecord,
-    ) -> VibexResult<()> {
-        let mut sessions = self.inner.agent.list_sessions(false).await?;
-        sessions.retain(|session| session.deleted_at_ms.is_none());
-        sessions.sort_by_key(|session| std::cmp::Reverse(session.last_message_at_ms));
-        sessions.truncate(DEFAULT_SESSION_LIST_LIMIT);
-        if let Ok(mut choices) = self.inner.session_choices.lock() {
-            choices.insert(
-                principal.principal_id.clone(),
-                sessions.iter().map(|session| session.id.clone()).collect(),
-            );
+        let locale = self.locale(event);
+        let role = role_label(principal.role, locale);
+        let runtime_line = match self.inner.agent.runtime_options(&binding.session_id).await {
+            Ok(options) => render::runtime_current(locale, &options),
+            Err(_) => session.agent_id.as_str().to_string(),
+        };
+        let mut buttons = Vec::new();
+        if principal.role.can_prompt() {
+            for (kind, label) in [
+                (
+                    commands::ACTION_STATUS_STOP,
+                    match locale {
+                        ImLocale::En => "Stop",
+                        ImLocale::ZhCn => "停止",
+                        ImLocale::ZhTw => "停止",
+                    },
+                ),
+                (
+                    commands::ACTION_MENU_SESSIONS,
+                    match locale {
+                        ImLocale::En => "Sessions",
+                        ImLocale::ZhCn => "会话",
+                        ImLocale::ZhTw => "工作階段",
+                    },
+                ),
+                (
+                    "runtime:model",
+                    match locale {
+                        ImLocale::En => "Model",
+                        ImLocale::ZhCn => "模型",
+                        ImLocale::ZhTw => "模型",
+                    },
+                ),
+                (
+                    "runtime:effort",
+                    match locale {
+                        ImLocale::En => "Effort",
+                        ImLocale::ZhCn => "思考",
+                        ImLocale::ZhTw => "思考",
+                    },
+                ),
+            ] {
+                let minted = self.mint_action(&conn, &binding, kind, "{}")?;
+                buttons.push(ImButton {
+                    action_id: minted.action_id,
+                    label: label.to_string(),
+                });
+            }
         }
-        self.reply(
-            event,
-            runtime,
-            &render::session_list(&sessions, self.locale(event)),
-        )
-        .await?;
+        let text = format!(
+            "Vibex session\n#{} · {}\nState: {}\n{runtime_line}\nApprovals pending: {}\nRole: {role}",
+            render::short_session_id(&session),
+            session.title,
+            render::state_label(&session, locale),
+            pending.len(),
+        );
+        self.reply_buttons(event, runtime, &text, buttons).await?;
         Ok(())
     }
 
@@ -1626,7 +1767,7 @@ impl ImChannelService {
     }
 
     async fn handle_new(
-        &self,
+        self: &Arc<Self>,
         event: &ImInboundEvent,
         runtime: &ChannelRuntime,
         principal: &ImPrincipalRecord,
@@ -1722,6 +1863,7 @@ impl ImChannelService {
         }
         let binding = self.make_binding(&reply_event, principal, &session, None);
         ImBindingRepository::upsert(&conn, &binding)?;
+        self.start_live_turn(&binding, Some(reply_event.chat_type));
         self.send_prompt(&reply_event, &session.id, prompt).await?;
         self.reply(
             &reply_event,
@@ -1737,7 +1879,7 @@ impl ImChannelService {
     }
 
     async fn handle_stop(
-        &self,
+        self: &Arc<Self>,
         event: &ImInboundEvent,
         runtime: &ChannelRuntime,
         principal: &ImPrincipalRecord,
@@ -1753,8 +1895,14 @@ impl ImChannelService {
             return Ok(());
         };
         self.inner.agent.interrupt(&binding.session_id).await?;
-        self.reply(event, runtime, "Stopped the current turn.")
-            .await?;
+        // The live message already says the turn ended; only a chat that never
+        // saw one needs the notice.
+        if self.live_mode_for_binding(&binding).edits_a_message() {
+            self.stop_live_turn(&binding).await;
+        } else {
+            self.reply(event, runtime, "Stopped the current turn.")
+                .await?;
+        }
         Ok(())
     }
 
@@ -1890,7 +2038,7 @@ impl ImChannelService {
     }
 
     async fn handle_plain_text(
-        &self,
+        self: &Arc<Self>,
         event: &ImInboundEvent,
         runtime: &ChannelRuntime,
         principal: &ImPrincipalRecord,
@@ -1914,10 +2062,16 @@ impl ImChannelService {
         if text.trim().is_empty() && event.attachments.is_empty() {
             return Ok(());
         }
+        // The live message is the acknowledgement; a second "Sent." line would
+        // only push it up the chat.
+        let live = self.live_mode_for_binding(&binding).edits_a_message();
+        self.start_live_turn(&binding, Some(event.chat_type));
         self.send_prompt_with_attachments(event, &binding.session_id, text, &event.attachments)
             .await?;
-        self.reply(event, runtime, "Sent. I will report back here.")
-            .await?;
+        if !live {
+            self.reply(event, runtime, "Sent. I will report back here.")
+                .await?;
+        }
         Ok(())
     }
 
@@ -1969,7 +2123,7 @@ impl ImChannelService {
             .collect();
         self.inner
             .agent
-            .send_message(SendAgentMessageRequest {
+            .submit_message(SendAgentMessageRequest {
                 session_id: session_id.clone(),
                 message_idempotency_key: key,
                 desired_runtime: runtime.desired,
@@ -2033,7 +2187,7 @@ impl ImChannelService {
         binding: &ImBindingRecord,
         text: &str,
     ) -> VibexResult<Option<ImSentMessage>> {
-        self.send_to_binding_with(binding, text, OutboundPriority::Normal)
+        self.send_to_binding_with(binding, text, false, OutboundPriority::Normal)
             .await
     }
 
@@ -2052,7 +2206,7 @@ impl ImChannelService {
         let mut last = None;
         for part in parts {
             last = self
-                .send_to_binding_with(binding, &part, OutboundPriority::Normal)
+                .send_to_binding_with(binding, &part, true, OutboundPriority::Normal)
                 .await?;
         }
         Ok(last)
@@ -2062,6 +2216,7 @@ impl ImChannelService {
         &self,
         binding: &ImBindingRecord,
         text: &str,
+        markdown: bool,
         priority: OutboundPriority,
     ) -> VibexResult<Option<ImSentMessage>> {
         let Some(runtime) = self
@@ -2081,7 +2236,7 @@ impl ImChannelService {
         let message_id = self.record_outbound(binding, text, "message");
         let result = runtime
             .outbox
-            .send(target, text.to_string(), Vec::new(), priority)
+            .send(target, text.to_string(), Vec::new(), markdown, priority)
             .await;
         self.finish_outbound(&message_id, &result);
         let sent = result.map_err(im_error_to_vibex)?;
@@ -2170,7 +2325,7 @@ impl ImChannelService {
         let message_id = self.record_outbound_reply(event, text);
         let result = runtime
             .outbox
-            .send(target, text.to_string(), Vec::new(), priority)
+            .send(target, text.to_string(), Vec::new(), false, priority)
             .await;
         self.finish_outbound(&message_id, &result);
         result.map_err(im_error_to_vibex)?;
@@ -2619,6 +2774,7 @@ mod tests {
             default_session: None,
             event_filter: Vec::new(),
             locale: None,
+            stream_mode: vibex_core::ImStreamMode::Auto,
         }
     }
 
@@ -2753,6 +2909,7 @@ mod tests {
             default_session: None,
             event_filter: Vec::new(),
             locale: None,
+            stream_mode: vibex_core::ImStreamMode::Auto,
         };
         assert_eq!(draft.config.kind(), vibex_core::ImChannelKind::Lark);
     }

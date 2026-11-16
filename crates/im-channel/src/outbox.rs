@@ -26,7 +26,7 @@ use vibex_core::{ImChannelState, ImChannelStatus, unix_timestamp_ms};
 
 use crate::adapter::ImAdapter;
 use crate::error::{ImError, ImResult};
-use crate::types::{ImButton, ImSentMessage, ImTarget};
+use crate::types::{ImActivity, ImButton, ImSentMessage, ImTarget};
 
 /// How hard the outbox tries before it reports a failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,11 +110,15 @@ enum OutboundCall {
     Send {
         text: String,
         buttons: Vec<ImButton>,
+        markdown: bool,
     },
     Edit {
         message_id: String,
         text: String,
+        markdown: bool,
     },
+    /// A chat action: no message id, nothing to retry.
+    Activity { activity: ImActivity },
 }
 
 struct OutboxJob {
@@ -169,13 +173,18 @@ impl Outbox {
         target: ImTarget,
         text: String,
         buttons: Vec<ImButton>,
+        markdown: bool,
         priority: OutboundPriority,
     ) -> ImResult<ImSentMessage> {
         let (reply, wait) = oneshot::channel();
         self.enqueue(OutboxJob {
             chat_id: target.chat_id.clone(),
             target,
-            call: OutboundCall::Send { text, buttons },
+            call: OutboundCall::Send {
+                text,
+                buttons,
+                markdown,
+            },
             priority,
             reply,
         })
@@ -188,13 +197,35 @@ impl Outbox {
         target: ImTarget,
         message_id: String,
         text: String,
+        markdown: bool,
+        priority: OutboundPriority,
     ) -> ImResult<()> {
         let (reply, wait) = oneshot::channel();
         self.enqueue(OutboxJob {
             chat_id: target.chat_id.clone(),
             target,
-            call: OutboundCall::Edit { message_id, text },
-            priority: OutboundPriority::Normal,
+            call: OutboundCall::Edit {
+                message_id,
+                text,
+                markdown,
+            },
+            priority,
+            reply,
+        })
+        .await?;
+        wait.await.map_err(|_| ImError::Internal)??;
+        Ok(())
+    }
+
+    /// Shows a chat action. It is best-effort: a failed typing hint is not
+    /// worth a retry, and it must never delay a real message.
+    pub(crate) async fn activity(&self, target: ImTarget, activity: ImActivity) -> ImResult<()> {
+        let (reply, wait) = oneshot::channel();
+        self.enqueue(OutboxJob {
+            chat_id: target.chat_id.clone(),
+            target,
+            call: OutboundCall::Activity { activity },
+            priority: OutboundPriority::BestEffort,
             reply,
         })
         .await?;
@@ -221,14 +252,38 @@ async fn deliver(
     loop {
         rate.acquire(chat_id).await;
         let result = match &job.call {
-            OutboundCall::Send { text, buttons } => {
-                adapter.send_text(&job.target, text, buttons).await
+            OutboundCall::Send {
+                text,
+                buttons,
+                markdown,
+            } => {
+                if *markdown {
+                    adapter.send_markdown(&job.target, text, buttons).await
+                } else {
+                    adapter.send_text(&job.target, text, buttons).await
+                }
             }
-            OutboundCall::Edit { message_id, text } => adapter
-                .edit_text(&job.target, message_id, text, &[])
+            OutboundCall::Edit {
+                message_id,
+                text,
+                markdown,
+            } => {
+                let result = if *markdown {
+                    adapter
+                        .edit_markdown(&job.target, message_id, text, &[])
+                        .await
+                } else {
+                    adapter.edit_text(&job.target, message_id, text, &[]).await
+                };
+                result.map(|()| ImSentMessage {
+                    message_id: message_id.clone(),
+                })
+            }
+            OutboundCall::Activity { activity } => adapter
+                .send_activity(&job.target, *activity)
                 .await
                 .map(|()| ImSentMessage {
-                    message_id: message_id.clone(),
+                    message_id: String::new(),
                 }),
         };
         match result {
@@ -422,6 +477,7 @@ mod tests {
                 target(),
                 "approval".to_string(),
                 Vec::new(),
+                false,
                 OutboundPriority::Critical,
             )
             .await
@@ -445,6 +501,7 @@ mod tests {
                 target(),
                 "ack".to_string(),
                 Vec::new(),
+                false,
                 OutboundPriority::BestEffort,
             )
             .await

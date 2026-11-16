@@ -11,6 +11,7 @@ mod error;
 mod i18n;
 mod lark;
 mod limits;
+mod markdown;
 mod outbox;
 mod render;
 mod service;
@@ -22,8 +23,10 @@ pub use agent_port::{AdministrativeAgent, ImAgentPort};
 pub use error::{ImError, ImResult};
 pub use i18n::ImLocale;
 pub use lark::LarkAdapter;
+pub use markdown::to_telegram_html;
 pub use service::{ImChannelService, ImChannelServiceConfig};
 pub use telegram::TelegramAdapter;
 pub use types::{
-    ImButton, ImCallback, ImChatType, ImInboundEvent, ImSentMessage, ImTarget, ImThreadTarget,
+    ImActivity, ImButton, ImCallback, ImChatType, ImCommandSpec, ImInboundEvent, ImSentMessage,
+    ImTarget, ImThreadTarget,
 };

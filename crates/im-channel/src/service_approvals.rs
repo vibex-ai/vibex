@@ -66,7 +66,9 @@ impl ImChannelService {
                             thread_key: binding.thread_key.clone(),
                         },
                         message_id.to_string(),
-                        format!("{}: {}\n{}", status, request.title, principal.display_name),
+                        format!("{status}: {}\n{}", request.title, principal.display_name),
+                        false,
+                        OutboundPriority::Normal,
                     )
                     .await;
             }
@@ -199,7 +201,7 @@ impl ImChannelService {
         // outranks a progress reply when the provider is rate limiting us.
         if let Ok(sent) = runtime
             .outbox
-            .send(target, text, buttons, OutboundPriority::Critical)
+            .send(target, text, buttons, false, OutboundPriority::Critical)
             .await
         {
             ImApprovalCardRepository::set_message_id(
@@ -260,6 +262,8 @@ impl ImChannelService {
                         },
                         message_id.to_string(),
                         format!("{status}: approval request {}", request_id),
+                        false,
+                        OutboundPriority::Normal,
                     )
                     .await;
             }
@@ -353,7 +357,13 @@ impl ImChannelService {
         };
         runtime
             .outbox
-            .send(target, prompt.text, buttons, OutboundPriority::Critical)
+            .send(
+                target,
+                prompt.text,
+                buttons,
+                false,
+                OutboundPriority::Critical,
+            )
             .await
             .map_err(im_error_to_vibex)?;
         Ok(())

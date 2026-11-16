@@ -3372,6 +3372,30 @@ impl AgentManager {
         coordinator.submit(request).await
     }
 
+    /// Enqueues a message without waiting for its turn to finish.
+    ///
+    /// A chat transport has to stay free while a turn runs — its reader may be
+    /// pressing `/stop` — so it accepts the prompt here and follows the turn
+    /// through the timeline broadcast instead of this call.
+    pub fn submit_message_in_background(
+        &self,
+        request: SendAgentMessageRequest,
+    ) -> VibexResult<()> {
+        self.reject_terminal_session(&request.session_id)?;
+        let coordinator = self
+            .message_submission
+            .get()
+            .and_then(Weak::upgrade)
+            .ok_or_else(|| {
+                VibexError::process(
+                    "message_submission_coordinator_unavailable",
+                    "durable message submission coordinator is unavailable",
+                )
+            })?;
+        coordinator.submit_in_background(request)?;
+        Ok(())
+    }
+
     /// Records what a terminal session's observer saw.
     ///
     /// The write is skipped when nothing a reader sees has moved, so an

@@ -400,6 +400,21 @@ impl MessageSubmissionCoordinator {
         Ok(record.submission_id)
     }
 
+    /// Persists a message and starts its worker without waiting for the turn.
+    ///
+    /// A caller that only needs the prompt accepted — a chat transport whose
+    /// reader must stay free to press `/stop` — uses this instead of `submit`.
+    /// The turn's outcome still reaches it through the timeline broadcast.
+    pub fn submit_in_background(
+        self: &Arc<Self>,
+        request: SendAgentMessageRequest,
+    ) -> VibexResult<MessageSubmissionId> {
+        let submission_id = self.prepare_submission(request)?;
+        let record = self.required_submission(&submission_id)?;
+        self.start_session_worker(record.session_id)?;
+        Ok(submission_id)
+    }
+
     pub async fn wait_for_submission(
         self: &Arc<Self>,
         submission_id: &MessageSubmissionId,

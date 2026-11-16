@@ -22,7 +22,7 @@ use vibex_core::{
     AgentSession, ImBindingSummary, ImChannelConfig, ImChannelDraft, ImChannelId, ImChannelKind,
     ImChannelSummary, ImLarkConfig, ImLarkRegion, ImLarkTransport, ImPairingCodeInfo,
     ImPairingRequest, ImPrincipalId, ImPrincipalRole, ImPrincipalSummary, ImSessionDefaults,
-    ImTelegramConfig,
+    ImStreamMode, ImTelegramConfig,
 };
 
 use crate::app::VibexWorkbench;
@@ -267,6 +267,7 @@ impl ImChannelsView {
                 default_session: None,
                 event_filter: Vec::new(),
                 locale: None,
+                stream_mode: ImStreamMode::Auto,
             };
             async {
                 let channel = backend
@@ -353,6 +354,7 @@ impl ImChannelsView {
                 default_session: None,
                 event_filter: Vec::new(),
                 locale: None,
+                stream_mode: ImStreamMode::Auto,
             };
             let created = backend
                 .management()
@@ -839,6 +841,68 @@ impl ImChannelsView {
         }
     }
 
+    fn stream_mode_label(mode: ImStreamMode) -> &'static str {
+        match mode {
+            ImStreamMode::Auto => locale::text("Auto", "自动", "自動"),
+            ImStreamMode::Off => locale::text("Off", "关闭", "關閉"),
+            ImStreamMode::Typing => locale::text("Typing", "输入中", "輸入中"),
+            ImStreamMode::Progress => locale::text("Progress", "进度", "進度"),
+            ImStreamMode::Live => locale::text("Live", "逐字", "逐字"),
+        }
+    }
+
+    fn next_stream_mode(mode: ImStreamMode) -> ImStreamMode {
+        match mode {
+            ImStreamMode::Auto => ImStreamMode::Off,
+            ImStreamMode::Off => ImStreamMode::Typing,
+            ImStreamMode::Typing => ImStreamMode::Progress,
+            ImStreamMode::Progress => ImStreamMode::Live,
+            ImStreamMode::Live => ImStreamMode::Auto,
+        }
+    }
+
+    fn set_stream_mode(
+        &mut self,
+        channel_id: ImChannelId,
+        mode: ImStreamMode,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(backend) = self.backend(cx) else {
+            return;
+        };
+        self.busy = true;
+        self.error = None;
+        self.task = Some(cx.spawn(
+            async move |weak: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let result = backend
+                    .management()
+                    .set_im_channel_stream_mode(vibex_backend::MutationRequest::new(
+                        vibex_backend::ImChannelStreamModeUpdate {
+                            channel_id,
+                            stream_mode: mode,
+                        },
+                    ))
+                    .await
+                    .map(|_| ())
+                    .map_err(backend_error);
+                let _ = weak.update(cx, |this, cx| {
+                    this.busy = false;
+                    match result {
+                        Ok(()) => {
+                            this.notice =
+                                Some(format!("Streaming: {}.", Self::stream_mode_label(mode)));
+                            this.loaded = false;
+                            this.loading = false;
+                            this.reload(cx);
+                        }
+                        Err(error) => this.error = Some(error),
+                    }
+                    cx.notify();
+                });
+            },
+        ));
+    }
+
     fn select_channel(&mut self, channel_id: ImChannelId, cx: &mut Context<Self>) {
         self.selected = Some(channel_id);
         self.pairing = None;
@@ -1188,6 +1252,24 @@ impl Render for ImChannelsView {
                         h_flex()
                             .gap_2()
                             .items_center()
+                            .child(
+                                Button::new("im-stream-mode")
+                                    .small()
+                                    .outline()
+                                    .label(format!(
+                                        "{}: {}",
+                                        locale::text("Streaming", "流式", "串流"),
+                                        Self::stream_mode_label(channel.stream_mode)
+                                    ))
+                                    .disabled(self.busy)
+                                    .on_click(cx.listener({
+                                        let channel_id = channel_id.clone();
+                                        let mode = Self::next_stream_mode(channel.stream_mode);
+                                        move |this, _, _, cx| {
+                                            this.set_stream_mode(channel_id.clone(), mode, cx)
+                                        }
+                                    })),
+                            )
                             .child(
                                 Button::new("im-pairing-role")
                                     .small()

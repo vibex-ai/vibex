@@ -53,6 +53,29 @@ pub struct ImButton {
     pub label: String,
 }
 
+/// A chat action that shows the bot is working without sending a message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImActivity {
+    Typing,
+}
+
+/// One entry of the provider's slash-command menu.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImCommandSpec {
+    /// Without the leading slash.
+    pub command: String,
+    pub description: String,
+}
+
+impl ImCommandSpec {
+    pub fn new(command: impl Into<String>, description: impl Into<String>) -> Self {
+        Self {
+            command: command.into(),
+            description: description.into(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImTarget {
     pub chat_id: String,

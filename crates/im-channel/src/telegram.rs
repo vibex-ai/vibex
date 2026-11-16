@@ -13,8 +13,8 @@ use vibex_core::{
 use crate::adapter::ImAdapter;
 use crate::error::{ImError, ImResult};
 use crate::types::{
-    ImAttachment, ImButton, ImCallback, ImChatType, ImInboundEvent, ImSentMessage, ImTarget,
-    ImThreadTarget,
+    ImActivity, ImAttachment, ImButton, ImCallback, ImChatType, ImCommandSpec, ImInboundEvent,
+    ImSentMessage, ImTarget, ImThreadTarget,
 };
 
 const TELEGRAM_API_BASE: &str = "https://api.telegram.org";
@@ -314,25 +314,43 @@ impl TelegramAdapter {
         text: &str,
         buttons: &[ImButton],
     ) -> ImResult<ImSentMessage> {
-        let mut body = json!({
-            "chat_id": target.chat_id,
-            "text": text,
-            "disable_web_page_preview": true,
-        });
-        if !target.thread_key.is_empty() {
-            body["message_thread_id"] = json!(target.thread_key);
+        self.send_rendered(target, text, buttons, false).await
+    }
+
+    /// Sends Markdown as Telegram HTML, falling back to the raw text when
+    /// Telegram refuses the entities.
+    ///
+    /// A refusal is recoverable and must not cost the answer: the same bytes
+    /// that failed as markup are still valid as plain text. Losing a reply to a
+    /// stray `<` in a code sample would be a worse outcome than losing its
+    /// bold.
+    pub async fn send_markdown(
+        &self,
+        target: &ImTarget,
+        markdown: &str,
+        buttons: &[ImButton],
+    ) -> ImResult<ImSentMessage> {
+        match self.send_rendered(target, markdown, buttons, true).await {
+            Err(error) if is_entity_error(&error) => {
+                self.send_rendered(target, markdown, buttons, false).await
+            }
+            result => result,
         }
-        if !buttons.is_empty() {
-            body["reply_markup"] = json!({
-                "inline_keyboard": [buttons
-                    .iter()
-                    .map(|button| json!({
-                        "text": button.label,
-                        "callback_data": button.action_id.as_str(),
-                    }))
-                    .collect::<Vec<_>>()]
-            });
-        }
+    }
+
+    async fn send_rendered(
+        &self,
+        target: &ImTarget,
+        text: &str,
+        buttons: &[ImButton],
+        render: bool,
+    ) -> ImResult<ImSentMessage> {
+        let text = if render {
+            crate::markdown::to_telegram_html(text)
+        } else {
+            text.to_string()
+        };
+        let body = self.message_body(target, &text, buttons, render);
         // Retry policy belongs to the outbox: it knows the message priority and
         // whether the caller is waiting, and a second sleep here would stack on
         // top of that. Report the provider's own cool-down and let it decide.
@@ -356,12 +374,69 @@ impl TelegramAdapter {
         text: &str,
         buttons: &[ImButton],
     ) -> ImResult<()> {
+        self.edit_rendered(target, message_id, text, buttons, false)
+            .await
+    }
+
+    /// Replaces a message with rendered Markdown, falling back to plain text.
+    pub async fn edit_markdown(
+        &self,
+        target: &ImTarget,
+        message_id: &str,
+        markdown: &str,
+        buttons: &[ImButton],
+    ) -> ImResult<()> {
+        match self
+            .edit_rendered(target, message_id, markdown, buttons, true)
+            .await
+        {
+            Err(error) if is_entity_error(&error) => {
+                self.edit_rendered(target, message_id, markdown, buttons, false)
+                    .await
+            }
+            result => result,
+        }
+    }
+
+    async fn edit_rendered(
+        &self,
+        target: &ImTarget,
+        message_id: &str,
+        text: &str,
+        buttons: &[ImButton],
+        render: bool,
+    ) -> ImResult<()> {
+        let text = if render {
+            crate::markdown::to_telegram_html(text)
+        } else {
+            text.to_string()
+        };
+        let mut body = self.message_body(target, &text, buttons, render);
+        body["message_id"] = json!(message_id);
+        self.call("editMessageText", body).await?;
+        self.mark_outbound();
+        Ok(())
+    }
+
+    /// The shared `text` body of `sendMessage` and `editMessageText`.
+    fn message_body(
+        &self,
+        target: &ImTarget,
+        text: &str,
+        buttons: &[ImButton],
+        render: bool,
+    ) -> Value {
         let mut body = json!({
             "chat_id": target.chat_id,
-            "message_id": message_id,
             "text": text,
             "disable_web_page_preview": true,
         });
+        if render {
+            body["parse_mode"] = json!("HTML");
+        }
+        if !target.thread_key.is_empty() {
+            body["message_thread_id"] = json!(target.thread_key);
+        }
         if !buttons.is_empty() {
             body["reply_markup"] = json!({
                 "inline_keyboard": [buttons
@@ -373,8 +448,53 @@ impl TelegramAdapter {
                     .collect::<Vec<_>>()]
             });
         }
-        self.call("editMessageText", body).await?;
-        self.mark_outbound();
+        body
+    }
+
+    /// Shows a chat action, which is the cheapest way to say "still working".
+    pub async fn send_activity(&self, target: &ImTarget, activity: ImActivity) -> ImResult<()> {
+        let action = match activity {
+            ImActivity::Typing => "typing",
+        };
+        let mut body = json!({
+            "chat_id": target.chat_id,
+            "action": action,
+        });
+        if !target.thread_key.is_empty() {
+            body["message_thread_id"] = json!(target.thread_key);
+        }
+        self.call("sendChatAction", body).await?;
+        Ok(())
+    }
+
+    /// Publishes the slash-command menu a client shows in its `/` picker.
+    ///
+    /// Telegram only accepts lowercase names of letters, digits and underscore,
+    /// so anything else is dropped rather than sent and rejected.
+    pub async fn register_commands(&self, commands: &[ImCommandSpec]) -> ImResult<()> {
+        let commands: Vec<Value> = commands
+            .iter()
+            .filter_map(|spec| {
+                let name = spec.command.trim_start_matches('/').to_ascii_lowercase();
+                if name.is_empty()
+                    || name.len() > 32
+                    || !name.chars().all(|character| {
+                        character.is_ascii_lowercase()
+                            || character.is_ascii_digit()
+                            || character == '_'
+                    })
+                {
+                    return None;
+                }
+                let description: String = spec.description.chars().take(256).collect();
+                Some(json!({ "command": name, "description": description }))
+            })
+            .collect();
+        if commands.is_empty() {
+            return Ok(());
+        }
+        self.call("setMyCommands", json!({ "commands": commands }))
+            .await?;
         Ok(())
     }
 
@@ -592,6 +712,24 @@ fn retry_after_ms(value: &Value) -> u64 {
         .unwrap_or(1_000)
 }
 
+/// Whether an error is Telegram refusing the message's markup rather than the
+/// message itself.
+///
+/// The distinction matters: an entity problem is fixed by resending the same
+/// text without `parse_mode`, while a transport or auth failure is not.
+fn is_entity_error(error: &ImError) -> bool {
+    let ImError::ProviderRejected { code, message } = error else {
+        return false;
+    };
+    if code == "400" {
+        let message = message.to_ascii_lowercase();
+        return message.contains("parse entities")
+            || message.contains("unsupported start tag")
+            || message.contains("can't parse");
+    }
+    false
+}
+
 fn provider_error(value: &Value) -> ImError {
     let code = value
         .get("error_code")
@@ -629,6 +767,33 @@ impl ImAdapter for TelegramAdapter {
         buttons: &[ImButton],
     ) -> ImResult<()> {
         TelegramAdapter::edit_text(self, target, message_id, text, buttons).await
+    }
+
+    async fn send_markdown(
+        &self,
+        target: &ImTarget,
+        markdown: &str,
+        buttons: &[ImButton],
+    ) -> ImResult<ImSentMessage> {
+        TelegramAdapter::send_markdown(self, target, markdown, buttons).await
+    }
+
+    async fn edit_markdown(
+        &self,
+        target: &ImTarget,
+        message_id: &str,
+        markdown: &str,
+        buttons: &[ImButton],
+    ) -> ImResult<()> {
+        TelegramAdapter::edit_markdown(self, target, message_id, markdown, buttons).await
+    }
+
+    async fn send_activity(&self, target: &ImTarget, activity: ImActivity) -> ImResult<()> {
+        TelegramAdapter::send_activity(self, target, activity).await
+    }
+
+    async fn register_commands(&self, commands: &[ImCommandSpec]) -> ImResult<()> {
+        TelegramAdapter::register_commands(self, commands).await
     }
 
     async fn answer_callback(&self, callback_query_id: &str, text: Option<&str>) -> ImResult<()> {

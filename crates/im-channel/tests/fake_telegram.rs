@@ -19,16 +19,16 @@ use axum::{
 use serde_json::{Value, json};
 use tokio::sync::{Notify, broadcast};
 use vibex_core::{
-    AgentId, AgentNotificationIntent, AgentSession, AgentSessionRuntimeSelectionState,
-    AgentSessionSafety, AgentSessionState, CreateAgentSessionRequest, FetchTimelineRequest,
-    ImBindingSummary, ImChannelConfig, ImChannelDraft, ImPairingRequest, ImPrincipalRole,
-    ImPrincipalStatus, PermissionActionDetail, PermissionRequest, PermissionRequestStatus,
-    PermissionResolution, PermissionResponseKind, PermissionResponseOption, ProjectId,
-    ProviderProfileId, ResolveElicitationRequest, ResolvePermissionRequest,
-    SendAgentMessageRequest, SessionRuntimeSelection, SessionRuntimeSelectionStatus, TimelineItem,
-    TimelineItemId, TimelineLiveEvent, TimelinePage, TimelinePayload, TimelinePayloadDepth,
-    TimelineRedactionState, TimelineSource, VibexResult, VibexSessionId, WorkspaceId,
-    WorkspaceMode, unix_timestamp_ms,
+    AgentId, AgentMessageDeltaPayload, AgentMessagePayload, AgentMessagePhase,
+    AgentNotificationIntent, AgentSession, AgentSessionRuntimeSelectionState, AgentSessionSafety,
+    AgentSessionState, CreateAgentSessionRequest, FetchTimelineRequest, ImBindingSummary,
+    ImChannelConfig, ImChannelDraft, ImPairingRequest, ImPrincipalRole, ImPrincipalStatus,
+    PermissionActionDetail, PermissionRequest, PermissionRequestStatus, PermissionResolution,
+    PermissionResponseKind, PermissionResponseOption, ProjectId, ProviderProfileId,
+    ResolveElicitationRequest, ResolvePermissionRequest, SendAgentMessageRequest,
+    SessionRuntimeSelection, SessionRuntimeSelectionStatus, TimelineItem, TimelineItemId,
+    TimelineLiveEvent, TimelinePage, TimelinePayload, TimelinePayloadDepth, TimelineRedactionState,
+    TimelineSource, VibexResult, VibexSessionId, WorkspaceId, WorkspaceMode, unix_timestamp_ms,
 };
 use vibex_im_channel::{ImAgentPort, ImChannelService, ImChannelServiceConfig};
 
@@ -114,6 +114,7 @@ async fn fake_telegram(
             state.edited.lock().expect("edited").push(body);
             Value::Bool(true)
         }
+        "setMyCommands" | "sendChatAction" => Value::Bool(true),
         "answerCallbackQuery" => {
             state.callbacks.lock().expect("callbacks").push(body);
             Value::Bool(true)
@@ -484,6 +485,7 @@ async fn telegram_pairing_commands_and_approval_round_trip() {
             default_session: None,
             event_filter: Vec::new(),
             locale: Some("en".to_string()),
+            stream_mode: vibex_core::ImStreamMode::Auto,
         })
         .await
         .expect("create channel");
@@ -942,6 +944,79 @@ async fn telegram_pairing_commands_and_approval_round_trip() {
         .expect("preview bounds");
     assert_eq!(preview_too_long, 0);
     drop(conn);
+
+    // A streamed turn: the live message the turn already owns is edited as
+    // deltas arrive, and the final answer lands in that same message rendered
+    // as HTML instead of being sent again.
+    wait_for(
+        || async { fake.sent_texts().iter().any(|text| text.contains("⏳")) },
+        "live progress message",
+    )
+    .await;
+    let session = agent.session.clone();
+    let _ = agent.sessions.send(AgentSession {
+        state: AgentSessionState::Running,
+        ..session.clone()
+    });
+    let _ = agent.timeline.send(TimelineLiveEvent {
+        session_id: session.id.clone(),
+        sequence: 21,
+        item: agent.item(
+            21,
+            TimelinePayload::AgentMessageDelta(AgentMessageDeltaPayload {
+                text_delta: "**streamed**".to_string(),
+                chunk_index: 0,
+                phase: Some(AgentMessagePhase::FinalAnswer),
+            }),
+        ),
+    });
+    let _ = agent.timeline.send(TimelineLiveEvent {
+        session_id: session.id.clone(),
+        sequence: 22,
+        item: agent.item(
+            22,
+            TimelinePayload::AgentMessage(AgentMessagePayload {
+                text: "**streamed** answer".to_string(),
+                is_final: true,
+            }),
+        ),
+    });
+    wait_for(
+        || async {
+            fake.edited.lock().expect("edited").iter().any(|body| {
+                body.get("text")
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| text.contains("<b>streamed</b> answer"))
+            })
+        },
+        "streamed final answer",
+    )
+    .await;
+    let final_edit_parse_mode = {
+        let edits = fake.edited.lock().expect("edited");
+        edits
+            .iter()
+            .find(|body| {
+                body.get("text")
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| text.contains("<b>streamed</b> answer"))
+            })
+            .and_then(|body| body.get("parse_mode"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    };
+    assert_eq!(
+        final_edit_parse_mode.as_deref(),
+        Some("HTML"),
+        "the final edit is rendered, not raw Markdown"
+    );
+    assert!(
+        !fake
+            .sent_texts()
+            .iter()
+            .any(|text| text.contains("streamed")),
+        "the final answer is edited into the live message, not sent again"
+    );
 
     service.stop().await;
     server.abort();
