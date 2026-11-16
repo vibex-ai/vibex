@@ -576,7 +576,11 @@ pub struct ImRuntimeAgentChoice {
     pub agent_id: AgentId,
     pub auth_source: RuntimeAuthSource,
     pub model: RuntimeModelSelection,
-    pub label: String,
+    /// The Agent's own name, without the source.
+    pub agent_label: String,
+    /// The credential source, which is what tells two entries of the same
+    /// Agent apart.
+    pub source_label: String,
     #[serde(default)]
     pub current: bool,
 }

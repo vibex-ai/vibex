@@ -192,7 +192,8 @@ impl ImAgentPort for AgentManagerImPort {
                 agent_id: option.selection.agent_id.clone(),
                 auth_source: option.selection.auth_source.clone(),
                 model: option.selection.model.clone(),
-                label: format!("{} · {}", option.agent_label, option.auth_source_label),
+                agent_label: option.agent_label.clone(),
+                source_label: option.auth_source_label.clone(),
                 current: option.selection.agent_id == current.agent_id
                     && option.selection.auth_source == current.auth_source,
             });

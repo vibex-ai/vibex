@@ -23,12 +23,14 @@ use vibex_core::{
     AgentNotificationIntent, AgentSession, AgentSessionRuntimeSelectionState, AgentSessionSafety,
     AgentSessionState, CreateAgentSessionRequest, FetchTimelineRequest, ImBindingSummary,
     ImChannelConfig, ImChannelDraft, ImPairingRequest, ImPrincipalRole, ImPrincipalStatus,
-    PermissionActionDetail, PermissionRequest, PermissionRequestStatus, PermissionResolution,
-    PermissionResponseKind, PermissionResponseOption, ProjectId, ProviderProfileId,
-    ResolveElicitationRequest, ResolvePermissionRequest, SendAgentMessageRequest,
-    SessionRuntimeSelection, SessionRuntimeSelectionStatus, TimelineItem, TimelineItemId,
-    TimelineLiveEvent, TimelinePage, TimelinePayload, TimelinePayloadDepth, TimelineRedactionState,
-    TimelineSource, VibexResult, VibexSessionId, WorkspaceId, WorkspaceMode, unix_timestamp_ms,
+    ImRuntimeAgentChoice, ImRuntimeChoice, ImRuntimeOptions, PermissionActionDetail,
+    PermissionRequest, PermissionRequestStatus, PermissionResolution, PermissionResponseKind,
+    PermissionResponseOption, ProjectId, ProviderProfileId, ResolveElicitationRequest,
+    ResolvePermissionRequest, SendAgentMessageRequest, SessionRuntimeSelection,
+    SessionRuntimeSelectionStatus, SetDesiredAgentSessionRuntimeRequest, TimelineItem,
+    TimelineItemId, TimelineLiveEvent, TimelinePage, TimelinePayload, TimelinePayloadDepth,
+    TimelineRedactionState, TimelineSource, VibexResult, VibexSessionId, WorkspaceId,
+    WorkspaceMode, unix_timestamp_ms,
 };
 use vibex_im_channel::{ImAgentPort, ImChannelService, ImChannelServiceConfig};
 
@@ -69,6 +71,33 @@ impl FakeTelegram {
             .iter()
             .filter_map(|body| body.get("text").and_then(Value::as_str).map(str::to_string))
             .collect()
+    }
+
+    /// The `callback_data` of the newest button whose label is `label`.
+    fn button_action(&self, label: &str) -> Option<String> {
+        let sent = self.sent.lock().expect("sent");
+        for body in sent.iter().rev() {
+            let Some(rows) = body
+                .pointer("/reply_markup/inline_keyboard")
+                .and_then(Value::as_array)
+            else {
+                continue;
+            };
+            for row in rows {
+                let Some(buttons) = row.as_array() else {
+                    continue;
+                };
+                for button in buttons {
+                    if button.get("text").and_then(Value::as_str) == Some(label) {
+                        return button
+                            .get("callback_data")
+                            .and_then(Value::as_str)
+                            .map(str::to_string);
+                    }
+                }
+            }
+        }
+        None
     }
 
     fn callback_data(&self) -> Option<String> {
@@ -152,6 +181,8 @@ struct MockAgent {
     /// fake records the value the channel actually sent.
     prompt_efforts: Mutex<Vec<Option<String>>>,
     created_selections: Mutex<Vec<SessionRuntimeSelection>>,
+    /// Every runtime selection the channel has applied.
+    applied_selections: Mutex<Vec<SessionRuntimeSelection>>,
     attachments: Mutex<Vec<Vec<vibex_core::MessageAttachment>>>,
     resolutions: Mutex<Vec<PermissionResolution>>,
     elicitations: Mutex<Vec<vibex_core::ElicitationResolution>>,
@@ -201,6 +232,7 @@ impl MockAgent {
             prompts: Mutex::new(Vec::new()),
             prompt_efforts: Mutex::new(Vec::new()),
             created_selections: Mutex::new(Vec::new()),
+            applied_selections: Mutex::new(Vec::new()),
             attachments: Mutex::new(Vec::new()),
             resolutions: Mutex::new(Vec::new()),
             elicitations: Mutex::new(Vec::new()),
@@ -328,6 +360,82 @@ impl ImAgentPort for MockAgent {
         Ok(Vec::new())
     }
 
+    async fn set_desired_runtime(
+        &self,
+        request: SetDesiredAgentSessionRuntimeRequest,
+    ) -> VibexResult<AgentSessionRuntimeSelectionState> {
+        self.applied_selections
+            .lock()
+            .expect("applied")
+            .push(request.desired.clone());
+        Ok(AgentSessionRuntimeSelectionState {
+            desired: request.desired,
+            effective: self.selection.clone(),
+            status: SessionRuntimeSelectionStatus::Ready,
+            session_revision: 2,
+            selection_revision: 2,
+            current_binding_id: None,
+            activation_generation: 1,
+            pending_switch_id: None,
+            actionable_error: None,
+        })
+    }
+
+    async fn runtime_options(&self, _session_id: &VibexSessionId) -> VibexResult<ImRuntimeOptions> {
+        Ok(ImRuntimeOptions {
+            session_revision: 1,
+            selection_revision: 1,
+            current: self.selection.clone(),
+            agent_label: "Claude Code".to_string(),
+            model_label: "Fake Model".to_string(),
+            effort_label: Some("high".to_string()),
+            mode_label: None,
+            agents: vec![
+                ImRuntimeAgentChoice {
+                    agent_id: self.selection.agent_id.clone(),
+                    auth_source: self.selection.auth_source.clone(),
+                    model: self.selection.model.clone(),
+                    agent_label: "Claude Code".to_string(),
+                    source_label: "Anthropic".to_string(),
+                    current: true,
+                },
+                ImRuntimeAgentChoice {
+                    agent_id: AgentId::parse("codex").expect("agent id"),
+                    auth_source: self.selection.auth_source.clone(),
+                    model: self.selection.model.clone(),
+                    agent_label: "Codex".to_string(),
+                    source_label: "OpenAI".to_string(),
+                    current: false,
+                },
+            ],
+            models: vec![
+                ImRuntimeChoice {
+                    id: "fake-model".to_string(),
+                    label: "Fake Model".to_string(),
+                    current: true,
+                },
+                ImRuntimeChoice {
+                    id: "other-model".to_string(),
+                    label: "Other Model".to_string(),
+                    current: false,
+                },
+            ],
+            efforts: vec![
+                ImRuntimeChoice {
+                    id: String::new(),
+                    label: "Default".to_string(),
+                    current: false,
+                },
+                ImRuntimeChoice {
+                    id: "high".to_string(),
+                    label: "High".to_string(),
+                    current: true,
+                },
+            ],
+            modes: Vec::new(),
+        })
+    }
+
     async fn interrupt(&self, _session_id: &VibexSessionId) -> VibexResult<()> {
         Ok(())
     }
@@ -367,6 +475,21 @@ fn message_update(update_id: i64, text: &str) -> Value {
             "text": text,
             "chat": { "id": 42, "type": "private" },
             "from": { "id": 42, "is_bot": false, "first_name": "Tester" }
+        }
+    })
+}
+
+fn callback_update(update_id: i64, action_id: &str) -> Value {
+    json!({
+        "update_id": update_id,
+        "callback_query": {
+            "id": format!("callback-{update_id}"),
+            "from": { "id": 42, "is_bot": false, "first_name": "Tester" },
+            "data": action_id,
+            "message": {
+                "message_id": update_id,
+                "chat": { "id": 42, "type": "private" }
+            }
         }
     })
 }
@@ -944,6 +1067,54 @@ async fn telegram_pairing_commands_and_approval_round_trip() {
         .expect("preview bounds");
     assert_eq!(preview_too_long, 0);
     drop(conn);
+
+    // `/status` offers pickers. A picker button carries no value at all, so
+    // pressing it has to open the card instead of failing to parse a payload.
+    fake.push(message_update(60, "/status"));
+    wait_for(
+        || async {
+            fake.sent_texts()
+                .iter()
+                .any(|text| text.contains("Approvals pending"))
+        },
+        "status card",
+    )
+    .await;
+    let model_menu = fake
+        .button_action("Model")
+        .expect("the status card offers the model picker");
+    fake.push(callback_update(61, &model_menu));
+    wait_for(
+        || async { fake.button_action("Other Model").is_some() },
+        "model card",
+    )
+    .await;
+    assert!(
+        !fake
+            .sent_texts()
+            .iter()
+            .any(|text| text.contains("could not be encoded")),
+        "a picker button must not be parsed as a value"
+    );
+
+    let other_model = fake
+        .button_action("Other Model")
+        .expect("the model card offers the other model");
+    fake.push(callback_update(62, &other_model));
+    wait_for(
+        || async {
+            agent
+                .applied_selections
+                .lock()
+                .expect("applied")
+                .last()
+                .and_then(|selection| selection.model.model_id().map(str::to_string))
+                .as_deref()
+                == Some("other-model")
+        },
+        "model applied",
+    )
+    .await;
 
     // A streamed turn: the live message the turn already owns is edited as
     // deltas arrive, and the final answer lands in that same message rendered

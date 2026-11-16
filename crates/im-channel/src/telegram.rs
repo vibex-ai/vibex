@@ -438,15 +438,24 @@ impl TelegramAdapter {
             body["message_thread_id"] = json!(target.thread_key);
         }
         if !buttons.is_empty() {
-            body["reply_markup"] = json!({
-                "inline_keyboard": [buttons
-                    .iter()
-                    .map(|button| json!({
-                        "text": button.label,
-                        "callback_data": button.action_id.as_str(),
-                    }))
-                    .collect::<Vec<_>>()]
-            });
+            // One row for an approval card, narrower rows for a picker: eight
+            // buttons in a single row leaves every label elided to `Cla...`,
+            // and a button cannot show an icon to tell them apart.
+            let width = if buttons.len() > 3 { 2 } else { buttons.len() };
+            let rows: Vec<Vec<Value>> = buttons
+                .chunks(width)
+                .map(|row| {
+                    row.iter()
+                        .map(|button| {
+                            json!({
+                                "text": button.label,
+                                "callback_data": button.action_id.as_str(),
+                            })
+                        })
+                        .collect()
+                })
+                .collect();
+            body["reply_markup"] = json!({ "inline_keyboard": rows });
         }
         body
     }

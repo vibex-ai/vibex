@@ -26,6 +26,11 @@ pub(super) const ACTION_SESSION_USE: &str = "session:use";
 pub(super) const ACTION_RUNTIME_PREFIX: &str = "runtime:";
 pub(super) const ACTION_MENU_HELP: &str = "menu:help";
 pub(super) const ACTION_MENU_SESSIONS: &str = "menu:sessions";
+/// Opens a picker. Unlike `runtime:*` these carry no value, so a card button
+/// that only asks "which model?" can never be mistaken for a choice.
+pub(super) const ACTION_MENU_MODEL: &str = "menu:model";
+pub(super) const ACTION_MENU_EFFORT: &str = "menu:effort";
+pub(super) const ACTION_MENU_PREFIX: &str = "menu:";
 pub(super) const ACTION_STATUS_STOP: &str = "status:stop";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -352,10 +357,15 @@ impl ImChannelService {
             .map_err(|_| im_payload_error())?;
             let minted =
                 self.mint_action(&conn, &binding, RuntimeField::Agent.action_kind(), &payload)?;
-            let marker = if choice.current { "✓ " } else { "" };
+            let repeats = options
+                .agents
+                .iter()
+                .filter(|other| other.agent_label == choice.agent_label)
+                .count()
+                > 1;
             buttons.push(ImButton {
                 action_id: minted.action_id,
-                label: format!("{marker}{}", render::truncate(&choice.label, 40)),
+                label: agent_button_label(choice, repeats),
             });
         }
         self.reply_buttons(event, runtime, &text, buttons).await
@@ -415,6 +425,29 @@ impl ImChannelService {
                 return Ok(true);
             }
             self.send_sessions_card(event, runtime, principal).await?;
+            return Ok(true);
+        }
+        if let Some(field) = kind
+            .strip_prefix(ACTION_MENU_PREFIX)
+            .and_then(RuntimeField::parse)
+        {
+            if !principal.role.can_prompt() {
+                self.reply(event, runtime, "Your role cannot change the runtime.")
+                    .await?;
+                return Ok(true);
+            }
+            if !self.consume_action(action, principal)? {
+                self.reply(event, runtime, "This action was already handled.")
+                    .await?;
+                return Ok(true);
+            }
+            match field {
+                RuntimeField::Agent => self.send_agent_card(event, runtime, principal).await?,
+                _ => {
+                    self.send_runtime_card(event, runtime, principal, field)
+                        .await?
+                }
+            }
             return Ok(true);
         }
         if kind == ACTION_STATUS_STOP {
@@ -652,9 +685,106 @@ impl ImChannelService {
     }
 }
 
+/// A picker button's text.
+///
+/// Telegram buttons carry no image, so the Agent's mark stands in for a logo
+/// and the label stays short enough not to be elided: the Agent's own name,
+/// or the source when the same Agent appears more than once.
+fn agent_button_label(choice: &vibex_core::ImRuntimeAgentChoice, repeats: bool) -> String {
+    let name = if repeats {
+        &choice.source_label
+    } else {
+        &choice.agent_label
+    };
+    let marker = if choice.current { "✓ " } else { "" };
+    let name = if name.trim().is_empty() {
+        choice.agent_id.as_str()
+    } else {
+        name.trim()
+    };
+    format!(
+        "{marker}{} {}",
+        agent_mark(choice.agent_id.as_str()),
+        render::truncate(name, 24)
+    )
+}
+
+/// A text stand-in for an Agent's brand, since a button cannot show one.
+fn agent_mark(agent_id: &str) -> &'static str {
+    let id = agent_id.to_ascii_lowercase();
+    if id.contains("claude") {
+        "🟠"
+    } else if id.contains("codex") {
+        "⬛"
+    } else if id.contains("gemini") {
+        "♊"
+    } else if id.contains("cline") {
+        "🔷"
+    } else if id.contains("deepseek") {
+        "🐋"
+    } else if id.contains("cursor") {
+        "🖱"
+    } else if id.contains("qwen") {
+        "🟣"
+    } else if id.contains("kimi") {
+        "🌙"
+    } else if id.contains("amp") {
+        "⚡"
+    } else {
+        "🤖"
+    }
+}
+
 fn im_payload_error() -> VibexError {
     VibexError::validation(
         "im_action_payload_invalid",
         "the action payload could not be encoded",
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn choice(
+        agent_id: &str,
+        agent_label: &str,
+        source_label: &str,
+        current: bool,
+    ) -> vibex_core::ImRuntimeAgentChoice {
+        vibex_core::ImRuntimeAgentChoice {
+            agent_id: AgentId::parse(agent_id).expect("agent id"),
+            auth_source: RuntimeAuthSource::provider_profile(vibex_core::ProviderProfileId::new()),
+            model: RuntimeModelSelection::explicit("model"),
+            agent_label: agent_label.to_string(),
+            source_label: source_label.to_string(),
+            current,
+        }
+    }
+
+    #[test]
+    fn an_agent_button_names_the_agent_and_marks_the_current_one() {
+        let pick = choice("claude", "Claude Code", "Anthropic", false);
+        assert_eq!(agent_button_label(&pick, false), "🟠 Claude Code");
+        let current = choice("claude", "Claude Code", "Anthropic", true);
+        assert_eq!(agent_button_label(&current, false), "✓ 🟠 Claude Code");
+    }
+
+    #[test]
+    fn a_repeated_agent_falls_back_to_its_source_so_the_buttons_differ() {
+        let first = choice("claude", "Claude Code", "Anthropic", false);
+        let second = choice("claude", "Claude Code", "Local Proxy", false);
+        assert_ne!(
+            agent_button_label(&first, true),
+            agent_button_label(&second, true)
+        );
+        assert_eq!(agent_button_label(&first, true), "🟠 Anthropic");
+        assert_eq!(agent_button_label(&second, true), "🟠 Local Proxy");
+    }
+
+    #[test]
+    fn a_long_agent_name_is_elided_by_the_label_not_by_the_client() {
+        let long = choice("something", &"x".repeat(80), "source", false);
+        assert!(agent_button_label(&long, false).chars().count() < 40);
+    }
 }

@@ -1676,7 +1676,7 @@ impl ImChannelService {
                     },
                 ),
                 (
-                    "runtime:model",
+                    commands::ACTION_MENU_MODEL,
                     match locale {
                         ImLocale::En => "Model",
                         ImLocale::ZhCn => "模型",
@@ -1684,7 +1684,7 @@ impl ImChannelService {
                     },
                 ),
                 (
-                    "runtime:effort",
+                    commands::ACTION_MENU_EFFORT,
                     match locale {
                         ImLocale::En => "Effort",
                         ImLocale::ZhCn => "思考",
