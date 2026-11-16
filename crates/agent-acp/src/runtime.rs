@@ -2450,6 +2450,8 @@ struct AcpAttachmentShared {
     /// The last Model replacement this attachment reported, so the user is
     /// told once per distinct substitution instead of on every config update.
     model_substitution_notice: Option<(String, String)>,
+    /// The last Mode replacement this attachment reported, for the same reason.
+    mode_substitution_notice: Option<(String, String)>,
     session_config_state: Option<ProviderSessionConfigState>,
     session_runtime_config_state: SessionRuntimeConfigState,
     session_config_planner: Option<SessionConfigPlanner>,
@@ -3599,6 +3601,22 @@ impl AcpSessionAttachment {
             return false;
         }
         state.model_substitution_notice = Some(pair);
+        true
+    }
+
+    /// Records one Mode replacement and returns whether it is newly observed.
+    ///
+    /// The pair is remembered per attachment so a repeatedly reported
+    /// substitution produces one notice, not one per config update.
+    fn note_mode_substitution(&self, requested: &str, effective: &str) -> bool {
+        let Ok(mut state) = self.state.lock() else {
+            return false;
+        };
+        let pair = (requested.to_string(), effective.to_string());
+        if state.mode_substitution_notice.as_ref() == Some(&pair) {
+            return false;
+        }
+        state.mode_substitution_notice = Some(pair);
         true
     }
 
@@ -9574,11 +9592,27 @@ impl RuntimeSelectionResolver for AcpRuntimeSwitchBridge {
                     || (!advertised_modes
                         && known_session_mode_values(&context.agent_id).contains(&mode.as_str()))
             };
+            // Model-scoped evidence outranks the profile's own: `auto` is gated
+            // on the model this selection resolves to, and one route group
+            // shares its Profile across several models. The live profile
+            // evidence stands in only when no model-scoped probe answered.
+            let auto_advertised = match session_probe
+                .as_ref()
+                .map(|probe| probe.modes.as_slice())
+                .filter(|modes| !modes.is_empty())
+            {
+                Some(modes) => modes.iter().any(|candidate| candidate.value == "auto"),
+                None => context
+                    .config
+                    .modes
+                    .iter()
+                    .any(|candidate| candidate == "auto"),
+            };
             if let Some(normalized) = normalize_claude_model_mode(
                 &context.agent_id,
                 context.launch_profile_id.is_some(),
                 model_id.as_deref().is_some(),
-                session_probe.as_ref().map(|probe| probe.modes.as_slice()),
+                auto_advertised,
                 &mode,
             ) {
                 mode = normalized;
@@ -10507,25 +10541,34 @@ fn normalize_pi_runtime_selection(
     selection.mode_id = None;
 }
 
+/// The mode a Claude Provider Profile switch persists for a model-gated `auto`.
+///
+/// Claude's `auto` mode is gated on the model the session actually resolves to,
+/// and a Provider Profile (or route) can resolve its configured model to a
+/// native alias. Probe evidence is therefore advisory: it can advertise `auto`
+/// for a model whose real session then recomputes a narrower set. It is still
+/// the only evidence that can justify keeping `auto` — it is the same evidence
+/// the picker drew the choice from — so the request survives when the
+/// model-scoped evidence advertises `auto`, and falls back to the unconditional
+/// `default` only when the evidence is silent or says otherwise. The switch
+/// path still verifies what the session applied
+/// ([`runtime_config_substituted_mode`]), so a lying probe degrades into one
+/// reported substitution instead of a binding that never converges.
 fn normalize_claude_model_mode(
     agent_id: &AgentId,
     is_provider_profile: bool,
     has_explicit_model: bool,
-    _advertised_modes: Option<&[ProviderSessionConfigValue]>,
+    auto_advertised: bool,
     requested_mode: &str,
 ) -> Option<String> {
     if agent_id.as_str() != CLAUDE_AGENT_ID
         || !is_provider_profile
         || !has_explicit_model
         || requested_mode != "auto"
+        || auto_advertised
     {
         return None;
     }
-
-    // Claude ACP probes can report the capability of a native alias instead
-    // of the configured proxy model.  The real session then recomputes modes
-    // for the resolved model and may reject the model-gated `auto` mode.  Keep
-    // provider-profile switches deterministic by using the unconditional mode.
     Some("default".to_string())
 }
 
@@ -15260,7 +15303,11 @@ impl AcpRuntimeClient {
                                 let substituted = runtime_config_substituted_model(
                                     &process, field, &plan, &response,
                                 );
+                                let substituted_mode = runtime_config_substituted_mode(
+                                    &process, field, &plan, &response,
+                                );
                                 if substituted.is_none()
+                                    && substituted_mode.is_none()
                                     && let Some(error_code) = runtime_config_response_conflict(
                                         &process, &response, field, &plan,
                                     )
@@ -15279,7 +15326,10 @@ impl AcpRuntimeClient {
                                     mutation_revision,
                                     &response,
                                     mutation_mode,
-                                    substituted.as_deref(),
+                                    RuntimeConfigSubstitutions {
+                                        model: substituted.as_deref(),
+                                        mode: substituted_mode.as_deref(),
+                                    },
                                 )? {
                                     RuntimeConfigConfirmation::Applied(_) => {
                                         outcomes.push(runtime_config_outcome(
@@ -15298,6 +15348,21 @@ impl AcpRuntimeClient {
                                                 AcpEvent::SystemNotice {
                                                     level: SystemNoticeLevel::Warning,
                                                     message: model_substitution_notice_text(
+                                                        requested, effective,
+                                                    ),
+                                                },
+                                            );
+                                        }
+                                        if let Some(effective) = substituted_mode.as_deref()
+                                            && let Some(requested) = field.value.as_deref()
+                                            && attachment
+                                                .payload()
+                                                .note_mode_substitution(requested, effective)
+                                        {
+                                            attachment.payload().emit_session_state_event(
+                                                AcpEvent::SystemNotice {
+                                                    level: SystemNoticeLevel::Warning,
+                                                    message: mode_substitution_notice_text(
                                                         requested, effective,
                                                     ),
                                                 },
@@ -15557,7 +15622,7 @@ impl AcpRuntimeClient {
         mutation_revision: i64,
         response: &Value,
         mutation_mode: AttachmentMutationMode,
-        substituted_model: Option<&str>,
+        substitutions: RuntimeConfigSubstitutions<'_>,
     ) -> VibexResult<RuntimeConfigConfirmation> {
         let previous_runtime_state = attachment.payload().runtime_config_state();
         let mut persisted = None;
@@ -15575,7 +15640,7 @@ impl AcpRuntimeClient {
                     ));
                 }
                 set_runtime_config_effective(&mut state.session_runtime_config_state, field);
-                if let Some(effective) = substituted_model {
+                if let Some(effective) = substitutions.model {
                     // The Agent runs this Model, so it replaces the requested
                     // one on both sides of the convergence fence: a preference
                     // the route cannot serve would otherwise never converge and
@@ -15584,6 +15649,13 @@ impl AcpRuntimeClient {
                         Some(effective.to_string());
                     state.session_runtime_config_state.preferred_model =
                         Some(effective.to_string());
+                }
+                if let Some(effective) = substitutions.mode {
+                    // Same contract as a substituted Model: the mode the Agent
+                    // answered with is the one it runs, so it replaces the
+                    // requested mode on both sides of the convergence fence.
+                    state.session_runtime_config_state.effective_mode = Some(effective.to_string());
+                    state.session_runtime_config_state.preferred_mode = Some(effective.to_string());
                 }
                 // Discovery is attachment-local as well.  Apply the response
                 // only after the revision/fence check, so a late response
@@ -15646,7 +15718,8 @@ impl AcpRuntimeClient {
                         // A substituted Model is the Agent's answer, so the
                         // recorded current Model is the replacement rather than
                         // the id that was asked for.
-                        let value = substituted_model
+                        let value = substitutions
+                            .model
                             .map(str::to_string)
                             .or_else(|| field.value.clone());
                         if let Some(value) = value {
@@ -15658,13 +15731,18 @@ impl AcpRuntimeClient {
                         }
                     }
                     SessionConfigFieldKind::Mode => {
-                        if let Some(value) = field.value.as_deref() {
-                            state.current_mode_id = Some(value.to_string());
+                        // A substituted Mode is the Agent's answer, so the
+                        // recorded current Mode is the replacement rather than
+                        // the id that was asked for.
+                        let value = substitutions
+                            .mode
+                            .map(str::to_string)
+                            .or_else(|| field.value.clone());
+                        if let Some(value) = value {
+                            state.current_mode_id = Some(value.clone());
                             if let Some(config) = state.session_config_state.as_mut() {
-                                config.current_mode = Some(ProviderSessionConfigValue {
-                                    value: value.to_string(),
-                                    label: None,
-                                });
+                                config.current_mode =
+                                    Some(ProviderSessionConfigValue { value, label: None });
                             }
                         }
                     }
@@ -16660,6 +16738,17 @@ enum RuntimeConfigConfirmation {
     ReconciliationRequired(SessionRuntimeConfigState),
 }
 
+/// The values an Agent answered with in place of the ones that were requested.
+///
+/// A substitution is the Agent describing what it runs, not a failed field, so
+/// the confirmation settles the state onto these values. Both dimensions travel
+/// together because one apply can report more than one substituted field.
+#[derive(Debug, Clone, Copy, Default)]
+struct RuntimeConfigSubstitutions<'a> {
+    model: Option<&'a str>,
+    mode: Option<&'a str>,
+}
+
 fn antigravity_model_reasoning_effort(model: &str) -> Option<&'static str> {
     [("-high", "high"), ("-medium", "medium"), ("-low", "low")]
         .into_iter()
@@ -17152,6 +17241,34 @@ fn runtime_config_substituted_model(
     let reported =
         extract_current_model_id(response).map(|model| process.product_model_id(&model))?;
     (reported != target).then_some(reported)
+}
+
+/// The Mode a Claude session answered with for a model-gated request.
+///
+/// `auto` is the only mode Claude gates on the resolved model, and the adapter
+/// substitutes a mode the model can run (`acceptEdits`, or `default` behind a
+/// proxy) instead of refusing the request. That answer is the Agent's own
+/// description of the session, so it is authoritative: the switch settles on it
+/// and tells the reader, rather than failing the convergence fence after the
+/// request was already accepted. Every other mode keeps the mismatch error.
+fn runtime_config_substituted_mode(
+    process: &AcpProcess,
+    field: &RuntimeConfigField,
+    plan: &SessionConfigPlan,
+    response: &Value,
+) -> Option<String> {
+    if process.agent_id.as_str() != CLAUDE_AGENT_ID
+        || field.kind != SessionConfigFieldKind::Mode
+        || field.value.as_deref() != Some("auto")
+        || !matches!(
+            plan,
+            SessionConfigPlan::Live { .. } | SessionConfigPlan::Extension { .. }
+        )
+    {
+        return None;
+    }
+    let reported = extract_current_mode_id(response)?;
+    (reported != "auto").then_some(reported)
 }
 
 fn is_capability_negative(error: &VibexError) -> bool {
@@ -21118,6 +21235,13 @@ fn acp_message_id(update: &Value, subagent: Option<&AcpSubagentAttribution>) -> 
 fn model_substitution_notice_text(requested: &str, effective: &str) -> String {
     bounded_session_content(&format!(
         "DeepSeek Harness replaced Model \"{requested}\" with \"{effective}\": the projected route no longer lists the requested Model"
+    ))
+}
+
+/// The user-facing text for one conversation-mode substitution.
+fn mode_substitution_notice_text(requested: &str, effective: &str) -> String {
+    bounded_session_content(&format!(
+        "The Agent runs conversation mode \"{effective}\" instead of the requested \"{requested}\": the selected Model does not offer it"
     ))
 }
 
@@ -29841,33 +29965,42 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn claude_model_gated_auto_mode_falls_back_but_bypass_permissions_is_preserved() {
+    fn claude_model_gated_auto_mode_follows_the_model_evidence() {
         let claude = AgentId::parse(CLAUDE_AGENT_ID).unwrap();
         let codex = AgentId::parse("codex").unwrap();
-        let advertised_auto = ProviderSessionConfigValue {
-            value: "auto".to_string(),
-            label: None,
-        };
 
+        // Evidence that this exact model advertises `auto` is what keeps it:
+        // the picker offered the value from the same evidence, so the switch
+        // path may not deny it.
         assert_eq!(
-            normalize_claude_model_mode(&claude, true, true, Some(&[advertised_auto]), "auto",)
-                .as_deref(),
+            normalize_claude_model_mode(&claude, true, true, true, "auto"),
+            None
+        );
+        // Silent evidence, or evidence that does not carry `auto`, falls back
+        // to the unconditional mode.
+        assert_eq!(
+            normalize_claude_model_mode(&claude, true, true, false, "auto").as_deref(),
             Some("default")
         );
+        // Every other mode is validated normally, never rewritten.
         assert_eq!(
-            normalize_claude_model_mode(&claude, true, true, None, "bypassPermissions").as_deref(),
+            normalize_claude_model_mode(&claude, true, true, true, "bypassPermissions"),
             None
         );
         assert_eq!(
-            normalize_claude_model_mode(&claude, true, true, None, "acceptEdits"),
+            normalize_claude_model_mode(&claude, true, true, true, "acceptEdits"),
             None
         );
         assert_eq!(
-            normalize_claude_model_mode(&codex, true, true, None, "auto"),
+            normalize_claude_model_mode(&codex, true, true, true, "auto"),
             None
         );
         assert_eq!(
-            normalize_claude_model_mode(&claude, true, false, None, "auto"),
+            normalize_claude_model_mode(&claude, true, false, true, "auto"),
+            None
+        );
+        assert_eq!(
+            normalize_claude_model_mode(&claude, false, true, true, "auto"),
             None
         );
     }
@@ -41104,6 +41237,93 @@ for line in sys.stdin:
             process_mut.shared.lock().unwrap().agent_version = None;
         }
         assert!(!process.substitutes_unavailable_models());
+    }
+
+    /// A Claude session that answers the model-gated `auto` with another mode is
+    /// describing what it runs, not failing: the answer replaces the request so
+    /// the switch can settle and the reader is told. Every other mode keeps the
+    /// strict mismatch answer.
+    #[test]
+    fn claude_model_gated_mode_substitution_is_the_answer_it_runs() {
+        let mut process = test_process(
+            AcpProcessInstanceId::new(),
+            None,
+            None,
+            None,
+            Arc::new(DisabledAcpTerminalHost),
+            false,
+            false,
+        );
+        {
+            let process_mut = Arc::get_mut(&mut process).expect("the fixture is not shared yet");
+            process_mut.agent_id = AgentId::parse(CLAUDE_AGENT_ID).unwrap();
+        }
+        let plan = SessionConfigPlan::Live {
+            operation: AcpOperation::SessionSetMode,
+            encoding: AcpWireEncoding::VersionedRaw,
+            source: CapabilitySource::NegotiatedRuntime,
+            option_id: Some("mode".to_string()),
+        };
+        let auto = RuntimeConfigField {
+            key: CanonicalSessionConfigKey::parse("mode").unwrap(),
+            kind: SessionConfigFieldKind::Mode,
+            value: Some("auto".to_string()),
+        };
+
+        assert_eq!(
+            runtime_config_substituted_mode(
+                &process,
+                &auto,
+                &plan,
+                &json!({ "currentModeId": "acceptEdits" })
+            )
+            .as_deref(),
+            Some("acceptEdits")
+        );
+        // Echoing `auto` back is a confirmation, not a substitution.
+        assert_eq!(
+            runtime_config_substituted_mode(
+                &process,
+                &auto,
+                &plan,
+                &json!({ "currentModeId": "auto" })
+            ),
+            None
+        );
+        // Only the model-gated `auto` is the Agent's own answer; another mode
+        // that comes back changed is an unexplained mismatch.
+        let requested_plan = RuntimeConfigField {
+            value: Some("plan".to_string()),
+            ..auto.clone()
+        };
+        assert_eq!(
+            runtime_config_substituted_mode(
+                &process,
+                &requested_plan,
+                &plan,
+                &json!({ "currentModeId": "acceptEdits" })
+            ),
+            None
+        );
+        // Nor does another Agent get the Claude rule.
+        {
+            let process_mut = Arc::get_mut(&mut process).expect("still uniquely owned");
+            process_mut.agent_id = AgentId::parse("codex").unwrap();
+        }
+        assert_eq!(
+            runtime_config_substituted_mode(
+                &process,
+                &auto,
+                &plan,
+                &json!({ "currentModeId": "acceptEdits" })
+            ),
+            None
+        );
+
+        assert_eq!(
+            mode_substitution_notice_text("auto", "acceptEdits"),
+            "The Agent runs conversation mode \"acceptEdits\" instead of the requested \"auto\": the selected Model does not offer it"
+        );
     }
 
     /// The completed-message marker carries the Model the bridge actually ran,

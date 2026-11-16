@@ -624,6 +624,15 @@ struct RuntimeRegistryNotification;
 /// reason on screen instead of stacking a queue of them.
 struct RuntimeNoteErrorNotification;
 
+/// Replace-by-id marker for the hint that reports a normalized conversation
+/// mode.
+///
+/// The authority replaces a mode the Agent's resolved model cannot run before
+/// it persists the selection, so the picker briefly showed a value the binding
+/// never received. One id keeps a reader who reselects the same mode from
+/// stacking copies of the explanation.
+struct RuntimeModeNormalizedNotification;
+
 /// Replace-by-id marker for the new-session dialog's failure hint.
 ///
 /// One id for every reason the dialog reports keeps the newest one on screen
@@ -3892,6 +3901,64 @@ impl VibexWorkbench {
             Theme::global_mut(cx).notification.placement = Anchor::TopCenter;
             for hint in hints {
                 hint_layer::push(window, hint, cx);
+            }
+        });
+    }
+
+    /// Queues the explanation for a conversation mode the authority replaced.
+    ///
+    /// The picker offers modes from catalogue evidence, and a model-gated mode
+    /// such as Claude's `auto` can still be narrowed by the model the session
+    /// resolves to. The committed selection carries the mode the binding will
+    /// actually run; reporting the difference is what keeps the control from
+    /// appearing to flip back on its own.
+    fn queue_runtime_mode_notice(
+        &mut self,
+        requested: &SessionRuntimeSelection,
+        persisted: &SessionRuntimeSelection,
+    ) {
+        let (Some(requested_mode), Some(persisted_mode)) =
+            (requested.mode_id.as_deref(), persisted.mode_id.as_deref())
+        else {
+            return;
+        };
+        if requested_mode == persisted_mode {
+            return;
+        }
+        let requested_label =
+            runtime_mode_label(self.runtime_catalog.as_deref(), requested, requested_mode);
+        let persisted_label =
+            runtime_mode_label(self.runtime_catalog.as_deref(), persisted, persisted_mode);
+        let notice = match locale::current_locale() {
+            locale::ResolvedLocale::ZhCn => {
+                format!("当前 Agent 与模型不支持 {requested_label} 模式，已改为 {persisted_label}")
+            }
+            locale::ResolvedLocale::ZhTw => {
+                format!("當前 Agent 與模型不支援 {requested_label} 模式，已改為 {persisted_label}")
+            }
+            _ => format!(
+                "{requested_label} mode is unavailable for this Agent and model; using {persisted_label}"
+            ),
+        };
+        self.pending_runtime_mode_notices.push(notice);
+    }
+
+    /// Hands the queued mode notices to the window's hint layer.
+    fn present_runtime_mode_notices(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.pending_runtime_mode_notices.is_empty() {
+            return;
+        }
+        let notices = std::mem::take(&mut self.pending_runtime_mode_notices);
+        window.defer(cx, move |window, cx| {
+            Theme::global_mut(cx).notification.placement = Anchor::TopCenter;
+            for notice in notices {
+                hint_layer::push(
+                    window,
+                    hint_notification(NotificationType::Info, notice)
+                        .id::<RuntimeModeNormalizedNotification>()
+                        .autohide(true),
+                    cx,
+                );
             }
         });
     }
@@ -11356,6 +11423,9 @@ pub struct VibexWorkbench {
     notification_suppressed_session_ids: BTreeSet<String>,
     /// Agent failures waiting for the next frame to reach the hint layer.
     pending_agent_failure_hints: Vec<hint_layer::Hint>,
+    /// Mode normalizations the authority applied while committing a runtime
+    /// selection, waiting for the next frame with a `Window` to announce them.
+    pending_runtime_mode_notices: Vec<String>,
     /// The highest timeline sequence already announced for each session.
     ///
     /// The same committed item reaches the workbench twice: once over the live
@@ -12938,6 +13008,7 @@ impl VibexWorkbench {
             pending_user_request_ids: BTreeMap::new(),
             notification_suppressed_session_ids: BTreeSet::new(),
             pending_agent_failure_hints: Vec::new(),
+            pending_runtime_mode_notices: Vec::new(),
             notified_timeline_sequences: BTreeMap::new(),
             auto_continue_enabled_by_default,
             auto_continue_default_project_ids,
@@ -29315,6 +29386,7 @@ impl VibexWorkbench {
                                 if persisted != requested_desired {
                                     this.optimistic_runtime_selections
                                         .remove(requested_session_id.as_str());
+                                    this.queue_runtime_mode_notice(&requested_desired, &persisted);
                                 }
                                 this.apply_runtime_selection_state(
                                     &requested_session_id,
@@ -85878,6 +85950,23 @@ fn runtime_provider_model_label(
         })
 }
 
+/// The label a conversation mode is shown with, falling back to its raw id.
+///
+/// The catalogue is the only place a mode's human label lives; a selection the
+/// catalogue no longer describes still has to be reported, so the id stands in
+/// rather than the notice naming nothing.
+fn runtime_mode_label(
+    catalog: Option<&SessionRuntimeOptionCatalog>,
+    selection: &SessionRuntimeSelection,
+    mode_id: &str,
+) -> String {
+    catalog
+        .and_then(|catalog| catalog_option_for(catalog, selection))
+        .and_then(|option| option.modes.iter().find(|mode| mode.value == mode_id))
+        .and_then(|mode| mode.label.clone())
+        .unwrap_or_else(|| mode_id.to_string())
+}
+
 /// A name for an auth source that the catalogue has not described yet.
 fn runtime_auth_source_placeholder_label(auth_source: &RuntimeAuthSource) -> String {
     match auth_source {
@@ -101065,6 +101154,7 @@ impl Render for VibexWorkbench {
         self.present_runtime_registry_error(window, cx);
         self.present_runtime_note_error(window, cx);
         self.present_agent_failure_hints(window, cx);
+        self.present_runtime_mode_notices(window, cx);
         self.present_new_session_error(window, cx);
         if self.initial_new_session_setup_pending {
             self.initial_new_session_setup_pending = false;
@@ -104901,6 +104991,71 @@ mod tests {
         assert_eq!(mounted_hint_count(cx), 1, "the frame delivers the card");
         workbench.read_with(cx, |this, _| {
             assert!(this.pending_agent_failure_hints.is_empty());
+        });
+    }
+
+    /// A mode the authority replaced while committing a runtime selection is
+    /// reported on the next frame, and the report names the mode the binding
+    /// actually received.
+    #[gpui::test]
+    fn a_normalized_mode_is_reported_on_the_next_frame(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        cx.update(hint_layer::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let workbench = Rc::new(RefCell::new(None));
+        let slot = workbench.clone();
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            let mut ui_state = DesktopUiStateV1::default();
+            ui_state.appearance.locale = LocaleMode::En;
+            let view =
+                cx.new(|cx| VibexWorkbench::with_initial_state(None, ui_state, None, window, cx));
+            *slot.borrow_mut() = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let workbench = workbench
+            .borrow()
+            .clone()
+            .expect("the window should have built the workbench");
+
+        let mut option = new_session_runtime_option("claude", "Claude Code");
+        option.modes = vec![
+            SessionConfigValue {
+                value: "auto".into(),
+                label: Some("Auto".into()),
+            },
+            SessionConfigValue {
+                value: "default".into(),
+                label: Some("Manual".into()),
+            },
+        ];
+        let mut requested = option.selection.clone();
+        requested.mode_id = Some("auto".into());
+        let mut persisted = option.selection.clone();
+        persisted.mode_id = Some("default".into());
+
+        workbench.update(cx, |this, cx| {
+            this.runtime_catalog = Some(Rc::new(SessionRuntimeOptionCatalog {
+                revision: 1,
+                agents: Vec::new(),
+                auth_sources: Vec::new(),
+                options: vec![option],
+            }));
+            this.queue_runtime_mode_notice(&requested, &persisted);
+            assert_eq!(this.pending_runtime_mode_notices.len(), 1);
+            assert!(
+                this.pending_runtime_mode_notices[0].contains("Manual"),
+                "the explanation names the mode in use"
+            );
+            cx.notify();
+        });
+        settle_hints(cx);
+        assert_eq!(
+            mounted_hint_count(cx),
+            1,
+            "the frame delivers the explanation"
+        );
+        workbench.read_with(cx, |this, _| {
+            assert!(this.pending_runtime_mode_notices.is_empty());
         });
     }
 
@@ -113963,6 +114118,40 @@ mod tests {
             runtime_provider_model_label(None, &option.selection),
             "provider_codex / codex_model"
         );
+    }
+
+    /// The notice that explains a normalized mode names the catalogue's label,
+    /// and still names something when the catalogue no longer describes it.
+    #[test]
+    fn runtime_mode_label_reads_the_catalogue_and_falls_back_to_the_id() {
+        let mut option = new_session_runtime_option("claude", "Claude Code");
+        option.modes = vec![
+            SessionConfigValue {
+                value: "auto".into(),
+                label: Some("Auto".into()),
+            },
+            SessionConfigValue {
+                value: "default".into(),
+                label: Some("Manual".into()),
+            },
+        ];
+        let selection = option.selection.clone();
+        let catalog = SessionRuntimeOptionCatalog {
+            revision: 1,
+            agents: Vec::new(),
+            auth_sources: Vec::new(),
+            options: vec![option],
+        };
+
+        assert_eq!(
+            runtime_mode_label(Some(&catalog), &selection, "default"),
+            "Manual"
+        );
+        assert_eq!(
+            runtime_mode_label(Some(&catalog), &selection, "removed"),
+            "removed"
+        );
+        assert_eq!(runtime_mode_label(None, &selection, "auto"), "auto");
     }
 
     #[test]

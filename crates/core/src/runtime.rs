@@ -872,12 +872,18 @@ impl SessionRuntimeSelection {
         {
             self.reasoning_effort = None;
         }
-        if self
-            .mode_id
-            .as_ref()
-            .is_some_and(|_| config.effective_mode.is_none())
-        {
-            self.mode_id = None;
+        match (self.mode_id.as_deref(), config.effective_mode.as_deref()) {
+            (Some(_), None) => self.mode_id = None,
+            // The Agent answered with the mode it will run — a model-gated
+            // `auto` comes back as the mode the resolved model can serve. The
+            // generation marker proves the apply path confirmed this
+            // configuration for this binding, so the durable selection settles
+            // on the answered mode instead of naming one the session never
+            // applied. Without it every later dispatch fails its binding fence.
+            (Some(requested), Some(effective)) if requested != effective => {
+                self.mode_id = Some(effective.to_string());
+            }
+            _ => {}
         }
         self.config_values.retain(|key, _| {
             config
@@ -2179,6 +2185,35 @@ mod tests {
         assert_eq!(selection.model_id(), Some("loomy/DeepSeek-V4.1-Flash"));
         // An unconfirmed generic value is dropped with it.
         assert!(selection.config_values.is_empty());
+        assert!(selection.matches_effective_config(&config));
+    }
+
+    #[test]
+    fn reconcile_settles_a_mode_the_agent_answered_with() {
+        let config = SessionRuntimeConfigState {
+            effective_model: Some("claude-opus-5-5".to_string()),
+            // The Agent answered the model-gated `auto` with the mode the
+            // resolved model can run, and the apply path confirmed it for this
+            // generation.
+            preferred_mode: Some("acceptEdits".to_string()),
+            effective_mode: Some("acceptEdits".to_string()),
+            applied_activation_generation: Some(2),
+            ..Default::default()
+        };
+        let mut selection = SessionRuntimeSelection {
+            mode_id: Some("auto".to_string()),
+            ..SessionRuntimeSelection::provider(
+                AgentId::parse("claude").unwrap(),
+                ProviderProfileId::parse("provider_claude").unwrap(),
+                "claude-opus-5-5",
+            )
+        };
+        assert!(!selection.matches_effective_config(&config));
+
+        selection.reconcile_with_effective_config(&config);
+        // The durable selection settles on the mode the binding actually
+        // carries instead of naming one the session never applied.
+        assert_eq!(selection.mode_id.as_deref(), Some("acceptEdits"));
         assert!(selection.matches_effective_config(&config));
     }
 

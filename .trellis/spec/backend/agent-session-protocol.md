@@ -216,11 +216,17 @@ agent_auth_model_catalog_snapshots(
   without blocking the Provider save or removing an existing successful model
   snapshot.
 - Claude Provider Profile model probes are advisory for model-gated `auto`
-  mode. For an explicit configured model, normalize `auto` to `default` before
-  persisting or applying a runtime switch: the Claude ACP adapter can resolve
-  a proxy model to a native alias and recompute a narrower `availableModes` set
-  in the real session. Preserve root-level `bypassPermissions` selections so
-  they reach the adapter's `session/set_mode` request unchanged.
+  mode, but they are still the evidence the picker drew the choice from, so the
+  switch path reads them instead of denying the value outright. For an explicit
+  configured model, keep `auto` when the model-scoped probe (or, with no probe
+  answer, the profile's live evidence) advertises it, and normalize it to
+  `default` only when that evidence is silent or says otherwise. Preserve
+  root-level `bypassPermissions` selections so they reach the adapter's
+  `session/set_mode` request unchanged. The real session remains the final
+  authority: a Claude session that answers a requested `auto` with another mode
+  is describing the mode it runs, so the applied state converges on that answer,
+  the durable selection settles onto it, and the reader gets one system notice
+  naming the substitution instead of a failed switch.
 - When `session/new.configOptions` advertises the model as a config option, the
   model probe uses `session/set_config_option` first because Agents such as
   OpenCode return the selected model's complete mode, effort, and generic option
