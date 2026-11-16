@@ -66073,17 +66073,24 @@ impl VibexWorkbench {
         let process_collapsible = timeline_turn_finished(turn)
             || (timeline_turn_conclusion_row(turn).is_some() && !turn.process_rows.is_empty());
         let process_toggle_id = turn.id.clone();
+        // The fallback reads the attribution's own Agent label while the turn
+        // has no row left to resolve an item from — the default display mode
+        // drops a still-streaming reasoning row, and that row is often the
+        // first attributed thing a turn produces. The label alone is not the
+        // identity a mark is matched against: "DeepSeek Harness" does not
+        // contain the `deepseek-harness` a label-less match looks for, so the
+        // header drew the default robot until the thought settled. The
+        // catalogue turns the label into the id/label/command/preset string,
+        // exactly as the row path and the terminal's fold already do.
         let agent_identity = execution_attribution
             .as_ref()
             .map(|attribution| self.agent_identity_for_label(&attribution.agent_label))
             .or_else(|| {
-                turn.runtime_attribution.as_deref().and_then(|attribution| {
-                    attribution
-                        .split(" · ")
-                        .next()
-                        .filter(|label| !label.is_empty())
-                        .map(str::to_owned)
-                })
+                turn.runtime_attribution
+                    .as_deref()
+                    .and_then(|attribution| attribution.split(" · ").next())
+                    .filter(|label| !label.is_empty())
+                    .map(|label| self.agent_identity_for_label(label))
             });
         let render_header_agent_icon = |identity: &String| {
             div()
@@ -132549,6 +132556,49 @@ mod tests {
         assert!(renderer.contains("strings.agent_turn_loading.to_string()"));
         // A turn whose start is loaded still reports what it worked for.
         assert!(renderer.contains("format!(\"{} {duration}\", strings.agent_worked_for)"));
+    }
+
+    /// A label-only attribution still resolves to the Agent's own mark.
+    ///
+    /// The default display mode drops a streaming reasoning row from
+    /// `process_rows`, and that row is often the first attributed thing a turn
+    /// produces. The header then has no item to read an attribution from and
+    /// falls back to the turn's `Agent · account · model` string, whose first
+    /// segment is the Agent's *display label*. A brand mark is matched against
+    /// the id/label/command/preset identity, so passing the bare label through
+    /// misses whenever the label is not the slug — "DeepSeek Harness" does not
+    /// contain the `deepseek-harness` needle — and the header drew the default
+    /// robot until the thought settled. Both clients must route the fallback
+    /// label back through the catalogue, exactly as the row path already does.
+    #[test]
+    fn an_attribution_label_fallback_resolves_the_agent_mark() {
+        let source = include_str!("app.rs");
+        let renderer = source
+            .split_once("    fn render_timeline_turn(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn timeline_turn_execution_attribution("))
+            .map(|(body, _)| body)
+            .expect("timeline turn renderer should remain inspectable");
+
+        assert!(renderer.contains("turn.runtime_attribution"));
+        assert!(
+            renderer.contains("self.agent_identity_for_label(label)"),
+            "the label-only fallback must resolve through the catalogue"
+        );
+        assert!(
+            !renderer.contains(".map(str::to_owned)"),
+            "a raw attribution label must not be matched against a brand mark"
+        );
+
+        // The trap itself: the bare display label has no mark, while the
+        // identity the catalogue builds for the same Agent does. An Agent whose
+        // id is its slug and whose label is prose is the ordinary case.
+        let deepseek = vibex_core::builtin_agent_definitions()
+            .into_iter()
+            .find(|definition| definition.id.as_str() == "deepseek-harness")
+            .expect("the DeepSeek Harness catalog Agent should be defined");
+        let agent = AgentSnapshotEntry::from_definition(&deepseek, None, None);
+        assert!(agent_brand_asset(&agent.label).is_none());
+        assert!(agent_brand_asset(&agent_brand_identity(&agent)).is_some());
     }
 
     #[test]
