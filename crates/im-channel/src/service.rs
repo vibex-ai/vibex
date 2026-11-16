@@ -1,0 +1,2793 @@
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, Weak};
+
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use tokio::sync::{Mutex as AsyncMutex, RwLock, mpsc, watch};
+use tokio::task::JoinHandle;
+use uuid::Uuid;
+use vibex_core::{
+    AgentNotificationIntent, AgentNotificationKind, AgentSession, CorrelationId,
+    CreateAgentSessionRequest, FetchTimelineRequest, ImActionId, ImBindingId, ImBindingStatus,
+    ImBindingSummary, ImChannelConfig, ImChannelConfigEnvelope, ImChannelDraft, ImChannelId,
+    ImChannelState, ImChannelStatus, ImChannelSummary, ImChannelTestReport, ImLarkTransport,
+    ImMessageId, ImPairingCodeInfo, ImPairingId, ImPairingRequest, ImPairingScope, ImPrincipalId,
+    ImPrincipalRole, ImPrincipalStatus, ImPrincipalSummary, ImSessionDefaults, MessageProvenance,
+    PermissionRequest, PermissionRequestStatus, PermissionResolution, PermissionResponseKind,
+    PermissionResponseOption, ResolvePermissionRequest, SendAgentMessageRequest, TimelineLiveEvent,
+    TimelinePayload, VibexError, VibexResult, VibexSessionId, unix_timestamp_ms,
+};
+use vibex_db::{
+    ImActionRecord, ImActionRepository, ImApprovalCardRecord, ImApprovalCardRepository,
+    ImAuditRecord, ImAuditRepository, ImBindingRecord, ImBindingRepository, ImChannelRecord,
+    ImChannelRepository, ImChannelSecretRecord, ImChannelSecretRepository, ImMessageRecord,
+    ImMessageRepository, ImPairingRecord, ImPairingRepository, ImPrincipalRecord,
+    ImPrincipalRepository,
+};
+
+use crate::adapter::ImAdapter;
+use crate::agent_port::ImAgentPort;
+use crate::error::ImError;
+use crate::i18n::ImLocale;
+use crate::lark::LarkAdapter;
+use crate::limits::{InboundDecision, InboundKind, InboundLimiter};
+use crate::outbox::{OutboundPriority, Outbox};
+use crate::render;
+use crate::telegram::TelegramAdapter;
+use crate::types::{ImButton, ImChatType, ImInboundEvent, ImSentMessage, ImTarget};
+
+const PAIRING_TTL_MS: i64 = 10 * 60 * 1000;
+/// How long the delivered-message log is kept for debugging.
+const MESSAGE_RETENTION_MS: i64 = 14 * 24 * 60 * 60 * 1000;
+/// How long the audit trail is kept. Longer than the message log: it is what
+/// answers "who approved this" after the fact.
+const AUDIT_RETENTION_MS: i64 = 180 * 24 * 60 * 60 * 1000;
+/// How often the retention sweep runs while the service is up.
+const RETENTION_INTERVAL: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
+const PAIRING_CODE_ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+const DEFAULT_SESSION_LIST_LIMIT: usize = 5;
+
+#[derive(Clone)]
+pub struct ImChannelServiceConfig {
+    pub db_path: PathBuf,
+    pub home_dir: PathBuf,
+    pub agent: Arc<dyn ImAgentPort>,
+    /// Test-only override for the Telegram API root.
+    pub telegram_api_base: Option<String>,
+    /// Test-only override for the Lark API root.
+    pub lark_api_base: Option<String>,
+    pub locale: Option<String>,
+}
+
+pub struct ImChannelService {
+    inner: Arc<Inner>,
+}
+
+#[path = "service_approvals.rs"]
+mod approvals;
+#[path = "service_events.rs"]
+mod events;
+
+struct Inner {
+    config: ImChannelServiceConfig,
+    agent: Arc<dyn ImAgentPort>,
+    channels: RwLock<HashMap<ImChannelId, Arc<ChannelRuntime>>>,
+    statuses: RwLock<HashMap<ImChannelId, Arc<Mutex<ImChannelStatus>>>>,
+    inbound_tx: mpsc::Sender<ImInboundEvent>,
+    inbound_rx: AsyncMutex<Option<mpsc::Receiver<ImInboundEvent>>>,
+    shutdown: watch::Sender<bool>,
+    router_task: AsyncMutex<Option<JoinHandle<()>>>,
+    event_task: AsyncMutex<Option<JoinHandle<()>>>,
+    retention_task: AsyncMutex<Option<JoinHandle<()>>>,
+    session_choices: Mutex<HashMap<ImPrincipalId, Vec<VibexSessionId>>>,
+    inbound_limiter: InboundLimiter,
+}
+
+struct ChannelRuntime {
+    adapter: Arc<dyn ImAdapter>,
+    outbox: Outbox,
+    task: JoinHandle<()>,
+}
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        let _ = self.shutdown.send(true);
+        if let Ok(mut task) = self.router_task.try_lock()
+            && let Some(task) = task.take()
+        {
+            task.abort();
+        }
+        if let Ok(mut task) = self.event_task.try_lock()
+            && let Some(task) = task.take()
+        {
+            task.abort();
+        }
+        if let Ok(channels) = self.channels.try_read() {
+            for runtime in channels.values() {
+                runtime.task.abort();
+            }
+        }
+    }
+}
+
+impl ImChannelService {
+    pub fn new(config: ImChannelServiceConfig) -> VibexResult<Self> {
+        let (inbound_tx, inbound_rx) = mpsc::channel(256);
+        let (shutdown, _) = watch::channel(false);
+        Ok(Self {
+            inner: Arc::new(Inner {
+                agent: Arc::clone(&config.agent),
+                config,
+                channels: RwLock::new(HashMap::new()),
+                statuses: RwLock::new(HashMap::new()),
+                inbound_tx,
+                inbound_rx: AsyncMutex::new(Some(inbound_rx)),
+                shutdown,
+                router_task: AsyncMutex::new(None),
+                event_task: AsyncMutex::new(None),
+                retention_task: AsyncMutex::new(None),
+                session_choices: Mutex::new(HashMap::new()),
+                inbound_limiter: InboundLimiter::new(),
+            }),
+        })
+    }
+
+    pub async fn start(self: &Arc<Self>) -> VibexResult<()> {
+        let mut conn = self.open()?;
+        vibex_db::apply_migrations(&mut conn)?;
+        let Some(inbound_rx) = self.inner.inbound_rx.lock().await.take() else {
+            return Err(VibexError::process(
+                "im_service_already_started",
+                "IM channel service was already started",
+            ));
+        };
+        let router = Arc::downgrade(self);
+        *self.inner.router_task.lock().await = Some(tokio::spawn(async move {
+            Self::router_loop(router, inbound_rx).await
+        }));
+        let events = Arc::downgrade(self);
+        let shutdown = self.inner.shutdown.subscribe();
+        *self.inner.event_task.lock().await = Some(tokio::spawn(async move {
+            Self::event_loop(events, shutdown).await
+        }));
+
+        let records = ImChannelRepository::list(&conn)?;
+        for record in records {
+            if record.enabled
+                && let Err(error) = self.connect_channel(&record).await
+            {
+                tracing::warn!(
+                    target: "vibex_im",
+                    channel_id = %record.channel_id,
+                    error_code = %error.code,
+                    "IM channel failed to connect"
+                );
+            }
+        }
+        // Reconciliation runs after the channels are registered: it sends
+        // through the transports, and a notice about the restart is exactly what
+        // a chat should see once rather than never.
+        if let Err(error) = self.reconcile_on_start().await {
+            tracing::warn!(
+                target: "vibex_im",
+                error_code = %error.code,
+                "IM restart reconciliation failed; channels stay connected"
+            );
+        }
+        // Retention runs once now so a database that was offline for months is
+        // trimmed before the timer's first tick, then keeps trimming.
+        let _ = self.prune_history().await;
+        let retention = Arc::downgrade(self);
+        let mut retention_shutdown = self.inner.shutdown.subscribe();
+        *self.inner.retention_task.lock().await = Some(tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = retention_shutdown.changed() => break,
+                    _ = tokio::time::sleep(RETENTION_INTERVAL) => {}
+                }
+                let Some(service) = retention.upgrade() else {
+                    break;
+                };
+                if let Err(error) = service.prune_history().await {
+                    tracing::warn!(
+                        target: "vibex_im",
+                        error_code = %error.code,
+                        "IM history pruning failed"
+                    );
+                }
+            }
+        }));
+        Ok(())
+    }
+
+    /// Deletes rows past their retention window.
+    ///
+    /// Called at start-up and on a timer. A failure is logged rather than
+    /// propagated: a full disk matters, but it must not stop the channels from
+    /// serving messages.
+    pub async fn prune_history(&self) -> VibexResult<(usize, usize)> {
+        let conn = self.open()?;
+        let now = unix_timestamp_ms();
+        let messages = ImMessageRepository::prune_older_than(&conn, now - MESSAGE_RETENTION_MS)?;
+        let audits = ImAuditRepository::prune_audit_older_than(&conn, now - AUDIT_RETENTION_MS)?;
+        if messages > 0 || audits > 0 {
+            tracing::info!(
+                target: "vibex_im",
+                messages,
+                audits,
+                "pruned expired IM channel history"
+            );
+        }
+        Ok((messages, audits))
+    }
+
+    pub async fn stop(&self) {
+        let _ = self.inner.shutdown.send(true);
+        if let Some(task) = self.inner.router_task.lock().await.take() {
+            task.abort();
+        }
+        if let Some(task) = self.inner.event_task.lock().await.take() {
+            task.abort();
+        }
+        if let Some(task) = self.inner.retention_task.lock().await.take() {
+            task.abort();
+        }
+        let runtimes: Vec<Arc<ChannelRuntime>> = {
+            let mut channels = self.inner.channels.write().await;
+            channels.drain().map(|(_, runtime)| runtime).collect()
+        };
+        for runtime in runtimes {
+            runtime.task.abort();
+        }
+        let statuses = self.inner.statuses.write().await;
+        for status in statuses.values() {
+            if let Ok(mut status) = status.lock() {
+                status.state = ImChannelState::Stopped;
+                status.since_ms = unix_timestamp_ms();
+            }
+        }
+    }
+
+    pub async fn list_channels(&self) -> VibexResult<Vec<ImChannelSummary>> {
+        let conn = self.open()?;
+        let records = ImChannelRepository::list(&conn)?;
+        let mut summaries = Vec::with_capacity(records.len());
+        for record in records {
+            let status = self.status_for(&record.channel_id, record.enabled).await;
+            summaries.push(self.summary_for(&conn, &record, status)?);
+        }
+        Ok(summaries)
+    }
+
+    pub async fn create_channel(&self, draft: ImChannelDraft) -> VibexResult<ImChannelSummary> {
+        if draft.display_name.trim().is_empty() {
+            return Err(VibexError::validation(
+                "im_channel_name_required",
+                "IM channel name is required",
+            ));
+        }
+        let now = unix_timestamp_ms();
+        let channel_id = ImChannelId::new();
+        let kind = draft.config.kind();
+        let envelope = ImChannelConfigEnvelope {
+            schema_version: 1,
+            config: draft.config,
+            default_session: draft.default_session,
+        };
+        let event_filter_json = if draft.event_filter.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_string(&draft.event_filter).map_err(|_| {
+                VibexError::validation("im_event_filter_invalid", "event filter is not valid JSON")
+            })?)
+        };
+        let record = ImChannelRecord {
+            channel_id: channel_id.clone(),
+            display_name: draft.display_name.trim().to_string(),
+            kind,
+            enabled: false,
+            config_json: serde_json::to_string(&envelope).map_err(|_| {
+                VibexError::validation(
+                    "im_channel_config_invalid",
+                    "IM channel configuration could not be encoded",
+                )
+            })?,
+            event_filter_json,
+            locale: draft.locale,
+            created_at_ms: now,
+            updated_at_ms: now,
+        };
+        let conn = self.open()?;
+        ImChannelRepository::insert(&conn, &record)?;
+        self.audit(
+            &conn,
+            &channel_id,
+            None,
+            "channel_created",
+            Some("channel"),
+            Some(channel_id.as_str()),
+            "allowed",
+            None,
+        )?;
+        let status = self.status_for(&record.channel_id, record.enabled).await;
+        self.summary_for(&conn, &record, status)
+    }
+
+    pub async fn set_channel_enabled(
+        &self,
+        channel_id: &ImChannelId,
+        enabled: bool,
+    ) -> VibexResult<ImChannelSummary> {
+        let conn = self.open()?;
+        let record = ImChannelRepository::get(&conn, channel_id)?.ok_or_else(|| {
+            VibexError::validation("im_channel_not_found", "IM channel was not found")
+        })?;
+        ImChannelRepository::set_enabled(&conn, channel_id, enabled, unix_timestamp_ms())?;
+        if enabled {
+            self.reload_channel(channel_id).await?;
+        } else {
+            self.disconnect_channel(channel_id).await;
+        }
+        let record = ImChannelRepository::get(&conn, channel_id)?.unwrap_or(record);
+        let status = self.status_for(&record.channel_id, record.enabled).await;
+        self.summary_for(&conn, &record, status)
+    }
+
+    pub async fn delete_channel(&self, channel_id: &ImChannelId) -> VibexResult<()> {
+        self.disconnect_channel(channel_id).await;
+        let conn = self.open()?;
+        // Read the lookup keys before the rows that name them are gone, then
+        // erase the secret material itself. Deleting only the rows would leave
+        // a usable bot token in the OS keychain with nothing pointing at it.
+        let secrets = ImChannelSecretRepository::list_for_channel(&conn, channel_id)?;
+        for secret in secrets {
+            if let Err(error) = vibex_config_switch::secrets::delete_im_secret(&secret.lookup_key) {
+                tracing::warn!(
+                    target: "vibex_im",
+                    channel_id = %channel_id,
+                    error_code = %error.code,
+                    "IM channel secret could not be erased from the secret store"
+                );
+            }
+        }
+        ImChannelSecretRepository::delete_for_channel(&conn, channel_id)?;
+        ImChannelRepository::delete(&conn, channel_id)?;
+        self.inner.statuses.write().await.remove(channel_id);
+        self.audit(
+            &conn,
+            channel_id,
+            None,
+            "channel_deleted",
+            Some("channel"),
+            Some(channel_id.as_str()),
+            "allowed",
+            None,
+        )?;
+        Ok(())
+    }
+
+    pub async fn set_bot_token(&self, channel_id: &ImChannelId, token: &str) -> VibexResult<()> {
+        self.set_secret(
+            channel_id,
+            "bot_token",
+            token,
+            "Telegram bot token is required",
+        )
+        .await
+    }
+
+    pub async fn set_app_secret(&self, channel_id: &ImChannelId, secret: &str) -> VibexResult<()> {
+        self.set_secret(
+            channel_id,
+            "app_secret",
+            secret,
+            "Lark app secret is required",
+        )
+        .await
+    }
+
+    async fn set_secret(
+        &self,
+        channel_id: &ImChannelId,
+        secret_kind: &str,
+        value: &str,
+        required_message: &str,
+    ) -> VibexResult<()> {
+        let conn = self.open()?;
+        let _record = ImChannelRepository::get(&conn, channel_id)?.ok_or_else(|| {
+            VibexError::validation("im_channel_not_found", "IM channel was not found")
+        })?;
+        if value.trim().is_empty() {
+            return Err(VibexError::validation(
+                "im_channel_secret_required",
+                required_message,
+            ));
+        }
+        let lookup_key = format!("im:{}:{}", channel_id.as_str(), secret_kind);
+        vibex_config_switch::secrets::store_im_secret(&lookup_key, value.trim())?;
+        let backend = vibex_config_switch::secrets::im_secret_write_backend();
+        let backend = match backend {
+            vibex_core::ProviderSecretBackend::HostFile => "host_file",
+            _ => "os_keychain",
+        };
+        let record = ImChannelSecretRecord {
+            channel_id: channel_id.clone(),
+            secret_kind: secret_kind.to_string(),
+            backend: backend.to_string(),
+            lookup_key,
+            setup_state: "configured".to_string(),
+            redacted_hint: "configured".to_string(),
+            updated_at_ms: unix_timestamp_ms(),
+        };
+        ImChannelSecretRepository::upsert(&conn, &record)?;
+        self.reload_channel(channel_id).await?;
+        Ok(())
+    }
+
+    pub async fn set_default_session(
+        &self,
+        channel_id: &ImChannelId,
+        default_session: Option<ImSessionDefaults>,
+    ) -> VibexResult<ImChannelSummary> {
+        let conn = self.open()?;
+        let record = ImChannelRepository::get(&conn, channel_id)?.ok_or_else(|| {
+            VibexError::validation("im_channel_not_found", "IM channel was not found")
+        })?;
+        let mut envelope: ImChannelConfigEnvelope = serde_json::from_str(&record.config_json)
+            .map_err(|_| {
+                VibexError::validation(
+                    "im_channel_config_invalid",
+                    "IM channel configuration is not valid",
+                )
+            })?;
+        envelope.default_session = default_session;
+        let updated = ImChannelRecord {
+            config_json: serde_json::to_string(&envelope).map_err(|_| {
+                VibexError::validation(
+                    "im_channel_config_invalid",
+                    "IM channel configuration could not be encoded",
+                )
+            })?,
+            updated_at_ms: unix_timestamp_ms(),
+            ..record
+        };
+        ImChannelRepository::update(&conn, &updated)?;
+        self.reload_channel(channel_id).await?;
+        let status = self.status_for(&updated.channel_id, updated.enabled).await;
+        self.summary_for(&conn, &updated, status)
+    }
+
+    /// Replaces the set of events this channel forwards.
+    ///
+    /// The filter is stored as JSON so a future event id can be added without a
+    /// migration. An empty list clears the filter and restores the default set.
+    pub async fn set_event_filter(
+        &self,
+        channel_id: &ImChannelId,
+        filter: Vec<String>,
+    ) -> VibexResult<ImChannelSummary> {
+        let conn = self.open()?;
+        let record = ImChannelRepository::get(&conn, channel_id)?.ok_or_else(|| {
+            VibexError::validation("im_channel_not_found", "IM channel was not found")
+        })?;
+        let known: Vec<&str> = filter
+            .iter()
+            .filter(|id| vibex_core::IM_EVENT_FILTER_IDS.contains(&id.as_str()))
+            .map(String::as_str)
+            .collect();
+        if known.len() != filter.len() {
+            return Err(VibexError::validation(
+                "im_event_filter_unknown",
+                "the event filter names an event this build does not know",
+            ));
+        }
+        let event_filter_json = if filter.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_string(&filter).map_err(|_| {
+                VibexError::validation("im_event_filter_invalid", "event filter is not valid JSON")
+            })?)
+        };
+        let updated = ImChannelRecord {
+            event_filter_json,
+            updated_at_ms: unix_timestamp_ms(),
+            ..record
+        };
+        ImChannelRepository::update(&conn, &updated)?;
+        let status = self.status_for(&updated.channel_id, updated.enabled).await;
+        self.summary_for(&conn, &updated, status)
+    }
+
+    /// Sets the language this channel replies in. `None` follows the host.
+    pub async fn set_channel_locale(
+        &self,
+        channel_id: &ImChannelId,
+        locale: Option<String>,
+    ) -> VibexResult<ImChannelSummary> {
+        if let Some(locale) = locale.as_deref()
+            && !matches!(
+                locale.split('-').next().unwrap_or_default(),
+                "en" | "zh" | "ja" | "ko" | "fr" | "de" | "es" | "pt" | "ru"
+            )
+        {
+            return Err(VibexError::validation(
+                "im_channel_locale_invalid",
+                "the channel language is not supported",
+            ));
+        }
+        let conn = self.open()?;
+        let record = ImChannelRepository::get(&conn, channel_id)?.ok_or_else(|| {
+            VibexError::validation("im_channel_not_found", "IM channel was not found")
+        })?;
+        let updated = ImChannelRecord {
+            locale,
+            updated_at_ms: unix_timestamp_ms(),
+            ..record
+        };
+        ImChannelRepository::update(&conn, &updated)?;
+        let status = self.status_for(&updated.channel_id, updated.enabled).await;
+        self.summary_for(&conn, &updated, status)
+    }
+
+    /// Changes what a paired identity is allowed to do.
+    ///
+    /// The role is read on every inbound message, so the next message honours
+    /// the change without reconnecting.
+    pub async fn set_principal_role(
+        &self,
+        principal_id: &ImPrincipalId,
+        role: ImPrincipalRole,
+    ) -> VibexResult<ImPrincipalSummary> {
+        let conn = self.open()?;
+        let principal = ImPrincipalRepository::get(&conn, principal_id)?.ok_or_else(|| {
+            VibexError::validation("im_principal_not_found", "IM principal was not found")
+        })?;
+        if principal.status != ImPrincipalStatus::Active {
+            return Err(VibexError::validation(
+                "im_principal_revoked",
+                "a revoked identity cannot change role",
+            ));
+        }
+        let updated = ImPrincipalRecord {
+            role,
+            updated_at_ms: unix_timestamp_ms(),
+            ..principal
+        };
+        ImPrincipalRepository::upsert_active(&conn, &updated)?;
+        self.audit(
+            &conn,
+            &updated.channel_id,
+            Some(principal_id),
+            "principal_role_changed",
+            Some("principal"),
+            Some(principal_id.as_str()),
+            "allowed",
+            Some(&format!("role={}", role.as_str())),
+        )?;
+        Ok(principal_summary(updated))
+    }
+
+    pub async fn test_channel(&self, channel_id: &ImChannelId) -> VibexResult<ImChannelTestReport> {
+        let conn = self.open()?;
+        let record = ImChannelRepository::get(&conn, channel_id)?.ok_or_else(|| {
+            VibexError::validation("im_channel_not_found", "IM channel was not found")
+        })?;
+        let envelope: ImChannelConfigEnvelope =
+            serde_json::from_str(&record.config_json).map_err(|_| {
+                VibexError::validation(
+                    "im_channel_config_invalid",
+                    "IM channel configuration is not valid",
+                )
+            })?;
+        let status = Arc::new(Mutex::new(ImChannelStatus::default()));
+        match envelope.config {
+            ImChannelConfig::Telegram(config) => {
+                let (token, _) = self.channel_secret(&conn, &record, "bot_token")?;
+                TelegramAdapter::new(
+                    record.channel_id.clone(),
+                    token,
+                    config.chat_id,
+                    config.require_mention_in_groups,
+                    self.inner.config.telegram_api_base.clone(),
+                    status,
+                )
+                .map_err(im_error_to_vibex)?
+                .probe()
+                .await
+                .map_err(im_error_to_vibex)
+            }
+            ImChannelConfig::Lark(config) => {
+                if config.transport != ImLarkTransport::LongConnection {
+                    return Err(VibexError::capability(
+                        "im_lark_transport_unsupported",
+                        "this build supports the Lark long connection only",
+                    ));
+                }
+                let (app_secret, _) = self.channel_secret(&conn, &record, "app_secret")?;
+                let api_base = Some(
+                    self.inner
+                        .config
+                        .lark_api_base
+                        .clone()
+                        .unwrap_or_else(|| config.region.api_base().to_string()),
+                );
+                LarkAdapter::new(
+                    record.channel_id.clone(),
+                    config.app_id,
+                    app_secret,
+                    config.chat_id,
+                    api_base,
+                    status,
+                )
+                .map_err(im_error_to_vibex)?
+                .probe()
+                .await
+                .map_err(im_error_to_vibex)
+            }
+        }
+    }
+
+    pub async fn create_pairing_code(
+        &self,
+        request: ImPairingRequest,
+    ) -> VibexResult<ImPairingCodeInfo> {
+        let conn = self.open()?;
+        if ImChannelRepository::get(&conn, &request.channel_id)?.is_none() {
+            return Err(VibexError::validation(
+                "im_channel_not_found",
+                "IM channel was not found",
+            ));
+        }
+        let ttl_ms = request.ttl_ms.map(i64::from).unwrap_or(PAIRING_TTL_MS);
+        if ttl_ms <= 0 || ttl_ms > 24 * 60 * 60 * 1000 {
+            return Err(VibexError::validation(
+                "im_pairing_ttl_invalid",
+                "pairing code lifetime is out of range",
+            ));
+        }
+        let code = generate_pairing_code();
+        let code_hash = sha256_hex(&code);
+        let now = unix_timestamp_ms();
+        if request.scope == vibex_core::ImPairingScope::Group
+            && request.target_chat_id.as_deref().is_none_or(str::is_empty)
+        {
+            return Err(VibexError::validation(
+                "im_pairing_group_chat_required",
+                "a group pairing code needs the chat it may be claimed in",
+            ));
+        }
+        let record = ImPairingRecord {
+            pairing_id: ImPairingId::new(),
+            channel_id: request.channel_id.clone(),
+            code_hash,
+            role: request.role,
+            scope: request.scope.as_str().to_string(),
+            target_chat_id: (request.scope == vibex_core::ImPairingScope::Group)
+                .then(|| request.target_chat_id.clone())
+                .flatten(),
+            created_by_principal_id: None,
+            expires_at_ms: now.saturating_add(ttl_ms),
+            claimed_principal_id: None,
+            created_at_ms: now,
+            claimed_at_ms: None,
+        };
+        ImPairingRepository::insert(&conn, &record)?;
+        self.audit(
+            &conn,
+            &request.channel_id,
+            None,
+            "pairing_created",
+            Some("pairing"),
+            Some(record.pairing_id.as_str()),
+            "allowed",
+            Some(&format!("role={}", request.role.as_str())),
+        )?;
+        Ok(ImPairingCodeInfo {
+            channel_id: request.channel_id,
+            code,
+            role: request.role,
+            expires_at_ms: record.expires_at_ms,
+        })
+    }
+
+    pub async fn list_principals(
+        &self,
+        channel_id: &ImChannelId,
+    ) -> VibexResult<Vec<ImPrincipalSummary>> {
+        let conn = self.open()?;
+        Ok(ImPrincipalRepository::list_for_channel(&conn, channel_id)?
+            .into_iter()
+            .map(principal_summary)
+            .collect())
+    }
+
+    pub async fn revoke_principal(&self, principal_id: &ImPrincipalId) -> VibexResult<()> {
+        let conn = self.open()?;
+        let principal = ImPrincipalRepository::get(&conn, principal_id)?.ok_or_else(|| {
+            VibexError::validation("im_principal_not_found", "IM principal was not found")
+        })?;
+        ImPrincipalRepository::revoke(&conn, principal_id, unix_timestamp_ms())?;
+        self.audit(
+            &conn,
+            &principal.channel_id,
+            Some(principal_id),
+            "principal_revoked",
+            Some("principal"),
+            Some(principal_id.as_str()),
+            "allowed",
+            None,
+        )?;
+        Ok(())
+    }
+
+    pub async fn list_bindings(
+        &self,
+        channel_id: &ImChannelId,
+    ) -> VibexResult<Vec<ImBindingSummary>> {
+        let conn = self.open()?;
+        Ok(ImBindingRepository::list_for_channel(&conn, channel_id)?
+            .into_iter()
+            .map(binding_summary)
+            .collect())
+    }
+
+    pub async fn revoke_binding(&self, binding_id: &ImBindingId) -> VibexResult<()> {
+        let conn = self.open()?;
+        let binding = ImBindingRepository::get(&conn, binding_id)?.ok_or_else(|| {
+            VibexError::validation("im_binding_not_found", "IM binding was not found")
+        })?;
+        ImBindingRepository::set_status(
+            &conn,
+            binding_id,
+            ImBindingStatus::Revoked,
+            unix_timestamp_ms(),
+        )?;
+        self.audit(
+            &conn,
+            &binding.channel_id,
+            None,
+            "binding_revoked",
+            Some("binding"),
+            Some(binding_id.as_str()),
+            "allowed",
+            None,
+        )?;
+        Ok(())
+    }
+
+    fn open(&self) -> VibexResult<vibex_db::DbConnection> {
+        vibex_db::open_database(&self.inner.config.db_path)
+    }
+
+    fn summary_for(
+        &self,
+        conn: &vibex_db::DbConnection,
+        record: &ImChannelRecord,
+        status: ImChannelStatus,
+    ) -> VibexResult<ImChannelSummary> {
+        let secrets = ImChannelSecretRepository::list_for_channel(conn, &record.channel_id)?;
+        let configured = secrets.iter().any(|secret| {
+            matches!(secret.secret_kind.as_str(), "bot_token" | "app_secret")
+                && secret.setup_state == "configured"
+        });
+        let default_session = serde_json::from_str::<ImChannelConfigEnvelope>(&record.config_json)
+            .ok()
+            .and_then(|envelope| envelope.default_session);
+        let event_filter = record
+            .event_filter_json
+            .as_deref()
+            .and_then(|json| serde_json::from_str::<Vec<String>>(json).ok())
+            .filter(|filter| !filter.is_empty())
+            .unwrap_or_else(|| {
+                vibex_core::DEFAULT_IM_EVENT_FILTER
+                    .iter()
+                    .map(|id| id.to_string())
+                    .collect()
+            });
+        Ok(ImChannelSummary {
+            channel_id: record.channel_id.clone(),
+            display_name: record.display_name.clone(),
+            kind: record.kind,
+            enabled: record.enabled,
+            configured,
+            default_session,
+            event_filter,
+            locale: record.locale.clone(),
+            status,
+            created_at_ms: record.created_at_ms,
+            updated_at_ms: record.updated_at_ms,
+        })
+    }
+
+    async fn status_for(&self, channel_id: &ImChannelId, enabled: bool) -> ImChannelStatus {
+        if let Some(status) = self.inner.statuses.read().await.get(channel_id) {
+            return status
+                .lock()
+                .map(|status| status.clone())
+                .unwrap_or_default();
+        }
+        ImChannelStatus {
+            state: if enabled {
+                ImChannelState::Stopped
+            } else {
+                ImChannelState::Disabled
+            },
+            ..ImChannelStatus::default()
+        }
+    }
+
+    async fn status_slot(&self, channel_id: &ImChannelId) -> Arc<Mutex<ImChannelStatus>> {
+        let mut statuses = self.inner.statuses.write().await;
+        statuses
+            .entry(channel_id.clone())
+            .or_insert_with(|| Arc::new(Mutex::new(ImChannelStatus::default())))
+            .clone()
+    }
+
+    async fn connect_channel(&self, record: &ImChannelRecord) -> VibexResult<()> {
+        if self
+            .inner
+            .channels
+            .read()
+            .await
+            .contains_key(&record.channel_id)
+        {
+            return Ok(());
+        }
+        let envelope: ImChannelConfigEnvelope =
+            serde_json::from_str(&record.config_json).map_err(|_| {
+                VibexError::validation(
+                    "im_channel_config_invalid",
+                    "IM channel configuration is not valid",
+                )
+            })?;
+        let conn = self.open()?;
+        let status = self.status_slot(&record.channel_id).await;
+        if let Ok(mut status) = status.lock() {
+            status.state = ImChannelState::Starting;
+            status.since_ms = unix_timestamp_ms();
+        }
+        let (adapter, task): (Arc<dyn ImAdapter>, JoinHandle<()>) = match envelope.config {
+            ImChannelConfig::Telegram(config) => {
+                let (token, _) = self.channel_secret(&conn, record, "bot_token")?;
+                let adapter = Arc::new(
+                    TelegramAdapter::new(
+                        record.channel_id.clone(),
+                        token,
+                        config.chat_id,
+                        config.require_mention_in_groups,
+                        self.inner.config.telegram_api_base.clone(),
+                        Arc::clone(&status),
+                    )
+                    .map_err(im_error_to_vibex)?,
+                );
+                let task = adapter.spawn(
+                    self.inner.inbound_tx.clone(),
+                    self.inner.shutdown.subscribe(),
+                );
+                (adapter, task)
+            }
+            ImChannelConfig::Lark(config) => {
+                if config.transport != ImLarkTransport::LongConnection {
+                    return Err(VibexError::capability(
+                        "im_lark_transport_unsupported",
+                        "this build supports the Lark long connection only",
+                    ));
+                }
+                let (app_secret, _) = self.channel_secret(&conn, record, "app_secret")?;
+                // The channel's own deployment wins; the test override exists
+                // only so a fake can stand in for the real service.
+                let api_base = Some(
+                    self.inner
+                        .config
+                        .lark_api_base
+                        .clone()
+                        .unwrap_or_else(|| config.region.api_base().to_string()),
+                );
+                let adapter = Arc::new(
+                    LarkAdapter::new(
+                        record.channel_id.clone(),
+                        config.app_id,
+                        app_secret,
+                        config.chat_id,
+                        api_base,
+                        Arc::clone(&status),
+                    )
+                    .map_err(im_error_to_vibex)?,
+                );
+                let task = adapter.spawn(
+                    self.inner.inbound_tx.clone(),
+                    self.inner.shutdown.subscribe(),
+                );
+                (adapter, task)
+            }
+        };
+        let (outbox, outbox_task) = Outbox::spawn(
+            Arc::clone(&adapter),
+            Arc::clone(&status),
+            self.inner.shutdown.subscribe(),
+        );
+        // Aborting the channel has to stop the poller and the sender together,
+        // so the stored handle owns the sender task and aborts the transport when
+        // it ends. The shutdown signal already covers a clean stop.
+        let task = tokio::spawn(async move {
+            let _ = outbox_task.await;
+            task.abort();
+        });
+        let runtime = ChannelRuntime {
+            adapter,
+            outbox,
+            task,
+        };
+        self.inner
+            .channels
+            .write()
+            .await
+            .insert(record.channel_id.clone(), Arc::new(runtime));
+        Ok(())
+    }
+
+    async fn disconnect_channel(&self, channel_id: &ImChannelId) {
+        if let Some(runtime) = self.inner.channels.write().await.remove(channel_id) {
+            runtime.task.abort();
+        }
+        if let Some(status) = self.inner.statuses.read().await.get(channel_id)
+            && let Ok(mut status) = status.lock()
+        {
+            status.state = ImChannelState::Stopped;
+            status.since_ms = unix_timestamp_ms();
+        }
+    }
+
+    async fn reload_channel(&self, channel_id: &ImChannelId) -> VibexResult<()> {
+        self.disconnect_channel(channel_id).await;
+        let conn = self.open()?;
+        let Some(record) = ImChannelRepository::get(&conn, channel_id)? else {
+            return Ok(());
+        };
+        if record.enabled {
+            self.connect_channel(&record).await?;
+        }
+        Ok(())
+    }
+
+    fn channel_secret(
+        &self,
+        conn: &vibex_db::DbConnection,
+        record: &ImChannelRecord,
+        secret_kind: &str,
+    ) -> VibexResult<(String, String)> {
+        let secret = ImChannelSecretRepository::get(conn, &record.channel_id, secret_kind)?
+            .ok_or_else(|| {
+                VibexError::validation(
+                    "im_channel_secret_missing",
+                    "the channel secret is not configured",
+                )
+            })?;
+        let value = vibex_config_switch::secrets::resolve_im_secret(&secret.lookup_key)?
+            .ok_or_else(|| {
+                VibexError::validation(
+                    "im_channel_secret_missing",
+                    "the channel secret is not configured",
+                )
+            })?;
+        Ok((value, secret.lookup_key))
+    }
+
+    async fn router_loop(this: Weak<Self>, mut rx: mpsc::Receiver<ImInboundEvent>) {
+        while let Some(event) = rx.recv().await {
+            let Some(service) = this.upgrade() else {
+                break;
+            };
+            if let Err(error) = service.handle_inbound(event.clone()).await {
+                tracing::warn!(
+                    target: "vibex_im",
+                    error_code = %error.code,
+                    "IM inbound message handling failed"
+                );
+                service.reply_error(&event, &error).await;
+            }
+        }
+    }
+
+    async fn reply_error(&self, event: &ImInboundEvent, error: &VibexError) {
+        let Some(runtime) = self
+            .inner
+            .channels
+            .read()
+            .await
+            .get(&event.channel_id)
+            .cloned()
+        else {
+            return;
+        };
+        let text = format!("Vibex error ({}): {}", error.code, error.message);
+        let _ = self.reply(event, &runtime, &text).await;
+    }
+
+    async fn handle_inbound(&self, event: ImInboundEvent) -> VibexResult<()> {
+        let conn = self.open()?;
+        let Some(record) = ImChannelRepository::get(&conn, &event.channel_id)? else {
+            return Ok(());
+        };
+        if !record.enabled {
+            return Ok(());
+        }
+        let message_id = ImMessageId::new().into_string();
+        let preview = render::truncate(&event.text, 256);
+        let inserted = ImMessageRepository::insert(
+            &conn,
+            &ImMessageRecord {
+                message_id,
+                channel_id: event.channel_id.clone(),
+                direction: "inbound".to_string(),
+                provider_update_id: Some(event.provider_update_id.clone()),
+                external_message_id: event.external_message_id.clone(),
+                binding_id: None,
+                principal_id: None,
+                kind: if event.text.starts_with('/') {
+                    "command".to_string()
+                } else {
+                    "message".to_string()
+                },
+                content_preview: (!preview.is_empty()).then_some(preview),
+                content_sha256: (!event.text.is_empty()).then(|| sha256_hex(&event.text)),
+                status: "received".to_string(),
+                error_code: None,
+                error_detail: None,
+                created_at_ms: event.received_at_ms,
+            },
+        )?;
+        if !inserted {
+            return Ok(());
+        }
+        let Some(runtime) = self
+            .inner
+            .channels
+            .read()
+            .await
+            .get(&event.channel_id)
+            .cloned()
+        else {
+            return Ok(());
+        };
+        runtime.adapter.mark_inbound();
+        // Buttons are exempt: a click is a single answer to a card that was
+        // already delivered, and throttling it would leave a request stuck.
+        if event.callback.is_none()
+            && let InboundDecision::Limited { retry_after } = self.inner.inbound_limiter.check(
+                &event.external_user_id,
+                &event.external_chat_id,
+                if event.text.trim_start().starts_with("/pair") {
+                    InboundKind::Pairing
+                } else if event.text.trim_start().starts_with('/') {
+                    InboundKind::Command
+                } else {
+                    InboundKind::Prompt
+                },
+            )
+        {
+            tracing::warn!(
+                target: "vibex_im",
+                channel_id = %event.channel_id,
+                retry_after_ms = retry_after.as_millis() as u64,
+                "IM inbound message was rate limited"
+            );
+            self.reply_with(
+                &event,
+                &runtime,
+                &render::rate_limited(self.locale(&event), retry_after.as_secs().max(1)),
+                OutboundPriority::BestEffort,
+            )
+            .await?;
+            return Ok(());
+        }
+        if let Some(callback) = &event.callback {
+            let action_id = callback.action_id.clone();
+            if let Some(callback_query_id) = callback.callback_query_id.as_deref() {
+                let _ = runtime
+                    .adapter
+                    .answer_callback(callback_query_id, None)
+                    .await;
+            }
+            let Some(action_id) = action_id else {
+                self.reply(&event, &runtime, "This action is no longer available.")
+                    .await?;
+                return Ok(());
+            };
+            return self.handle_callback(&event, &runtime, &action_id).await;
+        }
+
+        let principal = ImPrincipalRepository::get_by_external(
+            &conn,
+            &event.channel_id,
+            &event.external_user_id,
+        )?;
+        let Some(principal) = principal else {
+            if event.chat_type != ImChatType::Direct {
+                // An unpaired group is ignored so a bot in a busy room stays
+                // quiet, with one exception: a pairing code is a deliberate act
+                // by someone holding a code, and the handler enforces which chat
+                // the code was minted for.
+                if is_pairing_attempt(&event.text) {
+                    return self.handle_pairing(&event, &runtime).await;
+                }
+                return Ok(());
+            }
+            if event.text.trim_start().starts_with("/pair") {
+                return self.handle_pairing(&event, &runtime).await;
+            }
+            self.reply(
+                &event,
+                &runtime,
+                "This bot is not paired with you yet. Ask the owner for a pairing code, then send /pair <code>.",
+            )
+            .await?;
+            return Ok(());
+        };
+        if principal.status != ImPrincipalStatus::Active {
+            self.reply(
+                &event,
+                &runtime,
+                "Your IM identity has been revoked. Ask the owner to pair you again.",
+            )
+            .await?;
+            return Ok(());
+        }
+        ImPrincipalRepository::touch(&conn, &principal.principal_id, unix_timestamp_ms())?;
+
+        let mut text = event.text.clone();
+        if event.chat_type != ImChatType::Direct {
+            if !runtime.adapter.is_group_trigger(&text).await {
+                return Ok(());
+            }
+            if text.trim_start().starts_with('@') {
+                text = text
+                    .trim_start()
+                    .split_once(char::is_whitespace)
+                    .map(|(_, rest)| rest.to_string())
+                    .unwrap_or_default();
+            }
+        }
+        // A paired identity may still be trying to pair a second chat, and the
+        // answer depends on where the code was minted rather than on who sent it.
+        if is_pairing_attempt(&text) {
+            return self.handle_pairing(&event, &runtime).await;
+        }
+        if text.trim_start().starts_with('/') {
+            self.handle_command(&event, &runtime, &principal, &text)
+                .await
+        } else {
+            self.handle_plain_text(&event, &runtime, &principal, &text)
+                .await
+        }
+    }
+
+    async fn handle_pairing(
+        &self,
+        event: &ImInboundEvent,
+        runtime: &ChannelRuntime,
+    ) -> VibexResult<()> {
+        // In a group the command arrives as `@bot /pair CODE`.
+        let text = event.text.trim();
+        let text = text
+            .strip_prefix('@')
+            .and_then(|rest| rest.split_once(char::is_whitespace).map(|(_, rest)| rest))
+            .map(str::trim)
+            .unwrap_or(text);
+        let code = text.strip_prefix("/pair").unwrap_or_default().trim();
+        if code.is_empty() {
+            self.reply(
+                event,
+                runtime,
+                "Send /pair <code> with the code from Vibex settings.",
+            )
+            .await?;
+            return Ok(());
+        }
+        let code_hash = sha256_hex(&code.to_uppercase());
+        let now = unix_timestamp_ms();
+        let mut conn = self.open()?;
+        let Some(pairing) = ImPairingRepository::claim(&conn, &code_hash, now)? else {
+            drop(conn);
+            self.reply(event, runtime, "That pairing code is invalid or expired.")
+                .await?;
+            return Ok(());
+        };
+        // A code is bound to the kind of chat it was minted for. A direct code
+        // used in a group would otherwise pair everyone in it to one identity.
+        let scope_ok = match ImPairingScope::parse(&pairing.scope) {
+            Some(ImPairingScope::Direct) => event.chat_type == ImChatType::Direct,
+            Some(ImPairingScope::Group) => {
+                event.chat_type != ImChatType::Direct
+                    && pairing.target_chat_id.as_deref() == Some(event.external_chat_id.as_str())
+            }
+            None => false,
+        };
+        if !scope_ok {
+            drop(conn);
+            self.reply(
+                event,
+                runtime,
+                "That pairing code cannot be used in this chat.",
+            )
+            .await?;
+            return Ok(());
+        }
+        {
+            let tx = conn.transaction().map_err(|_| {
+                VibexError::storage(
+                    "im_pairing_transaction_failed",
+                    "pairing transaction failed",
+                )
+            })?;
+            let existing = ImPrincipalRepository::get_by_external(
+                &tx,
+                &event.channel_id,
+                &event.external_user_id,
+            )?;
+            let principal_id = existing
+                .as_ref()
+                .map(|principal| principal.principal_id.clone())
+                .unwrap_or_else(ImPrincipalId::new);
+            let principal = ImPrincipalRecord {
+                principal_id: principal_id.clone(),
+                channel_id: event.channel_id.clone(),
+                external_user_id: event.external_user_id.clone(),
+                display_name: event.sender_display_name.clone(),
+                role: pairing.role,
+                status: ImPrincipalStatus::Active,
+                paired_at_ms: Some(now),
+                last_seen_at_ms: Some(now),
+                revoked_at_ms: None,
+                created_at_ms: existing
+                    .as_ref()
+                    .map(|principal| principal.created_at_ms)
+                    .unwrap_or(now),
+                updated_at_ms: now,
+            };
+            ImPrincipalRepository::upsert_active(&tx, &principal)?;
+            ImPairingRepository::set_claimed_principal(&tx, &pairing.pairing_id, &principal_id)?;
+            self.audit(
+                &tx,
+                &event.channel_id,
+                Some(&principal_id),
+                "pairing_claimed",
+                Some("pairing"),
+                Some(pairing.pairing_id.as_str()),
+                "allowed",
+                Some(&format!("role={}", pairing.role.as_str())),
+            )?;
+            tx.commit().map_err(|_| {
+                VibexError::storage("im_pairing_commit_failed", "pairing transaction failed")
+            })?;
+        }
+        drop(conn);
+        let role = role_label(pairing.role, self.locale(event));
+        self.reply(
+            event,
+            runtime,
+            &format!("Paired as {role}. Send /help to see what you can do."),
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn handle_callback(
+        &self,
+        event: &ImInboundEvent,
+        runtime: &ChannelRuntime,
+        action_id: &ImActionId,
+    ) -> VibexResult<()> {
+        let conn = self.open()?;
+        let Some(principal) = ImPrincipalRepository::get_by_external(
+            &conn,
+            &event.channel_id,
+            &event.external_user_id,
+        )?
+        else {
+            self.reply(event, runtime, "Pair this chat before approving.")
+                .await?;
+            return Ok(());
+        };
+        if principal.status != ImPrincipalStatus::Active || !principal.role.can_approve() {
+            self.reply(event, runtime, "You do not have permission to approve.")
+                .await?;
+            return Ok(());
+        }
+        let Some(action) = ImActionRepository::get(&conn, action_id)? else {
+            self.reply(event, runtime, "This action is no longer available.")
+                .await?;
+            return Ok(());
+        };
+        if action.consumed_at_ms.is_some() {
+            self.reply(event, runtime, "This action was already handled.")
+                .await?;
+            return Ok(());
+        }
+        if action.expires_at_ms <= unix_timestamp_ms() {
+            self.reply(event, runtime, "This action has expired.")
+                .await?;
+            return Ok(());
+        }
+        if action.channel_id != event.channel_id {
+            self.reply(event, runtime, "This action belongs to another channel.")
+                .await?;
+            return Ok(());
+        }
+        let Some(binding) = ImBindingRepository::get(&conn, &action.binding_id)? else {
+            self.reply(event, runtime, "This conversation is no longer bound.")
+                .await?;
+            return Ok(());
+        };
+        if binding.external_chat_id != event.external_chat_id
+            || binding.thread_key != event.thread_key
+        {
+            self.reply(event, runtime, "This action belongs to another chat.")
+                .await?;
+            return Ok(());
+        }
+        // An elicitation button answers a question, not a permission request;
+        // the two share one action table but resolve through different ports.
+        if let Some(request_id) = action
+            .kind
+            .strip_prefix(ELICITATION_ACTION_PREFIX)
+            .map(str::to_string)
+        {
+            let payload: ElicitationActionPayload = serde_json::from_str(&action.payload_json)
+                .map_err(|_| {
+                    VibexError::validation(
+                        "im_action_payload_invalid",
+                        "elicitation action payload is invalid",
+                    )
+                })?;
+            let Some(request) = self
+                .pending_elicitation(&binding.session_id, &request_id)
+                .await?
+            else {
+                self.reply(
+                    event,
+                    runtime,
+                    "That question was already answered or withdrawn.",
+                )
+                .await?;
+                return Ok(());
+            };
+            if !ImActionRepository::consume(
+                &conn,
+                action_id,
+                &principal.principal_id,
+                unix_timestamp_ms(),
+            )? {
+                self.reply(event, runtime, "That answer was already recorded.")
+                    .await?;
+                return Ok(());
+            }
+            let status = self
+                .apply_elicitation_choice(
+                    event,
+                    runtime,
+                    &binding,
+                    &principal,
+                    &request,
+                    &payload.value,
+                )
+                .await?;
+            self.reply_with(event, runtime, &status, OutboundPriority::BestEffort)
+                .await?;
+            return Ok(());
+        }
+        let payload: ApprovalActionPayload =
+            serde_json::from_str(&action.payload_json).map_err(|_| {
+                VibexError::validation(
+                    "im_action_payload_invalid",
+                    "approval action payload is invalid",
+                )
+            })?;
+        let Some(request) = self
+            .pending_permission(&binding.session_id, Some(&payload.request_id))
+            .await?
+        else {
+            self.reply(
+                event,
+                runtime,
+                "That approval request is no longer pending.",
+            )
+            .await?;
+            return Ok(());
+        };
+        let Some(option) = request
+            .response_options
+            .iter()
+            .find(|option| option.option_id == payload.option_id)
+            .cloned()
+        else {
+            self.reply(
+                event,
+                runtime,
+                "That approval option is no longer available.",
+            )
+            .await?;
+            return Ok(());
+        };
+        if !ImActionRepository::consume(
+            &conn,
+            action_id,
+            &principal.principal_id,
+            unix_timestamp_ms(),
+        )? {
+            self.reply(event, runtime, "This action was already handled.")
+                .await?;
+            return Ok(());
+        }
+        let status = self
+            .apply_resolution(
+                event,
+                runtime,
+                &binding,
+                &request,
+                &option,
+                &principal,
+                action.card_id.as_deref(),
+            )
+            .await?;
+        self.reply_with(event, runtime, &status, OutboundPriority::BestEffort)
+            .await?;
+        Ok(())
+    }
+
+    async fn handle_command(
+        &self,
+        event: &ImInboundEvent,
+        runtime: &ChannelRuntime,
+        principal: &ImPrincipalRecord,
+        text: &str,
+    ) -> VibexResult<()> {
+        let mut parts = text.trim_start().splitn(2, char::is_whitespace);
+        let command = parts.next().unwrap_or_default().to_ascii_lowercase();
+        let args = parts.next().unwrap_or_default().trim();
+        let locale = self.locale(event);
+        match command.as_str() {
+            "/start" | "/help" => {
+                self.reply(event, runtime, &render::help(locale, "/"))
+                    .await?;
+            }
+            "/whoami" => {
+                let role = role_label(principal.role, locale);
+                self.reply(
+                    event,
+                    runtime,
+                    &format!(
+                        "Vibex IM identity\nUser: {}\nRole: {role}\nChannel: {}",
+                        principal.display_name, event.channel_id
+                    ),
+                )
+                .await?;
+            }
+            "/status" => self.handle_status(event, runtime, principal).await?,
+            "/sessions" => self.handle_sessions(event, runtime, principal).await?,
+            "/use" => self.handle_use(event, runtime, principal, args).await?,
+            "/new" => self.handle_new(event, runtime, principal, args).await?,
+            "/stop" => self.handle_stop(event, runtime, principal).await?,
+            "/approve" => {
+                self.handle_text_approval(event, runtime, principal, args, ApprovalChoice::Approve)
+                    .await?
+            }
+            "/always" => {
+                self.handle_text_approval(event, runtime, principal, args, ApprovalChoice::Always)
+                    .await?
+            }
+            "/deny" => {
+                self.handle_text_approval(event, runtime, principal, args, ApprovalChoice::Deny)
+                    .await?
+            }
+            "/say" => {
+                if !principal.role.can_prompt() {
+                    self.reply(event, runtime, "Your role cannot send prompts.")
+                        .await?;
+                } else if args.is_empty() {
+                    self.reply(event, runtime, "Usage: /say <text>").await?;
+                } else {
+                    self.handle_plain_text(event, runtime, principal, args)
+                        .await?;
+                }
+            }
+            "/unbind" => self.handle_unbind(event, runtime, principal).await?,
+            _ => {
+                self.reply(
+                    event,
+                    runtime,
+                    &format!("Unknown command {command}. Send /help for the command list."),
+                )
+                .await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn handle_status(
+        &self,
+        event: &ImInboundEvent,
+        runtime: &ChannelRuntime,
+        principal: &ImPrincipalRecord,
+    ) -> VibexResult<()> {
+        let conn = self.open()?;
+        let Some(binding) = self.binding_for(&conn, event)? else {
+            self.reply(
+                event,
+                runtime,
+                "No session is bound. Use /sessions or /new.",
+            )
+            .await?;
+            return Ok(());
+        };
+        let session = self.inner.agent.get_session(&binding.session_id).await?;
+        let pending =
+            ImApprovalCardRepository::list_pending_for_binding(&conn, &binding.binding_id)?;
+        let role = role_label(principal.role, self.locale(event));
+        self.reply(
+            event,
+            runtime,
+            &format!(
+                "Vibex session\n#{} · {}\nState: {}\nAgent: {}\nApprovals pending: {}\nRole: {role}",
+                render::short_session_id(&session),
+                session.title,
+                render::state_label(&session, self.locale(event)),
+                session.agent_id,
+                pending.len(),
+            ),
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn handle_sessions(
+        &self,
+        event: &ImInboundEvent,
+        runtime: &ChannelRuntime,
+        principal: &ImPrincipalRecord,
+    ) -> VibexResult<()> {
+        let mut sessions = self.inner.agent.list_sessions(false).await?;
+        sessions.retain(|session| session.deleted_at_ms.is_none());
+        sessions.sort_by_key(|session| std::cmp::Reverse(session.last_message_at_ms));
+        sessions.truncate(DEFAULT_SESSION_LIST_LIMIT);
+        if let Ok(mut choices) = self.inner.session_choices.lock() {
+            choices.insert(
+                principal.principal_id.clone(),
+                sessions.iter().map(|session| session.id.clone()).collect(),
+            );
+        }
+        self.reply(
+            event,
+            runtime,
+            &render::session_list(&sessions, self.locale(event)),
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn handle_use(
+        &self,
+        event: &ImInboundEvent,
+        runtime: &ChannelRuntime,
+        principal: &ImPrincipalRecord,
+        args: &str,
+    ) -> VibexResult<()> {
+        if !principal.role.can_approve() {
+            self.reply(event, runtime, "Your role cannot bind sessions.")
+                .await?;
+            return Ok(());
+        }
+        if args.is_empty() {
+            self.reply(event, runtime, "Usage: /use <n|session-id>")
+                .await?;
+            return Ok(());
+        }
+        let session_id = if let Ok(index) = args.parse::<usize>() {
+            self.inner
+                .session_choices
+                .lock()
+                .ok()
+                .and_then(|choices| choices.get(&principal.principal_id).cloned())
+                .and_then(|choices| choices.get(index.saturating_sub(1)).cloned())
+        } else {
+            let sessions = self.inner.agent.list_sessions(false).await?;
+            sessions
+                .into_iter()
+                .find(|session| {
+                    session.id.as_str() == args
+                        || render::short_session_id(session).eq_ignore_ascii_case(args)
+                })
+                .map(|session| session.id)
+        };
+        let Some(session_id) = session_id else {
+            self.reply(event, runtime, "Session not found. Send /sessions first.")
+                .await?;
+            return Ok(());
+        };
+        let session = self.inner.agent.get_session(&session_id).await?;
+        let conn = self.open()?;
+        let binding = self.make_binding(event, principal, &session, None);
+        ImBindingRepository::upsert(&conn, &binding)?;
+        self.reply(
+            event,
+            runtime,
+            &format!(
+                "Bound to #{} · {}",
+                render::short_session_id(&session),
+                session.title
+            ),
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn handle_new(
+        &self,
+        event: &ImInboundEvent,
+        runtime: &ChannelRuntime,
+        principal: &ImPrincipalRecord,
+        prompt: &str,
+    ) -> VibexResult<()> {
+        if !principal.role.can_prompt() {
+            self.reply(event, runtime, "Your role cannot start sessions.")
+                .await?;
+            return Ok(());
+        }
+        if prompt.trim().is_empty() {
+            self.reply(event, runtime, "Usage: /new <prompt>").await?;
+            return Ok(());
+        }
+        let conn = self.open()?;
+        let record = ImChannelRepository::get(&conn, &event.channel_id)?.ok_or_else(|| {
+            VibexError::validation("im_channel_not_found", "IM channel was not found")
+        })?;
+        let envelope: ImChannelConfigEnvelope =
+            serde_json::from_str(&record.config_json).map_err(|_| {
+                VibexError::validation(
+                    "im_channel_config_invalid",
+                    "IM channel configuration is not valid",
+                )
+            })?;
+        let topic_mode = matches!(
+            &envelope.config,
+            ImChannelConfig::Telegram(config) if config.topic_mode
+        );
+        let (workspace_root, workspace_mode, runtime_selection, safety) = if let Some(defaults) =
+            envelope.default_session
+        {
+            let runtime_selection = defaults.runtime_selection();
+            (
+                defaults.workspace_root,
+                defaults.workspace_mode,
+                runtime_selection,
+                vibex_core::AgentSessionSafety::workspace_write_ask_on_risk(),
+            )
+        } else if let Some(binding) = self.binding_for(&conn, event)? {
+            let session = self.inner.agent.get_session(&binding.session_id).await?;
+            let selection = self
+                .inner
+                .agent
+                .runtime_selection(&binding.session_id)
+                .await?;
+            (
+                session.workspace_root,
+                session.workspace_mode,
+                selection.desired,
+                session.safety,
+            )
+        } else {
+            self.reply(
+                    event,
+                    runtime,
+                    "This channel has no default workspace and Agent. Bind a session with /use first, or configure defaults in Vibex settings.",
+                )
+                .await?;
+            return Ok(());
+        };
+        let session = self
+            .inner
+            .agent
+            .create_session(CreateAgentSessionRequest {
+                runtime: runtime_selection,
+                workspace_root,
+                workspace_mode,
+                title: None,
+                safety: Some(safety),
+                session_id: None,
+                defer_runtime_materialization: true,
+                tools: Default::default(),
+            })
+            .await?;
+        let mut reply_event = event.clone();
+        if topic_mode && event.chat_type == ImChatType::Group && event.thread_key.is_empty() {
+            match runtime.adapter.create_thread(&topic_title(prompt)).await {
+                Ok(thread) => {
+                    reply_event.thread_key = thread.thread_key;
+                    reply_event.thread_kind = Some(thread.thread_kind);
+                }
+                Err(error) => {
+                    self.reply(
+                        event,
+                        runtime,
+                        &format!("Could not create a Telegram topic: {error}"),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            }
+        }
+        let binding = self.make_binding(&reply_event, principal, &session, None);
+        ImBindingRepository::upsert(&conn, &binding)?;
+        self.send_prompt(&reply_event, &session.id, prompt).await?;
+        self.reply(
+            &reply_event,
+            runtime,
+            &format!(
+                "Created #{} · {}\nSend /status to follow it.",
+                render::short_session_id(&session),
+                session.title
+            ),
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn handle_stop(
+        &self,
+        event: &ImInboundEvent,
+        runtime: &ChannelRuntime,
+        principal: &ImPrincipalRecord,
+    ) -> VibexResult<()> {
+        if !principal.role.can_prompt() {
+            self.reply(event, runtime, "Your role cannot stop sessions.")
+                .await?;
+            return Ok(());
+        }
+        let conn = self.open()?;
+        let Some(binding) = self.binding_for(&conn, event)? else {
+            self.reply(event, runtime, "No session is bound.").await?;
+            return Ok(());
+        };
+        self.inner.agent.interrupt(&binding.session_id).await?;
+        self.reply(event, runtime, "Stopped the current turn.")
+            .await?;
+        Ok(())
+    }
+
+    async fn handle_text_approval(
+        &self,
+        event: &ImInboundEvent,
+        runtime: &ChannelRuntime,
+        principal: &ImPrincipalRecord,
+        code: &str,
+        choice: ApprovalChoice,
+    ) -> VibexResult<()> {
+        if !principal.role.can_approve() {
+            self.reply(event, runtime, "Your role cannot approve.")
+                .await?;
+            return Ok(());
+        }
+        let conn = self.open()?;
+        let Some(binding) = self.binding_for(&conn, event)? else {
+            self.reply(event, runtime, "No session is bound.").await?;
+            return Ok(());
+        };
+        let (request, action_card) = if code.trim().is_empty() {
+            let cards =
+                ImApprovalCardRepository::list_pending_for_binding(&conn, &binding.binding_id)?;
+            let Some(card) = cards.first() else {
+                self.reply(event, runtime, "There is no pending approval.")
+                    .await?;
+                return Ok(());
+            };
+            let Some(request) = self
+                .pending_permission(&binding.session_id, Some(&card.request_id))
+                .await?
+            else {
+                self.reply(
+                    event,
+                    runtime,
+                    "That approval request is no longer pending.",
+                )
+                .await?;
+                return Ok(());
+            };
+            (request, Some(card.card_id.clone()))
+        } else {
+            let Some(action) = ImActionRepository::get_pending_by_short_code(
+                &conn,
+                &binding.binding_id,
+                &code.trim().to_uppercase(),
+                unix_timestamp_ms(),
+            )?
+            else {
+                self.reply(event, runtime, "That approval code is invalid or expired.")
+                    .await?;
+                return Ok(());
+            };
+            let payload: ApprovalActionPayload = serde_json::from_str(&action.payload_json)
+                .map_err(|_| {
+                    VibexError::validation(
+                        "im_action_payload_invalid",
+                        "approval action payload is invalid",
+                    )
+                })?;
+            if !ImActionRepository::consume(
+                &conn,
+                &action.action_id,
+                &principal.principal_id,
+                unix_timestamp_ms(),
+            )? {
+                self.reply(event, runtime, "That approval was already handled.")
+                    .await?;
+                return Ok(());
+            }
+            let Some(request) = self
+                .pending_permission(&binding.session_id, Some(&payload.request_id))
+                .await?
+            else {
+                self.reply(
+                    event,
+                    runtime,
+                    "That approval request is no longer pending.",
+                )
+                .await?;
+                return Ok(());
+            };
+            (request, Some(action.card_id.unwrap_or_default()))
+        };
+        let Some(option) = choose_option(&request, choice) else {
+            self.reply(event, runtime, "That approval option is not available.")
+                .await?;
+            return Ok(());
+        };
+        let status = self
+            .apply_resolution(
+                event,
+                runtime,
+                &binding,
+                &request,
+                &option,
+                principal,
+                action_card.as_deref(),
+            )
+            .await?;
+        self.reply_with(event, runtime, &status, OutboundPriority::BestEffort)
+            .await?;
+        Ok(())
+    }
+
+    async fn handle_unbind(
+        &self,
+        event: &ImInboundEvent,
+        runtime: &ChannelRuntime,
+        principal: &ImPrincipalRecord,
+    ) -> VibexResult<()> {
+        if !principal.role.can_admin() {
+            self.reply(event, runtime, "Only an admin can unbind this chat.")
+                .await?;
+            return Ok(());
+        }
+        let conn = self.open()?;
+        let Some(binding) = self.binding_for(&conn, event)? else {
+            self.reply(event, runtime, "This chat is not bound.")
+                .await?;
+            return Ok(());
+        };
+        ImBindingRepository::set_status(
+            &conn,
+            &binding.binding_id,
+            ImBindingStatus::Revoked,
+            unix_timestamp_ms(),
+        )?;
+        self.reply(event, runtime, "This chat is no longer bound to a session.")
+            .await?;
+        Ok(())
+    }
+
+    async fn handle_plain_text(
+        &self,
+        event: &ImInboundEvent,
+        runtime: &ChannelRuntime,
+        principal: &ImPrincipalRecord,
+        text: &str,
+    ) -> VibexResult<()> {
+        if !principal.role.can_prompt() {
+            self.reply(event, runtime, "Your role cannot send prompts.")
+                .await?;
+            return Ok(());
+        }
+        let conn = self.open()?;
+        let Some(binding) = self.binding_for(&conn, event)? else {
+            self.reply(
+                event,
+                runtime,
+                "No session is bound. Use /sessions or /new.",
+            )
+            .await?;
+            return Ok(());
+        };
+        if text.trim().is_empty() && event.attachments.is_empty() {
+            return Ok(());
+        }
+        self.send_prompt_with_attachments(event, &binding.session_id, text, &event.attachments)
+            .await?;
+        self.reply(event, runtime, "Sent. I will report back here.")
+            .await?;
+        Ok(())
+    }
+
+    async fn send_prompt(
+        &self,
+        event: &ImInboundEvent,
+        session_id: &VibexSessionId,
+        text: &str,
+    ) -> VibexResult<()> {
+        self.send_prompt_with_attachments(event, session_id, text, &[])
+            .await
+    }
+
+    /// Sends a user prompt, carrying the files the message brought in.
+    ///
+    /// The bytes travel as a `data:` URI, which is the one attachment form the
+    /// Agent materializes without needing a path this process can read. The
+    /// label is the file name so the transcript names it, and the MIME type is
+    /// the provider's or a guess from the extension.
+    async fn send_prompt_with_attachments(
+        &self,
+        event: &ImInboundEvent,
+        session_id: &VibexSessionId,
+        text: &str,
+        files: &[crate::types::ImAttachment],
+    ) -> VibexResult<()> {
+        let runtime = self.inner.agent.runtime_selection(session_id).await?;
+        let key = sha256_hex(&format!(
+            "{}:{}:{}",
+            event.channel_id, event.provider_update_id, session_id
+        ));
+        let attachments = files
+            .iter()
+            .map(|file| vibex_core::MessageAttachment {
+                label: file.file_name.clone(),
+                mime_type: Some(file.mime_type.clone()),
+                uri: Some(format!(
+                    "data:{};base64,{}",
+                    file.mime_type,
+                    BASE64.encode(&file.bytes)
+                )),
+                inline_text_offset: None,
+            })
+            .collect();
+        self.inner
+            .agent
+            .send_message(SendAgentMessageRequest {
+                session_id: session_id.clone(),
+                message_idempotency_key: key,
+                desired_runtime: runtime.desired,
+                text: text.to_string(),
+                attachments,
+                mentions: Vec::new(),
+                reasoning_effort: None,
+                correlation_id: Some(CorrelationId::new()),
+                delivery: Default::default(),
+                prompt_context: None,
+                provenance: MessageProvenance::human_input(),
+            })
+            .await?;
+        Ok(())
+    }
+
+    fn binding_for(
+        &self,
+        conn: &vibex_db::DbConnection,
+        event: &ImInboundEvent,
+    ) -> VibexResult<Option<ImBindingRecord>> {
+        ImBindingRepository::get_by_target(
+            conn,
+            &event.channel_id,
+            &event.external_chat_id,
+            &event.thread_key,
+        )
+    }
+
+    fn make_binding(
+        &self,
+        event: &ImInboundEvent,
+        principal: &ImPrincipalRecord,
+        session: &AgentSession,
+        existing: Option<&ImBindingRecord>,
+    ) -> ImBindingRecord {
+        let now = unix_timestamp_ms();
+        ImBindingRecord {
+            binding_id: existing
+                .map(|binding| binding.binding_id.clone())
+                .unwrap_or_default(),
+            channel_id: event.channel_id.clone(),
+            external_chat_id: event.external_chat_id.clone(),
+            thread_key: event.thread_key.clone(),
+            thread_kind: event.thread_kind.clone(),
+            session_id: session.id.clone(),
+            created_by_principal_id: Some(principal.principal_id.clone()),
+            status: ImBindingStatus::Active,
+            last_delivered_sequence: 0,
+            title: Some(session.title.clone()),
+            title_sync_enabled: matches!(event.chat_type, ImChatType::Group)
+                && !event.thread_key.is_empty(),
+            provider_payload_json: None,
+            created_at_ms: existing.map(|binding| binding.created_at_ms).unwrap_or(now),
+            updated_at_ms: now,
+        }
+    }
+
+    async fn send_to_binding(
+        &self,
+        binding: &ImBindingRecord,
+        text: &str,
+    ) -> VibexResult<Option<ImSentMessage>> {
+        self.send_to_binding_with(binding, text, OutboundPriority::Normal)
+            .await
+    }
+
+    /// Sends one answer, split into as many chat messages as it needs.
+    ///
+    /// The parts go out in order on the same outbox, so a provider rate limit
+    /// delays the tail instead of reordering it. Only the last part's id is
+    /// returned: it is the one a caller could edit later.
+    async fn send_answer_to_binding(
+        &self,
+        binding: &ImBindingRecord,
+        text: &str,
+    ) -> VibexResult<Option<ImSentMessage>> {
+        let locale = self.locale_for_channel(&binding.channel_id);
+        let parts = render::final_answer_parts(text, locale);
+        let mut last = None;
+        for part in parts {
+            last = self
+                .send_to_binding_with(binding, &part, OutboundPriority::Normal)
+                .await?;
+        }
+        Ok(last)
+    }
+
+    async fn send_to_binding_with(
+        &self,
+        binding: &ImBindingRecord,
+        text: &str,
+        priority: OutboundPriority,
+    ) -> VibexResult<Option<ImSentMessage>> {
+        let Some(runtime) = self
+            .inner
+            .channels
+            .read()
+            .await
+            .get(&binding.channel_id)
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        let target = ImTarget {
+            chat_id: binding.external_chat_id.clone(),
+            thread_key: binding.thread_key.clone(),
+        };
+        let message_id = self.record_outbound(binding, text, "message");
+        let result = runtime
+            .outbox
+            .send(target, text.to_string(), Vec::new(), priority)
+            .await;
+        self.finish_outbound(&message_id, &result);
+        let sent = result.map_err(im_error_to_vibex)?;
+        Ok(Some(sent))
+    }
+
+    /// Writes the row for one outbound message before the provider call.
+    ///
+    /// The `queued` state is what makes a restart honest: a row that never
+    /// reached `sent` is a message the runtime owes the chat. Content is kept
+    /// as a preview and a digest, never the full text, so the log cannot become
+    /// a second transcript.
+    fn record_outbound(&self, binding: &ImBindingRecord, text: &str, kind: &str) -> Option<String> {
+        let conn = self.open().ok()?;
+        let message_id = ImMessageId::new().into_string();
+        let preview = render::truncate(text, 256);
+        let record = ImMessageRecord {
+            message_id: message_id.clone(),
+            channel_id: binding.channel_id.clone(),
+            direction: "outbound".to_string(),
+            provider_update_id: None,
+            external_message_id: None,
+            binding_id: Some(binding.binding_id.clone()),
+            principal_id: binding.created_by_principal_id.clone(),
+            kind: kind.to_string(),
+            content_preview: (!preview.is_empty()).then_some(preview),
+            content_sha256: (!text.is_empty()).then(|| sha256_hex(text)),
+            status: "queued".to_string(),
+            error_code: None,
+            error_detail: None,
+            created_at_ms: unix_timestamp_ms(),
+        };
+        ImMessageRepository::insert(&conn, &record).ok()?;
+        Some(message_id)
+    }
+
+    fn finish_outbound(
+        &self,
+        message_id: &Option<String>,
+        result: &Result<ImSentMessage, ImError>,
+    ) {
+        let Some(message_id) = message_id.as_deref() else {
+            return;
+        };
+        let Ok(conn) = self.open() else {
+            return;
+        };
+        match result {
+            Ok(sent) => {
+                let _ = ImMessageRepository::set_status(&conn, message_id, "sent", None, None);
+                let _ = ImMessageRepository::set_external_id(&conn, message_id, &sent.message_id);
+            }
+            Err(error) => {
+                let _ = ImMessageRepository::set_status(
+                    &conn,
+                    message_id,
+                    "failed",
+                    Some(error.code()),
+                    Some(&error.to_string()),
+                );
+            }
+        }
+    }
+
+    async fn reply(
+        &self,
+        event: &ImInboundEvent,
+        runtime: &ChannelRuntime,
+        text: &str,
+    ) -> VibexResult<()> {
+        self.reply_with(event, runtime, text, OutboundPriority::Normal)
+            .await
+    }
+
+    async fn reply_with(
+        &self,
+        event: &ImInboundEvent,
+        runtime: &ChannelRuntime,
+        text: &str,
+        priority: OutboundPriority,
+    ) -> VibexResult<()> {
+        let target = ImTarget {
+            chat_id: event.external_chat_id.clone(),
+            thread_key: event.thread_key.clone(),
+        };
+        let message_id = self.record_outbound_reply(event, text);
+        let result = runtime
+            .outbox
+            .send(target, text.to_string(), Vec::new(), priority)
+            .await;
+        self.finish_outbound(&message_id, &result);
+        result.map_err(im_error_to_vibex)?;
+        Ok(())
+    }
+
+    /// The row for a reply that belongs to the chat rather than a binding.
+    fn record_outbound_reply(&self, event: &ImInboundEvent, text: &str) -> Option<String> {
+        let conn = self.open().ok()?;
+        let message_id = ImMessageId::new().into_string();
+        let preview = render::truncate(text, 256);
+        let record = ImMessageRecord {
+            message_id: message_id.clone(),
+            channel_id: event.channel_id.clone(),
+            direction: "outbound".to_string(),
+            provider_update_id: None,
+            external_message_id: None,
+            binding_id: self
+                .binding_for(&conn, event)
+                .ok()
+                .flatten()
+                .map(|binding| binding.binding_id),
+            principal_id: None,
+            kind: "reply".to_string(),
+            content_preview: (!preview.is_empty()).then_some(preview),
+            content_sha256: (!text.is_empty()).then(|| sha256_hex(text)),
+            status: "queued".to_string(),
+            error_code: None,
+            error_detail: None,
+            created_at_ms: unix_timestamp_ms(),
+        };
+        ImMessageRepository::insert(&conn, &record).ok()?;
+        Some(message_id)
+    }
+
+    /// The locale for a chat.
+    ///
+    /// The channel's own setting wins, then the host default, then English. The
+    /// channel row is read rather than cached: an owner changing the language in
+    /// settings expects the next reply to change with it, and the read is one
+    /// indexed row per inbound message.
+    fn locale(&self, event: &ImInboundEvent) -> ImLocale {
+        self.locale_for_channel(&event.channel_id)
+    }
+
+    fn locale_for_channel(&self, channel_id: &ImChannelId) -> ImLocale {
+        ImLocale::parse(
+            self.channel_locale(channel_id)
+                .as_deref()
+                .or(self.inner.config.locale.as_deref()),
+        )
+    }
+
+    /// The stored language tag for a channel, when one was chosen.
+    fn channel_locale(&self, channel_id: &ImChannelId) -> Option<String> {
+        let conn = self.open().ok()?;
+        ImChannelRepository::get(&conn, channel_id)
+            .ok()
+            .flatten()
+            .and_then(|record| record.locale)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn audit(
+        &self,
+        conn: &vibex_db::DbConnection,
+        channel_id: &ImChannelId,
+        principal_id: Option<&ImPrincipalId>,
+        action: &str,
+        target_kind: Option<&str>,
+        target_id: Option<&str>,
+        outcome: &str,
+        detail: Option<&str>,
+    ) -> VibexResult<()> {
+        ImAuditRepository::insert(
+            conn,
+            &ImAuditRecord {
+                audit_id: format!("imaudit_{}", Uuid::new_v4().simple()),
+                channel_id: channel_id.clone(),
+                principal_id: principal_id.cloned(),
+                action: action.to_string(),
+                target_kind: target_kind.map(str::to_string),
+                target_id: target_id.map(str::to_string),
+                outcome: outcome.to_string(),
+                detail_json: detail.map(str::to_string),
+                created_at_ms: unix_timestamp_ms(),
+            },
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ApprovalChoice {
+    Approve,
+    Always,
+    Deny,
+}
+
+impl ApprovalChoice {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Approve => "approve",
+            Self::Always => "always",
+            Self::Deny => "deny",
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ApprovalActionPayload {
+    request_id: String,
+    option_id: String,
+    choice: String,
+}
+
+/// The payload behind one elicitation button.
+#[derive(Debug, Serialize, Deserialize)]
+struct ElicitationActionPayload {
+    request_id: String,
+    /// `true`/`false` for a boolean field, the option value for a choice field.
+    value: String,
+}
+
+/// What an action record points at. The `kind` column already distinguishes a
+/// consent from an answer; the prefix keeps the two payload shapes apart when
+/// an old row is read back.
+const ELICITATION_ACTION_PREFIX: &str = "elicitation:";
+
+fn choose_option(
+    request: &PermissionRequest,
+    choice: ApprovalChoice,
+) -> Option<PermissionResponseOption> {
+    let kind = match choice {
+        ApprovalChoice::Approve => PermissionResponseKind::Approve,
+        ApprovalChoice::Always => PermissionResponseKind::AlwaysAllowForSession,
+        ApprovalChoice::Deny => PermissionResponseKind::Deny,
+    };
+    request
+        .response_options
+        .iter()
+        .find(|option| option.response == kind)
+        .cloned()
+        .or_else(|| {
+            (choice_is_always(choice))
+                .then(|| {
+                    request
+                        .response_options
+                        .iter()
+                        .find(|option| option.response == PermissionResponseKind::Approve)
+                })
+                .flatten()
+                .cloned()
+        })
+}
+
+const fn choice_is_always(choice: ApprovalChoice) -> bool {
+    matches!(choice, ApprovalChoice::Always)
+}
+
+fn topic_title(prompt: &str) -> String {
+    format!("Vibex · {}", render::truncate(prompt.trim(), 112))
+        .chars()
+        .take(128)
+        .collect()
+}
+
+fn role_label(role: ImPrincipalRole, locale: ImLocale) -> &'static str {
+    match (role, locale) {
+        (ImPrincipalRole::Observer, ImLocale::ZhCn) => "只读",
+        (ImPrincipalRole::Observer, ImLocale::ZhTw) => "唯讀",
+        (ImPrincipalRole::Observer, _) => "observer",
+        (ImPrincipalRole::Approver, ImLocale::ZhCn) => "审批",
+        (ImPrincipalRole::Approver, ImLocale::ZhTw) => "審批",
+        (ImPrincipalRole::Approver, _) => "approver",
+        (ImPrincipalRole::Operator, ImLocale::ZhCn) => "操作",
+        (ImPrincipalRole::Operator, ImLocale::ZhTw) => "操作",
+        (ImPrincipalRole::Operator, _) => "operator",
+        (ImPrincipalRole::Admin, ImLocale::ZhCn) => "管理员",
+        (ImPrincipalRole::Admin, ImLocale::ZhTw) => "管理員",
+        (ImPrincipalRole::Admin, _) => "admin",
+    }
+}
+
+fn generate_pairing_code() -> String {
+    let entropy = Uuid::new_v4().simple().to_string();
+    let mut chars = entropy.bytes().filter_map(|byte| {
+        let index = usize::from(byte) % PAIRING_CODE_ALPHABET.len();
+        PAIRING_CODE_ALPHABET.get(index).copied()
+    });
+    let mut code = String::new();
+    for _ in 0..10 {
+        if let Some(byte) = chars.next() {
+            code.push(char::from(byte));
+        }
+    }
+    while code.len() < 10 {
+        code.push('K');
+    }
+    format!("VBX-{}-{}", &code[..5], &code[5..])
+}
+
+fn action_short_code(action_id: &ImActionId) -> String {
+    action_id
+        .as_str()
+        .rsplit('_')
+        .next()
+        .unwrap_or_default()
+        .chars()
+        .take(6)
+        .collect::<String>()
+        .to_uppercase()
+}
+
+/// Whether a message is a `/pair` attempt, with or without a group mention.
+fn is_pairing_attempt(text: &str) -> bool {
+    let text = text.trim();
+    let text = text
+        .strip_prefix('@')
+        .and_then(|rest| rest.split_once(char::is_whitespace).map(|(_, rest)| rest))
+        .map(str::trim)
+        .unwrap_or(text);
+    text.starts_with("/pair")
+}
+
+fn sha256_hex(value: &str) -> String {
+    let digest = Sha256::digest(value.as_bytes());
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(&mut hex, "{byte:02x}");
+    }
+    hex
+}
+
+fn timeline_event_id(payload: &TimelinePayload) -> Option<&'static str> {
+    match payload {
+        TimelinePayload::AgentMessage(message) if message.is_final => Some("turn_complete"),
+        TimelinePayload::PermissionRequest(_) => Some("permission_request"),
+        TimelinePayload::PermissionResolution(_) => Some("permission_resolution"),
+        TimelinePayload::ElicitationRequest(_) => Some("elicitation_request"),
+        TimelinePayload::ElicitationResolution(_) => Some("elicitation_resolution"),
+        TimelinePayload::Error(_) => Some("error"),
+        _ => None,
+    }
+}
+
+fn event_allowed(record: &ImChannelRecord, event_id: &str) -> bool {
+    let filter = record
+        .event_filter_json
+        .as_deref()
+        .and_then(|json| serde_json::from_str::<Vec<String>>(json).ok())
+        .filter(|filter| !filter.is_empty());
+    match filter {
+        Some(filter) => filter.iter().any(|id| id == event_id),
+        None => vibex_core::DEFAULT_IM_EVENT_FILTER.contains(&event_id),
+    }
+}
+
+fn principal_summary(record: ImPrincipalRecord) -> ImPrincipalSummary {
+    ImPrincipalSummary {
+        principal_id: record.principal_id,
+        channel_id: record.channel_id,
+        external_user_id: record.external_user_id,
+        display_name: record.display_name,
+        role: record.role,
+        status: record.status,
+        paired_at_ms: record.paired_at_ms,
+        last_seen_at_ms: record.last_seen_at_ms,
+        revoked_at_ms: record.revoked_at_ms,
+    }
+}
+
+fn binding_summary(record: ImBindingRecord) -> ImBindingSummary {
+    ImBindingSummary {
+        binding_id: record.binding_id,
+        channel_id: record.channel_id,
+        external_chat_id: record.external_chat_id,
+        thread_key: record.thread_key,
+        thread_kind: record.thread_kind,
+        session_id: record.session_id,
+        status: record.status,
+        title: record.title,
+        last_delivered_sequence: record.last_delivered_sequence,
+        updated_at_ms: record.updated_at_ms,
+    }
+}
+
+fn im_error_to_vibex(error: ImError) -> VibexError {
+    VibexError::process(error.code(), error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+    use vibex_core::{
+        AgentSessionRuntimeSelectionState, ImChannelConfigEnvelope, ImTelegramConfig,
+        PermissionRiskCategory, ResolveElicitationRequest, TimelineItem, TimelinePage,
+    };
+
+    struct MockAgent {
+        timeline: tokio::sync::broadcast::Sender<TimelineLiveEvent>,
+        sessions: tokio::sync::broadcast::Sender<AgentSession>,
+        notifications: tokio::sync::broadcast::Sender<AgentNotificationIntent>,
+    }
+
+    impl MockAgent {
+        fn new() -> Self {
+            let (timeline, _) = tokio::sync::broadcast::channel(8);
+            let (sessions, _) = tokio::sync::broadcast::channel(8);
+            let (notifications, _) = tokio::sync::broadcast::channel(8);
+            Self {
+                timeline,
+                sessions,
+                notifications,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ImAgentPort for MockAgent {
+        fn subscribe_timeline(&self) -> tokio::sync::broadcast::Receiver<TimelineLiveEvent> {
+            self.timeline.subscribe()
+        }
+
+        fn subscribe_session_updates(&self) -> tokio::sync::broadcast::Receiver<AgentSession> {
+            self.sessions.subscribe()
+        }
+
+        fn subscribe_notifications(
+            &self,
+        ) -> tokio::sync::broadcast::Receiver<AgentNotificationIntent> {
+            self.notifications.subscribe()
+        }
+
+        async fn get_session(&self, _session_id: &VibexSessionId) -> VibexResult<AgentSession> {
+            Err(VibexError::process(
+                "mock_agent",
+                "not implemented in this test",
+            ))
+        }
+
+        async fn list_sessions(&self, _include_archived: bool) -> VibexResult<Vec<AgentSession>> {
+            Err(VibexError::process(
+                "mock_agent",
+                "not implemented in this test",
+            ))
+        }
+
+        async fn fetch_timeline(
+            &self,
+            _request: FetchTimelineRequest,
+        ) -> VibexResult<TimelinePage> {
+            Err(VibexError::process(
+                "mock_agent",
+                "not implemented in this test",
+            ))
+        }
+
+        async fn runtime_selection(
+            &self,
+            _session_id: &VibexSessionId,
+        ) -> VibexResult<AgentSessionRuntimeSelectionState> {
+            Err(VibexError::process(
+                "mock_agent",
+                "not implemented in this test",
+            ))
+        }
+
+        async fn create_session(
+            &self,
+            _request: CreateAgentSessionRequest,
+        ) -> VibexResult<AgentSession> {
+            Err(VibexError::process(
+                "mock_agent",
+                "not implemented in this test",
+            ))
+        }
+
+        async fn send_message(
+            &self,
+            _request: SendAgentMessageRequest,
+        ) -> VibexResult<Vec<TimelineItem>> {
+            Err(VibexError::process(
+                "mock_agent",
+                "not implemented in this test",
+            ))
+        }
+
+        async fn interrupt(&self, _session_id: &VibexSessionId) -> VibexResult<()> {
+            Err(VibexError::process(
+                "mock_agent",
+                "not implemented in this test",
+            ))
+        }
+
+        async fn resolve_permission(
+            &self,
+            _request: ResolvePermissionRequest,
+        ) -> VibexResult<TimelineItem> {
+            Err(VibexError::process(
+                "mock_agent",
+                "not implemented in this test",
+            ))
+        }
+
+        async fn resolve_elicitation(
+            &self,
+            _request: ResolveElicitationRequest,
+        ) -> VibexResult<TimelineItem> {
+            Err(VibexError::process(
+                "mock_agent",
+                "not implemented in this test",
+            ))
+        }
+    }
+
+    async fn service() -> (ImChannelService, tempfile::TempDir) {
+        let dir = tempdir().expect("temp dir");
+        let db_path = dir.path().join("vibex.db");
+        vibex_config_switch::secrets::configure_provider_secret_store(
+            vibex_config_switch::secrets::ProviderSecretStoreConfig::host_file(dir.path()),
+        );
+        let mut conn = vibex_db::open_database(&db_path).expect("open db");
+        vibex_db::apply_migrations(&mut conn).expect("migrate");
+        let service = ImChannelService::new(ImChannelServiceConfig {
+            db_path,
+            home_dir: dir.path().to_path_buf(),
+            agent: Arc::new(MockAgent::new()),
+            telegram_api_base: None,
+            lark_api_base: None,
+            locale: None,
+        })
+        .expect("service");
+        (service, dir)
+    }
+
+    fn telegram_draft() -> ImChannelDraft {
+        ImChannelDraft {
+            display_name: "Test bot".to_string(),
+            config: ImChannelConfig::Telegram(ImTelegramConfig {
+                chat_id: "-100123".to_string(),
+                topic_mode: false,
+                require_mention_in_groups: true,
+            }),
+            default_session: None,
+            event_filter: Vec::new(),
+            locale: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn channel_can_be_created_configured_and_paired() {
+        let (service, _dir) = service().await;
+        let channel = service
+            .create_channel(telegram_draft())
+            .await
+            .expect("create channel");
+        assert!(!channel.enabled);
+        assert!(!channel.configured);
+
+        service
+            .set_bot_token(&channel.channel_id, "123456:test-token")
+            .await
+            .expect("set token");
+        let channels = service.list_channels().await.expect("list channels");
+        assert_eq!(channels.len(), 1);
+        assert!(channels[0].configured);
+        assert!(!channels[0].enabled);
+
+        let pairing = service
+            .create_pairing_code(ImPairingRequest {
+                channel_id: channel.channel_id.clone(),
+                role: ImPrincipalRole::Approver,
+                ttl_ms: Some(60_000),
+                scope: ImPairingScope::Direct,
+                target_chat_id: None,
+            })
+            .await
+            .expect("pairing code");
+        assert!(pairing.code.starts_with("VBX-"));
+        assert_eq!(pairing.role, ImPrincipalRole::Approver);
+    }
+
+    #[tokio::test]
+    async fn default_session_round_trips_through_channel_config() {
+        let (service, _dir) = service().await;
+        let channel = service
+            .create_channel(telegram_draft())
+            .await
+            .expect("create channel");
+        let selection = vibex_core::SessionRuntimeSelection::provider(
+            vibex_core::AgentId::parse("claude").expect("agent"),
+            vibex_core::ProviderProfileId::new(),
+            "test-model",
+        );
+        let defaults = ImSessionDefaults {
+            workspace_root: "/tmp/vibex-default".to_string(),
+            workspace_mode: vibex_core::WorkspaceMode::CurrentCheckout,
+            agent_id: selection.agent_id.clone(),
+            auth_source: selection.auth_source.clone(),
+            model: selection.model.clone(),
+            reasoning_effort: selection.reasoning_effort.clone(),
+            mode_id: selection.mode_id.clone(),
+            config_values: selection.config_values.clone(),
+        };
+        let summary = service
+            .set_default_session(&channel.channel_id, Some(defaults.clone()))
+            .await
+            .expect("set default");
+        assert_eq!(summary.default_session, Some(defaults));
+        let summary = service
+            .set_default_session(&channel.channel_id, None)
+            .await
+            .expect("clear default");
+        assert!(summary.default_session.is_none());
+    }
+
+    #[test]
+    fn topic_title_is_bounded_and_prefixed() {
+        let title = topic_title(&"x".repeat(300));
+        assert!(title.starts_with("Vibex · "));
+        assert!(title.chars().count() <= 128);
+    }
+
+    #[test]
+    fn pairing_code_shape_is_stable() {
+        let code = generate_pairing_code();
+        assert_eq!(code.len(), 15);
+        assert!(code.starts_with("VBX-"));
+        assert_eq!(code.chars().filter(|ch| *ch == '-').count(), 2);
+    }
+
+    #[test]
+    fn always_falls_back_to_approve_when_provider_has_no_always_option() {
+        let request = PermissionRequest {
+            id: vibex_core::RequestId::new(),
+            session_id: VibexSessionId::new(),
+            project_id: None,
+            workspace_id: None,
+            provider_request_id: None,
+            risk_category: PermissionRiskCategory::Command,
+            title: "Run tests".to_string(),
+            details: Vec::new(),
+            allowed_responses: vec![
+                PermissionResponseKind::Approve,
+                PermissionResponseKind::Deny,
+            ],
+            response_options: vec![
+                PermissionResponseOption {
+                    option_id: "allow".to_string(),
+                    label: "Allow".to_string(),
+                    response: PermissionResponseKind::Approve,
+                },
+                PermissionResponseOption {
+                    option_id: "deny".to_string(),
+                    label: "Deny".to_string(),
+                    response: PermissionResponseKind::Deny,
+                },
+            ],
+            status: PermissionRequestStatus::Pending,
+            requested_at_ms: 1,
+            expires_at_ms: None,
+        };
+        let option = choose_option(&request, ApprovalChoice::Always).expect("fallback option");
+        assert_eq!(option.option_id, "allow");
+        assert_eq!(option.response, PermissionResponseKind::Approve);
+    }
+
+    #[test]
+    fn channel_kind_comes_from_the_draft_platform() {
+        let draft = ImChannelDraft {
+            display_name: "Lark acceptance".to_string(),
+            config: ImChannelConfig::Lark(vibex_core::ImLarkConfig {
+                app_id: "cli_test".to_string(),
+                chat_id: None,
+                transport: ImLarkTransport::LongConnection,
+                region: vibex_core::ImLarkRegion::Feishu,
+            }),
+            default_session: None,
+            event_filter: Vec::new(),
+            locale: None,
+        };
+        assert_eq!(draft.config.kind(), vibex_core::ImChannelKind::Lark);
+    }
+
+    #[test]
+    fn a_group_code_names_its_chat_and_a_direct_code_names_kind_only() {
+        let direct = ImPairingScope::Direct;
+        assert_eq!(direct.as_str(), "dm");
+        assert_eq!(ImPairingScope::parse("dm"), Some(direct));
+        let group = ImPairingScope::Group;
+        assert_eq!(group.as_str(), "group");
+        assert_eq!(ImPairingScope::parse("group"), Some(group));
+        assert_eq!(ImPairingScope::parse("anything"), None);
+        // The stored scope column round-trips through the parser the claim path
+        // uses, so a row written by an older build still reads as a direct code.
+        assert_eq!(ImPairingScope::parse("dm"), Some(ImPairingScope::Direct));
+    }
+
+    #[test]
+    fn default_event_filter_keeps_approvals_and_drops_prompt_echo() {
+        let record = ImChannelRecord {
+            channel_id: ImChannelId::new(),
+            display_name: "Test".to_string(),
+            kind: vibex_core::ImChannelKind::Telegram,
+            enabled: true,
+            config_json: serde_json::to_string(&ImChannelConfigEnvelope::new(
+                ImChannelConfig::Telegram(ImTelegramConfig {
+                    chat_id: "-100".to_string(),
+                    topic_mode: false,
+                    require_mention_in_groups: true,
+                }),
+            ))
+            .expect("config"),
+            event_filter_json: None,
+            locale: None,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        };
+        assert!(event_allowed(&record, "permission_request"));
+        assert!(event_allowed(&record, "turn_complete"));
+        assert!(!event_allowed(&record, "user_prompt_sent"));
+    }
+}
