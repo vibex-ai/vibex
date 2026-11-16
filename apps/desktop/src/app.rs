@@ -93611,10 +93611,18 @@ impl FoundationSettings {
                         let section = *section;
                         let label = settings_section_label(section);
                         let active = self.active_section == section;
-                        let icon = Icon::new(icon.clone())
-                            .size(px(16.0))
-                            .mr(px(2.0))
-                            .text_color(if active { foreground } else { muted_foreground });
+                        // The channels entry is a chat, not the generic Bot
+                        // glyph the Agent entries use. `MessageCircle` is not
+                        // in this icon set's curated list, so the bundled
+                        // asset is addressed by path.
+                        let icon = if section == SettingsSection::Channels {
+                            Icon::default().path("icons/message-circle.svg")
+                        } else {
+                            Icon::new(icon.clone())
+                        }
+                        .size(px(16.0))
+                        .mr(px(2.0))
+                        .text_color(if active { foreground } else { muted_foreground });
                         Button::new(SharedString::from(format!("settings-{section:?}")))
                             .small()
                             .ghost()
