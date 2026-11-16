@@ -1654,6 +1654,52 @@ struct ComposerSuggestionContext {
     character_range: Range<usize>,
 }
 
+/// A composer trigger the reader explicitly closed with Escape.
+///
+/// Moving the caret through text that already contains `/`, `@` or `$` must not
+/// reopen the popup, and neither may the keystroke that follows: while the same
+/// token stays under the caret the menu stays closed. Leaving the token, or a
+/// trigger at a different offset, clears this so the next one opens normally.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ComposerSuggestionDismissal {
+    target: ComposerTarget,
+    start: usize,
+}
+
+/// What a refresh of the composer's suggestions should do.
+///
+/// The decision is a plain function so the "typing opens, moving the caret does
+/// not" rule can be tested without a window: [`Self::Open`] when the token is
+/// new, [`Self::Suppressed`] while it is the one Escape just closed, and
+/// [`Self::Clear`] when the caret is no longer in a trigger at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ComposerSuggestionRefresh {
+    Open,
+    Suppressed,
+    Clear,
+}
+
+impl ComposerSuggestionRefresh {
+    fn decide(
+        dismissed: Option<ComposerSuggestionDismissal>,
+        target: ComposerTarget,
+        trigger_start: Option<usize>,
+    ) -> Self {
+        match trigger_start {
+            None => Self::Clear,
+            Some(start) => {
+                let dismissed_here =
+                    dismissed == Some(ComposerSuggestionDismissal { target, start });
+                if dismissed_here {
+                    Self::Suppressed
+                } else {
+                    Self::Open
+                }
+            }
+        }
+    }
+}
+
 /// `Up`/`Down` recall of the selected session's earlier user messages.
 ///
 /// `index` walks that session's user messages from newest (`len - 1`) to oldest
@@ -6034,6 +6080,9 @@ pub struct SessionView {
     /// stays visible; the list can hold more than the ten-row window.
     suggestion_scroll: ScrollHandle,
     suggestion_context: Option<ComposerSuggestionContext>,
+    /// The trigger the reader closed with Escape, which keeps caret movement
+    /// and further typing inside that same token from reopening the popup.
+    suggestion_dismissed: Option<ComposerSuggestionDismissal>,
     suggestion_loading: bool,
     suggestion_request_serial: u64,
     composer_history: ComposerHistoryState,
@@ -6188,6 +6237,7 @@ impl SessionView {
             suggestion_delegation_action: ComposerDelegationAction::default(),
             suggestion_scroll: ScrollHandle::new(),
             suggestion_context: None,
+            suggestion_dismissed: None,
             suggestion_loading: false,
             suggestion_request_serial: 0,
             suggestion_task: None,
@@ -11568,7 +11618,9 @@ fn subscribe_composer_input(
                     this.handle_composer_enter(window, cx)
                 }
             }
-            InputEvent::Focus => this.refresh_suggestions(ComposerTarget::Session, window, cx),
+            // Focusing a draft that already contains a `/`, `@` or `$` token
+            // must not pop the menu open: only typing a trigger does that.
+            InputEvent::Focus => this.refresh_active_suggestions(ComposerTarget::Session, cx),
             InputEvent::PressEnter { shift: true, .. } | InputEvent::Blur => {}
             InputEvent::PressEnter { shift: false, .. } => {}
         }
@@ -12418,7 +12470,7 @@ impl VibexWorkbench {
                         this.refresh_suggestions(ComposerTarget::NewSession, window, cx);
                     }
                     InputEvent::Focus => {
-                        this.refresh_suggestions(ComposerTarget::NewSession, window, cx)
+                        this.refresh_active_suggestions(ComposerTarget::NewSession, cx)
                     }
                     InputEvent::PressEnter { shift: true, .. } | InputEvent::Blur => cx.notify(),
                     InputEvent::PressEnter { shift: false, .. } => {}
@@ -33311,6 +33363,7 @@ impl VibexWorkbench {
         self.suggestion_delegation_action = ComposerDelegationAction::default();
         self.suggestion_scroll.scroll_to_item(0);
         self.suggestion_context = None;
+        self.suggestion_dismissed = None;
         self.suggestion_loading = false;
         self.suggestion_request_serial = self.suggestion_request_serial.saturating_add(1);
     }
@@ -33388,18 +33441,35 @@ impl VibexWorkbench {
 
         let value = input.read(cx).value().to_string();
         let selection = input.read(cx).selected_range();
-        let Some(trigger) = composer_trigger_for_selection(&value, selection) else {
-            if self
-                .suggestion_context
+        let trigger = composer_trigger_for_selection(&value, selection);
+        match ComposerSuggestionRefresh::decide(
+            self.suggestion_dismissed,
+            target,
+            trigger
                 .as_ref()
-                .is_some_and(|context| context.target == target)
-            {
-                self.clear_suggestions();
-                cx.notify();
+                .map(|trigger| trigger.character_range.start),
+        ) {
+            ComposerSuggestionRefresh::Clear => {
+                if self
+                    .suggestion_context
+                    .as_ref()
+                    .is_some_and(|context| context.target == target)
+                {
+                    self.clear_suggestions();
+                    cx.notify();
+                }
+                self.suggestion_dismissed = None;
             }
-            return;
-        };
-        self.request_composer_suggestions(target, trigger, cx);
+            // Escape closed this token and no text has changed it since, so a
+            // caret move or continued typing must leave the popup closed.
+            ComposerSuggestionRefresh::Suppressed => {}
+            ComposerSuggestionRefresh::Open => {
+                self.suggestion_dismissed = None;
+                if let Some(trigger) = trigger {
+                    self.request_composer_suggestions(target, trigger, cx);
+                }
+            }
+        }
     }
 
     fn refresh_active_suggestions(&mut self, target: ComposerTarget, cx: &mut Context<Self>) {
@@ -33901,6 +33971,9 @@ impl VibexWorkbench {
         });
         self.sync_inline_composer_attachments(false, cx);
         self.sync_composer_command_entry(ComposerTarget::Session, cx);
+        // The whole value was replaced, so an Escape dismissal from a previous
+        // token no longer applies to whatever the recalled text now holds.
+        self.suggestion_dismissed = None;
         self.refresh_suggestions(ComposerTarget::Session, window, cx);
         // `set_value` suppresses its own change event, so the store is told
         // about the recalled message — or the restored draft — here.
@@ -33969,7 +34042,18 @@ impl VibexWorkbench {
                 cx.stop_propagation();
             }
             ComposerSuggestionAction::Dismiss => {
+                // Remember which token Escape closed before the context is
+                // dropped: `clear_suggestions` forgets the dismissal it is
+                // about to record, so read the start first and set it after.
+                let dismissed =
+                    self.suggestion_context
+                        .as_ref()
+                        .map(|context| ComposerSuggestionDismissal {
+                            target: context.target,
+                            start: context.character_range.start,
+                        });
                 self.clear_suggestions();
+                self.suggestion_dismissed = dismissed;
                 cx.stop_propagation();
                 cx.notify();
             }
@@ -62507,19 +62591,21 @@ impl VibexWorkbench {
                                                             },
                                                         );
                                                     })
-                                                    .on_key_up(cx.listener(|this, _, window, cx| {
-                                                        this.refresh_suggestions(
+                                                    .on_key_up(cx.listener(|this, _, _window, cx| {
+                                                        // Moving the caret into a
+                                                        // token only keeps an open
+                                                        // popup in step; opening one
+                                                        // is reserved for typing.
+                                                        this.refresh_active_suggestions(
                                                             ComposerTarget::NewSession,
-                                                            window,
                                                             cx,
                                                         )
                                                     }))
                                                     .on_mouse_up(
                                                         MouseButton::Left,
-                                                        cx.listener(|this, _, window, cx| {
-                                                            this.refresh_suggestions(
+                                                        cx.listener(|this, _, _, cx| {
+                                                            this.refresh_active_suggestions(
                                                                 ComposerTarget::NewSession,
-                                                                window,
                                                                 cx,
                                                             )
                                                         }),
@@ -77230,19 +77316,20 @@ impl VibexWorkbench {
                                                     );
                                                 }
                                             })
-                                            .on_key_up(cx.listener(|this, _, window, cx| {
-                                                this.refresh_suggestions(
+                                            .on_key_up(cx.listener(|this, _, _window, cx| {
+                                                // Moving the caret into a token only
+                                                // keeps an open popup in step; opening
+                                                // one is reserved for typing.
+                                                this.refresh_active_suggestions(
                                                     ComposerTarget::Session,
-                                                    window,
                                                     cx,
                                                 )
                                             }))
                                             .on_mouse_up(
                                                 MouseButton::Left,
-                                                cx.listener(|this, _, window, cx| {
-                                                    this.refresh_suggestions(
+                                                cx.listener(|this, _, _, cx| {
+                                                    this.refresh_active_suggestions(
                                                         ComposerTarget::Session,
-                                                        window,
                                                         cx,
                                                     )
                                                 }),
@@ -110094,6 +110181,94 @@ mod tests {
         let trigger = composer_trigger_for_selection(text, caret..caret).unwrap();
         assert_eq!(trigger.query, "src/文件");
         assert!(composer_trigger_for_selection(text, 7..caret).is_none());
+    }
+
+    /// Typing a trigger opens the popup; moving the caret into text that already
+    /// contains one must not, and Escape has to keep it closed for that token.
+    #[test]
+    fn composer_suggestions_open_on_typing_not_on_caret_movement() {
+        use ComposerSuggestionRefresh::{Clear, Open, Suppressed};
+        let target = ComposerTarget::Session;
+        let dismissed = Some(ComposerSuggestionDismissal { target, start: 7 });
+
+        // The token Escape closed stays closed while the caret is inside it,
+        // but a different trigger — or a composer that never dismissed one —
+        // opens normally.
+        assert_eq!(
+            ComposerSuggestionRefresh::decide(dismissed, target, Some(7)),
+            Suppressed
+        );
+        assert_eq!(
+            ComposerSuggestionRefresh::decide(dismissed, target, Some(0)),
+            Open
+        );
+        assert_eq!(
+            ComposerSuggestionRefresh::decide(dismissed, ComposerTarget::NewSession, Some(7)),
+            Open
+        );
+        assert_eq!(
+            ComposerSuggestionRefresh::decide(None, target, Some(7)),
+            Open
+        );
+        // Leaving the trigger forgets the dismissal, so retyping opens again.
+        assert_eq!(
+            ComposerSuggestionRefresh::decide(dismissed, target, None),
+            Clear
+        );
+    }
+
+    /// Both composers wire typing to the opening refresh and caret movement to
+    /// the popup-follow refresh, and Escape records the token it closed.
+    #[test]
+    fn composer_suggestion_refresh_is_wired_to_text_changes() {
+        let source = include_str!("app.rs");
+
+        let session_subscription = source
+            .split_once("fn subscribe_composer_input(")
+            .and_then(|(_, tail)| {
+                tail.split_once(
+                    "\n/// Field access on the workbench resolves to the borrowed session view.",
+                )
+            })
+            .map(|(body, _)| body)
+            .expect("composer input subscription should remain inspectable");
+        assert!(
+            session_subscription
+                .contains("this.refresh_suggestions(ComposerTarget::Session, window, cx);")
+        );
+        assert!(session_subscription.contains(
+            "InputEvent::Focus => this.refresh_active_suggestions(ComposerTarget::Session, cx)"
+        ));
+        assert!(!session_subscription.contains("InputEvent::Focus => this.refresh_suggestions"));
+        assert!(source.contains("this.refresh_active_suggestions(ComposerTarget::NewSession, cx)"));
+
+        let composer = source
+            .split_once("    fn render_composer(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_runtime_failure("))
+            .map(|(body, _)| body)
+            .expect("composer renderer should remain inspectable");
+        assert_eq!(
+            composer.matches("this.refresh_active_suggestions(").count(),
+            2
+        );
+        assert!(!composer.contains("this.refresh_suggestions("));
+
+        let new_session = source
+            .split_once("    fn render_new_session_panel(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn show_turn_preview_rail("))
+            .map(|(body, _)| body)
+            .expect("new-session composer should remain inspectable");
+        assert_eq!(
+            new_session
+                .matches("this.refresh_active_suggestions(")
+                .count(),
+            2
+        );
+        assert!(!new_session.contains("this.refresh_suggestions("));
+
+        // Escape remembers the closed token, and every other close forgets it.
+        assert!(source.contains("self.suggestion_dismissed = dismissed;"));
+        assert!(source.contains("self.suggestion_dismissed = None;"));
     }
 
     #[test]
