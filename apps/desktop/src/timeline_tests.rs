@@ -15,6 +15,106 @@ impl Render for LiveTimelineProbe {
     }
 }
 
+/// Mounts the focused timeline boundary the way the workbench shell does.
+struct ComposerRetentionProbe {
+    workbench: Entity<VibexWorkbench>,
+}
+
+impl Render for ComposerRetentionProbe {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let timeline = self
+            .workbench
+            .update(cx, |workbench, cx| workbench.ensure_timeline_view(cx));
+        div().size_full().child(timeline)
+    }
+}
+
+/// A timeline-only repaint rebuilds the timeline boundary and leaves the
+/// composer, which is its own retained subtree, alone.
+#[gpui::test]
+fn a_timeline_repaint_reuses_the_composer(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let session_id = VibexSessionId::parse("session_composer_reuse").unwrap();
+    let slot: Rc<RefCell<Option<Entity<VibexWorkbench>>>> = Rc::new(RefCell::new(None));
+    let stored = slot.clone();
+    let (_, cx) = cx.add_window_view(move |window, cx| {
+        let workbench = cx.new(|cx| {
+            let mut ui_state = DesktopUiStateV1::default();
+            ui_state.appearance.locale = LocaleMode::En;
+            ui_state.session.turn_preview_rail = false;
+            let mut workbench =
+                VibexWorkbench::with_initial_state(None, ui_state, None, window, cx);
+            workbench.agent_loading = false;
+            workbench.selected_session_id = Some(session_id.clone());
+            workbench.view_session_id = Some(session_id.clone());
+            workbench
+                .timeline
+                .replace_authoritative(session_id.clone(), Vec::new());
+            workbench.rebuild_timeline_sizes();
+            workbench
+        });
+        *stored.borrow_mut() = Some(workbench.clone());
+        ComposerRetentionProbe { workbench }
+    });
+    let workbench = slot
+        .borrow()
+        .clone()
+        .expect("the probe mounted the workbench");
+    for _ in 0..3 {
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+    }
+    let timeline = workbench
+        .read_with(cx, |workbench, _| workbench.timeline_view.clone())
+        .expect("the shell mounted the timeline boundary");
+    let composer = workbench
+        .read_with(cx, |workbench, _| {
+            workbench
+                .composer_views
+                .get("session_composer_reuse")
+                .cloned()
+        })
+        .expect("the timeline mounted the composer");
+    let timeline_before = timeline.read_with(cx, |view, _| view.render_count.get());
+    let composer_before = composer.read_with(cx, |view, _| view.render_count.get());
+    for _ in 0..3 {
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+    }
+    assert_eq!(
+        composer.read_with(cx, |view, _| view.render_count.get()),
+        composer_before,
+        "the composer must be retained while nothing changes"
+    );
+
+    workbench.update(cx, |workbench, cx| workbench.notify_timeline_surfaces(cx));
+    let mut settled = None;
+    for _ in 0..5 {
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+        let count = composer.read_with(cx, |view, _| view.render_count.get());
+        match settled {
+            None => settled = Some(count),
+            Some(first) => assert_eq!(
+                count, first,
+                "the composer must settle after the timeline repaint instead of \
+                 rebuilding on every frame"
+            ),
+        }
+    }
+
+    assert!(
+        timeline.read_with(cx, |view, _| view.render_count.get()) > timeline_before,
+        "the timeline boundary must rebuild for its own repaint"
+    );
+}
+
 fn live_timeline_item(sequence: i64, payload: TimelinePayload) -> TimelineItem {
     TimelineItem {
         id: TimelineItemId::parse(format!("timeline_layout-{sequence}")).unwrap(),

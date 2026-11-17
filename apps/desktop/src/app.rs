@@ -10003,6 +10003,8 @@ impl Render for SessionTerminalView {
 /// workbench center uses this one.
 struct TimelineView {
     workbench: WeakEntity<VibexWorkbench>,
+    #[cfg(test)]
+    render_count: Cell<usize>,
 }
 
 impl TimelineView {
@@ -10010,18 +10012,78 @@ impl TimelineView {
         cx.observe(workbench, |_, _, cx| cx.notify()).detach();
         Self {
             workbench: workbench.downgrade(),
+            #[cfg(test)]
+            render_count: Cell::new(0),
         }
     }
 }
 
 impl Render for TimelineView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        #[cfg(test)]
+        self.render_count.set(self.render_count.get() + 1);
         let Some(workbench) = self.workbench.upgrade() else {
             return Empty.into_any_element();
         };
         let owner = cx.entity_id();
         motion::with_hover_owner(owner, || {
             workbench.update(cx, |this, cx| this.render_agent_workbench(window, cx))
+        })
+    }
+}
+
+/// The composer's own render boundary.
+///
+/// The composer is one pane's surface, but it used to be built inside the pane
+/// view's render: a streamed token notifies the timeline boundary, and the
+/// composer's whole element tree was rebuilt with it. As an entity it is a
+/// retained subtree of its own, so only a workbench notify — the state the
+/// shell owns: the session, the runtime controls, the draft — builds it again.
+///
+/// The composer reads the borrowed view for its session (`view_session_id` and
+/// everything derived from it), so it borrows that view for its own render, the
+/// way the virtual list does for its rows.
+struct ComposerView {
+    workbench: WeakEntity<VibexWorkbench>,
+    session_id: Option<VibexSessionId>,
+    enabled: bool,
+    #[cfg(test)]
+    render_count: Cell<usize>,
+}
+
+impl ComposerView {
+    fn new(
+        workbench: &Entity<VibexWorkbench>,
+        session_id: Option<VibexSessionId>,
+        enabled: bool,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        // The composer renders workbench state, so a workbench notify has to
+        // refresh it. Dropping the subscription would freeze it on frame one.
+        cx.observe(workbench, |_, _, cx| cx.notify()).detach();
+        Self {
+            workbench: workbench.downgrade(),
+            session_id,
+            enabled,
+            #[cfg(test)]
+            render_count: Cell::new(0),
+        }
+    }
+}
+
+impl Render for ComposerView {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        #[cfg(test)]
+        self.render_count.set(self.render_count.get() + 1);
+        let Some(workbench) = self.workbench.upgrade() else {
+            return Empty.into_any_element();
+        };
+        let session_id = self.session_id.clone();
+        let enabled = self.enabled;
+        workbench.update(cx, |this, cx| {
+            this.with_session_view_for_render(session_id.as_ref(), |this| {
+                this.render_composer(window, cx, enabled)
+            })
         })
     }
 }
@@ -11272,6 +11334,12 @@ pub struct VibexWorkbench {
     /// pane id alone, opening a second group reused the first group's view,
     /// which kept rendering that group, or nothing once it was dissolved.
     session_group_pane_views: BTreeMap<(String, String), Entity<SessionGroupPaneView>>,
+    /// The composer's render boundary per session, created on first use.
+    ///
+    /// A composer belongs to one pane, so it is keyed by the session that pane
+    /// is showing. Holding the entity here keeps it alive across frames; the
+    /// map is cleared with the pane views it is mounted beside.
+    composer_views: BTreeMap<String, Entity<ComposerView>>,
     sidebar_organization_drop_target: Option<SidebarOrganizationDropTarget>,
     sidebar_organization_root_drop_target:
         Option<(Vec<SidebarOrganizationItem>, SidebarOrganizationScope)>,
@@ -13060,6 +13128,7 @@ impl VibexWorkbench {
             session_group_view_errors: BTreeMap::new(),
             session_group_available_width_rem: 72.0,
             session_group_pane_views: BTreeMap::new(),
+            composer_views: BTreeMap::new(),
             sidebar_organization_drop_target: None,
             sidebar_organization_root_drop_target: None,
             sidebar_auto_archive_task: None,
@@ -28421,6 +28490,7 @@ impl VibexWorkbench {
         self.session_views.remove(session_id);
         self.session_view_lru.retain(|cached| cached != session_id);
         self.pending_composer_geometries.remove(session_id);
+        self.composer_views.remove(session_id);
     }
 
     /// Parks a Composer measurement for the session it was taken for.
@@ -54586,7 +54656,9 @@ impl VibexWorkbench {
         // workspace once every pane has rendered, not here: re-borrowing the
         // primary between panes would store and reload a view per pane for
         // nothing.
-        let composer = self.render_composer(window, cx, focused);
+        let composer = self
+            .ensure_composer_view(Some(&pane_session_id), focused, cx)
+            .into_any_element();
         self.session_group_pane_with_composer(conversation, conversation_find, composer, window, cx)
     }
 
@@ -63784,7 +63856,10 @@ impl VibexWorkbench {
         let conversation_find = include_composer
             .then(|| self.render_conversation_find(cx))
             .flatten();
-        let composer = include_composer.then(|| self.render_composer(window, cx, true));
+        let composer = include_composer.then(|| {
+            self.ensure_composer_view(live_session_id.as_ref(), true, cx)
+                .into_any_element()
+        });
         // Terminal mode routes its own near-fullscreen expansion through the
         // same timeline-collapse path as the input composer's expanded state.
         let composer_fullscreen = if self.composer_terminal_mode {
@@ -78449,6 +78524,33 @@ impl VibexWorkbench {
         view
     }
 
+    /// The composer's render boundary for `session_id`, created on first use.
+    ///
+    /// A pane that is not focused keeps its session's draft but cannot be typed
+    /// into, so the enabled flag is refreshed on the cached entity.
+    fn ensure_composer_view(
+        &mut self,
+        session_id: Option<&VibexSessionId>,
+        enabled: bool,
+        cx: &mut Context<Self>,
+    ) -> Entity<ComposerView> {
+        let key = session_id.map_or_else(|| "__none__".to_string(), |id| id.as_str().to_string());
+        if let Some(view) = self.composer_views.get(&key) {
+            let view = view.clone();
+            if view.read(cx).enabled != enabled {
+                view.update(cx, |this, cx| {
+                    this.enabled = enabled;
+                    cx.notify();
+                });
+            }
+            return view;
+        }
+        let workbench = cx.entity();
+        let view = cx.new(|cx| ComposerView::new(&workbench, session_id.cloned(), enabled, cx));
+        self.composer_views.insert(key, view.clone());
+        view
+    }
+
     /// Repaints the surfaces that draw a session's timeline when nothing else
     /// in the workbench changed.
     ///
@@ -79372,6 +79474,7 @@ impl VibexWorkbench {
                         .is_some_and(|group| group.adapt_layout_to_width(width));
                     if changed {
                         this.session_group_pane_views.clear();
+                        this.composer_views.clear();
                         this.queue_ui_state();
                         this.publish_sidebar_invalidation();
                         cx.notify();
@@ -131715,7 +131818,7 @@ mod tests {
         // The composer is built while the pane's own view is borrowed.
         // Re-borrowing the primary between panes made a split store and reload a
         // view twice for every pane, every frame.
-        assert!(content.contains("let composer = self.render_composer(window, cx, focused);"));
+        assert!(content.contains(".ensure_composer_view(Some(&pane_session_id), focused, cx)"));
         // The find bar is built in the same borrow, and only for the focused
         // pane: it searches that pane's conversation, so a bar in every pane
         // would put two live inputs on one query.
