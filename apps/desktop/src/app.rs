@@ -105191,10 +105191,13 @@ mod tests {
         });
 
         // A failed turn joins its card and never also writes the strip.
-        workbench.update(cx, |this, _| {
+        workbench.update(cx, |this, cx| {
             this.report_send_failure(&session_id, Some(100), Some(&failed), "code: text".into());
             assert_eq!(this.agent_error, None);
             assert_eq!(this.pending_agent_failure_hints.len(), 1);
+            // The hint reaches the layer from the workbench's own render, so the
+            // queued failure has to mark it dirty for a retained frame.
+            cx.notify();
         });
         settle_hints(cx);
         assert_eq!(mounted_hint_count(cx), 1, "the frame delivers the card");
@@ -133307,7 +133310,7 @@ mod tests {
         let mark_span = Rc::new(Cell::new((0.0, 0.0)));
         let body = Rc::new(Cell::new((0.0, 0.0, 0.0)));
         let surface_span = Rc::new(Cell::new((0.0, 0.0)));
-        let (_, cx) = cx.add_window_view(|_, _| UserMessageGoalBadgeProbe {
+        let (probe, cx) = cx.add_window_view(|_, _| UserMessageGoalBadgeProbe {
             is_goal_message: is_goal_message.clone(),
             measured_mark_center: mark_center.clone(),
             measured_mark_span: mark_span.clone(),
@@ -133319,6 +133322,9 @@ mod tests {
         for (case, is_goal) in [("ordinary", false), ("goal", true)] {
             is_goal_message.set(is_goal);
             mark_center.set(0.0);
+            // The probe's state lives in untracked cells, so a retained frame
+            // only sees the new case when the owner is told it changed.
+            probe.update(cx, |_, cx| cx.notify());
             cx.run_until_parked();
             cx.update(|window, cx| {
                 let _ = window.draw(cx);
@@ -133376,7 +133382,7 @@ mod tests {
         let measured_marker_center = Rc::new(Cell::new(0.0));
         let measured_body = Rc::new(Cell::new((0.0, 0.0, 0.0)));
         let measured_next_row_top = Rc::new(Cell::new(0.0));
-        let (_, cx) = cx.add_window_view(|_, _| UserMessageDeliveryMarkerProbe {
+        let (probe, cx) = cx.add_window_view(|_, _| UserMessageDeliveryMarkerProbe {
             delivery: delivery.clone(),
             measured_marker_center: measured_marker_center.clone(),
             measured_body: measured_body.clone(),
@@ -133390,6 +133396,9 @@ mod tests {
         ] {
             delivery.set(case);
             measured_marker_center.set(0.0);
+            // The probe's state lives in untracked cells, so a retained frame
+            // only sees the new case when the owner is told it changed.
+            probe.update(cx, |_, cx| cx.notify());
             cx.run_until_parked();
             cx.update(|window, cx| {
                 let _ = window.draw(cx);

@@ -217,6 +217,10 @@ impl UsageView {
     }
 
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
+        // The caller has usually written the request or the loading flag by now,
+        // and a retained tree only sees a write it was told about. Notify before
+        // the backend check so a state-only refresh still draws.
+        cx.notify();
         let Some(backend) = self.backend.clone() else {
             return;
         };

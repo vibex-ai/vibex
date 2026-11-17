@@ -11255,6 +11255,10 @@ impl CodeWorkbench {
         };
         entry.frames_waited += 1;
         if !landed && entry.frames_waited < MARKDOWN_PREVIEW_CHUNK_MAX_WAIT_FRAMES {
+            // The chunk already handed over has not reached the list yet. The
+            // feed runs from the frame that renders the preview, so a retained
+            // workbench has to be asked for that frame explicitly.
+            cx.notify();
             return;
         }
         let start = entry.fed_bytes;
@@ -11265,6 +11269,9 @@ impl CodeWorkbench {
         entry.fed_bytes = end;
         entry.blocks_last_pushed = Some(blocks);
         entry.frames_waited = 0;
+        // The next chunk follows on the next frame; a retained workbench is only
+        // rebuilt when it is told the feed still has work to do.
+        cx.notify();
     }
 
     /// Whether a path's tab is on screen showing its rendered document.
@@ -23981,7 +23988,7 @@ mod tests {
         let total = source.len();
         assert!(total > 3 * MARKDOWN_PREVIEW_CHUNK_BYTES);
 
-        workbench.update(cx, |this, _cx| {
+        workbench.update(cx, |this, cx| {
             this.presentations.insert(
                 "BIG.md".to_string(),
                 FilePresentation::Markdown {
@@ -24001,6 +24008,9 @@ mod tests {
                 )
                 .expect("BIG.md target is valid");
             this.preview.focus("file:BIG.md");
+            // Opening a preview is a write to untracked pane state, so the frame
+            // that feeds the Markdown chunks has to be asked for explicitly.
+            cx.notify();
         });
         draw_window(cx);
 
