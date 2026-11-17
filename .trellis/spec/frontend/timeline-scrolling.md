@@ -99,6 +99,20 @@ MessageScrollerState::set_row_height_hints(impl IntoIterator<Item = Pixels>);
 MessageScroller::new_with_renderer(entity, id, state, |view: &mut V, index, window, cx| ...);
 ```
 
+All of these now exist on the kit fork's `feat/message-scroller-api` branch, but
+**not in the published `gpui-component 0.10.0` that this workspace resolves**, and
+the dependency-source policy (`.trellis/spec/backend/rust-dependency-sources.md`)
+forbids reaching a fork through `[patch.crates-io]` or a vendored copy without
+explicit approval. The published crate still gives the row renderer only an
+index, so a caller cannot build a row from `&mut self` without routing through a
+weak entity and a snapshot.
+
+Two things follow. The API gap is no longer the blocker — the *payoff* is
+(see §7.1: a layer only pays when its content is stable across scrolled frames).
+And until a release carries the new API, any migration would have to work
+through the published surface, which is a larger rewrite of the row builders
+than the geometry changes alone suggest.
+
 Until then, keep the per-turn virtual list and adopt only compatible
 `MessageScroller` affordances (for example, the log role or the jump-button
 visual language) without removing the pixel-scroll state.
@@ -125,10 +139,69 @@ stride. `MessageScroller` is itself a scroll container, so it cannot be dropped
 in as a sub-list — it would either build every row (full-height content) or
 nest a second scroll over the outer one.
 
-The sidebar can move to `MessageScroller` by giving the list ownership of the
-scroll. Flatten every section of the sidebar (project, workspace, folder,
-group, session run) into one row list, render it with
-`MessageScroller::new` (its renderer signature is already
+### 7.1 Why the migration does not pay off on its own
+
+Measured in a `VisualTestContext` workbench with 200 sessions, drawing a wheel
+scroll over the sidebar column:
+
+| Probe | Result |
+| --- | --- |
+| Sidebar's outer scroll container | `layer_frames_composited` stays 0 across every frame |
+| A bare scrolling `div` in the same harness | composites from its second scrolled frame |
+| Per frame while scrolling | prepaint 7–11 ms, build ~1.7 ms, paint ~0.7 ms |
+| Views built per frame | 1 (`views_built` 1, `views_reused` 1) |
+
+Two conclusions follow, and they are the reason this section is a record of a
+rejected plan rather than a to-do:
+
+- **`SidebarSessionRun` already virtualizes.** One view is built per scrolled
+  frame, not one per row. Swapping the element for `MessageScroller` cannot
+  improve on that; the remaining cost is the prepaint walk over the rows that
+  are on screen, which any list pays.
+- **The sidebar's container never composites a layer, so a list layer would not
+  engage either.** Instrumenting `fast::layers::policy::decide` shows the
+  container reaching `streak >= 2` and then losing its record to
+  `owner_animating`, which `eligible()` and the `Bypass` arm both reject. The
+  animation frame comes from `gpui_base::Scrollbar`'s fade: it calls
+  `Window::request_animation_frame` while its opacity animates, and
+  `request_animation_frame` attributes the request to `window.current_view()`.
+
+### 7.2 The scrollbar-overlay experiment
+
+`pinned_scrollbar` (see `apps/desktop/src/gpui_ext/mod.rs`) draws the bar as a
+child element of the view that owns the scroller, so the fade's animation frame
+is attributed to that view. Giving the bar a view of its own — an overlay held
+by `Window::use_keyed_state`, rebuilding the bar each frame from the handle —
+moves the attribution to the overlay. Measured A/B, twenty scrolled frames each,
+wall-clock delayed so the fade can settle:
+
+| Subject | Baseline | With the overlay |
+| --- | --- | --- |
+| Bare `div` with stable rows | `Composite` after promotion, paint 176 µs → 21 µs | same |
+| Sidebar, 200 sessions | 310.8 ms prepaint | 303.7 ms prepaint |
+| `im_channels` lane | 3.30 ms prepaint, 0 composited | 4.23 ms prepaint, 0 composited |
+
+The overlay does move the animation frame off the owner, and a container whose
+content is stable then reaches `Composite` and keeps it. It does **not** help
+either real surface: the sidebar's content is `changed` on every frame
+(`deps_unchanged=false` in `scroll_only`, i.e. its recorded dependencies move),
+so its layer is `Repaint`ed and then demoted after
+`DEMOTE_AFTER_CHANGED_FRAMES`, and the `im_channels` lane never composites for
+reasons of its own. Net cost was equal or slightly worse, so the experiment was
+reverted rather than merged.
+
+### 7.3 What has to be true before either migration is worth doing
+
+A scroll layer only pays for itself when its content is stable across scrolled
+frames. For the sidebar that means the recorded dependencies of the column must
+stop moving every frame — the P0b work of narrowing notifications, so that a
+scroll frame notifies the scroll container and not the whole workbench. Until
+that holds, neither `MessageScroller` nor an overlay scrollbar changes what the
+reader pays, and the existing `SidebarSessionRun` is the right shape.
+
+If the migration is revisited, the mechanics are unchanged: flatten every
+section (project, workspace, folder, group, session run) into one row list,
+render it with `MessageScroller::new` (its renderer signature is already
 `Fn(usize, &mut Window, &mut App) -> AnyElement`, matching the current
 `SidebarSessionRowBuilder`), give fixed-height session rows
 `set_row_height_hints`, and move `sidebar_scroll`'s semantics onto
