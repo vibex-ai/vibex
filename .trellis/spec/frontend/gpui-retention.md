@@ -35,6 +35,9 @@ or to gpui-fast.
   `ChildAgentRailView`, `SessionTerminalView`) observe the workbench, so a
   workbench notify rebuilds all of them. A hot path that reaches
   `cx.notify()` on the workbench has to be worth rebuilding the shell.
+- A list row that can be recycled or shifted carries an `ElementId` built from
+  its domain id, not its position, so prepending keeps its layout node and
+  element state. The timeline keys a row by session and turn.
 
 ## 4. Known upstream gaps
 
