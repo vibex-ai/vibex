@@ -28463,7 +28463,10 @@ impl VibexWorkbench {
         else {
             return;
         };
-        if let Some(geometry) = self.pending_composer_geometries.remove(&session_id) {
+        // Keep the entry: the prepaint hook compares the next measurement
+        // against it, so consuming it here made every frame look changed and
+        // notified the workbench from prepaint forever.
+        if let Some(geometry) = self.pending_composer_geometries.get(&session_id).copied() {
             self.composer_geometry = geometry;
         }
     }
@@ -131608,6 +131611,47 @@ mod tests {
             .expect("the terminal body should remain inspectable");
         assert!(body.contains("session: AgentSession"));
         assert!(!body.contains("self.selected_session()"));
+    }
+
+    /// Adopting a composer's parked geometry must not leave the prepaint
+    /// measurement looking changed forever: the hook notifies the workbench
+    /// only when the bounds actually moved.
+    #[gpui::test]
+    fn an_adopted_composer_geometry_reports_no_change(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let slot: Rc<RefCell<Option<Entity<VibexWorkbench>>>> = Rc::new(RefCell::new(None));
+        let stored = slot.clone();
+        let session_id = VibexSessionId::parse("session_geometry").unwrap();
+        let (_, cx) = cx.add_window_view(move |window, cx| {
+            let workbench = cx.new(|cx| {
+                let ui_state = DesktopUiStateV1::default();
+                let mut workbench =
+                    VibexWorkbench::with_initial_state(None, ui_state, None, window, cx);
+                workbench.view_session_id = Some(session_id.clone());
+                workbench
+            });
+            *stored.borrow_mut() = Some(workbench.clone());
+            gpui_component::Root::new(workbench, window, cx)
+        });
+        let workbench = slot
+            .borrow()
+            .clone()
+            .expect("the window built the workbench");
+        workbench.update(cx, |this, _cx| {
+            let bounds = Bounds::new(point(px(0.0), px(0.0)), size(px(100.0), px(40.0)));
+            assert!(
+                this.record_composer_geometry(Some("session_geometry"), |geometry| {
+                    geometry.surface_bounds = Some(bounds)
+                })
+            );
+            this.adopt_composer_geometry();
+            assert!(
+                !this.record_composer_geometry(Some("session_geometry"), |geometry| {
+                    geometry.surface_bounds = Some(bounds)
+                }),
+                "an unchanged measurement must not notify the workbench"
+            );
+        });
     }
 
     /// Every pane renders the same composer as the main workbench, reading its
