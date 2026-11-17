@@ -226,33 +226,43 @@ reveal, the rename row (measured, not hinted), drag/drop targets, and the
 scroll position memory. Steps must keep the existing sidebar tests green:
 `cargo test -p vibex-desktop --lib --locked sidebar` covers 94 cases.
 
-## 8. Which view a scroll notifies
+## 8. What a sidebar scroll actually costs
 
-A wheel over a `track_scroll` element does not merely move the offset: gpui
-notifies `window.current_view()`, the view whose render is building the tree at
-that moment. For the sidebar that view is `VibexWorkbench`, because
-`SidebarView::render` hands its own render to the workbench:
+A wheel over a `track_scroll` element notifies `window.current_view()`, captured
+when the element was painted. The sidebar's container is built inside
+`render_agent_sidebar`, which `SidebarView::render` runs through
+`workbench.update(cx, |this, cx| this.render_agent_sidebar(cx))`, so that view is
+the workbench.
 
-```rust
-workbench.update(cx, |this, cx| this.render_agent_sidebar(cx))
-```
+That sounds like the workbench is rebuilt on every wheel step, and measuring it
+shows it is not. In a release build with a 200-session column:
 
-So every sidebar wheel step rebuilds the workbench. Measured on a 200-session
-column in a release build, a frame that only redraws costs ~21 µs of prepaint and
-one layout call, while a frame that scrolls the sidebar costs 2.6–4.3 ms and
-30–33 layout calls. The scroll itself is a few rows; the rest is the workbench
-being laid out again around it.
+| Frame | Views built | Layout calls | Prepaint |
+| --- | --- | --- | --- |
+| Idle redraw | 1 | 1 | ~21 µs |
+| Sidebar scrolled 60 px | 1 | 30–33 | 2.3–3.8 ms |
+| Workbench notified | 2 | 1 | ~90 µs |
 
-This is the ceiling on everything else in this document. A scroll layer, a
-retained subtree, or a virtual list can only save the work its own container
-does, and here the container's owner redoes the whole window. Narrowing the
-notification is therefore the first thing to fix, ahead of any list migration:
+So the notification reaches the workbench, but only one view is built, and
+asking the workbench to render costs 90 µs — not the milliseconds a scroll does.
+The cost is in the scroll frame itself: `SidebarSessionRun` clears its rows on
+every frame and then, for each visible row, builds the element, calls
+`layout_as_root`, and calls `prepaint_at`. `AnyElement` is consumed by drawing,
+so the rows cannot be carried across frames; the run re-does that work for every
+row in the viewport plus the overscan band.
 
-- the sidebar's scroll container has to be built by a view that is not the
-  workbench, so `current_view()` names the sidebar;
-- that view needs the state the rows read — `sidebar_state`, the filtered
-  groups, the selection — without borrowing `&mut VibexWorkbench` for the whole
-  render, which today is what forces the workbench onto the stack.
+The scaling confirms it. Layout calls follow the band, not the window:
 
-Until then, treat sidebar scroll cost as a workbench-wide rebuild, and do not
-expect a container-level change to move it.
+| `SIDEBAR_SESSION_RUN_OVERSCAN_PX` | Layout calls | Prepaint (200 sessions) |
+| --- | --- | --- |
+| 480 | 36 | 6.4 ms |
+| 240 | 30 | 4.9 ms |
+| 160 | — | 4.4 ms |
+| 0 | 25 | 2.7 ms |
+
+That is why the constant was trimmed to 240 (§7.2 records the numbers): the band
+is the one term in the scroll's cost that a call site controls. Removing the
+rest means making a row cheap enough to rebuild, or giving the rows a cache the
+run can reuse — which is what a virtual list does internally, and why §7.1's
+`MessageScroller` migration would only pay once the row work is the cost that
+remains.
