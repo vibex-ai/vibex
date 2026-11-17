@@ -5590,6 +5590,88 @@ fn timeline_batch_should_repaint(
     unread_changed || agent_projection_should_repaint(active_tab, timeline_changed || needs_refetch)
 }
 
+/// What a batch of runtime UI signals asks the frame to draw again.
+///
+/// A retained frame only rebuilds the views it is told changed, so a batch that
+/// touched nothing but a session's own timeline should notify that surface
+/// instead of the whole workbench. Everything else keeps the conservative
+/// shell repaint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct RuntimeUiRepaint {
+    /// Whether any surface has to be drawn again.
+    dirty: bool,
+    /// Whether every dirty source was a session's timeline content, so the
+    /// shell around it can stay retained.
+    timeline_only: bool,
+}
+
+impl RuntimeUiRepaint {
+    fn none() -> Self {
+        Self::default()
+    }
+
+    /// The whole workbench, its observes and the surfaces it parents.
+    fn shell() -> Self {
+        Self {
+            dirty: true,
+            timeline_only: false,
+        }
+    }
+
+    /// A session's timeline surface alone.
+    fn timeline() -> Self {
+        Self {
+            dirty: true,
+            timeline_only: true,
+        }
+    }
+
+    fn from_bool(dirty: bool) -> Self {
+        if dirty { Self::shell() } else { Self::none() }
+    }
+
+    /// Folds one source's answer into the batch. The batch stays timeline-only
+    /// while every source that asked for a repaint was.
+    fn merge(&mut self, other: Self) {
+        if !other.dirty {
+            return;
+        }
+        self.timeline_only = if self.dirty {
+            self.timeline_only && other.timeline_only
+        } else {
+            other.timeline_only
+        };
+        self.dirty = true;
+    }
+}
+
+/// Classifies a live timeline batch: a repaint that only the timeline asked
+/// for stays off the shell.
+fn timeline_batch_repaint(
+    active_tab: &str,
+    unread_changed: bool,
+    sidebar_changed: bool,
+    child_timeline_changed: bool,
+    timeline_changed: bool,
+    needs_refetch: bool,
+) -> RuntimeUiRepaint {
+    let shell_changed = unread_changed || sidebar_changed || child_timeline_changed;
+    let repaint = timeline_batch_should_repaint(
+        active_tab,
+        shell_changed,
+        timeline_changed || child_timeline_changed,
+        needs_refetch,
+    );
+    if !repaint {
+        return RuntimeUiRepaint::none();
+    }
+    if shell_changed {
+        RuntimeUiRepaint::shell()
+    } else {
+        RuntimeUiRepaint::timeline()
+    }
+}
+
 fn timeline_virtual_rows_need_rebuild(turn_count: usize, row_size_count: usize) -> bool {
     turn_count != row_size_count
 }
@@ -15466,11 +15548,15 @@ impl VibexWorkbench {
                         .iter()
                         .any(|signal| matches!(signal, RuntimeUiSignal::Shutdown));
                     let stopped = entity.update(cx, |this, cx| {
-                        let dirty = this.apply_runtime_ui_signals(signals, cx);
-                        if dirty {
-                            cx.notify();
+                        let repaint = this.apply_runtime_ui_signals(signals, cx);
+                        if repaint.dirty {
+                            if repaint.timeline_only {
+                                this.notify_timeline_surfaces(cx);
+                            } else {
+                                cx.notify();
+                            }
                         }
-                        dirty
+                        repaint.dirty
                     });
                     if stop || stopped.is_err() {
                         break;
@@ -20491,11 +20577,15 @@ impl VibexWorkbench {
                         }
                     }
                     let stopped = entity.update(cx, |this, cx| {
-                        let dirty = this.apply_runtime_ui_signals(signals, cx);
-                        if dirty {
-                            cx.notify();
+                        let repaint = this.apply_runtime_ui_signals(signals, cx);
+                        if repaint.dirty {
+                            if repaint.timeline_only {
+                                this.notify_timeline_surfaces(cx);
+                            } else {
+                                cx.notify();
+                            }
                         }
-                        dirty
+                        repaint.dirty
                     });
                     if stopped.is_err() {
                         break;
@@ -20549,8 +20639,8 @@ impl VibexWorkbench {
         &mut self,
         signals: Vec<RuntimeUiSignal>,
         cx: &mut Context<Self>,
-    ) -> bool {
-        let mut dirty = false;
+    ) -> RuntimeUiRepaint {
+        let mut repaint = RuntimeUiRepaint::none();
         let mut timeline_events = Vec::new();
         // Attachment updates are published for every ACP message — far more
         // often than the token usage they carry actually changes. They are not
@@ -20571,55 +20661,81 @@ impl VibexWorkbench {
                     }
                     event => {
                         if !timeline_events.is_empty() {
-                            dirty |= self.apply_live_timeline_batch(
+                            repaint.merge(self.apply_live_timeline_batch(
                                 std::mem::take(&mut timeline_events),
                                 cx,
-                            );
+                            ));
                         }
-                        dirty |= self.apply_desktop_event(event, cx);
+                        repaint.merge(RuntimeUiRepaint::from_bool(
+                            self.apply_desktop_event(event, cx),
+                        ));
                     }
                 },
                 RuntimeUiSignal::Shutdown => {
                     if !timeline_events.is_empty() {
-                        self.apply_live_timeline_batch(std::mem::take(&mut timeline_events), cx);
+                        repaint.merge(
+                            self.apply_live_timeline_batch(
+                                std::mem::take(&mut timeline_events),
+                                cx,
+                            ),
+                        );
                     }
                     self.runtime_note = Some("Runtime stopped".to_string());
-                    dirty = true;
+                    repaint.merge(RuntimeUiRepaint::shell());
                 }
                 RuntimeUiSignal::RemoteReconnecting => {
                     if !timeline_events.is_empty() {
-                        self.apply_live_timeline_batch(std::mem::take(&mut timeline_events), cx);
+                        repaint.merge(
+                            self.apply_live_timeline_batch(
+                                std::mem::take(&mut timeline_events),
+                                cx,
+                            ),
+                        );
                     }
                     self.runtime_note =
                         Some("Remote runtime connection lost; reconnecting…".to_string());
-                    dirty = true;
+                    repaint.merge(RuntimeUiRepaint::shell());
                 }
                 RuntimeUiSignal::RuntimeRenamed(display_name) => {
                     if !timeline_events.is_empty() {
-                        self.apply_live_timeline_batch(std::mem::take(&mut timeline_events), cx);
+                        repaint.merge(
+                            self.apply_live_timeline_batch(
+                                std::mem::take(&mut timeline_events),
+                                cx,
+                            ),
+                        );
                     }
-                    dirty |= self.apply_runtime_rename(&display_name, cx);
+                    repaint.merge(RuntimeUiRepaint::from_bool(
+                        self.apply_runtime_rename(&display_name, cx),
+                    ));
                 }
                 RuntimeUiSignal::SidebarInvalidated => {
                     if !timeline_events.is_empty() {
-                        self.apply_live_timeline_batch(std::mem::take(&mut timeline_events), cx);
+                        repaint.merge(
+                            self.apply_live_timeline_batch(
+                                std::mem::take(&mut timeline_events),
+                                cx,
+                            ),
+                        );
                     }
                     // The invalidation is the whole message: it does not say
                     // which row changed, and it is the only notice a creation
                     // gets, so the authoritative list is re-read rather than
                     // patched.
                     self.load_agent_overview(cx);
-                    dirty = true;
+                    repaint.merge(RuntimeUiRepaint::shell());
                 }
             }
         }
         if !timeline_events.is_empty() {
-            dirty |= self.apply_live_timeline_batch(timeline_events, cx);
+            repaint.merge(self.apply_live_timeline_batch(timeline_events, cx));
         }
         for session_id in attachment_sessions {
-            dirty |= self.refresh_agent_token_usage(&session_id, cx);
+            repaint.merge(RuntimeUiRepaint::from_bool(
+                self.refresh_agent_token_usage(&session_id, cx),
+            ));
         }
-        dirty
+        repaint
     }
 
     fn load_agent_configured_catalog(&mut self, cx: &mut Context<Self>) {
@@ -30889,17 +31005,20 @@ impl VibexWorkbench {
                                 return false;
                             }
                             let dirty = match signal {
-                                AgentPollSignal::Timeline(page) => this.apply_live_timeline_batch(
-                                    page.items
-                                        .into_iter()
-                                        .map(|item| TimelineLiveEvent {
-                                            session_id: page.session_id.clone(),
-                                            sequence: item.sequence,
-                                            item,
-                                        })
-                                        .collect(),
-                                    cx,
-                                ),
+                                AgentPollSignal::Timeline(page) => {
+                                    this.apply_live_timeline_batch(
+                                        page.items
+                                            .into_iter()
+                                            .map(|item| TimelineLiveEvent {
+                                                session_id: page.session_id.clone(),
+                                                sequence: item.sequence,
+                                                item,
+                                            })
+                                            .collect(),
+                                        cx,
+                                    )
+                                    .dirty
+                                }
                                 AgentPollSignal::Session(session) => {
                                     let previous_session =
                                         this.registered_session(session.id.as_str());
@@ -30995,7 +31114,7 @@ impl VibexWorkbench {
         &mut self,
         events: Vec<TimelineLiveEvent>,
         cx: &mut Context<Self>,
-    ) -> bool {
+    ) -> RuntimeUiRepaint {
         let defer_streaming_work = should_defer_timeline_streaming_work(
             &self.ui_state.workbench.active_tab,
             self.new_session_open,
@@ -31066,9 +31185,11 @@ impl VibexWorkbench {
                     .flat_map(|batch| batch.iter().cloned())
                     .collect::<Vec<_>>(),
             );
-            return timeline_batch_should_repaint(
+            return timeline_batch_repaint(
                 &self.ui_state.workbench.active_tab,
-                unread_changed || sidebar_changed,
+                unread_changed,
+                sidebar_changed,
+                false,
                 false,
                 false,
             );
@@ -31137,10 +31258,12 @@ impl VibexWorkbench {
                 self.refresh_session_view_timeline(&session_id, cx);
             }
         }
-        timeline_batch_should_repaint(
+        timeline_batch_repaint(
             &self.ui_state.workbench.active_tab,
-            unread_changed || sidebar_changed || child_timeline_changed,
-            timeline_changed || child_timeline_changed,
+            unread_changed,
+            sidebar_changed,
+            child_timeline_changed,
+            timeline_changed,
             refetch_pending,
         )
     }
@@ -31472,7 +31595,7 @@ impl VibexWorkbench {
 
     fn apply_desktop_event(&mut self, event: DesktopEvent, cx: &mut Context<Self>) -> bool {
         match event {
-            DesktopEvent::Timeline(event) => self.apply_live_timeline_batch(vec![event], cx),
+            DesktopEvent::Timeline(event) => self.apply_live_timeline_batch(vec![event], cx).dirty,
             DesktopEvent::SessionUpdated(session) => {
                 // A snapshot that raced a removal describes a row the sidebar
                 // no longer has: a deletion the runtime has not answered yet,
@@ -78308,6 +78431,22 @@ impl VibexWorkbench {
         view
     }
 
+    /// Repaints the surfaces that draw a session's timeline when nothing else
+    /// in the workbench changed.
+    ///
+    /// A live batch that only touched a session's transcript would otherwise
+    /// notify the workbench, which every shell view observes: the sidebar, the
+    /// child Agent rail and the terminal would rebuild with it. Notifying the
+    /// timeline boundaries alone keeps them retained.
+    fn notify_timeline_surfaces(&self, cx: &mut Context<Self>) {
+        if let Some(view) = self.timeline_view.as_ref() {
+            view.update(cx, |_, cx| cx.notify());
+        }
+        for view in self.session_group_pane_views.values() {
+            view.update(cx, |_, cx| cx.notify());
+        }
+    }
+
     fn render_inline_sidebar(
         &mut self,
         visibility: WorkbenchVisibility,
@@ -112485,6 +112624,46 @@ mod tests {
             false,
             true
         ));
+
+        // A batch that only touched the focused timeline stays off the shell.
+        assert_eq!(
+            timeline_batch_repaint("agent", false, false, false, true, false),
+            RuntimeUiRepaint::timeline()
+        );
+        assert_eq!(
+            timeline_batch_repaint("agent", false, false, false, false, true),
+            RuntimeUiRepaint::timeline()
+        );
+        // Unread, a sidebar timestamp or a child rail change still needs it.
+        assert_eq!(
+            timeline_batch_repaint("agent", true, false, false, false, false),
+            RuntimeUiRepaint::shell()
+        );
+        assert_eq!(
+            timeline_batch_repaint("agent", false, true, false, false, false),
+            RuntimeUiRepaint::shell()
+        );
+        assert_eq!(
+            timeline_batch_repaint("agent", false, false, true, false, false),
+            RuntimeUiRepaint::shell()
+        );
+        // A route that does not draw the timeline draws nothing at all.
+        assert_eq!(
+            timeline_batch_repaint("usage", false, false, false, true, false),
+            RuntimeUiRepaint::none()
+        );
+    }
+
+    #[test]
+    fn a_shell_repaint_wins_over_a_timeline_one_in_one_batch() {
+        let mut batch = RuntimeUiRepaint::none();
+        batch.merge(RuntimeUiRepaint::timeline());
+        assert!(batch.dirty && batch.timeline_only);
+        batch.merge(RuntimeUiRepaint::shell());
+        assert!(batch.dirty && !batch.timeline_only);
+        // A clean source leaves the batch as it was.
+        batch.merge(RuntimeUiRepaint::none());
+        assert!(batch.dirty && !batch.timeline_only);
     }
 
     #[test]
@@ -112792,7 +112971,11 @@ mod tests {
         assert!(event_bridge.contains("drop(signal_rx);"));
         assert!(event_bridge.contains("signal_rx.try_recv()"));
         assert!(event_bridge.contains("this.apply_runtime_ui_signals(signals, cx)"));
-        assert!(event_bridge.contains("if dirty {\n                            cx.notify();"));
+        // A batch that only changed a session's timeline notifies the timeline
+        // boundaries; everything else keeps the conservative shell repaint.
+        assert!(event_bridge.contains("repaint.timeline_only"));
+        assert!(event_bridge.contains("this.notify_timeline_surfaces(cx);"));
+        assert!(event_bridge.contains("cx.notify();"));
 
         let timeline_batch = source
             .split_once("    fn apply_live_timeline_batch(")
@@ -112838,9 +113021,7 @@ mod tests {
             .map(|(body, _)| body)
             .expect("desktop event handling should remain inspectable");
         assert!(event_handler.contains(") -> bool {"));
-        assert!(event_handler.contains(
-            "DesktopEvent::Timeline(event) => self.apply_live_timeline_batch(vec![event], cx)"
-        ));
+        assert!(event_handler.contains(".apply_live_timeline_batch(vec![event], cx).dirty"));
         assert!(!event_handler.contains("cx.notify();"));
     }
 
