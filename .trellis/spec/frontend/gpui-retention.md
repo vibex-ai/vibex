@@ -41,7 +41,10 @@ missing app notifications. Each reproduces with
 `cargo test -p vibex-desktop --lib <name>`.
 
 Four of them also fail with `GPUI_VIEW_RETENTION=0`, so they come from
-gpui-fast's retained layout or wheel path rather than view retention:
+gpui-fast's retained layout or wheel path rather than view retention. The three
+layout ones fail deterministically when run on their own, but the full library
+suite can pass them depending on test scheduling, so a green suite is not
+evidence that they are fixed:
 
 - `a_row_that_lands_in_one_frame_keeps_the_rows_under_it_still`
 - `a_windowed_run_keeps_the_rows_under_a_closing_row_still_on_the_bottom_edge`
