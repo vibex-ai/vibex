@@ -39,31 +39,33 @@ or to gpui-fast.
   its domain id, not its position, so prepending keeps its layout node and
   element state. The timeline keys a row by session and turn.
 
-## 4. Known upstream gaps
+## 4. Residual behavior differences
 
-The desktop library tests carry six failures under gpui-fast that are not
-missing app notifications. Each reproduces with
-`cargo test -p vibex-desktop --lib <name>`.
+Three probe failures the migration first surfaced were test artifacts that
+relied on an unconditional redraw, and are fixed:
 
-Four of them also fail with `GPUI_VIEW_RETENTION=0`, so they come from
-gpui-fast's retained layout or wheel path rather than view retention. The three
-layout ones fail deterministically when run on their own, but the full library
-suite can pass them depending on test scheduling, so a green suite is not
-evidence that they are fixed:
+- The cached-view hover probe moved the pointer onto a child that already sat
+  under it (the child fills the window's top), so no hover changed. It parks
+  the pointer below the child first.
+- The companion entrance probe drew once after advancing the clock, but the
+  lane's ticker is a repeating animation that reduced motion leaves still. It
+  asks the harness to notify before the draw.
+- The im-channels probe filled a maximized window, so both columns held a few
+  pixels more than their content and neither scrolled. It uses a 420px
+  definite-height viewport and asserts each column can scroll before the wheel.
+
+The windowed-run disclosure family still fails when run on its own
+(`cargo test -p vibex-desktop --lib <name>`):
 
 - `a_row_that_lands_in_one_frame_keeps_the_rows_under_it_still`
 - `a_windowed_run_keeps_the_rows_under_a_closing_row_still_on_the_bottom_edge`
 - `a_windowed_run_keeps_the_rows_under_a_disclosure_still_on_the_live_edge`
-- `im_channels::tests::the_two_columns_scroll_independently`, which also fails
-  with `GPUI_SCROLL_LAYERS=0`.
 
-Two are retention mechanics:
-
-- `a_click_and_a_hover_reach_an_element_inside_a_cached_view`: a hover over a
-  plainly mounted nested view does not rebuild it.
-- `arena::companion::tests::a_starting_turn_brings_the_companion_in_its_own_way`:
-  an inline `with_animation` ticker does not advance the pose during the
-  companion's entrance.
+The first frame after a toggle moves the row below with the disclosure. The
+probe refreshes every frame, so view retention is not involved; the difference
+is in the retained Taffy layout or the timeline's bottom-edge anchoring. The
+full library suite can pass it depending on scheduling, so a green suite does
+not clear it.
 
 ## 5. Timeline list layer
 
