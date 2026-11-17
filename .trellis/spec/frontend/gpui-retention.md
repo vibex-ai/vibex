@@ -78,16 +78,21 @@ virtual list and the child Agent rail stays on `MessageScroller`.
 
 ## 6. The composer boundary
 
-Moving the composer out of the pane view into its own retained subtree does not
-pay off yet, and the experiment was reverted rather than committed. A probe
-that counts renders showed the timeline boundary and the composer rebuilding on
-every frame even at rest, while a composer view that draws nothing stays
-retained. The workbench's observers do not fire in those frames, so the rebuild
-comes from a shared-state write inside the composer's component tree: a global
-written while the composer draws invalidates every view that read it, which is
-the per-frame registration the architecture notes describe. The boundary is
-worth redoing once that write is gone; on its own it reintroduces the per-pane
-borrow swap the pane views were written to avoid.
+The composer is its own retained subtree — `ComposerView`, keyed by session and
+mounted by the focused timeline and by each session-group pane. It observes the
+workbench and borrows its session's view for the render. It stays retained while
+nothing changes, which `a_timeline_repaint_reuses_the_composer` pins. A pane
+repaint still builds it once in that frame: the pane writes the workbench as it
+renders, and that write is foreign to the composer's record. Relaxing that — a
+write made by any subtree in a frame not counting against another subtree built
+in the same frame — is the generic fix, and was left undone as too risky for the
+gain.
+
+The every-frame rebuild that first hid the boundary was app-side. The composer's
+`on_prepaint` hook notified the workbench on every frame because
+`adopt_composer_geometry` took the parked measurement out of the map, so the
+next frame always compared against a default and reported a change. The hook now
+keeps the entry, and the workbench is no longer notified from prepaint.
 
 The app pattern itself is sound: on the local gpui-fast fork's
 `fix/retention-behaviour` branch, a view that updates the model it observes
