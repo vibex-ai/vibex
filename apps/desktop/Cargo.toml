@@ -19,6 +19,7 @@ gpui_tokio.workspace = true
 # editor highlights through the component's tree-sitter registry, so the
 # syntax list lives here now.
 gpui-component = { workspace = true, features = [
+  "gpui-fast",
   "tree-sitter-bash",
   "tree-sitter-c",
   "tree-sitter-cpp",
@@ -44,9 +45,9 @@ gpui-component = { workspace = true, features = [
   "tree-sitter-yaml",
   "tree-sitter-zig",
 ] }
-gpui-base.workspace = true
-gpui-fps.workspace = true
-gpui-kit-assets.workspace = true
+gpui-base = { workspace = true, features = ["gpui-fast"] }
+gpui-fps = { workspace = true, features = ["gpui-fast"] }
+gpui-kit-assets = { workspace = true, features = ["gpui-fast"] }
 anyhow.workspace = true
 image = { workspace = true, features = ["bmp", "gif", "ico", "jpeg", "png", "tiff", "webp"] }
 markdown.workspace = true
@@ -96,7 +97,7 @@ vibex-ui = { path = "../../crates/vibex-ui" }
 vibex-terminal = { path = "../../crates/terminal" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-gpui_wgpu = { package = "gpui-pre-wgpu", version = "=0.3.12" }
+gpui_wgpu = { package = "gpui-fast-wgpu", version = "=0.1.14" }
 libc.workspace = true
 # GTK 3 is still read for the desktop's caption layout and initialized so the
 # AppIndicator-era trays keep working; the crate line is 0.19 so it pulls a
