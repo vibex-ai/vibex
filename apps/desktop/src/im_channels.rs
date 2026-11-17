@@ -468,13 +468,19 @@ impl ImChannelsView {
             return;
         };
         self.busy = true;
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            backend
+                .management()
+                .delete_im_channel(vibex_backend::MutationRequest::new(channel_id))
+                .await
+                .map_err(backend_error)
+        });
         self.task = Some(cx.spawn(
             async move |weak: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
-                let result = backend
-                    .management()
-                    .delete_im_channel(vibex_backend::MutationRequest::new(channel_id))
-                    .await
-                    .map_err(backend_error);
+                let result = match runner.await {
+                    Ok(result) => result,
+                    Err(error) => Err(error.to_string()),
+                };
                 let _ = weak.update(cx, |this, cx| {
                     this.busy = false;
                     match result {
@@ -607,37 +613,45 @@ impl ImChannelsView {
             return;
         };
         self.busy = true;
+        // The IM service reconnects the channel when its default session
+        // changes, and the poller it starts boots with `tokio::spawn`. Polling
+        // that future from this GPUI task runs the spawn without a reactor and
+        // panics with "there is no reactor running", so the work goes to Tokio
+        // and the UI task only waits for the answer.
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            let selection = backend
+                .agent()
+                .runtime_selection(session.id.clone())
+                .await
+                .map_err(backend_error)?;
+            let defaults = ImSessionDefaults {
+                workspace_root: session.workspace_root.clone(),
+                workspace_mode: session.workspace_mode,
+                agent_id: selection.desired.agent_id.clone(),
+                auth_source: selection.desired.auth_source.clone(),
+                model: selection.desired.model.clone(),
+                reasoning_effort: selection.desired.reasoning_effort.clone(),
+                mode_id: selection.desired.mode_id.clone(),
+                config_values: selection.desired.config_values.clone(),
+            };
+            backend
+                .management()
+                .set_im_channel_default_session(vibex_backend::MutationRequest::new(
+                    vibex_backend::ImChannelDefaultSessionUpdate {
+                        channel_id,
+                        default_session: Some(defaults),
+                    },
+                ))
+                .await
+                .map(|_| ())
+                .map_err(backend_error)
+        });
         self.task = Some(cx.spawn(
             async move |weak: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
-                let result = async {
-                    let selection = backend
-                        .agent()
-                        .runtime_selection(session.id.clone())
-                        .await
-                        .map_err(backend_error)?;
-                    let defaults = ImSessionDefaults {
-                        workspace_root: session.workspace_root.clone(),
-                        workspace_mode: session.workspace_mode,
-                        agent_id: selection.desired.agent_id.clone(),
-                        auth_source: selection.desired.auth_source.clone(),
-                        model: selection.desired.model.clone(),
-                        reasoning_effort: selection.desired.reasoning_effort.clone(),
-                        mode_id: selection.desired.mode_id.clone(),
-                        config_values: selection.desired.config_values.clone(),
-                    };
-                    backend
-                        .management()
-                        .set_im_channel_default_session(vibex_backend::MutationRequest::new(
-                            vibex_backend::ImChannelDefaultSessionUpdate {
-                                channel_id,
-                                default_session: Some(defaults),
-                            },
-                        ))
-                        .await
-                        .map(|_| ())
-                        .map_err(backend_error)
-                }
-                .await;
+                let result = match runner.await {
+                    Ok(result) => result,
+                    Err(error) => Err(error.to_string()),
+                };
                 let _ = weak.update(cx, |this, cx| {
                     this.busy = false;
                     match result {
@@ -658,19 +672,27 @@ impl ImChannelsView {
         let Some(backend) = self.backend(cx) else {
             return;
         };
+        // Clearing the default reconnects the channel too; see
+        // `set_default_session` for why this belongs on the Tokio runtime.
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            backend
+                .management()
+                .set_im_channel_default_session(vibex_backend::MutationRequest::new(
+                    vibex_backend::ImChannelDefaultSessionUpdate {
+                        channel_id,
+                        default_session: None,
+                    },
+                ))
+                .await
+                .map(|_| ())
+                .map_err(backend_error)
+        });
         self.task = Some(cx.spawn(
             async move |weak: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
-                let result = backend
-                    .management()
-                    .set_im_channel_default_session(vibex_backend::MutationRequest::new(
-                        vibex_backend::ImChannelDefaultSessionUpdate {
-                            channel_id,
-                            default_session: None,
-                        },
-                    ))
-                    .await
-                    .map(|_| ())
-                    .map_err(backend_error);
+                let result = match runner.await {
+                    Ok(result) => result,
+                    Err(error) => Err(error.to_string()),
+                };
                 let _ = weak.update(cx, |this, cx| {
                     match result {
                         Ok(()) => {
@@ -691,8 +713,8 @@ impl ImChannelsView {
             return;
         };
         self.busy = true;
-        self.task = Some(cx.spawn(async move |weak: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
-            let result = backend
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            backend
                 .management()
                 .create_im_pairing_code(vibex_backend::MutationRequest::new(ImPairingRequest {
                     channel_id,
@@ -701,7 +723,13 @@ impl ImChannelsView {
                     target_chat_id: None,
                 }))
                 .await
-                .map_err(backend_error);
+                .map_err(backend_error)
+        });
+        self.task = Some(cx.spawn(async move |weak: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+            let result = match runner.await {
+                Ok(result) => result,
+                Err(error) => Err(error.to_string()),
+            };
             let _ = weak.update(cx, |this, cx| {
                 this.busy = false;
                 match result {
@@ -729,13 +757,19 @@ impl ImChannelsView {
         let Some(backend) = self.backend(cx) else {
             return;
         };
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            backend
+                .management()
+                .revoke_im_principal(vibex_backend::MutationRequest::new(principal_id))
+                .await
+                .map_err(backend_error)
+        });
         self.task = Some(cx.spawn(
             async move |weak: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
-                let result = backend
-                    .management()
-                    .revoke_im_principal(vibex_backend::MutationRequest::new(principal_id))
-                    .await
-                    .map_err(backend_error);
+                let result = match runner.await {
+                    Ok(result) => result,
+                    Err(error) => Err(error.to_string()),
+                };
                 let _ = weak.update(cx, |this, cx| {
                     match result {
                         Ok(()) => this.reload_selected(cx),
@@ -766,19 +800,25 @@ impl ImChannelsView {
         } else {
             filter.retain(|id| id != event_id);
         }
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            backend
+                .management()
+                .set_im_channel_event_filter(vibex_backend::MutationRequest::new(
+                    vibex_backend::ImChannelEventFilterUpdate {
+                        channel_id: channel.channel_id.clone(),
+                        event_filter: filter,
+                    },
+                ))
+                .await
+                .map(|_| ())
+                .map_err(backend_error)
+        });
         self.task = Some(cx.spawn(
             async move |weak: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
-                let result = backend
-                    .management()
-                    .set_im_channel_event_filter(vibex_backend::MutationRequest::new(
-                        vibex_backend::ImChannelEventFilterUpdate {
-                            channel_id: channel.channel_id.clone(),
-                            event_filter: filter,
-                        },
-                    ))
-                    .await
-                    .map(|_| ())
-                    .map_err(backend_error);
+                let result = match runner.await {
+                    Ok(result) => result,
+                    Err(error) => Err(error.to_string()),
+                };
                 let _ = weak.update(cx, |this, cx| {
                     match result {
                         Ok(()) => {
@@ -803,16 +843,22 @@ impl ImChannelsView {
         let Some(backend) = self.backend(cx) else {
             return;
         };
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            backend
+                .management()
+                .set_im_channel_locale(vibex_backend::MutationRequest::new(
+                    vibex_backend::ImChannelLocaleUpdate { channel_id, locale },
+                ))
+                .await
+                .map(|_| ())
+                .map_err(backend_error)
+        });
         self.task = Some(cx.spawn(
             async move |weak: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
-                let result = backend
-                    .management()
-                    .set_im_channel_locale(vibex_backend::MutationRequest::new(
-                        vibex_backend::ImChannelLocaleUpdate { channel_id, locale },
-                    ))
-                    .await
-                    .map(|_| ())
-                    .map_err(backend_error);
+                let result = match runner.await {
+                    Ok(result) => result,
+                    Err(error) => Err(error.to_string()),
+                };
                 let _ = weak.update(cx, |this, cx| {
                     match result {
                         Ok(()) => {
@@ -832,13 +878,19 @@ impl ImChannelsView {
         let Some(backend) = self.backend(cx) else {
             return;
         };
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            backend
+                .management()
+                .revoke_im_binding(vibex_backend::MutationRequest::new(binding_id))
+                .await
+                .map_err(backend_error)
+        });
         self.task = Some(cx.spawn(
             async move |weak: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
-                let result = backend
-                    .management()
-                    .revoke_im_binding(vibex_backend::MutationRequest::new(binding_id))
-                    .await
-                    .map_err(backend_error);
+                let result = match runner.await {
+                    Ok(result) => result,
+                    Err(error) => Err(error.to_string()),
+                };
                 let _ = weak.update(cx, |this, cx| {
                     match result {
                         Ok(()) => {
@@ -2095,6 +2147,52 @@ mod tests {
         assert!(source.contains("hint_layer::push"));
         assert!(!source.contains(concat!(".when_some(self.", "notice")));
         assert!(!source.contains(concat!(".when_some(self.", "error")));
+    }
+
+    /// Finds backend futures the page polls on GPUI's own executor.
+    ///
+    /// The IM service reconnects a channel with `tokio::spawn`, a reactor-backed
+    /// boot, so a backend future awaited by a `cx.spawn` body that is not inside
+    /// `gpui_tokio::Tokio::spawn` panics with "there is no reactor running" —
+    /// what made "set as default" take the app down. Only production code is
+    /// scanned: the test module quotes the shapes this looks for.
+    fn backend_awaited_on_the_gpui_executor() -> Vec<String> {
+        let source = include_str!("im_channels.rs")
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .unwrap_or_default();
+        let mut depth = 0usize;
+        let mut tokio_depth: Option<usize> = None;
+        let mut found = Vec::new();
+        for line in source.lines() {
+            let guarded = tokio_depth.is_some_and(|open| depth > open);
+            if !guarded && line.contains("backend") && line.contains(".await") {
+                found.push(line.trim().to_string());
+            }
+            if line.contains("gpui_tokio::Tokio::spawn") {
+                tokio_depth = Some(depth);
+            }
+            depth += line.matches('{').count();
+            depth = depth.saturating_sub(line.matches('}').count());
+        }
+        found
+    }
+
+    /// Every backend request the page makes leaves the GPUI executor.
+    ///
+    /// A Reactor-backed service call awaited on a foreground task panics the
+    /// worker and takes the workbench with it, so the bridge is a contract
+    /// rather than a style choice.
+    #[test]
+    fn backend_requests_run_on_the_tokio_runtime() {
+        let offenders = backend_awaited_on_the_gpui_executor();
+        assert!(
+            offenders.is_empty(),
+            "these lines poll a backend future on GPUI's executor, where the IM \
+             service's `tokio::spawn` panics with 'there is no reactor running'; \
+             hand the future to `gpui_tokio::Tokio::spawn` instead:\n  {}",
+            offenders.join("\n  ")
+        );
     }
 
     /// The page body follows the settings page measure, so the master–detail
