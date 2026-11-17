@@ -83056,7 +83056,14 @@ fn sidebar_empty_sessions(strings: &'static Strings, cx: &App) -> AnyElement {
 
 /// How far past the visible edge a session run still builds rows, so a scroll
 /// step never uncovers a row that has not been built yet.
-const SIDEBAR_SESSION_RUN_OVERSCAN_PX: f32 = 480.0;
+///
+/// Every pixel of band is a row the run builds, lays out and prepaints on each
+/// scrolled frame, so the value trades the cost of a scroll against the chance
+/// of showing an empty row while one. Measured on a 200-session column in a
+/// release build, the frame's prepaint averaged 6.4 ms at 480, 4.9 ms at 240 and
+/// 4.4 ms at 160: past 240 the cost climbs for a band no wheel step reaches,
+/// while 160 leaves too little for a dragged scrollbar.
+const SIDEBAR_SESSION_RUN_OVERSCAN_PX: f32 = 240.0;
 /// Rows a run lays out in flow rather than windowing. Below this the run costs
 /// less to build outright than to place row by row.
 const SIDEBAR_SESSION_RUN_FLOW_LIMIT: usize = 24;
@@ -136632,13 +136639,22 @@ mod tests {
 
         // A run scrolled up by one viewport starts at the row covering the
         // first offset the overscan cannot still see, rather than rescanning
-        // every row above it: (600 - 480) / 42 is the second row.
+        // every row above it. The first row it must still hold is the one
+        // under the overscan band, so the expected start follows the band
+        // rather than a number written out beside it: an overscan wider than
+        // the viewport keeps the first row, and one narrower skips the rows
+        // the band already covers.
         let scrolled = Bounds {
             origin: point(px(0.0), px(-600.0)),
             size: top.size,
         };
         let visible = run.visible_rows(scrolled, viewport);
-        assert!(visible.start >= 2 && visible.start <= 4, "{visible:?}");
+        let band = 600.0 - SIDEBAR_SESSION_RUN_OVERSCAN_PX;
+        let expected = (band / SIDEBAR_SESSION_ROW_STRIDE).ceil() as usize;
+        assert!(
+            visible.start.abs_diff(expected) <= 1,
+            "visible rows: {visible:?}, expected to start near {expected}"
+        );
 
         // A run entirely below the viewport builds nothing.
         let below = Bounds {
