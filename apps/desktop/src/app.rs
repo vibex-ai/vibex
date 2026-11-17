@@ -31004,21 +31004,18 @@ impl VibexWorkbench {
                             if this.session_generation != generation {
                                 return false;
                             }
-                            let dirty = match signal {
-                                AgentPollSignal::Timeline(page) => {
-                                    this.apply_live_timeline_batch(
-                                        page.items
-                                            .into_iter()
-                                            .map(|item| TimelineLiveEvent {
-                                                session_id: page.session_id.clone(),
-                                                sequence: item.sequence,
-                                                item,
-                                            })
-                                            .collect(),
-                                        cx,
-                                    )
-                                    .dirty
-                                }
+                            let repaint = match signal {
+                                AgentPollSignal::Timeline(page) => this.apply_live_timeline_batch(
+                                    page.items
+                                        .into_iter()
+                                        .map(|item| TimelineLiveEvent {
+                                            session_id: page.session_id.clone(),
+                                            sequence: item.sequence,
+                                            item,
+                                        })
+                                        .collect(),
+                                    cx,
+                                ),
                                 AgentPollSignal::Session(session) => {
                                     let previous_session =
                                         this.registered_session(session.id.as_str());
@@ -31054,12 +31051,12 @@ impl VibexWorkbench {
                                     {
                                         this.refresh_last_timeline_size();
                                     }
-                                    session_update_should_repaint(
+                                    RuntimeUiRepaint::from_bool(session_update_should_repaint(
                                         &this.ui_state.workbench.active_tab,
                                         this.new_session_open,
                                         changed,
                                         sidebar_changed,
-                                    )
+                                    ))
                                 }
                                 AgentPollSignal::RuntimeSelection(state) => {
                                     let changed = this.apply_runtime_selection_state(
@@ -31067,10 +31064,10 @@ impl VibexWorkbench {
                                         *state,
                                         cx,
                                     );
-                                    agent_projection_should_repaint(
+                                    RuntimeUiRepaint::from_bool(agent_projection_should_repaint(
                                         &this.ui_state.workbench.active_tab,
                                         changed,
-                                    )
+                                    ))
                                 }
                                 AgentPollSignal::RuntimeUsage { session_id, usage } => {
                                     let changed = if this.selected_session_id.as_ref()
@@ -31082,21 +31079,25 @@ impl VibexWorkbench {
                                         this.token_usage = usage;
                                         true
                                     };
-                                    agent_projection_should_repaint(
+                                    RuntimeUiRepaint::from_bool(agent_projection_should_repaint(
                                         &this.ui_state.workbench.active_tab,
                                         changed,
-                                    )
+                                    ))
                                 }
                                 AgentPollSignal::Terminals(terminals) => {
                                     let changed = this.sync_terminal_sessions(terminals, cx);
-                                    agent_projection_should_repaint(
+                                    RuntimeUiRepaint::from_bool(agent_projection_should_repaint(
                                         &this.ui_state.workbench.active_tab,
                                         changed,
-                                    )
+                                    ))
                                 }
                             };
-                            if dirty {
-                                cx.notify();
+                            if repaint.dirty {
+                                if repaint.timeline_only {
+                                    this.notify_timeline_surfaces(cx);
+                                } else {
+                                    cx.notify();
+                                }
                             }
                             true
                         })
