@@ -25,10 +25,12 @@ or to gpui-fast.
   unless its owner is notified (`cx.notify()`), the same rule cached views
   already impose.
 - Keep a notification as narrow as the change. `apply_runtime_ui_signals`
-  answers with `RuntimeUiRepaint { dirty, timeline_only }`. A timeline-only
-  batch is applied by `notify_timeline_surfaces` (the focused `TimelineView`
-  and the `SessionGroupPaneView`s); every other batch notifies the workbench.
-  The agent poll classifies its timeline page the same way.
+  answers with `RuntimeUiRepaint { dirty, shell, timeline, sidebar }` and
+  `apply_runtime_ui_repaint` applies it: a shell answer notifies the workbench,
+  otherwise the named boundaries are notified (`notify_timeline_surfaces` for
+  the focused `TimelineView` and the `SessionGroupPaneView`s,
+  `notify_sidebar_surface` for the `SidebarView`). The agent poll classifies its
+  timeline page the same way.
 - The shell views (`SidebarView`, `TimelineView`, `SessionGroupPaneView`,
   `ChildAgentRailView`, `SessionTerminalView`) observe the workbench, so a
   workbench notify rebuilds all of them. A hot path that reaches
