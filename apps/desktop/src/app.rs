@@ -63688,6 +63688,20 @@ impl VibexWorkbench {
                                                     );
                                                     Some(
                                                         h_flex()
+                                                            // A turn keeps its layout node by id
+                                                            // when older history is prepended and
+                                                            // every index shifts under it.
+                                                            .id(ElementId::Name(
+                                                                format!(
+                                                                    "agent-timeline-turn-{}-{}",
+                                                                    timeline_render_session_id
+                                                                        .as_ref()
+                                                                        .map(VibexSessionId::as_str)
+                                                                        .unwrap_or("none"),
+                                                                    turn.id
+                                                                )
+                                                                .into(),
+                                                            ))
                                                             .w_full()
                                                             .h(row_height)
                                                             .justify_center()
