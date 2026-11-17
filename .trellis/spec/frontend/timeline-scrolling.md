@@ -161,10 +161,18 @@ rejected plan rather than a to-do:
 - **The sidebar's container never composites a layer, so a list layer would not
   engage either.** Instrumenting `fast::layers::policy::decide` shows the
   container reaching `streak >= 2` and then losing its record to
-  `owner_animating`, which `eligible()` and the `Bypass` arm both reject. The
-  animation frame comes from `gpui_base::Scrollbar`'s fade: it calls
-  `Window::request_animation_frame` while its opacity animates, and
-  `request_animation_frame` attributes the request to `window.current_view()`.
+  `owner_animating` (`ineligible=false owner_animating=true` on every scrolled
+  frame), which the `Bypass` arm rejects. The animation frame comes from
+  `gpui_base::Scrollbar`'s fade: it calls `Window::request_animation_frame`
+  while its opacity animates, and `request_animation_frame` attributes the
+  request to `window.current_view()` — the workbench, which also owns the
+  scroller.
+
+The fade samples `Instant::now`, so a test that draws its frames in a few
+milliseconds keeps the animation running for every one of them; that is why the
+blocker shows up in tests even when a reader's own machine would let the fade
+settle between scrolls. Sleeping past the fade before each frame does not make
+the sidebar composite either, so the finding is not an artifact of the harness.
 
 ### 7.2 The scrollbar-overlay experiment
 
@@ -177,7 +185,7 @@ wall-clock delayed so the fade can settle:
 
 | Subject | Baseline | With the overlay |
 | --- | --- | --- |
-| Bare `div` with stable rows | `Composite` after promotion, paint 176 µs → 21 µs | same |
+| Bare `div` with stable rows | composites, paint ~176 µs | `Composite` held, paint ~21 µs |
 | Sidebar, 200 sessions | 310.8 ms prepaint | 303.7 ms prepaint |
 | `im_channels` lane | 3.30 ms prepaint, 0 composited | 4.23 ms prepaint, 0 composited |
 
@@ -193,11 +201,14 @@ reverted rather than merged.
 ### 7.3 What has to be true before either migration is worth doing
 
 A scroll layer only pays for itself when its content is stable across scrolled
-frames. For the sidebar that means the recorded dependencies of the column must
-stop moving every frame — the P0b work of narrowing notifications, so that a
-scroll frame notifies the scroll container and not the whole workbench. Until
-that holds, neither `MessageScroller` nor an overlay scrollbar changes what the
-reader pays, and the existing `SidebarSessionRun` is the right shape.
+frames. Once the overlay moved the animation frame off the owner, the sidebar's
+layer was promoted and then demoted again eight frames later: `scroll_only`
+reported `deps_unchanged=false`, meaning the column's recorded dependencies move
+on every scrolled frame, so its content is repainted rather than composited. For
+the sidebar that is the P0b work of narrowing notifications — a scroll frame
+should notify the scroll container, not the whole workbench — and until it holds,
+neither `MessageScroller` nor an overlay scrollbar changes what the reader pays.
+The existing `SidebarSessionRun` is the right shape meanwhile.
 
 If the migration is revisited, the mechanics are unchanged: flatten every
 section (project, workspace, folder, group, session run) into one row list,
