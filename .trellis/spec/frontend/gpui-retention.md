@@ -75,3 +75,20 @@ gpui-component 0.10.0 the published state still does not expose
 `scroll_by`, `viewport_bounds`, `offset`, `max_offset`, per-row size hints, or a
 row renderer that receives the owning view, so the transcript stays on its own
 virtual list and the child Agent rail stays on `MessageScroller`.
+
+## 6. The composer boundary
+
+Moving the composer out of the pane view into its own retained subtree does not
+pay off yet, and the experiment was reverted rather than committed. A probe
+that counts renders showed the timeline boundary and the composer rebuilding on
+every frame even at rest, while a composer view that draws nothing stays
+retained. The workbench's observers do not fire in those frames, so the rebuild
+comes from a shared-state write inside the composer's component tree: a global
+written while the composer draws invalidates every view that read it, which is
+the per-frame registration the architecture notes describe. The boundary is
+worth redoing once that write is gone; on its own it reintroduces the per-pane
+borrow swap the pane views were written to avoid.
+
+The app pattern itself is sound: on the local gpui-fast fork's
+`fix/retention-behaviour` branch, a view that updates the model it observes
+while rendering stays retained, and so do two siblings doing it to one model.
