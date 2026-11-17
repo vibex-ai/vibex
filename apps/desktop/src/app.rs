@@ -5600,9 +5600,12 @@ fn timeline_batch_should_repaint(
 struct RuntimeUiRepaint {
     /// Whether any surface has to be drawn again.
     dirty: bool,
-    /// Whether every dirty source was a session's timeline content, so the
-    /// shell around it can stay retained.
-    timeline_only: bool,
+    /// The whole workbench, its observers and the surfaces it parents.
+    shell: bool,
+    /// A session's timeline surface.
+    timeline: bool,
+    /// The sidebar.
+    sidebar: bool,
 }
 
 impl RuntimeUiRepaint {
@@ -5610,11 +5613,12 @@ impl RuntimeUiRepaint {
         Self::default()
     }
 
-    /// The whole workbench, its observes and the surfaces it parents.
+    /// The whole workbench, its observers and the surfaces it parents.
     fn shell() -> Self {
         Self {
             dirty: true,
-            timeline_only: false,
+            shell: true,
+            ..Self::none()
         }
     }
 
@@ -5622,7 +5626,17 @@ impl RuntimeUiRepaint {
     fn timeline() -> Self {
         Self {
             dirty: true,
-            timeline_only: true,
+            timeline: true,
+            ..Self::none()
+        }
+    }
+
+    /// The sidebar alone.
+    fn sidebar() -> Self {
+        Self {
+            dirty: true,
+            sidebar: true,
+            ..Self::none()
         }
     }
 
@@ -5630,23 +5644,21 @@ impl RuntimeUiRepaint {
         if dirty { Self::shell() } else { Self::none() }
     }
 
-    /// Folds one source's answer into the batch. The batch stays timeline-only
-    /// while every source that asked for a repaint was.
+    /// Folds one source's answer into the batch. A shell source covers the
+    /// narrower surfaces; the narrower flags are kept while no source asked for
+    /// the shell.
     fn merge(&mut self, other: Self) {
         if !other.dirty {
             return;
         }
-        self.timeline_only = if self.dirty {
-            self.timeline_only && other.timeline_only
-        } else {
-            other.timeline_only
-        };
         self.dirty = true;
+        self.shell |= other.shell;
+        self.timeline |= other.timeline;
+        self.sidebar |= other.sidebar;
     }
 }
 
-/// Classifies a live timeline batch: a repaint that only the timeline asked
-/// for stays off the shell.
+/// Classifies a live timeline batch into the surfaces it actually touched.
 fn timeline_batch_repaint(
     active_tab: &str,
     unread_changed: bool,
@@ -5655,20 +5667,26 @@ fn timeline_batch_repaint(
     timeline_changed: bool,
     needs_refetch: bool,
 ) -> RuntimeUiRepaint {
-    let shell_changed = unread_changed || sidebar_changed || child_timeline_changed;
-    let repaint = timeline_batch_should_repaint(
-        active_tab,
-        shell_changed,
-        timeline_changed || child_timeline_changed,
-        needs_refetch,
-    );
-    if !repaint {
+    // An unread badge or a child rail change is not something a narrower
+    // surface carries today.
+    if unread_changed || child_timeline_changed {
+        return RuntimeUiRepaint::shell();
+    }
+    if !timeline_batch_should_repaint(active_tab, sidebar_changed, timeline_changed, needs_refetch)
+    {
         return RuntimeUiRepaint::none();
     }
-    if shell_changed {
-        RuntimeUiRepaint::shell()
-    } else {
-        RuntimeUiRepaint::timeline()
+    let timeline_repaint =
+        agent_projection_should_repaint(active_tab, timeline_changed || needs_refetch);
+    match (timeline_repaint, sidebar_changed) {
+        (true, false) => RuntimeUiRepaint::timeline(),
+        (false, true) => RuntimeUiRepaint::sidebar(),
+        (true, true) => {
+            let mut repaint = RuntimeUiRepaint::timeline();
+            repaint.sidebar = true;
+            repaint
+        }
+        (false, false) => RuntimeUiRepaint::none(),
     }
 }
 
@@ -15549,13 +15567,7 @@ impl VibexWorkbench {
                         .any(|signal| matches!(signal, RuntimeUiSignal::Shutdown));
                     let stopped = entity.update(cx, |this, cx| {
                         let repaint = this.apply_runtime_ui_signals(signals, cx);
-                        if repaint.dirty {
-                            if repaint.timeline_only {
-                                this.notify_timeline_surfaces(cx);
-                            } else {
-                                cx.notify();
-                            }
-                        }
+                        this.apply_runtime_ui_repaint(repaint, cx);
                         repaint.dirty
                     });
                     if stop || stopped.is_err() {
@@ -20578,13 +20590,7 @@ impl VibexWorkbench {
                     }
                     let stopped = entity.update(cx, |this, cx| {
                         let repaint = this.apply_runtime_ui_signals(signals, cx);
-                        if repaint.dirty {
-                            if repaint.timeline_only {
-                                this.notify_timeline_surfaces(cx);
-                            } else {
-                                cx.notify();
-                            }
-                        }
+                        this.apply_runtime_ui_repaint(repaint, cx);
                         repaint.dirty
                     });
                     if stopped.is_err() {
@@ -31092,13 +31098,7 @@ impl VibexWorkbench {
                                     ))
                                 }
                             };
-                            if repaint.dirty {
-                                if repaint.timeline_only {
-                                    this.notify_timeline_surfaces(cx);
-                                } else {
-                                    cx.notify();
-                                }
-                            }
+                            this.apply_runtime_ui_repaint(repaint, cx);
                             true
                         })
                         .unwrap_or(false);
@@ -78448,6 +78448,34 @@ impl VibexWorkbench {
         }
     }
 
+    /// Repaints the sidebar surface alone.
+    fn notify_sidebar_surface(&self, cx: &mut Context<Self>) {
+        if let Some(view) = self.sidebar_view.as_ref() {
+            view.update(cx, |_, cx| cx.notify());
+        }
+    }
+
+    /// Applies a batch's repaint answer to the narrowest surfaces it names.
+    ///
+    /// A shell answer notifies the workbench; everything else notifies the
+    /// timeline and sidebar boundaries directly, so the views neither named nor
+    /// inside them stay retained.
+    fn apply_runtime_ui_repaint(&self, repaint: RuntimeUiRepaint, cx: &mut Context<Self>) {
+        if !repaint.dirty {
+            return;
+        }
+        if repaint.shell {
+            cx.notify();
+            return;
+        }
+        if repaint.timeline {
+            self.notify_timeline_surfaces(cx);
+        }
+        if repaint.sidebar {
+            self.notify_sidebar_surface(cx);
+        }
+    }
+
     fn render_inline_sidebar(
         &mut self,
         visibility: WorkbenchVisibility,
@@ -112635,19 +112663,27 @@ mod tests {
             timeline_batch_repaint("agent", false, false, false, false, true),
             RuntimeUiRepaint::timeline()
         );
-        // Unread, a sidebar timestamp or a child rail change still needs it.
+        // Unread or a child rail change still needs the shell.
         assert_eq!(
             timeline_batch_repaint("agent", true, false, false, false, false),
-            RuntimeUiRepaint::shell()
-        );
-        assert_eq!(
-            timeline_batch_repaint("agent", false, true, false, false, false),
             RuntimeUiRepaint::shell()
         );
         assert_eq!(
             timeline_batch_repaint("agent", false, false, true, false, false),
             RuntimeUiRepaint::shell()
         );
+        // A sidebar timestamp alone repaints the sidebar.
+        assert_eq!(
+            timeline_batch_repaint("agent", false, true, false, false, false),
+            RuntimeUiRepaint::sidebar()
+        );
+        assert_eq!(
+            timeline_batch_repaint("usage", false, true, false, false, false),
+            RuntimeUiRepaint::sidebar()
+        );
+        // A message that lands in the focused session touches both.
+        let both = timeline_batch_repaint("agent", false, true, false, true, false);
+        assert!(both.dirty && both.timeline && both.sidebar && !both.shell);
         // A route that does not draw the timeline draws nothing at all.
         assert_eq!(
             timeline_batch_repaint("usage", false, false, false, true, false),
@@ -112659,12 +112695,15 @@ mod tests {
     fn a_shell_repaint_wins_over_a_timeline_one_in_one_batch() {
         let mut batch = RuntimeUiRepaint::none();
         batch.merge(RuntimeUiRepaint::timeline());
-        assert!(batch.dirty && batch.timeline_only);
+        assert!(batch.dirty && batch.timeline && !batch.shell);
+        let mut both = RuntimeUiRepaint::sidebar();
+        both.merge(RuntimeUiRepaint::timeline());
+        assert!(both.dirty && both.sidebar && both.timeline && !both.shell);
         batch.merge(RuntimeUiRepaint::shell());
-        assert!(batch.dirty && !batch.timeline_only);
+        assert!(batch.dirty && batch.shell);
         // A clean source leaves the batch as it was.
         batch.merge(RuntimeUiRepaint::none());
-        assert!(batch.dirty && !batch.timeline_only);
+        assert!(batch.dirty && batch.shell);
     }
 
     #[test]
@@ -112972,11 +113011,17 @@ mod tests {
         assert!(event_bridge.contains("drop(signal_rx);"));
         assert!(event_bridge.contains("signal_rx.try_recv()"));
         assert!(event_bridge.contains("this.apply_runtime_ui_signals(signals, cx)"));
-        // A batch that only changed a session's timeline notifies the timeline
-        // boundaries; everything else keeps the conservative shell repaint.
-        assert!(event_bridge.contains("repaint.timeline_only"));
-        assert!(event_bridge.contains("this.notify_timeline_surfaces(cx);"));
-        assert!(event_bridge.contains("cx.notify();"));
+        // Every batch's answer goes through the surface dispatcher; the shell
+        // and the narrower boundaries are chosen there.
+        assert!(event_bridge.contains("this.apply_runtime_ui_repaint(repaint, cx);"));
+        let repaint_dispatch = source
+            .split_once("    fn apply_runtime_ui_repaint(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_inline_sidebar("))
+            .map(|(body, _)| body)
+            .expect("repaint dispatch should remain inspectable");
+        assert!(repaint_dispatch.contains("self.notify_timeline_surfaces(cx);"));
+        assert!(repaint_dispatch.contains("self.notify_sidebar_surface(cx);"));
+        assert!(repaint_dispatch.contains("cx.notify();"));
 
         let timeline_batch = source
             .split_once("    fn apply_live_timeline_batch(")
