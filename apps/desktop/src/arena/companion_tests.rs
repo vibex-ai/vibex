@@ -439,6 +439,9 @@ fn a_starting_turn_brings_the_companion_in_its_own_way(cx: &mut TestAppContext) 
     );
     cx.background_executor
         .advance_clock(Duration::from_secs_f32(gait::entrance(Guardian::Claude)));
+    // The lane's ticker is a repeating animation, which reduced motion leaves
+    // still, so the retained harness has to be asked to sample the new pose.
+    harness.update(cx, |_, cx| cx.notify());
     draw(cx);
     let lane = cx.debug_bounds("composer-companion-lane").unwrap();
     let badge = cx.debug_bounds("composer-companion").unwrap();

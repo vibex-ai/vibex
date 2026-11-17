@@ -2358,6 +2358,11 @@ fn a_click_and_a_hover_reach_an_element_inside_a_cached_view(cx: &mut TestAppCon
             cached,
         });
         cx.run_until_parked();
+        // The child fills the top of the window and the pointer starts at
+        // (0, 0) inside it, so moving onto its centre would not change the
+        // hover. Park the pointer below the child first, so the move onto it
+        // is the hover change the test is about.
+        cx.simulate_mouse_move(gpui::point(px(500.0), px(500.0)), None, Modifiers::none());
         cx.update(|window, cx| {
             let _ = window.draw(cx);
         });
