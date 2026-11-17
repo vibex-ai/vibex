@@ -19,12 +19,13 @@
 //! `.trellis/spec/frontend/quality-guidelines.md`.
 
 use gpui::{
-    Anchor, AnyElement, App, Context, Entity, Hsla, IntoElement, ParentElement as _, Render,
-    ScrollHandle, SharedString, Styled as _, WeakEntity, Window, div, point, prelude::*, px,
+    Anchor, AnyElement, App, ClipboardItem, Context, Entity, Hsla, IntoElement, ParentElement as _,
+    Render, ScrollHandle, SharedString, Styled as _, WeakEntity, Window, div, point, prelude::*,
+    px,
 };
 use gpui_component::{
-    ActiveTheme as _, Disableable as _, Icon, Selectable as _, Sizable as _, StyledExt as _, Theme,
-    WindowExt as _,
+    ActiveTheme as _, Disableable as _, Icon, IconName, Selectable as _, Sizable as _,
+    StyledExt as _, Theme, WindowExt as _,
     button::{Button, ButtonVariants as _},
     dialog::{DialogAction, DialogClose, DialogFooter},
     h_flex,
@@ -773,59 +774,6 @@ impl ImChannelsView {
                 let _ = weak.update(cx, |this, cx| {
                     match result {
                         Ok(()) => this.reload_selected(cx),
-                        Err(error) => this.hint(NotificationType::Error, error),
-                    }
-                    cx.notify();
-                });
-            },
-        ));
-    }
-
-    /// Adds or removes one event id from the channel's forwarded set.
-    fn toggle_event_filter(
-        &mut self,
-        channel: ImChannelSummary,
-        event_id: &'static str,
-        enabled: bool,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(backend) = self.backend(cx) else {
-            return;
-        };
-        let mut filter = channel.event_filter.clone();
-        if enabled {
-            if !filter.iter().any(|id| id == event_id) {
-                filter.push(event_id.to_string());
-            }
-        } else {
-            filter.retain(|id| id != event_id);
-        }
-        let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            backend
-                .management()
-                .set_im_channel_event_filter(vibex_backend::MutationRequest::new(
-                    vibex_backend::ImChannelEventFilterUpdate {
-                        channel_id: channel.channel_id.clone(),
-                        event_filter: filter,
-                    },
-                ))
-                .await
-                .map(|_| ())
-                .map_err(backend_error)
-        });
-        self.task = Some(cx.spawn(
-            async move |weak: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
-                let result = match runner.await {
-                    Ok(result) => result,
-                    Err(error) => Err(error.to_string()),
-                };
-                let _ = weak.update(cx, |this, cx| {
-                    match result {
-                        Ok(()) => {
-                            this.loaded = false;
-                            this.loading = false;
-                            this.reload(cx);
-                        }
                         Err(error) => this.hint(NotificationType::Error, error),
                     }
                     cx.notify();
@@ -1638,11 +1586,38 @@ impl ImChannelsView {
             .as_ref()
             .filter(|pairing| pairing.channel_id == channel_id)
         {
-            Some(pairing) => div()
-                .text_base()
-                .font_semibold()
-                .child(SharedString::from(pairing.code.clone()))
-                .into_any_element(),
+            Some(pairing) => {
+                let code = pairing.code.clone();
+                h_flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_base()
+                            .font_semibold()
+                            .child(SharedString::from(code.clone())),
+                    )
+                    .child(
+                        Button::new("im-channel-pair-copy")
+                            .xsmall()
+                            .ghost()
+                            .icon(IconName::Copy)
+                            .tooltip(locale::text(
+                                "Copy pairing code",
+                                "复制配对码",
+                                "複製配對碼",
+                            ))
+                            .accessibility_label(locale::text(
+                                "Copy pairing code",
+                                "复制配对码",
+                                "複製配對碼",
+                            ))
+                            .on_click(move |_, _, cx| {
+                                cx.write_to_clipboard(ClipboardItem::new_string(code.clone()));
+                            }),
+                    )
+                    .into_any_element()
+            }
             None => div()
                 .text_sm()
                 .child(locale::text("Pairing code", "配对码", "配對碼"))
@@ -1880,49 +1855,6 @@ impl ImChannelsView {
             );
         }
 
-        let mut event_rows = Vec::new();
-        for event_id in vibex_core::IM_EVENT_FILTER_IDS {
-            let enabled = channel.event_filter.iter().any(|id| id == event_id);
-            let channel_for_toggle = channel.clone();
-            event_rows.push(
-                h_flex()
-                    .w_full()
-                    .min_w_0()
-                    .gap_3()
-                    .py_2()
-                    .items_center()
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .text_xs()
-                            .text_color(foreground)
-                            .child(*event_id),
-                    )
-                    .child(
-                        Switch::new(SharedString::from(format!(
-                            "im-event-{}-{}",
-                            channel_id.as_str(),
-                            event_id
-                        )))
-                        .small()
-                        .checked(enabled)
-                        .disabled(self.busy)
-                        .on_click(cx.listener(
-                            move |this, checked, _, cx| {
-                                this.toggle_event_filter(
-                                    channel_for_toggle.clone(),
-                                    event_id,
-                                    *checked,
-                                    cx,
-                                )
-                            },
-                        )),
-                    )
-                    .into_any_element(),
-            );
-        }
-
         let locale_choice = |id: String,
                              label: &'static str,
                              value: Option<&'static str>,
@@ -2003,12 +1935,14 @@ impl ImChannelsView {
             .child(header)
             .child(section(
                 locale::text("Pairing", "配对", "配對"),
-                Some(locale::text(
-                    "A pairing code is how a chat proves it belongs to this channel.",
-                    "配对码用于让一个聊天证明自己属于这个频道。",
-                    "配對碼用於讓一個聊天證明自己屬於這個頻道。",
-                )
-                .to_string()),
+                Some(
+                    locale::text(
+                        "A pairing code is how a chat proves it belongs to this channel.",
+                        "配对码用于让一个聊天证明自己属于这个频道。",
+                        "配對碼用於讓一個聊天證明自己屬於這個頻道。",
+                    )
+                    .to_string(),
+                ),
                 panel(pairing_rows, is_dark, border),
                 cx,
             ))
@@ -2051,19 +1985,6 @@ impl ImChannelsView {
                     .to_string(),
                 ),
                 panel(default_rows, is_dark, border),
-                cx,
-            ))
-            .child(section(
-                locale::text("Events sent to this chat", "发送到这个聊天的活动", "傳送到這個聊天的活動"),
-                Some(
-                    locale::text(
-                        "Approvals and errors are the default set. Turning one off stops it for every binding on this channel.",
-                        "审批和错误默认开启。关闭一项会同时影响该频道下的所有绑定。",
-                        "審批和錯誤預設開啟。關閉一項會同時影響該頻道下的所有綁定。",
-                    )
-                    .to_string(),
-                ),
-                panel(event_rows, is_dark, border),
                 cx,
             ))
             .child(section(
