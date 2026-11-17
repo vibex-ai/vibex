@@ -225,3 +225,34 @@ render it with `MessageScroller::new` (its renderer signature is already
 reveal, the rename row (measured, not hinted), drag/drop targets, and the
 scroll position memory. Steps must keep the existing sidebar tests green:
 `cargo test -p vibex-desktop --lib --locked sidebar` covers 94 cases.
+
+## 8. Which view a scroll notifies
+
+A wheel over a `track_scroll` element does not merely move the offset: gpui
+notifies `window.current_view()`, the view whose render is building the tree at
+that moment. For the sidebar that view is `VibexWorkbench`, because
+`SidebarView::render` hands its own render to the workbench:
+
+```rust
+workbench.update(cx, |this, cx| this.render_agent_sidebar(cx))
+```
+
+So every sidebar wheel step rebuilds the workbench. Measured on a 200-session
+column in a release build, a frame that only redraws costs ~21 µs of prepaint and
+one layout call, while a frame that scrolls the sidebar costs 2.6–4.3 ms and
+30–33 layout calls. The scroll itself is a few rows; the rest is the workbench
+being laid out again around it.
+
+This is the ceiling on everything else in this document. A scroll layer, a
+retained subtree, or a virtual list can only save the work its own container
+does, and here the container's owner redoes the whole window. Narrowing the
+notification is therefore the first thing to fix, ahead of any list migration:
+
+- the sidebar's scroll container has to be built by a view that is not the
+  workbench, so `current_view()` names the sidebar;
+- that view needs the state the rows read — `sidebar_state`, the filtered
+  groups, the selection — without borrowing `&mut VibexWorkbench` for the whole
+  render, which today is what forces the workbench onto the stack.
+
+Until then, treat sidebar scroll cost as a workbench-wide rebuild, and do not
+expect a container-level change to move it.
