@@ -532,12 +532,6 @@ struct Badge {
     frames: Rc<RefCell<FrameCache>>,
     sample: Rc<Cell<Option<PreviewSample>>>,
 }
-impl IntoElement for Badge {
-    type Element = Self;
-    fn into_element(self) -> Self {
-        self
-    }
-}
 impl Element for Badge {
     type RequestLayoutState = ();
     type PrepaintState = (Vec<PixelRect>, [Hsla; ink::COUNT]);

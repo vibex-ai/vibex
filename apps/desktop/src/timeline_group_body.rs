@@ -87,14 +87,6 @@ impl TimelineGroupBody {
     }
 }
 
-impl IntoElement for TimelineGroupBody {
-    type Element = Self;
-
-    fn into_element(self) -> Self::Element {
-        self
-    }
-}
-
 /// The flow child the body reserves its height with, and the rows it placed.
 struct TimelineGroupBodyLayout {
     spacer: AnyElement,

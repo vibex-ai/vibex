@@ -98,14 +98,6 @@ struct SelectionGuardLayer {
     gesture: Rc<GestureGuard>,
 }
 
-impl IntoElement for SelectionGuardLayer {
-    type Element = Self;
-
-    fn into_element(self) -> Self::Element {
-        self
-    }
-}
-
 impl Element for SelectionGuardLayer {
     type RequestLayoutState = ();
     type PrepaintState = ();

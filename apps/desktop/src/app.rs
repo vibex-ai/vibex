@@ -82547,14 +82547,6 @@ struct SidebarSessionRunLayout {
     rows: Vec<AnyElement>,
 }
 
-impl IntoElement for SidebarSessionRun {
-    type Element = Self;
-
-    fn into_element(self) -> Self::Element {
-        self
-    }
-}
-
 impl Element for SidebarSessionRun {
     type RequestLayoutState = SidebarSessionRunLayout;
     type PrepaintState = ();
@@ -82991,14 +82983,6 @@ fn timeline_window_origins(
 struct TimelineProcessRunLayout {
     spacer: AnyElement,
     units: Vec<AnyElement>,
-}
-
-impl IntoElement for TimelineProcessRun {
-    type Element = Self;
-
-    fn into_element(self) -> Self::Element {
-        self
-    }
 }
 
 impl Element for TimelineProcessRun {

@@ -1,6 +1,6 @@
 use gpui::{
     AnyElement, App, AvailableSpace, Bounds, ContentMask, Element, ElementId, GlobalElementId,
-    InspectorElementId, IntoElement, LayoutId, Pixels, Style, Window, px, relative, size,
+    InspectorElementId, LayoutId, Pixels, Style, Window, px, relative, size,
 };
 
 /// A height reveal that leaves settled content in normal layout. History and
@@ -24,13 +24,6 @@ impl TimelineDisclosure {
             progress: progress.clamp(0.0, 1.0),
             child,
         }
-    }
-}
-
-impl IntoElement for TimelineDisclosure {
-    type Element = Self;
-    fn into_element(self) -> Self {
-        self
     }
 }
 

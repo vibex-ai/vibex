@@ -390,12 +390,6 @@ impl Entry {
         }
     }
 }
-impl IntoElement for Entry {
-    type Element = Self;
-    fn into_element(self) -> Self {
-        self
-    }
-}
 impl Element for Entry {
     type RequestLayoutState = ();
     type PrepaintState = ActorsLayout;
