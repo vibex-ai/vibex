@@ -1310,6 +1310,16 @@ const COMPOSER_SURFACE_MIN_HEIGHT: f32 = 112.0;
 const ACTIVE_COMPOSER_SURFACE_MIN_HEIGHT: f32 = COMPOSER_SURFACE_MIN_HEIGHT + 24.0;
 const ACTIVE_COMPOSER_TEXT_AREA_MIN_HEIGHT: f32 = 80.0;
 const COMPOSER_SURFACE_RADIUS: f32 = 20.0;
+/// The slim composer's height: the input line plus one tight control row. The
+/// full box reserves two text rows, a stacked trailing column and a padded
+/// control row under them, which is what made it tower over a split pane.
+const COMPOSER_SLIM_SURFACE_HEIGHT: f32 = 64.0;
+/// One text line plus the row's own breathing room.
+const COMPOSER_SLIM_TEXT_AREA_MIN_HEIGHT: f32 = 26.0;
+const COMPOSER_SLIM_SURFACE_RADIUS: f32 = 16.0;
+/// The insets a slim bar keeps from its own edges. The full box pads by `px_3`;
+/// a one-line bar reads as a pill, so its padding is tighter.
+const COMPOSER_SLIM_HORIZONTAL_PADDING: f32 = 10.0;
 const COMPOSER_RUNTIME_MENU_WIDTH: f32 = 320.0;
 const COMPOSER_RUNTIME_MENU_MAX_HEIGHT: f32 = 448.0;
 /// One sign-in method row in the runtime authentication submenu. The loading
@@ -2651,8 +2661,8 @@ fn reveal_composer_cursor_after_layout(input: Entity<TextareaState>, window: &mu
     });
 }
 
-fn composer_runtime_controls_are_compact(viewport_width: u32) -> bool {
-    viewport_width <= NEW_SESSION_COMPACT_SELECTOR_MAX_WIDTH
+fn composer_runtime_controls_are_compact(width: f32) -> bool {
+    width <= NEW_SESSION_COMPACT_SELECTOR_MAX_WIDTH as f32
 }
 
 fn composer_runtime_menu_placement(
@@ -4091,6 +4101,59 @@ fn runtime_status_banner_is_visible(status: SessionRuntimeSelectionStatus) -> bo
 
 fn composer_surface_background(is_dark: bool) -> Hsla {
     theme::semantic_color("composer-surface", is_dark)
+}
+
+/// How much room a composer gives itself.
+///
+/// The two densities are the same composer at two heights, not two widgets: the
+/// input, the send gate and the submission path are shared, so a draft that
+/// grows past one line keeps everything it had and only gains the rows it needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ComposerDensity {
+    /// The room a draft that fits on one line needs.
+    Slim,
+    /// The full box: two rows of text, the trailing control column, and the row
+    /// of runtime controls under the input.
+    Full,
+}
+
+/// The density one composer frame draws.
+///
+/// `wrapped_rows` is how many rows the input's own display map reports for the
+/// draft, which is the only count that answers the question the two densities
+/// exist for: does this draft fit on one line? `draft_empty` keeps a blank draft
+/// slim even before the map has been prepared. `extra_rows` folds in everything
+/// else that already asks for the box — the extension surfaces, the notice rows,
+/// the plan, the goal and the collaboration rows. An expanded composer is always
+/// full: it is a fullscreen editor.
+fn composer_density(
+    wrapped_rows: usize,
+    draft_empty: bool,
+    attachments_empty: bool,
+    extension_visible: bool,
+    extra_rows: bool,
+    expanded: bool,
+) -> ComposerDensity {
+    let one_line = draft_empty || wrapped_rows <= 1;
+    if !expanded && one_line && attachments_empty && !extension_visible && !extra_rows {
+        ComposerDensity::Slim
+    } else {
+        ComposerDensity::Full
+    }
+}
+
+/// The rows a draft occupies in its own input, for the density decision.
+///
+/// The display map is refreshed by layout, so it is exact for every frame after
+/// the first. Before the first layout it can report zero rows for non-empty
+/// text; the newline count is the honest fallback there, and it errs toward the
+/// full box rather than hiding a second line inside a one-bar composer.
+fn composer_wrapped_rows(input: &TextareaState, text: &str) -> usize {
+    let wrapped = input.display_map().wrap_row_count();
+    if wrapped > 0 {
+        return wrapped;
+    }
+    text.lines().count().max(1)
 }
 
 fn composer_queue_surface_background(is_dark: bool) -> Hsla {
@@ -12441,9 +12504,13 @@ impl VibexWorkbench {
                 .auto_grow(1, 4)
                 .submit_on_enter(true)
         });
+        // One row to start: the composer itself decides how much surface to
+        // reserve (see `composer_density`), and the input only asks for the rows
+        // its draft actually needs. Reserving two rows here made an empty draft
+        // pay for a line it never used.
         let composer_input = cx.new(|cx| {
             TextareaState::new(window, cx)
-                .auto_grow(2, 8)
+                .auto_grow(1, 8)
                 .submit_on_enter(true)
                 .placeholder(initial_strings.message_agent)
         });
@@ -28288,9 +28355,10 @@ impl VibexWorkbench {
             return input.clone();
         }
         let placeholder = self.strings().message_agent;
+        // One row, for the reason given where the first composer input is built.
         let input = cx.new(|cx| {
             TextareaState::new(window, cx)
-                .auto_grow(2, 8)
+                .auto_grow(1, 8)
                 .submit_on_enter(true)
                 .placeholder(placeholder)
         });
@@ -51255,6 +51323,13 @@ impl VibexWorkbench {
             self.settings_open,
             selected_session.is_some(),
         );
+        // A session group owns the workbench while one of its members is
+        // selected: the group's name and live count replace the single session's
+        // title, capabilities and menu, because those describe one conversation
+        // while the band is now describing several. Folding the group header into
+        // this row is what frees the row the workspace used to spend repeating
+        // itself under the chrome.
+        let active_session_group = self.active_session_group();
         let management_open = self.ui_state.workbench.active_tab == "management";
         let usage_open = self.ui_state.workbench.active_tab == "usage";
         let usage_loading = usage_open && self.usage_refresh_in_flight;
@@ -51655,7 +51730,9 @@ impl VibexWorkbench {
                                         ),
                                 )
                             })
-                            .when(show_session_context, |this| {
+                            .when(
+                                show_session_context && active_session_group.is_none(),
+                                |this| {
                                 this.child(
                                     h_flex()
                                         .id("title-session-heading")
@@ -51681,6 +51758,53 @@ impl VibexWorkbench {
                                         .when_some(title_session_menu, |this, menu| {
                                             this.child(menu)
                                         }),
+                                )
+                            })
+                            // The group's own heading: the icon, the name, the
+                            // live count and the merge action, all in the band
+                            // the single session used to spend on one title.
+                            .when_some(active_session_group.clone(), |this, (group_id, group)| {
+                                let merge_id = group_id.clone();
+                                let can_merge = group.layout.pane_count() > 1;
+                                this.child(
+                                    h_flex()
+                                        .id("title-session-group-heading")
+                                        .min_w_0()
+                                        .flex_none()
+                                        .items_center()
+                                        .gap_2()
+                                        .child(
+                                            sidebar_icon("icons/vibex/layers.svg")
+                                                .size(px(14.0))
+                                                .text_color(cx.theme().muted_foreground),
+                                        )
+                                        .child(
+                                            div()
+                                                .id("title-session-group-name")
+                                                .min_w_0()
+                                                .max_w(px(TITLE_BAR_SESSION_TITLE_MAX_WIDTH))
+                                                .truncate()
+                                                .text_sm()
+                                                .font_medium()
+                                                .child(group.name.clone()),
+                                        )
+                                        .children(self.render_session_group_team_status(
+                                            &group, cx,
+                                        ))
+                                        .child(
+                                            Button::new("title-session-group-merge")
+                                                .xsmall()
+                                                .ghost()
+                                                .compact()
+                                                .size(px(24.0))
+                                                .px_0()
+                                                .icon(sidebar_icon("icons/vibex/columns-2.svg"))
+                                                .tooltip(strings.sidebar_group_merge_panes)
+                                                .disabled(!can_merge)
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.merge_session_group_panes(&merge_id, cx)
+                                                })),
+                                        ),
                                 )
                             }),
                     )
@@ -53691,7 +53815,6 @@ impl VibexWorkbench {
             .retain(|pane_id, _| live_panes.iter().any(|live| live == pane_id));
         self.session_group_revealed_tab_ids
             .retain(|pane_id, _| live_panes.iter().any(|live| live == pane_id));
-        let strings = self.strings();
         let applied = group.observed_layout();
         let feedback = group
             .automatic_layout
@@ -53722,52 +53845,10 @@ impl VibexWorkbench {
             .min_w_0()
             .min_h_0()
             .bg(cx.theme().background)
-            .child(
-                h_flex()
-                    .flex_none()
-                    .items_center()
-                    .justify_between()
-                    .gap_2()
-                    .px_3()
-                    .min_h_8()
-                    .py_1()
-                    .border_b_1()
-                    .border_color(cx.theme().border)
-                    .child(
-                        h_flex()
-                            .min_w_0()
-                            .flex_1()
-                            .flex_wrap()
-                            .gap_2()
-                            .child(sidebar_icon("icons/vibex/layers.svg").size(px(14.0)))
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_sm()
-                                    .font_medium()
-                                    .child(group.name.clone()),
-                            )
-                            .children(self.render_session_group_team_status(group, cx)),
-                    )
-                    .child(
-                        h_flex().flex_none().gap_1().child(
-                            Button::new("session-group-merge-panes")
-                                .xsmall()
-                                .ghost()
-                                .compact()
-                                .icon(sidebar_icon("icons/vibex/columns-2.svg"))
-                                .tooltip(strings.sidebar_group_merge_panes)
-                                .disabled(group.layout.pane_count() <= 1)
-                                .on_click(cx.listener({
-                                    let group_id = group_id.clone();
-                                    move |this, _, _, cx| {
-                                        this.merge_session_group_panes(&group_id, cx)
-                                    }
-                                })),
-                        ),
-                    ),
-            )
+            // The group's name, live count and merge action ride the title bar
+            // instead of a header here: the band above this workspace was already
+            // naming the session, and two headers stacked on top of each other
+            // cost the conversation a row without saying anything new.
             .when_some(feedback, |workspace, feedback| {
                 workspace.child(
                     div()
@@ -54198,13 +54279,32 @@ impl VibexWorkbench {
             // A folder `Tab` draws the plate and the separator; the tab keeps
             // its agent mark, its title and its status column, plus the drag
             // and drop that reorder the strip.
-            let tab_element = Tab::new().selected(selected).min_w_0().text_xs().child(
+            // The pane that holds the keyboard says so here: its active tab
+            // carries a quiet accent mark and the rest of the strip stays quiet.
+            // This is the mark the pane frame used to shout with a bright border.
+            let tab_holds_focus = focused && selected;
+            let tab_element = Tab::new()
+                .selected(selected)
+                .min_w_0()
+                .text_xs()
+                .when(tab_holds_focus, |this| this.text_color(cx.theme().foreground))
+                .child(
                 h_flex()
                     .id(format!("session-group-tab-{session_id}"))
                     .min_w_0()
                     .items_center()
                     .gap_1()
                     .cursor_pointer()
+                    .when(tab_holds_focus, |this| {
+                        this.child(
+                            div()
+                                .flex_none()
+                                .w(px(2.0))
+                                .h(px(12.0))
+                                .rounded_full()
+                                .bg(cx.theme().primary.opacity(0.75)),
+                        )
+                    })
                     .child(sidebar_agent_logo(&agent_id, selected, cx))
                     .child(div().min_w_0().truncate().child(title_element))
                     .child(status_mark)
@@ -54459,12 +54559,18 @@ impl VibexWorkbench {
             .min_h_0()
             .overflow_hidden()
             .bg(cx.theme().background)
+            // The focused pane is marked by its tab, not by a bright frame
+            // around the whole pane. A near-white border on the seam between two
+            // panes read as a second divider — the loudest line on the screen —
+            // while the thing it meant to say was already in the tab. So the
+            // frame stays the ordinary border for every pane, the hovered pane
+            // lifts it slightly, and the focused pane only carries a quiet
+            // emphasis, which is where the tab it belongs to sits.
+            .border_1()
+            .border_color(cx.theme().border)
+            .hover(|this| this.border_color(cx.theme().border.opacity(1.6)))
             .when(focused, |this| {
-                this.border_1()
-                    .border_color(cx.theme().primary.opacity(0.45))
-            })
-            .when(!focused, |this| {
-                this.border_1().border_color(cx.theme().border)
+                this.border_color(cx.theme().foreground.opacity(0.16))
             })
             .when(!focused, |this| {
                 // Focus the pane on the way down. The event keeps propagating so
@@ -61175,8 +61281,12 @@ impl VibexWorkbench {
             .iter()
             .any(|id| agent_choices.iter().any(|agent| agent.id.as_str() == id));
         let is_dark = cx.theme().is_dark();
-        let compact_runtime_controls =
-            composer_runtime_controls_are_compact(self.last_visibility.layout.viewport_width);
+        // The new-session home always draws the full selector set: it is the
+        // page a session is created on, so its width is the window's, not a
+        // pane's.
+        let compact_runtime_controls = composer_runtime_controls_are_compact(
+            self.last_visibility.layout.viewport_width as f32,
+        );
         let chart_3 = theme::semantic_color("chart-3", is_dark);
         let chart_4 = theme::semantic_color("chart-4", is_dark);
         let reasoning_efforts = projection
@@ -76919,8 +77029,14 @@ impl VibexWorkbench {
             let projection = self.runtime_cascade_projection_for(&catalog, selection);
             Some((selection.clone(), catalog, projection))
         });
-        let compact_runtime_controls =
-            composer_runtime_controls_are_compact(self.last_visibility.layout.viewport_width);
+        // The composer's own column decides this, not the window. A split pane
+        // can be narrower than the compact threshold while the window is wide,
+        // and a window narrower than it can still hold a wide column; measuring
+        // the window made the chips compact in one case and not the other.
+        let composer_width = self
+            .timeline_layout_width
+            .unwrap_or(self.last_visibility.layout.viewport_width as f32);
+        let compact_runtime_controls = composer_runtime_controls_are_compact(composer_width);
         let content_max_width = session_content_max_width(self.ui_state.session.content_width);
         // The composer shares the content spine with the timeline above it.
         let content_insets = self.session_content_insets();
@@ -76982,6 +77098,35 @@ impl VibexWorkbench {
         let companion_inset = content_insets.horizontal;
         let composer_is_expanded = self.composer_expanded;
         let composer_extension_visible = composer_queue.is_some() || composer_goal.is_some();
+        // Which of the two densities this frame draws.
+        //
+        // It is a property of the content, not of the window or the split, so it
+        // reads the same in the single-session column and in every pane of a
+        // group workspace. Anything that adds a row to the surface — an
+        // attachment, a queued message, a plan, a goal, a continuation prompt, a
+        // failure — asks for the full box, because those rows have nowhere to go
+        // on a one-line bar.
+        let composer_draft = composer_input.read(cx).value();
+        let composer_draft_is_empty = composer_draft.trim().is_empty();
+        let composer_density = composer_density(
+            {
+                let input = composer_input.read(cx);
+                composer_wrapped_rows(&input, composer_draft.as_str())
+            },
+            composer_draft_is_empty,
+            self.composer_attachments.is_empty(),
+            composer_extension_visible,
+            composer_plan.is_some()
+                || composer_goal.is_some()
+                || composer_collaboration.is_some()
+                || generation_status.is_some()
+                || failover_prompt.is_some()
+                || failover_notices.is_some()
+                || self.agent_error.is_some()
+                || continuation_available,
+            self.composer_expanded,
+        );
+        let composer_is_slim = composer_density == ComposerDensity::Slim;
         let input_geometry_entity = cx.weak_entity();
         let surface_geometry_entity = cx.weak_entity();
         let session_uninitialized = self.selected_session_runtime_uninitialized();
@@ -77083,12 +77228,16 @@ impl VibexWorkbench {
             } else {
                 (Empty.into_any_element(), Vec::new())
             };
+        // A slim bar seats the action on its own row, where 28 px matches the
+        // controls beside it; the full box seats it in the trailing column, where
+        // 32 px matches the two stacked buttons above it.
+        let primary_action_size = if composer_is_slim { 28.0 } else { 32.0 };
         let primary_action = if session_running {
             Button::new("interrupt-agent")
                 .danger()
                 .compact()
-                .size(px(32.0))
-                .rounded(px(16.0))
+                .size(px(primary_action_size))
+                .rounded(px(primary_action_size / 2.0))
                 .child(
                     div()
                         .size(px(10.0))
@@ -77107,8 +77256,8 @@ impl VibexWorkbench {
             Button::new("send-agent-message")
                 .primary()
                 .compact()
-                .size(px(32.0))
-                .rounded(px(16.0))
+                .size(px(primary_action_size))
+                .rounded(px(primary_action_size / 2.0))
                 .icon(IconName::ArrowUp)
                 .tooltip(if self.composer_message_schedule().is_some() {
                     locale::text("Schedule message", "定时发送", "定時傳送")
@@ -77400,11 +77549,23 @@ impl VibexWorkbench {
                         v_flex()
                             .w_full()
                             .min_w_0()
-                            .min_h(px(ACTIVE_COMPOSER_SURFACE_MIN_HEIGHT))
+                            // The slim bar is one row tall; the full box keeps
+                            // its reserved two rows and control column. Both read
+                            // the same border, fill and shadow, so the densities
+                            // differ only in the room they ask for.
+                            .min_h(px(if composer_is_slim {
+                                COMPOSER_SLIM_SURFACE_HEIGHT
+                            } else {
+                                ACTIVE_COMPOSER_SURFACE_MIN_HEIGHT
+                            }))
                             .when(self.composer_expanded, |this| {
                                 this.flex_1().min_h(px(240.0))
                             })
-                            .rounded(px(COMPOSER_SURFACE_RADIUS))
+                            .rounded(px(if composer_is_slim {
+                                COMPOSER_SLIM_SURFACE_RADIUS
+                            } else {
+                                COMPOSER_SURFACE_RADIUS
+                            }))
                             .border_1()
                             .border_color(cx.theme().border)
                             .bg(composer_background)
@@ -77448,18 +77609,34 @@ impl VibexWorkbench {
                                 h_flex()
                                     .w_full()
                                     .min_w_0()
-                                    .min_h(px(ACTIVE_COMPOSER_TEXT_AREA_MIN_HEIGHT))
-                                    .flex_1()
-                                    .items_start()
+                                    // The slim bar centres its one line; the full
+                                    // box aligns the text to the top of the two
+                                    // rows it reserves.
+                                    .map(|this| {
+                                        if composer_is_slim {
+                                            this.min_h(px(COMPOSER_SLIM_TEXT_AREA_MIN_HEIGHT))
+                                                .items_center()
+                                                .px(px(COMPOSER_SLIM_HORIZONTAL_PADDING))
+                                                .py_1()
+                                        } else {
+                                            this.min_h(px(ACTIVE_COMPOSER_TEXT_AREA_MIN_HEIGHT))
+                                                .flex_1()
+                                                .items_start()
+                                                .px_3()
+                                                .pt_3()
+                                                .pb_1()
+                                        }
+                                    })
                                     .gap_2()
-                                    .px_3()
-                                    .pt_3()
-                                    .pb_1()
                                     .child(
                                         div()
                                             .relative()
                                             .min_w_0()
-                                            .min_h(px(ACTIVE_COMPOSER_TEXT_AREA_MIN_HEIGHT))
+                                            .min_h(px(if composer_is_slim {
+                                                COMPOSER_SLIM_TEXT_AREA_MIN_HEIGHT
+                                            } else {
+                                                ACTIVE_COMPOSER_TEXT_AREA_MIN_HEIGHT
+                                            }))
                                             .flex_1()
                                             // The expanded composer is a fullscreen input:
                                             // the slot stretches and the textarea fills it,
@@ -77681,13 +77858,22 @@ impl VibexWorkbench {
                                                     )),
                                             )
                                     )
-                                    .child(
-                                        v_flex()
-                                            .flex_none()
-                                            .items_center()
-                                            .gap_1()
-                                            .child(
-                                                Button::new("toggle-composer-expanded")
+                                    // The trailing column is three stacked
+                                    // controls, so it is taller than the text
+                                    // beside it and sets the floor for the whole
+                                    // surface. A slim bar has no room for a
+                                    // column: the expand control it carried lives
+                                    // on the composer's own shortcut, and the
+                                    // schedule and terminal controls keep their
+                                    // place on the control row below.
+                                    .when(!composer_is_slim, |this| {
+                                        this.child(
+                                            v_flex()
+                                                .flex_none()
+                                                .items_center()
+                                                .gap_1()
+                                                .child(
+                                                    Button::new("toggle-composer-expanded")
                                                     .xsmall()
                                                     .ghost()
                                                     .compact()
@@ -77724,7 +77910,8 @@ impl VibexWorkbench {
                                                 ))
                                             })
                                             .child(self.render_composer_terminal_menu(cx)),
-                                    ),
+                                        )
+                                    }),
                             )
                             .when_some(self.composer_message_schedule(), |this, schedule| {
                                 this.child(self.render_message_schedule_draft_hint(schedule, cx))
@@ -77736,8 +77923,14 @@ impl VibexWorkbench {
                                     .items_center()
                                     .justify_between()
                                     .gap_2()
-                                    .px_3()
-                                    .pb_3()
+                                    .map(|this| {
+                                        if composer_is_slim {
+                                            this.px(px(COMPOSER_SLIM_HORIZONTAL_PADDING))
+                                                .pb_1()
+                                        } else {
+                                            this.px_3().pb_3()
+                                        }
+                                    })
                                     .child(
                                         h_flex()
                                             .id("composer-runtime-controls-scroll")
@@ -77750,7 +77943,7 @@ impl VibexWorkbench {
                                                 Button::new("choose-composer-attachments")
                                                     .ghost()
                                                     .compact()
-                                                    .size(px(32.0))
+                                                    .size(px(primary_action_size))
                                                     .icon(IconName::Plus)
                                                     .tooltip(locale::text(
                                                         "Add attachments",
@@ -120920,7 +121113,10 @@ mod tests {
             .and_then(|(_, tail)| tail.split_once("\n        let new_session_input ="))
             .map(|(body, _)| body)
             .expect("composer input setup should remain inspectable");
-        assert!(input_setup.contains(".auto_grow(2, 8)"));
+        assert!(
+            input_setup.contains(".auto_grow(1, 8)"),
+            "an empty draft asks for one row; the surface decides how tall it is"
+        );
 
         let composer = source
             .split_once("    fn render_composer(")
@@ -120937,10 +121133,21 @@ mod tests {
         assert!(composer.contains("ACTIVE_COMPOSER_SURFACE_MIN_HEIGHT"));
         assert!(composer.contains("ACTIVE_COMPOSER_TEXT_AREA_MIN_HEIGHT"));
         assert!(composer.contains(".min_h(px(ACTIVE_COMPOSER_TEXT_AREA_MIN_HEIGHT))"));
+        // Both densities are drawn by the same renderer, chosen from the draft.
+        assert!(composer.contains("let composer_density = composer_density("));
+        assert!(composer.contains("COMPOSER_SLIM_SURFACE_HEIGHT"));
+        assert!(composer.contains("COMPOSER_SLIM_TEXT_AREA_MIN_HEIGHT"));
         assert!(composer.contains(".when(self.composer_expanded, |this| this.pt_4())"));
         let fullscreen_button = composer
             .find("toggle-composer-expanded")
             .expect("composer fullscreen control should remain present");
+        let slim_branch = composer
+            .find(".when(!composer_is_slim, |this| {")
+            .expect("the stacked trailing column should be gated to the full box");
+        assert!(
+            slim_branch < fullscreen_button,
+            "the stacked column, expand control included, belongs to the full box"
+        );
         let terminal_button = composer
             .find("self.render_composer_terminal_menu(cx)")
             .expect("composer terminal control should remain present");
@@ -122882,9 +123089,11 @@ mod tests {
 
     #[test]
     fn composer_runtime_controls_match_tauri_compact_breakpoint() {
-        assert!(composer_runtime_controls_are_compact(360));
-        assert!(composer_runtime_controls_are_compact(860));
-        assert!(!composer_runtime_controls_are_compact(861));
+        // The breakpoint reads the composer's own column now, so the values are
+        // pane widths rather than window widths.
+        assert!(composer_runtime_controls_are_compact(360.0));
+        assert!(composer_runtime_controls_are_compact(860.0));
+        assert!(!composer_runtime_controls_are_compact(861.0));
     }
 
     #[test]
@@ -130672,7 +130881,15 @@ mod tests {
             .expect("title bar should remain inspectable");
         assert!(title_bar.contains("show_session_context"));
         assert!(title_bar.contains("title_bar_session_context_visible"));
-        assert!(title_bar.contains(".when(show_session_context"));
+        assert!(
+            title_bar.contains("show_session_context && active_session_group.is_none()"),
+            "a group replaces the single session's heading"
+        );
+        // A group's heading, live count and merge action live in the band, and
+        // the workspace no longer repeats them under the chrome.
+        assert!(title_bar.contains("title-session-group-heading"));
+        assert!(title_bar.contains("title-session-group-merge"));
+        assert!(title_bar.contains("render_session_group_team_status"));
         let sidebar_start = title_bar
             .find(".id(\"title-bar-sidebar\")")
             .expect("sidebar title-bar segment should exist");
@@ -131846,6 +132063,10 @@ mod tests {
             .map(|(body, _)| body)
             .expect("group workspace should remain inspectable");
         assert!(workspace.contains(".retain(|(view_group_id, pane_id), _|"));
+        // The group's name and merge action live in the title bar now, so the
+        // workspace must not draw a second header of its own.
+        assert!(!workspace.contains("session-group-merge-panes"));
+        assert!(!workspace.contains("min_h_8()"));
         assert!(workspace.contains("*view_group_id == group_id"));
         // Pane ids repeat across groups, so a pane's view is found by its group
         // too: a pane id alone handed one group's view to the next group.
