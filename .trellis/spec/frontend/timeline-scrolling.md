@@ -115,3 +115,24 @@ visual language) without removing the pixel-scroll state.
 - `cargo test -p vibex-desktop --locked child_agent_rail` covers the child
   Agent rail's virtualization and its separation from the parent's Markdown
   surfaces.
+
+## 7. Sidebar list migration
+
+The sidebar's session lists are hand-rolled `SidebarSessionRun` virtual lists
+inside a single outer `sidebar_scroll`: the run reserves its own `flow_height()`
+and builds only the rows the outer viewport shows, placing each at a fixed
+stride. `MessageScroller` is itself a scroll container, so it cannot be dropped
+in as a sub-list — it would either build every row (full-height content) or
+nest a second scroll over the outer one.
+
+The sidebar can move to `MessageScroller` by giving the list ownership of the
+scroll. Flatten every section of the sidebar (project, workspace, folder,
+group, session run) into one row list, render it with
+`MessageScroller::new` (its renderer signature is already
+`Fn(usize, &mut Window, &mut App) -> AnyElement`, matching the current
+`SidebarSessionRowBuilder`), give fixed-height session rows
+`set_row_height_hints`, and move `sidebar_scroll`'s semantics onto
+`MessageScrollerState`: the selected-session anchor, `locate current session`
+reveal, the rename row (measured, not hinted), drag/drop targets, and the
+scroll position memory. Steps must keep the existing sidebar tests green:
+`cargo test -p vibex-desktop --lib --locked sidebar` covers 94 cases.
