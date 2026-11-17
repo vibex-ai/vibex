@@ -191,24 +191,29 @@ wall-clock delayed so the fade can settle:
 
 The overlay does move the animation frame off the owner, and a container whose
 content is stable then reaches `Composite` and keeps it. It does **not** help
-either real surface: the sidebar's content is `changed` on every frame
-(`deps_unchanged=false` in `scroll_only`, i.e. its recorded dependencies move),
-so its layer is `Repaint`ed and then demoted after
-`DEMOTE_AFTER_CHANGED_FRAMES`, and the `im_channels` lane never composites for
-reasons of its own. Net cost was equal or slightly worse, so the experiment was
-reverted rather than merged.
+either real surface. In the overlay build the sidebar's layer was promoted and
+then demoted again eight frames later, with `scroll_only` reporting
+`deps_unchanged=false` — the column's recorded dependencies move on every
+scrolled frame, so its content is repainted rather than composited. Without the
+overlay the sidebar never reaches `scroll_only` at all, because
+`owner_animating` rejects it first; the two blockers stack, and clearing one
+only reveals the other. The `im_channels` lane never composites for reasons of
+its own. Net cost was equal or slightly worse, so the experiment was reverted
+rather than merged.
 
 ### 7.3 What has to be true before either migration is worth doing
 
 A scroll layer only pays for itself when its content is stable across scrolled
-frames. Once the overlay moved the animation frame off the owner, the sidebar's
-layer was promoted and then demoted again eight frames later: `scroll_only`
-reported `deps_unchanged=false`, meaning the column's recorded dependencies move
-on every scrolled frame, so its content is repainted rather than composited. For
-the sidebar that is the P0b work of narrowing notifications — a scroll frame
-should notify the scroll container, not the whole workbench — and until it holds,
-neither `MessageScroller` nor an overlay scrollbar changes what the reader pays.
-The existing `SidebarSessionRun` is the right shape meanwhile.
+frames. The sidebar has two independent blockers, and both have to go:
+
+1. The scrollbar's fade must not be attributed to the view that owns the
+   scroller (the overlay experiment in §7.2).
+2. The column's recorded dependencies must stop moving on every scrolled frame.
+   That is the P0b work of narrowing notifications: a scroll frame should
+   notify the scroll container, not the whole workbench.
+
+Until both hold, neither `MessageScroller` nor an overlay scrollbar changes what
+the reader pays, and the existing `SidebarSessionRun` is the right shape.
 
 If the migration is revisited, the mechanics are unchanged: flatten every
 section (project, workspace, folder, group, session run) into one row list,
