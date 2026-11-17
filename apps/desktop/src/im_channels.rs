@@ -2145,11 +2145,13 @@ mod tests {
                 // The same nesting the settings dialog gives a page: a
                 // definite-height viewport whose child fills it. The page's own
                 // `h_full` is what turns the two columns into bounded scroll
-                // regions instead of content-sized blocks.
+                // regions instead of content-sized blocks. The height is a
+                // realistic dialog one so both columns' content overflows it.
                 div()
                     .id("im-channels-test-viewport")
                     .debug_selector(|| "im-channels-test-viewport".to_string())
-                    .size_full()
+                    .w_full()
+                    .h(px(420.0))
                     .overflow_y_scroll()
                     .track_scroll(&self.viewport_scroll)
                     .child(self.view.clone())
@@ -2270,6 +2272,12 @@ mod tests {
         let header_area = cx
             .debug_bounds("im-channels-header")
             .expect("the page title should be laid out");
+        assert!(
+            lane_scroll.max_offset().y > px(0.0),
+            "the lane needs scrollable content, got {:?} in {:?}",
+            lane_scroll.max_offset(),
+            lane_area.size
+        );
         cx.simulate_event(ScrollEvent {
             position: lane_area.center(),
             delta: ScrollDelta::Pixels(point(px(0.0), px(-80.0))),
@@ -2297,6 +2305,12 @@ mod tests {
             "the page title stays put while a column scrolls"
         );
 
+        assert!(
+            detail_scroll.max_offset().y > px(0.0),
+            "the work area needs scrollable content, got {:?} in {:?}",
+            detail_scroll.max_offset(),
+            detail_area.size
+        );
         cx.simulate_event(ScrollEvent {
             position: point(detail_area.center().x, detail_area.top() + px(40.0)),
             delta: ScrollDelta::Pixels(point(px(0.0), px(-80.0))),
