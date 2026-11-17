@@ -261,8 +261,17 @@ The scaling confirms it. Layout calls follow the band, not the window:
 | 0 | 25 | 2.7 ms |
 
 That is why the constant was trimmed to 240 (§7.2 records the numbers): the band
-is the one term in the scroll's cost that a call site controls. Removing the
-rest means making a row cheap enough to rebuild, or giving the rows a cache the
-run can reuse — which is what a virtual list does internally, and why §7.1's
-`MessageScroller` migration would only pay once the row work is the cost that
-remains.
+is the one term in the scroll's cost that a call site controls.
+
+A row's own build is the other term, and it is almost entirely element
+construction. Measured in a release build, `render_sidebar_session` takes
+~39 µs per row, while every workbench lookup it does first — the row state, the
+branch collapse, the move selection, the focus handle — comes to 79 ns together.
+So the cost is not the lookups, the maps, or the string keys; it is building the
+element tree of a row, which is what any list pays per row it has to rebuild.
+
+Two consequences. Trimming the band is the whole of the cheap win, and it is
+done. Making rows survive a scroll needs a cache the run can reuse across
+frames, which `AnyElement` cannot be — it is consumed by drawing — so that would
+mean a virtual list that owns the rows, i.e. the `MessageScroller` migration in
+§7.1, and it would only pay for the rows it does *not* have to rebuild.
