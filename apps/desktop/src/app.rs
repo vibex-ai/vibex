@@ -60483,12 +60483,13 @@ impl VibexWorkbench {
     /// advertised a mode it could never select, so the control is left out and
     /// the page simply is the interface mode.
     ///
-    /// When it is drawn, the two modes are one control, so they read as a
-    /// choice rather than as two unrelated buttons: one track, one raised
-    /// segment for the active mode, and an icon pair that says "Vibex draws it"
-    /// against "the Agent draws it". Each tooltip names what the mode gains and
-    /// what it gives up: the interface keeps Vibex's extensions, while the
-    /// Agent's own TUI cannot receive them.
+    /// When it is drawn, the two modes are one control: the component's
+    /// "Filling Space" segmented [`TabBar`], where every tab takes an equal
+    /// share of the bar, so the pair reads as a choice rather than as two
+    /// unrelated buttons. An icon pair says "Vibex draws it" against "the Agent
+    /// draws it". Each tooltip names what the mode gains and what it gives up:
+    /// the interface keeps Vibex's extensions, while the Agent's own TUI cannot
+    /// receive them.
     fn render_new_session_transport_switch(
         &self,
         agent_id: Option<&AgentId>,
@@ -60507,21 +60508,10 @@ impl VibexWorkbench {
             .as_ref()
             .is_some_and(|selection| selection.provider_profile_id().is_some());
         // The remembered transport is global, so it can name a mode this Agent
-        // does not offer. A disabled segment cannot wear the raised style, and
-        // drawing the stored mode directly then left both halves flat. Read it
-        // through the effective choice instead: the interface mode is always a
-        // segment this page can actually create.
+        // does not offer. The bar can only raise a segment the page can create,
+        // so the stored mode is read through the effective choice instead.
         let stored = self.ui_state.session.new_session_transport;
         let current = effective_new_session_transport(stored, agent_id);
-        let is_dark = cx.theme().is_dark();
-        let track = theme::semantic_color("muted", is_dark).opacity(0.55);
-        // The raised segment is the card, not the page background: on a dark
-        // theme `background` and the track are nearly the same colour, so the
-        // accent label drawn on it disappeared into its own segment.
-        let selected_bg = theme::semantic_color("card", is_dark);
-        let selected_fg = cx.theme().foreground;
-        let unselected = cx.theme().muted_foreground;
-        let terminal_accent = theme::semantic_color("accent", is_dark);
         // Each segment says what the reader gets and what they give up: the
         // interface keeps Vibex's extensions, the Agent's own TUI is complete
         // without them.
@@ -60554,77 +60544,59 @@ impl VibexWorkbench {
         let options = [
             (
                 NewSessionTransport::Acp,
-                "new-session-transport-acp",
                 IconName::LayoutDashboard,
                 crate::locale::text("Vibex interface", "Vibex 界面", "Vibex 介面"),
                 vibex_interface_tooltip,
-                cx.theme().foreground,
             ),
             (
                 NewSessionTransport::Terminal,
-                "new-session-transport-terminal",
                 IconName::SquareTerminal,
                 crate::locale::text("Native terminal", "原生终端", "原生終端"),
                 terminal_tooltip,
-                terminal_accent,
             ),
         ];
-        let mut segments = Vec::with_capacity(options.len());
-        for (mode, id, icon, label, tooltip, _active_color) in options {
-            let selected = current == mode;
-            segments.push(
-                Button::new(id)
-                    .xsmall()
-                    .ghost()
-                    .h(px(24.0))
-                    .px_2()
-                    .rounded(px(7.0))
-                    .when(selected, |this| this.bg(selected_bg).shadow_xs())
-                    .tooltip(tooltip)
-                    .child(
-                        // Colour is set on the content rather than only on the
-                        // button: a child that inherits from the theme paints over
-                        // whatever the button asked for, which is how the active
-                        // label ended up darker than the segment it sits on.
-                        h_flex()
-                            .items_center()
-                            .gap(px(5.0))
-                            // The icon follows the label, not the mode accent:
-                            // a dark accent on a raised segment left the
-                            // terminal's icon dim beside its own bright text.
-                            .child(Icon::new(icon).size(px(12.0)).text_color(if selected {
-                                selected_fg
-                            } else {
-                                unselected
-                            }))
-                            .child(
-                                div()
-                                    .text_size(px(11.0))
-                                    .text_color(if selected { selected_fg } else { unselected })
-                                    .child(label),
-                            ),
-                    )
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        if this.ui_state.session.new_session_transport == mode {
-                            return;
-                        }
-                        this.ui_state.session.new_session_transport = mode;
-                        this.queue_ui_state();
-                        cx.notify();
-                    }))
-                    .into_any_element(),
-            );
-        }
+        let selected_index = options
+            .iter()
+            .position(|(mode, ..)| *mode == current)
+            .unwrap_or(0);
+        let modes: Vec<NewSessionTransport> = options.iter().map(|(mode, ..)| *mode).collect();
         Some(
-            h_flex()
-                .id("new-session-transport")
-                .flex_none()
-                .items_center()
-                .gap(px(2.0))
-                .p(px(2.0))
-                .rounded(px(9.0))
-                .bg(track)
-                .children(segments)
+            // The kit's segmented bar paints the track and the raised chip, so
+            // the switch only contributes its tabs. Each tab is `flex_1`, which
+            // is what makes the two modes fill the bar as equal halves.
+            TabBar::new("new-session-transport")
+                .segmented()
+                .small()
+                .h(px(28.0))
+                .selected_index(selected_index)
+                .children(options.into_iter().map(|(_, icon, label, tooltip)| {
+                    // The kit's `prefix` slot pins the mark to the tab's leading
+                    // edge, which pushed the icon away from the label it belongs
+                    // to; the tab's own child keeps them one centred group.
+                    Tab::new()
+                        .flex_1()
+                        .aria_label(label)
+                        .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+                        .child(
+                            h_flex()
+                                .items_center()
+                                .justify_center()
+                                .gap(px(5.0))
+                                .child(Icon::new(icon).size(px(12.0)))
+                                .child(div().text_size(px(11.0)).child(label)),
+                        )
+                }))
+                .on_click(cx.listener(move |this, index: &usize, _, cx| {
+                    let Some(mode) = modes.get(*index).copied() else {
+                        return;
+                    };
+                    if this.ui_state.session.new_session_transport == mode {
+                        return;
+                    }
+                    this.ui_state.session.new_session_transport = mode;
+                    this.queue_ui_state();
+                    cx.notify();
+                }))
                 .into_any_element(),
         )
     }
@@ -116486,6 +116458,10 @@ mod tests {
 
     /// The new-session page offers terminal mode only for an Agent this release
     /// verified, and an Agent without one draws no switch at all.
+    ///
+    /// The switch itself is the component's "Filling Space" segmented tab bar:
+    /// both modes are one control, and each tab takes an equal share of the bar
+    /// so the pair reads as a choice rather than two unrelated buttons.
     #[test]
     fn the_new_session_transport_switch_is_absent_without_terminal_mode() {
         let source = include_str!("app.rs");
@@ -116506,6 +116482,21 @@ mod tests {
         assert!(
             switch.contains("let current = effective_new_session_transport(stored, agent_id);")
         );
+        // The component's Filling Space recipe is a segmented bar whose tabs
+        // each take an equal share of the width.
+        assert!(switch.contains("TabBar::new(\"new-session-transport\")"));
+        assert!(switch.contains(".segmented()"));
+        assert!(switch.contains(".flex_1()"));
+        assert!(switch.contains(".selected_index(selected_index)"));
+        assert!(switch.contains(".on_click(cx.listener("));
+        // The kit's `prefix` slot pins the mark to the leading edge, away from
+        // the title it belongs to; the tab's own child keeps them one centred
+        // group.
+        assert!(switch.contains(".aria_label(label)"));
+        assert!(switch.contains("justify_center()"));
+        assert!(!switch.contains(".prefix("));
+        // Each tab keeps the tooltip that names what the mode gains and gives up.
+        assert!(switch.contains("Tooltip::new(tooltip.clone())"));
         let panel = source
             .split_once("    fn render_new_session_panel(")
             .and_then(|(_, tail)| tail.split_once("\n    fn show_turn_preview_rail("))
