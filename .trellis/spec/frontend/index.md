@@ -21,6 +21,7 @@ Primary evidence:
 | [AI Souls Home Arena](./pixel-arena.md) | Changing the pixel guardian preview, local boss combat, the reward companion a won encounter unlocks on a session composer, input lifecycle, or its appearance preference. |
 | [Timeline Presentation](./timeline-presentation.md) | Changing shared activity labels, mobile disclosures, TUI grouping, or reasoning windows. |
 | [Session Timeline Scrolling](./timeline-scrolling.md) | Changing the transcript scroll container, follow/jump controls, or evaluating `MessageScroller`. |
+| [GPUI Fast Retention](./gpui-retention.md) | Changing a desktop notify/repaint path, adding a view boundary, or judging a gpui-fast behavior difference. |
 | [State Management](./state-management.md) | Deciding local UI state, remote snapshots, streaming buffers, or persisted preferences. |
 | [TUI Session State](./tui-session-state.md) | Changing TUI drafts, creation, runtime picker targets, async replies, or transcript ownership. |
 | [Type Safety](./type-safety.md) | Adding protocol types, timeline events, capabilities, or form models. |
