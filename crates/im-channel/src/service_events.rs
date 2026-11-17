@@ -1,5 +1,21 @@
 use super::*;
 
+/// Releases a drain slot even when the drain task is cancelled.
+///
+/// The guard carries the generation it claimed: a cancelled task must free the
+/// slot, but only the drain that owns it may, so a task dropped late cannot
+/// unlock a newer drain.
+struct LagRecoverySlot<'a> {
+    recovery: &'a LagRecovery,
+    generation: u64,
+}
+
+impl Drop for LagRecoverySlot<'_> {
+    fn drop(&mut self) {
+        self.recovery.abandon(self.generation);
+    }
+}
+
 impl ImChannelService {
     pub(super) async fn event_loop(this: Weak<Self>, mut shutdown: watch::Receiver<bool>) {
         let Some(service) = this.upgrade() else {
@@ -24,14 +40,17 @@ impl ImChannelService {
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {
                             // Dropping these silently is what makes a busy runtime
-                            // "go quiet" with no way to tell it happened. Every
-                            // bound chat gets one notice and a re-sync instead.
+                            // "go quiet" with no way to tell it happened. The
+                            // backlog is drained beside the loop, one recovery at
+                            // a time: awaiting it here made every reading wait for
+                            // a send, which is how one backlog turned into a run
+                            // of identical notices.
                             tracing::warn!(
                                 target: "vibex_im",
                                 skipped = count,
                                 "IM timeline subscription fell behind"
                             );
-                            let _ = service.recover_from_lag().await;
+                            service.spawn_lag_recovery();
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }
@@ -136,14 +155,60 @@ impl ImChannelService {
         Ok(())
     }
 
+    /// Starts a drain of a lagged subscription, unless one already owns the
+    /// backlog.
+    ///
+    /// This is deliberately off the event loop: awaiting the drain there made
+    /// every reading wait for a provider send, so a runtime that produced faster
+    /// than the channel drained reported the same backlog again while the chat
+    /// was still being told about the last one. Readings that arrive during a
+    /// drain fold into one more round instead of being dropped or spamming a
+    /// second drain.
+    fn spawn_lag_recovery(self: &Arc<Self>) {
+        let Some(generation) = self.inner.lag_recovery.try_begin(unix_timestamp_ms()) else {
+            return;
+        };
+        let service = Arc::downgrade(self);
+        tokio::spawn(async move {
+            let Some(service) = service.upgrade() else {
+                // The whole service is gone, and the claim with it.
+                return;
+            };
+            let _slot = LagRecoverySlot {
+                recovery: &service.inner.lag_recovery,
+                generation,
+            };
+            loop {
+                if *service.inner.shutdown.borrow() {
+                    return;
+                }
+                if let Err(error) = service.recover_from_lag().await {
+                    tracing::warn!(
+                        target: "vibex_im",
+                        error_code = %error.code,
+                        "IM lag recovery failed"
+                    );
+                }
+                if !service.inner.lag_recovery.finish_round(generation) {
+                    return;
+                }
+            }
+        });
+    }
+
     /// Tells every bound chat that live updates were missed and re-sends the
     /// state they can act on.
     ///
     /// A successful turn is not replayed: the message text is gone from the
     /// broadcast ring, and the desktop timeline is the place to read it. What is
-    /// re-sent is what a user would otherwise be stuck on — a pending approval
-    /// whose card never arrived, and a one-line notice that replies may be
-    /// incomplete.
+    /// re-sent is what a user would otherwise be stuck on — an approval card
+    /// whose message never reached the chat.
+    ///
+    /// The notice is what used to flood a chat: one reading of a backlog is one
+    /// line, and a backlog that takes several readings sent that line again and
+    /// again. Each binding is told at most once per cooldown; the cards are
+    /// re-sent on every recovery because a pending approval the chat never saw is
+    /// the one thing it cannot find any other way.
     async fn recover_from_lag(&self) -> VibexResult<()> {
         let conn = self.open()?;
         let channels = ImChannelRepository::list(&conn)?;
@@ -156,16 +221,45 @@ impl ImChannelService {
                 .into_iter()
                 .filter(|binding| binding.status == ImBindingStatus::Active)
             {
-                let notice = render::lag_notice(self.locale_for_channel(&record.channel_id));
-                let _ = self.send_to_binding(&binding, notice).await;
-                let pending =
-                    ImApprovalCardRepository::list_pending_for_binding(&conn, &binding.binding_id)?;
-                for card in pending {
+                let mut pending = Vec::new();
+                for card in
+                    ImApprovalCardRepository::list_pending_for_binding(&conn, &binding.binding_id)?
+                {
+                    // A card with a message id is already on screen; tapping it
+                    // is what resolves the request. Re-sending it would be a
+                    // no-op inside `send_approval_card`, so the timeline read
+                    // that would decide what to re-send is skipped here.
+                    if card.external_message_id.is_some() {
+                        continue;
+                    }
                     if let Some(request) = self
                         .pending_permission(&binding.session_id, Some(&card.request_id))
                         .await?
                     {
-                        self.send_approval_card(&binding, &request, 0).await?;
+                        pending.push(request);
+                    }
+                }
+                let now = unix_timestamp_ms();
+                if self
+                    .inner
+                    .lag_recovery
+                    .claim_notice(&binding.binding_id, now)
+                {
+                    let locale = self.locale_for_channel(&record.channel_id);
+                    let notice = render::lag_notice(locale, pending.len());
+                    let _ = self.send_to_binding(&binding, &notice).await;
+                }
+                for request in pending {
+                    if let Err(error) = self.send_approval_card(&binding, &request, 0).await {
+                        // One chat's provider refusal must not keep the others
+                        // from being brought back to a state they can act on.
+                        tracing::warn!(
+                            target: "vibex_im",
+                            channel_id = %record.channel_id,
+                            binding_id = %binding.binding_id,
+                            error_code = %error.code,
+                            "IM approval re-send after lag failed"
+                        );
                     }
                 }
             }

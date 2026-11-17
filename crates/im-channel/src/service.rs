@@ -32,6 +32,7 @@ use crate::adapter::ImAdapter;
 use crate::agent_port::ImAgentPort;
 use crate::error::ImError;
 use crate::i18n::ImLocale;
+use crate::lag::LagRecovery;
 use crate::lark::LarkAdapter;
 use crate::limits::{InboundDecision, InboundKind, InboundLimiter};
 use crate::outbox::{OutboundPriority, Outbox};
@@ -94,6 +95,8 @@ struct Inner {
     /// Chat messages recent prompts came from, so an Agent reaction can reach
     /// the message it answered.
     prompt_targets: Mutex<reactions::PromptTargets>,
+    /// Coalesces recovery from a live subscription that fell behind.
+    lag_recovery: LagRecovery,
 }
 
 struct ChannelRuntime {
@@ -143,6 +146,7 @@ impl ImChannelService {
                 inbound_limiter: InboundLimiter::new(),
                 live_turns: Mutex::new(HashMap::new()),
                 prompt_targets: Mutex::new(reactions::PromptTargets::default()),
+                lag_recovery: LagRecovery::default(),
             }),
         })
     }

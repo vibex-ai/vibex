@@ -5,7 +5,7 @@
 //! resolved approval. No real bot token or network access is involved.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -28,12 +28,16 @@ use vibex_core::{
     PermissionResponseOption, ProjectId, ProviderProfileId, ResolveElicitationRequest,
     ResolvePermissionRequest, RuntimeAuthSource, RuntimeModelSelection, SendAgentMessageRequest,
     SessionRuntimeSelection, SessionRuntimeSelectionStatus, SetDesiredAgentSessionRuntimeRequest,
-    SystemNoticeLevel, SystemNoticePayload, TimelineItem, TimelineItemId, TimelineLiveEvent,
-    TimelinePage, TimelinePayload, TimelinePayloadDepth, TimelineRedactionState, TimelineSource,
-    UserMessagePayload, VIBEX_USE_REACTION_CORRELATION_PREFIX, VibexResult, VibexSessionId,
-    WorkspaceId, WorkspaceMode, unix_timestamp_ms,
+    SystemNoticeLevel, SystemNoticePayload, TimelineErrorPayload, TimelineItem, TimelineItemId,
+    TimelineLiveEvent, TimelinePage, TimelinePayload, TimelinePayloadDepth, TimelineRedactionState,
+    TimelineSource, UserMessagePayload, VIBEX_USE_REACTION_CORRELATION_PREFIX, VibexResult,
+    VibexSessionId, WorkspaceId, WorkspaceMode, unix_timestamp_ms,
 };
 use vibex_im_channel::{ImAgentPort, ImChannelService, ImChannelServiceConfig};
+
+/// A provider send slow enough that the runtime keeps producing while the
+/// channel is blocked on it — the condition a lagged subscription reports.
+const SLOW_SEND: Duration = Duration::from_millis(400);
 
 struct FakeTelegram {
     updates: Mutex<VecDeque<Value>>,
@@ -43,6 +47,9 @@ struct FakeTelegram {
     topics: Mutex<Vec<Value>>,
     topic_edits: Mutex<Vec<Value>>,
     reactions: Mutex<Vec<Value>>,
+    /// How many `sendMessage` calls still take `SLOW_SEND`, so a test can make
+    /// the runtime produce faster than the channel drains.
+    slow_sends: AtomicU32,
     notify: Notify,
     next_message_id: AtomicI64,
 }
@@ -57,6 +64,7 @@ impl FakeTelegram {
             topics: Mutex::new(Vec::new()),
             topic_edits: Mutex::new(Vec::new()),
             reactions: Mutex::new(Vec::new()),
+            slow_sends: AtomicU32::new(0),
             notify: Notify::new(),
             next_message_id: AtomicI64::new(1),
         }
@@ -138,6 +146,15 @@ async fn fake_telegram(
             json!(updates)
         }
         "sendMessage" => {
+            if state
+                .slow_sends
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                    left.checked_sub(1)
+                })
+                .is_ok()
+            {
+                tokio::time::sleep(SLOW_SEND).await;
+            }
             state.sent.lock().expect("sent").push(body);
             let id = state.next_message_id.fetch_add(1, Ordering::Relaxed);
             json!({ "message_id": id })
@@ -1343,6 +1360,231 @@ async fn telegram_pairing_commands_and_approval_round_trip() {
         !fake.sent_texts().iter().any(|text| text.contains("answer")),
         "the final answer finishes that message instead of being sent again"
     );
+
+    service.stop().await;
+    server.abort();
+}
+
+/// A burst of live events that the channel cannot keep up with.
+///
+/// One slow send blocks the event loop, and more events than the broadcast ring
+/// holds arrive behind it, so the subscription reports the backlog the way the
+/// real runtime does when it produces faster than a chat can be written to.
+async fn lag_the_subscription(fake: &Arc<FakeTelegram>, agent: &Arc<MockAgent>, sequence: i64) {
+    fake.slow_sends.store(1, Ordering::SeqCst);
+    let _ = agent.timeline.send(TimelineLiveEvent {
+        session_id: agent.session.id.clone(),
+        sequence,
+        item: agent.item(
+            sequence,
+            TimelinePayload::Error(TimelineErrorPayload {
+                code: "fake_slow_send".to_string(),
+                message: "the send that holds the loop".to_string(),
+                recoverable: true,
+            }),
+        ),
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    // Well past the ring's capacity, so the receiver must report a lag.
+    for offset in 0..64 {
+        let _ = agent.timeline.send(TimelineLiveEvent {
+            session_id: agent.session.id.clone(),
+            sequence: sequence + 1 + offset,
+            item: agent.item(
+                sequence + 1 + offset,
+                TimelinePayload::UserMessage(UserMessagePayload {
+                    text: format!("queued {offset}"),
+                    ..Default::default()
+                }),
+            ),
+        });
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lagged_subscription_tells_the_chat_once_and_keeps_its_card() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let home = dir.path().to_path_buf();
+    let db_path = home.join("vibex.db");
+    vibex_config_switch::secrets::configure_provider_secret_store(
+        vibex_config_switch::secrets::ProviderSecretStoreConfig::host_file(&home),
+    );
+    let mut conn = vibex_db::open_database(&db_path).expect("db");
+    vibex_db::apply_migrations(&mut conn).expect("migrate");
+
+    let agent = Arc::new(MockAgent::new());
+    seed_session(&conn, &agent);
+    drop(conn);
+
+    let fake = Arc::new(FakeTelegram::new());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let address = listener.local_addr().expect("addr");
+    let router = Router::new()
+        .route("/file/bot{token}/{*path}", get(fake_file))
+        .route("/bot{token}/{method}", post(fake_telegram))
+        .with_state(Arc::clone(&fake));
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router).await.expect("fake server");
+    });
+
+    let agent_port: Arc<dyn ImAgentPort> = agent.clone();
+    let service = Arc::new(
+        ImChannelService::new(ImChannelServiceConfig {
+            db_path: db_path.clone(),
+            home_dir: home,
+            agent: agent_port,
+            telegram_api_base: Some(format!("http://{address}")),
+            lark_api_base: None,
+            locale: Some("en".to_string()),
+        })
+        .expect("service"),
+    );
+    service.start().await.expect("start");
+    let channel = service
+        .create_channel(ImChannelDraft {
+            display_name: "Lag bot".to_string(),
+            config: ImChannelConfig::Telegram(vibex_core::ImTelegramConfig {
+                chat_id: "42".to_string(),
+                topic_mode: false,
+                require_mention_in_groups: false,
+            }),
+            default_session: None,
+            event_filter: Vec::new(),
+            locale: Some("en".to_string()),
+        })
+        .await
+        .expect("create channel");
+    service
+        .set_bot_token(&channel.channel_id, "123:fake-token")
+        .await
+        .expect("token");
+    service
+        .set_channel_enabled(&channel.channel_id, true)
+        .await
+        .expect("enable");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let pairing = service
+        .create_pairing_code(ImPairingRequest {
+            channel_id: channel.channel_id.clone(),
+            ttl_ms: Some(60_000),
+            scope: vibex_core::ImPairingScope::Direct,
+            target_chat_id: None,
+        })
+        .await
+        .expect("pairing");
+    fake.push(message_update(1, "/start"));
+    fake.push(message_update(2, &format!("/pair {}", pairing.code)));
+    wait_for(
+        || async {
+            service
+                .list_principals(&channel.channel_id)
+                .await
+                .map(|principals| {
+                    principals
+                        .iter()
+                        .any(|principal| principal.status == ImPrincipalStatus::Active)
+                })
+                .unwrap_or(false)
+        },
+        "pairing",
+    )
+    .await;
+
+    // Pairing creates the principal; the binding is what routes a session's
+    // live events to that chat. A real channel binds through `/sessions`; the
+    // row is written directly so the test can start from a bound chat.
+    let binding_id = vibex_core::ImBindingId::new();
+    let now = unix_timestamp_ms();
+    let conn = rusqlite::Connection::open(&db_path).expect("db");
+    conn.execute(
+        "INSERT INTO im_bindings (
+            binding_id, channel_id, external_chat_id, thread_key, thread_kind, session_id,
+            created_by_principal_id, status, last_delivered_sequence, title,
+            title_sync_enabled, provider_payload_json, created_at_ms, updated_at_ms
+         ) VALUES (?1, ?2, '42', '', NULL, ?3, NULL, 'active', 0, ?4, 0, NULL, ?5, ?5)",
+        rusqlite::params![
+            binding_id.as_str(),
+            channel.channel_id.as_str(),
+            agent.session.id.as_str(),
+            agent.session.title,
+            now
+        ],
+    )
+    .expect("binding");
+    drop(conn);
+
+    // An approval the chat already holds buttons for. A backlog must not send
+    // it a second time: the message on screen is the one that resolves it.
+    let request = PermissionRequest {
+        id: vibex_core::RequestId::new(),
+        session_id: agent.session.id.clone(),
+        project_id: Some(agent.session.project_id.clone()),
+        workspace_id: Some(agent.session.workspace_id.clone()),
+        provider_request_id: Some("lag-request".to_string()),
+        risk_category: vibex_core::PermissionRiskCategory::Command,
+        title: "Run the lag tests".to_string(),
+        details: vec![PermissionActionDetail {
+            label: "Command".to_string(),
+            value: "cargo test".to_string(),
+        }],
+        allowed_responses: vec![PermissionResponseKind::Approve],
+        response_options: vec![PermissionResponseOption {
+            option_id: "allow".to_string(),
+            label: "Allow".to_string(),
+            response: PermissionResponseKind::Approve,
+        }],
+        status: PermissionRequestStatus::Pending,
+        requested_at_ms: unix_timestamp_ms(),
+        expires_at_ms: None,
+    };
+    *agent.pending.lock().expect("pending") = Some(request.clone());
+    let _ = agent.timeline.send(TimelineLiveEvent {
+        session_id: agent.session.id.clone(),
+        sequence: 7,
+        item: agent.item(7, TimelinePayload::PermissionRequest(request)),
+    });
+    wait_for(
+        || async {
+            fake.sent_texts()
+                .iter()
+                .any(|text| text.contains("Run the lag tests"))
+        },
+        "approval card",
+    )
+    .await;
+
+    // Two backlogs in a row, the way a busy runtime reports them: the first
+    // tells the chat, the second must stay quiet instead of repeating the same
+    // line while the reader is already behind.
+    lag_the_subscription(&fake, &agent, 100).await;
+    wait_for(
+        || async {
+            fake.sent_texts()
+                .iter()
+                .any(|text| text.contains("fell behind"))
+        },
+        "lag notice",
+    )
+    .await;
+    lag_the_subscription(&fake, &agent, 400).await;
+    // Give the second recovery every chance to speak before proving it did not.
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+
+    let notices = fake
+        .sent_texts()
+        .into_iter()
+        .filter(|text| text.contains("fell behind"))
+        .count();
+    assert_eq!(notices, 1, "one backlog is one notice, not one per reading");
+    let cards = fake
+        .sent_texts()
+        .iter()
+        .filter(|text| text.contains("Run the lag tests"))
+        .count();
+    assert_eq!(cards, 1, "a card already on screen is not sent again");
 
     service.stop().await;
     server.abort();

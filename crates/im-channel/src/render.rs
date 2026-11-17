@@ -438,18 +438,29 @@ pub fn rate_limited(locale: ImLocale, retry_after_secs: u64) -> String {
 }
 
 /// Sent after the subscription fell behind and some live events were lost.
-pub fn lag_notice(locale: ImLocale) -> &'static str {
-    match locale {
-        ImLocale::En => {
-            "Vibex fell behind and some live updates were not delivered. Send /status for the current state; pending approvals are re-sent below."
-        }
-        ImLocale::ZhCn => {
-            "Vibex 处理积压时漏掉了一些实时更新。发送 /status 查看当前状态；待处理的审批已在下方重新发送。"
-        }
-        ImLocale::ZhTw => {
-            "Vibex 處理積壓時漏掉了一些即時更新。傳送 /status 查看目前狀態；待處理的審批已在下方重新傳送。"
-        }
+///
+/// The second sentence only appears when there is something below it: telling a
+/// chat that approvals are re-sent when none are waiting is a false promise, and
+/// on a busy runtime the same line repeated is what made the chat look flooded.
+pub fn lag_notice(locale: ImLocale, resent_approvals: usize) -> String {
+    let (lead, approvals) = match locale {
+        ImLocale::En => (
+            "Vibex fell behind and some live updates were not delivered. Send /status for the current state.",
+            "Pending approvals are re-sent below.",
+        ),
+        ImLocale::ZhCn => (
+            "Vibex 处理积压时漏掉了一些实时更新。发送 /status 查看当前状态。",
+            "待处理的审批已在下方重新发送。",
+        ),
+        ImLocale::ZhTw => (
+            "Vibex 處理積壓時漏掉了一些即時更新。傳送 /status 查看目前狀態。",
+            "待處理的審批已在下方重新傳送。",
+        ),
+    };
+    if resent_approvals == 0 {
+        return lead.to_string();
     }
+    format!("{lead} {approvals}")
 }
 
 pub fn session_list(sessions: &[AgentSession], locale: ImLocale) -> String {
@@ -932,5 +943,18 @@ mod tests {
     #[test]
     fn whitespace_only_answers_produce_no_parts() {
         assert!(final_answer_parts("   \n\n  ", ImLocale::En).is_empty());
+    }
+
+    #[test]
+    fn a_lag_notice_only_promises_approvals_it_actually_sends() {
+        let alone = lag_notice(ImLocale::ZhCn, 0);
+        assert!(alone.contains("/status"), "{alone}");
+        assert!(
+            !alone.contains("审批"),
+            "nothing is re-sent, so nothing may be promised: {alone}"
+        );
+        let with_cards = lag_notice(ImLocale::ZhCn, 2);
+        assert!(with_cards.contains("待处理的审批"), "{with_cards}");
+        assert!(with_cards.starts_with(&alone), "{with_cards}");
     }
 }

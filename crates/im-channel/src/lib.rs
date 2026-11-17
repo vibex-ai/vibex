@@ -9,6 +9,7 @@ mod agent_port;
 mod elicitation;
 mod error;
 mod i18n;
+mod lag;
 mod lark;
 mod limits;
 mod markdown;

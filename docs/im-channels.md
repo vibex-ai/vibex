@@ -318,6 +318,21 @@ delivered.
 Timestamped delivery problems are visible in the channel's status: last inbound,
 last outbound, pending sends, and the last error with its retry time.
 
+### Falling behind
+
+Live events reach a channel over a process-local stream with a bounded buffer.
+When the runtime produces faster than a chat can be written to, the buffer
+overwrites its oldest entries and the channel reports how many it dropped; the
+count is logged, not shown in the chat.
+
+A dropped batch is drained beside the stream, one drain at a time, so the
+channel keeps reading while it catches up. A chat is told once per backlog — one
+line suggesting `/status` — rather than once per batch, and only when it was not
+already told about the same run of drops. An approval card is re-sent only if its
+message never left the process: a card already on screen keeps the buttons that
+resolve it. A reply that was lost is not replayed, because the stream is not a
+durable log; open Vibex for the transcript.
+
 ## Limits
 
 - One runtime per home directory owns the connections. A second process cannot
