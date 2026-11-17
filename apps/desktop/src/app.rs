@@ -51733,33 +51733,34 @@ impl VibexWorkbench {
                             .when(
                                 show_session_context && active_session_group.is_none(),
                                 |this| {
-                                this.child(
-                                    h_flex()
-                                        .id("title-session-heading")
-                                        .w_auto()
-                                        .max_w(px(TITLE_BAR_SESSION_TITLE_MAX_WIDTH
-                                            + TITLE_BAR_SESSION_HEADING_EXTRA_WIDTH))
-                                        .flex_none()
-                                        .items_center()
-                                        .gap(px(1.0))
-                                        .child(
-                                            div()
-                                                .id("title-session-title")
-                                                .min_w_0()
-                                                .max_w(px(TITLE_BAR_SESSION_TITLE_MAX_WIDTH))
-                                                .truncate()
-                                                .text_sm()
-                                                .font_medium()
-                                                .child(session_title),
-                                        )
-                                        .when_some(title_session_capabilities, |this, pill| {
-                                            this.child(pill)
-                                        })
-                                        .when_some(title_session_menu, |this, menu| {
-                                            this.child(menu)
-                                        }),
-                                )
-                            })
+                                    this.child(
+                                        h_flex()
+                                            .id("title-session-heading")
+                                            .w_auto()
+                                            .max_w(px(TITLE_BAR_SESSION_TITLE_MAX_WIDTH
+                                                + TITLE_BAR_SESSION_HEADING_EXTRA_WIDTH))
+                                            .flex_none()
+                                            .items_center()
+                                            .gap(px(1.0))
+                                            .child(
+                                                div()
+                                                    .id("title-session-title")
+                                                    .min_w_0()
+                                                    .max_w(px(TITLE_BAR_SESSION_TITLE_MAX_WIDTH))
+                                                    .truncate()
+                                                    .text_sm()
+                                                    .font_medium()
+                                                    .child(session_title),
+                                            )
+                                            .when_some(title_session_capabilities, |this, pill| {
+                                                this.child(pill)
+                                            })
+                                            .when_some(title_session_menu, |this, menu| {
+                                                this.child(menu)
+                                            }),
+                                    )
+                                },
+                            )
                             // The group's own heading: the icon, the name, the
                             // live count and the merge action, all in the band
                             // the single session used to spend on one title.
@@ -51788,9 +51789,7 @@ impl VibexWorkbench {
                                                 .font_medium()
                                                 .child(group.name.clone()),
                                         )
-                                        .children(self.render_session_group_team_status(
-                                            &group, cx,
-                                        ))
+                                        .children(self.render_session_group_team_status(&group, cx))
                                         .child(
                                             Button::new("title-session-group-merge")
                                                 .xsmall()
@@ -54287,189 +54286,197 @@ impl VibexWorkbench {
                 .selected(selected)
                 .min_w_0()
                 .text_xs()
-                .when(tab_holds_focus, |this| this.text_color(cx.theme().foreground))
+                .when(tab_holds_focus, |this| {
+                    this.text_color(cx.theme().foreground)
+                })
                 .child(
-                h_flex()
-                    .id(format!("session-group-tab-{session_id}"))
-                    .min_w_0()
-                    .items_center()
-                    .gap_1()
-                    .cursor_pointer()
-                    .when(tab_holds_focus, |this| {
-                        this.child(
-                            div()
-                                .flex_none()
-                                .w(px(2.0))
-                                .h(px(12.0))
-                                .rounded_full()
-                                .bg(cx.theme().primary.opacity(0.75)),
-                        )
-                    })
-                    .child(sidebar_agent_logo(&agent_id, selected, cx))
-                    .child(div().min_w_0().truncate().child(title_element))
-                    .child(status_mark)
-                    .on_click(move |_, _, cx| {
-                        let _ = click_entity.update(cx, |this, cx| {
-                            this.focus_session_group_tab(
-                                &click_group_id,
-                                &click_pane_id,
-                                &click_session_id,
-                                cx,
+                    h_flex()
+                        .id(format!("session-group-tab-{session_id}"))
+                        .min_w_0()
+                        .items_center()
+                        .gap_1()
+                        .cursor_pointer()
+                        .when(tab_holds_focus, |this| {
+                            this.child(
+                                div()
+                                    .flex_none()
+                                    .w(px(2.0))
+                                    .h(px(12.0))
+                                    .rounded_full()
+                                    .bg(cx.theme().primary.opacity(0.75)),
                             )
-                        });
-                    })
-                    .on_drag_move(cx.listener(
-                        move |this, event: &DragMoveEvent<SessionGroupTabDrag>, _, cx| {
-                            let drag = event.drag(cx);
-                            if !event.bounds.contains(&event.event.position) {
-                                return;
-                            }
-                            let next = (drag.session_id != reorder_target_id).then_some(
-                                SessionGroupTabDropTarget {
-                                    pane_id: reorder_pane_id.clone(),
-                                    session_id: reorder_target_id.clone(),
-                                    after: event.event.position.x >= event.bounds.center().x,
-                                },
-                            );
-                            if this.session_group_tab_drop_target != next {
-                                this.session_group_tab_drop_target = next;
-                                this.session_group_pane_drop_target =
-                                    Some(SessionGroupPaneDropTarget {
-                                        pane_id: reorder_pane_id.clone(),
-                                        region: SessionGroupPaneDropRegion::TabGroup,
-                                    });
-                                cx.notify();
-                            }
-                        },
-                    ))
-                    .on_drop(cx.listener(move |this, drag: &SessionGroupTabDrag, _, cx| {
-                        this.session_group_pane_drop_target = None;
-                        this.session_group_tab_removal_active = false;
-                        // A tab is always a landing slot for the strip it lives
-                        // in, so a drop on one never falls through to the pane:
-                        // it either lands next to this tab or, with no resolved
-                        // slot, at the end of this pane.
-                        let target = this
-                            .session_group_tab_drop_target
-                            .take()
-                            .filter(|target| target.pane_id == drop_pane_id);
-                        if let Some(target) = target {
-                            this.reorder_session_group_tab(
-                                &drop_group_id,
-                                &target.pane_id,
-                                &drag.session_id,
-                                &target.session_id,
-                                target.after,
-                                cx,
-                            );
-                        } else {
-                            this.drop_session_group_tab(
-                                &drop_group_id,
-                                &drop_pane_id,
-                                &drag.session_id,
-                                SessionGroupPaneDropRegion::TabGroup,
-                                cx,
-                            );
-                        }
-                    }))
-                    .on_drag(
-                        SessionGroupTabDrag {
-                            group_id: group_id.to_string(),
-                            session_id: session_id.clone(),
-                            label: title.clone().into(),
-                            agent_id: agent_id.clone(),
-                        },
-                        move |drag, _, _, cx| {
-                            // A fresh drag starts with no target: the previous
-                            // drag's hover must not decide where this one lands.
-                            let _ = drag_entity.update(cx, |this, cx| {
-                                this.session_group_tab_drop_target = None;
-                                this.session_group_pane_drop_target = None;
-                                this.session_group_tab_removal_active = false;
-                                cx.notify();
+                        })
+                        .child(sidebar_agent_logo(&agent_id, selected, cx))
+                        .child(div().min_w_0().truncate().child(title_element))
+                        .child(status_mark)
+                        .on_click(move |_, _, cx| {
+                            let _ = click_entity.update(cx, |this, cx| {
+                                this.focus_session_group_tab(
+                                    &click_group_id,
+                                    &click_pane_id,
+                                    &click_session_id,
+                                    cx,
+                                )
                             });
-                            cx.new(|_| drag.clone())
-                        },
-                    )
-                    .context_menu({
-                        let menu_entity = cx.weak_entity();
-                        let menu_group_id = group_id.to_string();
-                        let menu_pane_id = pane_id.clone();
-                        let menu_session_id = session_id.clone();
-                        move |menu, _window, cx| {
-                            let _ = cx;
-                            let split_entity = menu_entity.clone();
-                            let split_group_id = menu_group_id.clone();
-                            let split_pane_id = menu_pane_id.clone();
-                            let split_session_id = menu_session_id.clone();
-                            let down_entity = menu_entity.clone();
-                            let down_group_id = menu_group_id.clone();
-                            let down_pane_id = menu_pane_id.clone();
-                            let down_session_id = menu_session_id.clone();
-                            let leave_entity = menu_entity.clone();
-                            let leave_group_id = menu_group_id.clone();
-                            let leave_session_id = menu_session_id.clone();
-                            menu.item(
-                                PopupMenuItem::new(locale::text(
-                                    "Split right",
-                                    "向右分屏",
-                                    "向右分割",
-                                ))
-                                .icon(sidebar_icon("icons/vibex/chevrons-right.svg"))
-                                .disabled(false)
-                                .on_click(move |_, _, cx| {
-                                    let _ = split_entity.update(cx, |this, cx| {
-                                        this.drop_session_group_tab(
-                                            &split_group_id,
-                                            &split_pane_id,
-                                            &split_session_id,
-                                            SessionGroupPaneDropRegion::Right,
-                                            cx,
-                                        )
-                                    });
-                                }),
-                            )
-                            .item(
-                                PopupMenuItem::new(locale::text(
-                                    "Split down",
-                                    "向下分屏",
-                                    "向下分割",
-                                ))
-                                .icon(sidebar_icon("icons/vibex/chevrons-down-up.svg"))
-                                .disabled(false)
-                                .on_click(move |_, _, cx| {
-                                    let _ = down_entity.update(cx, |this, cx| {
-                                        this.drop_session_group_tab(
-                                            &down_group_id,
-                                            &down_pane_id,
-                                            &down_session_id,
-                                            SessionGroupPaneDropRegion::Bottom,
-                                            cx,
-                                        )
-                                    });
-                                }),
-                            )
-                            .separator()
-                            .item(
-                                PopupMenuItem::new(locale::text(
-                                    "Remove from session group",
-                                    "移出会话组",
-                                    "移出會話組",
-                                ))
-                                .icon(sidebar_icon("icons/vibex/layers.svg"))
-                                .on_click(move |_, _, cx| {
-                                    let _ = leave_entity.update(cx, |this, cx| {
-                                        this.remove_session_from_group_from_menu(
-                                            &leave_group_id,
-                                            &leave_session_id,
-                                            cx,
-                                        )
-                                    });
-                                }),
-                            )
-                        }
-                    }),
-            );
+                        })
+                        .on_drag_move(cx.listener(
+                            move |this, event: &DragMoveEvent<SessionGroupTabDrag>, _, cx| {
+                                let drag = event.drag(cx);
+                                if !event.bounds.contains(&event.event.position) {
+                                    return;
+                                }
+                                let next = (drag.session_id != reorder_target_id).then_some(
+                                    SessionGroupTabDropTarget {
+                                        pane_id: reorder_pane_id.clone(),
+                                        session_id: reorder_target_id.clone(),
+                                        after: event.event.position.x >= event.bounds.center().x,
+                                    },
+                                );
+                                if this.session_group_tab_drop_target != next {
+                                    this.session_group_tab_drop_target = next;
+                                    this.session_group_pane_drop_target =
+                                        Some(SessionGroupPaneDropTarget {
+                                            pane_id: reorder_pane_id.clone(),
+                                            region: SessionGroupPaneDropRegion::TabGroup,
+                                        });
+                                    cx.notify();
+                                }
+                            },
+                        ))
+                        .on_drop(cx.listener(move |this, drag: &SessionGroupTabDrag, _, cx| {
+                            this.session_group_pane_drop_target = None;
+                            this.session_group_tab_removal_active = false;
+                            // A tab is always a landing slot for the strip it lives
+                            // in, so a drop on one never falls through to the pane:
+                            // it either lands next to this tab or, with no resolved
+                            // slot, at the end of this pane.
+                            let target = this
+                                .session_group_tab_drop_target
+                                .take()
+                                .filter(|target| target.pane_id == drop_pane_id);
+                            if let Some(target) = target {
+                                this.reorder_session_group_tab(
+                                    &drop_group_id,
+                                    &target.pane_id,
+                                    &drag.session_id,
+                                    &target.session_id,
+                                    target.after,
+                                    cx,
+                                );
+                            } else {
+                                this.drop_session_group_tab(
+                                    &drop_group_id,
+                                    &drop_pane_id,
+                                    &drag.session_id,
+                                    SessionGroupPaneDropRegion::TabGroup,
+                                    cx,
+                                );
+                            }
+                        }))
+                        .on_drag(
+                            SessionGroupTabDrag {
+                                group_id: group_id.to_string(),
+                                session_id: session_id.clone(),
+                                label: title.clone().into(),
+                                agent_id: agent_id.clone(),
+                            },
+                            move |drag, _, _, cx| {
+                                // A fresh drag starts with no target: the previous
+                                // drag's hover must not decide where this one lands.
+                                let _ = drag_entity.update(cx, |this, cx| {
+                                    this.session_group_tab_drop_target = None;
+                                    this.session_group_pane_drop_target = None;
+                                    this.session_group_tab_removal_active = false;
+                                    cx.notify();
+                                });
+                                cx.new(|_| drag.clone())
+                            },
+                        )
+                        .context_menu({
+                            let menu_entity = cx.weak_entity();
+                            let menu_group_id = group_id.to_string();
+                            let menu_pane_id = pane_id.clone();
+                            let menu_session_id = session_id.clone();
+                            move |menu, _window, cx| {
+                                let _ = cx;
+                                let split_entity = menu_entity.clone();
+                                let split_group_id = menu_group_id.clone();
+                                let split_pane_id = menu_pane_id.clone();
+                                let split_session_id = menu_session_id.clone();
+                                let down_entity = menu_entity.clone();
+                                let down_group_id = menu_group_id.clone();
+                                let down_pane_id = menu_pane_id.clone();
+                                let down_session_id = menu_session_id.clone();
+                                let leave_entity = menu_entity.clone();
+                                let leave_group_id = menu_group_id.clone();
+                                let leave_session_id = menu_session_id.clone();
+                                menu.item(
+                                    PopupMenuItem::new(locale::text(
+                                        "Split right",
+                                        "向右分屏",
+                                        "向右分割",
+                                    ))
+                                    .icon(sidebar_icon("icons/vibex/chevrons-right.svg"))
+                                    .disabled(false)
+                                    .on_click(
+                                        move |_, _, cx| {
+                                            let _ = split_entity.update(cx, |this, cx| {
+                                                this.drop_session_group_tab(
+                                                    &split_group_id,
+                                                    &split_pane_id,
+                                                    &split_session_id,
+                                                    SessionGroupPaneDropRegion::Right,
+                                                    cx,
+                                                )
+                                            });
+                                        },
+                                    ),
+                                )
+                                .item(
+                                    PopupMenuItem::new(locale::text(
+                                        "Split down",
+                                        "向下分屏",
+                                        "向下分割",
+                                    ))
+                                    .icon(sidebar_icon("icons/vibex/chevrons-down-up.svg"))
+                                    .disabled(false)
+                                    .on_click(
+                                        move |_, _, cx| {
+                                            let _ = down_entity.update(cx, |this, cx| {
+                                                this.drop_session_group_tab(
+                                                    &down_group_id,
+                                                    &down_pane_id,
+                                                    &down_session_id,
+                                                    SessionGroupPaneDropRegion::Bottom,
+                                                    cx,
+                                                )
+                                            });
+                                        },
+                                    ),
+                                )
+                                .separator()
+                                .item(
+                                    PopupMenuItem::new(locale::text(
+                                        "Remove from session group",
+                                        "移出会话组",
+                                        "移出會話組",
+                                    ))
+                                    .icon(sidebar_icon("icons/vibex/layers.svg"))
+                                    .on_click(
+                                        move |_, _, cx| {
+                                            let _ = leave_entity.update(cx, |this, cx| {
+                                                this.remove_session_from_group_from_menu(
+                                                    &leave_group_id,
+                                                    &leave_session_id,
+                                                    cx,
+                                                )
+                                            });
+                                        },
+                                    ),
+                                )
+                            }
+                        }),
+                );
 
             tab_items.push(tab_element);
         }
@@ -54568,9 +54575,13 @@ impl VibexWorkbench {
             // emphasis, which is where the tab it belongs to sits.
             .border_1()
             .border_color(cx.theme().border)
-            .hover(|this| this.border_color(cx.theme().border.opacity(1.6)))
+            // Hover answers "which pane would take a click", so it lifts the
+            // frame one step. Focus answers "which pane has the keyboard", and it
+            // is said by the tab; the frame only gains a touch more weight than
+            // hover so a hovered pane never outshines the focused one.
+            .hover(|this| this.border_color(cx.theme().foreground.opacity(0.10)))
             .when(focused, |this| {
-                this.border_color(cx.theme().foreground.opacity(0.16))
+                this.border_color(cx.theme().foreground.opacity(0.18))
             })
             .when(!focused, |this| {
                 // Focus the pane on the way down. The event keeps propagating so
@@ -77861,11 +77872,9 @@ impl VibexWorkbench {
                                     // The trailing column is three stacked
                                     // controls, so it is taller than the text
                                     // beside it and sets the floor for the whole
-                                    // surface. A slim bar has no room for a
-                                    // column: the expand control it carried lives
-                                    // on the composer's own shortcut, and the
-                                    // schedule and terminal controls keep their
-                                    // place on the control row below.
+                                    // surface. A slim bar has one row to spend, so
+                                    // the same three controls are laid along that
+                                    // row instead — see the slim branch below.
                                     .when(!composer_is_slim, |this| {
                                         this.child(
                                             v_flex()
@@ -77911,6 +77920,58 @@ impl VibexWorkbench {
                                             })
                                             .child(self.render_composer_terminal_menu(cx)),
                                         )
+                                    })
+                                    // The same three controls, on the bar's own
+                                    // row. Nothing is dropped from the slim
+                                    // composer: it is the full one with its
+                                    // column folded flat.
+                                    .when(composer_is_slim, |this| {
+                                        this.child(
+                                            Button::new("toggle-composer-expanded")
+                                                .xsmall()
+                                                .ghost()
+                                                .compact()
+                                                .size(px(28.0))
+                                                .px_0()
+                                                .icon(if self.composer_expanded {
+                                                    IconName::Minimize
+                                                } else {
+                                                    IconName::Maximize
+                                                })
+                                                .tooltip(if self.composer_expanded {
+                                                    locale::text(
+                                                        "Collapse input",
+                                                        "收起输入框",
+                                                        "收合輸入框",
+                                                    )
+                                                } else {
+                                                    locale::text(
+                                                        "Expand input",
+                                                        "展开输入框",
+                                                        "展開輸入框",
+                                                    )
+                                                })
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.composer_expanded =
+                                                        !this.composer_expanded;
+                                                    cx.notify();
+                                                })),
+                                        )
+                                        .when_some(
+                                            self.view_session_id.clone(),
+                                            |this, session_id| {
+                                                this.child(
+                                                    self.render_message_schedule_button(
+                                                        MessageScheduleTarget::Session(
+                                                            session_id,
+                                                        ),
+                                                        enabled,
+                                                        cx,
+                                                    ),
+                                                )
+                                            },
+                                        )
+                                        .child(self.render_composer_terminal_menu(cx))
                                     }),
                             )
                             .when_some(self.composer_message_schedule(), |this, schedule| {
