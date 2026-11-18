@@ -8152,6 +8152,36 @@ fn user_message_edit_action_state(
     }
 }
 
+/// How many times the transcript's list has notified its workbench for a scroll.
+///
+/// `gpui::list` notifies the view holding it from inside its own wheel handler,
+/// and every shell view observing that workbench rebuilds with it — the
+/// composer, the sidebar, the rails. None of them reads what a scroll changes,
+/// and a composer rebuilt beside the transcript is what makes the transcript's
+/// list fail `scroll_only`: the layer asks whether the scroll was the only thing
+/// that happened, and a sibling rebuilt in the same frame answers no.
+///
+/// The count lives in the app's globals rather than on the workbench because a
+/// notify callback is handed the entity that is being updated and cannot read
+/// it. A view records the count it last rendered at and skips a notify that
+/// moved nothing else.
+#[derive(Default)]
+struct TranscriptScrollNotifies(u64);
+
+impl Global for TranscriptScrollNotifies {}
+
+fn note_transcript_scroll(cx: &mut App) {
+    let count = cx
+        .try_global::<TranscriptScrollNotifies>()
+        .map_or(0, |notifies| notifies.0);
+    cx.set_global(TranscriptScrollNotifies(count.wrapping_add(1)));
+}
+
+fn transcript_scroll_notifies(cx: &App) -> u64 {
+    cx.try_global::<TranscriptScrollNotifies>()
+        .map_or(0, |notifies| notifies.0)
+}
+
 /// How far the viewport's bottom is above the content's bottom.
 ///
 /// `offset_y` is where the viewport starts (zero at the top, negative as it
@@ -10161,15 +10191,36 @@ impl Render for SessionTerminalView {
 /// workbench center uses this one.
 struct TimelineView {
     workbench: WeakEntity<VibexWorkbench>,
+    /// The transcript-scroll count this view last rendered at.
+    ///
+    /// A workbench notify that only moved the transcript's list is skipped: the
+    /// list repaints itself, and rebuilding the view around it is exactly what
+    /// keeps the list from being composited.
+    last_seen_scroll_notifies: u64,
     #[cfg(test)]
     render_count: Cell<usize>,
 }
 
 impl TimelineView {
     fn new(workbench: &Entity<VibexWorkbench>, cx: &mut Context<Self>) -> Self {
-        cx.observe(workbench, |_, _, cx| cx.notify()).detach();
+        // The transcript's list notifies the view that painted it from inside
+        // its own wheel handler, which is this one. Rebuilding here is what
+        // stops the list from compositing: `scroll_only` asks whether the
+        // scroll was the only thing that happened, and a view rebuilt by the
+        // scroll itself answers no. The count of those notifies lets this
+        // subscription tell them apart from every other workbench change.
+        cx.observe(workbench, |view, _, cx| {
+            let notifies = transcript_scroll_notifies(cx);
+            if notifies != view.last_seen_scroll_notifies {
+                view.last_seen_scroll_notifies = notifies;
+                return;
+            }
+            cx.notify();
+        })
+        .detach();
         Self {
             workbench: workbench.downgrade(),
+            last_seen_scroll_notifies: transcript_scroll_notifies(cx),
             #[cfg(test)]
             render_count: Cell::new(0),
         }
@@ -10205,6 +10256,12 @@ struct ComposerView {
     workbench: WeakEntity<VibexWorkbench>,
     session_id: Option<VibexSessionId>,
     enabled: bool,
+    /// The workbench's transcript-scroll count when this view last rendered.
+    ///
+    /// A workbench notify that only moved the transcript is skipped: the
+    /// composer reads nothing a scroll changes, and rebuilding it there is what
+    /// stops the transcript's list from compositing.
+    last_seen_scroll_notifies: u64,
     #[cfg(test)]
     render_count: Cell<usize>,
 }
@@ -10218,11 +10275,34 @@ impl ComposerView {
     ) -> Self {
         // The composer renders workbench state, so a workbench notify has to
         // refresh it. Dropping the subscription would freeze it on frame one.
-        cx.observe(workbench, |_, _, cx| cx.notify()).detach();
+        //
+        // It does not read any of what a transcript scroll changes, though, and
+        // the list notifies the workbench from inside its own scroll handler.
+        // Rebuilding the composer there costs a frame's work and, worse, makes
+        // the transcript's layer see content that changed: `scroll_only` asks
+        // whether the scroll was the only thing that happened, and a composer
+        // rebuilt beside it answers no. The scroll count lets this subscription
+        // skip exactly those notifies.
+        cx.observe(workbench, |composer, _, cx| {
+            // A notify callback cannot read the entity being updated, so the
+            // count of transcript scrolls lives in the app's globals. A notify
+            // that only moved the transcript leaves the composer retained: it
+            // reads nothing a scroll changes, and rebuilding it there is what
+            // stops the transcript's list from compositing.
+            let notifies = transcript_scroll_notifies(cx);
+            if notifies != composer.last_seen_scroll_notifies {
+                composer.last_seen_scroll_notifies = notifies;
+                return;
+            }
+            cx.notify();
+        })
+        .detach();
+        let last_seen_scroll_notifies = transcript_scroll_notifies(cx);
         Self {
             workbench: workbench.downgrade(),
             session_id,
             enabled,
+            last_seen_scroll_notifies,
             #[cfg(test)]
             render_count: Cell::new(0),
         }
@@ -32363,6 +32443,18 @@ impl VibexWorkbench {
     /// measures what it draws and replaces the hint as rows come into view, so
     /// the hint only has to be good enough for the scrollbar and for placing
     /// rows above the viewport, which is what the estimate already was.
+    /// Teaches the transcript's list to announce its scrolls.
+    ///
+    /// `gpui::list` notifies the view that painted it from inside its own wheel
+    /// handler, and every shell view observing the workbench rebuilds with it.
+    /// The handler runs just before that notify, so counting here is what lets
+    /// the views that read nothing a scroll changes stay retained; see
+    /// [`transcript_scroll_notifies`].
+    fn install_timeline_scroll_handler(&self) {
+        self.timeline_scroll
+            .set_scroll_handler(|_, _, cx| note_transcript_scroll(cx));
+    }
+
     fn sync_timeline_list_rows(&mut self) {
         let rows = self.timeline_row_sizes.len();
         let count = self.timeline_scroll.item_count();
@@ -64181,6 +64273,7 @@ impl VibexWorkbench {
         // The list lays out the rows it was told about, so the table and its
         // count have to agree before the element is built.
         self.sync_timeline_list_rows();
+        self.install_timeline_scroll_handler();
         self.prefetch_older_timeline_if_needed(cx);
         self.request_expanded_timeline_details(cx);
         let turns_summary = self.conversation_turns_summary;
