@@ -364,6 +364,10 @@ fn timeline_view(host: SessionHost) -> impl IntoElement {
                     })
                 })
                 .estimated_item_size(px(72.0))
+                // A chat opens at its newest message and stays there while a
+                // reply streams in, unless the reader has scrolled up.
+                .alignment(ListAlignment::Bottom)
+                .follow_end(px(120.0))
                 .flex_1()
             },
         ))
