@@ -307,6 +307,8 @@ pub struct SessionHost {
     pub on_open_git: Action,
     pub on_close_git: Action,
     pub on_open_git_diff: OpenDiff,
+    pub on_stage_git: OpenPath,
+    pub on_unstage_git: OpenPath,
     pub on_git_back: Action,
     pub on_refresh_git: Action,
 }
@@ -341,6 +343,8 @@ pub fn session(host: SessionHost) -> impl IntoElement {
         diff: host.git_diff,
         error: host.git_error,
         on_open_diff: host.on_open_git_diff.clone(),
+        on_stage: host.on_stage_git.clone(),
+        on_unstage: host.on_unstage_git.clone(),
         on_back: host.on_git_back.clone(),
         on_refresh: host.on_refresh_git.clone(),
         on_close: host.on_close_git.clone(),

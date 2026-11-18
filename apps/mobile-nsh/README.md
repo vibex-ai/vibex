@@ -90,7 +90,9 @@ A successful claim or a tapped saved runtime opens the session shell:
   `file_tree`, a file's text from `read_file`, with back through the
   directories and the preview;
 - the drawer opens the workspace's Git status: branch, changed paths with
-  additions and deletions, and a path's diff from `git_diff`.
+  additions and deletions, and a path's diff from `git_diff`; each row stages
+  or unstages its path (`stage`, `unstage`) and the status the runtime returns
+  replaces the list.
 
 Attachments and `@`-mentions land with their own passes. The shell's tests
 mount it over a fixture; the live, answer and terminal paths are
@@ -138,7 +140,8 @@ Two layers:
   session opens through the picker and its sheet collects a workspace and a
   runtime, the terminal shows a program's output, the files surface lists a
   directory and reads a file, and the Git surface lists a change and shows its
-  diff. Each migrated screen adds the flows its GPUI pair has.
+  diff and stages a change. Each migrated screen adds the flows its GPUI pair
+  has.
 
 `cargo test --workspace` and `cargo clippy --workspace -- -D warnings` in CI
 cover the new crates as they do the rest of the workspace.
@@ -258,4 +261,4 @@ the shipping GPUI client, taken before the screen moves.
 2. The platform device name and the release pipeline; the shell's own camera
    and discovery code against the request queue.
 3. The rest of the workbench: editing (nsh's `Editor` and `DiffView`), and the
-   Git actions (stage, revert, commit) beyond the read-only status.
+   Git actions still missing (revert, commit, history).

@@ -24,12 +24,12 @@ use vibex_core::{
     ElicitationAnswerValue, ElicitationField, ElicitationFieldKind, ElicitationRequest,
     ElicitationRequestStatus, ElicitationResolution, ElicitationResolutionAction,
     FetchTimelineRequest, FileReadRequest, FileTreeRequest, GitChangeKind, GitDiffRequest,
-    GitStatusSummary, MessageProvenance, PermissionRequest, PermissionRequestStatus,
-    PermissionResolution, PermissionResponseKind, RequestId, ResolveElicitationRequest,
-    ResolvePermissionRequest, RuntimeOptionAvailability, SendAgentMessageRequest,
-    SessionRuntimeOption, TerminalCreateRequest, TerminalId, TerminalStatus, TerminalWriteRequest,
-    TimelinePage, TimelinePayload, UserMessageDelivery, VibexSessionId, WorkspaceId,
-    unix_timestamp_ms,
+    GitStageRequest, GitStatusSummary, MessageProvenance, PermissionRequest,
+    PermissionRequestStatus, PermissionResolution, PermissionResponseKind, RequestId,
+    ResolveElicitationRequest, ResolvePermissionRequest, RuntimeOptionAvailability,
+    SendAgentMessageRequest, SessionRuntimeOption, TerminalCreateRequest, TerminalId,
+    TerminalStatus, TerminalWriteRequest, TimelinePage, TimelinePayload, UserMessageDelivery,
+    VibexSessionId, WorkspaceId, unix_timestamp_ms,
 };
 use vibex_desktop_model::TimelineModel;
 use vibex_mobile_pairing::MobileCredentialBundle;
@@ -298,6 +298,14 @@ impl SessionService {
             on_open_git_diff: {
                 let service = self.clone();
                 Rc::new(move |path: &str, staged: bool| service.open_git_diff(path, staged))
+            },
+            on_stage_git: {
+                let service = self.clone();
+                Rc::new(move |path: &str| service.stage_path(path, true))
+            },
+            on_unstage_git: {
+                let service = self.clone();
+                Rc::new(move |path: &str| service.stage_path(path, false))
             },
             on_git_back: {
                 let service = self.clone();
@@ -1261,6 +1269,38 @@ impl SessionService {
                 Ok(Err(error)) => service.git_error.set(Some(error_text(&error))),
                 Err(error) => service.git_error.set(Some(
                     format!("reading the diff did not finish: {error}").into(),
+                )),
+            }
+        });
+    }
+
+    /// Stages or unstages one path and applies the status that comes back.
+    fn stage_path(&self, path: &str, stage: bool) {
+        let service = self.clone();
+        let git = self.git_backend.clone();
+        let agent = self.backend.clone();
+        let path = path.to_owned();
+        spawn(async move {
+            let Some(workspace) = service.workspace(&agent).await else {
+                return;
+            };
+            let result = background(async move {
+                let request = MutationRequest::new(GitStageRequest {
+                    workspace_id: workspace,
+                    paths: vec![path],
+                });
+                if stage {
+                    git.stage(request).await
+                } else {
+                    git.unstage(request).await
+                }
+            })
+            .await;
+            match result {
+                Ok(Ok(status)) => service.apply_git_status(status),
+                Ok(Err(error)) => service.git_error.set(Some(error_text(&error))),
+                Err(error) => service.git_error.set(Some(
+                    format!("staging the path did not finish: {error}").into(),
                 )),
             }
         });

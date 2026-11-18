@@ -186,6 +186,20 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         }));
     });
     let on_git_back = Rc::new(move || git_diff.set(None));
+    let on_stage = Rc::new(move |path: &str| {
+        git_changes.update(|changes| {
+            if let Some(change) = changes.iter_mut().find(|change| change.path == path) {
+                change.staged = true;
+            }
+        });
+    });
+    let on_unstage = Rc::new(move |path: &str| {
+        git_changes.update(|changes| {
+            if let Some(change) = changes.iter_mut().find(|change| change.path == path) {
+                change.staged = false;
+            }
+        });
+    });
     let new_session_open = signal(false);
     let new_workspaces = signal(vec![WorkspaceChoice {
         id: "w1".to_owned(),
@@ -306,6 +320,8 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         on_open_git: Rc::new(move || git_open.set(true)),
         on_close_git: Rc::new(move || git_open.set(false)),
         on_open_git_diff,
+        on_stage_git: on_stage,
+        on_unstage_git: on_unstage,
         on_git_back,
         on_refresh_git: Rc::new(|| {}),
         new_session_open,
@@ -508,4 +524,14 @@ fn the_git_surface_lists_changes_and_shows_a_diff() {
     app.press("src/main.rs").unwrap();
     app.wait_for("diff --git a/src/main.rs b/src/main.rs")
         .unwrap();
+}
+
+#[test]
+fn a_git_change_can_be_staged_from_the_surface() {
+    let mut config = EngineConfig::new(Root::of::<GitShell>());
+    config.viewport = nsh_core::geometry::Size::new(px(390.0), px(1600.0));
+    let mut app = Headless::start(config).unwrap();
+    app.wait_for("src/main.rs").unwrap();
+    app.press("Stage").unwrap();
+    app.wait_for("Unstage").unwrap();
 }

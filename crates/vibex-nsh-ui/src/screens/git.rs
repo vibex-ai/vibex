@@ -44,6 +44,10 @@ pub struct GitHost {
     /// Opens a path's diff; the second argument says whether it is the staged
     /// or the working-tree version.
     pub on_open_diff: OpenDiff,
+    /// Stages an unstaged path.
+    pub on_stage: Rc<dyn Fn(&str)>,
+    /// Unstages a staged path.
+    pub on_unstage: Rc<dyn Fn(&str)>,
     pub on_back: Rc<dyn Fn()>,
     pub on_refresh: Rc<dyn Fn()>,
     pub on_close: Rc<dyn Fn()>,
@@ -124,15 +128,35 @@ pub fn git(host: GitHost) -> impl IntoElement {
         .child(when(move || diff.get().is_some(), move || diff_view(diff)))
         .child(when(
             move || diff.get().is_none(),
-            move || change_list(changes, host.on_open_diff.clone()),
+            move || {
+                change_list(
+                    changes,
+                    host.on_open_diff.clone(),
+                    host.on_stage.clone(),
+                    host.on_unstage.clone(),
+                )
+            },
         ))
 }
 
-fn change_list(changes: Signal<Vec<GitChangeRow>>, on_open_diff: OpenDiff) -> impl IntoElement {
+fn change_list(
+    changes: Signal<Vec<GitChangeRow>>,
+    on_open_diff: OpenDiff,
+    on_stage: Rc<dyn Fn(&str)>,
+    on_unstage: Rc<dyn Fn(&str)>,
+) -> impl IntoElement {
     view().flex_1().min_h(px(0.0)).child(
         virtual_list(
             move || changes.with(|changes| changes.len()),
-            move |at: Position| change_row(at, changes, on_open_diff.clone()),
+            move |at: Position| {
+                change_row(
+                    at,
+                    changes,
+                    on_open_diff.clone(),
+                    on_stage.clone(),
+                    on_unstage.clone(),
+                )
+            },
         )
         .keys(move || {
             changes.with(|changes| {
@@ -151,69 +175,114 @@ fn change_row(
     at: Position,
     changes: Signal<Vec<GitChangeRow>>,
     on_open_diff: OpenDiff,
+    on_stage: Rc<dyn Fn(&str)>,
+    on_unstage: Rc<dyn Fn(&str)>,
 ) -> impl IntoElement {
     let change = computed(move || changes.with(|changes| changes.get(at.index()).cloned()));
-    button()
+    let opened = change;
+    view()
         .w_full()
         .min_h(px(48.0))
         .flex_row()
         .items_center()
-        .gap(px(theme::SPACING_SM))
-        .px(px(theme::SPACING_LG))
         .border_b_1()
         .border_b_color(theme::border_subtle)
-        .active(|style| style.opacity(0.8))
-        .on_press(move || {
-            let Some(change) = change.get_untracked() else {
-                return;
-            };
-            on_open_diff(&change.path, change.staged);
-        })
         .child(
-            text(move || {
-                change
-                    .with(|change| change.as_ref().map(|change| change.status.clone()))
-                    .unwrap_or_default()
-            })
-            .w(px(16.0))
-            .text_size(px(theme::FONT_MICRO))
-            .font_weight(FontWeight::SEMIBOLD)
-            .text_color(move || {
-                change
-                    .with(|change| change.as_ref().map(|change| status_color(&change.status)))
-                    .unwrap_or_else(theme::text_muted)
-            }),
-        )
-        .child(
-            text(move || {
-                change
-                    .with(|change| change.as_ref().map(|change| change.path.clone()))
-                    .unwrap_or_default()
-            })
-            .flex_1()
-            .truncate()
-            .text_size(px(theme::FONT_DETAIL))
-            .text_color(theme::foreground),
-        )
-        .child(
-            text(move || {
-                change.with(|change| {
-                    change.as_ref().map_or(String::new(), |change| {
-                        format!("+{} −{}", change.additions, change.deletions)
-                    })
+            button()
+                .flex_1()
+                .min_h(px(48.0))
+                .flex_row()
+                .items_center()
+                .gap(px(theme::SPACING_SM))
+                .px(px(theme::SPACING_LG))
+                .active(|style| style.opacity(0.8))
+                .on_press(move || {
+                    let Some(change) = opened.get_untracked() else {
+                        return;
+                    };
+                    on_open_diff(&change.path, change.staged);
                 })
-            })
-            .text_size(px(theme::FONT_MICRO))
-            .text_color(theme::text_muted),
-        )
-        .child(when(
-            move || change.with(|change| change.as_ref().is_some_and(|change| change.staged)),
-            || {
-                text("●")
+                .child(
+                    text(move || {
+                        change
+                            .with(|change| change.as_ref().map(|change| change.status.clone()))
+                            .unwrap_or_default()
+                    })
+                    .w(px(16.0))
                     .text_size(px(theme::FONT_MICRO))
-                    .text_color(theme::color_token("chart-1"))
-            },
-        ))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(move || {
+                        change
+                            .with(|change| {
+                                change.as_ref().map(|change| status_color(&change.status))
+                            })
+                            .unwrap_or_else(theme::text_muted)
+                    }),
+                )
+                .child(
+                    text(move || {
+                        change
+                            .with(|change| change.as_ref().map(|change| change.path.clone()))
+                            .unwrap_or_default()
+                    })
+                    .flex_1()
+                    .truncate()
+                    .text_size(px(theme::FONT_DETAIL))
+                    .text_color(theme::foreground),
+                )
+                .child(
+                    text(move || {
+                        change.with(|change| {
+                            change.as_ref().map_or(String::new(), |change| {
+                                format!("+{} −{}", change.additions, change.deletions)
+                            })
+                        })
+                    })
+                    .text_size(px(theme::FONT_MICRO))
+                    .text_color(theme::text_muted),
+                )
+                .child(when(
+                    move || {
+                        change.with(|change| change.as_ref().is_some_and(|change| change.staged))
+                    },
+                    || {
+                        text("●")
+                            .text_size(px(theme::FONT_MICRO))
+                            .text_color(theme::color_token("chart-1"))
+                    },
+                )),
+        )
+        .child({
+            let staged = change;
+            button()
+                .min_h(px(theme::TOUCH_TARGET))
+                .px(px(theme::SPACING_MD))
+                .items_center()
+                .justify_center()
+                .active(|style| style.opacity(0.7))
+                .on_press(move || {
+                    let Some(change) = staged.get_untracked() else {
+                        return;
+                    };
+                    if change.staged {
+                        on_unstage(&change.path);
+                    } else {
+                        on_stage(&change.path);
+                    }
+                })
+                .child(
+                    text(move || {
+                        if staged.with(|change| change.as_ref().is_some_and(|change| change.staged))
+                        {
+                            copy::text("Unstage", "取消暂存", "取消暫存")
+                        } else {
+                            copy::text("Stage", "暂存", "暫存")
+                        }
+                    })
+                    .text_size(px(theme::FONT_MICRO))
+                    .text_color(theme::text_secondary),
+                )
+        })
 }
 
 fn diff_view(diff: Signal<Option<GitDiffPreview>>) -> impl IntoElement {
