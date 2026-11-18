@@ -109,11 +109,26 @@ explicit approval. The published crate still gives the row renderer only an
 index, so a caller cannot build a row from `&mut self` without routing through a
 weak entity and a snapshot.
 
+Verified against the resolved `gpui-component 0.10.0` source
+(`src/message_scroller.rs`): `scroll_to_offset(ListOffset)` is published; the
+rest of the list above is not, and `MessageScroller::new` still takes
+`impl FnMut(usize, &mut Window, &mut App) -> E`. So four of the five state
+accessors, the row-height hints, and the owning-entity renderer are all still
+absent from what this workspace can build against.
+
 Two things follow. The API gap is no longer the blocker — the *payoff* is
 (see §7.1: a layer only pays when its content is stable across scrolled frames).
 And until a release carries the new API, any migration would have to work
 through the published surface, which is a larger rewrite of the row builders
 than the geometry changes alone suggest.
+
+**Decision (closed): the main transcript stays on `v_virtual_list`.** The fork's
+`feat/message-scroller-api` branch is not a path this workspace may take, and
+even if it were, §7.1 and §8 show a list layer would not engage on either real
+surface. The open question this section used to carry — push upstream or
+abandon — is answered as *abandon for the transcript*: the requirement list
+above stays as the record of what a future upstream release would have to ship
+before the question is worth reopening, and no work is planned against it.
 
 Until then, keep the per-turn virtual list and adopt only compatible
 `MessageScroller` affordances (for example, the log role or the jump-button
@@ -154,7 +169,8 @@ scroll over the sidebar column:
 | Views built per frame | 1 (`views_built` 1, `views_reused` 1) |
 
 Two conclusions follow, and they are the reason this section is a record of a
-rejected plan rather than a to-do:
+rejected plan rather than a to-do — with a third recorded below the next
+paragraph, once the container's background was measured separately:
 
 - **`SidebarSessionRun` already virtualizes.** One view is built per scrolled
   frame, not one per row. Swapping the element for `MessageScroller` cannot
@@ -175,6 +191,33 @@ milliseconds keeps the animation running for every one of them; that is why the
 blocker shows up in tests even when a reader's own machine would let the fade
 settle between scrolls. Sleeping past the fade before each frame does not make
 the sidebar composite either, so the finding is not an artifact of the harness.
+
+**The scroll container's background is not a blocker.** It is painted
+`cx.theme().transparent` by default, and `fast::layers::background::bake` only
+clears a layer's tiles with a solid, opaque, borderless, unrounded quad that
+covers the whole viewport — so it looked like a second, independent cause.
+Measured on the real `#sidebar-session-list` in a 200-session workbench, drawing
+sixteen scrolled frames, `window.layout_stats().layer_frames_composited`:
+
+| Background | Scrollbar | Composited frames |
+| --- | --- | --- |
+| transparent | present | 0 |
+| transparent | removed | 8, then 0 |
+| opaque | present | 0 |
+| opaque | removed | 8, then 0 |
+
+The background makes no difference at all: the sidebar's panel (`#agent-sidebar`,
+`.bg(cx.theme().sidebar)`) is already painted under the container, and the bake
+rule finds that quad either way. A minimal isolated `div` probe that scrolls
+fifteen stable rows *does* show the difference (0 composited transparent, 9
+opaque), which is what made the wrong reading available — a bare container has
+no opaque ancestor to bake, while the sidebar does. Trust the sidebar harness,
+not the synthetic one, for this question.
+
+The scrollbar is the first blocker and the dependency record is the second: with
+the bar gone the container composites eight frames and is then demoted, which is
+the `deps_unchanged=false` finding of §7.2 arriving on schedule
+(`REPROMOTE_AFTER_STABLE_FRAMES`). Neither is removed by painting the container.
 
 ### 7.2 The scrollbar-overlay experiment
 
@@ -214,8 +257,17 @@ frames. The sidebar has two independent blockers, and both have to go:
    That is the P0b work of narrowing notifications: a scroll frame should
    notify the scroll container, not the whole workbench.
 
+The container's background is deliberately not on this list: §7.1 measured it
+against the real sidebar and it changes nothing, because the panel behind the
+container is already opaque. Painting the container solid would only be needed
+if it were ever hosted over a translucent surface.
+
 Until both hold, neither `MessageScroller` nor an overlay scrollbar changes what
-the reader pays, and the existing `SidebarSessionRun` is the right shape.
+the reader pays, and the existing `SidebarSessionRun` is the right shape. Both
+were measured, not inferred: removing the bar alone lifts `owner_animating` and
+the container composites for eight frames before the dependency record demotes
+it again, which is the same finding the overlay experiment reached from the
+other side.
 
 If the migration is revisited, the mechanics are unchanged: flatten every
 section (project, workspace, folder, group, session run) into one row list,
