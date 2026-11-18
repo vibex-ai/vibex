@@ -93,20 +93,17 @@ impl PairingService {
             busy: self.busy,
             error: self.error,
             on_scan: Rc::new(move || {
-                scan.fail_message(copy::text(
-                    "Scanning needs the camera host, which is not wired yet.",
-                    "扫码需要相机宿主，尚未接入。",
-                    "掃碼需要相機宿主，尚未接入。",
-                ));
+                // The shell polls for this and opens the camera; the scan
+                // comes back through the host event channel.
+                crate::host::request_scan();
+                scan.error.set(None);
             }),
             on_connect: Rc::new(move |entry, server| connect.connect_entry(entry, server)),
             on_paste: Rc::new(move |draft| paste.paste(draft)),
             on_find: Rc::new(move || {
-                find.fail_message(copy::text(
-                    "Nearby discovery needs the local-network host, which is not wired yet.",
-                    "附近发现需要局域网宿主，尚未接入。",
-                    "附近發現需要區域網路宿主，尚未接入。",
-                ));
+                crate::host::request_discovery(true);
+                find.nearby.set(Vec::new());
+                find.error.set(None);
             }),
             on_pick_saved: Rc::new(move |id| pick_saved.probe_runtime(id)),
             on_pick_nearby: Rc::new(move |_| {

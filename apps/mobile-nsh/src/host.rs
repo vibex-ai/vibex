@@ -14,7 +14,10 @@
 //! - `{"kind":"permission_denied"}`
 //! - `{"kind":"failed","message":"…"}`
 
-use std::sync::{Mutex, OnceLock};
+use std::{
+    collections::VecDeque,
+    sync::{Mutex, OnceLock},
+};
 
 use futures_channel::mpsc::{UnboundedSender, unbounded};
 use futures_util::StreamExt as _;
@@ -43,6 +46,78 @@ pub enum HostEvent {
 }
 
 static SENDER: OnceLock<Mutex<Option<UnboundedSender<HostEvent>>>> = OnceLock::new();
+
+/// Something the app asks the platform host to do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostRequest {
+    /// Open the camera and scan a pairing link.
+    Scan,
+    /// Start looking for runtimes on the local network.
+    DiscoveryStart,
+    /// Stop looking.
+    DiscoveryStop,
+}
+
+impl HostRequest {
+    /// The number the platform entry points hand out.
+    fn code(self) -> i32 {
+        match self {
+            HostRequest::Scan => 1,
+            HostRequest::DiscoveryStart => 2,
+            HostRequest::DiscoveryStop => 3,
+        }
+    }
+}
+
+/// Requests the host has not taken yet. The shells poll them: a request is a
+/// button press, not a stream, so polling on their existing timer is enough
+/// and needs no callback object across JNI.
+static REQUESTS: OnceLock<Mutex<VecDeque<HostRequest>>> = OnceLock::new();
+
+fn requests() -> &'static Mutex<VecDeque<HostRequest>> {
+    REQUESTS.get_or_init(|| Mutex::new(VecDeque::new()))
+}
+
+/// Asks the shell for the camera.
+pub fn request_scan() {
+    requests()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .push_back(HostRequest::Scan);
+}
+
+/// Asks the shell to start or stop local-network discovery.
+pub fn request_discovery(start: bool) {
+    requests()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .push_back(if start {
+            HostRequest::DiscoveryStart
+        } else {
+            HostRequest::DiscoveryStop
+        });
+}
+
+/// The next request, if any.
+#[cfg_attr(
+    not(any(target_os = "android", target_os = "ios")),
+    allow(dead_code, reason = "called by the platform entry points only")
+)]
+pub fn take_request() -> Option<HostRequest> {
+    requests()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .pop_front()
+}
+
+/// The next request as the platform entry points' number (0: none).
+#[cfg_attr(
+    not(any(target_os = "android", target_os = "ios")),
+    allow(dead_code, reason = "called by the platform entry points only")
+)]
+pub fn take_request_code() -> i32 {
+    take_request().map_or(0, HostRequest::code)
+}
 
 /// Starts the host-event reader for `service`.
 ///
@@ -138,6 +213,18 @@ mod tests {
                 key: "desktop-1".to_owned()
             }
         );
+    }
+
+    #[test]
+    fn host_requests_are_taken_once_in_order() {
+        while take_request_code() != 0 {}
+        request_scan();
+        request_discovery(true);
+        request_discovery(false);
+        assert_eq!(take_request_code(), 1);
+        assert_eq!(take_request_code(), 2);
+        assert_eq!(take_request_code(), 3);
+        assert_eq!(take_request_code(), 0);
     }
 
     #[test]

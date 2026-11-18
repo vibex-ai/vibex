@@ -164,6 +164,29 @@ vibex_mobile_nsh_discovery_event(json)         // one discovery event
 vibex_mobile_nsh_detach(app)                   // when the shell goes away
 ```
 
+The app asks the shell to act through a small polled queue: the Scan entry
+queues "open the camera" and the Find sheet queues "start discovery". The
+shell polls the queue on its own timer (the press rate makes a push callback
+unnecessary across JNI):
+
+```kotlin
+// on the host's UI loop, every 200 ms or so
+when (NshHost.nativeTakeHostRequest()) {
+    1 -> openPairingScanner()
+    2 -> startLanDiscovery()
+    3 -> stopLanDiscovery()
+}
+```
+
+```swift
+switch vibex_mobile_nsh_take_host_request() {
+case 1: openPairingScanner()
+case 2: startLanDiscovery()
+case 3: stopLanDiscovery()
+default: break
+}
+```
+
 The camera and the network browser stay in the host. Their observations come
 back through the two event calls; discovery uses this JSON contract:
 
@@ -174,10 +197,10 @@ back through the two event calls; discovery uses this JSON contract:
 {"kind":"failed","message":"…"}
 ```
 
-Still missing from the bridge: the host has no way to be *asked* to open the
-camera or start discovery, so the page's Scan and Find entries still say they
-are not wired. That outbound half (a callback registered by the shell at
-attach) is the next host step, together with the platform device name.
+Still missing from the bridge: the host does not report the platform's device
+name (the pair key stays "Vibex Mobile"), and the shells' camera and discovery
+implementations are theirs to write against the queue and event contract
+above.
 
 ## Theme
 

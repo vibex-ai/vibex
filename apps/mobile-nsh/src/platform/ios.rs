@@ -88,3 +88,10 @@ fn c_string(value: *const c_char) -> Option<String> {
         .ok()
         .map(str::to_owned)
 }
+
+/// The next thing the app asks the shell to do: 0 none, 1 scan, 2 start
+/// discovery, 3 stop discovery. Poll it from the shell's own timer.
+#[unsafe(no_mangle)]
+pub extern "C" fn vibex_mobile_nsh_take_host_request() -> i32 {
+    crate::host::take_request_code()
+}

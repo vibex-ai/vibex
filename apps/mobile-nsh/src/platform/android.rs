@@ -63,3 +63,13 @@ pub extern "system" fn Java_ai_vibex_mobile_nsh_NshHost_nativeDiscoveryEvent(
     })
     .resolve::<jni::errors::LogErrorAndDefault>()
 }
+
+/// The next thing the app asks the host to do: 0 none, 1 scan, 2 start
+/// discovery, 3 stop discovery. Poll it from the host's UI loop.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_ai_vibex_mobile_nsh_NshHost_nativeTakeHostRequest(
+    _env: *mut c_void,
+    _class: *mut c_void,
+) -> i32 {
+    crate::host::take_request_code()
+}
