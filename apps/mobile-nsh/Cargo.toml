@@ -18,8 +18,25 @@ vibex-backend = { path = "../../crates/vibex-backend" }
 vibex-core = { path = "../../crates/core" }
 vibex-desktop-model = { path = "../../crates/desktop-model" }
 vibex-mobile-pairing = { path = "../../crates/vibex-mobile-pairing" }
+serde.workspace = true
 serde_json.workspace = true
+futures-channel.workspace = true
+futures-util.workspace = true
 vibex-nsh-ui = { path = "../../crates/vibex-nsh-ui" }
+
+[target.'cfg(target_os = "ios")'.dependencies]
+nsh-platform-ios = { version = "=0.6.0", default-features = false }
+objc2 = "0.6.5"
+objc2-ui-kit = { version = "0.3.2", default-features = false, features = [
+  "std",
+  "UIView",
+  "UIResponder",
+  "objc2-core-foundation",
+] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+nsh-platform-android = { version = "=0.6.0", default-features = false }
+jni = "0.22"
 
 [dev-dependencies]
 # The headless driver: mounts the real root with no platform, so the app's

@@ -18,7 +18,9 @@
 //! camera and local-network discovery are platform seams the host fills in
 //! next.
 
+mod host;
 mod pairing;
+mod platform;
 mod session;
 pub mod theme_gen;
 
@@ -43,6 +45,7 @@ pub fn App() -> impl IntoElement {
     // (the web) gets a temporary one, so the page still works there.
     let data = data_dir().unwrap_or_else(|| std::env::temp_dir().join("vibex-mobile-nsh"));
     let service = PairingService::new(data);
+    host::start(service.clone());
     let connected = service.connected();
     let pairing_service = service.clone();
     let shell_service = service;

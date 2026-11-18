@@ -58,6 +58,10 @@ The native mobile surface follows Zedra's restrained dark palette, compact spaci
 small radii, clear hierarchy, and edge-drawer navigation. Product-specific
 content remains Vibex GUI session content rather than Zedra's terminal workflow.
 
+The nsh client mounts into the existing Kotlin and Swift shells (the nsh
+platform crates' `NshView`/`AppView`), which keep the notifications, the
+foreground service, the camera and the discovery bridge. Host observations
+reach the app through its host-event channel; the shells never own state.
 The nsh client draws the same palette from `apps/mobile-nsh/theme.json`
 (generated from the token source; `cargo run -p vibex-mobile-nsh --bin
 gen-theme` refreshes it, and a test fails when it is stale). Its parity contract

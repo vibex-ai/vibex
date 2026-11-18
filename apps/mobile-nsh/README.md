@@ -112,6 +112,59 @@ Two layers:
 `cargo test --workspace` and `cargo clippy --workspace -- -D warnings` in CI
 cover the new crates as they do the rest of the workspace.
 
+## Embedding in the existing shells
+
+The `nsh` CLI's generated runners do not carry Vibex's native integrations.
+The app therefore mounts into the Kotlin and Swift shells that already own the
+notifications, the foreground service, the camera and the discovery bridge.
+
+**Android** (Kotlin; the symbol names match this class):
+
+```kotlin
+package ai.vibex.mobile.nsh
+
+object NshHost {
+    init { System.loadLibrary("vibex_mobile_nsh") }
+    external fun nativeRunRoot(handle: Long)
+    external fun nativeScanResult(value: String)
+    external fun nativeDiscoveryEvent(value: String)
+}
+
+val view = com.longbridge.nsh.NshView(this)
+container.addView(view, LayoutParams.MATCH_PARENT)
+val handle = view.javaClass.getDeclaredField("handle")
+    .apply { isAccessible = true }
+    .getLong(view)
+NshHost.nativeRunRoot(handle)
+```
+
+The `handle` field is the `NshView`'s native handle that nsh documents for
+custom Rust hosts; reading it is the only package-private access involved.
+
+**iOS** (Swift, with the symbols declared in the bridging header):
+
+```swift
+let app = vibex_mobile_nsh_attach(container)
+vibex_mobile_nsh_scan_result(payload)          // a scanned pairing link
+vibex_mobile_nsh_discovery_event(json)         // one discovery event
+vibex_mobile_nsh_detach(app)                   // when the shell goes away
+```
+
+The camera and the network browser stay in the host. Their observations come
+back through the two event calls; discovery uses this JSON contract:
+
+```json
+{"kind":"candidate","key":"desktop-1","name":"Studio"}
+{"kind":"removed","key":"desktop-1"}
+{"kind":"permission_denied"}
+{"kind":"failed","message":"…"}
+```
+
+Still missing from the bridge: the host has no way to be *asked* to open the
+camera or start discovery, so the page's Scan and Find entries still say they
+are not wired. That outbound half (a callback registered by the shell at
+attach) is the next host step, together with the platform device name.
+
 ## Theme
 
 `theme.json` is generated; do not hand-edit it. After a token change in

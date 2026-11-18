@@ -296,12 +296,43 @@ impl PairingService {
         }));
     }
 
+    /// Applies something a platform host observed (a scan, discovery).
+    pub fn apply_host_event(&self, event: crate::host::HostEvent) {
+        use crate::host::HostEvent;
+        match event {
+            HostEvent::ScanResult(entry) => self.connect_entry(&entry, ""),
+            HostEvent::DiscoveryCandidate { key, name } => {
+                self.nearby.update(|nearby| {
+                    if let Some(candidate) = nearby.iter_mut().find(|nearby| nearby.key == key) {
+                        candidate.name = name;
+                    } else {
+                        nearby.push(NearbyRuntime { key, name });
+                    }
+                });
+            }
+            HostEvent::DiscoveryRemoved { key } => {
+                self.nearby
+                    .update(|nearby| nearby.retain(|nearby| nearby.key != key));
+            }
+            HostEvent::DiscoveryPermissionDenied => self.fail_text(copy::text(
+                "Local network access is needed to find nearby computers.",
+                "查找附近的电脑需要局域网权限。",
+                "尋找附近的電腦需要區域網路權限。",
+            )),
+            HostEvent::DiscoveryFailed(message) => self.fail_text(message),
+        }
+    }
+
     fn fail(&self, error: &BackendError) {
         self.busy.set(false);
         self.error.set(Some(error_text(error)));
     }
 
     fn fail_message(&self, message: &'static str) {
+        self.fail_text(message);
+    }
+
+    fn fail_text(&self, message: impl Into<SharedString>) {
         self.busy.set(false);
         self.error.set(Some(message.into()));
     }
