@@ -11100,6 +11100,13 @@ pub struct VibexWorkbench {
     runtime_edit_workspaces_input: Entity<InputState>,
     runtime_edit_local_port_input: Entity<InputState>,
     runtime_edit_error: Option<String>,
+    /// The data directory the remote runtime opens, typed or adopted from the
+    /// scan. Empty means the managed `{install_root}/home`.
+    runtime_edit_home_input: Entity<InputState>,
+    runtime_edit_homes: Vec<crate::ssh_connection::homes::RemoteRuntimeHome>,
+    runtime_edit_homes_scanning: bool,
+    runtime_edit_homes_error: Option<String>,
+    runtime_edit_homes_task: Option<Task<()>>,
     /// The runtime id a switch is connecting to; blocks a second switch.
     runtime_switch_pending: Option<String>,
     /// A pairing link or code is being claimed; blocks a second claim while
@@ -12493,6 +12500,13 @@ impl VibexWorkbench {
                 "本機通道連接埠",
             ))
         });
+        let runtime_edit_home_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(locale::text(
+                "Runtime data directory (empty = independent)",
+                "运行时数据目录（留空为独立数据）",
+                "執行階段資料目錄（留空為獨立資料）",
+            ))
+        });
         // The registry is read once at boot: it names every runtime the manager
         // renders and decides whether the first connection is local or remote.
         let runtime_registry_store = config
@@ -13083,6 +13097,11 @@ impl VibexWorkbench {
             runtime_edit_workspaces_input,
             runtime_edit_local_port_input,
             runtime_edit_error: None,
+            runtime_edit_home_input,
+            runtime_edit_homes: Vec::new(),
+            runtime_edit_homes_scanning: false,
+            runtime_edit_homes_error: None,
+            runtime_edit_homes_task: None,
             runtime_switch_pending: None,
             remote_pairing_pending: false,
             runtime_remove_pending: None,
@@ -15887,12 +15906,89 @@ impl VibexWorkbench {
                 &self.runtime_edit_local_port_input,
                 profile.local_tunnel_port.to_string(),
             ),
+            (
+                &self.runtime_edit_home_input,
+                profile.runtime_home.clone().unwrap_or_default(),
+            ),
         ];
+        self.runtime_edit_homes.clear();
+        self.runtime_edit_homes_error = None;
+        self.runtime_edit_homes_scanning = false;
         for (input, value) in values {
             input.update(cx, |input, cx| input.set_value(value, window, cx));
         }
         self.runtime_edit_name_input
             .update(cx, |input, cx| input.focus(window, cx));
+        cx.notify();
+    }
+
+    /// Lists the Vibex data directories that already exist on the host.
+    ///
+    /// The scan is an SSH round trip, so it runs off the UI thread and lands as
+    /// candidates the dialog renders. Its failure stays in the dialog body: the
+    /// reader asked a question about this host and is still looking at it.
+    fn scan_ssh_profile_homes(&mut self, cx: &mut Context<Self>) {
+        if self.runtime_edit_homes_scanning {
+            return;
+        }
+        let Some(profile_id) = self.runtime_edit_pending.clone() else {
+            return;
+        };
+        let Some(config) = self.config.as_ref() else {
+            self.runtime_edit_homes_error =
+                Some("the runtime configuration is unavailable".to_string());
+            cx.notify();
+            return;
+        };
+        let profiles = SshProfileStore::at_home(&config.home_dir)
+            .load()
+            .unwrap_or_default();
+        let Some(profile) = profiles.into_iter().find(|profile| profile.id == profile_id) else {
+            self.runtime_edit_homes_error = Some("the SSH profile was not found".to_string());
+            cx.notify();
+            return;
+        };
+        self.runtime_edit_homes_scanning = true;
+        self.runtime_edit_homes_error = None;
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            let program = profile
+                .ssh_client_path
+                .clone()
+                .unwrap_or_else(|| PathBuf::from("ssh"));
+            let destination = SshDestination {
+                host: profile.host.clone(),
+                user: profile.user.clone(),
+                port: profile.port,
+            };
+            let command = SshCommand::for_destination(
+                program,
+                &destination,
+                profile.ssh_config_path.as_deref(),
+            )
+            .map_err(|error| format!("{}: {}", error.code, error.message))?;
+            crate::ssh_connection::homes::scan(&command, &profile.remote_install_root)
+                .map_err(|error| error.to_string())
+        });
+        self.runtime_edit_homes_task = Some(cx.spawn(
+            async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let result = runner.await;
+                let _ = entity.update(cx, |this, cx| {
+                    this.runtime_edit_homes_scanning = false;
+                    match result {
+                        Ok(Ok(homes)) => {
+                            this.runtime_edit_homes = homes;
+                            this.runtime_edit_homes_error = None;
+                        }
+                        Ok(Err(error)) => this.runtime_edit_homes_error = Some(error),
+                        Err(_) => {
+                            this.runtime_edit_homes_error =
+                                Some("the data directory scan stopped unexpectedly".to_string());
+                        }
+                    }
+                    cx.notify();
+                });
+            },
+        ));
         cx.notify();
     }
 
@@ -15950,6 +16046,14 @@ impl VibexWorkbench {
             .trim()
             .parse::<u16>()
             .unwrap_or(0);
+        let runtime_home = self
+            .runtime_edit_home_input
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        let runtime_home = (!runtime_home.is_empty()).then_some(runtime_home);
+        let adopted_home_changed = runtime_home != profile.runtime_home;
         if display_name.is_empty() {
             self.runtime_edit_error = Some("the display name must not be empty".to_string());
             cx.notify();
@@ -15980,10 +16084,26 @@ impl VibexWorkbench {
         profile.ssh_config_path = (!config_path.is_empty()).then(|| PathBuf::from(config_path));
         profile.workspace_roots = workspaces;
         profile.local_tunnel_port = port;
+        profile.runtime_home = runtime_home;
         if let Err(error) = profile.validate() {
             self.runtime_edit_error = Some(format!("{}: {}", error.code, error.message));
             cx.notify();
             return;
+        }
+        // The runtime identity lives in the database the home holds, so another
+        // directory is another server. Dropping the binding makes the next
+        // connect provision against the adopted home and pair again instead of
+        // failing against a pinned identity that no longer answers.
+        if adopted_home_changed && runtime_id.is_some() {
+            profile.registered_runtime_id = None;
+            if let Some(previous) = runtime_id.as_deref()
+                && self.runtime_registry.active_runtime_id() != previous
+            {
+                self.runtime_registry
+                    .runtimes
+                    .retain(|runtime| runtime.id != previous);
+                self.persist_runtime_registry(cx);
+            }
         }
         let active = profile.registered_runtime_id.as_deref()
             == Some(self.runtime_registry.active_runtime_id());
@@ -16803,7 +16923,8 @@ impl VibexWorkbench {
                 &profile.workspace_roots,
                 profile.remote_port,
             )
-            .map_err(|error| format!("{}: {}", error.code, error.message))?;
+            .map_err(|error| format!("{}: {}", error.code, error.message))?
+            .with_runtime_home(profile.runtime_home_path());
             let channel = profile
                 .runtime_version
                 .as_deref()
@@ -16956,6 +17077,9 @@ impl VibexWorkbench {
                 return;
             }
         };
+        // An adopted directory lives outside the install root, so even a
+        // remove-everything uninstall cannot reach the reader's own data.
+        let launch = launch.with_runtime_home(profile.runtime_home_path());
         let runtime_id = profile.registered_runtime_id.clone();
         let profile_id = profile.id;
         self.ssh_uninstall_error = None;
@@ -17217,7 +17341,8 @@ impl VibexWorkbench {
                 &profile.workspace_roots,
                 profile.remote_port,
             )
-            .map_err(|error| format!("{}: {}", error.code, error.message))?;
+            .map_err(|error| format!("{}: {}", error.code, error.message))?
+            .with_runtime_home(profile.runtime_home_path());
             let launch = if profile.macos_lifecycle == SshMacOsLifecycle::LaunchAgent {
                 launch.with_launch_agent(crate::ssh_connection::launchd::label_for_profile(
                     &profile.id,
@@ -18489,6 +18614,7 @@ impl VibexWorkbench {
                 return;
             }
         };
+        let launch = launch.with_runtime_home(profile.runtime_home_path());
         let spec = match TunnelSpec::new(
             command.program.clone(),
             destination,
@@ -20330,6 +20456,113 @@ impl VibexWorkbench {
             .into_any_element()
     }
 
+    /// The data-directory section of the SSH edit dialog.
+    ///
+    /// A remote runtime normally owns `{install_root}/home`. When the host
+    /// already runs Vibex — usually its own desktop build — the reader can
+    /// point this connection at that directory instead, and this section is how
+    /// they find it: one scan, one click, and the sessions in that database are
+    /// the sessions this connection opens.
+    fn render_ssh_runtime_home_field(&self, cx: &mut Context<Self>) -> AnyElement {
+        let scanning = self.runtime_edit_homes_scanning;
+        let candidates = self.runtime_edit_homes.clone();
+        let error = self.runtime_edit_homes_error.clone();
+        let input = self.runtime_edit_home_input.clone();
+        let clear_input = self.runtime_edit_home_input.clone();
+        v_flex()
+            .w_full()
+            .gap_1()
+            .px_2()
+            .py_1()
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(locale::text(
+                        "Runtime data directory",
+                        "运行时数据目录",
+                        "執行階段資料目錄",
+                    )),
+            )
+            .child(Input::new(&self.runtime_edit_home_input).small())
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .whitespace_normal()
+                    .child(locale::text(
+                        "Leave it empty to use this connection's own data directory. Choosing one that already exists on the host reuses its sessions and installed Agents; the connection then pairs again, and provider credentials may have to be entered once more because the desktop keeps them in its own keychain.",
+                        "留空则使用这条连接自己的数据目录。选择主机上已有的目录会复用它里面的会话和已装 Agent；之后这条连接需要重新配对，provider 凭据可能需要再录一次（桌面端把它们放在自己的 keychain 里）。",
+                        "留空則使用這條連線自己的資料目錄。選擇主機上已有的目錄會沿用其中的工作階段與已裝 Agent；之後這條連線需要重新配對，provider 憑據可能需要再輸入一次（桌面端將它們放在自己的 keychain 裡）。",
+                    )),
+            )
+            .child(
+                h_flex()
+                    .w_full()
+                    .flex_wrap()
+                    .gap_1()
+                    .child(
+                        Button::new("runtime-edit-home-scan")
+                            .small()
+                            .ghost()
+                            .label(if scanning {
+                                locale::text("Scanning…", "正在检测…", "正在偵測…")
+                            } else {
+                                locale::text("Detect existing data", "检测已有数据", "偵測現有資料")
+                            })
+                            .disabled(scanning)
+                            .on_click(cx.listener(|this, _, _, cx| this.scan_ssh_profile_homes(cx))),
+                    )
+                    .child(
+                        Button::new("runtime-edit-home-clear")
+                            .small()
+                            .ghost()
+                            .label(locale::text(
+                                "Independent data",
+                                "独立数据",
+                                "獨立資料",
+                            ))
+                            .on_click(cx.listener(move |_, _, window, cx| {
+                                clear_input.update(cx, |input, cx| input.set_value("", window, cx));
+                                cx.notify();
+                            })),
+                    )
+                    .children(candidates.into_iter().enumerate().map(|(index, home)| {
+                        let (english, chinese, traditional) = runtime_home_kind_labels(home.kind);
+                        let label = format!(
+                            "{}{} — {}",
+                            locale::text(english, chinese, traditional),
+                            if home.adoptable() {
+                                ""
+                            } else if home.has_database {
+                                locale::text(" (in use)", "（正在使用）", "（使用中）")
+                            } else {
+                                locale::text(" (no data)", "（无数据）", "（無資料）")
+                            },
+                            home.path
+                        );
+                        let value = home.path.clone();
+                        let adoptable = home.adoptable();
+                        let input = input.clone();
+                        Button::new(SharedString::from(format!("runtime-edit-home-{index}")))
+                            .small()
+                            .ghost()
+                            .disabled(!adoptable)
+                            .label(label)
+                            .on_click(cx.listener(move |_, _, window, cx| {
+                                input.update(cx, |input, cx| {
+                                    input.set_value(value.clone(), window, cx)
+                                });
+                                cx.notify();
+                            }))
+                    })),
+            )
+            .when_some(error, |this, error| {
+                this.child(div().text_xs().text_color(cx.theme().danger).child(error))
+            })
+            .into_any_element()
+    }
+
     fn render_ssh_profile_edit(
         &self,
         _profile: &SshConnectionProfile,
@@ -20354,6 +20587,7 @@ impl VibexWorkbench {
                 self.runtime_edit_error.clone(),
                 cx,
             ))
+            .child(self.render_ssh_runtime_home_field(cx))
             .child(
                 h_flex()
                     .gap_1()
@@ -90316,6 +90550,24 @@ fn connections_profile_id(alias: &str, now_ms: i64) -> String {
 ///
 /// Both edit the same `SshConnectionProfile`, so they read the same input
 /// entities and render the same labels; only the surrounding surface differs.
+/// What a detected data directory is, in the reader's language.
+fn runtime_home_kind_labels(
+    kind: crate::ssh_connection::homes::RuntimeHomeKind,
+) -> (&'static str, &'static str, &'static str) {
+    use crate::ssh_connection::homes::RuntimeHomeKind as Kind;
+    match kind {
+        Kind::Managed => ("Independent data", "独立数据", "獨立資料"),
+        Kind::DesktopStable => ("Desktop data · stable", "桌面端数据 · stable", "桌面端資料 · stable"),
+        Kind::DesktopRc => ("Desktop data · rc", "桌面端数据 · rc", "桌面端資料 · rc"),
+        Kind::DesktopPreview => (
+            "Desktop data · preview",
+            "桌面端数据 · preview",
+            "桌面端資料 · preview",
+        ),
+        Kind::DesktopLegacy => ("Desktop data · legacy", "旧版桌面端数据", "舊版桌面端資料"),
+    }
+}
+
 fn ssh_profile_edit_fields(
     name: &Entity<InputState>,
     client: &Entity<InputState>,
@@ -96036,6 +96288,7 @@ impl FoundationSettings {
                 proxy_jump: effective.proxy_jump,
                 remote_install_root,
                 remote_home: environment.home.clone(),
+                runtime_home: None,
                 remote_os: Some(environment.os.clone()),
                 workspace_roots: vec![environment.home.clone()],
                 remote_port,

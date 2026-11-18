@@ -66,6 +66,16 @@ pub struct SshConnectionProfile {
     pub proxy_jump: Option<String>,
     pub remote_install_root: String,
     pub remote_home: String,
+    /// The runtime home this connection uses on the remote host, when the
+    /// reader adopted an existing one instead of the managed directory.
+    ///
+    /// Absent means `{remote_install_root}/home`, which provisioning owns and
+    /// rebuilds from the release artifact. A path here points the runtime at
+    /// another Vibex home — typically the host's own desktop data — and since
+    /// the runtime identity lives in that database, a change re-pairs the
+    /// connection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_home: Option<String>,
     /// OS reported by the environment probe when known (linux/macos/...).
     #[serde(default)]
     pub remote_os: Option<String>,
@@ -87,6 +97,17 @@ pub struct SshConnectionProfile {
 }
 
 impl SshConnectionProfile {
+    /// The directory the remote runtime opens as `VIBEX_HOME`.
+    ///
+    /// The managed default mirrors what the launcher derives from the install
+    /// root, so "the default" and "an adopted directory" are the same kind of
+    /// answer everywhere the profile is read.
+    pub fn runtime_home_path(&self) -> String {
+        self.runtime_home
+            .clone()
+            .unwrap_or_else(|| format!("{}/home", self.remote_install_root))
+    }
+
     /// Rejects values that would make the profile unusable or unsafe to pass
     /// to an SSH child process.
     pub fn validate(&self) -> VibexResult<()> {
@@ -126,6 +147,9 @@ impl SshConnectionProfile {
         }
         validate_remote_path("remoteInstallRoot", &self.remote_install_root)?;
         validate_remote_path("remoteHome", &self.remote_home)?;
+        if let Some(runtime_home) = &self.runtime_home {
+            validate_remote_path("runtimeHome", runtime_home)?;
+        }
         if let Some(remote_os) = &self.remote_os {
             validate_text("remoteOs", remote_os, 32)?;
         }
@@ -581,6 +605,7 @@ mod tests {
             proxy_jump: Some("bastion.example.com".to_string()),
             remote_install_root: "~/.local/share/vibex".to_string(),
             remote_home: "~/.local/share/vibex/server/home".to_string(),
+            runtime_home: None,
             remote_os: None,
             workspace_roots: vec!["$HOME".to_string(), "/srv/src".to_string()],
             remote_port: 8765,
@@ -626,6 +651,53 @@ mod tests {
                 .filter_map(Result::ok)
                 .all(|entry| !entry.file_name().to_string_lossy().contains(".tmp-"))
         );
+    }
+
+    /// Absent means the directory provisioning owns; a path means the reader
+    /// adopted one that was already on the host.
+    #[test]
+    fn an_absent_adopted_home_falls_back_to_the_managed_directory() {
+        let mut profile = sample();
+        assert_eq!(
+            profile.runtime_home_path(),
+            format!("{}/home", profile.remote_install_root)
+        );
+        profile.runtime_home = Some("/home/dev/.vibex/desktop-stable".to_string());
+        profile.validate().unwrap();
+        assert_eq!(
+            profile.runtime_home_path(),
+            "/home/dev/.vibex/desktop-stable"
+        );
+    }
+
+    #[test]
+    fn an_adopted_home_must_be_rooted_and_free_of_parent_segments() {
+        let mut profile = sample();
+        profile.runtime_home = Some("relative/home".to_string());
+        assert!(profile.validate().is_err());
+        profile.runtime_home = Some("/home/dev/../etc".to_string());
+        assert!(profile.validate().is_err());
+        profile.runtime_home = Some("~/data/vibex".to_string());
+        profile.validate().unwrap();
+        profile.runtime_home = Some("$HOME/.vibex/desktop-stable".to_string());
+        profile.validate().unwrap();
+    }
+
+    /// Stores written before the option existed must still load, and a profile
+    /// that never adopted a directory must not grow a null field.
+    #[test]
+    fn an_absent_adopted_home_is_not_serialized() {
+        let value = serde_json::to_value(sample()).unwrap();
+        assert!(value.get("runtimeHome").is_none());
+        let mut profile = sample();
+        profile.runtime_home = Some("/home/dev/.vibex/desktop-stable".to_string());
+        let value = serde_json::to_value(profile.clone()).unwrap();
+        assert_eq!(value["runtimeHome"], "/home/dev/.vibex/desktop-stable");
+        let round_tripped: SshConnectionProfile = serde_json::from_value(value).unwrap();
+        assert_eq!(round_tripped, profile);
+        let legacy: SshConnectionProfile =
+            serde_json::from_value(serde_json::to_value(sample()).unwrap()).unwrap();
+        assert_eq!(legacy.runtime_home, None);
     }
 
     #[cfg(unix)]
