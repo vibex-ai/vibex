@@ -88,3 +88,26 @@ fn action(
                 .text_color(content),
         )
 }
+
+/// An icon-only button: a 44-point target, no frame, and a label screen
+/// readers say (and tests select it by).
+pub fn icon_button(
+    icon: ImageSrc,
+    label: &'static str,
+    on_press: impl Fn() + 'static,
+) -> ButtonElement {
+    button()
+        .accessibility_label(label)
+        .on_press(on_press)
+        .size(px(theme::TOUCH_TARGET))
+        .items_center()
+        .justify_center()
+        .rounded(px(theme::RADIUS_CONTROL))
+        .active(|style| style.opacity(0.6))
+        .child(
+            svg(icon)
+                .w(px(theme::ICON_MD))
+                .h(px(theme::ICON_MD))
+                .text_color(theme::foreground),
+        )
+}

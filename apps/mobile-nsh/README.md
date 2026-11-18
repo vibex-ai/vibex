@@ -54,6 +54,23 @@ The camera and local-network discovery are still host seams: they say so on
 the page instead of pretending to work. The host integration fills them in
 with the scanner activity and the discovery bridge.
 
+### The session shell
+
+A successful claim or a tapped saved runtime opens the session shell:
+
+- the drawer lists the runtime's sessions (`list_sessions`) with their Agent,
+  age and state, and opening one reads its timeline;
+- the transcript is `vibex-desktop-model`'s projection over the fetched page,
+  so a row means the same thing it means on the desktop: user bubbles, Agent
+  prose, reasoning, tool cards, notices and errors;
+- the composer sends through the session's own runtime selection and reads the
+  transcript back (`send_message` then `fetch_timeline`).
+
+Markdown is plain text here for now; the `TextView` renderer, streaming
+updates, attachments, approvals and the composer's commands land with their
+own passes. The shell's tests mount it over a fixture; the backend wiring is
+covered by the same projection types the desktop tests.
+
 ## Run it
 
 Install the `nsh` CLI and use a Rust toolchain (see
@@ -87,8 +104,10 @@ Two layers:
   simulator: the pairing page shows its three entries, the link sheet opens and
   its connect action stays disabled until there is something to claim, a bare
   code without an address is refused with the copy that says what is missing,
-  and the nearby sheet opens. Each migrated screen adds the flows its GPUI pair
-  has.
+  and the nearby sheet opens. The session shell's flows are covered too: the
+  drawer lists sessions, switching one swaps the transcript, and the composer
+  appends what was sent and clears. Each migrated screen adds the flows its
+  GPUI pair has.
 
 `cargo test --workspace` and `cargo clippy --workspace -- -D warnings` in CI
 cover the new crates as they do the rest of the workspace.
@@ -128,7 +147,8 @@ the shipping GPUI client, taken before the screen moves.
 
 ## Next
 
-1. The session shell: sidebar, timeline, composer, over the remote backend.
+1. Live updates: the runtime's event stream into the timeline, so rows stream
+   instead of arriving with each read; Markdown through `TextView`.
 2. The camera and local-network discovery bridges in the Kotlin/Swift host,
    plus the host's device name and the release pipeline.
 3. Workbench: files, Git and the terminal (nsh's `Editor`, `DiffView` and

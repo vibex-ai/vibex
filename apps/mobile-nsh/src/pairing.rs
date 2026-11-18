@@ -27,6 +27,15 @@ const DEVICE_NAME: &str = "Vibex Mobile";
 /// The file the credentials live in, inside the app's data directory.
 const STORE_FILE: &str = "pairing.json";
 
+/// The runtime the page is connected to, once a claim or a probe succeeds.
+#[derive(Clone, PartialEq)]
+pub struct ConnectedRuntime {
+    /// The label the shell shows for it.
+    pub label: String,
+    /// The credential the session shell's backend is built from.
+    pub bundle: MobileCredentialBundle,
+}
+
 /// The pairing page's state and actions.
 #[derive(Clone)]
 pub struct PairingService {
@@ -36,6 +45,7 @@ pub struct PairingService {
     nearby: Signal<Vec<NearbyRuntime>>,
     busy: Signal<bool>,
     error: Signal<Option<SharedString>>,
+    connected: Signal<Option<ConnectedRuntime>>,
 }
 
 impl PairingService {
@@ -63,6 +73,7 @@ impl PairingService {
             nearby: signal(Vec::new()),
             busy: signal(false),
             error: signal(error),
+            connected: signal(None),
         };
         service.probe_saved();
         service
@@ -108,6 +119,17 @@ impl PairingService {
         }
     }
 
+    /// The runtime the page is connected to.
+    pub fn connected(&self) -> Signal<Option<ConnectedRuntime>> {
+        self.connected
+    }
+
+    /// Leaves the connected runtime; the credential stays saved.
+    pub fn disconnect(&self) {
+        self.connected.set(None);
+        self.error.set(None);
+    }
+
     /// Claims `entry` (a link, or a code with `server`) on a background task.
     fn connect_entry(&self, entry: &str, server: &str) {
         if self.busy.get_untracked() {
@@ -144,10 +166,11 @@ impl PairingService {
     /// Stores a claimed credential and shows it in the list.
     fn finish_claim(&self, result: BackendResult<MobilePairedRuntime>) {
         match result {
-            Ok(paired) => match self.store.upsert(paired.bundle) {
+            Ok(paired) => match self.store.upsert(paired.bundle.clone()) {
                 Ok(bundles) => {
                     self.set_bundles(bundles);
                     self.busy.set(false);
+                    self.connect(paired.bundle);
                 }
                 Err(error) => self.fail(&error),
             },
@@ -180,7 +203,7 @@ impl PairingService {
     fn probe_saved(&self) {
         let bundles = self.bundles.borrow().clone();
         for bundle in bundles {
-            self.spawn_probe(bundle);
+            self.spawn_probe(bundle, false);
         }
     }
 
@@ -196,10 +219,11 @@ impl PairingService {
             return;
         };
         self.set_status(host_id, RuntimeStatus::Probing);
-        self.spawn_probe(bundle);
+        self.error.set(None);
+        self.spawn_probe(bundle, true);
     }
 
-    fn spawn_probe(&self, bundle: MobileCredentialBundle) {
+    fn spawn_probe(&self, bundle: MobileCredentialBundle, connect_on_success: bool) {
         let service = self.clone();
         let id = bundle.host_id().to_owned();
         let probing = bundle.clone();
@@ -217,6 +241,17 @@ impl PairingService {
                     RuntimeStatus::Unreachable
                 },
             );
+            if connect_on_success {
+                if online {
+                    service.connect(bundle);
+                } else {
+                    service.fail_message(copy::text(
+                        "The runtime could not be reached.",
+                        "无法连接到运行时。",
+                        "無法連線到執行環境。",
+                    ));
+                }
+            }
         });
     }
 
@@ -254,6 +289,13 @@ impl PairingService {
         self.saved.set(rows);
     }
 
+    fn connect(&self, bundle: MobileCredentialBundle) {
+        self.connected.set(Some(ConnectedRuntime {
+            label: bundle.host_label(),
+            bundle,
+        }));
+    }
+
     fn fail(&self, error: &BackendError) {
         self.busy.set(false);
         self.error.set(Some(error_text(error)));
@@ -269,7 +311,7 @@ impl PairingService {
 ///
 /// The transport's messages describe the protocol; the page says what the
 /// person can do next. An unmapped code falls back to the message, bounded.
-fn error_text(error: &BackendError) -> SharedString {
+pub(crate) fn error_text(error: &BackendError) -> SharedString {
     let text = match error.code.as_str() {
         "remote_pairing_code_invalid" | "remote_pairing_code_expired" => copy::text(
             "The pairing code is invalid or has expired.",
