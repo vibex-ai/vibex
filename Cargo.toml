@@ -129,7 +129,7 @@ gpui-base = "0.10.0"
 # one version. `svg` draws the brand mark and icons natively; `nsh-base` ships
 # unstyled behavior only, so the app's look lives in `crates/vibex-nsh-ui`.
 nsh-core = { version = "=0.6.0", default-features = false, features = ["svg"] }
-nsh-base = { version = "=0.6.0", default-features = false, features = ["term"] }
+nsh-base = { version = "=0.6.0", default-features = false, features = ["term", "editor", "highlight"] }
 image = { version = "=0.25.10", default-features = false }
 # The Linux backend is chosen per target in the desktop crate: `ksni` on Linux
 # so the tray does not drag in the GTK 3 binding, and no default feature

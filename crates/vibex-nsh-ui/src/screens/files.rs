@@ -7,7 +7,7 @@
 
 use std::rc::Rc;
 
-use nsh_base::button;
+use nsh_base::{button, editor};
 use nsh_core::{element::ImageSrc, prelude::*};
 
 use crate::{copy, theme, ui::action};
@@ -26,6 +26,8 @@ pub struct FilePreview {
     pub title: String,
     pub body: String,
     pub truncated: bool,
+    /// The language the runtime reported, for highlighting.
+    pub language: String,
 }
 
 /// What the browser may do, and the state it shows.
@@ -143,7 +145,7 @@ pub fn files(host: FilesHost) -> impl IntoElement {
         ))
         .child(when(
             move || file.get().is_some(),
-            move || file_preview(file),
+            move || file_preview(file, host.content, dirty),
         ))
         .child(when(
             move || file.get().is_none(),
@@ -230,14 +232,11 @@ fn file_row(
         )
 }
 
-fn file_preview(file: Signal<Option<FilePreview>>) -> impl IntoElement {
-    let body = computed(move || {
-        file.with(|file| {
-            file.as_ref()
-                .map(|file| file.body.clone())
-                .unwrap_or_default()
-        })
-    });
+fn file_preview(
+    file: Signal<Option<FilePreview>>,
+    content: Signal<String>,
+    dirty: Signal<bool>,
+) -> impl IntoElement {
     let truncated =
         computed(move || file.with(|file| file.as_ref().is_some_and(|file| file.truncated)));
     view()
@@ -247,10 +246,22 @@ fn file_preview(file: Signal<Option<FilePreview>>) -> impl IntoElement {
         .px(px(theme::SPACING_LG))
         .py(px(theme::SPACING_SM))
         .child(
-            text(move || body.get())
-                .text_size(px(theme::FONT_CAPTION))
-                .line_height(theme::line_height_for(theme::FONT_CAPTION))
-                .text_color(theme::foreground),
+            editor()
+                .value(move || Some(content.get().into()))
+                .language(move || {
+                    file.with(|file| {
+                        file.as_ref()
+                            .map(|file| SharedString::from(file.language.clone()))
+                            .filter(|language| !language.is_empty())
+                    })
+                })
+                .test_id("file-content")
+                .on_change(move |value: &SharedString| {
+                    content.set(value.to_string());
+                    dirty.set(true);
+                })
+                .flex_1()
+                .min_h(px(240.0)),
         )
         .child(when(
             move || truncated.get(),

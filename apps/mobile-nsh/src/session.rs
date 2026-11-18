@@ -1189,6 +1189,7 @@ impl SessionService {
                         title: file.name,
                         body: file.content.unwrap_or_default(),
                         truncated: file.truncated,
+                        language: file.language.unwrap_or_default(),
                     }));
                 }
                 Ok(Err(error)) => service.files_error.set(Some(error_text(&error))),

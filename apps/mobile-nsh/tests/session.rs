@@ -167,6 +167,7 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
             title: path.rsplit('/').next().unwrap_or(path).to_owned(),
             body: String::new(),
             truncated: false,
+            language: "rust".to_owned(),
         }));
         files_content.set("edited".to_owned());
         files_dirty.set(true);
