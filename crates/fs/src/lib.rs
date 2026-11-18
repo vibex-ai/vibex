@@ -761,51 +761,84 @@ impl WorkspaceFileService {
         Ok(())
     }
 
+    /// Resolves an existing workspace-relative path and returns the logical
+    /// path the caller asked for, not the canonical target behind it.
+    ///
+    /// Authorization walks the path one component at a time. Symbolic links
+    /// are resolved and must still point inside the workspace, so a link
+    /// planted inside cannot be used to read or write outside it. Directory
+    /// junctions (`mklink /J`) are not symbolic links: Windows reports them as
+    /// directories, while `Path::canonicalize` follows them to their target.
+    /// Keeping the returned path logical is what lets a junction entry inside
+    /// the workspace point at a target outside it without failing the
+    /// workspace containment check.
     fn resolve_existing(&self, relative: &str) -> VibexResult<PathBuf> {
         let path = self.resolve_child_path(relative)?;
-        let canonical = path.canonicalize().map_err(|err| {
-            VibexError::validation("file_path_missing", "path does not exist")
-                .with_diagnostic("path", path.display().to_string())
-                .with_diagnostic("error", err.to_string())
-        })?;
-        self.ensure_inside_root(&canonical)?;
-        Ok(canonical)
+        self.authorize_existing_path(&path, "file_path_missing")?;
+        Ok(path)
     }
 
     fn resolve_existing_entry(&self, relative: &str) -> VibexResult<PathBuf> {
         let path = self.resolve_child_path(relative)?;
-        fs::symlink_metadata(&path).map_err(|err| {
-            VibexError::validation("file_path_missing", "path does not exist")
-                .with_diagnostic("path", path.display().to_string())
-                .with_diagnostic("error", err.to_string())
-        })?;
-        let parent = path.parent().ok_or_else(|| {
-            VibexError::validation(
-                "file_parent_missing",
-                "workspace entry has no parent directory",
-            )
-        })?;
-        let canonical_parent = parent.canonicalize().map_err(|err| {
-            VibexError::validation("file_parent_missing", "parent directory does not exist")
-                .with_diagnostic("path", parent.display().to_string())
-                .with_diagnostic("error", err.to_string())
-        })?;
-        self.ensure_inside_root(&canonical_parent)?;
-        if fs::symlink_metadata(&path)
-            .map(|metadata| metadata.file_type().is_symlink())
-            .unwrap_or(false)
-        {
-            let canonical_target = path.canonicalize().map_err(|err| {
-                VibexError::validation(
-                    "file_symlink_target_missing",
-                    "symbolic link target does not exist",
-                )
-                .with_diagnostic("path", path.display().to_string())
-                .with_diagnostic("error", err.to_string())
-            })?;
-            self.ensure_inside_root(&canonical_target)?;
-        }
+        self.authorize_existing_path(&path, "file_symlink_target_missing")?;
         Ok(path)
+    }
+
+    /// Verifies that `path` exists and that every symbolic link on the way
+    /// from the workspace root still resolves inside the workspace.
+    ///
+    /// Junctions are intentionally followed through their logical path instead
+    /// of being canonicalized: the workspace boundary is the junction entry,
+    /// not the target it points at. `final_symlink_missing_code` lets the
+    /// caller distinguish an unresolvable final link from a missing path.
+    fn authorize_existing_path(
+        &self,
+        path: &Path,
+        final_symlink_missing_code: &'static str,
+    ) -> VibexResult<()> {
+        self.ensure_inside_root(path)?;
+        let relative = path.strip_prefix(&self.root).map_err(|err| {
+            VibexError::storage(
+                "file_relative_path_failed",
+                "failed to compute relative path",
+            )
+            .with_diagnostic("error", err.to_string())
+        })?;
+        let mut components = relative.components().peekable();
+        let mut current = self.root.clone();
+        while let Some(component) = components.next() {
+            let is_final = components.peek().is_none();
+            current.push(component.as_os_str());
+            let metadata = fs::symlink_metadata(&current).map_err(|err| {
+                VibexError::validation("file_path_missing", "path does not exist")
+                    .with_diagnostic("path", current.display().to_string())
+                    .with_diagnostic("error", err.to_string())
+            })?;
+            if !metadata.file_type().is_symlink() {
+                continue;
+            }
+            let missing_code = if is_final {
+                final_symlink_missing_code
+            } else {
+                "file_path_missing"
+            };
+            let target = current.canonicalize().map_err(|err| {
+                let message = if missing_code == "file_symlink_target_missing" {
+                    "symbolic link target does not exist"
+                } else {
+                    "path does not exist"
+                };
+                VibexError::validation(missing_code, message)
+                    .with_diagnostic("path", current.display().to_string())
+                    .with_diagnostic("error", err.to_string())
+            })?;
+            self.ensure_inside_root(&target)?;
+            // Continue from the resolved target so a later link is checked
+            // against the real location, not the link spelling that reached
+            // it.
+            current = target;
+        }
+        Ok(())
     }
 
     fn resolve_existing_dir(&self, relative: &str) -> VibexResult<PathBuf> {
@@ -833,12 +866,8 @@ impl WorkspaceFileService {
     fn resolve_for_write(&self, relative: &str) -> VibexResult<PathBuf> {
         let path = self.resolve_child_path(relative)?;
         if let Some(parent) = path.parent() {
-            let canonical_parent = parent.canonicalize().map_err(|err| {
-                VibexError::validation("file_parent_missing", "parent directory does not exist")
-                    .with_diagnostic("path", parent.display().to_string())
-                    .with_diagnostic("error", err.to_string())
-            })?;
-            self.ensure_inside_root(&canonical_parent)?;
+            self.ensure_inside_root(parent)?;
+            self.authorize_existing_path(parent, "file_path_missing")?;
         }
         Ok(path)
     }
@@ -1303,12 +1332,15 @@ fn kind_for_path(path: &Path) -> VibexResult<FileEntryKind> {
 
 fn kind_for_metadata(metadata: &fs::Metadata) -> FileEntryKind {
     let ty = metadata.file_type();
-    if ty.is_dir() {
+    // A Windows directory symbolic link also carries the directory attribute,
+    // so the link check must win. Junctions are not symbolic links and stay
+    // directories, which is what lets the tree expand them.
+    if ty.is_symlink() {
+        FileEntryKind::Symlink
+    } else if ty.is_dir() {
         FileEntryKind::Directory
     } else if ty.is_file() {
         FileEntryKind::File
-    } else if ty.is_symlink() {
-        FileEntryKind::Symlink
     } else {
         FileEntryKind::Other
     }
@@ -2005,6 +2037,147 @@ mod tests {
             "target\n"
         );
         cleanup(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symbolic_links_that_escape_the_workspace_are_still_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_root("symlink-escape");
+        let outside = temp_root("symlink-escape-target");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("secret.txt"), "outside\n").unwrap();
+        symlink(&outside, root.join("escape")).unwrap();
+        symlink(outside.join("secret.txt"), root.join("secret-link.txt")).unwrap();
+        let workspace_id = WorkspaceId::new();
+        let service = WorkspaceFileService::new(&root, workspace_id.clone()).unwrap();
+
+        let read_error = service
+            .read_file(&FileReadRequest {
+                workspace_id: workspace_id.clone(),
+                path: "escape/secret.txt".into(),
+                max_bytes: None,
+            })
+            .unwrap_err();
+        assert_eq!(read_error.code, "file_path_outside_workspace");
+
+        let tree_error = service
+            .list_tree(&FileTreeRequest {
+                workspace_id: workspace_id.clone(),
+                path: Some("escape".into()),
+                max_depth: Some(1),
+                include_hidden: false,
+            })
+            .unwrap_err();
+        assert_eq!(tree_error.code, "file_path_outside_workspace");
+
+        let link_error = service
+            .read_file(&FileReadRequest {
+                workspace_id,
+                path: "secret-link.txt".into(),
+                max_bytes: None,
+            })
+            .unwrap_err();
+        assert_eq!(link_error.code, "file_path_outside_workspace");
+
+        fs::remove_file(root.join("secret-link.txt")).unwrap();
+        fs::remove_file(root.join("escape")).unwrap();
+        cleanup(root);
+        cleanup(outside);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn follows_in_workspace_directory_junctions() {
+        use std::process::Command;
+
+        let root = temp_root("junction-workspace");
+        let target = temp_root("junction-target");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(target.join("nested")).unwrap();
+        fs::write(
+            target.join("nested").join("hello.txt"),
+            "from the junction target\n",
+        )
+        .unwrap();
+        let junction = root.join("shared");
+        let status = Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&junction)
+            .arg(&target)
+            .status()
+            .unwrap();
+        assert!(status.success(), "mklink /J did not create the junction");
+
+        let canonical_root = root.canonicalize().unwrap();
+        let workspace_id = WorkspaceId::new();
+        let service = WorkspaceFileService::new(&root, workspace_id.clone()).unwrap();
+
+        let entries = service
+            .list_tree(&FileTreeRequest {
+                workspace_id: workspace_id.clone(),
+                path: None,
+                max_depth: Some(2),
+                include_hidden: false,
+            })
+            .unwrap();
+        assert_eq!(
+            entry_by_path(&entries, "shared").kind,
+            FileEntryKind::Directory
+        );
+        entry_by_path(&entries, "shared/nested/hello.txt");
+
+        let nested = service
+            .list_tree(&FileTreeRequest {
+                workspace_id: workspace_id.clone(),
+                path: Some("shared/nested".into()),
+                max_depth: Some(1),
+                include_hidden: false,
+            })
+            .unwrap();
+        assert!(
+            nested
+                .iter()
+                .any(|entry| entry.path == "shared/nested/hello.txt")
+        );
+
+        let read = service
+            .read_file(&FileReadRequest {
+                workspace_id: workspace_id.clone(),
+                path: "shared/nested/hello.txt".into(),
+                max_bytes: None,
+            })
+            .unwrap();
+        assert_eq!(read.path, "shared/nested/hello.txt");
+        assert_eq!(read.content.as_deref(), Some("from the junction target\n"));
+
+        let written = service
+            .write_file(&FileWriteRequest {
+                workspace_id: workspace_id.clone(),
+                path: "shared/nested/hello.txt".into(),
+                content: "edited through the junction\n".into(),
+                create_if_missing: false,
+                expected_revision: Some(read.content_revision),
+                encoding: None,
+                line_ending: None,
+            })
+            .unwrap();
+        assert_eq!(written.path, "shared/nested/hello.txt");
+        assert_eq!(
+            fs::read_to_string(target.join("nested").join("hello.txt")).unwrap(),
+            "edited through the junction\n"
+        );
+
+        let resolved = service
+            .resolve_existing_path(&workspace_id, "shared")
+            .unwrap();
+        assert_eq!(resolved, canonical_root.join("shared"));
+
+        fs::remove_dir(&junction).unwrap();
+        cleanup(root);
+        cleanup(target);
     }
 
     #[test]
