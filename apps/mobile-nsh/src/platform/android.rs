@@ -12,7 +12,7 @@
 
 use std::ffi::c_void;
 
-use nsh_platform_android::{Root, run_root};
+use nsh_android::{Root, run_root};
 
 /// Mounts the app into the `NshView` whose native handle is `handle`.
 ///

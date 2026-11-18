@@ -70,8 +70,12 @@ anything that needs a runtime or a phone are listed at the bottom.
 
 ## Environment limits of this checkout
 
-- No `nsh` CLI, no Android SDK/NDK, no Xcode: the Android/iOS platform crates
-  and the packaging scripts are not compiled or run here.
+- Android was built here: `nsh` 0.6.0, SDK platform/build-tools 35, NDK 27.2,
+  and a debug-signed universal APK. The x86_64 build installed and showed the
+  pairing page and its Link sheet on an API 35 emulator; the universal APK
+  (arm64-v8a, armeabi-v7a, x86_64) installed and launched there too.
+- iOS still has no Xcode, so the iOS platform crate and `build-ios.sh` remain
+  uncompiled and unrun.
 - No reachable runtime: pairing, sending, terminal frames, Git and file writes
   are verified against fixtures and types, not a live authority.
 - `apps/mobile` (the GPUI client) is untouched; the Native Shell client is a

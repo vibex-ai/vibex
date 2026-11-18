@@ -36,7 +36,11 @@ objc2-ui-kit = { version = "0.3.2", default-features = false, features = [
 ] }
 
 [target.'cfg(target_os = "android")'.dependencies]
-nsh-platform-android = { version = "=0.6.0", default-features = false }
+# Aliased: with the plain key, cargo does not pass the extern to this crate
+# when the Android package is built from the app's workspace (the generated
+# runner depends on the same package), so `platform/android.rs` failed to
+# compile. The alias keeps the same package and version.
+nsh-android = { package = "nsh-platform-android", version = "=0.6.0", default-features = false }
 jni = "0.22"
 
 [dev-dependencies]

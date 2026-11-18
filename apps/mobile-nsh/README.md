@@ -150,10 +150,12 @@ store metadata stay with the generated Gradle/Xcode projects (or a release CI
 step) rather than this repository; the app's name, id and version live in
 `nsh.json`, and the theme is generated from the design tokens (see "Theme").
 
-Neither script can be exercised on this machine: there is no `nsh` CLI, no
-Android SDK/NDK and no Xcode here. The Android and iOS platform crates also
-fail to build without those toolchains, so the packaging path is verified only
-by `bash -n` and by the compiler checks that can run on Linux.
+The Android path was exercised on a Linux machine with `nsh` 0.6.0, the
+Android SDK (platform/build-tools 35) and NDK 27.2: `nsh package` produced a
+debug-signed universal APK (arm64-v8a, armeabi-v7a, x86_64). A build of the
+same app installs and opens the pairing page and its Link sheet on an API 35
+x86_64 emulator, and the universal APK installs and launches there too. A store release needs `--keystore`; iOS still needs macOS and Xcode,
+so both the iOS build and its packaging script remain unverified here.
 
 ## Tests
 
