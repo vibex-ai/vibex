@@ -33242,7 +33242,14 @@ impl VibexWorkbench {
             .timeline_measured_turn_layout_signatures
             .get(&turn_id)
             .copied();
+        // A held extent is a blank band under the last row, and the viewport
+        // is anchored to that extent: releasing it slides the last row down by
+        // the band's height. While the reader is at the live edge the band is
+        // the last thing on screen, so the hold buys nothing there and costs
+        // that slide. Hold only while they are scrolled up, where the band sits
+        // below the fold and a transient reparse would otherwise bounce.
         let preserve_streaming_extent = !self.timeline_disclosure_animating
+            && !self.timeline_follow.following_bottom
             && self.streaming_row_state.as_ref().is_some_and(|state| {
                 state.turn_id == turn_id
                     && self
@@ -33275,7 +33282,13 @@ impl VibexWorkbench {
             self.timeline_streaming_shrink_candidates
                 .get(&turn_id)
                 .copied(),
-            Instant::now(),
+            // The settle window runs on the clock that drives this view's
+            // frames, not on the process clock. A test advances the frame clock
+            // to draw, so reading `Instant::now()` here made the window depend
+            // on how long the fixture happened to take: the same probe failed
+            // on its own and passed in the suite, because wall time was what
+            // settled the hold.
+            cx.background_executor().now(),
         );
         if let Some(candidate) = shrink_candidate {
             self.timeline_streaming_shrink_candidates
