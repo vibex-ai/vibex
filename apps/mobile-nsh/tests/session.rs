@@ -38,7 +38,7 @@ fn sessions() -> Vec<SessionSummary> {
             title: "Good morning".to_owned(),
             agent: "Claude".to_owned(),
             meta: "2m".to_owned(),
-            state: SessionState::Running,
+            state: SessionState::Idle,
         },
         SessionSummary {
             id: "s2".to_owned(),
@@ -359,6 +359,13 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
     let on_open_terminal = Rc::new(move || terminal_open.set(true));
     let on_close_terminal = Rc::new(move || terminal_open.set(false));
     let on_new_session = Rc::new(move || new_session_open.set(true));
+    let on_interrupt = Rc::new(move || {
+        sessions.update(|sessions| {
+            if let Some(session) = sessions.first_mut() {
+                session.state = SessionState::Idle;
+            }
+        });
+    });
     SessionHost {
         sessions,
         active,
@@ -394,6 +401,7 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         on_terminal_data: Rc::new(|_| {}),
         on_terminal_resize: Rc::new(|_, _| {}),
         on_terminal_title: Rc::new(|_| {}),
+        on_interrupt,
         files_open,
         files_path,
         files_entries,
@@ -763,4 +771,14 @@ fn a_session_can_be_deleted_from_the_drawer() {
         |screen| screen.texts().iter().all(|text| *text != "Fix the tests"),
     )
     .unwrap();
+}
+
+#[test]
+fn a_running_turn_can_be_stopped_from_the_composer() {
+    let mut config = EngineConfig::new(Root::of::<OneSessionShell>());
+    config.viewport = nsh_core::geometry::Size::new(px(390.0), px(1600.0));
+    let mut app = Headless::start(config).unwrap();
+    app.wait_for("role:button[Stop]").unwrap();
+    app.press("role:button[Stop]").unwrap();
+    app.wait_for("role:button[Send]").unwrap();
 }

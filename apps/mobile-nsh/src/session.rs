@@ -366,6 +366,10 @@ impl SessionService {
                 let service = self.clone();
                 Rc::new(move |cols: u32, rows: u32| service.terminal_resize(cols, rows))
             },
+            on_interrupt: {
+                let service = self.clone();
+                Rc::new(move || service.interrupt_active())
+            },
             on_terminal_title: {
                 let service = self.clone();
                 Rc::new(move |title: &str| {
@@ -946,6 +950,35 @@ impl SessionService {
             if let Ok(Ok(discovery)) = result {
                 let entries = command_entries(discovery);
                 service.mentions.set(entries);
+            }
+        });
+    }
+
+    /// Stops the active session's turn.
+    fn interrupt_active(&self) {
+        let Some(active) = self.active.get_untracked() else {
+            return;
+        };
+        let Ok(session_id) = VibexSessionId::parse(active) else {
+            return;
+        };
+        let service = self.clone();
+        let backend = self.backend.clone();
+        spawn(async move {
+            let result = background(async move {
+                backend
+                    .interrupt(MutationRequest::new(session_id.clone()))
+                    .await
+            })
+            .await;
+            match result {
+                Ok(Ok(true)) => service.refresh(),
+                Ok(Ok(false)) => {}
+                Ok(Err(error)) => service.fail(&error),
+                Err(error) => service.fail(&BackendError::failed(
+                    "session_interrupt_task_failed",
+                    format!("stopping the turn did not finish: {error}"),
+                )),
             }
         });
     }

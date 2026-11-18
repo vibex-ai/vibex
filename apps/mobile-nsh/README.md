@@ -78,6 +78,8 @@ A successful claim or a tapped saved runtime opens the session shell:
 - a pending question is a typed form: one field per kind (text, a number, a
   choice, yes/no, multi-select), required fields checked before submitting,
   and the answers converted back to the runtime's typed values;
+- while the open session is running, the composer's send action becomes Stop
+  (`interrupt`); otherwise it sends, so a turn can be stopped from the phone;
 - the composer offers the session's `/` commands and `@` references (one
   discovery per session each, filtered locally; a reference replaces the
   `@…` token in place), attaches photos and files through the platform's own
@@ -172,7 +174,8 @@ Two layers:
   and leaves, the `/` and `@` palettes insert a command and a reference, New
   session opens through the picker and its sheet collects a workspace and a
   runtime, a session is renamed, archived and deleted from its drawer actions,
-  the terminal shows a program's output, the files surface lists a
+  a running turn is stopped from the composer, the terminal shows a program's
+  output, the files surface lists a
   directory and reads a file, and the Git surface lists a change and shows its
   diff, stages a change, commits and switches to history. Each migrated screen
   adds the flows its GPUI pair has.

@@ -297,6 +297,8 @@ pub struct SessionHost {
     pub on_terminal_data: TerminalInput,
     pub on_terminal_resize: Rc<dyn Fn(u32, u32)>,
     pub on_terminal_title: Rc<dyn Fn(&str)>,
+    /// Stops the active session's turn.
+    pub on_interrupt: Action,
     /// The files surface, when it is open over the shell.
     pub files_open: Signal<bool>,
     pub files_path: Signal<String>,
@@ -1304,11 +1306,25 @@ fn composer(host: SessionHost) -> impl IntoElement {
     let mentions = host.mentions;
     let on_query = host.on_command_query.clone();
     let on_mention = host.on_mention_query.clone();
+    let on_interrupt = host.on_interrupt.clone();
+    let sessions = host.sessions;
+    let active = host.active;
     let attachments = host.attachments;
     let on_remove_attachment = host.on_remove_attachment.clone();
-    let submit = {
+    let running = computed(move || {
+        let Some(active) = active.get() else {
+            return false;
+        };
+        sessions.with(|sessions| {
+            sessions
+                .iter()
+                .find(|session| session.id == active)
+                .is_some_and(|session| session.state == SessionState::Running)
+        })
+    });
+    let submit: Rc<dyn Fn()> = {
         let send = send.clone();
-        move || {
+        Rc::new(move || {
             if sending.get_untracked() {
                 return;
             }
@@ -1319,7 +1335,7 @@ fn composer(host: SessionHost) -> impl IntoElement {
             }
             send(text);
             draft.set(String::new());
-        }
+        })
     };
     view()
         .w_full()
@@ -1377,19 +1393,33 @@ fn composer(host: SessionHost) -> impl IntoElement {
                         move || on_attach_file(),
                     )
                 })
-                .child(
-                    action::primary(
-                        copy::text("Send", "发送", "傳送"),
-                        icon(include_str!("../../assets/icons/send.svg")),
-                        submit,
-                    )
-                    .disabled(move || {
-                        sending.get()
-                            || (draft.with(|draft| draft.trim().is_empty())
-                                && attachments.with(|attachments| attachments.is_empty()))
-                    })
-                    .disabled_style(|style| style.opacity(0.4)),
-                ),
+                .child(when(move || running.get(), {
+                    let on_interrupt = on_interrupt.clone();
+                    move || {
+                        let on_interrupt = on_interrupt.clone();
+                        action::icon_button(
+                            icon(include_str!("../../assets/icons/square.svg")),
+                            copy::text("Stop", "停止", "停止"),
+                            move || on_interrupt(),
+                        )
+                    }
+                }))
+                .child(when(move || !running.get(), {
+                    move || {
+                        let submit = submit.clone();
+                        action::primary(
+                            copy::text("Send", "发送", "傳送"),
+                            icon(include_str!("../../assets/icons/send.svg")),
+                            move || submit(),
+                        )
+                        .disabled(move || {
+                            sending.get()
+                                || (draft.with(|draft| draft.trim().is_empty())
+                                    && attachments.with(|attachments| attachments.is_empty()))
+                        })
+                        .disabled_style(|style| style.opacity(0.4))
+                    }
+                })),
         )
 }
 
