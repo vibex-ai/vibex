@@ -6,10 +6,10 @@
 //! The rows are the shared projection `vibex-desktop-model` computes, so the
 //! phone shows what the desktop shows for the same timeline.
 
-use std::{rc::Rc, sync::Arc};
+use std::{cell::RefCell, rc::Rc, sync::Arc};
 
 use nsh_core::prelude::*;
-use vibex_backend::{AgentBackend, BackendError, BackendResult, MutationRequest};
+use vibex_backend::{AgentBackend, BackendError, BackendEvent, BackendResult, MutationRequest};
 use vibex_core::{
     FetchTimelineRequest, MessageProvenance, SendAgentMessageRequest, TimelinePage,
     UserMessageDelivery, VibexSessionId, unix_timestamp_ms,
@@ -37,6 +37,8 @@ pub struct SessionService {
     sending: Signal<bool>,
     error: Signal<Option<SharedString>>,
     runtime: Signal<Option<SharedString>>,
+    /// The session's projection, kept for the live stream to append to.
+    model: Rc<RefCell<TimelineModel>>,
     on_disconnect: Rc<dyn Fn()>,
 }
 
@@ -57,9 +59,11 @@ impl SessionService {
             sending: signal(false),
             error: signal(None),
             runtime: signal(Some(runtime.into())),
+            model: Rc::new(RefCell::new(TimelineModel::default())),
             on_disconnect,
         };
         service.refresh();
+        service.subscribe();
         Ok(service)
     }
 
@@ -112,6 +116,70 @@ impl SessionService {
                 )),
             }
         });
+    }
+
+    /// Follows the runtime's event stream for the life of the shell.
+    ///
+    /// The stream is the authority's: a live timeline item is applied to the
+    /// same projection the last read filled, so a streamed reply grows in
+    /// place. A stream that ends re-syncs the list once; the backend
+    /// reconnects on its next call.
+    fn subscribe(&self) {
+        let subscription = match self.backend.subscribe() {
+            Ok(subscription) => subscription,
+            Err(_) => return,
+        };
+        let service = self.clone();
+        spawn(async move {
+            let mut subscription = subscription;
+            // The stream ends (or the transport drops): one refresh re-syncs
+            // the list, and the backend reconnects on its next call.
+            while let Ok(Some(event)) = subscription.next().await {
+                service.apply_event(event);
+            }
+            service.refresh();
+        });
+    }
+
+    /// Applies one backend event to what the shell shows.
+    fn apply_event(&self, event: BackendEvent) {
+        match event {
+            BackendEvent::Timeline(live) => {
+                if self.active.get_untracked().as_deref() == Some(live.session_id.as_str()) {
+                    let changed = self.model.borrow_mut().apply_live(live);
+                    if changed {
+                        self.publish();
+                    }
+                }
+            }
+            BackendEvent::SessionUpdated(session) => {
+                let row = summary(&session);
+                self.sessions.update(|sessions| {
+                    if let Some(existing) =
+                        sessions.iter_mut().find(|existing| existing.id == row.id)
+                    {
+                        *existing = row;
+                    } else {
+                        sessions.insert(0, row);
+                    }
+                });
+            }
+            BackendEvent::SessionsRemoved(removed) => {
+                let ids = removed
+                    .iter()
+                    .map(|id| id.as_str().to_owned())
+                    .collect::<Vec<_>>();
+                self.sessions
+                    .update(|sessions| sessions.retain(|session| !ids.contains(&session.id)));
+                let active = self.active.get_untracked();
+                if active.as_ref().is_some_and(|active| ids.contains(active)) {
+                    self.active.set(None);
+                    self.timeline.set(Vec::new());
+                    *self.model.borrow_mut() = TimelineModel::default();
+                }
+            }
+            _ => {}
+        }
     }
 
     /// Opens `id`: its transcript replaces what is shown.
@@ -174,9 +242,17 @@ impl SessionService {
 
     /// Projects a fetched page into the shell's rows.
     fn apply_page(&self, session_id: &VibexSessionId, page: TimelinePage) {
-        let mut model = TimelineModel::default();
-        model.replace_authoritative(session_id.clone(), page.items);
-        let rows = model
+        self.model
+            .borrow_mut()
+            .replace_authoritative(session_id.clone(), page.items);
+        self.publish();
+    }
+
+    /// Re-projects the kept model into the shell's rows.
+    fn publish(&self) {
+        let rows = self
+            .model
+            .borrow()
             .rows()
             .into_iter()
             .map(|row| TimelineEntry {

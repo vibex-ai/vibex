@@ -103,7 +103,10 @@ fn Shell() -> impl IntoElement {
 }
 
 fn start() -> Headless {
-    let mut app = Headless::start(EngineConfig::new(Root::of::<Shell>())).unwrap();
+    let mut config = EngineConfig::new(Root::of::<Shell>());
+    // A tall phone: the transcript's rows all mount in the list's window.
+    config.viewport = nsh_core::geometry::Size::new(px(390.0), px(1600.0));
+    let mut app = Headless::start(config).unwrap();
     app.wait_for("Good morning").unwrap();
     app
 }

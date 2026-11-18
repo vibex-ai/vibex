@@ -13,7 +13,10 @@
 
 use std::rc::Rc;
 
-use nsh_base::{SheetEvent, button, sheet};
+use nsh_base::{
+    SheetEvent, button, sheet,
+    text_view::{MarkdownOptions, text_view},
+};
 use nsh_core::{
     element::{ImageSrc, Position},
     prelude::*,
@@ -347,10 +350,16 @@ fn agent_prose(title: Memo<String>, body: Memo<String>, streaming: Memo<bool>) -
                 )),
         )
         .child(
-            text(move || body.get())
-                .text_size(px(theme::FONT_BODY))
-                .line_height(theme::line_height_for(theme::FONT_BODY))
-                .text_color(theme::foreground),
+            // Markdown, with the open syntax of a still-arriving reply repaired
+            // as it streams. `nsh` lays the blocks out natively and only shows
+            // the blocks that changed again.
+            text_view()
+                .markdown(move || Some(body.get().into()))
+                .options(move || MarkdownOptions {
+                    streaming: streaming.get(),
+                    ..MarkdownOptions::default()
+                })
+                .selectable(true),
         )
 }
 
