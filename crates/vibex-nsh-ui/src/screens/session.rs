@@ -199,6 +199,22 @@ pub enum QuestionResponse {
 /// Answers a question card.
 type QuestionAction = Rc<dyn Fn(&str, QuestionResponse)>;
 
+/// A callback with no arguments.
+type Action = Rc<dyn Fn()>;
+
+/// One entry of the composer's `/` palette.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommandEntry {
+    pub id: String,
+    pub label: String,
+    pub description: String,
+    /// What pressing it puts in the composer.
+    pub insertion: String,
+}
+
+/// Asks for the commands matching what follows `/`.
+type CommandQuery = Rc<dyn Fn(&str)>;
+
 /// What the shell may do, and the state it shows.
 #[derive(Clone)]
 pub struct SessionHost {
@@ -222,6 +238,11 @@ pub struct SessionHost {
     pub on_disconnect: Rc<dyn Fn()>,
     pub on_permission: PermissionAction,
     pub on_question: QuestionAction,
+    /// The `/` commands the session offers, filtered by what is typed.
+    pub commands: Signal<Vec<CommandEntry>>,
+    pub on_command_query: CommandQuery,
+    /// Starts a new session in the open session's workspace.
+    pub on_new_session: Action,
 }
 
 /// The session shell.
@@ -249,6 +270,14 @@ pub fn session(host: SessionHost) -> impl IntoElement {
                     }
                 })),
         )
+        .child(when(
+            move || !host.commands.with(|commands| commands.is_empty()),
+            {
+                let commands = host.commands;
+                let draft = host.draft;
+                move || command_palette(commands, draft)
+            },
+        ))
         .child(when(move || host.pending.get().is_some(), {
             let pending = host.pending;
             let resolving = host.resolving;
@@ -552,6 +581,73 @@ fn error_card(body: Memo<String>) -> impl IntoElement {
             text(move || body.get())
                 .text_size(px(theme::FONT_DETAIL))
                 .text_color(theme::accent_red),
+        )
+}
+
+/// The `/` command palette, above the composer.
+///
+/// The list is what the session's runtime offers, narrowed by the text after
+/// the slash; pressing a row writes its insertion into the composer.
+fn command_palette(commands: Signal<Vec<CommandEntry>>, draft: Signal<String>) -> impl IntoElement {
+    view()
+        .w_full()
+        .max_h(px(240.0))
+        .border_t_1()
+        .border_t_color(theme::border_subtle)
+        .bg(theme::background_card)
+        .child(
+            scroll()
+                .max_h(px(240.0))
+                .child(view().flex_col().p(px(theme::SPACING_XS)).child(each(
+                    move || {
+                        let query = draft.with(|draft| {
+                            draft
+                                .strip_prefix('/')
+                                .unwrap_or_default()
+                                .trim()
+                                .to_lowercase()
+                        });
+                        commands.with(|commands| {
+                            commands
+                                .iter()
+                                .filter(|command| {
+                                    query.is_empty()
+                                        || command.label.to_lowercase().contains(&query)
+                                        || command.insertion.to_lowercase().contains(&query)
+                                })
+                                .cloned()
+                                .collect::<Vec<_>>()
+                        })
+                    },
+                    |command| command.id.clone(),
+                    move |command, _| command_row(command, draft),
+                ))),
+        )
+}
+
+fn command_row(command: ReadSignal<CommandEntry>, draft: Signal<String>) -> impl IntoElement {
+    button()
+        .on_press(move || {
+            draft.set(command.get_untracked().insertion);
+        })
+        .w_full()
+        .rounded(px(theme::RADIUS_CONTROL))
+        .px(px(theme::SPACING_SM))
+        .py(px(theme::SPACING_XS))
+        .flex_col()
+        .items_start()
+        .active(|style| style.opacity(0.85))
+        .child(
+            text(move || command.get().label)
+                .text_size(px(theme::FONT_DETAIL))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(theme::foreground),
+        )
+        .child(
+            text(move || command.get().description)
+                .truncate()
+                .text_size(px(theme::FONT_MICRO))
+                .text_color(theme::text_muted),
         )
 }
 
@@ -969,6 +1065,8 @@ fn composer(host: SessionHost) -> impl IntoElement {
     let draft = host.draft;
     let sending = host.sending;
     let send = host.on_send.clone();
+    let commands = host.commands;
+    let on_query = host.on_command_query.clone();
     let submit = {
         let send = send.clone();
         move || {
@@ -996,9 +1094,13 @@ fn composer(host: SessionHost) -> impl IntoElement {
         .bg(theme::background)
         .pb_keyboard()
         .child(
-            field::text_field(
+            field::text_field_with(
                 draft,
                 copy::text("Message the Agent…", "给 Agent 发消息…", "傳訊息給 Agent…"),
+                move |text: &str| match text.strip_prefix('/') {
+                    Some(query) => on_query(query),
+                    None => commands.set(Vec::new()),
+                },
             )
             .multiline(true)
             .min_h(px(theme::TOUCH_TARGET))
@@ -1023,6 +1125,7 @@ fn drawer(host: SessionHost, open: Signal<bool>) -> impl IntoElement {
     let runtime = host.runtime;
     let on_select = host.on_select.clone();
     let on_disconnect = host.on_disconnect.clone();
+    let on_new_session = host.on_new_session.clone();
     sheet()
         .side(Placement::Left)
         .open(move || Some(open.get()))
@@ -1081,6 +1184,17 @@ fn drawer(host: SessionHost, open: Signal<bool>) -> impl IntoElement {
                             })
                             .text_size(px(theme::FONT_CAPTION))
                             .text_color(theme::text_muted),
+                        )
+                        .child(
+                            action::primary(
+                                copy::text("New session", "新建会话", "新增工作階段"),
+                                icon(include_str!("../../assets/icons/circle-plus.svg")),
+                                {
+                                    let on_new_session = on_new_session.clone();
+                                    move || on_new_session()
+                                },
+                            )
+                            .w_full(),
                         )
                         .child(
                             action::secondary(

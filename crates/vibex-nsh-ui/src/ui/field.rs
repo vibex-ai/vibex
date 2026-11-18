@@ -11,9 +11,22 @@ use crate::theme;
 /// `on_change` writes it back. The platform draws the caret, selection,
 /// autocorrection and keyboard, so the app does not.
 pub fn text_field(value: Signal<String>, placeholder: impl IntoReactive<String>) -> Input {
+    text_field_with(value, placeholder, |_text: &str| {})
+}
+
+/// A field whose owner also hears every edit (a composer that opens its
+/// command palette on `/`).
+pub fn text_field_with(
+    value: Signal<String>,
+    placeholder: impl IntoReactive<String>,
+    on_change: impl Fn(&str) + 'static,
+) -> Input {
     input()
         .value(move || value.get())
-        .on_change(move |text: &str| value.set(text.to_owned()))
+        .on_change(move |text: &str| {
+            value.set(text.to_owned());
+            on_change(text);
+        })
         .placeholder(placeholder)
         .placeholder_color(theme::muted_foreground)
         .caret_color(theme::primary)

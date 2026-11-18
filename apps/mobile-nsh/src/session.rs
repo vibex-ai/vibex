@@ -6,26 +6,32 @@
 //! The rows are the shared projection `vibex-desktop-model` computes, so the
 //! phone shows what the desktop shows for the same timeline.
 
-use std::{cell::RefCell, collections::BTreeMap, rc::Rc, sync::Arc};
+use std::{
+    cell::{Cell, RefCell},
+    collections::BTreeMap,
+    rc::Rc,
+    sync::Arc,
+};
 
 use nsh_core::prelude::*;
 use vibex_backend::{AgentBackend, BackendError, BackendEvent, BackendResult, MutationRequest};
 use vibex_core::{
-    ApprovalResponder, ElicitationAnswerValue, ElicitationField, ElicitationFieldKind,
-    ElicitationRequest, ElicitationRequestStatus, ElicitationResolution,
-    ElicitationResolutionAction, FetchTimelineRequest, MessageProvenance, PermissionRequest,
-    PermissionRequestStatus, PermissionResolution, PermissionResponseKind, RequestId,
-    ResolveElicitationRequest, ResolvePermissionRequest, SendAgentMessageRequest, TimelinePage,
-    TimelinePayload, UserMessageDelivery, VibexSessionId, unix_timestamp_ms,
+    AgentCommandDiscoverRequest, AgentCommandTrigger, ApprovalResponder, CreateAgentSessionRequest,
+    ElicitationAnswerValue, ElicitationField, ElicitationFieldKind, ElicitationRequest,
+    ElicitationRequestStatus, ElicitationResolution, ElicitationResolutionAction,
+    FetchTimelineRequest, MessageProvenance, PermissionRequest, PermissionRequestStatus,
+    PermissionResolution, PermissionResponseKind, RequestId, ResolveElicitationRequest,
+    ResolvePermissionRequest, SendAgentMessageRequest, TimelinePage, TimelinePayload,
+    UserMessageDelivery, VibexSessionId, unix_timestamp_ms,
 };
 use vibex_desktop_model::TimelineModel;
 use vibex_mobile_pairing::MobileCredentialBundle;
 use vibex_nsh_ui::{
     copy,
     screens::session::{
-        EntryKind, PendingPermission, PendingQuestion, PermissionChoice, PermissionOption,
-        QuestionAnswer, QuestionField, QuestionFieldKind, QuestionOption, QuestionResponse,
-        SessionHost, SessionState, SessionSummary, TimelineEntry,
+        CommandEntry, EntryKind, PendingPermission, PendingQuestion, PermissionChoice,
+        PermissionOption, QuestionAnswer, QuestionField, QuestionFieldKind, QuestionOption,
+        QuestionResponse, SessionHost, SessionState, SessionSummary, TimelineEntry,
     },
 };
 
@@ -49,6 +55,8 @@ pub struct SessionService {
     question: Signal<Option<PendingQuestion>>,
     /// The question the card shows, kept for typed submissions.
     question_request: Rc<RefCell<Option<ElicitationRequest>>>,
+    commands: Signal<Vec<CommandEntry>>,
+    commands_loaded: Rc<Cell<bool>>,
     resolving: Signal<bool>,
     /// The session's projection, kept for the live stream to append to.
     model: Rc<RefCell<TimelineModel>>,
@@ -75,6 +83,8 @@ impl SessionService {
             pending: signal(None),
             question: signal(None),
             question_request: Rc::new(RefCell::new(None)),
+            commands: signal(Vec::new()),
+            commands_loaded: Rc::new(Cell::new(false)),
             resolving: signal(false),
             model: Rc::new(RefCell::new(TimelineModel::default())),
             on_disconnect,
@@ -96,6 +106,7 @@ impl SessionService {
             runtime: self.runtime,
             pending: self.pending,
             question: self.question,
+            commands: self.commands,
             resolving: self.resolving,
             on_select: {
                 let service = self.clone();
@@ -121,6 +132,14 @@ impl SessionService {
                 Rc::new(move |request_id: &str, response: QuestionResponse| {
                     service.resolve_question(request_id, response)
                 })
+            },
+            on_command_query: {
+                let service = self.clone();
+                Rc::new(move |query: &str| service.query_commands(query))
+            },
+            on_new_session: {
+                let service = self.clone();
+                Rc::new(move || service.new_session())
             },
         }
     }
@@ -228,6 +247,8 @@ impl SessionService {
         self.pending.set(None);
         self.question.set(None);
         *self.question_request.borrow_mut() = None;
+        self.commands.set(Vec::new());
+        self.commands_loaded.set(false);
         self.error.set(None);
         let service = self.clone();
         let backend = self.backend.clone();
@@ -469,6 +490,108 @@ impl SessionService {
                 Err(error) => service.fail(&BackendError::failed(
                     "session_task_failed",
                     format!("resolving the question did not finish: {error}"),
+                )),
+            }
+        });
+    }
+
+    /// Loads the `/` commands the open session offers.
+    ///
+    /// One read per session: the palette filters what came back locally as the
+    /// person keeps typing, so typing does not make a request per keystroke.
+    fn query_commands(&self, _query: &str) {
+        if self.commands_loaded.get() {
+            return;
+        }
+        let Some(active) = self.active.get_untracked() else {
+            return;
+        };
+        let Ok(session_id) = VibexSessionId::parse(active) else {
+            return;
+        };
+        self.commands_loaded.set(true);
+        let service = self.clone();
+        let backend = self.backend.clone();
+        spawn(async move {
+            let result = background(async move {
+                backend
+                    .discover_agent_commands(AgentCommandDiscoverRequest {
+                        agent_id: None,
+                        provider_profile_id: None,
+                        session_id: Some(session_id),
+                        workspace_id: None,
+                        trigger: Some(AgentCommandTrigger::Slash),
+                        query: None,
+                        limit: Some(30),
+                    })
+                    .await
+            })
+            .await;
+            if let Ok(Ok(discovery)) = result {
+                let mut entries = Vec::new();
+                let mut seen = std::collections::BTreeSet::new();
+                for entry in discovery
+                    .response
+                    .entries
+                    .into_iter()
+                    .chain(discovery.quick_phrases)
+                {
+                    if seen.insert(entry.id.clone()) {
+                        entries.push(CommandEntry {
+                            id: entry.id,
+                            label: entry.label,
+                            description: entry.description.unwrap_or_default(),
+                            insertion: entry.insertion_text,
+                        });
+                    }
+                }
+                service.commands.set(entries);
+            }
+        });
+    }
+
+    /// Starts a session in the open session's workspace with its runtime.
+    fn new_session(&self) {
+        let Some(active) = self.active.get_untracked() else {
+            self.fail_text(copy::text(
+                "Open a session first; the new one reuses its workspace.",
+                "请先打开一个会话，新会话会复用它的工作区。",
+                "請先開啟一個工作階段，新工作階段會沿用它的工作區。",
+            ));
+            return;
+        };
+        let Ok(active_id) = VibexSessionId::parse(active) else {
+            return;
+        };
+        let service = self.clone();
+        let backend = self.backend.clone();
+        spawn(async move {
+            let result = background(async move {
+                let session = backend.open_session(active_id.clone()).await?;
+                let selection = backend.runtime_selection(active_id).await?.desired;
+                backend
+                    .create_session(MutationRequest::new(CreateAgentSessionRequest {
+                        runtime: selection,
+                        workspace_root: session.workspace_root,
+                        workspace_mode: session.workspace_mode,
+                        title: None,
+                        safety: None,
+                        session_id: Some(VibexSessionId::new()),
+                        defer_runtime_materialization: false,
+                        tools: Default::default(),
+                    }))
+                    .await
+            })
+            .await;
+            match result {
+                Ok(Ok(session)) => {
+                    service.refresh();
+                    service.open(session.id.as_str());
+                }
+                Ok(Err(error)) => service.fail(&error),
+                Err(error) => service.fail(&BackendError::failed(
+                    "session_task_failed",
+                    format!("creating the session did not finish: {error}"),
                 )),
             }
         });

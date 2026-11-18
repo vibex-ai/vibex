@@ -11,8 +11,9 @@ use nsh_core::prelude::*;
 use nsh_engine::{EngineConfig, Root};
 use nsh_testing::Headless;
 use vibex_nsh_ui::screens::session::{
-    self, EntryKind, PendingPermission, PendingQuestion, PermissionChoice, PermissionOption,
-    QuestionField, QuestionFieldKind, SessionHost, SessionState, SessionSummary, TimelineEntry,
+    self, CommandEntry, EntryKind, PendingPermission, PendingQuestion, PermissionChoice,
+    PermissionOption, QuestionField, QuestionFieldKind, SessionHost, SessionState, SessionSummary,
+    TimelineEntry,
 };
 
 fn entry(id: &str, kind: EntryKind, title: &str, body: &str) -> TimelineEntry {
@@ -124,6 +125,7 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
     let pending = signal(pending);
     let question = signal(question);
     let resolving = signal(false);
+    let commands = signal(Vec::new());
 
     let select = Rc::new(move |id: &str| {
         active.set(Some(id.to_owned()));
@@ -146,6 +148,30 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
     let on_question = Rc::new(move |_: &str, _| {
         question.set(None);
     });
+    let on_command_query = Rc::new(move |_: &str| {
+        commands.set(vec![CommandEntry {
+            id: "review".to_owned(),
+            label: "Review changes".to_owned(),
+            description: "Ask the Agent to review the working tree".to_owned(),
+            insertion: "/review ".to_owned(),
+        }]);
+    });
+    let on_new_session = Rc::new(move || {
+        sessions.update(|sessions| {
+            sessions.insert(
+                0,
+                SessionSummary {
+                    id: "s3".to_owned(),
+                    title: "Fresh session".to_owned(),
+                    agent: "Claude".to_owned(),
+                    meta: "now".to_owned(),
+                    state: SessionState::Idle,
+                },
+            );
+        });
+        active.set(Some("s3".to_owned()));
+        timeline.set(transcript("s3"));
+    });
     SessionHost {
         sessions,
         active,
@@ -156,6 +182,7 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         runtime,
         pending,
         question,
+        commands,
         resolving,
         on_select: select,
         on_send: send,
@@ -163,6 +190,8 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         on_disconnect: Rc::new(|| {}),
         on_permission,
         on_question,
+        on_command_query,
+        on_new_session,
     }
 }
 
@@ -263,4 +292,22 @@ fn a_question_collects_an_answer_and_leaves() {
     app.press("role:button[Submit]").unwrap();
     app.wait_for_gone("Which branch?", std::time::Duration::from_secs(5))
         .unwrap();
+}
+
+#[test]
+fn the_slash_palette_inserts_a_command() {
+    let mut app = start();
+    app.type_text("text:Message the Agent…", "/").unwrap();
+    app.wait_for("Review changes").unwrap();
+    app.press("Review changes").unwrap();
+    app.wait_for("text:/review ").unwrap();
+}
+
+#[test]
+fn a_new_session_reuses_the_open_workspace_and_opens() {
+    let mut app = start();
+    app.press("role:button[Sessions]").unwrap();
+    app.wait_for("Fix the tests").unwrap();
+    app.press("role:button[New session]").unwrap();
+    app.wait_for("Fresh session").unwrap();
 }
