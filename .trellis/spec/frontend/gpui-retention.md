@@ -54,18 +54,78 @@ relied on an unconditional redraw, and are fixed:
   pixels more than their content and neither scrolled. It uses a 420px
   definite-height viewport and asserts each column can scroll before the wheel.
 
-The windowed-run disclosure family still fails when run on its own
-(`cargo test -p vibex-desktop --lib <name>`):
+### The shimmer gate was process state, not a retention miss
+
+`activity_shimmer_stops_when_settled_or_motion_is_reduced` passed alone and
+failed inside the suite, which read as a retention problem. It was not. The
+live-label frame gate kept its state in process-wide statics: one epoch, one
+last-frame stamp, one verdict. Three separate ways to go wrong came from that:
+
+- A window that ran late — a background timeline, another pane, a slow headless
+  draw — stopped the sweep in every other window.
+- A window id is unique only inside one `App`, and every `App` starts its
+  slotmap at the same key, so a table keyed by window id let two tests share an
+  entry.
+- An epoch is only meaningful against the clock it was taken from, and each
+  `App` owns its executor clock, so a shared epoch compared two unrelated time
+  bases.
+
+The gate is now `LiveLabelFrameGate` on `SessionView`: one workbench, one
+clock, one verdict, and no statics. It is sampled once per
+`render_agent_workbench_for` with `cx.background_executor().now()` — the
+executor clock, not `Instant::now`, so a test's `advance_clock` is the only
+thing that moves a frame's gap — and the rest of the frame reads
+`self.live_label_frame_gate.animating()`.
+
+The general rule: never key a cadence decision, or anything timed, on process
+state. The clock a measurement subtracts from belongs to the same `App` as the
+frames it times.
+
+### The windowed-run disclosure family is a layout defect, not retention
+
+These still fail when run on their own
+(`cargo test -p vibex-desktop --lib <name>`), and they also fail with
+`GPUI_VIEW_RETENTION=0`, so view retention is not the cause:
 
 - `a_row_that_lands_in_one_frame_keeps_the_rows_under_it_still`
 - `a_windowed_run_keeps_the_rows_under_a_closing_row_still_on_the_bottom_edge`
 - `a_windowed_run_keeps_the_rows_under_a_disclosure_still_on_the_live_edge`
 
-The first frame after a toggle moves the row below with the disclosure. The
-probe refreshes every frame, so view retention is not involved; the difference
-is in the retained Taffy layout or the timeline's bottom-edge anchoring. The
-full library suite can pass it depending on scheduling, so a green suite does
-not clear it.
+Measured, on the first frame after a toggle:
+
+| | before click | frame 0 |
+| --- | --- | --- |
+| row table | 2385 | 2363 |
+| `max_offset` | 2017 | 1995 |
+| row below the toggle | 263.5 | 285.5 |
+
+The row below moves by exactly the 22px the row table loses, and it moves
+because the viewport is bottom-anchored: the offset is `-max_offset`, so a
+smaller extent pulls the content down.
+
+The 22px is stale streaming slack, not the disclosure's own delta. While a turn
+streams, `record_timeline_turn_height` holds the larger previous extent
+(`stable_streaming_timeline_height`), so the table keeps 2385 while the laid-out
+box is 2363. `preserve_streaming_extent` is gated on
+`!self.timeline_disclosure_animating`, so the click releases that hold in the
+same frame it opens the row, the table takes the true 2363, and the release
+lands as a jump before the disclosure's growth arrives.
+
+Two candidate fixes were tried and both left the family red, so neither was
+committed:
+
+- Keeping the hold while `timeline_disclosure_animating` (or while settle
+  frames remain) fixes the first test but leaves the closing-row and live-edge
+  probes jumping at frame 19, when `timeline_rows_hang_from_bottom` turns off
+  while the table is still behind.
+- Clamping the recorded extent to the previous height during the settle window
+  changes which frame jumps rather than removing the jump.
+
+The remaining work is to make the hang window end on the table catching up
+rather than on a fixed frame count, and to keep the streaming hold from being
+released by a disclosure at all. Both touch the bottom-edge anchoring that
+`timeline_rows_hang_from_bottom` documents, so they need their own change with
+the probes as the gate.
 
 ## 5. Timeline list layer
 
